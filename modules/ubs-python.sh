@@ -706,6 +706,54 @@ severity: info
 message: "open() without encoding=... may be non-deterministic across locales"
 YAML
 
+  cat >"$AST_RULE_DIR/resource-open-no-close.yml" <<'YAML'
+id: py.resource.open-no-close
+language: python
+rule:
+  pattern: $VAR = open($ARGS)
+  not:
+    inside:
+      pattern: $VAR.close()
+severity: warning
+message: "open() assigned to a variable without close() in the same block."
+YAML
+
+  cat >"$AST_RULE_DIR/resource-popen-no-wait.yml" <<'YAML'
+id: py.resource.Popen-no-wait
+language: python
+rule:
+  pattern: $PROC = subprocess.Popen($ARGS)
+  not:
+    inside:
+      pattern: $PROC.wait()
+  not:
+    inside:
+      pattern: $PROC.communicate($$)
+  not:
+    inside:
+      pattern: $PROC.terminate()
+  not:
+    inside:
+      pattern: $PROC.kill()
+severity: warning
+message: "subprocess.Popen handle created without wait/communicate/terminate in the same scope."
+YAML
+
+  cat >"$AST_RULE_DIR/resource-asyncio-task.yml" <<'YAML'
+id: py.resource.asyncio-task-no-await
+language: python
+rule:
+  pattern: $TASK = asyncio.create_task($ARGS)
+  not:
+    inside:
+      pattern: await $TASK
+  not:
+    inside:
+      pattern: $TASK.cancel()
+severity: warning
+message: "asyncio.create_task result neither awaited nor cancelled."
+YAML
+
   cat >"$AST_RULE_DIR/assert-used.yml" <<'YAML'
 id: py.assert-used
 language: python

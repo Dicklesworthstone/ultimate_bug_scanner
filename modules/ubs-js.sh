@@ -653,6 +653,39 @@ rule:
 severity: warning
 message: "JSON.parse without try/catch; malformed input will throw"
 YAML
+  cat >"$AST_RULE_DIR/js-resource-add-listener.yml" <<'YAML'
+id: js.resource.listener-no-remove
+language: javascript
+rule:
+  pattern: $TARGET.addEventListener($EVENT, $HANDLER)
+  not:
+    inside:
+      pattern: $TARGET.removeEventListener($EVENT, $HANDLER)
+severity: warning
+message: "addEventListener without matching removeEventListener in the same scope."
+YAML
+  cat >"$AST_RULE_DIR/js-resource-interval.yml" <<'YAML'
+id: js.resource.interval-no-clear
+language: javascript
+rule:
+  pattern: $TIMER = setInterval($CALL)
+  not:
+    inside:
+      pattern: clearInterval($TIMER)
+severity: warning
+message: "setInterval assigned to a variable without clearInterval on the same identifier."
+YAML
+  cat >"$AST_RULE_DIR/js-resource-observer.yml" <<'YAML'
+id: js.resource.observer-no-disconnect
+language: javascript
+rule:
+  pattern: $OBS = new MutationObserver($CALLBACK)
+  not:
+    inside:
+      pattern: $OBS.disconnect()
+severity: warning
+message: "MutationObserver created without disconnect()."
+YAML
 }
 
 run_ast_rules() {

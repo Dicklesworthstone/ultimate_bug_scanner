@@ -68,6 +68,34 @@ AST_JSON=""
 AST_SARIF=""
 AST_SCAN_OK=0
 
+# Resource lifecycle correlation spec (acquire vs release pairs)
+RESOURCE_LIFECYCLE_IDS=(context_cancel ticker_stop timer_stop)
+declare -A RESOURCE_LIFECYCLE_SEVERITY=(
+  [context_cancel]="critical"
+  [ticker_stop]="warning"
+  [timer_stop]="warning"
+)
+declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
+  [context_cancel]='context\.With(Cancel|Timeout|Deadline)\('
+  [ticker_stop]='time\.NewTicker\('
+  [timer_stop]='time\.NewTimer\('
+)
+declare -A RESOURCE_LIFECYCLE_RELEASE=(
+  [context_cancel]='cancel\('
+  [ticker_stop]='\.Stop\('
+  [timer_stop]='\.Stop\('
+)
+declare -A RESOURCE_LIFECYCLE_SUMMARY=(
+  [context_cancel]='context.With* without deferred cancel'
+  [ticker_stop]='time.NewTicker not stopped'
+  [timer_stop]='time.NewTimer not stopped'
+)
+declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
+  [context_cancel]='Store the cancel func and defer cancel() immediately after acquiring the context'
+  [ticker_stop]='Keep the ticker handle and call Stop() when finished'
+  [timer_stop]='Stop or drain timers to avoid leaks'
+)
+
 print_usage() {
   cat >&2 <<USAGE
 Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
@@ -256,6 +284,46 @@ show_detailed_finding() {
     print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+run_resource_lifecycle_checks() {
+  local header_shown=0
+  local rid
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      acquire_hits=${acquire_hits:-0}
+      release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then
+          print_subheader "Resource lifecycle correlation"
+          header_shown=1
+        fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}
+        [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local title="$summary [$relpath]"
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        print_finding "$severity" "$delta" "$title" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
+    print_subheader "Resource lifecycle correlation"
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
 }
 
 # Temporarily relax pipefail for grep-heavy scans
@@ -1097,6 +1165,17 @@ if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
 else
   say "${YELLOW}${WARN} ast-grep not available; AST categories summarized via regex only.${RESET}"
 fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 17: RESOURCE LIFECYCLE CORRELATION
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 17; then
+print_header "17. RESOURCE LIFECYCLE CORRELATION"
+print_category "Detects: context.With* without cancel, tickers/timers without Stop" \
+  "Go resources must be explicitly cleaned up to avoid leaks"
+
+run_resource_lifecycle_checks
 fi
 
 # restore pipefail if we relaxed it

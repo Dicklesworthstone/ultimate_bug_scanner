@@ -185,6 +185,34 @@ HAS_DENY=0
 HAS_UDEPS=0
 HAS_OUTDATED=0
 
+# Resource lifecycle correlation spec (acquire vs release pairs)
+RESOURCE_LIFECYCLE_IDS=(thread_join tokio_spawn tcp_shutdown)
+declare -A RESOURCE_LIFECYCLE_SEVERITY=(
+  [thread_join]="critical"
+  [tokio_spawn]="warning"
+  [tcp_shutdown]="warning"
+)
+declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
+  [thread_join]='std::thread::spawn'
+  [tokio_spawn]='tokio::spawn'
+  [tcp_shutdown]='TcpStream::connect'
+)
+declare -A RESOURCE_LIFECYCLE_RELEASE=(
+  [thread_join]='\.join\('
+  [tokio_spawn]='\.await'
+  [tcp_shutdown]='\.shutdown\('
+)
+declare -A RESOURCE_LIFECYCLE_SUMMARY=(
+  [thread_join]='std::thread::spawn without join()'
+  [tokio_spawn]='tokio::spawn tasks not awaited/cancelled'
+  [tcp_shutdown]='TcpStream without shutdown()'
+)
+declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
+  [thread_join]='Store the JoinHandle and call join() or detach intentionally'
+  [tokio_spawn]='Await the JoinHandle result or abort/cancel the task explicitly'
+  [tcp_shutdown]='Call shutdown() or drop connections explicitly when done'
+)
+
 # ────────────────────────────────────────────────────────────────────────────
 # Category gating
 # ────────────────────────────────────────────────────────────────────────────
@@ -290,6 +318,46 @@ show_detailed_finding() {
     print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+run_resource_lifecycle_checks() {
+  local header_shown=0
+  local rid
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      acquire_hits=${acquire_hits:-0}
+      release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then
+          print_subheader "Resource lifecycle correlation"
+          header_shown=1
+        fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}
+        [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local title="$summary [$relpath]"
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        print_finding "$severity" "$delta" "$title" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
+    print_subheader "Resource lifecycle correlation"
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
 }
 
 show_ast_examples() {
@@ -1410,6 +1478,17 @@ if [[ -f "$cargo_toml" ]]; then
 else
   print_finding "info" 1 "No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)"
 fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 19: RESOURCE LIFECYCLE CORRELATION
+# ═══════════════════════════════════════════════════════════════════════════
+if category_enabled 19; then
+print_header "19. RESOURCE LIFECYCLE CORRELATION"
+print_category "Detects: std::thread::spawn without join, tokio::spawn without await, TcpStream without shutdown" \
+  "Rust relies on explicit joins/shutdowns even with RAII—leaks create zombie work"
+
+run_resource_lifecycle_checks
 fi
 
 # restore pipefail

@@ -157,6 +157,34 @@ AST_GREP_CMD=()      # array-safe
 AST_RULE_DIR=""      # created later if ast-grep exists
 ASTG_VERSION=""
 
+# Resource lifecycle correlation spec (acquire vs release pairs)
+RESOURCE_LIFECYCLE_IDS=(thread_join malloc_heap fopen_handle)
+declare -A RESOURCE_LIFECYCLE_SEVERITY=(
+  [thread_join]="critical"
+  [malloc_heap]="critical"
+  [fopen_handle]="warning"
+)
+declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
+  [thread_join]='std::thread'
+  [malloc_heap]='\b(malloc|calloc|realloc)\('
+  [fopen_handle]='fopen\('
+)
+declare -A RESOURCE_LIFECYCLE_RELEASE=(
+  [thread_join]='\.join\('
+  [malloc_heap]='free\('
+  [fopen_handle]='fclose\('
+)
+declare -A RESOURCE_LIFECYCLE_SUMMARY=(
+  [thread_join]='std::thread started without join/detach'
+  [malloc_heap]='malloc/calloc/realloc without free'
+  [fopen_handle]='fopen without fclose'
+)
+declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
+  [thread_join]='Join or detach std::thread instances to avoid std::terminate'
+  [malloc_heap]='Balance heap allocations with free() or prefer smart pointers'
+  [fopen_handle]='Track FILE* handles and call fclose() or wrap in RAII'
+)
+
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep) + include/exclude
 # ────────────────────────────────────────────────────────────────────────────
@@ -260,6 +288,46 @@ show_detailed_finding() {
     print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+run_resource_lifecycle_checks() {
+  local header_shown=0
+  local rid
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      acquire_hits=${acquire_hits:-0}
+      release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then
+          print_subheader "Resource lifecycle correlation"
+          header_shown=1
+        fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}
+        [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local title="$summary [$relpath]"
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        print_finding "$severity" "$delta" "$title" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
+    print_subheader "Resource lifecycle correlation"
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
 }
 
 # Temporarily relax pipefail for grep-heavy scans
@@ -1118,6 +1186,17 @@ if [ "$count" -gt 50 ]; then print_finding "warning" "$count" "Many asserts/abor
 print_subheader "Debug prints (std::cout/cerr)"
 cout_count=$("${GREP_RN[@]}" -e "std::cout|std::cerr" "$PROJECT_DIR" 2>/dev/null | count_lines)
 if [ "$cout_count" -gt 50 ]; then print_finding "info" "$cout_count" "Many std::cout/cerr statements - consider a logging library"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 16: RESOURCE LIFECYCLE CORRELATION
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 16; then
+print_header "16. RESOURCE LIFECYCLE CORRELATION"
+print_category "Detects: std::thread spawn w/o join, malloc/calloc without free, fopen without fclose" \
+  "Manual resources must be paired with cleanup to avoid leaks and crashes"
+
+run_resource_lifecycle_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

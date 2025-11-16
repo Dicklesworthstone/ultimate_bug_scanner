@@ -54,6 +54,34 @@ JOBS="${JOBS:-0}"
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
 
+# Resource lifecycle correlation spec (acquire vs release pairs)
+RESOURCE_LIFECYCLE_IDS=(dom_event interval observer)
+declare -A RESOURCE_LIFECYCLE_SEVERITY=(
+  [dom_event]="critical"
+  [interval]="warning"
+  [observer]="warning"
+)
+declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
+  [dom_event]='addEventListener'
+  [interval]='setInterval[[:space:]]*\('
+  [observer]='new[[:space:]]+MutationObserver'
+)
+declare -A RESOURCE_LIFECYCLE_RELEASE=(
+  [dom_event]='removeEventListener'
+  [interval]='clearInterval[[:space:]]*\('
+  [observer]='\.disconnect[[:space:]]*\('
+)
+declare -A RESOURCE_LIFECYCLE_SUMMARY=(
+  [dom_event]='Event listeners missing cleanup'
+  [interval]='Intervals never cleared'
+  [observer]='MutationObserver not disconnected'
+)
+declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
+  [dom_event]='Call removeEventListener with the same handler during cleanup'
+  [interval]='Store the interval id and call clearInterval when disposing components'
+  [observer]='Hold the observer handle and invoke disconnect before teardown'
+)
+
 print_usage() {
   cat >&2 <<USAGE
 Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
@@ -230,6 +258,46 @@ show_detailed_finding() {
     print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+run_resource_lifecycle_checks() {
+  local header_shown=0
+  local rid
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      acquire_hits=${acquire_hits:-0}
+      release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then
+          print_subheader "Resource lifecycle correlation"
+          header_shown=1
+        fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}
+        [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local title="$summary [$relpath]"
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        print_finding "$severity" "$delta" "$title" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
+    print_subheader "Resource lifecycle correlation"
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
 }
 
 # Temporarily relax pipefail for grep-heavy scans to avoid ERR on 1/no-match
@@ -1543,6 +1611,17 @@ if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Synchronous fs.*Sy
 print_subheader "Dynamic require()"
 count=$("${GREP_RN[@]}" -e "require\(\s*\+|require\(\s*[A-Za-z_$][A-Za-z0-9_$]*\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Dynamic require/variable module path" "Hinders bundling and caching"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 19: RESOURCE LIFECYCLE CORRELATION
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 19; then
+print_header "19. RESOURCE LIFECYCLE CORRELATION"
+print_category "Detects: Acquire/release imbalances for listeners, timers, observers" \
+  "Unreleased resources leak memory, CPU, and event handlers across renders"
+
+run_resource_lifecycle_checks
 fi
 
 # (Optional) Run ast-grep rule packs (if available) to emit structured findings

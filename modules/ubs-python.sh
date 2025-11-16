@@ -174,6 +174,34 @@ HAS_RIPGREP=0
 UVX_CMD=()           # (uvx -q or uv -qx) if available
 HAS_UV=0
 
+# Resource lifecycle correlation spec (acquire vs release pairs)
+RESOURCE_LIFECYCLE_IDS=(file_handle popen_handle asyncio_task)
+declare -A RESOURCE_LIFECYCLE_SEVERITY=(
+  [file_handle]="critical"
+  [popen_handle]="warning"
+  [asyncio_task]="warning"
+)
+declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
+  [file_handle]='open\('
+  [popen_handle]='subprocess\.Popen\('
+  [asyncio_task]='asyncio\.create_task'
+)
+declare -A RESOURCE_LIFECYCLE_RELEASE=(
+  [file_handle]='\.close\(|with[[:space:]]+open'
+  [popen_handle]='\.wait\(|\.communicate\(|\.terminate\(|\.kill\('
+  [asyncio_task]='\.cancel\(|await[[:space:]]+asyncio\.(gather|wait)'
+)
+declare -A RESOURCE_LIFECYCLE_SUMMARY=(
+  [file_handle]='File handles opened without context manager/close'
+  [popen_handle]='Popen handles not waited or terminated'
+  [asyncio_task]='asyncio tasks spawned without cancellation/await'
+)
+declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
+  [file_handle]='Use "with open(...)" or explicitly call .close()'
+  [popen_handle]='Capture the Popen object and call wait/communicate/terminate on it'
+  [asyncio_task]='Await the task result or cancel/monitor it before shutdown'
+)
+
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep) + include/exclude
 # ────────────────────────────────────────────────────────────────────────────
@@ -276,6 +304,46 @@ show_detailed_finding() {
     print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+run_resource_lifecycle_checks() {
+  local header_shown=0
+  local rid
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      acquire_hits=${acquire_hits:-0}
+      release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then
+          print_subheader "Resource lifecycle correlation"
+          header_shown=1
+        fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}
+        [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local title="$summary [$relpath]"
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        print_finding "$severity" "$delta" "$title" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
+    print_subheader "Resource lifecycle correlation"
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
 }
 
 show_ast_samples_from_json() {
@@ -1581,6 +1649,17 @@ if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Dynamic imports prese
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 19: RESOURCE LIFECYCLE CORRELATION
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 19; then
+print_header "19. RESOURCE LIFECYCLE CORRELATION"
+print_category "Detects: File handles, subprocesses, and async tasks missing cleanup" \
+  "Unreleased resources leak descriptors, zombie processes, and pending tasks"
+
+run_resource_lifecycle_checks
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
 # ═══════════════════════════════════════════════════════════════════════════
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
@@ -1596,10 +1675,10 @@ if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CATEGORY 19: UV-POWERED EXTRA ANALYZERS (optional)
+# CATEGORY 20: UV-POWERED EXTRA ANALYZERS (optional)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 19; then
-print_header "19. UV-POWERED EXTRA ANALYZERS"
+if should_skip 20; then
+print_header "20. UV-POWERED EXTRA ANALYZERS"
 print_category "Ruff linting, Bandit security, Pip-audit (supply chain)" \
   "Uses uvx when available; falls back to system tools if installed."
 

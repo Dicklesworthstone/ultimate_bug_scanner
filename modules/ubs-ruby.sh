@@ -84,6 +84,18 @@ SUMMARY_JSON=""
 SARIF_OUT=""
 JSON_OUT=""
 
+# Async error coverage metadata
+ASYNC_ERROR_RULE_IDS=(ruby.async.thread-no-rescue)
+declare -A ASYNC_ERROR_SUMMARY=(
+  [ruby.async.thread-no-rescue]='Thread.new block lacks rescue'
+)
+declare -A ASYNC_ERROR_REMEDIATION=(
+  [ruby.async.thread-no-rescue]='Wrap thread bodies in begin/rescue to log or propagate errors'
+)
+declare -A ASYNC_ERROR_SEVERITY=(
+  [ruby.async.thread-no-rescue]='warning'
+)
+
 print_usage() {
   cat >&2 <<USAGE
 Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
@@ -357,6 +369,85 @@ run_resource_lifecycle_checks() {
   if [[ $header_shown -eq 0 ]]; then
     print_subheader "Resource lifecycle correlation"
     print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
+}
+
+run_async_error_checks() {
+  print_subheader "Async error path coverage"
+  if [[ "$HAS_AST_GREP" -ne 1 ]]; then
+    print_finding "info" 0 "ast-grep not available" "Install ast-grep to analyze Thread error handling"
+    return
+  fi
+  local rule_file tmp_json
+  rule_file="$(mktemp 2>/dev/null || mktemp -t rb_async_rules.XXXXXX)"
+  cat >"$rule_file" <<'YAML'
+rules:
+  - id: ruby.async.thread-no-rescue
+    language: ruby
+    rule:
+      pattern: |
+        Thread.new($ARGS) do
+          $$
+        end
+      not:
+        contains:
+          kind: rescue_clause
+YAML
+  tmp_json="$(mktemp 2>/dev/null || mktemp -t rb_async_matches.XXXXXX)"
+  if ! "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json >"$tmp_json" 2>/dev/null; then
+    rm -f "$rule_file" "$tmp_json"
+    print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
+    return
+  fi
+  rm -f "$rule_file"
+  if ! [[ -s "$tmp_json" ]]; then
+    rm -f "$tmp_json"
+    print_finding "good" "Thread bodies appear to handle exceptions"
+    return
+  fi
+  local printed=0
+  while IFS=$'\t' read -r rid count samples; do
+    [[ -z "$rid" ]] && continue
+    printed=1
+    local severity=${ASYNC_ERROR_SEVERITY[$rid]:-warning}
+    local summary=${ASYNC_ERROR_SUMMARY[$rid]:-$rid}
+    local desc=${ASYNC_ERROR_REMEDIATION[$rid]:-"Handle thread exceptions"}
+    if [[ -n "$samples" ]]; then
+      desc+=" (e.g., $samples)"
+    fi
+    print_finding "$severity" "$count" "$summary" "$desc"
+  done < <(python3 - "$tmp_json" <<'PY'
+import json, sys
+from collections import OrderedDict
+path = sys.argv[1]
+stats = OrderedDict()
+with open(path, 'r', encoding='utf-8') as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid = obj.get('rule_id') or obj.get('id')
+        if not rid:
+            continue
+        rng = obj.get('range') or {}
+        start = rng.get('start') or {}
+        line_no = start.get('row', 0) + 1
+        file_path = obj.get('file', '?')
+        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
+        entry['count'] += 1
+        if len(entry['samples']) < 3:
+            entry['samples'].append(f"{file_path}:{line_no}")
+for rid, data in stats.items():
+    print(f"{rid}\t{data['count']}\t{','.join(data['samples'])}")
+PY
+  )
+  rm -f "$tmp_json"
+  if [[ $printed -eq 0 ]]; then
+    print_finding "good" "Thread bodies appear to handle exceptions"
   fi
 }
 
@@ -1528,6 +1619,8 @@ fi
 print_subheader "Ractor.new heavy usage"
 count=$("${GREP_RN[@]}" -e "Ractor\.new\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Ractor usage - verify isolation & shareable objects"; fi
+
+run_async_error_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

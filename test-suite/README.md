@@ -666,3 +666,35 @@ ubs test-suite/buggy/02-security.js test-suite/clean/02-security-clean.js
 # Async patterns: before and after
 ubs test-suite/buggy/03-async-await.js test-suite/clean/03-async-await-clean.js
 ```
+
+## Manifest-driven regression runner
+
+In addition to ad-hoc scans you can execute a curated manifest of cases that
+assert exit semantics and severity thresholds across the repo. The manifest
+(`test-suite/manifest.json`) currently focuses on the JS module (core buggy/clean
+pairs plus Node framework fixtures) and keeps placeholders for other languages.
+
+```bash
+cd test-suite
+./run_manifest.py            # run every enabled case
+./run_manifest.py --list     # inspect case ids / skip status
+./run_manifest.py --case js-node-buggy --fail-fast
+```
+
+Key behavior:
+
+- Each case specifies the path to scan, additional UBS arguments (e.g.
+  `--only=js`, `--fail-on-warning`), and expectations for `critical/warning/info`
+  counts.
+- Runs use `--format=json` for reliable parsing; derived exit status is computed
+  from the severity totals so we can still ensure “buggy” cases fail even when
+  UBS returns `0` in JSON mode.
+- Artifacts for every case (stdout, stderr, parsed summary) land under
+  `test-suite/artifacts/<case-id>/` to speed up debugging scanner regressions.
+- Disabled cases (currently the Python fixtures) are recorded with skip reasons
+  so we can track the backlog explicitly. See `test-suite/TODO.md` for the full
+  punch list.
+
+This runner is the starting point for expanding expectations to the remaining
+languages—just add a case entry to `manifest.json`, set bounds for counts, and
+flip `enabled` once the underlying module is trustworthy.

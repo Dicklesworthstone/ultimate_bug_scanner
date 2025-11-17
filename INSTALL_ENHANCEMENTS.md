@@ -203,6 +203,7 @@ Comprehensive enhancement of the UBS installation script with enterprise-grade f
 - New stale-binary warning: after installation we compare the freshly written `$install_dir/ubs` with `command -v ubs` and warn if an older binary shadows the new one on PATH.
 - Installer now keeps *all* temporary logs under `mktemp`-managed directories via `register_temp_path`, replacing hard-coded `/tmp/*.log` writes and guaranteeing cleanup on exit.
 - Ripgrep/jq installers now share the dry-run + temp-log behavior introduced for ast-grep, so binary fetches and package-manager attempts are auditable and respect non-mutating runs.
+- Added Typos integration: the installer now checks for the `typos` CLI, can install it via Homebrew/cargo/or direct binary downloads, exposes a `--skip-typos` flag + config knob, and surfaces Typos in the verification phase so spellcheck automation becomes first-class alongside ripgrep/jq/ast-grep.
 
 ---
 

@@ -719,7 +719,7 @@ Contributing patterns misses the point—**the integration IS the innovation.**
 - ❌ String handling can be verbose
 - ❌ No static typing
 
-**Bottom line:** For a tool that orchestrates existing CLI tools (ripgrep, ast-grep, jq) and needs to be universally available, Bash is pragmatic.
+**Bottom line:** For a tool that orchestrates existing CLI tools (ripgrep, ast-grep, jq, typos) and needs to be universally available, Bash is pragmatic.
 
 **Future:** Core modules might be rewritten in Rust for speed, but the meta-runner will stay Bash for compatibility.
 
@@ -958,6 +958,7 @@ The installer will:
 - ✅ Optionally install `ast-grep` (for advanced AST analysis)
 - ✅ Optionally install `ripgrep` (for 10x faster scanning)
 - ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
+- ✅ Optionally install `typos` (smart spellchecker for docs and identifiers)
 - ✅ Set up git hooks (block commits with critical bugs)
 - ✅ Set up Claude Code hooks (scan on file save)
 - ✅ Add documentation to your AGENTS.md
@@ -986,6 +987,7 @@ ubs --help
 # Optional but recommended: Install dependencies
 npm install -g @ast-grep/cli     # AST-based analysis
 brew install ripgrep             # 10x faster searching (or: apt/dnf/cargo install)
+brew install typos-cli           # Spellchecker tuned for code (or: cargo install typos-cli)
 ```
 
 ### **Option 3: Use Without Installing**

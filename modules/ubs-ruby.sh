@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# RUBY ULTIMATE BUG SCANNER v1.5 (Bash) - Industrial-Grade Code Analysis
+# RUBY ULTIMATE BUG SCANNER v2.0 (Bash) - Industrial-Grade Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for modern Ruby (3.3+) using:
 #   • ast-grep (rule packs; language: ruby)
@@ -21,6 +21,7 @@
 #   --fail-on-warning, --skip, --only, --jobs, --ag-threads, --include-ext, --exclude
 #   --ci, --no-color, --list-rules, --ag-fixable-only, --ag-preview-fix
 #   --json-out, --sarif-out, --summary-json
+#   --only-rules=GLOB, --disable-rules=GLOB, --very-verbose
 #   CI-friendly timestamps, robust find, safe pipelines, auto parallel jobs
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -29,31 +30,10 @@ umask 022
 shopt -s lastpipe
 shopt -s extglob
 
-on_err() {
-  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
-  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
-  exit "$ec"
-}
-trap on_err ERR
-
-# Honor NO_COLOR and non-tty
-USE_COLOR=1
-if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
-
-if [[ "$USE_COLOR" -eq 1 ]]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
-  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
-  BOLD=''; DIM=''; RESET=''
-fi
-
-CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; SHIELD="🛡"; GEM="💎"
-
 # ────────────────────────────────────────────────────────────────────────────
-# CLI Parsing & Configuration
+# Globals & defaults
 # ────────────────────────────────────────────────────────────────────────────
+
 VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
@@ -83,18 +63,37 @@ AG_PREVIEW_FIX=0
 SUMMARY_JSON=""
 SARIF_OUT=""
 JSON_OUT=""
+ONLY_RULES=""
+DISABLE_RULES=""
 
-# Async error coverage metadata
-ASYNC_ERROR_RULE_IDS=(ruby.async.thread-no-rescue)
-declare -A ASYNC_ERROR_SUMMARY=(
-  [ruby.async.thread-no-rescue]='Thread.new block lacks rescue'
-)
-declare -A ASYNC_ERROR_REMEDIATION=(
-  [ruby.async.thread-no-rescue]='Wrap thread bodies in begin/rescue to log or propagate errors'
-)
-declare -A ASYNC_ERROR_SEVERITY=(
-  [ruby.async.thread-no-rescue]='warning'
-)
+CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; SHIELD="🛡"; GEM="💎"
+
+# Color handling
+USE_COLOR=1
+if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
+if [[ "$USE_COLOR" -eq 1 ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+else
+  : "${RED:=}" "${GREEN:=}" "${YELLOW:=}" "${BLUE:=}" "${MAGENTA:=}" "${CYAN:=}" "${WHITE:=}" "${GRAY:=}" "${BOLD:=}" "${DIM:=}" "${RESET:=}"
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+  BOLD=''; DIM=''; RESET=''
+fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# Error handling
+# ────────────────────────────────────────────────────────────────────────────
+
+on_err() {
+  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "sarif" ]]; then
+    echo "{\"error\":{\"exit\":$ec,\"file\":\"$src\",\"line\":$line,\"cmd\":\"${cmd//\"/\\\"}\"}}" >&2; exit "$ec"
+  fi
+  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
+  exit "$ec"
+}
+trap on_err ERR
 
 print_usage() {
   cat >&2 <<USAGE
@@ -102,6 +101,7 @@ Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
 
 Options:
   -v, --verbose            More code samples per finding (DETAIL=10)
+  --very-verbose           Max code samples (DETAIL=25)
   -q, --quiet              Reduce non-essential output
   --format=FMT             Output format: text|json|sarif (default: text)
   --json-out=FILE          Save full JSON report to file (text still prints)
@@ -109,6 +109,8 @@ Options:
   --summary-json=FILE      Save brief summary counters JSON
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
+  --only-rules=GLOB        Restrict to ast-grep rules matching GLOB (e.g. rb.*)
+  --disable-rules=GLOB     Disable ast-grep rules matching GLOB
   --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
   --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
   --only=CSV               Only run these category numbers/names
@@ -125,15 +127,18 @@ Options:
   -h, --help               Show help
 Env:
   JOBS, NO_COLOR, CI, RB_TIMEOUT, UBS_METRICS_DIR
+  UBS_FIND_PRUNE_MODE=path|name   (advanced: choose prune matching mode; default: path)
 Args:
   PROJECT_DIR              Directory to scan (default: ".")
   OUTPUT_FILE              File to save the report (optional)
 USAGE
 }
 
+# CLI parsing
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
+    --very-verbose) VERBOSE=2; DETAIL_LIMIT=25; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
     --format=*)   FORMAT="${1#*=}"; shift;;
     --json-out=*) JSON_OUT="${1#*=}"; shift;;
@@ -141,6 +146,8 @@ while [[ $# -gt 0 ]]; do
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
+    --only-rules=*) ONLY_RULES="${1#*=}"; shift;;
+    --disable-rules=*) DISABLE_RULES="${1#*=}"; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
     --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
@@ -171,7 +178,7 @@ done
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
 
-# Redirect output early to capture everything
+# Redirect output early to capture everything (honors machine formats too)
 if [[ -n "${OUTPUT_FILE}" ]]; then
   if command -v tee >/dev/null 2>&1; then
     exec > >(tee "${OUTPUT_FILE}") 2>&1
@@ -182,6 +189,13 @@ fi
 
 DATE_FMT='%Y-%m-%d %H:%M:%S'
 if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
+is_machine_format(){ [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; }
+
+# If machine format: silence all user-facing text immediately.
+if is_machine_format; then
+  QUIET=1
+  USE_COLOR=0
+fi
 
 # ────────────────────────────────────────────────────────────────────────────
 # Global Counters
@@ -230,100 +244,29 @@ declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
 )
 
 # ────────────────────────────────────────────────────────────────────────────
-# Search engine configuration (rg if available, else grep) + include/exclude
+# Utilities
 # ────────────────────────────────────────────────────────────────────────────
-LC_ALL=C
-IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
-INCLUDE_GLOBS=()
-for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
-
-EXCLUDE_DIRS=(.git .hg .svn .bzr .bundle vendor/bundle vendor/cache log tmp .yardoc coverage .tox .nox .cache .idea .vscode .history node_modules dist build pkg doc public/assets storage .sass-cache .rubocop-cache .reek .bundle-audit .solargraph .gem spec/fixtures test/fixtures)
-if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
-EXCLUDE_FLAGS=()
-for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
-
-if command -v rg >/dev/null 2>&1; then
-  HAS_RIPGREP=1
-  if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
-  RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
-  RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden --pcre2 "${RG_JOBS[@]}")
-  RG_EXCLUDES=()
-  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
-  RG_INCLUDES=()
-  for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
-  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  RG_JOBS=()
-else
-  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
-  GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
-  GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
-  GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
-fi
-
-# Helper: robust numeric end-of-pipeline counter
-count_lines() { awk 'END{print (NR+0)}'; }
-
-# ────────────────────────────────────────────────────────────────────────────
-# Helper Functions
-# ────────────────────────────────────────────────────────────────────────────
-maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]]; then clear || true; fi; }
+maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 && ! is_machine_format ]]; then clear || true; fi; }
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
-
-print_header() {
-  say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-  say "${WHITE}${BOLD}$1${RESET}"
-  say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-}
-
-print_category() {
-  say "\n${MAGENTA}${BOLD}▓▓▓ $1${RESET}"
-  say "${DIM}$2${RESET}"
-}
-
+print_header() { say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; say "${WHITE}${BOLD}$1${RESET}"; say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; }
+print_category() { say "\n${MAGENTA}${BOLD}▓▓▓ $1${RESET}"; say "${DIM}$2${RESET}"; }
 print_subheader() { say "\n${YELLOW}${BOLD}$BULLET $1${RESET}"; }
-
 print_finding() {
   local severity=$1
   case $severity in
-    good)
-      local title=$2
-      say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}"
-      ;;
+    good) local title=$2; say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}" ;;
     *)
       local raw_count=$2; local title=$3; local description="${4:-}"
       local count; count=$(printf '%s\n' "$raw_count" | awk 'END{print $0+0}')
       case $severity in
-        critical)
-          CRITICAL_COUNT=$((CRITICAL_COUNT + count))
-          say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"
-          say "    ${RED}${BOLD}$title${RESET}"
-          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
-          ;;
-        warning)
-          WARNING_COUNT=$((WARNING_COUNT + count))
-          say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"
-          say "    ${YELLOW}$title${RESET}"
-          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
-          ;;
-        info)
-          INFO_COUNT=$((INFO_COUNT + count))
-          say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"
-          say "    ${BLUE}$title${RESET}"
-          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
-          ;;
+        critical) CRITICAL_COUNT=$((CRITICAL_COUNT + count)); say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"; say "    ${RED}${BOLD}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
+        warning)  WARNING_COUNT=$((WARNING_COUNT + count)); say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"; say "    ${YELLOW}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
+        info)     INFO_COUNT=$((INFO_COUNT + count));      say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"; say "    ${BLUE}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
       esac
       ;;
   esac
 }
-
-print_code_sample() {
-  local file=$1; local line=$2; local code=$3
-  say "${GRAY}      $file:$line${RESET}"
-  say "${WHITE}      $code${RESET}"
-}
-
+print_code_sample() { local file=$1; local line=$2; local code=$3; say "${GRAY}      $file:$line${RESET}"; say "${WHITE}      $code${RESET}"; }
 show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS=: read -r file line code; do
@@ -331,134 +274,7 @@ show_detailed_finding() {
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
 }
-
-run_resource_lifecycle_checks() {
-  local header_shown=0
-  local rid
-  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
-    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
-    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
-    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
-    local file_list
-    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
-    [[ -n "$file_list" ]] || continue
-    while IFS= read -r file; do
-      [[ -z "$file" ]] && continue
-      local acquire_hits release_hits
-      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
-      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
-      acquire_hits=${acquire_hits:-0}
-      release_hits=${release_hits:-0}
-      if (( acquire_hits > release_hits )); then
-        if [[ $header_shown -eq 0 ]]; then
-          print_subheader "Resource lifecycle correlation"
-          header_shown=1
-        fi
-        local delta=$((acquire_hits - release_hits))
-        local relpath=${file#"$PROJECT_DIR"/}
-        [[ "$relpath" == "$file" ]] && relpath="$file"
-        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
-        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
-        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
-        local title="$summary [$relpath]"
-        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
-        print_finding "$severity" "$delta" "$title" "$desc"
-      fi
-    done <<<"$file_list"
-  done
-  if [[ $header_shown -eq 0 ]]; then
-    print_subheader "Resource lifecycle correlation"
-    print_finding "good" "All tracked resource acquisitions have matching cleanups"
-  fi
-}
-
-run_async_error_checks() {
-  print_subheader "Async error path coverage"
-  if [[ "$HAS_AST_GREP" -ne 1 ]]; then
-    print_finding "info" 0 "ast-grep not available" "Install ast-grep to analyze Thread error handling"
-    return
-  fi
-  local rule_dir tmp_json
-  rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t rb_async_rules.XXXXXX)"
-  if [[ ! -d "$rule_dir" ]]; then
-    print_finding "info" 0 "temp dir creation failed" "Unable to stage ast-grep rules"
-    return
-  fi
-  cat >"$rule_dir/ruby.async.thread-no-rescue.yml" <<'YAML'
-id: ruby.async.thread-no-rescue
-language: ruby
-rule:
-  pattern: |
-    Thread.new($ARGS) do
-      $$
-    end
-  not:
-    contains:
-      kind: rescue_clause
-YAML
-  tmp_json="$(mktemp 2>/dev/null || mktemp -t rb_async_matches.XXXXXX)"
-  : >"$tmp_json"
-  local rule_file
-  for rule_file in "$rule_dir"/*.yml; do
-    if ! "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null; then
-      rm -rf "$rule_dir"
-      rm -f "$tmp_json"
-      print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
-      return
-    fi
-  done
-  rm -rf "$rule_dir"
-  if ! [[ -s "$tmp_json" ]]; then
-    rm -f "$tmp_json"
-    print_finding "good" "Thread bodies appear to handle exceptions"
-    return
-  fi
-  local printed=0
-  while IFS=$'\t' read -r rid count samples; do
-    [[ -z "$rid" ]] && continue
-    printed=1
-    local severity=${ASYNC_ERROR_SEVERITY[$rid]:-warning}
-    local summary=${ASYNC_ERROR_SUMMARY[$rid]:-$rid}
-    local desc=${ASYNC_ERROR_REMEDIATION[$rid]:-"Handle thread exceptions"}
-    if [[ -n "$samples" ]]; then
-      desc+=" (e.g., $samples)"
-    fi
-    print_finding "$severity" "$count" "$summary" "$desc"
-  done < <(python3 - "$tmp_json" <<'PY'
-import json, sys
-from collections import OrderedDict
-path = sys.argv[1]
-stats = OrderedDict()
-with open(path, 'r', encoding='utf-8') as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rid = obj.get('rule_id') or obj.get('id') or obj.get('ruleId')
-        if not rid:
-            continue
-        rng = obj.get('range') or {}
-        start = rng.get('start') or {}
-        line_no = start.get('row', 0) + 1
-        file_path = obj.get('file', '?')
-        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
-        entry['count'] += 1
-        if len(entry['samples']) < 3:
-            entry['samples'].append(f"{file_path}:{line_no}")
-for rid, data in stats.items():
-    print(f"{rid}\t{data['count']}\t{','.join(data['samples'])}")
-PY
-  )
-  rm -f "$tmp_json"
-  if [[ $printed -eq 0 ]]; then
-    print_finding "good" "Thread bodies appear to handle exceptions"
-  fi
-}
-
+# JSON sample helper (used when jq present)
 show_ast_samples_from_json() {
   local blob=$1
   [[ -n "$blob" ]] || return 0
@@ -484,30 +300,65 @@ persist_metric_json() {
   } >"$UBS_METRICS_DIR/$key.json"
 }
 
-begin_scan_section(){
-  if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi
-  set +e
-  trap - ERR
-}
-end_scan_section(){
-  trap on_err ERR
-  set -e
-  if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi
-}
+begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; set +e; trap - ERR; }
+end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
+
+mktemp_dir() { mktemp -d 2>/dev/null || mktemp -d -t ubs-ruby.XXXXXX; }
+mktemp_file(){ mktemp 2>/dev/null    || mktemp    -t ubs-ruby.XXXXXX; }
 
 with_timeout() {
-  # with_timeout <seconds> <command...>
   local seconds="$1"; shift || true
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$seconds" "$@"
-  else
-    "$@"
-  fi
+  if command -v timeout >/dev/null 2>&1; then timeout "$seconds" "$@"; else "$@"; fi
 }
 
-# ────────────────────────────────────────────────────────────────────────────
-# ast-grep: detection, rule packs, and wrappers
-# ────────────────────────────────────────────────────────────────────────────
+# Path helpers & robust file discovery
+abspath() { perl -MCwd=abs_path -e 'print abs_path(shift)' -- "$1" 2>/dev/null || python3 - "$1" <<'PY'
+import os,sys; print(os.path.abspath(sys.argv[1]))
+PY
+}
+count_lines() { awk 'END{print (NR>0?NR:0)}'; }
+
+LC_ALL=C
+IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
+INCLUDE_GLOBS=(); for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
+EXCLUDE_DIRS=(.git .hg .svn .bzr .bundle vendor/bundle vendor/cache log tmp .yardoc coverage .tox .nox .cache .idea .vscode .history node_modules dist build pkg doc public/assets storage .sass-cache .rubocop-cache .reek .bundle-audit .solargraph .gem spec/fixtures test/fixtures .next .turbo .webpacker public/packs)
+if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
+EXCLUDE_FLAGS=(); for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+
+build_find_cmd() {
+  local mode="${UBS_FIND_PRUNE_MODE:-path}" ; local -a prune=( )
+  if [[ "$mode" == "path" ]]; then
+    for d in "${EXCLUDE_DIRS[@]}"; do prune+=( -path "$PROJECT_DIR/$d" -o ); done
+  else
+    for d in "${EXCLUDE_DIRS[@]}"; do prune+=( -name "$d" -o ); done
+  fi
+  [[ ${#prune[@]} -gt 0 ]] && unset 'prune[${#prune[@]}-1]'
+  local -a names=( ); local first=1
+  for e in "${_EXT_ARR[@]}"; do if [[ $first -eq 1 ]]; then names+=( -name "*.$e" ); first=0; else names+=( -o -name "*.$e" ); fi; done
+  FIND_CMD=(find "$PROJECT_DIR" \( -type d \( "${prune[@]}" \) -prune \) -o \( -type f \( "${names[@]}" \) -print0 \))
+}
+build_find_cmd
+safe_count_files(){ tr -cd '\0' | awk 'END{print (length>0?gsub(/\0/,"")+0:0)}'; }
+
+if command -v rg >/dev/null 2>&1; then
+  HAS_RIPGREP=1
+  if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
+  RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
+  RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden --pcre2 "${RG_JOBS[@]}")
+  RG_EXCLUDES=(); for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
+  RG_INCLUDES=(); for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
+  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  RG_JOBS=()
+else
+  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
+  GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
+  GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
+  GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
+fi
+
+# ast-grep helpers
 check_ast_grep() {
   if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
   if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
@@ -516,7 +367,6 @@ check_ast_grep() {
   say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
   HAS_AST_GREP=0; return 1
 }
-
 ast_search() {
   local pattern=$1
   if [[ "$HAS_AST_GREP" -eq 1 ]]; then
@@ -525,36 +375,25 @@ ast_search() {
     return 1
   fi
 }
-
 analyze_rb_chain_guards() {
   local limit=${1:-$DETAIL_LIMIT}
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 1
   command -v python3 >/dev/null 2>&1 || return 1
   local tmp_chains result
-  tmp_chains="$(mktemp -t ubs-rb-chains.XXXXXX 2>/dev/null || mktemp -t ubs-rb-chains)"
-
-  # Long call chains (4+ hops). Sample-friendly stream output
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang ruby \
-      --pattern '$A.$B.$C.$D' \
-      --json=stream "$PROJECT_DIR" 2>/dev/null || true ) >"$tmp_chains"
-
+  tmp_chains="$(mktemp_file)"
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang ruby --pattern '$A.$B.$C.$D' --json=stream "$PROJECT_DIR" 2>/dev/null || true ) >"$tmp_chains"
   result=$(python3 - "$tmp_chains" "$limit" <<'PYHELP'
 import json, sys, re
 def load_stream(path):
     data = []
     try:
         for line in open(path, 'r', encoding='utf-8'):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data.append(json.loads(line))
-            except Exception:
-                pass
-    except FileNotFoundError:
-        pass
+            line=line.strip()
+            if not line: continue
+            try: data.append(json.loads(line))
+            except Exception: pass
+    except FileNotFoundError: pass
     return data
-
 matches_path, limit_raw = sys.argv[1:3]
 limit = int(limit_raw)
 matches = load_stream(matches_path)
@@ -564,8 +403,8 @@ for m in matches:
     file_path = m.get('file')
     code = (m.get('lines') or '').strip()
     rng = m.get('range') or {}
-    line = (rng.get('start') or {}).get('line', 0) + 1
-    # basic suppression: safe navigation or explicit nil guard in same line
+    start = rng.get('start') or {}
+    line = start.get('row', 0) + 1
     suppressed = bool(safe_nav.search(code)) or bool(re.search(r'\bif\b.+\bnil\?', code))
     if suppressed:
         guarded += 1
@@ -576,37 +415,35 @@ for m in matches:
 print(json.dumps({'unguarded': unguarded, 'guarded': guarded, 'samples': samples}))
 PYHELP
   )
-
   rm -f "$tmp_chains"
   printf '%s' "$result"
 }
-
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
-  AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t rb_ag_rules.XXXXXX)"
+  AST_RULE_DIR="$(mktemp_dir)"
   trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
   fi
-
   # ── Core Ruby rules (expanded) ───────────────────────────────────────────
-  cat >"$AST_RULE_DIR/nil-eq.yml" <<'YAML'
-id: rb.nil-eq
+  cat >"$AST_RULE_DIR/nil-eq-eq.yml" <<'YAML'
+id: rb.nil-eq.eq
 language: ruby
 rule:
-  any:
-    - pattern: $X == nil
-    - pattern: $X != nil
+  pattern: $X == nil
 severity: warning
-message: "Prefer x.nil? / !x.nil? instead of == nil / != nil"
-fix: |
-  if ($MATCH =~ /==\s*nil/)
-    {{X}}.nil?
-  else
-    !{{X}}.nil?
-  end
+message: "Prefer x.nil? instead of == nil"
+fix: "{{X}}.nil?"
 YAML
-
+  cat >"$AST_RULE_DIR/nil-eq-neq.yml" <<'YAML'
+id: rb.nil-eq.neq
+language: ruby
+rule:
+  pattern: $X != nil
+severity: warning
+message: "Prefer !x.nil? instead of != nil"
+fix: "!{{X}}.nil?"
+YAML
   cat >"$AST_RULE_DIR/is-literal.yml" <<'YAML'
 id: rb.equal-literal
 language: ruby
@@ -618,7 +455,6 @@ rule:
 severity: info
 message: "Avoid identity checks with literals; use == (and nil? for nil)"
 YAML
-
   cat >"$AST_RULE_DIR/bare-rescue.yml" <<'YAML'
 id: rb.bare-rescue
 language: ruby
@@ -632,7 +468,6 @@ rule:
 severity: warning
 message: "Bare rescue catches StandardError broadly; rescue specific errors"
 YAML
-
   cat >"$AST_RULE_DIR/rescue-exception.yml" <<'YAML'
 id: rb.rescue-exception
 language: ruby
@@ -646,7 +481,6 @@ rule:
 severity: critical
 message: "Rescuing Exception also catches system exits/interrupts; avoid"
 YAML
-
   cat >"$AST_RULE_DIR/raise-e.yml" <<'YAML'
 id: rb.raise-e
 language: ruby
@@ -660,7 +494,6 @@ rule:
 severity: warning
 message: "Use 'raise' (without arg) to preserve original backtrace"
 YAML
-
   cat >"$AST_RULE_DIR/mutable-const.yml" <<'YAML'
 id: rb.mutable-const
 language: ruby
@@ -674,7 +507,6 @@ constraints:
 severity: info
 message: "Mutable constants may be modified; consider freezing or dup on read"
 YAML
-
   cat >"$AST_RULE_DIR/eval-exec.yml" <<'YAML'
 id: rb.eval-exec
 language: ruby
@@ -686,7 +518,6 @@ rule:
 severity: critical
 message: "eval*/_*eval with strings can lead to code injection"
 YAML
-
   cat >"$AST_RULE_DIR/marshal-load.yml" <<'YAML'
 id: rb.marshal-load
 language: ruby
@@ -697,7 +528,6 @@ rule:
 severity: critical
 message: "Unmarshalling untrusted data is insecure; prefer JSON or safer formats"
 YAML
-
   cat >"$AST_RULE_DIR/yaml-unsafe.yml" <<'YAML'
 id: rb.yaml-unsafe
 language: ruby
@@ -706,7 +536,6 @@ rule:
 severity: warning
 message: "YAML.load may instantiate objects; prefer YAML.safe_load with permitted_classes"
 YAML
-
   cat >"$AST_RULE_DIR/digest-weak.yml" <<'YAML'
 id: rb.digest-weak
 language: ruby
@@ -719,7 +548,6 @@ rule:
 severity: warning
 message: "Weak hash algorithm (MD5/SHA1); prefer SHA256/512"
 YAML
-
   cat >"$AST_RULE_DIR/random-insecure.yml" <<'YAML'
 id: rb.random-insecure
 language: ruby
@@ -730,7 +558,6 @@ rule:
 severity: info
 message: "rand/Random are not cryptographic; use SecureRandom for secrets/tokens"
 YAML
-
   cat >"$AST_RULE_DIR/http-verify-none.yml" <<'YAML'
 id: rb.http-verify-none
 language: ruby
@@ -741,7 +568,6 @@ rule:
 severity: warning
 message: "SSL verification disabled; enable peer verification"
 YAML
-
   cat >"$AST_RULE_DIR/send-dynamic.yml" <<'YAML'
 id: rb.send-dynamic
 language: ruby
@@ -752,7 +578,6 @@ rule:
 severity: info
 message: "Dynamic dispatch via send; ensure $NAME is validated"
 YAML
-
   cat >"$AST_RULE_DIR/sql-interp.yml" <<'YAML'
 id: rb.sql-interp
 language: ruby
@@ -766,7 +591,6 @@ rule:
 severity: warning
 message: "Interpolated SQL; prefer parameterized queries (e.g., where(name: ?))"
 YAML
-
   cat >"$AST_RULE_DIR/system-single-string.yml" <<'YAML'
 id: rb.system-single-string
 language: ruby
@@ -780,7 +604,6 @@ constraints:
 severity: critical
 message: "Shell invocation via single string; use argv array to avoid injection."
 YAML
-
   cat >"$AST_RULE_DIR/open-pipe.yml" <<'YAML'
 id: rb.open-pipe
 language: ruby
@@ -792,7 +615,6 @@ constraints:
 severity: warning
 message: "Kernel#open with leading '|' spawns a subshell; avoid or validate inputs."
 YAML
-
   cat >"$AST_RULE_DIR/json-parse.yml" <<'YAML'
 id: rb.json-parse
 language: ruby
@@ -801,43 +623,42 @@ rule:
 severity: info
 message: "Ensure JSON.parse is wrapped with rescue JSON::ParserError."
 YAML
-
   cat >"$AST_RULE_DIR/file-open-no-block.yml" <<'YAML'
 id: rb.file-open-no-block
 language: ruby
 rule:
-  all:
-    - pattern: File.open($ARGS)
-    - not:
-        has:
-          regex: '\bdo\s*\||\{.*\|'
+  pattern: File.open($$)
+  not:
+    inside:
+      kind: block
 severity: warning
 message: "File.open without a block; may leak descriptors; use a block to auto-close."
 YAML
-
-  cat >"$AST_RULE_DIR/tmp-no-block.yml" <<'YAML'
-id: rb.tmp-no-block
+  cat >"$AST_RULE_DIR/tempfile-no-block.yml" <<'YAML'
+id: rb.tempfile-no-block
 language: ruby
 rule:
   any:
-    - pattern: Dir.mktmpdir($$)
     - pattern: Tempfile.new($$)
+    - pattern: Dir.mktmpdir($$)
+  not:
+    inside:
+      kind: block
 severity: info
-message: "Tempfile/tmpdir without block can leak; use block form to ensure cleanup."
+message: "Tempfile/mktmpdir without block; ensure cleanup or use block form."
 YAML
-
   cat >"$AST_RULE_DIR/ruby-resource-thread.yml" <<'YAML'
 id: ruby.resource.thread-no-join
 language: ruby
 rule:
-  pattern: $VAR = Thread.new($ARGS)
-  not:
-    inside:
-      pattern: $VAR.join
+  all:
+    - pattern: $VAR = Thread.new($ARGS)
+    - not:
+        has:
+          pattern: $VAR.join
 severity: warning
 message: "Thread handle created without join() in the same scope."
 YAML
-
   cat >"$AST_RULE_DIR/rails-constantize.yml" <<'YAML'
 id: rails.constantize
 language: ruby
@@ -847,7 +668,6 @@ rule:
 severity: info
 message: "constantize may raise NameError; prefer safe_constantize when input is user-controlled."
 YAML
-
   cat >"$AST_RULE_DIR/rails-update-attributes.yml" <<'YAML'
 id: rails.update-attributes
 language: ruby
@@ -857,7 +677,6 @@ rule:
 severity: info
 message: "update_attributes is deprecated; prefer update with strong params."
 YAML
-
   cat >"$AST_RULE_DIR/rails-permit-bang.yml" <<'YAML'
 id: rails.permit-bang
 language: ruby
@@ -866,7 +685,6 @@ rule:
 severity: warning
 message: "Strong params permit! found; review carefully."
 YAML
-
   cat >"$AST_RULE_DIR/rails-csrf-skip.yml" <<'YAML'
 id: rails.csrf-skip
 language: ruby
@@ -876,7 +694,6 @@ rule:
 severity: warning
 message: "CSRF protections skipped in controllers."
 YAML
-
   cat >"$AST_RULE_DIR/float-eq.yml" <<'YAML'
 id: rb.float-eq
 language: ruby
@@ -888,7 +705,6 @@ constraints:
 severity: warning
 message: "Exact float equality; use tolerance (|(a-b).abs < EPS)."
 YAML
-
   cat >"$AST_RULE_DIR/and-or.yml" <<'YAML'
 id: rb.and-or
 language: ruby
@@ -899,7 +715,6 @@ rule:
 severity: info
 message: "'and'/'or' have lower precedence than &&/||; prefer &&/|| in expressions."
 YAML
-
   cat >"$AST_RULE_DIR/retry.yml" <<'YAML'
 id: rb.retry
 language: ruby
@@ -908,28 +723,38 @@ rule:
 severity: info
 message: "Ensure bounded retries with backoff."
 YAML
-
   # ── Done writing rules ────────────────────────────────────────────────────
 }
-
+filter_rules_by_glob(){
+  [[ -z "${ONLY_RULES:-}" && -z "${DISABLE_RULES:-}" ]] && return 0
+  shopt -s nullglob
+  local f
+  if [[ -n "${ONLY_RULES:-}" ]]; then
+    for f in "$AST_RULE_DIR"/*.yml; do
+      local base="${f##*/}"
+      [[ "$base" == $ONLY_RULES ]] || rm -f -- "$f"
+    done
+  fi
+  if [[ -n "${DISABLE_RULES:-}" ]]; then
+    for f in "$AST_RULE_DIR"/*.yml; do
+      local base="${f##*/}"
+      [[ "$base" == $DISABLE_RULES ]] && rm -f -- "$f"
+    done
+  fi
+}
 run_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
   local outfmt="--json"; [[ "$FORMAT" == "sarif" ]] && outfmt="--sarif"
   local threads=()
-  if [[ "$AG_THREADS" -gt 0 ]]; then
-    threads=(--threads "$AG_THREADS")
-  else
+  if [[ "$AG_THREADS" -gt 0 ]]; then threads=(--threads "$AG_THREADS"); else
     local n="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"
     [[ "$n" -gt 0 ]] && threads=(--threads "$n")
   fi
-  local extra=()
-  [[ "$AG_FIXABLE_ONLY" -eq 1 ]] && extra+=(--only-fixable)
-
+  local extra=(); [[ "$AG_FIXABLE_ONLY" -eq 1 ]] && extra+=(--only-fixable)
   if [[ "$AG_PREVIEW_FIX" -eq 1 ]]; then
     "${AST_GREP_CMD[@]}" fix -r "$AST_RULE_DIR" "$PROJECT_DIR" --dry-run --diff "${threads[@]}" 2>/dev/null || true
     return 0
   fi
-
   if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt "${threads[@]}" "${extra[@]}" 2>/dev/null; then
     return 0
   else
@@ -937,29 +762,20 @@ run_ast_rules() {
   fi
 }
 
-# ────────────────────────────────────────────────────────────────────────────
 # Bundler/toolchain helpers
-# ────────────────────────────────────────────────────────────────────────────
 check_bundler() {
   if command -v bundle >/dev/null 2>&1 && [[ -f "$PROJECT_DIR/Gemfile" ]]; then
     HAS_BUNDLE=1; BUNDLE_EXEC=(bundle exec); return 0
   fi
   HAS_BUNDLE=0; BUNDLE_EXEC=(); return 1
 }
-
 run_rb_tool_text() {
-  # run_rb_tool_text <tool> [args...]
   local tool="$1"; shift || true
   if [[ "$ENABLE_BUNDLER_TOOLS" -eq 1 && "$HAS_BUNDLE" -eq 1 ]]; then
-    if [[ "$tool" == "bundle" ]]; then
-      with_timeout "$RB_TIMEOUT" bundle "$@" || true
-    else
-      with_timeout "$RB_TIMEOUT" "${BUNDLE_EXEC[@]}" "$tool" "$@" || true
-    fi
+    if [[ "$tool" == "bundle" ]]; then with_timeout "$RB_TIMEOUT" bundle "$@" || true
+    else with_timeout "$RB_TIMEOUT" "${BUNDLE_EXEC[@]}" "$tool" "$@" || true; fi
   else
-    if command -v "$tool" >/dev/null 2>&1; then
-      with_timeout "$RB_TIMEOUT" "$tool" "$@" || true
-    fi
+    if command -v "$tool" >/dev/null 2>&1; then with_timeout "$RB_TIMEOUT" "$tool" "$@" || true; fi
   fi
 }
 run_bundle_audit() {
@@ -974,10 +790,8 @@ run_bundle_audit() {
   fi
 }
 
-# ────────────────────────────────────────────────────────────────────────────
-# Category skipping helper
-# ────────────────────────────────────────────────────────────────────────────
-should_skip() {
+# Category gating (run if returns 0)
+run_category() {
   local cat="$1"
   if [[ -n "$ONLY_CATEGORIES" ]]; then
     IFS=',' read -r -a arr <<<"$ONLY_CATEGORIES"
@@ -995,6 +809,7 @@ should_skip() {
 # ────────────────────────────────────────────────────────────────────────────
 maybe_clear
 
+if ! is_machine_format; then
 echo -e "${BOLD}${CYAN}"
 cat <<'BANNER'
 ╔══════════════════════════════════════════════════════════════════╗
@@ -1033,25 +848,14 @@ cat <<'BANNER'
 ╚══════════════════════════════════════════════════════════════════╝
 BANNER
 echo -e "${RESET}"
+fi
 
+PROJECT_DIR="$(abspath "$PROJECT_DIR")"
 say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
 say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
 
 # Count files with robust find
-EX_PRUNE=()
-for d in "${EXCLUDE_DIRS[@]}"; do EX_PRUNE+=( -name "$d" -o ); done
-EX_PRUNE=( \( -type d \( "${EX_PRUNE[@]}" -false \) -prune \) )
-NAME_EXPR=( \( )
-first=1
-for e in "${_EXT_ARR[@]}"; do
-  if [[ $first -eq 1 ]]; then NAME_EXPR+=( -name "*.${e}" ); first=0
-  else NAME_EXPR+=( -o -name "*.${e}" ); fi
-done
-NAME_EXPR+=( \) )
-TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print0 \) 2>/dev/null || true ) \
-  | tr -cd '\0' | wc -c | awk '{print $1+0}'
-)
+TOTAL_FILES=$(( ( set +o pipefail; "${FIND_CMD[@]}" 2>/dev/null || true ) | safe_count_files ))
 say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
 
 # ast-grep availability
@@ -1059,6 +863,7 @@ echo ""
 if check_ast_grep; then
   say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
   write_ast_rules || true
+  filter_rules_by_glob || true
   if [[ "$LIST_RULES" -eq 1 ]]; then
     (grep -RHAn --include '*.yml' '^id:' "$AST_RULE_DIR" || true) | sed 's/.*id:\s*//' | sort -u
     exit 0
@@ -1080,7 +885,7 @@ begin_scan_section
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: NIL / DEFENSIVE PROGRAMMING
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 1; then
+if run_category 1; then
 print_header "1. NIL / DEFENSIVE PROGRAMMING"
 print_category "Detects: nil equality, deep method chains without guards, dig? usage" \
   "Prefer x.nil?, safe navigation (&.), and Hash#dig to avoid NoMethodError."
@@ -1155,7 +960,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 2: NUMERIC / ARITHMETIC PITFALLS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 2; then
+if run_category 2; then
 print_header "2. NUMERIC / ARITHMETIC PITFALLS"
 print_category "Detects: division by variable, float equality, modulo hazards" \
   "Guard divisors and avoid exact float equality."
@@ -1188,7 +993,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 3: COLLECTION SAFETY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 3; then
+if run_category 3; then
 print_header "3. COLLECTION SAFETY"
 print_category "Detects: index risks, mutation during iteration, length checks" \
   "Collection misuse leads to IndexError or subtle logic bugs."
@@ -1221,7 +1026,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 4: COMPARISON & IDIOMS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 4; then
+if run_category 4; then
 print_header "4. COMPARISON & IDIOMS"
 print_category "Detects: 'and/or' precedence, object identity, case equality misuse" \
   "Prefer &&/|| for precedence; avoid === misuse outside case."
@@ -1243,7 +1048,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 5: EXCEPTIONS & ERROR HANDLING
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 5; then
+if run_category 5; then
 print_header "5. EXCEPTIONS & ERROR HANDLING"
 print_category "Detects: bare rescue, rescue Exception, swallowed errors, raise e" \
   "Proper exception handling preserves backtraces and avoids masking bugs."
@@ -1283,7 +1088,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 6: SECURITY VULNERABILITIES
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 6; then
+if run_category 6; then
 print_header "6. SECURITY VULNERABILITIES"
 print_category "Detects: code injection, unsafe deserialization, TLS off, weak crypto" \
   "Security bugs expose users to attacks and data breaches."
@@ -1354,7 +1159,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 7: SHELL/SUBPROCESS SAFETY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 7; then
+if run_category 7; then
 print_header "7. SHELL / SUBPROCESS SAFETY"
 print_category "Detects: system single-string, backticks, Kernel#open pipelines" \
   "Prefer argv array to avoid shell injection."
@@ -1375,7 +1180,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 8: I/O & RESOURCE LIFECYCLE CORRELATION
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 8; then
+if run_category 8; then
 print_header "8. I/O & RESOURCE LIFECYCLE CORRELATION"
 print_category "Detects: File.open without block, Dir.chdir global effects, Tempfile misuse" \
   "Use blocks to auto-close and avoid global state surprises."
@@ -1398,13 +1203,47 @@ count=$("${GREP_RN[@]}" -e "Tempfile\.new\(|Dir\.mktmpdir\(" "$PROJECT_DIR" 2>/d
   (grep -E -v "do[[:space:]]*\||\{[[:space:]]*\|[^\|]*\|" || true) | count_lines)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Tempfile/tmpdir without block may leak"; fi
 
+run_resource_lifecycle_checks() {
+  local header_shown=0
+  local rid
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      acquire_hits=${acquire_hits:-0}; release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then print_subheader "Resource lifecycle correlation"; header_shown=1; fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}; [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local title="$summary [$relpath]"
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        print_finding "$severity" "$delta" "$title" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
+    print_subheader "Resource lifecycle correlation"
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  fi
+}
 run_resource_lifecycle_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 9: PARSING & TYPE CONVERSION
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 9; then
+if run_category 9; then
 print_header "9. PARSING & TYPE CONVERSION BUGS"
 print_category "Detects: JSON.load/parse without rescue, Integer(x) vs to_i, time parsing" \
   "Prefer strict conversions with exceptions where appropriate."
@@ -1432,7 +1271,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 10: CONTROL FLOW GOTCHAS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 10; then
+if run_category 10; then
 print_header "10. CONTROL FLOW GOTCHAS"
 print_category "Detects: return in ensure, retry, nested ternary, next/break in ensure" \
   "Flow pitfalls cause lost exceptions or confusing semantics."
@@ -1462,7 +1301,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 11: DEBUGGING & PRODUCTION CODE
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 11; then
+if run_category 11; then
 print_header "11. DEBUGGING & PRODUCTION CODE"
 print_category "Detects: puts/p, pry/binding.irb, sensitive logs" \
   "Debug artifacts degrade performance or leak secrets."
@@ -1497,7 +1336,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 12: PERFORMANCE & MEMORY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 12; then
+if run_category 12; then
 print_header "12. PERFORMANCE & MEMORY"
 print_category "Detects: string concat in loops, regex compile in loops, gsub in loops" \
   "Micro-optimizations can matter in hot paths."
@@ -1529,7 +1368,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 13: VARIABLE & SCOPE
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 13; then
+if run_category 13; then
 print_header "13. VARIABLE & SCOPE"
 print_category "Detects: global variables, class variables, monkey patching core" \
   "Scope issues cause hard-to-debug conflicts and side effects."
@@ -1556,7 +1395,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 14: CODE QUALITY MARKERS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 14; then
+if run_category 14; then
 print_header "14. CODE QUALITY MARKERS"
 print_category "Detects: TODO, FIXME, HACK, XXX, NOTE" \
   "Technical debt markers indicate incomplete or problematic code."
@@ -1590,7 +1429,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 15: REGEX & STRING SAFETY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 15; then
+if run_category 15; then
 print_header "15. REGEX & STRING SAFETY"
 print_category "Detects: ReDoS, dynamic regex with input, escaping issues" \
   "Regex bugs cause performance issues and security vulnerabilities."
@@ -1612,7 +1451,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 16: CONCURRENCY & PARALLELISM
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 16; then
+if run_category 16; then
 print_header "16. CONCURRENCY & PARALLELISM"
 print_category "Detects: Thread.new without join, Ractor misuse patterns" \
   "Concurrency bugs lead to leaks and nondeterminism."
@@ -1628,24 +1467,99 @@ print_subheader "Ractor.new heavy usage"
 count=$("${GREP_RN[@]}" -e "Ractor\.new\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Ractor usage - verify isolation & shareable objects"; fi
 
+run_async_error_checks() {
+  print_subheader "Async error path coverage"
+  if [[ "$HAS_AST_GREP" -ne 1 ]]; then
+    print_finding "info" 0 "ast-grep not available" "Install ast-grep to analyze Thread error handling"
+    return
+  fi
+  local rule_dir tmp_json
+  rule_dir="$(mktemp_dir)"
+  if [[ ! -d "$rule_dir" ]]; then
+    print_finding "info" 0 "temp dir creation failed" "Unable to stage ast-grep rules"
+    return
+  fi
+  cat >"$rule_dir/ruby.async.thread-no-rescue.yml" <<'YAML'
+id: ruby.async.thread-no-rescue
+language: ruby
+rule:
+  pattern: |
+    Thread.new($ARGS) do
+      $$
+    end
+  not:
+    contains:
+      kind: rescue_clause
+YAML
+  tmp_json="$(mktemp_file)"; : >"$tmp_json"
+  local rule_file
+  for rule_file in "$rule_dir"/*.yml; do
+    if ! "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null; then
+      rm -rf "$rule_dir"; rm -f "$tmp_json"
+      print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
+      return
+    fi
+  done
+  rm -rf "$rule_dir"
+  if ! [[ -s "$tmp_json" ]]; then
+    rm -f "$tmp_json"
+    print_finding "good" "Thread bodies appear to handle exceptions"
+    return
+  fi
+  local printed=0
+  while IFS=$'\t' read -r rid count samples; do
+    [[ -z "$rid" ]] && continue
+    printed=1
+    local severity=${ASYNC_ERROR_SEVERITY[$rid]:-warning}
+    local summary='Thread.new block lacks rescue'
+    local desc='Wrap thread bodies in begin/rescue to log or propagate errors'
+    if [[ -n "$samples" ]]; then desc+=" (e.g., $samples)"; fi
+    print_finding "$severity" "$count" "$summary" "$desc"
+  done < <(python3 - "$tmp_json" <<'PY'
+import json, sys
+from collections import OrderedDict
+path = sys.argv[1]
+stats = OrderedDict()
+with open(path, 'r', encoding='utf-8') as fh:
+    for line in fh:
+        line=line.strip()
+        if not line: continue
+        try: obj=json.loads(line)
+        except json.JSONDecodeError: continue
+        rid = obj.get('rule_id') or obj.get('id') or obj.get('ruleId') or 'ruby.async.thread-no-rescue'
+        rng = obj.get('range') or {}
+        start = rng.get('start') or {}
+        line_no = start.get('row', 0) + 1
+        file_path = obj.get('file', '?')
+        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
+        entry['count'] += 1
+        if len(entry['samples']) < 3:
+            entry['samples'].append(f"{file_path}:{line_no}")
+for rid, data in stats.items():
+    print(f"{rid}\t{data['count']}\t{','.join(data['samples'])}")
+PY
+  )
+  rm -f "$tmp_json"
+  if [[ $printed -eq 0 ]]; then
+    print_finding "good" "Thread bodies appear to handle exceptions"
+  fi
+}
 run_async_error_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 17: RUBY/RAILS PRACTICALS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 17; then
+if run_category 17; then
 print_header "17. RUBY/RAILS PRACTICALS"
 print_category "Detects: frozen_string_literal pragma, mass assignment hints, csrf skip" \
   "Rails conventions and Ruby pragmas that impact safety/perf."
 
 print_subheader "Missing 'frozen_string_literal: true' pragma (heuristic)"
-rb_files=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f -name "*.rb" -print \) 2>/dev/null || true )
-)
+rb_files=$(( set +o pipefail; find "$PROJECT_DIR" -type d \( -name .git -o -name vendor -o -name node_modules \) -prune -o -type f -name "*.rb" -print 2>/dev/null || true ))
 missing_pragma=0
 while IFS= read -r f; do
-  # check first two lines for pragma
+  [[ -z "$f" ]] && continue
   if ! head -n 2 "$f" 2>/dev/null | grep -q "frozen_string_literal:\s*true"; then
     missing_pragma=$((missing_pragma+1))
   fi
@@ -1666,7 +1580,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 18: AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 18; then
+if run_category 18; then
 print_header "AST-GREP RULE PACK FINDINGS"
   if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
     if [[ "$AG_PREVIEW_FIX" -eq 1 ]]; then
@@ -1690,7 +1604,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 19: BUNDLER-POWERED EXTRA ANALYZERS (optional)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 19; then
+if run_category 19; then
 print_header "19. BUNDLER-POWERED EXTRA ANALYZERS"
 print_category "Rubocop (lint), Brakeman (Rails security), Bundler-Audit (deps), Reek (smells), Fasterer (perf)" \
   "These tools augment ast-grep/rg results."
@@ -1743,7 +1657,6 @@ end_scan_section
 
 # If machine format is requested globally, produce pure output and exit
 if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
-  # run_ast_rules already streamed the artifact and exited earlier.
   exit 0
 fi
 
@@ -1793,6 +1706,8 @@ fi
 echo ""
 if [ "$VERBOSE" -eq 0 ]; then
   say "${DIM}Tip: Run with -v/--verbose for more code samples per finding.${RESET}"
+elif [ "$VERBOSE" -eq 2 ]; then
+  say "${DIM}Very-verbose mode: showing up to $DETAIL_LIMIT samples per finding.${RESET}"
 fi
 say "${DIM}Add to pre-commit: ./ubs --ci --fail-on-warning . > rb-bug-scan-report.txt${RESET}"
 echo ""

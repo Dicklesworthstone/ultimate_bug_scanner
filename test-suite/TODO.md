@@ -36,7 +36,7 @@
 - [x] Run the refreshed manifest end-to-end, capture artifacts, and record the date/result in `notes/` for future baselines.
 
 ## JS clean fixture follow-ups
-- [ ] Replace the remaining regex heuristics (async error coverage, try/finally bookkeeping, DOM listener cleanup) with ast-grep rules so clean fixtures run with zero warnings rather than noisy false positives.
+- [x] Replace the remaining regex heuristics (async error coverage, try/finally bookkeeping, DOM listener cleanup) with ast-grep rules so clean fixtures run with zero warnings rather than noisy false positives.
 - [ ] When the ast-grep coverage lands, restore the JS clean manifest case to run the full category set (no selective skipping) so we keep parity with real-world scans.
 
 _Last updated: 2025-11-17 03:25 UTC_

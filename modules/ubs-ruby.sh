@@ -397,12 +397,16 @@ rule:
       kind: rescue_clause
 YAML
   tmp_json="$(mktemp 2>/dev/null || mktemp -t rb_async_matches.XXXXXX)"
-  if ! "${AST_GREP_CMD[@]}" scan -r "$rule_dir" "$PROJECT_DIR" --json >"$tmp_json" 2>/dev/null; then
-    rm -rf "$rule_dir"
-    rm -f "$tmp_json"
-    print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
-    return
-  fi
+  : >"$tmp_json"
+  local rule_file
+  for rule_file in "$rule_dir"/*.yml; do
+    if ! "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null; then
+      rm -rf "$rule_dir"
+      rm -f "$tmp_json"
+      print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
+      return
+    fi
+  done
   rm -rf "$rule_dir"
   if ! [[ -s "$tmp_json" ]]; then
     rm -f "$tmp_json"

@@ -823,134 +823,276 @@ PY
 
 run_taint_analysis_checks() {
   print_subheader "Lightweight taint analysis"
-  if ! command -v python3 >/dev/null 2>&1; then
-    print_finding "info" 0 "python3 not found" "Install python3 to enable taint flow checks"
-    return
-  fi
   local printed=0
   while IFS=$'\t' read -r rule_id count samples; do
     [[ -z "$rule_id" ]] && continue
     printed=1
     local severity=${TAINT_SEVERITY[$rule_id]:-warning}
     local summary=${TAINT_SUMMARY[$rule_id]:-$rule_id}
-    local remediation=${TAINT_REMEDIATION[$rule_id]:-"Sanitize user input before it reaches this sink"}
-    local detail="$remediation"
+    local desc=${TAINT_REMEDIATION[$rule_id]:-"Sanitize user input before reaching this sink"}
     if [[ -n "$samples" ]]; then
-      detail+=" (e.g., $samples)"
+      desc+=" (e.g., $samples)"
     fi
-    print_finding "$severity" "$count" "$summary" "$detail"
+    print_finding "$severity" "$count" "$summary" "$desc"
   done < <(python3 - "$PROJECT_DIR" <<'PY'
-import re
-import sys
+import re, sys
 from collections import defaultdict
+from copy import deepcopy
 from pathlib import Path
 
 ROOT = Path(sys.argv[1]).resolve()
 BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
-SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.cache', 'coverage', 'tmp'}
+SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '.cache', 'dist', 'build', 'coverage', 'tmp', '.turbo'}
 EXTS = {'.js', '.jsx', '.ts', '.tsx'}
+PATH_LIMIT = 5
 
-SOURCE_KEYWORDS = [
-    'req.body', 'req.query', 'req.params', 'request.body', 'request.query', 'request.params',
-    'event.target.value', 'window.location', 'document.location', 'location.search',
-    'document.cookie', 'localStorage.getItem', 'sessionStorage.getItem', 'FormData(',
-    'URLSearchParams(', 'ctx.request.body', 'context.req.body'
+SOURCE_PATTERNS = [
+    (re.compile(r"\b(?:req|request|ctx\.request|context\.req)\.(?:body|query|params)[\w\.\[\]'\"]*", re.IGNORECASE), 'HTTP request payload'),
+    (re.compile(r"\b(?:req|request)\.files?\b", re.IGNORECASE), 'Uploaded file'),
+    (re.compile(r"\b(?:event|e)\.target\.value\b", re.IGNORECASE), 'DOM event value'),
+    (re.compile(r"\blocation\.(?:search|hash|href)\b", re.IGNORECASE), 'window.location data'),
+    (re.compile(r"\bwindow\.location\b", re.IGNORECASE), 'window.location data'),
+    (re.compile(r"\bdocument\.cookie\b", re.IGNORECASE), 'document.cookie'),
+    (re.compile(r"\b(?:localStorage|sessionStorage)\.getItem\s*\([^)]*\)", re.IGNORECASE), 'Web storage read'),
+    (re.compile(r"\b(?:new\s+)?FormData\s*\([^)]*\)", re.IGNORECASE), 'FormData payload'),
+    (re.compile(r"\bURLSearchParams\s*\([^)]*\)", re.IGNORECASE), 'URLSearchParams payload'),
 ]
 
-SANITIZER_KEYWORDS = [
-    'DOMPurify.sanitize', 'sanitizeHtml', 'escapeHtml', 'xssFilters', 'encodeURIComponent',
-    'he.escape', '_.escape', 'validator.escape', 'stripTags', 'sanitizeInput',
-    'db.escape', 'pool.escape', 'connection.escape', 'mysql.escape', 'sqlstring.escape',
-    'shellescape', 'sanitizeUrl'
+SANITIZER_REGEXES = [
+    re.compile(r"DOMPurify\.sanitize"),
+    re.compile(r"sanitizeHtml"),
+    re.compile(r"escapeHtml"),
+    re.compile(r"xssFilters"),
+    re.compile(r"encodeURIComponent"),
+    re.compile(r"he\.escape"),
+    re.compile(r"(?:lodash|_)\.escape"),
+    re.compile(r"validator\.escape"),
+    re.compile(r"stripTags"),
+    re.compile(r"sanitizeInput"),
+    re.compile(r"sanitizeUrl"),
+    re.compile(r"shellescape"),
+    re.compile(r"db\.escape|pool\.escape|connection\.escape|mysql\.escape|sqlstring\.escape"),
 ]
 
 SINKS = [
-    (re.compile(r"\\.innerHTML\\s*=\\s*(.+)"), 'js.taint.xss'),
-    (re.compile(r"\\.outerHTML\\s*=\\s*(.+)"), 'js.taint.xss'),
-    (re.compile(r"insertAdjacentHTML\\s*\\((.+)\\)"), 'js.taint.xss'),
-    (re.compile(r"dangerouslySetInnerHTML\\s*=\\s*(.+)"), 'js.taint.xss'),
-    (re.compile(r"document\\.write\\s*\\((.+)\\)"), 'js.taint.xss'),
-    (re.compile(r"res\\.(?:send|json)\\s*\\((.+)\\)"), 'js.taint.xss'),
-    (re.compile(r"response\\.(?:send|json)\\s*\\((.+)\\)"), 'js.taint.xss'),
-    (re.compile(r"eval\\s*\\((.+)\\)"), 'js.taint.eval'),
-    (re.compile(r"new\\s+Function\\s*\\((.+)\\)"), 'js.taint.eval'),
-    (re.compile(r"(?:child_process|cp)\\.(?:exec|execSync|spawn)\\s*\\((.+)\\)"), 'js.taint.command'),
-    (re.compile(r"execSync\\s*\\((.+)\\)"), 'js.taint.command'),
-    (re.compile(r"shell\\.exec\\s*\\((.+)\\)"), 'js.taint.command'),
-    (re.compile(r"(?:db|pool|connection|client|knex|sequelize)\\.(?:query|execute|raw)\\s*\\((.+)\\)"), 'js.taint.sql'),
+    (re.compile(r"\.innerHTML\s*=\s*(.+)"), 'js.taint.xss', 'innerHTML write'),
+    (re.compile(r"\.outerHTML\s*=\s*(.+)"), 'js.taint.xss', 'outerHTML write'),
+    (re.compile(r"dangerouslySetInnerHTML\s*=\s*(.+)"), 'js.taint.xss', 'dangerouslySetInnerHTML'),
+    (re.compile(r"insertAdjacentHTML\s*\((.+)\)"), 'js.taint.xss', 'insertAdjacentHTML'),
+    (re.compile(r"document\.write\s*\((.+)\)"), 'js.taint.xss', 'document.write'),
+    (re.compile(r"res(?:ponse)?\.send\s*\((.+)\)"), 'js.taint.xss', 'HTTP send'),
+    (re.compile(r"res(?:ponse)?\.json\s*\((.+)\)"), 'js.taint.xss', 'HTTP json send'),
+    (re.compile(r"eval\s*\((.+)\)"), 'js.taint.eval', 'eval'),
+    (re.compile(r"new\s+Function\s*\((.+)\)"), 'js.taint.eval', 'Function constructor'),
+    (re.compile(r"(?:child_process|cp)\.(?:execFile|exec|spawn|execSync|spawnSync)\s*\((.+)\)"), 'js.taint.command', 'child_process exec'),
+    (re.compile(r"shell\.exec\s*\((.+)\)"), 'js.taint.command', 'shell.exec'),
+    (re.compile(r"(?:db|pool|connection|client|knex|sequelize|prisma)\.(?:query|execute|raw)\s*\((.+)\)"), 'js.taint.sql', 'SQL execution'),
 ]
 
-ASSIGN_DECL = re.compile(r"(?:const|let|var)\\s+([A-Za-z_][\\w]*)\\s*=\\s*(?!\\=)(.+)")
-ASSIGN_REASSIGN = re.compile(r"^([A-Za-z_][\\w]*)\\s*=\\s*(?!\\=)(.+)")
-
+ASSIGN_DECL = re.compile(r"^(?:const|let|var)\s+(.+?)\s*=\s*(.+)")
+ASSIGN_SIMPLE = re.compile(r"^([A-Za-z_$][\w$]*)\s*=\s*(?![=])(.+)")
+DESTRUCT_OBJECT = re.compile(r"^(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)")
+DESTRUCT_ARRAY = re.compile(r"^(?:const|let|var)\s*\[([^]]*)\]\s*=\s*(.+)")
 
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
 
-
-def list_files(root: Path):
+def iter_js_files(root: Path):
     if root.is_file():
         if root.suffix.lower() in EXTS:
             yield root
         return
     for path in root.rglob('*'):
+        if not path.is_file():
+            continue
         if should_skip(path):
             continue
-        if path.suffix.lower() in EXTS and path.is_file():
+        if path.suffix.lower() in EXTS:
             yield path
 
-
 def strip_comments(line: str) -> str:
-    if '//' in line:
-        idx = line.find('//')
-        if idx >= 0:
-            return line[:idx]
-    return line
+    out, quote, escape = [], '', False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            i += 1
+            continue
+        if ch == '/' and i + 1 < len(line):
+            nxt = line[i + 1]
+            if nxt == '/':
+                break
+            if nxt == '*':
+                end = line.find('*/', i + 2)
+                if end == -1:
+                    break
+                i = end + 2
+                continue
+        out.append(ch)
+        i += 1
+    return ''.join(out).strip()
 
+def split_statements(line: str):
+    if ';' not in line:
+        return [line]
+    parts, buf, depth = [], [], 0
+    for ch in line:
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth = max(depth - 1, 0)
+        if ch == ';' and depth == 0:
+            token = ''.join(buf).strip()
+            if token:
+                parts.append(token)
+            buf = []
+            continue
+        buf.append(ch)
+    token = ''.join(buf).strip()
+    if token:
+        parts.append(token)
+    return parts
+
+def normalize_target(raw: str) -> str:
+    raw = raw.strip()
+    if not raw:
+        return ''
+    raw = raw.split('=')[0].strip()
+    raw = raw.split(':')[-1].strip()
+    if raw.startswith('...'):
+        raw = raw[3:]
+    return raw
+
+def parse_targets(blob: str):
+    targets = []
+    for chunk in blob.split(','):
+        name = normalize_target(chunk)
+        if name and re.match(r"[A-Za-z_$][\w$]*", name):
+            targets.append(name)
+    return targets
 
 def parse_assignments(lines):
     assignments = []
     for idx, raw in enumerate(lines, start=1):
-        line = strip_comments(raw).strip()
-        if not line:
+        stripped = strip_comments(raw)
+        if not stripped:
             continue
-        m = ASSIGN_DECL.match(line)
-        if not m:
-            m = ASSIGN_REASSIGN.match(line)
-        if not m:
-            continue
-        var, expr = m.group(1), m.group(2)
-        assignments.append((idx, var, expr))
+        for stmt in split_statements(stripped):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            m = DESTRUCT_OBJECT.match(stmt)
+            if m:
+                targets = parse_targets(m.group(1))
+                expr = m.group(2)
+            else:
+                m = DESTRUCT_ARRAY.match(stmt)
+                if m:
+                    targets = parse_targets(m.group(1))
+                    expr = m.group(2)
+                else:
+                    m = ASSIGN_DECL.match(stmt)
+                    if m:
+                        targets = parse_targets(m.group(1))
+                        expr = m.group(2)
+                    else:
+                        m = ASSIGN_SIMPLE.match(stmt)
+                        if m:
+                            targets = [m.group(1)]
+                            expr = m.group(2)
+                        else:
+                            continue
+            expr = expr.strip()
+            for target in targets:
+                assignments.append((idx, target, expr))
     return assignments
 
+def find_sources(expr: str):
+    matches = []
+    for regex, label in SOURCE_PATTERNS:
+        for match in regex.finditer(expr):
+            snippet = match.group(0).strip()
+            if snippet:
+                matches.append((snippet, label))
+    return matches
 
-def contains_keyword(expr: str, keywords) -> bool:
-    expr_low = expr.lower()
-    for key in keywords:
-        if key.lower() in expr_low:
+def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
+    for regex in SANITIZER_REGEXES:
+        if regex.search(expr):
             return True
+    if sink_rule == 'js.taint.sql' and re.search(r",\s*(?:\[[^\]]+\]|params|values|bindings)", expr, re.IGNORECASE):
+        return True
     return False
 
+def expr_has_tainted(expr: str, tainted):
+    for name, meta in tainted.items():
+        if re.search(rf"(?<![A-Za-z0-9_$]){re.escape(name)}(?![A-Za-z0-9_$])", expr):
+            return name, meta
+    return None, None
 
-def contains_taint(expr: str, tainted):
-    expr_low = expr.lower()
-    for key in SOURCE_KEYWORDS:
-        if key.lower() in expr_low:
-            return key
-    for name in tainted:
-        pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
-        if re.search(pattern, expr):
-            return name
-    return None
+def extend_path(meta, new_node):
+    clone = deepcopy(meta)
+    path = list(clone.get('path') or [clone.get('source', new_node)])
+    if len(path) >= PATH_LIMIT:
+        path = path[-(PATH_LIMIT-1):]
+    path.append(new_node)
+    clone['path'] = path
+    return clone
 
+def record_taint(assignments):
+    tainted = {}
+    for line_no, target, expr in assignments:
+        sources = find_sources(expr)
+        if sources:
+            snippet, label = sources[0]
+            tainted[target] = {
+                'source': snippet,
+                'source_label': label,
+                'line': line_no,
+                'path': [snippet.strip(), target]
+            }
+    for _ in range(6):
+        changed = False
+        for line_no, target, expr in assignments:
+            if target in tainted or expr_has_sanitizer(expr):
+                continue
+            ref, meta = expr_has_tainted(expr, tainted)
+            if ref:
+                clone = extend_path(meta, target)
+                clone['line'] = line_no
+                tainted[target] = clone
+                changed = True
+                continue
+            sources = find_sources(expr)
+            if sources:
+                snippet, label = sources[0]
+                tainted[target] = {
+                    'source': snippet,
+                    'source_label': label,
+                    'line': line_no,
+                    'path': [snippet.strip(), target]
+                }
+                changed = True
+        if not changed:
+            break
+    return tainted
 
-def is_sanitized(expr: str) -> bool:
-    expr_low = expr.lower()
-    for key in SANITIZER_KEYWORDS:
-        if key.lower() in expr_low:
-            return True
-    return False
-
+def format_path(path, sink_label):
+    seq = list(path)
+    if len(seq) >= PATH_LIMIT:
+        seq = seq[-(PATH_LIMIT-1):]
+    seq.append(sink_label)
+    return ' -> '.join(seq)
 
 def analyze_file(path: Path, issues):
     try:
@@ -959,73 +1101,50 @@ def analyze_file(path: Path, issues):
         return
     lines = text.splitlines()
     assignments = parse_assignments(lines)
-    tainted = set()
-
-    for _, var, expr in assignments:
-        if contains_keyword(expr, SOURCE_KEYWORDS):
-            tainted.add(var)
-
-    for _ in range(5):
-        changed = False
-        for _, var, expr in assignments:
-            if var in tainted:
-                continue
-            if is_sanitized(expr):
-                continue
-            culprit = contains_taint(expr, tainted)
-            if culprit:
-                tainted.add(var)
-                changed = True
-        if not changed:
-            break
-
+    tainted = record_taint(assignments)
     for idx, raw in enumerate(lines, start=1):
-        line = strip_comments(raw)
-        if not line:
+        stripped = strip_comments(raw)
+        if not stripped:
             continue
-        for regex, rule in SINKS:
-            match = regex.search(line)
+        for regex, rule, sink_label in SINKS:
+            match = regex.search(stripped)
             if not match:
                 continue
-            expr = match.group(1)
-            if not expr or is_sanitized(expr):
+            expr = match.group(1).strip()
+            if not expr or expr_has_sanitizer(expr, rule):
                 continue
-            culprit = contains_taint(expr, tainted)
-            if not culprit:
-                continue
-            rel_base = BASE_DIR if BASE_DIR.exists() else ROOT.parent
+            literal = find_sources(expr)
+            if literal:
+                snippet, _ = literal[0]
+                path_desc = f"{snippet.strip()} -> {sink_label}"
+            else:
+                ref, meta = expr_has_tainted(expr, tainted)
+                if not ref:
+                    continue
+                path_desc = format_path(meta.get('path', [ref]), sink_label)
             try:
-                rel = path.relative_to(rel_base)
+                rel = path.relative_to(BASE_DIR)
             except ValueError:
                 rel = path.name
-            sample = f"{rel}:{idx}:{culprit}"
-            info = issues[rule]
-            info['count'] += 1
-            if len(info['samples']) < 3:
-                info['samples'].append(sample)
+            sample = f"{rel}:{idx} {path_desc}"
+            bucket = issues[rule]
+            bucket['count'] += 1
+            if len(bucket['samples']) < 3:
+                bucket['samples'].append(sample)
 
+issues = defaultdict(lambda: {'count': 0, 'samples': []})
+for file_path in iter_js_files(ROOT):
+    analyze_file(file_path, issues)
 
-def main():
-    issues = defaultdict(lambda: {'count': 0, 'samples': []})
-    for file_path in list_files(ROOT):
-        analyze_file(file_path, issues)
-    for rule_id, data in issues.items():
-        if data['count'] > 0:
-            samples = ','.join(data['samples'])
-            print(f"{rule_id}\t{data['count']}\t{samples}")
-
-
-if __name__ == '__main__':
-    main()
+for rule_id, data in issues.items():
+    samples = ','.join(data['samples'])
+    print(f"{rule_id}\t{data['count']}\t{samples}")
 PY
 )
   if [[ $printed -eq 0 ]]; then
     print_finding "good" "No tainted sources reach dangerous sinks"
   fi
 }
-
-
-
 
 # Temporarily relax pipefail for grep-heavy scans to avoid ERR on 1/no-match
 begin_scan_section(){

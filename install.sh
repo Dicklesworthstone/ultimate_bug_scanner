@@ -1305,11 +1305,16 @@ uninstall_ubs() {
       log "Backed up $rc_file to ${rc_file}.pre-uninstall-backup"
 
       # Remove PATH and alias/function entries
-      sed -i.bak '/# Ultimate Bug Scanner.*added/,+1d' "$rc_file" 2>/dev/null || true
-      sed -i.bak '/# Ultimate Bug Scanner alias/,+1d' "$rc_file" 2>/dev/null || true
-      rm -f "${rc_file}.bak" 2>/dev/null || true
+      if sed -i.bak '/# Ultimate Bug Scanner.*added/,+1d' "$rc_file" 2>/dev/null; then
+        rm -f "${rc_file}.bak" 2>/dev/null || true
+      fi
+      if sed -i.bak '/# Ultimate Bug Scanner alias/,+1d' "$rc_file" 2>/dev/null; then
+        rm -f "${rc_file}.bak" 2>/dev/null || true
+      fi
       # Remove blank lines
-      sed -i.bak '/^$/N;/^\n$/d' "$rc_file" 2>/dev/null && rm -f "${rc_file}.bak" 2>/dev/null || true
+      if sed -i.bak '/^$/N;/^\n$/d' "$rc_file" 2>/dev/null; then
+        rm -f "${rc_file}.bak" 2>/dev/null || true
+      fi
       success "Removed from $rc_file"
     fi
   fi
@@ -1892,7 +1897,8 @@ add_to_path() {
 
   local rc_file
   rc_file="$(get_rc_file)"
-  local shell_type="$(detect_shell)"
+  local shell_type
+  shell_type="$(detect_shell)"
 
   if dry_run_enabled; then
     log_dry_run "Would update PATH in $rc_file for $install_dir."
@@ -1986,15 +1992,19 @@ create_alias() {
         return 0
       else
         warn "Existing alias points to different location, updating..."
-        sed -i.bak "/alias ubs=/d" "$rc_file" 2>/dev/null && rm -f "${rc_file}.bak" || {
+        if sed -i.bak "/alias ubs=/d" "$rc_file" 2>/dev/null; then
+          rm -f "${rc_file}.bak"
+        else
           warn "Could not update existing alias - you may need to manually remove it"
-        }
+        fi
       fi
     fi
 
-    echo "" >> "$rc_file"
-    echo "# Ultimate Bug Scanner alias" >> "$rc_file"
-    echo "alias ubs='$script_path'" >> "$rc_file"
+    {
+      echo ""
+      echo "# Ultimate Bug Scanner alias"
+      echo "alias ubs='$script_path'"
+    } >> "$rc_file"
     success "Created 'ubs' alias pointing to: $script_path"
   fi
 
@@ -2092,10 +2102,12 @@ AIDER
     success "Created Aider config with UBS integration: $aider_conf"
   else
     if ! grep -q "ubs" "$aider_conf" 2>/dev/null; then
-      echo "" >> "$aider_conf"
-      echo "# Ultimate Bug Scanner integration" >> "$aider_conf"
-      echo "lint-cmd: \"ubs --fail-on-warning .\"" >> "$aider_conf"
-      echo "auto-lint: true" >> "$aider_conf"
+      {
+        echo ""
+        echo "# Ultimate Bug Scanner integration"
+        echo "lint-cmd: \"ubs --fail-on-warning .\""
+        echo "auto-lint: true"
+      } >> "$aider_conf"
       success "Added UBS to Aider config: $aider_conf"
     else
       log "Aider already configured with UBS"
@@ -2246,15 +2258,17 @@ detect_coding_agents() {
   HAS_AGENT_TABNINE=0
   HAS_AGENT_REPLIT=0
 
-  [[ -d "${HOME}/.claude" || -d ".claude" ]] && HAS_AGENT_CLAUDE=1 || true
-  [[ -d "${HOME}/.codex"  || -d ".codex"  ]] && HAS_AGENT_CODEX=1 || true
-  [[ -d "${HOME}/.cursor" || -d ".cursor" ]] && HAS_AGENT_CURSOR=1 || true
-  [[ -d "${HOME}/.gemini" || -d ".gemini" ]] && HAS_AGENT_GEMINI=1 || true
-  [[ -d "${HOME}/.opencode" || -d ".opencode" ]] && HAS_AGENT_OPENCODE=1 || true
-  [[ -d "${HOME}/.windsurf" || -d ".windsurf" ]] && HAS_AGENT_WINDSURF=1 || true
-  [[ -d "${HOME}/.cline" || -d ".cline" ]] && HAS_AGENT_CLINE=1 || true
+  if [[ -d "${HOME}/.claude" || -d ".claude" ]]; then HAS_AGENT_CLAUDE=1; fi
+  if [[ -d "${HOME}/.codex"  || -d ".codex"  ]]; then HAS_AGENT_CODEX=1; fi
+  if [[ -d "${HOME}/.cursor" || -d ".cursor" ]]; then HAS_AGENT_CURSOR=1; fi
+  if [[ -d "${HOME}/.gemini" || -d ".gemini" ]]; then HAS_AGENT_GEMINI=1; fi
+  if [[ -d "${HOME}/.opencode" || -d ".opencode" ]]; then HAS_AGENT_OPENCODE=1; fi
+  if [[ -d "${HOME}/.windsurf" || -d ".windsurf" ]]; then HAS_AGENT_WINDSURF=1; fi
+  if [[ -d "${HOME}/.cline" || -d ".cline" ]]; then HAS_AGENT_CLINE=1; fi
 
-  [[ -f "${HOME}/.aider.conf.yml" || -f ".aider.conf.yml" || -f ".aider.config.yml" ]] && HAS_AGENT_AIDER=1 || true
+  if [[ -f "${HOME}/.aider.conf.yml" || -f ".aider.conf.yml" || -f ".aider.config.yml" ]]; then
+    HAS_AGENT_AIDER=1
+  fi
 
   if [ -d "$HOME/.vscode/extensions" ]; then
     if compgen -G "$HOME/.vscode/extensions"/continue.* >/dev/null 2>&1; then
@@ -2264,9 +2278,9 @@ detect_coding_agents() {
       HAS_AGENT_COPILOT=1
     fi
   fi
-  [[ -d "${HOME}/.continue" || -d ".continue" ]] && HAS_AGENT_CONTINUE=1 || true
+  if [[ -d "${HOME}/.continue" || -d ".continue" ]]; then HAS_AGENT_CONTINUE=1; fi
 
-  [[ -d "$HOME/.tabnine" ]] && HAS_AGENT_TABNINE=1 || true
+  if [[ -d "$HOME/.tabnine" ]]; then HAS_AGENT_TABNINE=1; fi
 
   if [[ -f ".replit" || -f "${HOME}/.replit" ]]; then
     HAS_AGENT_REPLIT=1

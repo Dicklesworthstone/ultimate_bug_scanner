@@ -185,6 +185,13 @@ Each file contains **intentional bugs** that the scanner should detect:
 
 **Frameworks Total:** 63+ issues in buggy files
 
+### Feature-Specific Suites
+
+| Manifest Case | Path | Purpose |
+|----------------|------|---------|
+| `js-taint-buggy` | `test-suite/js/buggy/taint_analysis.js` | Unsanitized req.body/req.query/window.location flows into `innerHTML`, `res.send`, `db.query`, and `child_process.exec` so taint analysis should emit CRITICAL findings. |
+| `js-taint-clean` | `test-suite/js/clean/taint_analysis.js` | Mirrors the buggy flows but sanitizes with DOMPurify/escapeHtml/shellescape/parameterized SQL to prove the helper suppresses safe code. |
+
 ### Realistic Scenarios
 
 | File | Expected Issues | Description |

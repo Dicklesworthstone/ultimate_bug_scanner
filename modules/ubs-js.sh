@@ -537,7 +537,8 @@ PROPS_FUNC_PATTERN = re.compile(r"function\s+[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\{([^
 ARROW_FUNC_PATTERN = re.compile(r"=\s*\(\s*\{([^}]*)\}\s*\)\s*=>")
 DESTRUCT_PROPS_PATTERN = re.compile(r"const\s*\{([^}]*)\}\s*=\s*props")
 
-STRING_RE = re.compile(r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)", re.S)
+STRING_RE = re.compile(r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')", re.S)
+TEMPLATE_START = '`'
 file_cache = {}
 
 def parse_props(blob):
@@ -550,6 +551,7 @@ def parse_props(blob):
         if not name:
             continue
         name = name.replace('*', '').strip()
+        name = name.strip('()')
         if name:
             names.append(name)
     return names
@@ -594,10 +596,51 @@ def extract_params(callback_text):
     return params
 
 def extract_locals(callback_text):
-    return {m.group(1) for m in re.finditer(r"(?:const|let|var|function)\s+([A-Za-z_][A-Za-z0-9_]*)", callback_text)}
+    locals_set = {m.group(1) for m in re.finditer(r"(?:const|let|var|function)\s+([A-Za-z_][A-Za-z0-9_]*)", callback_text)}
+    for match in re.finditer(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*=>", callback_text):
+        locals_set.add(match.group(1))
+    for match in re.finditer(r"\(\s*([^)]+?)\s*\)\s*=>", callback_text):
+        locals_set.update(parse_props(match.group(1)))
+    return locals_set
+
+def strip_template_literals(text):
+    result = []
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch == '`':
+            i += 1
+            while i < length:
+                if text[i] == '\\' and i + 1 < length:
+                    i += 2
+                    continue
+                if text[i] == '$' and i + 1 < length and text[i + 1] == '{':
+                    i += 2
+                    brace = 1
+                    while i < length and brace:
+                        if text[i] == '{':
+                            brace += 1
+                        elif text[i] == '}':
+                            brace -= 1
+                        if brace == 0:
+                            i += 1
+                            break
+                        result.append(text[i])
+                        i += 1
+                    continue
+                if text[i] == '`':
+                    i += 1
+                    break
+                i += 1
+            continue
+        result.append(ch)
+        i += 1
+    return ''.join(result)
 
 def strip_strings(text):
-    return STRING_RE.sub(' ', text)
+    text = STRING_RE.sub(' ', text)
+    return strip_template_literals(text)
 
 def extract_identifiers(callback_text):
     cleaned = strip_strings(callback_text)
@@ -1444,8 +1487,8 @@ if [ "$count" -gt 0 ]; then
 fi
 
 print_subheader "Missing array existence checks before .length"
-count=$("${GREP_RN[@]}" -e "\.[A-Za-z_][A-Za-z0-9_]*\.length" "$PROJECT_DIR" 2>/dev/null || true | \
-  (grep -Ev "if|Array\.isArray|\?\." || true) | count_lines)
+count=$( ("${GREP_RN[@]}" -e "\.[A-Za-z_][A-Za-z0-9_]*\.length" "$PROJECT_DIR" 2>/dev/null || true) \
+  | (grep -Ev "if|Array\.isArray|\?\." || true) | count_lines)
 if [ "$count" -gt 15 ]; then
   print_finding "info" "$count" "Chained .length access without null checks"
 fi
@@ -1472,13 +1515,13 @@ else
 fi
 
 print_subheader "Comparing different types"
-count=$("${GREP_RN[@]}" -e "===[[:space:]]*('|\"|true|false|null)" "$PROJECT_DIR" 2>/dev/null || true | \
-  (grep -vE "typeof|instanceof" || true) | count_lines)
+count=$( ("${GREP_RN[@]}" -e "===[[:space:]]*('|\"|true|false|null)" "$PROJECT_DIR" 2>/dev/null || true) \
+  | (grep -vE "typeof|instanceof" || true) | count_lines)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Type comparisons - verify both sides match"; fi
 
 print_subheader "typeof checks with wrong string literals"
-count=$("${GREP_RN[@]}" -e "typeof[[:space:]]*\(.+\)[[:space:]]*===?[[:space:]]*['\"][A-Za-z]+['\"]" "$PROJECT_DIR" 2>/dev/null || true | \
-  (grep -Ev "undefined|string|number|boolean|function|object|symbol|bigint" || true) | count_lines)
+count=$( ("${GREP_RN[@]}" -e "typeof[[:space:]]*\(.+\)[[:space:]]*===?[[:space:]]*['\"][A-Za-z]+['\"]" "$PROJECT_DIR" 2>/dev/null || true) \
+  | (grep -Ev "undefined|string|number|boolean|function|object|symbol|bigint" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Invalid typeof comparison" "Valid: undefined|string|number|boolean|function|object|symbol|bigint"
   show_detailed_finding "typeof[[:space:]]*\(.+\)[[:space:]]*===?[[:space:]]*['\"][A-Za-z]+['\"]" 3
@@ -1491,8 +1534,10 @@ if [ "$count" -gt 8 ]; then
 fi
 
 print_subheader "Implicit string concatenation with +"
-count=$(( $("${GREP_RN[@]}" -e "\+[[:space:]]*['\"]|['\"][[:space:]]*\+" "$PROJECT_DIR" 2>/dev/null || true | \
-  grep -v -E "\+\+|[+\-]=" || true | wc -l | awk '{print $1+0}') ))
+count=$("${GREP_RN[@]}" -e "\+[[:space:]]*['\"]|['\"][[:space:]]*\+" "$PROJECT_DIR" 2>/dev/null \
+  | (grep -v -E "\+\+|[+\-]=" || true) \
+  | wc -l | awk '{print $1+0}')
+count=${count:-0}
 if [ "$count" -gt 5 ]; then
   print_finding "info" "$count" "String concatenation with +" "Use Number() for math; template literals for strings"
 fi
@@ -1536,7 +1581,8 @@ if [ "$count" -gt 3 ]; then
 fi
 
 print_subheader "Missing 'async' keyword on functions using await"
-count=$("${GREP_RNW[@]}" "await" "$PROJECT_DIR" 2>/dev/null || true | (grep -v "async" || true) | count_lines)
+count=$( ("${GREP_RNW[@]}" "await" "$PROJECT_DIR" 2>/dev/null || true) \
+  | (grep -v "async" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "await used in non-async function" "SyntaxError in JS"
   show_detailed_finding "\bawait\b" 3
@@ -1753,7 +1799,8 @@ fi
 
 print_subheader "JSON.parse without try/catch"
 count=$("${GREP_RN[@]}" -e "JSON\.parse\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-trycatch_count=$("${GREP_RNW[@]}" -B2 "try" "$PROJECT_DIR" 2>/dev/null || true | (grep -c "JSON\.parse" || true))
+trycatch_count=$( ("${GREP_RNW[@]}" -B2 "try" "$PROJECT_DIR" 2>/dev/null || true) \
+  | (grep -c "JSON\.parse" || true))
 trycatch_count=$(printf '%s\n' "$trycatch_count" | awk 'END{print $0+0}')
 if [ "$count" -gt "$trycatch_count" ]; then
   ratio=$((count - trycatch_count))
@@ -2059,8 +2106,8 @@ dom_count=$("${GREP_RN[@]}" -e "querySelector|getElementById" "$PROJECT_DIR" 2>/
 print_finding "info" "$dom_count" "DOM queries found" "Ensure all queries have null checks before property access"
 
 print_subheader "Uncached DOM queries in loops"
-count=$("${GREP_RN[@]}" -e "for|while" "$PROJECT_DIR" 2>/dev/null || true | \
-  (grep -A5 -E "querySelector|getElementById" || true) | (grep -c -E "querySelector|getElementById" || true) )
+count=$( ("${GREP_RN[@]}" -e "for|while" "$PROJECT_DIR" 2>/dev/null || true) \
+  | (grep -A5 -E "querySelector|getElementById" || true) | (grep -c -E "querySelector|getElementById" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 5 ]; then
   print_finding "warning" "$count" "DOM queries inside loops" "Cache selectors outside loops"

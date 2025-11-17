@@ -248,6 +248,54 @@
       }
     },
     {
+      "id": "js-react-hooks-buggy",
+      "description": "React hooks dependency regression (missing deps, unstable dependencies).",
+      "path": "test-suite/js/buggy/react_hooks.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "react",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "React hooks dependency analysis"
+        ]
+      }
+    },
+    {
+      "id": "js-react-hooks-clean",
+      "description": "React hooks clean baseline with correct dependency arrays.",
+      "path": "test-suite/js/clean/react_hooks.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "react",
+        "clean"
+      ],
+      "args": [
+        "--only=js"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "python-buggy",
       "description": "Python buggy fixtures (enable once python module assertions stabilize).",
       "path": "test-suite/python/buggy",

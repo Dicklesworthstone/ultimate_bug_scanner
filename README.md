@@ -184,6 +184,7 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 ✅ Integrates with git hooks, CI/CD, file watchers
 ✅ Actionable output (tells you WHAT's wrong and HOW to fix it)
 ✅ Fails fast in CI (catch bugs before they merge)
+✅ New: React Hooks dependency analysis that spots missing deps, unstable objects, and stale closures
 ```
 
 ### 📊 **4. Real-World Impact**

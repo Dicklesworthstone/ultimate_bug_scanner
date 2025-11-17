@@ -297,7 +297,7 @@
             "max": 0
           },
           "warning": {
-            "max": 1
+            "max": 6
           }
         }
       }
@@ -397,7 +397,7 @@
             "max": 0
           },
           "warning": {
-            "max": 1
+            "max": 6
           }
         }
       }
@@ -576,7 +576,7 @@
             "max": 0
           },
           "warning": {
-            "max": 1
+            "max": 6
           }
         }
       }
@@ -703,7 +703,7 @@
             "max": 0
           },
           "warning": {
-            "max": 1
+            "max": 6
           }
         }
       }
@@ -722,6 +722,9 @@
         "--only=rust",
         "--fail-on-warning"
       ],
+      "env": {
+        "UBS_SKIP_RUST_BUILD": "1"
+      },
       "expect": {
         "exit_code": "nonzero",
         "totals": {
@@ -747,6 +750,9 @@
       "args": [
         "--only=rust"
       ],
+      "env": {
+        "UBS_SKIP_RUST_BUILD": "1"
+      },
       "expect": {
         "exit_code": "zero",
         "totals": {

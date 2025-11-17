@@ -1555,6 +1555,26 @@ Layer 4: STATISTICAL (Insightful)  │
 
 ---
 
+## 🚫 Ignoring Paths with `.ubsignore`
+
+Need repo-wide scans to ignore generated code or intentionally buggy fixtures (like this project’s `test-suite/`)? Drop a `.ubsignore` at the root.
+
+- Format mirrors `.gitignore`: one glob per line, `#` for comments.
+- UBS loads `PROJECT/.ubsignore` automatically; override with `--ignore-file=/path/to/file`.
+- Every language module receives the ignore list via their `--exclude` flag, so skips stay consistent.
+- This repository ships with a default `.ubsignore` that excludes `test-suite/`, keeping “real” source scans noise-free.
+
+Example:
+
+```text
+# Ignore fixtures + build output
+test-suite/
+dist/
+coverage/
+```
+
+---
+
 ## 📜 **License**
 
 MIT License - see [LICENSE](LICENSE) file

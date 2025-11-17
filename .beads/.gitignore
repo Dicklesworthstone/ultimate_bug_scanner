@@ -18,3 +18,7 @@ bd.db
 !*.jsonl
 !metadata.json
 !config.json
+
+# Exclude temporary snapshot files (generated during diff operations)
+beads.*.jsonl
+beads.*.meta.json

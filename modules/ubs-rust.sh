@@ -391,27 +391,29 @@ run_async_error_checks() {
 id: rust.async.await-no-handler
 language: rust
 rule:
-  pattern: $CALL.await
-  not:
-    pattern: $CALL.await?
-  not:
-    inside:
-      pattern: match $EXPR { $$ }
-  not:
-    inside:
-      pattern: if let Err($ERR) = $CALL.await { $$ }
+  all:
+    - pattern: $CALL.await
+    - not:
+        pattern: $CALL.await?
+    - not:
+        inside:
+          pattern: match $EXPR { $$ }
+    - not:
+        inside:
+          pattern: if let Err($ERR) = $CALL.await { $$ }
 YAML
   cat >"$rule_dir/rust.async.tokio-task-no-await.yml" <<'YAML'
 id: rust.async.tokio-task-no-await
 language: rust
 rule:
-  pattern: let $HANDLE = tokio::spawn($ARGS);
-  not:
-    has:
-      pattern: $HANDLE.await
-  not:
-    has:
-      pattern: $HANDLE.abort()
+  all:
+    - pattern: let $HANDLE = tokio::spawn($ARGS);
+    - not:
+        has:
+          pattern: $HANDLE.await
+    - not:
+        has:
+          pattern: $HANDLE.abort()
 YAML
   tmp_json="$(mktemp 2>/dev/null || mktemp -t rs_async_matches.XXXXXX)"
   : >"$tmp_json"

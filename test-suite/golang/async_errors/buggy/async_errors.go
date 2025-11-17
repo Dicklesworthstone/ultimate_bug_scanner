@@ -8,9 +8,8 @@ import (
 func fireAndForget(urls []string) {
     for _, url := range urls {
         go func(u string) {
-            resp, err := http.Get(u)
-            resp.Body.Close()
-            fmt.Println("status", resp.Status, err)
+            resp, _ := http.Get(u)
+            fmt.Println("status", resp.Status)
         }(url)
     }
 }

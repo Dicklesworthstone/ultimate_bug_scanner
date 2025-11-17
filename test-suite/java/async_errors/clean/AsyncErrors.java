@@ -12,13 +12,16 @@ public class AsyncErrors {
     }
 
     public static void logChain() {
-        CompletableFuture.supplyAsync(() -> "value")
-            .thenApply(String::toUpperCase)
-            .exceptionally(ex -> {
-                System.err.println("chain failed " + ex.getMessage());
-                return "fallback";
-            })
-            .thenAccept(System.out::println);
+    CompletableFuture.supplyAsync(() -> "value")
+        .handle((result, err) -> {
+            if (err != null) {
+                System.err.println("chain failed " + err.getMessage());
+            } else {
+                System.out.println(result.toUpperCase());
+            }
+            return null;
+        })
+        .join();
     }
 
     public static void main(String[] args) {

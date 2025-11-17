@@ -1,12 +1,12 @@
 # Ultimate Bug Scanner - Test Suite
 
-This test suite provides comprehensive examples of buggy and clean JavaScript code for validating the bug scanner's detection capabilities.
+This suite now spans **every language UBS supports**. JavaScript remains the template, but each directory (`python/`, `golang/`, `cpp/`, `rust/`, `java/`, `ruby/`) contains mirrored buggy/clean fixtures so we can regression-test the language modules with the same discipline.
 
 ## 📁 Directory Structure
 
 ```
 test-suite/
-├── buggy/                      # Core bug patterns (scanner SHOULD find issues)
+├── buggy/                      # Core JS bug patterns (scanner SHOULD find issues)
 │   ├── 01-null-safety.js              # Null pointer bugs, unguarded access
 │   ├── 02-security.js                 # XSS, eval, hardcoded secrets
 │   ├── 03-async-await.js              # Promise handling, missing await
@@ -53,8 +53,28 @@ test-suite/
 │   ├── timezone-date-bugs.js          # Dates, timezones, DST, leap years
 │   └── floating-point-bugs.js         # Precision, money, rounding
 │
+├── python/                     # Python fixtures + manifest cases
+├── golang/                     # Go fixtures + manifest cases
+├── cpp/                        # C/C++ fixtures + manifest cases
+├── rust/                       # Rust fixtures + manifest cases
+├── java/                       # Java fixtures + manifest cases
+├── ruby/                       # Ruby fixtures + manifest cases
 └── README.md                   # This file
 ```
+
+## Cross-language quick reference
+
+| Language | Buggy path | Clean path | Highlights |
+|----------|------------|------------|------------|
+| JavaScript/TypeScript | `test-suite/buggy/`, `test-suite/js/buggy/` | `test-suite/clean/`, `test-suite/js/clean/` | 20 core files + framework + realistic + edge-case coverage |
+| Python | `test-suite/python/buggy/` | `test-suite/python/clean/` | Async/security/resource fixtures + mutable defaults, shell injection |
+| Go | `test-suite/golang/buggy/` | `test-suite/golang/clean/` | Concurrency, HTTP safety, context leaks, ticker/perf issues |
+| C/C++ | `test-suite/cpp/buggy/` | `test-suite/cpp/clean/` | RAII vs leaks, unsafe `strcpy`, overflow/memory hygiene |
+| Rust | `test-suite/rust/buggy/` | `test-suite/rust/clean/` | `unwrap()` panics, async tasks, command injection, float precision |
+| Java | `test-suite/java/buggy/` | `test-suite/java/clean/` | Executor leaks, blocking I/O, SQL and command injection |
+| Ruby | `test-suite/ruby/buggy/` | `test-suite/ruby/clean/` | eval/YAML problems, thread leaks, file cleanup |
+
+Every directory has its own README summarizing the files and the scanner categories they exercise (security, async error coverage, resource lifecycle, math/precision, etc.).
 
 ## 🧪 Running Tests
 
@@ -671,14 +691,14 @@ ubs test-suite/buggy/03-async-await.js test-suite/clean/03-async-await-clean.js
 
 In addition to ad-hoc scans you can execute a curated manifest of cases that
 assert exit semantics and severity thresholds across the repo. The manifest
-(`test-suite/manifest.json`) currently focuses on the JS module (core buggy/clean
-pairs plus Node framework fixtures) and keeps placeholders for other languages.
+(`test-suite/manifest.json`) now includes **every language** (JS core + frameworks, Python, Go, C++, Rust, Java, Ruby, and the JS edge-case directories).
 
 ```bash
 cd test-suite
-./run_manifest.py            # run every enabled case
-./run_manifest.py --list     # inspect case ids / skip status
-./run_manifest.py --case js-node-buggy --fail-fast
+./run_manifest.py                  # run every enabled case
+./run_manifest.py --list           # inspect case ids / skip status
+./run_manifest.py --case cpp-buggy # run one case
+./run_all.sh --fail-fast           # convenience wrapper around run_manifest.py
 ```
 
 Key behavior:
@@ -691,10 +711,8 @@ Key behavior:
   UBS returns `0` in JSON mode.
 - Artifacts for every case (stdout, stderr, parsed summary) land under
   `test-suite/artifacts/<case-id>/` to speed up debugging scanner regressions.
-- Disabled cases (currently the Python fixtures) are recorded with skip reasons
-  so we can track the backlog explicitly. See `test-suite/TODO.md` for the full
-  punch list.
+- Disabled cases are recorded with skip reasons so we can track the backlog
+  explicitly. See `test-suite/TODO.md` for the full punch list.
 
-This runner is the starting point for expanding expectations to the remaining
-languages—just add a case entry to `manifest.json`, set bounds for counts, and
-flip `enabled` once the underlying module is trustworthy.
+`run_all.sh` simply forwards to `run_manifest.py`, so CI and humans share the
+same entry point.

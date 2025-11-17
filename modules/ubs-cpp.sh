@@ -1228,7 +1228,7 @@ print_category "Detects: non-C++20 standard settings, missing warnings, no sanit
   "Build settings are part of correctness and performance"
 
 print_subheader "CMAKE_CXX_STANDARD and target_compile_features"
-cxxstd=$("${GREP_RN[@]}" -e "CMAKE_CXX_STANDARD|target_compile_features" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+cxxstd=$(rg --no-config --no-messages -n -e "CMAKE_CXX_STANDARD|target_compile_features" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$cxxstd" -eq 0 ]; then
   print_finding "warning" 1 "CMake lacks explicit C++ standard settings" "Set CMAKE_CXX_STANDARD 20 and/or target_compile_features(... cxx_std_20)"
 else

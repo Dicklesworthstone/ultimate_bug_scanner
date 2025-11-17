@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# RUST ULTIMATE BUG SCANNER v1.1 - Industrial-Grade Rust Code Analysis
+# RUST ULTIMATE BUG SCANNER v2.0 - Industrial-Grade Rust Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for Rust using ast-grep + semantic patterns
 # + cargo-driven checks (check, clippy, fmt, audit, deny, udeps, outdated)
@@ -9,13 +9,15 @@
 #
 # Features:
 #   - Colorful, CI-friendly TTY output with NO_COLOR support
-#   - Robust find/rg search with include/exclude globs
+#   - Robust find/rg search with include/exclude globs (BSD grep-safe)
 #   - Heuristics + AST rule packs (Rust language) written on-the-fly
 #   - JSON/SARIF passthrough from ast-grep rule scans
+#   - Our own findings emit to stdout via --format=json + --emit-findings-json
 #   - Category skip/selection, verbosity, sample snippets
 #   - Parallel jobs for ripgrep
 #   - Exit on critical or optionally on warnings
 #   - Optional JSON summary & flexible failure thresholds
+#   - New: --list-categories, --dump-rules, --strict-gitignore
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
@@ -64,10 +66,14 @@ CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAG
 # ────────────────────────────────────────────────────────────────────────────
 # CLI Parsing & Configuration
 # ────────────────────────────────────────────────────────────────────────────
+VERSION="2.0"
+SELF_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
-FORMAT="text"          # text|json|sarif (text implemented; ast-grep emits json/sarif in rule-pack mode)
+FORMAT="text"          # text|json|sarif (text + json implemented; ast-grep emits json/sarif in rule-pack mode)
 CI_MODE=0
 FAIL_ON_WARNING=0
 INCLUDE_EXT="rs"
@@ -87,6 +93,10 @@ CARGO_TARGETS_ALL=1
 FAIL_CRITICAL_THRESHOLD=1
 FAIL_WARNING_THRESHOLD=0
 SUMMARY_JSON=""
+EMIT_FINDINGS_JSON=""
+LIST_CATEGORIES=0
+DUMP_RULES_DIR=""
+STRICT_GITIGNORE=0
 
 print_usage() {
   cat >&2 <<USAGE
@@ -95,6 +105,8 @@ Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
 Options:
   -v, --verbose              More code samples per finding (DETAIL=10)
   -q, --quiet                Reduce non-essential output
+  --list-categories          Print category index and exit
+  --dump-rules=DIR           Persist generated ast-grep rules to DIR
   --format=FMT               Output format: text|json|sarif (default: text)
   --ci                       CI mode (stable timestamps, no screen clear)
   --no-color                 Force disable ANSI color
@@ -109,6 +121,8 @@ Options:
   --no-all-features          Do not pass --all-features to cargo
   --no-all-targets           Do not pass --all-targets to cargo
   --summary-json=FILE        Write a machine-readable summary (JSON)
+  --emit-findings-json=FILE  Write full findings (structured JSON)
+  --strict-gitignore         Honor .gitignore even without ripgrep
   --fail-critical=N          Exit non-zero if critical issues >= N (default: 1)
   --fail-warning=N           Exit non-zero if warnings  >= N (default: 0)
   -h, --help                 Show help
@@ -126,6 +140,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
+    --list-categories) LIST_CATEGORIES=1; shift;;
+    --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
     --format=*)   FORMAT="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
@@ -140,6 +156,8 @@ while [[ $# -gt 0 ]]; do
     --no-all-features) CARGO_FEATURES_ALL=0; shift;;
     --no-all-targets)  CARGO_TARGETS_ALL=0; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
+    --emit-findings-json=*) EMIT_FINDINGS_JSON="${1#*=}"; shift;;
+    --strict-gitignore) STRICT_GITIGNORE=1; shift;;
     --fail-critical=*) FAIL_CRITICAL_THRESHOLD="${1#*=}"; shift;;
     --fail-warning=*)  FAIL_WARNING_THRESHOLD="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
@@ -185,6 +203,43 @@ HAS_DENY=0
 HAS_UDEPS=0
 HAS_OUTDATED=0
 
+# ────────────────────────────────────────────────────────────────────────────
+# Finding recording (for JSON/text dual-mode)
+# ────────────────────────────────────────────────────────────────────────────
+FINDINGS=()     # each: severity|count|title|desc|category|samples_json
+add_finding() {
+  local severity="$1" count="$2" title="$3" desc="${4:-}" category="${5:-}"
+  local samples="${6:-[]}"
+  FINDINGS+=("${severity}|${count}|${title}|${desc}|${category}|${samples}")
+}
+json_escape() { sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+emit_findings_json() {
+  local out="$1"
+  {
+    echo '{'
+    printf '  "meta": {"version":"%s","project_dir":"%s","timestamp":"%s"},\n' "$VERSION" "$(printf '%s' "$PROJECT_DIR" | json_escape)" "$(now)"
+    echo '  "summary": {'
+    printf '    "files": %s, "critical": %s, "warning": %s, "info": %s\n' "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT"
+    echo '  },'
+    echo '  "findings": ['
+    local first=1
+    for f in "${FINDINGS[@]}"; do
+      IFS='|' read -r sev cnt ttl dsc cat sampl <<<"$f"
+      [[ $first -eq 0 ]] && echo ','
+      first=0
+      printf '    {"severity":"%s","count":%s,"category":"%s","title":"%s","description":"%s","samples":%s}' \
+        "$(printf '%s' "$sev" | json_escape)" "$(printf '%s' "$cnt")" \
+        "$(printf '%s' "$cat" | json_escape)" \
+        "$(printf '%s' "$ttl" | json_escape)" \
+        "$(printf '%s' "$dsc" | json_escape)" \
+        "${sampl:-[]}"
+    done
+    echo
+    echo '  ]'
+    echo '}'
+  } > "$out"
+}
+
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(rust.async.tokio-task-no-await)
 declare -A ASYNC_ERROR_SUMMARY=(
@@ -197,7 +252,32 @@ declare -A ASYNC_ERROR_SEVERITY=(
   [rust.async.tokio-task-no-await]='warning'
 )
 
-# Taint analysis metadata
+have_python3=0
+if command -v python3 >/dev/null 2>&1; then have_python3=1; fi
+
+# Category names (for JSON category tagging & --list-categories)
+declare -A CATEGORY_NAME=()
+CATEGORY_NAME[1]="Ownership & Error Handling"
+CATEGORY_NAME[2]="Unsafe & Memory Operations"
+CATEGORY_NAME[3]="Concurrency & Async Pitfalls"
+CATEGORY_NAME[4]="Numeric & Floating-Point"
+CATEGORY_NAME[5]="Collections & Iterators"
+CATEGORY_NAME[6]="String & Allocation Smells"
+CATEGORY_NAME[7]="Filesystem & Process"
+CATEGORY_NAME[8]="Security Findings"
+CATEGORY_NAME[9]="Code Quality Markers"
+CATEGORY_NAME[10]="Module & Visibility Issues"
+CATEGORY_NAME[11]="Tests & Benches Hygiene"
+CATEGORY_NAME[12]="Lints & Style (fmt/clippy)"
+CATEGORY_NAME[13]="Build Health (check/test)"
+CATEGORY_NAME[14]="Dependency Hygiene"
+CATEGORY_NAME[15]="API Misuse (Common)"
+CATEGORY_NAME[16]="Domain-Specific Heuristics"
+CATEGORY_NAME[17]="AST-Grep Rule Pack Findings"
+CATEGORY_NAME[18]="Meta Statistics & Inventory"
+CATEGORY_NAME[19]="Resource Lifecycle Correlation"
+
+# Taint analysis metadata (kept for future wiring)
 TAINT_RULE_IDS=(rust.taint.xss rust.taint.sql rust.taint.command)
 declare -A TAINT_SUMMARY=(
   [rust.taint.xss]='User input flows into HttpResponse/body/output macros without escaping'
@@ -263,13 +343,16 @@ for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)
 EXCLUDE_DIRS=(target .git .cargo .rustup .idea .vscode .DS_Store .svn .hg .vcpkg build dist coverage node_modules .tox .mypy_cache .pytest_cache .cache)
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
 EXCLUDE_FLAGS=()
-for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+if grep --help 2>&1 | grep -q -- '--exclude-dir'; then
+  for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+fi
 
 if command -v rg >/dev/null 2>&1; then
   HAS_RG=1
   if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
   RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
   RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden "${RG_JOBS[@]}")
+  if [[ "$STRICT_GITIGNORE" -eq 1 ]]; then RG_BASE+=(--ignore); else RG_BASE+=(--no-ignore); fi
   RG_EXCLUDES=()
   for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
   RG_INCLUDES=()
@@ -282,6 +365,11 @@ else
   GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
   GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
   GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
+  if [[ "$STRICT_GITIGNORE" -eq 1 && -f "$PROJECT_DIR/.gitignore" ]]; then
+    if command -v git >/dev/null 2>&1; then
+      export UBS_GIT_CHECK_IGNORE=1
+    fi
+  fi
 fi
 
 count_lines() { awk 'END{print (NR+0)}'; }
@@ -290,6 +378,7 @@ maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]]; then clear || true; fi; }
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 
 print_header() {
+  [[ -n "${1:-}" ]] || return 0
   say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   say "${WHITE}${BOLD}$1${RESET}"
   say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -310,7 +399,7 @@ print_finding() {
       say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}"
       ;;
     *)
-      local raw_count=$2; local title=$3; local description="${4:-}"
+      local raw_count=$2; local title=$3; local description="${4:-}"; local category="${5:-}"
       local count; count=$(printf '%s\n' "$raw_count" | awk 'END{print $0+0}')
       case $severity in
         critical)
@@ -350,6 +439,12 @@ show_detailed_finding() {
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
 }
 
+collect_samples_rg() {
+  local pattern="$1"; local limit="${2:-$DETAIL_LIMIT}"
+  mapfile -t lines < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit")
+  printf '['; local i=0; for l in "${lines[@]}"; do [[ $i -gt 0 ]] && printf ','; printf '"%s"' "$(printf '%s' "$l" | json_escape)"; i=$((i+1)); done; printf ']'
+}
+
 run_resource_lifecycle_checks() {
   local header_shown=0
   local rid
@@ -381,6 +476,7 @@ run_resource_lifecycle_checks() {
         local title="$summary [$relpath]"
         local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
         print_finding "$severity" "$delta" "$title" "$desc"
+        add_finding "$severity" "$delta" "$title" "$desc" "Resource Lifecycle" "$(collect_samples_rg "$acquire_regex" 3)"
       fi
     done <<<"$file_list"
   done
@@ -399,11 +495,11 @@ run_async_error_checks() {
     return
   fi
   local issues=0
-  while IFS=$'
-' read -r file; do
+  while IFS=$'\n' read -r file; do
     [[ -z "$file" ]] && continue
-    local missing
-    missing=$(python3 <<'PY2' "$file"
+    local missing=""
+    if [[ $have_python3 -eq 1 ]]; then
+      missing=$(python3 <<'PY2' "$file"
 import sys, re
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -420,10 +516,20 @@ if missing:
     print(','.join(missing))
 PY2
 )
+    else
+      local names
+      names=$(grep -nE 'let[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*tokio::spawn' "$file" 2>/dev/null | sed -E 's/.*let[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/' | sort -u)
+      for n in $names; do
+        if ! grep -qE "\\b${n}\\.(await|abort)\\b" "$file" 2>/dev/null; then
+          if [[ -z "$missing" ]]; then missing="$n"; else missing="$missing,$n"; fi
+        fi
+      done
+    fi
     if [[ -n "$missing" ]]; then
       issues=1
       local rel="${file#"$PROJECT_DIR"/}"
       print_finding "warning" 1 "tokio::spawn JoinHandle dropped" "Await or abort JoinHandles returned by tokio::spawn ($rel)"
+      add_finding "warning" 1 "tokio::spawn JoinHandle dropped" "Await or abort JoinHandles returned by tokio::spawn ($rel)" "Concurrency/Async" "$(collect_samples_rg "tokio::spawn" 3)"
     fi
   done <<<"$files"
   if [[ $issues -eq 0 ]]; then
@@ -457,16 +563,28 @@ check_ast_grep() {
   HAS_AST_GREP=0; return 1
 }
 
-check_cargo() {
-  if command -v cargo >/dev/null 2>&1; then HAS_CARGO=1; else HAS_CARGO=0; fi
-  if [[ "$HAS_CARGO" -eq 1 ]]; then
-    if cargo clippy -V >/dev/null 2>&1; then HAS_CLIPPY=1; fi
-    if rustfmt -V  >/dev/null 2>&1 || cargo fmt -V >/dev/null 2>&1; then HAS_FMT=1; fi
-    if cargo audit -V >/dev/null 2>&1; then HAS_AUDIT=1; fi
-    if cargo deny --version >/dev/null 2>&1; then HAS_DENY=1; fi
-    if cargo udeps -V >/dev/null 2>&1; then HAS_UDEPS=1; fi
-    if cargo outdated -V >/dev/null 2>&1; then HAS_OUTDATED=1; fi
-  fi
+list_categories() {
+  cat <<'CATS'
+1  Ownership & Error Handling
+2  Unsafe & Memory Operations
+3  Concurrency & Async Pitfalls
+4  Numeric & Floating-Point
+5  Collections & Iterators
+6  String & Allocation Smells
+7  Filesystem & Process
+8  Security Findings
+9  Code Quality Markers
+10 Module & Visibility Issues
+11 Tests & Benches Hygiene
+12 Lints & Style (fmt/clippy)
+13 Build Health (check/test)
+14 Dependency Hygiene
+15 API Misuse (Common)
+16 Domain-Specific Heuristics
+17 AST-Grep Rule Pack Findings
+18 Meta Statistics & Inventory
+19 Resource Lifecycle Correlation
+CATS
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -477,7 +595,7 @@ ast_search() {
   if [[ "$HAS_AST_GREP" -eq 1 ]]; then
     ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
   else
-    return 1
+    echo 0
   fi
 }
 
@@ -486,6 +604,9 @@ write_ast_rules() {
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ag_rules.XXXXXX)"
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
+  fi
+  if [[ -n "$DUMP_RULES_DIR" ]]; then
+    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
   fi
 
   # Ownership/error handling macros and panics
@@ -802,10 +923,11 @@ YAML
 id: rust.resource.thread-no-join
 language: rust
 rule:
-  pattern: let $HANDLE = std::thread::spawn($ARGS);
-  not:
-    inside:
-      pattern: $HANDLE.join()
+  all:
+    - pattern: let $HANDLE = std::thread::spawn($ARGS);
+    - not:
+        has:
+          pattern: $HANDLE.join()
 severity: warning
 message: "std::thread::spawn handle not joined in the same scope."
 YAML
@@ -814,15 +936,25 @@ YAML
 id: rust.resource.tokio-task-no-await
 language: rust
 rule:
-  pattern: let $TASK = tokio::spawn($ARGS);
-  not:
-    inside:
-      pattern: $TASK.await
-  not:
-    inside:
-      pattern: $TASK.abort()
+  all:
+    - pattern: let $TASK = tokio::spawn($ARGS);
+    - not:
+        has:
+          pattern: $TASK.await
+    - not:
+        has:
+          pattern: $TASK.abort()
 severity: warning
 message: "tokio::spawn task handle not awaited or aborted."
+YAML
+
+  cat >"$AST_RULE_DIR/tokio-spawn-no-move.yml" <<'YAML'
+id: rust.tokio.spawn-no-move
+language: rust
+rule:
+  pattern: tokio::spawn(async { $$ })
+severity: info
+message: "tokio::spawn without `move`; consider `async move` to avoid borrow across await."
 YAML
 
   # Performance / allocation
@@ -942,9 +1074,20 @@ YAML
 id: rust.plain-http-url
 language: rust
 rule:
-  pattern: "http://$REST"
+  all:
+    - kind: string_literal
+    - regex: "\"http://[^\"]+\""
 severity: info
 message: "Plain HTTP URL found; ensure HTTPS for production"
+YAML
+
+  cat >"$AST_RULE_DIR/command-shell-c.yml" <<'YAML'
+id: rust.command.shell-c
+language: rust
+rule:
+  pattern: std::process::Command::new($S).arg("-c").arg($CMD)
+severity: warning
+message: "Command::new(shell).arg(\"-c\", ...) invites shell injection; avoid shells or strictly validate input."
 YAML
 
   cat >"$AST_RULE_DIR/regex-new-unwrap.yml" <<'YAML'
@@ -974,6 +1117,9 @@ rule:
 severity: info
 message: "FIXME marker present"
 YAML
+
+  # Copy rules for external usage if requested
+  if [[ -n "$DUMP_RULES_DIR" ]]; then cp -R "$AST_RULE_DIR"/. "$DUMP_RULES_DIR"/ 2>/dev/null || true; fi
 }
 
 run_ast_rules() {
@@ -1091,6 +1237,12 @@ else
   say "${YELLOW}${WARN} --no-cargo set: skipping cargo-based checks.${RESET}"
 fi
 
+# If user only wants to see categories
+if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
+  list_categories
+  exit 0
+fi
+
 # relax pipefail for scanning
 begin_scan_section
 
@@ -1113,6 +1265,7 @@ ue_total=$((u_total + e_total))
 if [ "$ue_total" -gt 0 ]; then
   print_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer \`?\` or match to propagate/handle errors"
   show_detailed_finding "\.(unwrap|expect)\(" 5
+  add_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer \`?\` or match to propagate/handle errors" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "\.(unwrap|expect)\(" 5)"
 else
   print_finding "good" "No unwrap/expect detected"
 fi
@@ -1122,20 +1275,18 @@ p_count=$(( $(ast_search 'panic!($$)' || echo 0) + $("${GREP_RN[@]}" -e "panic!\
 u_count=$(( $(ast_search 'unreachable!($$)' || echo 0) + $("${GREP_RN[@]}" -e "unreachable!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 t_count=$(( $(ast_search 'todo!($$)' || echo 0) + $("${GREP_RN[@]}" -e "todo!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 ui_count=$(( $(ast_search 'unimplemented!($$)' || echo 0) + $("${GREP_RN[@]}" -e "unimplemented!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$p_count" -gt 0 ]; then print_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code"; show_detailed_finding "panic!\(" 5; else print_finding "good" "No panic! macros"; fi
-if [ "$u_count" -gt 0 ]; then print_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic"; fi
-if [ "$t_count" -gt 0 ]; then print_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)"; fi
-if [ "$ui_count" -gt 0 ]; then print_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove"; fi
+if [ "$p_count" -gt 0 ]; then print_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code"; show_detailed_finding "panic!\(" 5; add_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "panic!\(" 5)"; else print_finding "good" "No panic! macros"; fi
+if [ "$u_count" -gt 0 ]; then print_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic"; add_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "unreachable!\(" 3)"; fi
+if [ "$t_count" -gt 0 ]; then print_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)"; add_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "todo!\(" 3)"; fi
+if [ "$ui_count" -gt 0 ]; then print_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove"; add_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "unimplemented!\(" 3)"; fi
 
 print_subheader "dbg!/println!/eprintln!"
 dbg_count=$(( $(ast_search 'dbg!($$)' || echo 0) + $("${GREP_RN[@]}" -e "dbg!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 pln_count=$(( $(ast_search 'println!($$)' || echo 0) + $("${GREP_RN[@]}" -e "println!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 epln_count=$(( $(ast_search 'eprintln!($$)' || echo 0) + $("${GREP_RN[@]}" -e "eprintln!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$dbg_count" -gt 0 ]; then print_finding "info" "$dbg_count" "dbg! macros present"; fi
-if [ "$pln_count" -gt 0 ]; then print_finding "info" "$pln_count" "println! found - prefer logging"; fi
-if [ "$epln_count" -gt 0 ]; then print_finding "info" "$epln_count" "eprintln! found - prefer logging"; fi
-fi
-fi
+if [ "$dbg_count" -gt 0 ]; then print_finding "info" "$dbg_count" "dbg! macros present"; add_finding "info" "$dbg_count" "dbg! macros present" "" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "dbg!\(" 3)"; fi
+if [ "$pln_count" -gt 0 ]; then print_finding "info" "$pln_count" "println! found - prefer logging"; add_finding "info" "$pln_count" "println! found - prefer logging" "" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "println!\(" 3)"; fi
+if [ "$epln_count" -gt 0 ]; then print_finding "info" "$epln_count" "eprintln! found - prefer logging"; add_finding "info" "$epln_count" "eprintln! found - prefer logging" "" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "eprintln!\(" 3)"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1148,33 +1299,33 @@ print_category "Detects: unsafe blocks, transmute/uninitialized/forget/zeroed, r
 
 print_subheader "unsafe { ... } blocks"
 unsafe_count=$(( $(ast_search 'unsafe { $$ }' || echo 0) + $("${GREP_RN[@]}" -e "unsafe[[:space:]]*\{" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$unsafe_count" -gt 0 ]; then print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"; else print_finding "good" "No unsafe blocks detected"; fi
+if [ "$unsafe_count" -gt 0 ]; then print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"; add_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "unsafe[[:space:]]*\{" 3)"; else print_finding "good" "No unsafe blocks detected"; fi
 
 print_subheader "transmute, uninitialized, zeroed, forget"
 transmute_count=$(( $(ast_search 'std::mem::transmute($$)' || echo 0) + $("${GREP_RN[@]}" -e "transmute\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 uninit_count=$(( $(ast_search 'std::mem::uninitialized::<$T>()' || echo 0) + $("${GREP_RN[@]}" -e "uninitialized::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 zeroed_count=$(( $(ast_search 'std::mem::zeroed::<$T>()' || echo 0) + $("${GREP_RN[@]}" -e "zeroed::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 forget_count=$(( $(ast_search 'std::mem::forget($$)' || echo 0) + $("${GREP_RN[@]}" -e "mem::forget\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$transmute_count" -gt 0 ]; then print_finding "critical" "$transmute_count" "mem::transmute usage"; show_detailed_finding "transmute\(" 3; fi
-if [ "$uninit_count" -gt 0 ]; then print_finding "critical" "$uninit_count" "mem::uninitialized usage"; show_detailed_finding "uninitialized::<" 3; fi
-if [ "$zeroed_count" -gt 0 ]; then print_finding "critical" "$zeroed_count" "mem::zeroed usage"; show_detailed_finding "zeroed::<" 3; fi
-if [ "$forget_count" -gt 0 ]; then print_finding "warning" "$forget_count" "mem::forget leaks memory"; show_detailed_finding "mem::forget\(" 3; fi
+if [ "$transmute_count" -gt 0 ]; then print_finding "critical" "$transmute_count" "mem::transmute usage"; show_detailed_finding "transmute\(" 3; add_finding "critical" "$transmute_count" "mem::transmute usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "transmute\(" 3)"; fi
+if [ "$uninit_count" -gt 0 ]; then print_finding "critical" "$uninit_count" "mem::uninitialized usage"; show_detailed_finding "uninitialized::<" 3; add_finding "critical" "$uninit_count" "mem::uninitialized usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "uninitialized::<" 3)"; fi
+if [ "$zeroed_count" -gt 0 ]; then print_finding "critical" "$zeroed_count" "mem::zeroed usage"; show_detailed_finding "zeroed::<" 3; add_finding "critical" "$zeroed_count" "mem::zeroed usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "zeroed::<" 3)"; fi
+if [ "$forget_count" -gt 0 ]; then print_finding "warning" "$forget_count" "mem::forget leaks memory"; show_detailed_finding "mem::forget\(" 3; add_finding "warning" "$forget_count" "mem::forget leaks memory" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "mem::forget\(" 3)"; fi
 
 print_subheader "CStr::from_bytes_with_nul_unchecked"
 cstr_count=$(( $(ast_search 'std::ffi::CStr::from_bytes_with_nul_unchecked($$)' || echo 0) + $("${GREP_RN[@]}" -e "from_bytes_with_nul_unchecked\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$cstr_count" -gt 0 ]; then print_finding "warning" "$cstr_count" "CStr unchecked conversion used"; fi
+if [ "$cstr_count" -gt 0 ]; then print_finding "warning" "$cstr_count" "CStr unchecked conversion used"; add_finding "warning" "$cstr_count" "CStr unchecked conversion used" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "from_bytes_with_nul_unchecked\(" 2)"; fi
 
 print_subheader "get_unchecked / from_utf8_unchecked / from_raw_parts"
 guc_count=$(( $(ast_search '$S.get_unchecked($I)' || echo 0) + $(ast_search '$S.get_unchecked_mut($I)' || echo 0) ))
 u8u_count=$(( $(ast_search 'std::str::from_utf8_unchecked($$)' || echo 0) + $(ast_search 'std::string::String::from_utf8_unchecked($$)' || echo 0) ))
 raw_parts=$(( $(ast_search 'std::slice::from_raw_parts($$)' || echo 0) + $(ast_search 'std::slice::from_raw_parts_mut($$)' || echo 0) ))
-if [ "$guc_count" -gt 0 ]; then print_finding "warning" "$guc_count" "Unchecked indexing APIs in use"; fi
-if [ "$u8u_count" -gt 0 ]; then print_finding "warning" "$u8u_count" "UTF-8 unchecked conversion APIs"; fi
-if [ "$raw_parts" -gt 0 ]; then print_finding "warning" "$raw_parts" "slice::from_raw_parts(_mut) usage"; fi
+if [ "$guc_count" -gt 0 ]; then print_finding "warning" "$guc_count" "Unchecked indexing APIs in use"; add_finding "warning" "$guc_count" "Unchecked indexing APIs in use" "" "${CATEGORY_NAME[2]}"; fi
+if [ "$u8u_count" -gt 0 ]; then print_finding "warning" "$u8u_count" "UTF-8 unchecked conversion APIs"; add_finding "warning" "$u8u_count" "UTF-8 unchecked conversion APIs" "" "${CATEGORY_NAME[2]}"; fi
+if [ "$raw_parts" -gt 0 ]; then print_finding "warning" "$raw_parts" "slice::from_raw_parts(_mut) usage"; add_finding "warning" "$raw_parts" "slice::from_raw_parts(_mut) usage" "" "${CATEGORY_NAME[2]}"; fi
 
 print_subheader "Unsafe Send/Sync impls"
 autos_count=$(( $(ast_search 'unsafe impl Send for $T { $$ }' || echo 0) + $(ast_search 'unsafe impl Sync for $T { $$ }' || echo 0) ))
-if [ "$autos_count" -gt 0 ]; then print_finding "warning" "$autos_count" "Unsafe Send/Sync implementations"; fi
+if [ "$autos_count" -gt 0 ]; then print_finding "warning" "$autos_count" "Unsafe Send/Sync implementations"; add_finding "warning" "$autos_count" "Unsafe Send/Sync implementations" "" "${CATEGORY_NAME[2]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1189,39 +1340,40 @@ print_subheader "Arc<Mutex<..>> / Rc<RefCell<..>> / RwLock"
 arc_mutex=$(( $(ast_search 'Arc<Mutex<$T>>' || echo 0) + $("${GREP_RN[@]}" -e "Arc<\s*Mutex<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 rc_refcell=$(( $(ast_search 'Rc<RefCell<$T>>' || echo 0) + $("${GREP_RN[@]}" -e "Rc<\s*RefCell<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 rwlock_count=$("${GREP_RN[@]}" -e "RwLock<" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$arc_mutex" -gt 0 ]; then print_finding "info" "$arc_mutex" "Arc<Mutex<..>> detected - verify contention"; fi
-if [ "$rc_refcell" -gt 0 ]; then print_finding "warning" "$rc_refcell" "Rc<RefCell<..>> borrow panics possible"; fi
-if [ "$rwlock_count" -gt 0 ]; then print_finding "info" "$rwlock_count" "RwLock in use - verify read/write patterns"; fi
+if [ "$arc_mutex" -gt 0 ]; then print_finding "info" "$arc_mutex" "Arc<Mutex<..>> detected - verify contention"; add_finding "info" "$arc_mutex" "Arc<Mutex<..>> detected - verify contention" "" "${CATEGORY_NAME[3]}"; fi
+if [ "$rc_refcell" -gt 0 ]; then print_finding "warning" "$rc_refcell" "Rc<RefCell<..>> borrow panics possible"; add_finding "warning" "$rc_refcell" "Rc<RefCell<..>> borrow panics possible" "" "${CATEGORY_NAME[3]}"; fi
+if [ "$rwlock_count" -gt 0 ]; then print_finding "info" "$rwlock_count" "RwLock in use - verify read/write patterns"; add_finding "info" "$rwlock_count" "RwLock in use - verify read/write patterns" "" "${CATEGORY_NAME[3]}"; fi
 
 print_subheader "Mutex::lock().unwrap()/expect()"
 mu_unwrap=$(( $(ast_search '$M.lock().unwrap()' || echo 0) + $("${GREP_RN[@]}" -e "\.lock\(\)\.unwrap\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 mu_expect=$(( $(ast_search '$M.lock().expect($MSG)' || echo 0) + $("${GREP_RN[@]}" -e "\.lock\(\)\.expect\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 mu_total=$((mu_unwrap + mu_expect))
-if [ "$mu_total" -gt 0 ]; then print_finding "warning" "$mu_total" "Poisoned lock handling via unwrap/expect"; show_detailed_finding "\.lock\(\)\.(unwrap|expect)\(" 5; fi
+if [ "$mu_total" -gt 0 ]; then print_finding "warning" "$mu_total" "Poisoned lock handling via unwrap/expect"; show_detailed_finding "\.lock\(\)\.(unwrap|expect)\(" 5; add_finding "warning" "$mu_total" "Poisoned lock handling via unwrap/expect" "" "${CATEGORY_NAME[3]}" "$(collect_samples_rg "\.lock\(\)\.(unwrap|expect)\(" 5)"; fi
 
 print_subheader "await inside loops (sequentialism)"
 await_loop=$(( $(ast_search 'for $P in $I { $$ $F.await $$ }' || echo 0) + $("${GREP_RN[@]}" -e "for[^(]*\{[^\}]*\.[[:alnum:]_]+\.await" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$await_loop" -gt 0 ]; then print_finding "info" "$await_loop" "await inside loop; consider batched concurrency"; fi
+if [ "$await_loop" -gt 0 ]; then print_finding "info" "$await_loop" "await inside loop; consider batched concurrency"; add_finding "info" "$await_loop" "await inside loop; consider batched concurrency" "" "${CATEGORY_NAME[3]}"; fi
 
 print_subheader "Blocking ops inside async (thread::sleep, std::fs)"
 sleep_async=$(( $(ast_search 'std::thread::sleep($$)' || echo 0) + $("${GREP_RN[@]}" -e "thread::sleep\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 fs_async=$(( $(ast_search 'std::fs::read($$)' || echo 0) + $("${GREP_RN[@]}" -e "std::fs::(read|read_to_string|write|rename|copy|remove_file)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$sleep_async" -gt 0 ]; then print_finding "warning" "$sleep_async" "thread::sleep in async"; fi
-if [ "$fs_async" -gt 0 ]; then print_finding "info" "$fs_async" "Blocking std::fs in async code"; fi
+if [ "$sleep_async" -gt 0 ]; then print_finding "warning" "$sleep_async" "thread::sleep in async"; add_finding "warning" "$sleep_async" "thread::sleep in async" "" "${CATEGORY_NAME[3]}"; fi
+if [ "$fs_async" -gt 0 ]; then print_finding "info" "$fs_async" "Blocking std::fs in async code"; add_finding "info" "$fs_async" "Blocking std::fs in async code" "" "${CATEGORY_NAME[3]}"; fi
 
 print_subheader "block_on within async context"
 block_on=$(( $(ast_search 'futures::executor::block_on($$)' || echo 0) + $(ast_search 'tokio::runtime::Runtime::block_on($$)' || echo 0) ))
-if [ "$block_on" -gt 0 ]; then print_finding "warning" "$block_on" "block_on within async function"; fi
+if [ "$block_on" -gt 0 ]; then print_finding "warning" "$block_on" "block_on within async function"; add_finding "warning" "$block_on" "block_on within async function" "" "${CATEGORY_NAME[3]}"; fi
 
 print_subheader "std::thread::spawn within async"
 spawn_in_async=$(( $(ast_search 'std::thread::spawn($$)' || echo 0) ))
-if [ "$spawn_in_async" -gt 0 ]; then print_finding "warning" "$spawn_in_async" "std::thread::spawn inside async fn"; fi
+if [ "$spawn_in_async" -gt 0 ]; then print_finding "warning" "$spawn_in_async" "std::thread::spawn inside async fn"; add_finding "warning" "$spawn_in_async" "std::thread::spawn inside async fn" "" "${CATEGORY_NAME[3]}"; fi
 
 print_subheader "tokio::spawn usage (heuristic for detached tasks)"
 spawn_count=$("${GREP_RN[@]}" -e "tokio::spawn\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 join_handle_used=$("${GREP_RN[@]}" -e "JoinHandle<|\.await" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$spawn_count" -gt 0 ] && [ "$join_handle_used" -lt "$spawn_count" ]; then
   print_finding "info" "$((spawn_count - join_handle_used))" "spawn without awaiting JoinHandle (heuristic)" "Ensure detached tasks handle errors appropriately"
+  add_finding "info" "$((spawn_count - join_handle_used))" "spawn without awaiting JoinHandle (heuristic)" "Ensure detached tasks handle errors appropriately" "${CATEGORY_NAME[3]}"
 fi
 
 run_async_error_checks
@@ -1236,15 +1388,14 @@ print_category "Detects: float equality, division/modulo by variable, potential 
   "Numeric bugs cause subtle logic errors or panics in debug builds (overflow)"
 
 print_subheader "Floating-point equality comparisons"
-# literals or obvious float identifiers on either side
 fp_eq=$("${GREP_RN[@]}" -e "([[:alnum:]_]\s*(==|!=)\s*[[:alnum:]_]*\.[[:alnum:]_]+)|((==|!=)[[:space:]]*[0-9]+\.[0-9]+)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$fp_eq" -gt 0 ]; then print_finding "info" "$fp_eq" "Float equality/inequality check" "Consider epsilon comparisons"; show_detailed_finding "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" 3; else print_finding "good" "No direct float equality checks detected"; fi
+if [ "$fp_eq" -gt 0 ]; then print_finding "info" "$fp_eq" "Float equality/inequality check" "Consider epsilon comparisons"; show_detailed_finding "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" 3; add_finding "info" "$fp_eq" "Float equality/inequality check" "Consider epsilon comparisons" "${CATEGORY_NAME[4]}" "$(collect_samples_rg "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" 3)"; else print_finding "good" "No direct float equality checks detected"; fi
 
 print_subheader "Division/modulo by variable (verify non-zero)"
 div_var=$("${GREP_RN[@]}" -e "/[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "https?://|//|/\*" || true | count_lines)
 mod_var=$("${GREP_RN[@]}" -e "%[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "//|/\*" || true | count_lines)
-if [ "$div_var" -gt 0 ]; then print_finding "info" "$div_var" "Division by variables - guard zero divisors"; fi
-if [ "$mod_var" -gt 0 ]; then print_finding "info" "$mod_var" "Modulo by variables - guard zero divisors"; fi
+if [ "$div_var" -gt 0 ]; then print_finding "info" "$div_var" "Division by variables - guard zero divisors"; add_finding "info" "$div_var" "Division by variables - guard zero divisors" "" "${CATEGORY_NAME[4]}"; fi
+if [ "$mod_var" -gt 0 ]; then print_finding "info" "$mod_var" "Modulo by variables - guard zero divisors"; add_finding "info" "$mod_var" "Modulo by variables - guard zero divisors" "" "${CATEGORY_NAME[4]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1258,16 +1409,16 @@ print_category "Detects: clone in loops, collect then iterate, nth(0), length ch
 print_subheader "clone() occurrences & clone() in loops"
 clone_any=$(( $(ast_search '$X.clone()' || echo 0) + $("${GREP_RN[@]}" -e "\.clone\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 clone_loop=$(( $(ast_search 'for $P in $I { $$ $X.clone() $$ }' || echo 0) ))
-if [ "$clone_any" -gt 0 ]; then print_finding "info" "$clone_any" "clone() usages - audit for necessity"; fi
-if [ "$clone_loop" -gt 0 ]; then print_finding "warning" "$clone_loop" "clone() inside loops - potential perf hit"; fi
+if [ "$clone_any" -gt 0 ]; then print_finding "info" "$clone_any" "clone() usages - audit for necessity"; add_finding "info" "$clone_any" "clone() usages - audit for necessity" "" "${CATEGORY_NAME[5]}"; fi
+if [ "$clone_loop" -gt 0 ]; then print_finding "warning" "$clone_loop" "clone() inside loops - potential perf hit"; add_finding "warning" "$clone_loop" "clone() inside loops - potential perf hit" "" "${CATEGORY_NAME[5]}"; fi
 
 print_subheader "collect::<Vec<_>>() then for"
 collect_for=$(( $(ast_search 'for $P in $I.collect::<Vec<$T>>() { $$ }' || echo 0) + $("${GREP_RN[@]}" -e "collect::<\s*Vec<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$collect_for" -gt 0 ]; then print_finding "info" "$collect_for" "Collecting to Vec before iterate - consider streaming"; fi
+if [ "$collect_for" -gt 0 ]; then print_finding "info" "$collect_for" "Collecting to Vec before iterate - consider streaming"; add_finding "info" "$collect_for" "Collecting to Vec before iterate - consider streaming" "" "${CATEGORY_NAME[5]}"; fi
 
 print_subheader "nth(0) → next()"
 nth0=$(( $(ast_search '$I.nth(0)' || echo 0) + $("${GREP_RN[@]}" -e "\.nth\(\s*0\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$nth0" -gt 0 ]; then print_finding "info" "$nth0" "nth(0) detected - prefer next()"; fi
+if [ "$nth0" -gt 0 ]; then print_finding "info" "$nth0" "nth(0) detected - prefer next()"; add_finding "info" "$nth0" "nth(0) detected - prefer next()" "" "${CATEGORY_NAME[5]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1280,13 +1431,13 @@ print_category "Detects: needless allocations, format!(literal), to_owned().to_s
 
 print_subheader "to_owned().to_string() chain"
 to_owned_to_string=$(( $(ast_search '$X.to_owned().to_string()' || echo 0) + $("${GREP_RN[@]}" -e "\.to_owned\(\)\.to_string\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$to_owned_to_string" -gt 0 ]; then print_finding "info" "$to_owned_to_string" "to_owned().to_string() chain - simplify"; fi
+if [ "$to_owned_to_string" -gt 0 ]; then print_finding "info" "$to_owned_to_string" "to_owned().to_string() chain - simplify"; add_finding "info" "$to_owned_to_string" "to_owned().to_string() chain - simplify" "" "${CATEGORY_NAME[6]}"; fi
 
 print_subheader "format!(\"literal\") with no placeholders"
 fmt_lit=$(( $(ast_search 'format!($S)' || echo 0) ))
 fmt_lit_rg=$("${GREP_RN[@]}" -e "format!\(\s*([rR]?#?\"[^\{\}]*\"#?)\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 fmt_total=$((fmt_lit + fmt_lit_rg))
-if [ "$fmt_total" -gt 0 ]; then print_finding "info" "$fmt_total" "format!(literal) allocates - use .to_string()"; fi
+if [ "$fmt_total" -gt 0 ]; then print_finding "info" "$fmt_total" "format!(literal) allocates - use .to_string()"; add_finding "info" "$fmt_total" "format!(literal) allocates - use .to_string()" "" "${CATEGORY_NAME[6]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1299,11 +1450,11 @@ print_category "Detects: blocking std::fs in async, process::Command usage heuri
 
 print_subheader "std::fs usage (general inventory)"
 fs_any=$("${GREP_RN[@]}" -e "std::fs::" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$fs_any" -gt 0 ]; then print_finding "info" "$fs_any" "std::fs operations present - consider async equivalents where applicable"; fi
+if [ "$fs_any" -gt 0 ]; then print_finding "info" "$fs_any" "std::fs operations present - consider async equivalents where applicable"; add_finding "info" "$fs_any" "std::fs operations present - consider async equivalents where applicable" "" "${CATEGORY_NAME[7]}"; fi
 
 print_subheader "std::process::Command usage"
 cmd_count=$("${GREP_RN[@]}" -e "std::process::Command::new\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$cmd_count" -gt 0 ]; then print_finding "info" "$cmd_count" "Command::new detected - ensure args are sanitized and errors handled"; show_detailed_finding "std::process::Command::new\(" 3; fi
+if [ "$cmd_count" -gt 0 ]; then print_finding "info" "$cmd_count" "Command::new detected - ensure args are sanitized and errors handled"; show_detailed_finding "std::process::Command::new\(" 3; add_finding "info" "$cmd_count" "Command::new detected - ensure args are sanitized and errors handled" "" "${CATEGORY_NAME[7]}" "$(collect_samples_rg "std::process::Command::new\(" 3)"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1316,22 +1467,22 @@ print_category "Detects: TLS verification disabled, weak hash algos, HTTP URLs, 
 
 print_subheader "Weak hash algorithms (MD5/SHA1)"
 weak_hash=$(( $(ast_search 'md5::$F($$)' || echo 0) + $(ast_search 'sha1::$F($$)' || echo 0) + $("${GREP_RN[@]}" -e "SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$weak_hash" -gt 0 ]; then print_finding "warning" "$weak_hash" "Weak hash algorithm usage (MD5/SHA1)"; show_detailed_finding "md5::|sha1::|SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)" 5; else print_finding "good" "No MD5/SHA1 found"; fi
+if [ "$weak_hash" -gt 0 ]; then print_finding "warning" "$weak_hash" "Weak hash algorithm usage (MD5/SHA1)"; show_detailed_finding "md5::|sha1::|SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)" 5; add_finding "warning" "$weak_hash" "Weak hash algorithm usage (MD5/SHA1)" "" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "md5::|sha1::|SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)" 5)"; else print_finding "good" "No MD5/SHA1 found"; fi
 
 print_subheader "TLS verification disabled"
 tls_insecure=$(( $(ast_search 'reqwest::ClientBuilder::new().danger_accept_invalid_certs(true)' || echo 0) \
   + $("${GREP_RN[@]}" -e "danger_accept_invalid_certs\(\s*true\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) \
   + $("${GREP_RN[@]}" -e "SslVerifyMode::NONE" "$PROJECT_DIR" 2>/dev/null | count_lines || true) \
   + $("${GREP_RN[@]}" -e "TlsConnector::builder\(\)\.danger_accept_invalid_certs\(true\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$tls_insecure" -gt 0 ]; then print_finding "critical" "$tls_insecure" "TLS verification disabled"; fi
+if [ "$tls_insecure" -gt 0 ]; then print_finding "critical" "$tls_insecure" "TLS verification disabled"; add_finding "critical" "$tls_insecure" "TLS verification disabled" "" "${CATEGORY_NAME[8]}"; fi
 
 print_subheader "Plain http:// URLs"
 http_url=$(( $(ast_search '"http://$REST"' || echo 0) + $("${GREP_RN[@]}" -e "http://[A-Za-z0-9]" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$http_url" -gt 0 ]; then print_finding "info" "$http_url" "Plain HTTP URL(s) detected"; fi
+if [ "$http_url" -gt 0 ]; then print_finding "info" "$http_url" "Plain HTTP URL(s) detected"; add_finding "info" "$http_url" "Plain HTTP URL(s) detected" "" "${CATEGORY_NAME[8]}"; fi
 
 print_subheader "Hardcoded secrets/credentials (heuristic)"
 secret_heur=$("${GREP_RNI[@]}" -e "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$secret_heur" -gt 0 ]; then print_finding "critical" "$secret_heur" "Possible hardcoded secrets"; show_detailed_finding "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" 3; fi
+if [ "$secret_heur" -gt 0 ]; then print_finding "critical" "$secret_heur" "Possible hardcoded secrets"; show_detailed_finding "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" 3; add_finding "critical" "$secret_heur" "Possible hardcoded secrets" "" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" 3)"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1349,8 +1500,10 @@ note_count=$("${GREP_RNI[@]}" "NOTE" "$PROJECT_DIR" 2>/dev/null | count_lines ||
 total_markers=$((todo_count + fixme_count + hack_count))
 if [ "$total_markers" -gt 20 ]; then
   print_finding "warning" "$total_markers" "Significant technical debt"; say "    ${YELLOW}TODO:${RESET} $todo_count  ${RED}FIXME:${RESET} $fixme_count  ${MAGENTA}HACK:${RESET} $hack_count  ${BLUE}NOTE:${RESET} $note_count"
+  add_finding "warning" "$total_markers" "Significant technical debt" "TODO:$todo_count, FIXME:$fixme_count, HACK:$hack_count, NOTE:$note_count" "${CATEGORY_NAME[9]}"
 elif [ "$total_markers" -gt 0 ]; then
   print_finding "info" "$total_markers" "Technical debt markers present"; say "    ${YELLOW}TODO:${RESET} $todo_count  ${RED}FIXME:${RESET} $fixme_count  ${MAGENTA}HACK:${RESET} $hack_count  ${BLUE}NOTE:${RESET} $note_count"
+  add_finding "info" "$total_markers" "Technical debt markers present" "TODO:$todo_count, FIXME:$fixme_count, HACK:$hack_count, NOTE:$note_count" "${CATEGORY_NAME[9]}"
 else
   print_finding "good" "No TODO/FIXME/HACK markers found"
 fi
@@ -1366,11 +1519,11 @@ print_category "Detects: pub use wildcards, glob imports, re-exports" \
 
 print_subheader "Wildcard imports (use crate::* or ::*)"
 glob_imports=$("${GREP_RN[@]}" -e "use\s+[a-zA-Z0-9_:]+::\*\s*;" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$glob_imports" -gt 0 ]; then print_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names"; show_detailed_finding "use\s+[a-zA-Z0-9_:]+::\*\s*;" 3; else print_finding "good" "No wildcard imports detected"; fi
+if [ "$glob_imports" -gt 0 ]; then print_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names"; show_detailed_finding "use\s+[a-zA-Z0-9_:]+::\*\s*;" 3; add_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names" "" "${CATEGORY_NAME[10]}" "$(collect_samples_rg "use\s+[a-zA-Z0-9_:]+::\*\s*;" 3)"; else print_finding "good" "No wildcard imports detected"; fi
 
 print_subheader "pub use re-exports (inventory)"
 pub_use=$("${GREP_RN[@]}" -e "pub\s+use\s+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$pub_use" -gt 0 ]; then print_finding "info" "$pub_use" "pub use re-exports present - verify API surface"; fi
+if [ "$pub_use" -gt 0 ]; then print_finding "info" "$pub_use" "pub use re-exports present - verify API surface"; add_finding "info" "$pub_use" "pub use re-exports present - verify API surface" "" "${CATEGORY_NAME[10]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1383,12 +1536,12 @@ print_category "Detects: ignored tests, todo! in tests, println!/dbg! in tests" 
 
 print_subheader "#[ignore] tests"
 ignored_tests=$("${GREP_RN[@]}" -e "#\[ignore\]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$ignored_tests" -gt 0 ]; then print_finding "info" "$ignored_tests" "#[ignore] tests present - verify intent"; fi
+if [ "$ignored_tests" -gt 0 ]; then print_finding "info" "$ignored_tests" "#[ignore] tests present - verify intent"; add_finding "info" "$ignored_tests" "#[ignore] tests present - verify intent" "" "${CATEGORY_NAME[11]}"; fi
 
 print_subheader "todo!/unimplemented! in tests"
 test_todo=$("${GREP_RN[@]}" -e "#\[test\]" "$PROJECT_DIR" 2>/dev/null | (grep -A5 -E "todo!|unimplemented!" || true) | (grep -Ec "todo!|unimplemented!" || true))
 test_todo=$(echo "$test_todo" | awk 'END{print $0+0}')
-if [ "$test_todo" -gt 0 ]; then print_finding "info" "$test_todo" "todo!/unimplemented! seen near #[test]"; fi
+if [ "$test_todo" -gt 0 ]; then print_finding "info" "$test_todo" "todo!/unimplemented! seen near #[test]"; add_finding "info" "$test_todo" "todo!/unimplemented! seen near #[test]" "" "${CATEGORY_NAME[11]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1410,6 +1563,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     r_ec=$(cat "$FMT_LOG.ec" 2>/dev/null || echo 0)
     if [[ "$r_ec" -ne 0 ]]; then
       print_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt"
+      add_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt" "${CATEGORY_NAME[12]}"
     else
       print_finding "good" "Formatting is clean"
     fi
@@ -1417,14 +1571,14 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     print_finding "info" 1 "rustfmt not installed; skipping format check"
   fi
 
-  # cargo clippy
+  # cargo clippy (normalize -D warnings)
   if [[ "$HAS_CLIPPY" -eq 1 ]]; then
     extra1=(); [[ "$CARGO_FEATURES_ALL" -eq 1 ]] && extra1+=(--all-features)
     extra2=(); [[ "$CARGO_TARGETS_ALL" -eq 1 ]] && extra2+=(--all-targets)
-    run_cargo_subcmd "clippy" "$CLIPPY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo clippy ${extra1[*]} ${extra2[*]} -- -D warnings"
+    run_cargo_subcmd "clippy" "$CLIPPY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo clippy ${extra1[*]} ${extra2[*]} -- -D warnings || true"
     w_e=$(count_warnings_errors "$CLIPPY_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
-    if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Clippy errors"; fi
-    if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Clippy warnings"; fi
+    if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Clippy errors"; add_finding "critical" "$e" "Clippy errors" "" "${CATEGORY_NAME[12]}"; fi
+    if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Clippy warnings"; add_finding "warning" "$w" "Clippy warnings" "" "${CATEGORY_NAME[12]}"; fi
     if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then print_finding "good" "No clippy warnings/errors"; fi
   else
     print_finding "info" 1 "clippy not installed; skipping lint pass"
@@ -1449,13 +1603,13 @@ CHECK_LOG="$(mktemp)"; TEST_LOG="$(mktemp)"; TMP_FILES+=("$CHECK_LOG" "$TEST_LOG
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   run_cargo_subcmd "check" "$CHECK_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo check"
   w_e=$(count_warnings_errors "$CHECK_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
-  if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "cargo check errors"; fi
-  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "cargo check warnings"; else print_finding "good" "cargo check clean"; fi
+  if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "cargo check errors"; add_finding "critical" "$e" "cargo check errors" "" "${CATEGORY_NAME[13]}"; fi
+  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "cargo check warnings"; add_finding "warning" "$w" "cargo check warnings" "" "${CATEGORY_NAME[13]}"; else print_finding "good" "cargo check clean"; fi
 
   run_cargo_subcmd "test-no-run" "$TEST_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo test --no-run"
   w_e=$(count_warnings_errors "$TEST_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
-  if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Tests failed to build (cargo test --no-run)"; fi
-  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; else print_finding "good" "Tests build clean"; fi
+  if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Tests failed to build (cargo test --no-run)"; add_finding "critical" "$e" "Tests failed to build (cargo test --no-run)" "" "${CATEGORY_NAME[13]}"; fi
+  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; add_finding "warning" "$w" "Test build warnings" "" "${CATEGORY_NAME[13]}"; else print_finding "good" "Tests build clean"; fi
 else
   print_finding "info" 1 "cargo disabled/unavailable; build checks skipped"
 fi
@@ -1473,7 +1627,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$HAS_AUDIT" -eq 1 ]]; then
     AUDIT_LOG="$(mktemp)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo audit"
     audit_vuln=$(grep -c -E "Vulnerability|RUSTSEC" "$AUDIT_LOG" 2>/dev/null || true); audit_vuln=${audit_vuln:-0}
-    if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; else print_finding "good" "No known advisories (cargo-audit)"; fi
+    if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; add_finding "critical" "$audit_vuln" "Advisories found by cargo-audit" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "No known advisories (cargo-audit)"; fi
   else
     print_finding "info" 1 "cargo-audit not installed; skipping advisory scan"
   fi
@@ -1482,8 +1636,8 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     DENY_LOG="$(mktemp)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo deny check advisories bans licenses sources"
     deny_err=$(grep -c -E "error\[[^)]+\]|[[:space:]]error:" "$DENY_LOG" 2>/dev/null || true); deny_err=${deny_err:-0}
     deny_warn=$(grep -c -E "[[:space:]]warning:" "$DENY_LOG" 2>/dev/null || true); deny_warn=${deny_warn:-0}
-    if [[ "$deny_err" -gt 0 ]]; then print_finding "critical" "$deny_err" "cargo-deny errors"; fi
-    if [[ "$deny_warn" -gt 0 ]]; then print_finding "warning" "$deny_warn" "cargo-deny warnings"; fi
+    if [[ "$deny_err" -gt 0 ]]; then print_finding "critical" "$deny_err" "cargo-deny errors"; add_finding "critical" "$deny_err" "cargo-deny errors" "" "${CATEGORY_NAME[14]}"; fi
+    if [[ "$deny_warn" -gt 0 ]]; then print_finding "warning" "$deny_warn" "cargo-deny warnings"; add_finding "warning" "$deny_warn" "cargo-deny warnings" "" "${CATEGORY_NAME[14]}"; fi
     if [[ "$deny_err" -eq 0 && "$deny_warn" -eq 0 ]]; then print_finding "good" "cargo-deny clean"; fi
   else
     print_finding "info" 1 "cargo-deny not installed; skipping policy checks"
@@ -1492,7 +1646,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$HAS_UDEPS" -eq 1 ]]; then
     UDEPS_LOG="$(mktemp)"; TMP_FILES+=("$UDEPS_LOG"); run_cargo_subcmd "udeps" "$UDEPS_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo udeps --all-targets"
     udeps_count=$(grep -c -E "(unused dependency|possibly unused|not used)" "$UDEPS_LOG" 2>/dev/null || true); udeps_count=${udeps_count:-0}
-    if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; else print_finding "good" "No unused dependencies"; fi
+    if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; add_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "No unused dependencies"; fi
   else
     print_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan"
   fi
@@ -1500,7 +1654,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$HAS_OUTDATED" -eq 1 ]]; then
     OUT_LOG="$(mktemp)"; TMP_FILES+=("$OUT_LOG"); run_cargo_subcmd "outdated" "$OUT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo outdated -R"
     outdated_count=$(grep -E "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null | wc -l | awk '{print $1+0}')
-    if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; else print_finding "good" "Dependencies up-to-date"; fi
+    if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; add_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "Dependencies up-to-date"; fi
   else
     print_finding "info" 1 "cargo-outdated not installed; skipping update report"
   fi
@@ -1519,16 +1673,16 @@ print_category "Detects: nth(0), DefaultHasher, expect_err/unwrap_err, Option::u
 
 print_subheader "std::collections::hash_map::DefaultHasher"
 def_hasher=$("${GREP_RN[@]}" -e "DefaultHasher" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$def_hasher" -gt 0 ]; then print_finding "info" "$def_hasher" "DefaultHasher detected - not for cryptographic or stable hashing"; fi
+if [ "$def_hasher" -gt 0 ]; then print_finding "info" "$def_hasher" "DefaultHasher detected - not for cryptographic or stable hashing"; add_finding "info" "$def_hasher" "DefaultHasher detected - not for cryptographic or stable hashing" "" "${CATEGORY_NAME[15]}"; fi
 
 print_subheader "unwrap_err()/expect_err() usage inventory"
 unwrap_err=$("${GREP_RN[@]}" -e "unwrap_err\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 expect_err=$("${GREP_RN[@]}" -e "expect_err\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$unwrap_err" -gt 0 ] || [ "$expect_err" -gt 0 ]; then print_finding "info" "$((unwrap_err+expect_err))" "unwrap_err/expect_err present - ensure test-only or justified"; fi
+if [ "$unwrap_err" -gt 0 ] || [ "$expect_err" -gt 0 ]; then print_finding "info" "$((unwrap_err+expect_err))" "unwrap_err/expect_err present - ensure test-only or justified"; add_finding "info" "$((unwrap_err+expect_err))" "unwrap_err/expect_err present - ensure test-only or justified" "" "${CATEGORY_NAME[15]}"; fi
 
 print_subheader "Option::unwrap_or_default inventory"
 uod=$("${GREP_RN[@]}" -e "\.unwrap_or_default\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$uod" -gt 0 ]; then print_finding "info" "$uod" "unwrap_or_default present - validate default semantics"; fi
+if [ "$uod" -gt 0 ]; then print_finding "info" "$uod" "unwrap_or_default present - validate default semantics"; add_finding "info" "$uod" "unwrap_or_default present - validate default semantics" "" "${CATEGORY_NAME[15]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1541,15 +1695,15 @@ print_category "Detects: reqwest builder, SQL string concatenation (heuristic), 
 
 print_subheader "reqwest::ClientBuilder inventory"
 reqwest_builder=$("${GREP_RN[@]}" -e "reqwest::ClientBuilder::new\(\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$reqwest_builder" -gt 0 ]; then print_finding "info" "$reqwest_builder" "reqwest ClientBuilder usage - review TLS, timeouts, redirects"; fi
+if [ "$reqwest_builder" -gt 0 ]; then print_finding "info" "$reqwest_builder" "reqwest ClientBuilder usage - review TLS, timeouts, redirects"; add_finding "info" "$reqwest_builder" "reqwest ClientBuilder usage - review TLS, timeouts, redirects" "" "${CATEGORY_NAME[16]}"; fi
 
 print_subheader "serde_json::from_str without error context (heuristic)"
 from_str=$("${GREP_RN[@]}" -e "serde_json::from_str::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$from_str" -gt 0 ]; then print_finding "info" "$from_str" "serde_json::from_str uses - ensure error context and validation"; fi
+if [ "$from_str" -gt 0 ]; then print_finding "info" "$from_str" "serde_json::from_str uses - ensure error context and validation"; add_finding "info" "$from_str" "serde_json::from_str uses - ensure error context and validation" "" "${CATEGORY_NAME[16]}"; fi
 
 print_subheader "SQL string concatenation (heuristic)"
 sql_concat=$("${GREP_RN[@]}" -e "(SELECT|INSERT|UPDATE|DELETE)[^;]*\+[[:space:]]*[_a-zA-Z0-9\"]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$sql_concat" -gt 0 ]; then print_finding "warning" "$sql_concat" "Possible SQL construction via concatenation - prefer parameters"; fi
+if [ "$sql_concat" -gt 0 ]; then print_finding "warning" "$sql_concat" "Possible SQL construction via concatenation - prefer parameters"; add_finding "warning" "$sql_concat" "Possible SQL construction via concatenation - prefer parameters" "" "${CATEGORY_NAME[16]}"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1643,6 +1797,12 @@ if [[ -n "$OUTPUT_FILE" ]]; then
   say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
 fi
 
+if [[ "$FORMAT" == "json" ]]; then
+  TMP_JSON="$(mktemp)"; TMP_FILES+=("$TMP_JSON")
+  emit_findings_json "$TMP_JSON"
+  cat "$TMP_JSON"
+fi
+
 echo ""
 if [ "$VERBOSE" -eq 0 ]; then
   say "${DIM}Tip: Run with -v/--verbose for more code samples per finding.${RESET}"
@@ -1661,6 +1821,11 @@ if [[ -n "$SUMMARY_JSON" ]]; then
 }
 JSON
   say "${GREEN}${CHECK} Summary JSON: ${CYAN}$SUMMARY_JSON${RESET}"
+fi
+
+if [[ -n "$EMIT_FINDINGS_JSON" ]]; then
+  emit_findings_json "$EMIT_FINDINGS_JSON"
+  say "${GREEN}${CHECK} Findings JSON: ${CYAN}$EMIT_FINDINGS_JSON${RESET}"
 fi
 
 EXIT_CODE=0

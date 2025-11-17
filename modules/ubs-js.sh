@@ -55,18 +55,57 @@ USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
 
 # Async error coverage spec (rule ids -> metadata)
-ASYNC_ERROR_RULE_IDS=(js.async.then-no-catch js.async.promiseall-no-try)
+ASYNC_ERROR_RULE_IDS=(js.async.then-no-catch js.async.promiseall-no-try js.await-non-async)
 declare -A ASYNC_ERROR_SUMMARY=(
   [js.async.then-no-catch]='Promise.then chain missing .catch()'
   [js.async.promiseall-no-try]='Promise.all without try/catch'
+  [js.await-non-async]='await keyword used outside async context'
 )
 declare -A ASYNC_ERROR_REMEDIATION=(
   [js.async.then-no-catch]='Chain .catch() (or .finally()) to surface rejections'
   [js.async.promiseall-no-try]='Wrap Promise.all in try/catch to handle aggregate failures'
+  [js.await-non-async]='Mark the surrounding function as async or remove await'
 )
 declare -A ASYNC_ERROR_SEVERITY=(
   [js.async.then-no-catch]='warning'
   [js.async.promiseall-no-try]='warning'
+  [js.await-non-async]='critical'
+)
+
+# Error handling AST metadata
+ERROR_RULE_IDS=(js.error.empty-catch js.error.throw-string js.json-parse-without-try)
+declare -A ERROR_RULE_SUMMARY=(
+  [js.error.empty-catch]='Catch block swallows errors silently'
+  [js.error.throw-string]='Throwing string literal instead of Error object'
+  [js.json-parse-without-try]='JSON.parse without try/catch'
+)
+declare -A ERROR_RULE_REMEDIATION=(
+  [js.error.empty-catch]='Log or rethrow the caught error; empty catch hides bugs'
+  [js.error.throw-string]='Use throw new Error("message") so stack traces include context'
+  [js.json-parse-without-try]='Wrap JSON.parse in try/catch or validate input'
+)
+declare -A ERROR_RULE_SEVERITY=(
+  [js.error.empty-catch]='warning'
+  [js.error.throw-string]='warning'
+  [js.json-parse-without-try]='warning'
+)
+
+# Resource lifecycle AST metadata
+RESOURCE_RULE_IDS=(js.resource.listener-no-remove js.resource.interval-no-clear js.resource.observer-no-disconnect)
+declare -A RESOURCE_RULE_SUMMARY=(
+  [js.resource.listener-no-remove]='Global event listener missing removeEventListener'
+  [js.resource.interval-no-clear]='setInterval without matching clearInterval'
+  [js.resource.observer-no-disconnect]='MutationObserver without disconnect()'
+)
+declare -A RESOURCE_RULE_REMEDIATION=(
+  [js.resource.listener-no-remove]='Store the handler and call removeEventListener during teardown'
+  [js.resource.interval-no-clear]='Keep the interval id and clearInterval when disposing'
+  [js.resource.observer-no-disconnect]='Call disconnect() on observers when they are no longer needed'
+)
+declare -A RESOURCE_RULE_SEVERITY=(
+  [js.resource.listener-no-remove]='warning'
+  [js.resource.interval-no-clear]='warning'
+  [js.resource.observer-no-disconnect]='warning'
 )
 
 # React hooks dependency metadata
@@ -306,6 +345,110 @@ print_finding() {
   esac
 }
 
+emit_ast_rule_group() {
+  local rules_name="$1"
+  local severity_map_name="$2"
+  local summary_map_name="$3"
+  local remediation_map_name="$4"
+  local good_msg="$5"
+  local missing_msg="$6"
+
+  if [[ "$HAS_AST_GREP" -ne 1 || -z "$AST_RULE_DIR" ]]; then
+    print_finding "info" 0 "$missing_msg" "Install ast-grep (https://ast-grep.github.io/) to enable this check"
+    return 1
+  fi
+
+  declare -n _rule_ids="$rules_name"
+  declare -n _severity="$severity_map_name"
+  declare -n _summary="$summary_map_name"
+  declare -n _remediation="$remediation_map_name"
+
+  local rule_dir
+  rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t js_rule_group.XXXXXX)" || {
+    print_finding "info" 0 "$missing_msg" "Unable to allocate temporary directory"
+    return 1
+  }
+
+  local copied=0
+  local rid
+  for rid in "${_rule_ids[@]}"; do
+    if [[ -f "$AST_RULE_DIR/$rid.yml" ]]; then
+      cp "$AST_RULE_DIR/$rid.yml" "$rule_dir/" 2>/dev/null || true
+      copied=1
+    fi
+  done
+  if [[ $copied -eq 0 ]]; then
+    rm -rf "$rule_dir"
+    print_finding "good" "$good_msg"
+    return 0
+  fi
+
+  local tmp_json
+  tmp_json="$(mktemp 2>/dev/null || mktemp -t js_rule_group.XXXXXX)"
+  if ! "${AST_GREP_CMD[@]}" scan -r "$rule_dir" "$PROJECT_DIR" --json=stream >"$tmp_json" 2>/dev/null; then
+    rm -rf "$rule_dir" "$tmp_json"
+    print_finding "info" 0 "$missing_msg" "ast-grep scan failed"
+    return 1
+  fi
+  rm -rf "$rule_dir"
+
+  if ! [[ -s "$tmp_json" ]]; then
+    rm -f "$tmp_json"
+    print_finding "good" "$good_msg"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r match_rid match_count match_samples; do
+    [[ -z "$match_rid" ]] && continue
+    local sev=${_severity[$match_rid]:-warning}
+    local summary=${_summary[$match_rid]:-$match_rid}
+    local desc=${_remediation[$match_rid]:-}
+    print_finding "$sev" "$match_count" "$summary" "$desc"
+    if [[ -n "$match_samples" ]]; then
+      IFS=',' read -r -a sample_arr <<<"$match_samples"
+      local sample
+      for sample in "${sample_arr[@]}"; do
+        [[ -z "$sample" ]] && continue
+        say "    ${DIM}$sample${RESET}"
+      done
+    fi
+  done < <(python3 - "$tmp_json" <<'PY'
+import json, sys
+from collections import OrderedDict
+
+stats = OrderedDict()
+with open(sys.argv[1], 'r', encoding='utf-8') as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid = obj.get('ruleId') or obj.get('rule_id') or obj.get('id')
+        if not rid:
+            continue
+        file_path = obj.get('file') or obj.get('path') or '?' 
+        start = (obj.get('range') or {}).get('start') or {}
+        line_no = start.get('line')
+        if isinstance(line_no, int):
+            line_no += 1  # ast-grep reports 0-based lines
+        sample = f"{file_path}:{line_no if line_no is not None else '?'}"
+        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
+        entry['count'] += 1
+        if len(entry['samples']) < 3:
+            entry['samples'].append(sample)
+for rid, data in stats.items():
+    samples = ','.join(data['samples'])
+    print(f"{rid}\t{data['count']}\t{samples}")
+PY
+  )
+
+  rm -f "$tmp_json"
+  return 0
+}
+
 print_code_sample() {
   local file=$1; local line=$2; local code=$3
   say "${GRAY}      $file:$line${RESET}"
@@ -361,97 +504,11 @@ run_resource_lifecycle_checks() {
 }
 
 run_async_error_checks() {
-  local header_shown=0
   print_subheader "Async error path coverage"
-  if [[ "$HAS_AST_GREP" -ne 1 ]]; then
-    print_finding "info" 0 "ast-grep not available" "Install ast-grep to enable async error correlation checks"
-    return
-  fi
-  local rule_dir tmp_json
-  rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t js_async_rules.XXXXXX)"
-  if [[ ! -d "$rule_dir" ]]; then
-    print_finding "info" 0 "temp dir creation failed" "Unable to stage ast-grep rules"
-    return
-  fi
-  cat >"$rule_dir/js.async.then-no-catch.yml" <<'YAML'
-id: js.async.then-no-catch
-language: javascript
-rule:
-  pattern: $PROMISE.then($HANDLER)
-  not:
-    has:
-      pattern: .catch($CATCH)
-YAML
-  cat >"$rule_dir/js.async.promiseall-no-try.yml" <<'YAML'
-id: js.async.promiseall-no-try
-language: javascript
-rule:
-  pattern: await Promise.all($ARG)
-  not:
-    inside:
-      kind: try_statement
-YAML
-  tmp_json="$(mktemp 2>/dev/null || mktemp -t js_async_matches.XXXXXX)"
-  : >"$tmp_json"
-  local rule_file
-  for rule_file in "$rule_dir"/*.yml; do
-    if ! "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null; then
-      rm -rf "$rule_dir"
-      rm -f "$tmp_json"
-      print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
-      return
-    fi
-  done
-  rm -rf "$rule_dir"
-  if ! [[ -s "$tmp_json" ]]; then
-    rm -f "$tmp_json"
-    print_finding "good" "All async operations appear protected"
-    return
-  fi
-  while IFS=$'\t' read -r rid count samples; do
-    [[ -z "$rid" ]] && continue
-    header_shown=1
-    local severity=${ASYNC_ERROR_SEVERITY[$rid]:-warning}
-    local summary=${ASYNC_ERROR_SUMMARY[$rid]:-$rid}
-    local desc=${ASYNC_ERROR_REMEDIATION[$rid]:-"Add error handling."}
-    if [[ -n "$samples" ]]; then
-      desc+=" (e.g., $samples)"
-    fi
-    print_finding "$severity" "$count" "$summary" "$desc"
-  done < <(python3 - "$tmp_json" <<'PY'
-import json, sys
-from collections import OrderedDict
-path = sys.argv[1]
-stats = OrderedDict()
-with open(path, 'r', encoding='utf-8') as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rid = obj.get('rule_id') or obj.get('id') or obj.get('ruleId')
-        if not rid:
-            continue
-        rng = obj.get('range') or {}
-        start = rng.get('start') or {}
-        line_no = start.get('row', 0) + 1
-        file_path = obj.get('file', '?')
-        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
-        entry['count'] += 1
-        if len(entry['samples']) < 3:
-            entry['samples'].append(f"{file_path}:{line_no}")
-for rid, data in stats.items():
-    print(f"{rid}\t{data['count']}\t{','.join(data['samples'])}")
-PY
-)
-  rm -f "$tmp_json"
-  if [[ $header_shown -eq 0 ]]; then
-    print_finding "good" "All async operations appear protected"
-  fi
+  emit_ast_rule_group ASYNC_ERROR_RULE_IDS ASYNC_ERROR_SEVERITY ASYNC_ERROR_SUMMARY ASYNC_ERROR_REMEDIATION \
+    "All async operations appear protected" "Async rule checks"
 }
+
 run_hooks_dependency_checks() {
   print_subheader "React hooks dependency analysis"
   if [[ "$HAS_AST_GREP" -ne 1 ]]; then

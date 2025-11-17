@@ -120,10 +120,17 @@ path = pathlib.Path(sys.argv[1])
 if not path.exists():
     sys.exit(0)
 patterns = []
+seen = set()
 for raw in path.read_text().splitlines():
     stripped = raw.strip()
     if not stripped or stripped.startswith('#'):
         continue
+    stripped = stripped.rstrip('/')
+    if stripped.startswith('./'):
+        stripped = stripped[2:]
+    if not stripped or stripped in seen:
+        continue
+    seen.add(stripped)
     patterns.append(stripped)
 print(",".join(patterns))
 PY

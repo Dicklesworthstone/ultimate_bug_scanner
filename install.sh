@@ -48,6 +48,7 @@ NO_PATH_MODIFY=0
 SKIP_AST_GREP=0
 SKIP_RIPGREP=0
 SKIP_JQ=0
+SKIP_TYPOS=0
 SKIP_HOOKS=0
 INSTALL_DIR=""
 FORCE_REINSTALL=0
@@ -80,6 +81,44 @@ log_section() {
   echo ""
   echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════${RESET}"
   echo -e "${BOLD}${BLUE}   ${title}${RESET}"
+  echo ""
+}
+
+print_help_option() {
+  local flag="$1"
+  local description="$2"
+  printf "  %-24s %s\n" "$flag" "$description"
+}
+
+show_help() {
+  cat <<'HELP'
+Usage: install.sh [OPTIONS]
+
+Options:
+HELP
+  print_help_option "--easy-mode" "Accept all prompts, install deps, and wire integrations"
+  print_help_option "--non-interactive" "Skip all prompts (use defaults)"
+  print_help_option "--update" "Force reinstall to latest version"
+  print_help_option "--dry-run" "Log every action without modifying the system"
+  print_help_option "--self-test" "Run installer smoke tests after install"
+  print_help_option "--install-dir DIR" "Custom installation directory"
+  print_help_option "--system" "Install to /usr/local/bin (uses sudo if needed)"
+  print_help_option "--no-path-modify" "Skip shell RC edits and alias creation"
+  print_help_option "--skip-ast-grep" "Skip ast-grep installation"
+  print_help_option "--skip-ripgrep" "Skip ripgrep installation"
+  print_help_option "--skip-jq" "Skip jq installation"
+  print_help_option "--skip-typos" "Skip typos installation"
+  print_help_option "--skip-hooks" "Skip hook/setup prompts"
+  print_help_option "--skip-version-check" "Do not check GitHub for newer releases"
+  print_help_option "--skip-verification" "Skip post-install verification banner"
+  print_help_option "--quiet" "Reduce installer output"
+  print_help_option "--no-color" "Disable ANSI colors"
+  print_help_option "--setup-git-hook" "Only (re)install git hook"
+  print_help_option "--setup-claude-hook" "Only install Claude on-save hook"
+  print_help_option "--generate-config" "Create ~/.config/ubs/install.conf"
+  print_help_option "--diagnose" "Print environment + dependency diagnostics"
+  print_help_option "--uninstall" "Remove UBS and integrations"
+  print_help_option "--help" "Show this help"
   echo ""
 }
 
@@ -175,10 +214,27 @@ HEADER
   echo -e "${RESET}"
 }
 
-log() { echo -e "${ARROW} $*"; }
-success() { echo -e "${CHECK} $*"; }
-error() { echo -e "${CROSS} $*" >&2; }
-warn() { echo -e "${WARN} $*"; }
+print_with_icon() {
+  local icon="$1"
+  shift || true
+  local message="$*"
+  if [ -z "$message" ]; then
+    printf "%b\n" "$icon"
+    return 0
+  fi
+
+  local prefix="$icon"
+  local indent="   "
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf "%b %s%s\n" "$prefix" "$indent" "$line"
+    prefix=" "
+  done <<<"$message"
+}
+
+log() { print_with_icon "${ARROW}" "$*"; }
+success() { print_with_icon "${CHECK}" "$*"; }
+error() { print_with_icon "${CROSS}" "$*" >&2; }
+warn() { print_with_icon "${WARN}" "$*"; }
 
 log_network_failure() {
   local context="$1"
@@ -468,6 +524,7 @@ install_ast_grep() {
 
 check_ripgrep() { command -v rg >/dev/null 2>&1; }
 check_jq() { command -v jq >/dev/null 2>&1; }
+check_typos() { command -v typos >/dev/null 2>&1; }
 
 # ==============================================================================
 # TIER 1 ENHANCEMENTS: Version Checking, Binary Fallbacks, Verification
@@ -652,6 +709,79 @@ download_binary_release() {
         return 0
       fi
       ;;
+
+    typos)
+      local version="1.20.7"
+      local asset type="tar"
+      case "$platform-$arch" in
+        linux-x86_64|wsl-x86_64)
+          asset="typos-v${version}-x86_64-unknown-linux-gnu.tar.gz"
+          ;;
+        linux-aarch64|wsl-aarch64)
+          asset="typos-v${version}-aarch64-unknown-linux-musl.tar.gz"
+          ;;
+        macos-x86_64)
+          asset="typos-v${version}-x86_64-apple-darwin.tar.gz"
+          ;;
+        macos-aarch64)
+          asset="typos-v${version}-aarch64-apple-darwin.tar.gz"
+          ;;
+        windows-x86_64)
+          asset="typos-v${version}-x86_64-pc-windows-msvc.zip"
+          type="zip"
+          ;;
+        windows-aarch64)
+          asset="typos-v${version}-aarch64-pc-windows-msvc.zip"
+          type="zip"
+          ;;
+        *)
+          warn "No typos binary release available for $platform-$arch"
+          return 1
+          ;;
+      esac
+
+      local url="https://github.com/crate-ci/typos/releases/download/v${version}/${asset}"
+      local archive="$temp_dir/${asset}"
+
+      if with_backoff 3 curl -fsSL "$url" -o "$archive" 2>"$err_log"; then
+        case "$type" in
+          tar)
+            if tar -xzf "$archive" -C "$temp_dir" >/dev/null 2>&1; then
+              local typos_bin
+              typos_bin=$(find "$temp_dir" -name typos -type f 2>/dev/null | head -1)
+              if [ -n "$typos_bin" ]; then
+                chmod +x "$typos_bin" 2>/dev/null
+                local target="$install_dir/typos"
+                [[ "$typos_bin" == *.exe ]] && target="$install_dir/typos.exe"
+                mv "$typos_bin" "$target"
+                success "typos binary installed to $target"
+                export PATH="$install_dir:$PATH"
+                return 0
+              fi
+            fi
+            ;;
+          zip)
+            if command -v unzip >/dev/null 2>&1; then
+              if unzip -q "$archive" -d "$temp_dir/typos" 2>/dev/null; then
+                local exe
+                exe=$(find "$temp_dir/typos" -name 'typos*' -type f 2>/dev/null | head -1)
+                if [ -n "$exe" ]; then
+                  chmod +x "$exe" 2>/dev/null || true
+                  local target="$install_dir/typos"
+                  [[ "$exe" == *.exe ]] && target="$install_dir/typos.exe"
+                  mv "$exe" "$target"
+                  success "typos binary installed to $target"
+                  export PATH="$install_dir:$PATH"
+                  return 0
+                fi
+              fi
+            else
+              warn "unzip not available, cannot extract typos archive"
+            fi
+            ;;
+        esac
+      fi
+      ;;
   esac
 
   log_network_failure "Binary download failed for $tool" "$err_log"
@@ -666,7 +796,7 @@ verify_installation() {
     return 0
   fi
 
-  log_section "Post-Install Verification"
+  log_section "POST-INSTALL VERIFICATION"
   log "Running post-install verification..."
   local errors=0
   local had_ubs=0
@@ -708,6 +838,12 @@ verify_installation() {
     success "   jq: $(command -v jq)"
   else
     warn "   jq: not available (JSON/SARIF merging disabled)"
+  fi
+
+  if check_typos; then
+    success "   typos: $(command -v typos)"
+  else
+    warn "   typos: not available (spellcheck automation disabled)"
   fi
 
   # Test 4: Quick smoke test
@@ -858,6 +994,9 @@ read_config_file() {
       skip_jq)
         SKIP_JQ="$(normalize_bool "$value")"
         ;;
+      skip_typos)
+        SKIP_TYPOS="$(normalize_bool "$value")"
+        ;;
       skip_hooks)
         SKIP_HOOKS="$(normalize_bool "$value")"
         ;;
@@ -919,6 +1058,7 @@ generate_config() {
 skip_ast_grep=0
 skip_ripgrep=0
 skip_jq=0
+skip_typos=0
 
 # Skip version checking on install
 skip_version_check=0
@@ -957,7 +1097,7 @@ CONFIG
 }
 
 diagnostic_check() {
-  log_section "Diagnostic Report"
+  log_section "ULTIMATE BUG SCANNER DIAGNOSTIC REPORT"
 
   # System info
   echo -e "${BOLD}System Information:${RESET}"
@@ -1476,6 +1616,58 @@ install_ripgrep() {
     error "ripgrep installation failed - command not found after install"
     return 1
   fi
+}
+
+install_typos() {
+  local platform log_file
+  platform="$(detect_platform)"
+
+  log "Installing typos (code-aware spellchecker)..."
+
+  if dry_run_enabled; then
+    log_dry_run "Would install typos (platform $platform)."
+    return 0
+  fi
+
+  log_file="$(mktemp_in_workdir "typos-install.log.XXXXXX")"
+
+  case "$platform" in
+    macos)
+      if command -v brew >/dev/null 2>&1; then
+        if brew install typos-cli 2>&1 | tee "$log_file"; then
+          success "typos installed via Homebrew"
+          return 0
+        else
+          warn "Homebrew installation failed"
+        fi
+      fi
+      ;;
+    wsl|linux)
+      if [ "$platform" = "wsl" ]; then
+        log "Detected WSL environment - treating as Linux"
+      fi
+      ;;
+    windows)
+      ;;
+  esac
+
+  if command -v cargo >/dev/null 2>&1; then
+    log "Attempting installation via cargo..."
+    if cargo install typos-cli 2>&1 | tee "$log_file"; then
+      success "typos installed via cargo"
+      return 0
+    else
+      warn "cargo installation failed"
+    fi
+  fi
+
+  if download_binary_release "typos" "$platform"; then
+    return 0
+  fi
+
+  error "All typos installation methods failed"
+  warn "Install manually from https://github.com/crate-ci/typos or your package manager"
+  return 1
 }
 
 validate_install_dir() {
@@ -2215,6 +2407,10 @@ shift
 SKIP_JQ=1
 shift
 ;;
+--skip-typos)
+SKIP_TYPOS=1
+shift
+;;
 --skip-hooks)
 SKIP_HOOKS=1
 shift
@@ -2273,11 +2469,12 @@ echo "  --update                Force reinstall to latest version"
 echo "  --skip-ast-grep         Skip ast-grep installation"
 echo "  --skip-ripgrep          Skip ripgrep installation"
 echo "  --skip-jq               Skip jq installation"
+echo "  --skip-typos            Skip typos installation"
 echo "  --skip-hooks            Skip hook setup"
 echo "  --skip-version-check    Don't check for updates"
 echo "  --skip-verification     Skip post-install verification"
-echo "  --dry-run               Print actions without changing the system"
-echo "  --self-test             Run extended self-tests after installation"
+echo "  --dry-run               Print every action without modifying the system (skips verification/self-test contents)"
+echo "  --self-test             Run installer smoke tests after install (requires repo test-suite/install/run_tests.sh)"
 echo "  --install-dir DIR       Custom installation directory"
 echo "  --system                Install system-wide to /usr/local/bin (uses sudo if needed)"
 echo "  --no-path-modify        Do not modify shell RC files to add to PATH"
@@ -2289,6 +2486,10 @@ echo "  --generate-config       Create configuration file at ~/.config/ubs/insta
 echo "  --diagnose              Run diagnostic check and show system information"
 echo "  --uninstall             Remove UBS and all integrations"
 echo "  --help                  Show this help"
+echo ""
+echo "Notes:"
+echo "  --dry-run still resolves config and detects agents so you can audit changes safely."
+echo "  --self-test is ideal for CI but must run from a working tree that contains the test-suite harness."
 exit 0
 ;;
 *)
@@ -2344,6 +2545,18 @@ fi
 echo ""
 else
 success "jq is installed"
+echo ""
+fi
+
+# Check for typos
+if ! check_typos && [ "$SKIP_TYPOS" -eq 0 ]; then
+warn "typos not found (smart spellchecker for docs/code)"
+if ask "Install typos now?"; then
+install_typos || warn "Continuing without typos (spellcheck automation disabled)"
+fi
+echo ""
+else
+success "typos is installed"
 echo ""
 fi
 
@@ -2403,8 +2616,6 @@ if ! run_self_tests_if_requested; then
   exit 1
 fi
 
-warn_if_stale_binary
-
 echo ""
 echo -e "${BOLD}${GREEN}"
 cat << 'SUCCESS'
@@ -2450,9 +2661,6 @@ echo -e "${BLUE}├──${RESET} ${BOLD}Run scanner:${RESET}    ${GREEN}ubs .${
 echo -e "${BLUE}├──${RESET} ${BOLD}Get help:${RESET}       ${GREEN}ubs --help${RESET}"
 echo -e "${BLUE}└──${RESET} ${BOLD}Verbose mode:${RESET}   ${GREEN}ubs -v .${RESET}"
 fi
-
-echo ""
-warn_if_stale_binary
 
 echo -e "${BOLD}${BLUE}📚 Documentation:${RESET} ${BLUE}[https://github.com/Dicklesworthstone/ultimate_bug_scanner${RESET}](https://github.com/Dicklesworthstone/ultimate_bug_scanner${RESET})"
 echo ""

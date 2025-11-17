@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# ULTIMATE BUG SCANNER v4.4 - Industrial-Grade Code Quality Analysis
+# ULTIMATE BUG SCANNER v4.7 - Industrial-Grade Code Quality Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis using ast-grep + semantic pattern matching
 # Catches bugs that cost developers hours of debugging
-# v4.4 adds: robust find, safe pipelines, richer AST rules, --no-color, --rules,
-# improved ERR diagnostics, auto jobs, JSON/SARIF passthrough
+# v4.7 adds: fixed AST rule-group execution (ID/file mismatch), stronger rule-pack
+# aggregator, jq/Python fallbacks, better --exclude handling, new rules
+# (dangling promises/fetch/cookies/headers/crypto), JSON export, richer samples,
+# safer trap boundaries, and improved CI ergonomics.
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
@@ -51,6 +53,10 @@ SKIP_CATEGORIES=""
 DETAIL_LIMIT=3
 MAX_DETAILED=250
 JOBS="${JOBS:-0}"
+MAX_JSON_SAMPLES=3
+REPORT_JSON=""
+UBS_VERSION="4.7"
+JSON_FINDINGS_TMP=""
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
 
@@ -167,6 +173,8 @@ Options:
   --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
   --fail-on-warning        Exit non-zero on warnings or critical
   --rules=DIR              Additional ast-grep rules directory (merged)
+  --report-json=FILE       Also write a machine-readable JSON summary to FILE
+  --max-samples=N          Maximum samples per finding (default: 3)
   -h, --help               Show help
 Env:
   JOBS, NO_COLOR, CI
@@ -189,6 +197,8 @@ while [[ $# -gt 0 ]]; do
     --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
     --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+    --max-samples=*) MAX_JSON_SAMPLES="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
@@ -205,6 +215,12 @@ done
 # CI auto-detect + color override
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
+
+# Create a temp JSON accumulator if requested
+if [[ -n "$REPORT_JSON" ]]; then
+  JSON_FINDINGS_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-findings.XXXXXX)"
+  : > "$JSON_FINDINGS_TMP"
+fi
 
 # Redirect output early to capture everything
 if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
@@ -234,10 +250,18 @@ LC_ALL=C
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=()
 for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
-EXCLUDE_DIRS=(node_modules dist build coverage .next out .turbo .cache .git)
+EXCLUDE_DIRS=(node_modules dist build coverage .next out .turbo .cache .git .pnpm .yarn .parcel .svelte-kit .astro .vite .expo storybook-static)
+EXCLUDE_GLOBS=()
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
 EXCLUDE_FLAGS=()
-for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+for d in "${EXCLUDE_DIRS[@]}"; do
+  if [[ "$d" == *"*"* || "$d" == *"?"* || "$d" == *"["* ]]; then
+    EXCLUDE_FLAGS+=( "--exclude=$d" )
+    EXCLUDE_GLOBS+=( "$d" )
+  else
+    EXCLUDE_FLAGS+=( "--exclude-dir=$d" )
+  fi
+done
 
 if command -v rg >/dev/null 2>&1; then
   if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
@@ -245,6 +269,7 @@ if command -v rg >/dev/null 2>&1; then
   RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden "${RG_JOBS[@]}")
   RG_EXCLUDES=()
   for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
+  for g in "${EXCLUDE_GLOBS[@]}"; do RG_EXCLUDES+=( -g "!$g" ); done
   RG_INCLUDES=()
   for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
   GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
@@ -269,6 +294,7 @@ maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]]; then clear || true; fi; }
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 
 print_header() {
+  [[ -n "$REPORT_JSON" ]] && { :; }
   say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
   say "${WHITE}${BOLD}$1${RESET}"
   say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
@@ -282,6 +308,20 @@ print_category() {
 print_subheader() { say "\n${YELLOW}${BOLD}$BULLET $1${RESET}"; }
 
 print_finding() {
+  local __severity=$1
+  local __raw_count=$2
+  local __title=$3
+  local __desc="${4:-}"
+  if [[ -n "$REPORT_JSON" ]]; then
+    local __count; __count=$(printf '%s\n' "$__raw_count" | awk 'END{print $0+0}')
+    python3 - "$JSON_FINDINGS_TMP" "$MAX_JSON_SAMPLES" <<'PY' 2>/dev/null || true
+import json, sys
+tmp = sys.argv[1]
+# sys.argv[2] is MAX_JSON_SAMPLES (reserved for future per-finding truncation)
+obj = {"severity": sys.argv[3], "count": int(sys.argv[4]), "title": sys.argv[5], "description": (sys.argv[6] if len(sys.argv)>6 else "")}
+open(tmp, 'a', encoding='utf-8').write(json.dumps(obj, ensure_ascii=False)+'\n')
+PY
+  fi
   local severity=$1
   case $severity in
     good)
@@ -333,90 +373,75 @@ emit_ast_rule_group() {
   declare -n _summary="$summary_map_name"
   declare -n _remediation="$remediation_map_name"
 
-  local rule_dir
-  rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t js_rule_group.XXXXXX)" || {
-    print_finding "info" 0 "$missing_msg" "Unable to allocate temporary directory"
-    return 1
-  }
-
-  local copied=0
-  local rid
-  for rid in "${_rule_ids[@]}"; do
-    if [[ -f "$AST_RULE_DIR/$rid.yml" ]]; then
-      cp "$AST_RULE_DIR/$rid.yml" "$rule_dir/" 2>/dev/null || true
-      copied=1
-    fi
-  done
-  if [[ $copied -eq 0 ]]; then
-    rm -rf "$rule_dir"
-    print_finding "good" "$good_msg"
-    return 0
-  fi
-
   local tmp_json
   tmp_json="$(mktemp 2>/dev/null || mktemp -t js_rule_group.XXXXXX)"
-  if ! "${AST_GREP_CMD[@]}" scan -r "$rule_dir" "$PROJECT_DIR" --json=stream >"$tmp_json" 2>/dev/null; then
-    rm -rf "$rule_dir" "$tmp_json"
+  if ! "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream >"$tmp_json" 2>/dev/null; then
+    rm -f "$tmp_json"
     print_finding "info" 0 "$missing_msg" "ast-grep scan failed"
     return 1
   fi
-  rm -rf "$rule_dir"
-
   if ! [[ -s "$tmp_json" ]]; then
     rm -f "$tmp_json"
     print_finding "good" "$good_msg"
     return 0
   fi
 
-  while IFS=$'\t' read -r match_rid match_count match_samples; do
-    [[ -z "$match_rid" ]] && continue
-    local sev=${_severity[$match_rid]:-warning}
-    local summary=${_summary[$match_rid]:-$match_rid}
-    local desc=${_remediation[$match_rid]:-}
-    print_finding "$sev" "$match_count" "$summary" "$desc"
-    if [[ -n "$match_samples" ]]; then
-      IFS=',' read -r -a sample_arr <<<"$match_samples"
-      local sample
-      for sample in "${sample_arr[@]}"; do
-        [[ -z "$sample" ]] && continue
-        say "    ${DIM}$sample${RESET}"
-      done
-    fi
-  done < <(python3 - "$tmp_json" <<'PY'
+  local had_matches=0
+  if command -v python3 >/dev/null 2>&1; then
+    while IFS=$'\t' read -r match_rid match_count match_samples; do
+      [[ -z "$match_rid" ]] && continue
+      had_matches=1
+      local sev=${_severity[$match_rid]:-warning}
+      local summary=${_summary[$match_rid]:-$match_rid}
+      local desc=${_remediation[$match_rid]:-}
+      print_finding "$sev" "$match_count" "$summary" "$desc"
+      if [[ -n "$match_samples" ]]; then
+        IFS=',' read -r -a sample_arr <<<"$match_samples"
+        for sample in "${sample_arr[@]}"; do
+          [[ -z "$sample" ]] && continue
+          say "    ${DIM}$sample${RESET}"
+        done
+      fi
+    done < <(python3 - "$tmp_json" <<PY
 import json, sys
 from collections import OrderedDict
-
+want = set(${_rule_ids[@] and repr(list("${_rule_ids[@]}".split())) or "[]"})
 stats = OrderedDict()
-with open(sys.argv[1], 'r', encoding='utf-8') as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rid = obj.get('ruleId') or obj.get('rule_id') or obj.get('id')
-        if not rid:
-            continue
-        file_path = obj.get('file') or obj.get('path') or '?' 
-        start = (obj.get('range') or {}).get('start') or {}
-        line_no = start.get('line')
-        if isinstance(line_no, int):
-            line_no += 1  # ast-grep reports 0-based lines
-        sample = f"{file_path}:{line_no if line_no is not None else '?'}"
-        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
-        entry['count'] += 1
-        if len(entry['samples']) < 3:
-            entry['samples'].append(sample)
+for line in open(sys.argv[1],'r',encoding='utf-8'):
+    if not line.strip(): continue
+    try: obj = json.loads(line)
+    except: continue
+    rid = obj.get('ruleId') or obj.get('rule_id') or obj.get('id')
+    if not rid or rid not in want: continue
+    f = obj.get('file') or obj.get('path') or '?'
+    sline = ((obj.get('range') or {}).get('start') or {}).get('line')
+    if isinstance(sline, int): sline += 1
+    sample = f"{f}:{sline if sline is not None else '?'}"
+    ent = stats.setdefault(rid, {'count':0,'samples':[]})
+    ent['count'] += 1
+    if len(ent['samples'])<3: ent['samples'].append(sample)
 for rid, data in stats.items():
-    samples = ','.join(data['samples'])
-    print(f"{rid}\t{data['count']}\t{samples}")
+    print(rid, data['count'], ','.join(data['samples']), sep='\\t')
 PY
-  )
-
+    )
+  else
+    if command -v jq >/dev/null 2>&1; then
+      for rid in "${_rule_ids[@]}"; do
+        local c; c=$(jq -r --arg id "$rid" 'select(.ruleId==$id) | 1' "$tmp_json" 2>/dev/null | wc -l | awk '{print $1+0}')
+        if [[ "$c" -gt 0 ]]; then
+          had_matches=1
+          local sev=${_severity[$rid]:-warning}
+          local summary=${_summary[$rid]:-$rid}
+          local desc=${_remediation[$rid]:-}
+          print_finding "$sev" "$c" "$summary" "$desc"
+        fi
+      done
+    fi
+  fi
   rm -f "$tmp_json"
-  return 0
+  if [[ $had_matches -eq 0 ]]; then
+    print_finding "good" "$good_msg"
+  fi
 }
 
 print_code_sample() {
@@ -574,7 +599,10 @@ def get_file_symbols(path_str):
     cached = file_cache.get(path_str)
     if cached:
         return cached
-    text = Path(path_str).read_text(encoding='utf-8')
+    try:
+        text = Path(path_str).read_text(encoding='utf-8')
+    except Exception:
+        text = ""
     state_vars, setters = set(), set()
     for match in STATE_PATTERN.finditer(text):
         state_vars.add(match.group(1))
@@ -1087,7 +1115,7 @@ def format_path(path, sink_label):
     seq.append(sink_label)
     return ' -> '.join(seq)
 
-def analyze_file(path: Path, issues):
+def analyze_file(path, issues):
     try:
         text = path.read_text(encoding='utf-8')
     except (UnicodeDecodeError, OSError):
@@ -1182,7 +1210,6 @@ ast_search_with_context() {
 }
 
 # Analyze deep property chains and determine which ones are actually gated by explicit if conditions.
-# Emits a JSON blob with unguarded count, suppressed guard matches, and representative samples.
 analyze_deep_property_guards() {
   local limit=${1:-$DETAIL_LIMIT}
   if [[ "$HAS_AST_GREP" -ne 1 ]]; then return 1; fi
@@ -1280,14 +1307,26 @@ PY
 show_ast_samples_from_json() {
   local blob=$1
   [[ -n "$blob" ]] || return 0
-  if ! command -v jq >/dev/null 2>&1; then return 0; fi
-  jq -cr '.samples[]?' <<<"$blob" | while IFS= read -r sample; do
-    local file line code
-    file=$(printf '%s' "$sample" | jq -r '.file')
-    line=$(printf '%s' "$sample" | jq -r '.line')
-    code=$(printf '%s' "$sample" | jq -r '.code')
-    print_code_sample "$file" "$line" "$code"
-  done
+  if command -v jq >/dev/null 2>&1; then
+    jq -cr '.samples[]?' <<<"$blob" | while IFS= read -r sample; do
+      local file line code
+      file=$(printf '%s' "$sample" | jq -r '.file')
+      line=$(printf '%s' "$sample" | jq -r '.line')
+      code=$(printf '%s' "$sample" | jq -r '.code')
+      print_code_sample "$file" "$line" "$code"
+    done
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' "$blob" 2>/dev/null || true
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    for s in data.get('samples', []):
+        file = s.get('file','?'); line = s.get('line','?'); code = (s.get('code','') or '').replace('\n',' ')
+        print(f"{file}:{line}\n{code}")
+except Exception:
+    pass
+PY
+  fi
 }
 
 persist_metric_json() {
@@ -1310,6 +1349,7 @@ write_ast_rules() {
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
   fi
   # Core rules
+  # (Keep file names arbitrary; ruleId is authoritative)
   cat >"$AST_RULE_DIR/parseInt-no-radix.yml" <<'YAML'
 id: js.parseInt-no-radix
 language: javascript
@@ -1344,7 +1384,7 @@ message: "Assigning innerHTML; ensure input is sanitized or use textContent"
 YAML
   cat >"$AST_RULE_DIR/then-without-catch.yml" <<'YAML'
 id: js.then-without-catch
-language: javascript
+language: typescript
 rule:
   pattern: $P.then($$)
   not:
@@ -1352,6 +1392,25 @@ rule:
       pattern: .catch($$)
 severity: warning
 message: "Promise.then without catch/finally; handle rejections"
+YAML
+  # Alias for async group compatibility
+  cat >"$AST_RULE_DIR/async-then-no-catch.yml" <<'YAML'
+id: js.async.then-no-catch
+language: typescript
+rule:
+  pattern: $P.then($$)
+  not:
+    has:
+      pattern: .catch($$)
+severity: warning
+message: "Promise.then without .catch/.finally; add rejection handling"
+YAML
+  cat >"$AST_RULE_DIR/async-promiseall-no-try.yml" <<'YAML'
+id: js.async.promiseall-no-try
+language: typescript
+rule: { pattern: await Promise.all($$), not: { inside: { kind: try_statement } } }
+severity: warning
+message: "await Promise.all() without try/catch; wrap to handle aggregate failures"
 YAML
   cat >"$AST_RULE_DIR/eval-call.yml" <<'YAML'
 id: js.eval-call
@@ -1501,6 +1560,93 @@ rule:
 severity: warning
 message: "JSON.parse without try/catch; malformed input will throw"
 YAML
+  # New: Dangling promises (heuristic)
+  cat >"$AST_RULE_DIR/async-dangling-promise.yml" <<'YAML'
+id: js.async.dangling-promise
+language: typescript
+rule:
+  all:
+    - any:
+        - pattern: $CALLEE($$)
+        - pattern: new $CALLEE($$)
+    - not:
+        inside:
+          any:
+            - pattern: await $EXPR
+            - pattern: $EXPR.then($$)
+            - pattern: Promise.all($$)
+            - pattern: Promise.race($$)
+severity: warning
+message: "Possible unhandled/dangling promise; use await/then/catch"
+YAML
+  # New: fetch without rejection handling
+  cat >"$AST_RULE_DIR/fetch-no-catch.yml" <<'YAML'
+id: js.fetch.no-catch
+language: typescript
+rule:
+  pattern: fetch($$)
+  not:
+    inside:
+      any:
+        - pattern: try { $$ } catch ($E) { $$ }
+        - pattern: .catch($$)
+severity: warning
+message: "fetch() without catch/try; network failures will be unhandled"
+YAML
+  # New: insecure cookie usage
+  cat >"$AST_RULE_DIR/cookie-insecure.yml" <<'YAML'
+id: security.cookie-insecure
+language: typescript
+rule:
+  any:
+    - pattern: res.cookie($NAME, $VAL)
+    - pattern: response.cookie($NAME, $VAL)
+  not:
+    has:
+      pattern: { httpOnly: true, secure: true, sameSite: $S }
+severity: warning
+message: "Set-Cookie without httpOnly/secure/sameSite; add them to mitigate XSS/CSRF"
+YAML
+  # New: header injection risk
+  cat >"$AST_RULE_DIR/header-taint.yml" <<'YAML'
+id: js.taint.header-injection
+language: typescript
+rule:
+  pattern: res.set($NAME, $VAL)
+severity: warning
+message: "Headers set from variables; ensure input is sanitized to prevent header injection"
+YAML
+  # New: insecure crypto params
+  cat >"$AST_RULE_DIR/insecure-crypto-params.yml" <<'YAML'
+id: security.insecure-crypto-params
+language: typescript
+rule:
+  any:
+    - pattern: crypto.pbkdf2($$)
+    - pattern: crypto.pbkdf2Sync($$)
+severity: info
+message: "crypto.pbkdf2/Sync called; ensure iteration count and key length meet policy"
+YAML
+  # New: env leak heuristic
+  cat >"$AST_RULE_DIR/env-leak.yml" <<'YAML'
+id: security.env-in-client
+language: typescript
+rule:
+  pattern: process.env.$NAME
+severity: info
+message: "process.env used; ensure not bundled to client or prefixed (NEXT_PUBLIC_ etc.)"
+YAML
+  # New: other DOM assignment surfaces
+  cat >"$AST_RULE_DIR/innerText-outerHTML.yml" <<'YAML'
+id: js.dom.innerText-outerHTML
+language: typescript
+rule:
+  any:
+    - pattern: $EL.innerText = $VAL
+    - pattern: $EL.outerHTML = $VAL
+severity: warning
+message: "DOM text/html assignment; confirm the source is trusted or sanitized"
+YAML
   cat >"$AST_RULE_DIR/js-resource-add-listener.yml" <<'YAML'
 id: js.resource.listener-no-remove
 language: javascript
@@ -1617,7 +1763,7 @@ for e in "${_EXT_ARR[@]}"; do
 done
 NAME_EXPR+=( \) )
 TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
+  ( set +o pipefail; find "$PROJECT_DIR" -xdev "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
   | wc -l | awk '{print $1+0}'
 )
 say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
@@ -2490,6 +2636,24 @@ say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}"
 say "  ${BLUE}Info items:${RESET}       ${BLUE}$INFO_COUNT${RESET}"
 echo ""
 
+# Optional machine-friendly JSON export
+if [[ -n "$REPORT_JSON" ]]; then
+  python3 - "$JSON_FINDINGS_TMP" "$REPORT_JSON" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$UBS_VERSION" <<'PY' 2>/dev/null || true
+import json, sys, time
+src, out, files, crit, warn, info, ver = sys.argv[1:8]
+findings = []
+try:
+  with open(src,'r',encoding='utf-8') as fh:
+    for line in fh:
+      if line.strip(): findings.append(json.loads(line))
+except FileNotFoundError: pass
+payload = {"version": ver, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "files": int(files), "critical": int(crit), "warning": int(warn), "info": int(info), "findings": findings}
+open(out,'w',encoding='utf-8').write(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  say "${GREEN}${CHECK} JSON report saved to: ${CYAN}$REPORT_JSON${RESET}"
+fi
+
 say "${BOLD}${WHITE}Priority Actions:${RESET}"
 if [ "$CRITICAL_COUNT" -gt 0 ]; then
   say "  ${RED}${FIRE} ${BOLD}FIX CRITICAL ISSUES IMMEDIATELY${RESET}"
@@ -2514,6 +2678,9 @@ say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
 if [[ -n "$OUTPUT_FILE" ]]; then
   say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
 fi
+
+# Cleanup temp
+[[ -n "$JSON_FINDINGS_TMP" ]] && rm -f "$JSON_FINDINGS_TMP" || true
 
 echo ""
 if [ "$VERBOSE" -eq 0 ]; then

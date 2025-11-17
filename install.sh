@@ -1836,28 +1836,33 @@ detect_coding_agents() {
   HAS_AGENT_TABNINE=0
   HAS_AGENT_REPLIT=0
 
-  [[ -d "${HOME}/.claude" || -d ".claude" ]] && HAS_AGENT_CLAUDE=1
-  [[ -d "${HOME}/.codex"  || -d ".codex"  ]] && HAS_AGENT_CODEX=1
-  [[ -d "${HOME}/.cursor" || -d ".cursor" ]] && HAS_AGENT_CURSOR=1
-  [[ -d "${HOME}/.gemini" || -d ".gemini" ]] && HAS_AGENT_GEMINI=1
-  [[ -d "${HOME}/.opencode" || -d ".opencode" ]] && HAS_AGENT_OPENCODE=1
-  [[ -d "${HOME}/.windsurf" || -d ".windsurf" ]] && HAS_AGENT_WINDSURF=1
-  [[ -d "${HOME}/.cline" || -d ".cline" ]] && HAS_AGENT_CLINE=1
+  [[ -d "${HOME}/.claude" || -d ".claude" ]] && HAS_AGENT_CLAUDE=1 || true
+  [[ -d "${HOME}/.codex"  || -d ".codex"  ]] && HAS_AGENT_CODEX=1 || true
+  [[ -d "${HOME}/.cursor" || -d ".cursor" ]] && HAS_AGENT_CURSOR=1 || true
+  [[ -d "${HOME}/.gemini" || -d ".gemini" ]] && HAS_AGENT_GEMINI=1 || true
+  [[ -d "${HOME}/.opencode" || -d ".opencode" ]] && HAS_AGENT_OPENCODE=1 || true
+  [[ -d "${HOME}/.windsurf" || -d ".windsurf" ]] && HAS_AGENT_WINDSURF=1 || true
+  [[ -d "${HOME}/.cline" || -d ".cline" ]] && HAS_AGENT_CLINE=1 || true
 
-  [[ -f "${HOME}/.aider.conf.yml" || -f ".aider.conf.yml" || -f ".aider.config.yml" ]] && HAS_AGENT_AIDER=1
-
-  if [ -d "$HOME/.vscode/extensions" ]; then
-    ls "$HOME/.vscode/extensions"/continue.* >/dev/null 2>&1 && HAS_AGENT_CONTINUE=1
-  fi
-  [[ -d "${HOME}/.continue" || -d ".continue" ]] && HAS_AGENT_CONTINUE=1
+  [[ -f "${HOME}/.aider.conf.yml" || -f ".aider.conf.yml" || -f ".aider.config.yml" ]] && HAS_AGENT_AIDER=1 || true
 
   if [ -d "$HOME/.vscode/extensions" ]; then
-    ls "$HOME/.vscode/extensions"/github.copilot* >/dev/null 2>&1 && HAS_AGENT_COPILOT=1
+    if compgen -G "$HOME/.vscode/extensions"/continue.* >/dev/null 2>&1; then
+      HAS_AGENT_CONTINUE=1
+    fi
+    if compgen -G "$HOME/.vscode/extensions"/github.copilot* >/dev/null 2>&1; then
+      HAS_AGENT_COPILOT=1
+    fi
+  fi
+  [[ -d "${HOME}/.continue" || -d ".continue" ]] && HAS_AGENT_CONTINUE=1 || true
+
+  [[ -d "$HOME/.tabnine" ]] && HAS_AGENT_TABNINE=1 || true
+
+  if [[ -f ".replit" || -f "${HOME}/.replit" ]]; then
+    HAS_AGENT_REPLIT=1
   fi
 
-  [[ -d "$HOME/.tabnine" ]] && HAS_AGENT_TABNINE=1
-
-  [[ -f ".replit" ]] && HAS_AGENT_REPLIT=1
+  return 0
 }
 
 add_to_agents_md() {
@@ -2143,8 +2148,11 @@ add_to_path
 echo ""
 
 # Create alias/function
-
-create_alias
+if [ "$NO_PATH_MODIFY" -eq 1 ]; then
+  log "Skipping alias creation (per --no-path-modify)"
+else
+  create_alias
+fi
 echo ""
 
 detect_coding_agents

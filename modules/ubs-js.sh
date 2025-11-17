@@ -846,6 +846,7 @@ from collections import defaultdict
 from pathlib import Path
 
 ROOT = Path(sys.argv[1]).resolve()
+BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
 SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.cache', 'coverage', 'tmp'}
 EXTS = {'.js', '.jsx', '.ts', '.tsx'}
 
@@ -888,6 +889,10 @@ def should_skip(path: Path) -> bool:
 
 
 def list_files(root: Path):
+    if root.is_file():
+        if root.suffix.lower() in EXTS:
+            yield root
+        return
     for path in root.rglob('*'):
         if should_skip(path):
             continue
@@ -988,7 +993,12 @@ def analyze_file(path: Path, issues):
             culprit = contains_taint(expr, tainted)
             if not culprit:
                 continue
-            sample = f"{path.relative_to(ROOT)}:{idx}:{culprit}"
+            rel_base = BASE_DIR if BASE_DIR.exists() else ROOT.parent
+            try:
+                rel = path.relative_to(rel_base)
+            except ValueError:
+                rel = path.name
+            sample = f"{rel}:{idx}:{culprit}"
             info = issues[rule]
             info['count'] += 1
             if len(info['samples']) < 3:
@@ -1796,11 +1806,73 @@ if [ "$count" -gt 3 ]; then
 fi
 
 print_subheader "Missing 'async' keyword on functions using await"
-count=$( ("${GREP_RNW[@]}" "await" "$PROJECT_DIR" 2>/dev/null || true) \
-  | (grep -v "async" || true) | count_lines)
-if [ "$count" -gt 0 ]; then
-  print_finding "critical" "$count" "await used in non-async function" "SyntaxError in JS"
-  show_detailed_finding "\bawait\b" 3
+violations=$(python3 - "$PROJECT_DIR" <<'PY'
+import re, sys
+from pathlib import Path
+
+ROOT = Path(sys.argv[1]).resolve()
+EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+pat_async_fn = re.compile(r'\basync\s+function\b')
+pat_async_arrow = re.compile(r'=\s*async\s*(?:\([^)]*\)|[A-Za-z0-9_]+)\s*=>')
+pat_inline_async = re.compile(r'\basync\s*\([^)]*\)\s*=>')
+pat_async_method = re.compile(r'\basync\s+[A-Za-z_][\w]*\s*\(')
+
+def iter_files():
+    for path in ROOT.rglob('*'):
+        if path.suffix.lower() in EXTS and path.is_file():
+            yield path
+
+def strip_comment(text):
+    if '//' in text:
+        idx = text.find('//')
+        if idx >= 0:
+            return text[:idx]
+    return text
+
+violations = []
+for path in iter_files():
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except UnicodeDecodeError:
+        continue
+    stack = []
+    pending_async = False
+    for idx, raw in enumerate(lines, start=1):
+        line = strip_comment(raw)
+        if pat_async_fn.search(line) or pat_async_arrow.search(line) or pat_inline_async.search(line) or pat_async_method.search(line):
+            pending_async = True
+        for ch in line:
+            if ch == '{':
+                async_flag = pending_async or (stack[-1] if stack else False)
+                stack.append(async_flag)
+                pending_async = False
+            elif ch == '}':
+                if stack:
+                    stack.pop()
+        current_async = stack[-1] if stack else False
+        if 'await' not in line:
+            continue
+        if re.search(r'\bfor\s+await\b', line):
+            continue
+        if current_async:
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        violations.append((path.relative_to(ROOT), idx, stripped))
+
+for relpath, idx, text in violations[:50]:
+    print(f"{relpath}\t{idx}\t{text}")
+PY
+)
+if [[ -n "$violations" ]]; then
+  violation_count=$(printf '%s\n' "$violations" | grep -c .)
+  print_finding "critical" "$violation_count" "await used in non-async function" "Ensure surrounding function is declared async"
+  printf '%s\n' "$violations" | head -n 3 | while IFS=$'\t' read -r file line snippet; do
+    say "    ${DIM}${file}:${line}${RESET} ${snippet}"
+  done
+else
+  print_finding "good" "No await usage outside async functions"
 fi
 
 print_subheader "Race conditions with Promise.race/any"

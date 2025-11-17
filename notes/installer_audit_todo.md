@@ -1,6 +1,6 @@
 # Installer & Type Narrowing TODOs
 
-_Updated: 2025-11-17 22:37 UTC_
+_Updated: 2025-11-17 22:55 UTC_
 
 ## Issue Ownership
 - `ultimate_bug_scanner-46h` – Type narrowing fixtures + manifest (TS focus)
@@ -27,7 +27,7 @@ _Updated: 2025-11-17 22:37 UTC_
 - [x] Investigate Kotlin (or other language) heuristic feasibility + design plan.
 - [x] Hook optional rules into CLI config/flags (parallel to TS case).
 - [x] Update docs to mention multi-language coverage & how to toggle.
-- [x] Evaluate migrating the Rust helper to ast-grep rules (current helper shells out to ast-grep and falls back to regex when unavailable).
+- [x] Evaluate migrating the Rust helper to ast-grep rules (Bash wrapper now collects ast-grep JSON and feeds the helper, with regex fallback when ast-grep/python unavailable).
 
 ### 4. Typos Spellchecker Integration
 - [x] Confirm `install_typos` handles macOS/Linux/Windows, dry-run, retries (binary download + brew/cargo paths verified).
@@ -36,7 +36,7 @@ _Updated: 2025-11-17 22:37 UTC_
 - [x] Extend smoke tests to exercise Typos install/skip paths (installer harness updated with regression coverage).
 
 ### 5. Installer Reliability + UX
-- [x] Review locking/tempfile helpers (acquire/release coverage review outstanding).
+- [x] Review locking/tempfile helpers (self-test releases locks; harness ensures no stray `/tmp/ubs-install.lock`).
 - [ ] Ensure cleanup only deletes tracked temp paths; add coverage in tests.
 - [ ] Polish log formatting + section headings (consistent emojis/colors?).
 - [ ] Improve `install.sh --help` text (options grouped, new flags described).

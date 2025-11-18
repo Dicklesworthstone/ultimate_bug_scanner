@@ -406,30 +406,77 @@ show_detailed_finding() {
 run_resource_lifecycle_checks() {
   print_subheader "Resource lifecycle correlation"
   local helper="$SCRIPT_DIR/helpers/resource_lifecycle_py.py"
-  if [[ ! -f "$helper" ]]; then
-    print_finding "info" 0 "Resource helper missing" "Expected $helper"
-    return
+  if [[ -f "$helper" ]] && command -v python3 >/dev/null 2>&1; then
+    local output
+    if output=$(python3 "$helper" "$PROJECT_DIR" 2>/dev/null); then
+      if [[ -z "$output" ]]; then
+        print_finding "good" "All tracked resource acquisitions have matching cleanups"
+      else
+        while IFS=$'\t' read -r location kind message; do
+          [[ -z "$location" ]] && continue
+          local summary="${RESOURCE_LIFECYCLE_SUMMARY[$kind]:-Resource imbalance}"
+          local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$kind]:-Ensure matching cleanup call}"
+          local severity="${RESOURCE_LIFECYCLE_SEVERITY[$kind]:-warning}"
+          local detail="$remediation"
+          [[ -n "$message" ]] && detail="$message"
+          print_finding "$severity" 1 "$summary [$location]" "$detail"
+        done <<<"$output"
+      fi
+      return
+    else
+      print_finding "info" 0 "AST helper failed" "See stderr for details"
+    fi
+  else
+    if [[ ! -f "$helper" ]]; then
+      print_finding "info" 0 "Resource helper missing" "Expected $helper"
+    elif ! command -v python3 >/dev/null 2>&1; then
+      print_finding "info" 0 "python3 not available" "Install Python 3 to run AST helper"
+    fi
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    print_finding "info" 0 "python3 not available" "Install Python 3 to run AST helper"
-    return
-  fi
-  local output
-  if ! output=$(python3 "$helper" "$PROJECT_DIR" 2>/dev/null); then
-    print_finding "info" 0 "AST helper failed" "See stderr for details"
-    return
-  fi
-  if [[ -z "$output" ]]; then
+
+  # Regex fallback
+  local rid
+  local header_shown=0
+  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
+    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
+    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
+    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
+    local file_list
+    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+    [[ -n "$file_list" ]] || continue
+    while IFS= read -r file; do
+      [[ -z "$file" ]] && continue
+      local acquire_hits release_hits
+      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
+      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      local context_hits=0
+      if [[ "$rid" == "file_handle" ]]; then
+        context_hits=$("${GREP_RN[@]}" -e "with[[:space:]]+[[:alnum:]_.]*open" "$file" 2>/dev/null | count_lines || true)
+      fi
+      acquire_hits=${acquire_hits:-0}
+      release_hits=${release_hits:-0}
+      if (( acquire_hits > release_hits )); then
+        if [[ $header_shown -eq 0 ]]; then
+          header_shown=1
+        fi
+        local delta=$((acquire_hits - release_hits))
+        local relpath=${file#"$PROJECT_DIR"/}
+        [[ "$relpath" == "$file" ]] && relpath="$file"
+        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
+        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
+        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
+        local extra=""
+        if [[ "$rid" == "file_handle" ]]; then
+          extra=", context-managed=${context_hits:-0}"
+        fi
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits$extra)"
+        print_finding "$severity" "$delta" "$summary [$relpath]" "$desc"
+      fi
+    done <<<"$file_list"
+  done
+  if [[ $header_shown -eq 0 ]]; then
     print_finding "good" "All tracked resource acquisitions have matching cleanups"
-    return
   fi
-  while IFS=$'\t' read -r location kind _; do
-    [[ -z "$location" ]] && continue
-    local summary="${RESOURCE_LIFECYCLE_SUMMARY[$kind]:-Resource imbalance}"
-    local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$kind]:-Ensure matching cleanup call}"
-    local severity="${RESOURCE_LIFECYCLE_SEVERITY[$kind]:-warning}"
-    print_finding "$severity" 1 "$summary [$location]" "$remediation"
-  done <<<"$output"
 }
 
 run_async_error_checks() {

@@ -135,3 +135,11 @@ _Updated: 2025-11-18 01:30 UTC_
 - [x] Expand manifest `java-resource-lifecycle` expectations to assert on new summary strings.
 - [x] Refresh README resource-lifecycle bullet to mention Statement/PreparedStatement coverage (already documents new helper block).
 - [x] Re-run Java manifest + full `test-suite/run_all.sh` + `./ubs --ci .`; document outcomes.
+
+### 15. Swift Module Wiring (6x4 / 41t / 7g7 cross-over)
+- [x] Re-enable all categories by fixing `should_skip` inversion so scans emit findings again.
+- [x] Repair the banner heredoc + startup logging so the script parses under `set -e`.
+- [x] Count Swift sources separately and gate the guard helper on actual `.swift` files.
+- [x] Wire `run_swift_type_narrowing_checks` (helper + `UBS_SKIP_TYPE_NARROWING`) into Category 1 with proper logging.
+- [x] Update manifest/test-suite docs/README to run Swift cases via `--only=swift` and advertise the dedicated module.
+- [x] Patch the multi-line counter pipelines/Heredoc regression so the Swift module executes without syntax errors and surfaces guard warnings.

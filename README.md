@@ -423,7 +423,7 @@ ubs .
 - **TypeScript** – UBS shells out to `tsserver` (via the bundled helper) whenever Node.js + the `typescript` package are available. The installer surfaces a "Type narrowing readiness" diagnostic so you immediately know if tsserver-powered guards are running.
 - **Rust** – A Python helper inspects `if let Some/Ok` guard clauses and flags subsequent `.unwrap()`/`.expect()` calls outside of exiting blocks. Fixtures and manifest cases keep this regression-tested.
 - **Kotlin** – The Java module scans `.kt` sources for `if (value == null)` guards that merely log and keep running before hitting `value!!`, catching the same pitfall on JVM teams that mix Java + Kotlin.
-- **Swift** – Guard-`let` validation plus optional chaining/Objective‑C bridging heuristics catch cases where code logs and continues before force-unwrapping `value!`, protecting iOS/macOS pipelines that blend Swift + ObjC.
+- **Swift** – The dedicated `ubs-swift` module now ships the guard-`let` helper directly, so optional chaining/Objective‑C bridging heuristics fire even when you run `ubs --only=swift` locally (no piggybacking on the Java module). It catches cases where code logs and keeps going before force-unwrapping `value!`, protecting iOS/macOS pipelines that blend Swift + ObjC.
 
 ### **Resource Lifecycle AST Coverage**
 

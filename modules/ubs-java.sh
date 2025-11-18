@@ -246,7 +246,7 @@ declare -A RESOURCE_LIFECYCLE_RULE_SUMMARY=(
   [java.resource.thread-no-join]='Thread started without join()'
   [java.resource.jdbc-no-close]='JDBC connection acquired without close()'
   [java.resource.resultset-no-close]='ResultSet not closed after use'
-  [java.resource.statement-no-close]='Statement/PreparedStatement not closed after use'
+  [java.resource.statement-no-close]='Statement/Prepared/CallableStatement not closed after use'
 )
 declare -A RESOURCE_LIFECYCLE_RULE_REMEDIATION=(
   [java.resource.executor-no-shutdown]='Store the ExecutorService and call shutdown()/shutdownNow() in finally blocks'
@@ -447,11 +447,11 @@ run_resource_lifecycle_checks() {
       done <<<"$helper_output"
       if [ "$stmt_count" -gt 0 ]; then
         emitted=1
-        local desc="Use try-with-resources and ensure Statement/PreparedStatement handles call close()"
+        local desc="Use try-with-resources and ensure Statement/Prepared/CallableStatement handles call close()"
         if [ "${#stmt_samples[@]}" -gt 0 ]; then
           desc+=" (e.g., ${stmt_samples[0]})"
         fi
-        print_finding "warning" "$stmt_count" "Statement/PreparedStatement not closed after use" "$desc"
+        print_finding "warning" "$stmt_count" "Statement/Prepared/CallableStatement not closed after use" "$desc"
       fi
       if [ "$rs_count" -gt 0 ]; then
         emitted=1

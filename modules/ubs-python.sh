@@ -89,8 +89,8 @@ MAX_DETAILED=250
 JOBS="${JOBS:-0}"
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
-ENABLE_UV_TOOLS=1                     # try uv integrations by default
-UV_TOOLS="ruff,bandit,pip-audit"      # subset via --uv-tools=
+ENABLE_UV_TOOLS=${ENABLE_UV_TOOLS:-1}               # try uv integrations by default
+UV_TOOLS=${UV_TOOLS:-"ruff,bandit,pip-audit"}      # subset via --uv-tools=
 UV_TIMEOUT="${UV_TIMEOUT:-1200}"      # generous time budget per tool
 ENABLE_EXTRA_TOOLS=1                  # mypy/safety/detect-secrets if present
 SUMMARY_JSON=""
@@ -98,6 +98,14 @@ TIMEOUT_CMD=""                        # resolved later
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-0}"
 AST_PASSTHROUGH=0
 AST_TEXT_SUMMARY=1
+
+# Category filtering from meta-runner (e.g., UBS_CATEGORY_FILTER=resource-lifecycle)
+CATEGORY_WHITELIST=""
+case "${UBS_CATEGORY_FILTER:-}" in
+  resource-lifecycle)
+    CATEGORY_WHITELIST="16,19"
+    ;;
+esac
 
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(py.async.task-no-await)
@@ -159,7 +167,7 @@ Options:
   --max-detailed=N        Cap number of detailed code samples (default: $MAX_DETAILED)
   -h, --help              Show help
 Env:
-  JOBS, NO_COLOR, CI, UV_TIMEOUT, TIMEOUT_SECONDS, MAX_FILE_SIZE
+  JOBS, NO_COLOR, CI, UV_TIMEOUT, TIMEOUT_SECONDS, MAX_FILE_SIZE, UBS_CATEGORY_FILTER
 Args:
   PROJECT_DIR             Directory to scan (default: ".")
   OUTPUT_FILE             File to save the report (optional)
@@ -263,7 +271,7 @@ declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
   [asyncio_task]='asyncio\.create_task'
 )
 declare -A RESOURCE_LIFECYCLE_RELEASE=(
-  [file_handle]='\.close\(|with[[:space:]]+open'
+  [file_handle]='\.close\(|with[[:space:]]+[[:alnum:]_.]*open'
   [socket_handle]='\.close\('
   [popen_handle]='\.wait\(|\.communicate\(|\.terminate\(|\.kill\('
   [asyncio_task]='\.cancel\(|await[[:space:]]+asyncio\.(gather|wait)'
@@ -405,7 +413,7 @@ run_resource_lifecycle_checks() {
       release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
       local context_hits=0
       if [[ "$rid" == "file_handle" ]]; then
-        context_hits=$("${GREP_RN[@]}" -e "with[[:space:]]+open" "$file" 2>/dev/null | count_lines || true)
+        context_hits=$("${GREP_RN[@]}" -e "with[[:space:]]+[[:alnum:]_.]*open" "$file" 2>/dev/null | count_lines || true)
       fi
       acquire_hits=${acquire_hits:-0}
       release_hits=${release_hits:-0}
@@ -1502,6 +1510,12 @@ run_system_or_uv_tool() {
 # ────────────────────────────────────────────────────────────────────────────
 should_skip() {
   local cat="$1"
+  if [[ -n "$CATEGORY_WHITELIST" ]]; then
+    local allowed=1
+    IFS=',' read -r -a allow <<<"$CATEGORY_WHITELIST"
+    for s in "${allow[@]}"; do [[ "$s" == "$cat" ]] && allowed=0; done
+    [[ $allowed -eq 1 ]] && return 1
+  fi
   if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
   IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
   for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
@@ -2266,22 +2280,27 @@ print_category "Detects: open without with, missing encoding, rmtree(ignore_erro
   "I/O bugs leak resources and produce nondeterministic behavior."
 
 print_subheader "open(...) without context manager"
-count=$("${GREP_RN[@]}" -e "open\(" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v -E "with[[:space:]]+open\(" || true) | count_lines)
-if [ "$count" -gt 5 ]; then
-  print_finding "warning" "$count" "open() outside 'with' block" "Wrap in 'with' to ensure close()"
+open_calls=$("${GREP_RN[@]}" -e "open\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+with_calls=$("${GREP_RN[@]}" -e "with[[:space:]]+open\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$open_calls" -gt 0 ] && [ "$with_calls" -lt "$open_calls" ]; then
+  diff=$((open_calls - with_calls))
+  print_finding "warning" "$diff" "open() calls missing 'with'" "Wrap file handles in context managers or close them explicitly"
+else
+  print_finding "good" "File usage appears context-managed"
 fi
 
 print_subheader "open() without explicit encoding"
-count=$("${GREP_RN[@]}" -e "open\([^\)]*\)|Path\([^\)]*\)\.open\([^\)]*\)" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v "encoding[[:space:]]*=" || true) | count_lines
-if [ "$count" -gt 10 ]; then
-  print_finding "info" "$count" "No encoding in open()" "Specify encoding= 'utf-8' etc."
+no_encoding=$("${GREP_RN[@]}" -e "open\([^)]*\)" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "encoding[[:space:]]*=" || true) | count_lines)
+if [ "$no_encoding" -gt 0 ]; then
+  print_finding "info" "$no_encoding" "open() missing encoding" "Pass encoding='utf-8' (or desired charset) for portability"
 fi
 
 print_subheader "shutil.rmtree(ignore_errors=True)"
-count=$("${GREP_RN[@]}" -e "shutil\.rmtree\([^)]*ignore_errors\s*=\s*True" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$count" -gt 0 ]; then print_finding "info" "$count" "rmtree(ignore_errors=True) hides failures"; fi
+rmtree_ignore=$("${GREP_RN[@]}" -e "shutil\.rmtree\([^)]*ignore_errors\s*=\s*True" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$rmtree_ignore" -gt 0 ]; then
+  print_finding "info" "$rmtree_ignore" "rmtree(ignore_errors=True) hides failures"
+fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

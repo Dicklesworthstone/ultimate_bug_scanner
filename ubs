@@ -25,7 +25,7 @@ declare -A MODULE_CHECKSUMS=(
   [golang]='1ffde3581adc85ea70d4287ae6b9c3e2edd8256aa9af8ada36e303ef7e00cf8f'
   [java]='af71e11a018dcffce9a260d94f04fa17d94ba008e5deac5d12ac29aef55002b4'
   [ruby]='b147852bf853d28442cdefd9f638830e5e6a676f473b7bb9d85b44869d31dfea'
-  [swift]='1fa406bf879df6bc1a159263841d2af758d03da6453a922cbc42b40e87535115'
+  [swift]='8a125fd0872890f2f0bba1a6b024effde2663e08bf2ea6c9254f0c247d80299e'
 )
 
 # Colors (respect NO_COLOR or non-tty)

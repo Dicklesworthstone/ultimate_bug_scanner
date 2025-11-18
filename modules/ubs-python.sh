@@ -37,6 +37,8 @@ shopt -s lastpipe
 shopt -s extglob
 shopt -s compat31 || true
 
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
@@ -257,36 +259,41 @@ HAS_UV=0
 RG_MAX_SIZE_FLAGS=()
 
 # Resource lifecycle correlation spec (acquire vs release pairs)
-RESOURCE_LIFECYCLE_IDS=(file_handle socket_handle popen_handle asyncio_task)
+RESOURCE_LIFECYCLE_IDS=(file_handle socket_handle popen_handle asyncio_task context_cancel)
 declare -A RESOURCE_LIFECYCLE_SEVERITY=(
   [file_handle]="critical"
   [socket_handle]="warning"
   [popen_handle]="warning"
   [asyncio_task]="warning"
+  [context_cancel]="critical"
 )
 declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
   [file_handle]='open\('
   [socket_handle]='socket\.socket\('
   [popen_handle]='subprocess\.Popen\('
   [asyncio_task]='asyncio\.create_task'
+  [context_cancel]='context\.With(Timeout|Cancel|Deadline)'
 )
 declare -A RESOURCE_LIFECYCLE_RELEASE=(
   [file_handle]='\.close\(|with[[:space:]]+[[:alnum:]_.]*open'
   [socket_handle]='\.close\('
   [popen_handle]='\.wait\(|\.communicate\(|\.terminate\(|\.kill\('
   [asyncio_task]='\.cancel\(|await[[:space:]]+asyncio\.(gather|wait)'
+  [context_cancel]='cancel\('
 )
 declare -A RESOURCE_LIFECYCLE_SUMMARY=(
   [file_handle]='File handles opened without context manager/close'
   [socket_handle]='Sockets opened without matching close()'
   [popen_handle]='Popen handles not waited or terminated'
   [asyncio_task]='asyncio tasks spawned without cancellation/await'
+  [context_cancel]='context.With* without cancel()'
 )
 declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
   [file_handle]='Use "with open(...)" or explicitly call .close()'
   [socket_handle]='Use contextlib closing() or call sock.close() in finally/defer'
   [popen_handle]='Capture the Popen object and call wait/communicate/terminate on it'
   [asyncio_task]='Await the task result or cancel/monitor it before shutdown'
+  [context_cancel]='Store the cancel function and call/defer it immediately after creation'
 )
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -397,51 +404,32 @@ show_detailed_finding() {
 }
 
 run_resource_lifecycle_checks() {
-  local header_shown=0
-  local rid
-  for rid in "${RESOURCE_LIFECYCLE_IDS[@]}"; do
-    local acquire_regex="${RESOURCE_LIFECYCLE_ACQUIRE[$rid]:-}"
-    local release_regex="${RESOURCE_LIFECYCLE_RELEASE[$rid]:-}"
-    [[ -z "$acquire_regex" || -z "$release_regex" ]] && continue
-    local file_list
-    file_list=$("${GREP_RN[@]}" -e "$acquire_regex" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
-    [[ -n "$file_list" ]] || continue
-    while IFS= read -r file; do
-      [[ -z "$file" ]] && continue
-      local acquire_hits release_hits
-      acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
-      release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
-      local context_hits=0
-      if [[ "$rid" == "file_handle" ]]; then
-        context_hits=$("${GREP_RN[@]}" -e "with[[:space:]]+[[:alnum:]_.]*open" "$file" 2>/dev/null | count_lines || true)
-      fi
-      acquire_hits=${acquire_hits:-0}
-      release_hits=${release_hits:-0}
-      if (( acquire_hits > release_hits )); then
-        if [[ $header_shown -eq 0 ]]; then
-          print_subheader "Resource lifecycle correlation"
-          header_shown=1
-        fi
-        local delta=$((acquire_hits - release_hits))
-        local relpath=${file#"$PROJECT_DIR"/}
-        [[ "$relpath" == "$file" ]] && relpath="$file"
-        local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
-        local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
-        local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
-        local title="$summary [$relpath]"
-        local extra=""
-        if [[ "$rid" == "file_handle" ]]; then
-          extra=", context-managed=${context_hits:-0}"
-        fi
-        local desc="$remediation (acquire=$acquire_hits, release=$release_hits$extra)"
-        print_finding "$severity" "$delta" "$title" "$desc"
-      fi
-    done <<<"$file_list"
-  done
-  if [[ $header_shown -eq 0 ]]; then
-    print_subheader "Resource lifecycle correlation"
-    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+  print_subheader "Resource lifecycle correlation"
+  local helper="$SCRIPT_DIR/helpers/resource_lifecycle_py.py"
+  if [[ ! -f "$helper" ]]; then
+    print_finding "info" 0 "Resource helper missing" "Expected $helper"
+    return
   fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    print_finding "info" 0 "python3 not available" "Install Python 3 to run AST helper"
+    return
+  fi
+  local output
+  if ! output=$(python3 "$helper" "$PROJECT_DIR" 2>/dev/null); then
+    print_finding "info" 0 "AST helper failed" "See stderr for details"
+    return
+  fi
+  if [[ -z "$output" ]]; then
+    print_finding "good" "All tracked resource acquisitions have matching cleanups"
+    return
+  fi
+  while IFS=$'\t' read -r location kind _; do
+    [[ -z "$location" ]] && continue
+    local summary="${RESOURCE_LIFECYCLE_SUMMARY[$kind]:-Resource imbalance}"
+    local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$kind]:-Ensure matching cleanup call}"
+    local severity="${RESOURCE_LIFECYCLE_SEVERITY[$kind]:-warning}"
+    print_finding "$severity" 1 "$summary [$location]" "$remediation"
+  done <<<"$output"
 }
 
 run_async_error_checks() {

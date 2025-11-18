@@ -133,9 +133,9 @@ def collect_elvis_issues(text: str):
 def analyze_file(path: Path):
     text = path.read_text(encoding="utf-8", errors="ignore")
     issues = []
+    issues.extend(collect_guard_issues(text, SAFE_CALL_GUARD_PATTERN, "{name}!! used after ?. guard without exit"))
     issues.extend(collect_guard_issues(text, NEGATIVE_GUARD_PATTERN, "{name}!! after non-exiting null guard"))
     issues.extend(collect_guard_issues(text, POSITIVE_GUARD_PATTERN, "{name}!! used after '!= null' guard without exit"))
-    issues.extend(collect_guard_issues(text, SAFE_CALL_GUARD_PATTERN, "{name}!! used after ?. guard without exit"))
     issues.extend(collect_smart_cast_issues(text))
     issues.extend(collect_elvis_issues(text))
     deduped = []

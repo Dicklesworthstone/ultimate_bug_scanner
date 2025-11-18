@@ -8,12 +8,13 @@ from pathlib import Path
 
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
 GUARD_PATTERN = re.compile(r"guard\s+let\s+([A-Za-z_][\w]*)\s*=\s*[^\\n]+\s+else\s*\{", re.MULTILINE)
-NEGATIVE_NIL_GUARD = re.compile(r"if\s*\(\s*([A-Za-z_][\w]*)\s*==\s*nil[^)]*\)", re.MULTILINE)
-POSITIVE_NIL_GUARD = re.compile(r"if\s*\(\s*([A-Za-z_][\w]*)\s*!=\s*nil[^)]*\)", re.MULTILINE)
-OPTIONAL_CHAIN_GUARD = re.compile(r"if\s*\(\s*([A-Za-z_][\w]*)\s*\?\.[^)]*\)", re.MULTILINE)
+NEGATIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*==\s*nil[^)\{]*\)?", re.MULTILINE)
+POSITIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*!=\s*nil[^)\{]*\)?", re.MULTILINE)
+OPTIONAL_CHAIN_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*\?\.[^)\{]*\)?", re.MULTILINE)
 FORCE_TEMPLATE = r"{name}\s*!"
 ASSIGN_TEMPLATE = r"{name}\s*="
 EXIT_KEYWORDS = ("return", "throw", "break", "continue", "fatalError", "preconditionFailure")
+COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
 
 
 def iter_swift_files(root: Path):
@@ -42,7 +43,8 @@ def find_block_end(text: str, brace_start: int) -> int:
 
 
 def block_has_exit(block: str) -> bool:
-    lower = block.lower()
+    stripped = COMMENT_PATTERN.sub("", block)
+    lower = stripped.lower()
     for keyword in EXIT_KEYWORDS:
         if keyword.lower() in lower:
             return True

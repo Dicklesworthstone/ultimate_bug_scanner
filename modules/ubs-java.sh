@@ -229,21 +229,29 @@ RESOURCE_LIFECYCLE_RULE_IDS=(
   java.resource.executor-no-shutdown
   java.resource.thread-no-join
   java.resource.jdbc-no-close
+  java.resource.resultset-no-close
+  java.resource.statement-no-close
 )
 declare -A RESOURCE_LIFECYCLE_RULE_SEVERITY=(
   [java.resource.executor-no-shutdown]="critical"
   [java.resource.thread-no-join]="warning"
   [java.resource.jdbc-no-close]="warning"
+  [java.resource.resultset-no-close]="warning"
+  [java.resource.statement-no-close]="warning"
 )
 declare -A RESOURCE_LIFECYCLE_RULE_SUMMARY=(
   [java.resource.executor-no-shutdown]='ExecutorService created without shutdown'
   [java.resource.thread-no-join]='Thread started without join()'
   [java.resource.jdbc-no-close]='JDBC connection acquired without close()'
+  [java.resource.resultset-no-close]='ResultSet not closed after use'
+  [java.resource.statement-no-close]='Statement/PreparedStatement not closed after use'
 )
 declare -A RESOURCE_LIFECYCLE_RULE_REMEDIATION=(
   [java.resource.executor-no-shutdown]='Store the ExecutorService and call shutdown()/shutdownNow() in finally blocks'
   [java.resource.thread-no-join]='Join threads or use executors to avoid orphaned workers'
   [java.resource.jdbc-no-close]='Use try-with-resources or explicitly close java.sql.Connection objects'
+  [java.resource.resultset-no-close]='Close java.sql.ResultSet objects or wrap them in try-with-resources'
+  [java.resource.statement-no-close]='Close Statement/PreparedStatement handles or wrap them in try-with-resources'
 )
 
 RESOURCE_LIFECYCLE_REGEX_IDS=(executor_shutdown thread_join jdbc_close)
@@ -632,6 +640,7 @@ rule:
     inside:
       kind: try_statement
 YAML
+
   cat >"$rule_dir/java.async.then-no-exceptionally.yml" <<'YAML'
 id: java.async.then-no-exceptionally
 language: java
@@ -1138,6 +1147,41 @@ severity: info
 message: "Virtual threads detected; ensure blocking I/O is appropriate or use async APIs"
 YAML
 
+  cat >"$AST_RULE_DIR/java-resource-resultset.yml" <<'YAML'
+id: java.resource.resultset-no-close
+language: java
+rule:
+  any:
+    - pattern: java.sql.ResultSet $R = $EXPR.executeQuery($$);
+    - pattern: ResultSet $R = $EXPR.executeQuery($$);
+  not:
+    any:
+      - inside:
+          pattern: $R.close()
+      - inside:
+          kind: try_with_resources_statement
+severity: warning
+message: "ResultSet acquired without close(); wrap in try-with-resources or close explicitly."
+YAML
+
+  cat >"$AST_RULE_DIR/java-resource-statement.yml" <<'YAML'
+id: java.resource.statement-no-close
+language: java
+rule:
+  any:
+    - pattern: java.sql.Statement $S = $EXPR.createStatement($$);
+    - pattern: Statement $S = $EXPR.createStatement($$);
+    - pattern: java.sql.PreparedStatement $S = $EXPR.prepareStatement($$);
+    - pattern: PreparedStatement $S = $EXPR.prepareStatement($$);
+  not:
+    any:
+      - inside:
+          pattern: $S.close()
+      - inside:
+          kind: try_with_resources_statement
+severity: warning
+message: "Statement/PreparedStatement acquired without close(); wrap in try-with-resources or close explicitly."
+YAML
   # ====== Closeable without try-with-resources (heuristic) ======
   cat >"$AST_RULE_DIR/closeable-no-twr.yml" <<'YAML'
 id: java.closeable-no-twr

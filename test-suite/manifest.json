@@ -934,6 +934,54 @@
       }
     },
     {
+      "id": "cpp-macro-traps",
+      "description": "C++ macro pitfalls (min/max macros, debug toggles).",
+      "path": "test-suite/cpp/macro_traps",
+      "language": "cpp",
+      "tags": [
+        "cpp",
+        "macros",
+        "buggy"
+      ],
+      "args": [
+        "--only=cpp",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "min/max macros detected"
+        ]
+      }
+    },
+    {
+      "id": "cpp-modern-io-clean",
+      "description": "C++ fmt/iostream clean baseline with no legacy I/O APIs.",
+      "path": "test-suite/cpp/modern_io",
+      "language": "cpp",
+      "tags": [
+        "cpp",
+        "clean",
+        "modern"
+      ],
+      "args": [
+        "--only=cpp"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "rust-buggy",
       "description": "Rust buggy fixtures (unwrap panics, resource leaks, injection, float precision).",
       "path": "test-suite/rust/buggy",
@@ -1459,6 +1507,109 @@
         "require_substrings": [
           "resource_lifecycle.rb"
         ]
+      }
+    },
+    {
+      "id": "ruby-taint-buggy",
+      "description": "Ruby taint regression (single-string system/backticks).",
+      "path": "test-suite/ruby/security_buggy",
+      "language": "ruby",
+      "tags": [
+        "ruby",
+        "security",
+        "buggy"
+      ],
+      "args": [
+        "--only=ruby",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Shell invocation risk",
+          "Backtick command execution"
+        ]
+      }
+    },
+    {
+      "id": "ruby-taint-clean",
+      "description": "Ruby secure shell calls using argv arrays/Open3.",
+      "path": "test-suite/ruby/security_clean",
+      "language": "ruby",
+      "tags": [
+        "ruby",
+        "security",
+        "clean"
+      ],
+      "args": [
+        "--only=ruby"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "ruby-serialization-buggy",
+      "description": "Ruby unsafe YAML/Marshal loading regression.",
+      "path": "test-suite/ruby/serialization_buggy",
+      "language": "ruby",
+      "tags": [
+        "ruby",
+        "serialization",
+        "buggy"
+      ],
+      "args": [
+        "--only=ruby",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Unsafe deserialization"
+        ]
+      }
+    },
+    {
+      "id": "ruby-serialization-clean",
+      "description": "Ruby safe YAML loading baseline.",
+      "path": "test-suite/ruby/serialization_clean",
+      "language": "ruby",
+      "tags": [
+        "ruby",
+        "serialization",
+        "clean"
+      ],
+      "args": [
+        "--only=ruby"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
       }
     }
   ]

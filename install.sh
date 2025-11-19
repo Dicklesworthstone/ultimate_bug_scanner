@@ -2521,30 +2521,13 @@ append_agent_rule_block() {
   local agent_dir="$1"
   local friendly_name="$2"
   local file="$agent_dir/rules"
-  local marker="Ultimate Bug Scanner Integration"
 
   if dry_run_enabled; then
-    log_dry_run "Would update $file with $friendly_name guardrails."
+    log_dry_run "Would update $file with $friendly_name quick reference."
     return 0
   fi
 
-  mkdir -p "$agent_dir"
-  if [ -f "$file" ] && grep -q "$marker" "$file"; then
-    log "$friendly_name instructions already present at $file"
-    return 0
-  fi
-
-  cat >> "$file" <<'RULE'
-# >>> Ultimate Bug Scanner Integration
-# Always run the unified scanner before finalizing work:
-#   1. Execute: ubs --fail-on-warning .
-#   2. Review and fix any findings (critical + warning) before marking a task complete.
-#   3. Mention outstanding issues in your response if they remain.
-# This keeps AI coding agents honest about quality.
-# <<< End Ultimate Bug Scanner Integration
-
-RULE
-  success "Added $friendly_name quality instructions at $file"
+  append_quick_reference_block "$file" "$friendly_name guardrails"
 }
 
 setup_cursor_rules() { append_agent_rule_block ".cursor" "Cursor"; }
@@ -2760,37 +2743,9 @@ detect_coding_agents() {
   return 0
 }
 
-add_to_agents_md() {
-  local agents_file="AGENTS.md"
-
-  if [ ! -f "$agents_file" ]; then
-    log "No AGENTS.md found in current directory"
-    return 0
-  fi
-
-  if [ ! -w "$agents_file" ]; then
-    error "AGENTS.md exists but is not writable - check permissions"
-    return 1
-  fi
-
-  if grep -qF "## Code Quality: Ultimate Bug Scanner" "$agents_file" 2>/dev/null; then
-    log "AGENTS.md already contains scanner documentation"
-    return 0
-  fi
-
-  log "Adding scanner section to AGENTS.md..."
-
-  if dry_run_enabled; then
-    log_dry_run "Would append scanner documentation to $agents_file."
-    return 0
-  fi
-
-  if ! cp "$agents_file" "${agents_file}.backup" 2>/dev/null; then
-    warn "Could not create backup of AGENTS.md"
-  fi
-
-  cat >> "$agents_file" << 'AGENTS_EOF'
-```bash
+quick_reference_block() {
+cat <<'QUICK_REF'
+````markdown
 ## UBS Quick Reference for AI Agents
 
 UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
@@ -2838,9 +2793,87 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - ❌ Ignore findings → ✅ Investigate each
 - ❌ Full scan per edit → ✅ Scope to file
 - ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
-AGENTS_EOF
+````
+QUICK_REF
+}
 
-success "Added section to AGENTS.md"
+append_quick_reference_block() {
+  local destination="$1"
+  local friendly_name="$2"
+  local marker="## UBS Quick Reference for AI Agents"
+
+  if dry_run_enabled; then
+    log_dry_run "Would append UBS quick reference to ${destination}."
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$destination")"
+
+  if [ -f "$destination" ] && grep -qF "$marker" "$destination" 2>/dev/null; then
+    [ -n "$friendly_name" ] && log "${friendly_name} already contains UBS quick reference"
+    return 0
+  fi
+
+  {
+    echo ""
+    quick_reference_block
+  } >> "$destination"
+
+  [ -n "$friendly_name" ] && success "Added UBS quick reference to ${friendly_name}"
+}
+
+add_to_agents_md() {
+  local agents_file="AGENTS.md"
+
+  if [ ! -f "$agents_file" ]; then
+    log "No AGENTS.md found in current directory"
+    return 0
+  fi
+
+  if [ ! -w "$agents_file" ]; then
+    error "AGENTS.md exists but is not writable - check permissions"
+    return 1
+  fi
+
+  log "Adding scanner section to AGENTS.md..."
+
+  if dry_run_enabled; then
+    log_dry_run "Would append scanner documentation to $agents_file."
+    return 0
+  fi
+
+  if ! cp "$agents_file" "${agents_file}.backup" 2>/dev/null; then
+    warn "Could not create backup of AGENTS.md"
+  fi
+
+  append_quick_reference_block "$agents_file" "AGENTS.md"
+}
+
+add_to_claude_md() {
+  local claude_file="CLAUDE.md"
+
+  if [ ! -f "$claude_file" ]; then
+    log "No CLAUDE.md found in current directory"
+    return 0
+  fi
+
+  if [ ! -w "$claude_file" ]; then
+    error "CLAUDE.md exists but is not writable - check permissions"
+    return 1
+  fi
+
+  log "Adding scanner section to CLAUDE.md..."
+
+  if dry_run_enabled; then
+    log_dry_run "Would append scanner documentation to $claude_file."
+    return 0
+  fi
+
+  if ! cp "$claude_file" "${claude_file}.backup" 2>/dev/null; then
+    warn "Could not create backup of CLAUDE.md"
+  fi
+
+  append_quick_reference_block "$claude_file" "CLAUDE.md"
 }
 
 check_cron() {
@@ -3235,6 +3268,13 @@ fi
 if [ -f "AGENTS.md" ]; then
 if ask "Add scanner documentation to AGENTS.md?"; then
 add_to_agents_md
+fi
+echo ""
+fi
+
+if [ -f "CLAUDE.md" ]; then
+if ask "Add scanner documentation to CLAUDE.md?"; then
+add_to_claude_md
 fi
 echo ""
 fi

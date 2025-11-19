@@ -17,34 +17,16 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 
 </div>
 
----
+<div align="center">
 
-## 🛠 Python Tooling (uv + CPython 3.13)
-
-All helper scripts (manifest runner, fixtures, inline analyzers inside `ubs`) assume a single source of truth: **CPython 3.13 managed by [uv](https://github.com/astral-sh/uv)** living inside `.venv/` at the repo root.
+Just want it to do everything without confirmations? Live life on the edge with easy-mode to auto-install every dependency, accept all prompts, detect local coding agents, and wire their quality guardrails with zero extra questions:
 
 ```bash
-# 1) Install uv (one-time)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2) Create the managed environment defined by pyproject.toml / uv.lock
-uv sync --python 3.13
-
-# 3) Activate it whenever you work in this repo (puts .venv/bin first on PATH)
-source .venv/bin/activate
-
-# 4) Run any Python entrypoint through the env
-uv run python test-suite/run_manifest.py --case js-core-buggy
-# ...or rely on 'python'/'python3' now that they point at .venv/bin/python3.13
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh \
+  | bash -s -- --easy-mode
 ```
 
-> ℹ️ Shell scripts that invoke `python3` (language modules under `modules/`, `test-suite/run_all.sh`, etc.) automatically pick up `.venv/bin/python3` as long as the environment is activated or `.venv/bin` is on your `PATH`. The pinned `pyproject.toml` + `uv.lock` are the single source of truth for this toolchain.
-
-Common uv-powered entrypoints:
-
-- `uv run python test-suite/run_manifest.py --case js-core-buggy` – run the manifest in CI or locally without manually activating the venv.
-- `source .venv/bin/activate && python -m pip list` – verify that every inline `python3` invocation maps to CPython 3.13.
-- `uv run python - <<'PY' …` – mirrors how the language modules embed Python helpers, but now guaranteed to execute inside the managed interpreter.
+</div>
 
 ---
 
@@ -126,6 +108,144 @@ ubs --ci --only=python --category=resource-lifecycle \
 ```
 
 `latest.json` now contains the git metadata (repo URL, commit, blob_base) plus a `comparison.delta` block, and `latest.html` renders a lightweight dashboard summarising the deltas. SARIF uploads also pick up the comparison id so repeating runs in CI stay grouped by automation id.
+
+---
+
+## 💡 **Basic Usage**
+
+```bash
+# Scan current directory
+ubs .
+
+# Scan specific directory
+ubs /path/to/your/project
+
+# Verbose mode (show more code examples)
+ubs -v .
+
+# Save report to file
+ubs . bug-report.txt
+
+# CI mode (exit code 1 on warnings)
+ubs . --fail-on-warning
+
+# Quiet mode (summary only)
+ubs -q .
+
+# Skip specific categories (e.g., skip TODO markers)
+ubs . --skip=11,14
+
+# Custom file extensions
+ubs . --include-ext=js,ts,vue,svelte
+```
+
+---
+
+## 🚀 **Quick Install (30 Seconds)**
+
+### **Option 1: Automated Install (Recommended)**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash
+```
+
+The installer will:
+- ✅ Install the `ubs` command globally
+- ✅ Optionally install `ast-grep` (for advanced AST analysis)
+- ✅ Optionally install `ripgrep` (for 10x faster scanning)
+- ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
+- ✅ Optionally install `typos` (smart spellchecker for docs and identifiers)
+- ✅ Optionally install `Node.js + typescript` (enables deep TypeScript type narrowing analysis)
+- ✅ Auto-run `ubs doctor` post-install and append a session summary to `~/.config/ubs/session.md`
+- ✅ Capture readiness facts (ripgrep/jq/typos/type narrowing) and store them for `ubs sessions --entries 1`
+- ✅ Set up git hooks (block commits with critical bugs)
+- ✅ Set up Claude Code hooks (scan on file save)
+- ✅ Add documentation to your AGENTS.md
+
+Need to revisit what the installer discovered later? Run `ubs sessions --entries 1` to view the most recent session log (or point teammates at the same summary).
+
+Need the “just make it work” button? Run the installer with `--easy-mode` to auto-install every dependency, accept all prompts, detect local coding agents, and wire their quality guardrails with zero extra questions:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh \
+  | bash -s -- --easy-mode
+```
+
+**Total time:** 30 seconds to 2 minutes (depending on dependencies)
+
+Need to keep your shell RC files untouched? Combine `--no-path-modify` (and optionally `--skip-hooks`) with the command above—the installer will still drop `ubs` into your chosen `--install-dir`, but it will skip both PATH edits and the alias helper entirely.
+
+### **Option 2: Manual Install**
+
+```bash
+# Download and install the unified runner
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/ubs \
+  -o /usr/local/bin/ubs && chmod +x /usr/local/bin/ubs
+
+# Verify it works
+ubs --help
+
+# Optional but recommended: Install dependencies
+npm install -g @ast-grep/cli     # AST-based analysis
+brew install ripgrep             # 10x faster searching (or: apt/dnf/cargo install)
+brew install typos-cli           # Spellchecker tuned for code (or: cargo install typos-cli)
+npm install -g typescript        # Enables full tsserver-based type narrowing checks
+```
+
+### **Option 3: Use Without Installing**
+
+```bash
+# Download once
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/ubs \
+  -o ubs && chmod +x ubs
+
+# Run it
+./ubs .
+```
+
+### Installer Safety Nets
+
+#### Uninstall from any shell
+
+Run the installer in `--uninstall` mode via curl if you want to remove UBS and all of its integrations:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash -s -- --uninstall --non-interactive
+```
+
+This command deletes the UBS binary, shell RC snippets/aliases, config under `~/.config/ubs`, and the optional Claude/Git hooks that the installer set up. Because it passes `--non-interactive`, it auto-confirms all prompts and runs unattended.
+
+| Flag | What it does | Why it matters |
+|------|--------------|----------------|
+| `--dry-run` | Prints every install action (downloads, PATH edits, hook writes, cleanup) without touching disk. Dry runs still resolve config, detect agents, and show you exactly what *would* change. | Audit the installer, demo it to teammates, or validate CI steps without modifying a workstation. |
+| `--self-test` | Immediately runs `test-suite/install/run_tests.sh` after installation and exits non-zero if the smoke suite fails. | CI/CD jobs and verified setups can prove the installer still works end-to-end before trusting a release. |
+| `--skip-type-narrowing` | Skip the Node.js + TypeScript readiness probe **and** the cross-language guard analyzers (JS/Rust/Kotlin/Swift). | Useful for air-gapped hosts or environments that want to stay in heuristic-only mode. |
+| `--skip-typos` | Skip the Typos spellchecker installation + diagnostics. | Handy when corp images already provide Typos or when you deliberately disable spellcheck automation. |
+| `--skip-doctor` | Skip the automatic `ubs doctor` run + session summary after install. | Use when CI already runs doctor separately or when you're iterating locally and want a faster finish. |
+
+> [!WARNING]
+> `--self-test` requires running `install.sh` from a working tree that contains `test-suite/install/run_tests.sh` (i.e., the repo root). Curl-piping the installer from GitHub can’t self-test because the harness isn’t present, so the flag will error out early instead of giving a false sense of safety.
+
+> [!NOTE]
+> After every install the script now double-checks `command -v ubs`. If another copy shadows the freshly written binary, you’ll get an explicit warning with both paths so you can fix PATH order before running scans.
+
+> [!TIP]
+> Type narrowing relies on Node.js plus the `typescript` npm package *and* the Python helpers that power the Rust/Kotlin/Swift checks. The installer now checks Node/TypeScript readiness, can optionally run `npm install -g typescript`, and surfaces the status inside `install.sh --diagnose`. Use `--skip-type-narrowing` if you’re on an air-gapped host or plan to keep the heuristic-only mode.
+
+> [!TIP]
+> To avoid global npm permission issues, the installer now detects/installs [bun](https://bun.sh/) just like other dependencies and uses `bun install --global typescript` by default, falling back to npm only if bun isn’t available.
+>
+> The diagnostics also call out Swift guard readiness: if python3 is available we count `.swift` files under your repo and record whether the guard helper will actually run. That fact shows up in `install.sh --diagnose` output and the auto-generated session log so iOS/macOS teams can tell at a glance whether the ObjC-bridging heuristics are active.
+
+**Common combos**
+
+```bash
+# Preview everything without touching dotfiles or hooks
+bash install.sh --dry-run --no-path-modify --skip-hooks --non-interactive
+
+# CI-friendly install that self-tests the smoke harness
+bash install.sh --easy-mode --self-test --skip-hooks
+```
 
 ### 🔄 **Auto-Update**
 
@@ -275,6 +395,668 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 
 ---
 
+## 🤖 **AI Agent Integration (The Real Magic)**
+
+### On-Device Agent Guardrails
+
+`install.sh` now inspects your workstation for the most common coding agents (the same set listed below) and, when asked, drops guardrails that remind those agents to run `ubs --fail-on-warning .` before claiming a task is done. In `--easy-mode` this happens automatically; otherwise you can approve each integration individually.
+
+| Agent / IDE | What we wire up | Why it helps |
+|-------------|-----------------|--------------|
+| **Claude Code Desktop** (`.claude/hooks/on-file-write.sh`) | File-save hook that shells out to `ubs --ci` whenever Claude saves JS/TS files. | Keeps Claude from accepting “Apply Patch” without a fresh scan. |
+| **Cursor** (`.cursor/rules`) | Shared rule block that tells Cursor plans/tasks to run `ubs --fail-on-warning .` and summarize outstanding issues. | Cursor’s autonomous jobs inherit the same QA checklist as humans. |
+| **Codex CLI** (`.codex/rules`) | Adds the identical rule block for Anthropic’s Codex terminal workflow. | Ensures Codex sessions never skip the scanner during long refactors. |
+| **Gemini Code Assist** (`.gemini/rules`) | Guidance instructing Gemini agents to run `ubs` before closing a ticket. | Keeps Gemini’s asynchronous fixes aligned with UBS exit criteria. |
+| **Windsurf** (`.windsurf/rules`) | Guardrail text + sample command palette snippet referencing `ubs`. | Windsurf’s multi-step plans stay grounded in the same quality gate. |
+| **Cline** (`.cline/rules`) | Markdown instructions that Cline’s VS Code extension ingests. | Forces every “tool call” from Cline to mention scanner findings. |
+| **OpenCode MCP** (`.opencode/rules`) | Local MCP instructions so HTTP tooling always calls `ubs` before replying. | Makes OpenCode’s multi-agent swarms share the same notion of “done”. |
+
+### **Why This Matters for AI Workflows**
+
+When you're coding with AI, you're moving **10-100x faster** than traditional development. But bugs accumulate just as quickly. Traditional tools slow you down. This scanner keeps pace:
+
+```
+Traditional workflow:              AI-powered workflow with scanner:
+┌──────────────────┐              ┌──────────────────┐
+│ AI writes code   │              │ AI writes code   │
+└────────┬─────────┘              └────────┬─────────┘
+         │                                 │
+         ↓                                 ↓
+┌──────────────────┐              ┌──────────────────┐
+│ You review       │              │ Scanner runs     │
+│ (15 min)         │              │ (3 seconds)      │
+└────────┬─────────┘              └────────┬─────────┘
+         │                                 │
+         ↓                                 ↓
+┌──────────────────┐              ┌──────────────────┐
+│ Tests pass?      │              │ Critical bugs?   │
+└────────┬─────────┘              └────────┬─────────┘
+         │ NO!                              │ YES!
+         ↓                                 ↓
+┌──────────────────┐              ┌──────────────────┐
+│ Debug in prod    │              │ AI fixes them    │
+│ (6 hours)        │              │ (5 minutes)      │
+└──────────────────┘              └────────┬─────────┘
+                                           ↓
+                                  ┌──────────────────┐
+                                  │ Ship with         │
+                                  │ confidence        │
+                                  └──────────────────┘
+
+Total: 6.25 hours                Total: 8 minutes
+```
+
+### **Pattern 1: Claude Code Integration (Real-Time Scanning)**
+
+Drop this into `.claude/hooks/on-file-write.sh`:
+
+```bash
+#!/bin/bash
+# Auto-scan UBS-supported languages (JS/TS, Python, C/C++, Rust, Go, Java, Ruby) on save
+
+if [[ "$FILE_PATH" =~ \.(js|jsx|ts|tsx|mjs|cjs|py|pyw|pyi|c|cc|cpp|cxx|h|hh|hpp|hxx|rs|go|java|rb)$ ]]; then
+  echo "🔬 Quality check running..."
+
+  if ubs "${PROJECT_DIR}" --ci 2>&1 | head -30; then
+    echo "✅ No critical issues"
+  else
+    echo "⚠️  Issues detected - review above"
+  fi
+fi
+```
+
+**Result:** Every time Claude writes code, the scanner catches bugs **instantly**.
+
+### **Pattern 2: Git Pre-Commit Hook (Quality Gate)**
+
+The installer can set this up automatically, or add to `.git/hooks/pre-commit`:
+
+```bash
+#!/bin/bash
+# Block commits with critical bugs
+
+echo "🔬 Running bug scanner..."
+
+if ! ubs . --fail-on-warning 2>&1 | tee /tmp/scan.txt | tail -30; then
+  echo ""
+  echo "❌ Critical issues found. Fix them or use: git commit --no-verify"
+  echo ""
+  echo "Top issues:"
+  grep -A 3 "🔥 CRITICAL" /tmp/scan.txt | head -20
+  exit 1
+fi
+
+echo "✅ Quality check passed - committing..."
+```
+
+**Result:** Bugs **cannot** be committed. Period.
+
+### **Pattern 3: Cursor/Windsurf/Continue Integration**
+
+Add to your `.cursorrules` or similar:
+
+```markdown
+## Code Quality Standards
+
+Before marking any task as complete:
+
+1. Run the bug scanner: `ubs .`
+2. Fix ALL critical issues (🔥)
+3. Review warnings (⚠️) and fix if trivial
+4. Only then mark task complete
+
+If the scanner finds critical issues, your task is NOT done.
+```
+
+**Result:** AI agents have **built-in quality standards**.
+
+### **Pattern 4: CI/CD Pipeline (GitHub Actions Example)**
+
+```yaml
+name: Code Quality Gate
+
+on: [push, pull_request]
+
+jobs:
+  bug-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Bug Scanner
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash -s -- --non-interactive
+
+      - name: Scan for Bugs
+        run: |
+          ubs . --fail-on-warning --ci
+```
+
+**Result:** Pull requests with critical bugs **cannot merge**.
+
+### **Pattern 5: The Fix-Verify Loop (For AI Agents)**
+
+This is the golden pattern for AI coding workflows:
+
+```bash
+#!/bin/bash
+# Have your AI agent run this after implementing features
+
+echo "🔬 Post-implementation quality check..."
+
+# Run scanner
+if ubs . --fail-on-warning > /tmp/scan-result.txt 2>&1; then
+  echo "✅ All quality checks passed!"
+  echo "📝 Ready to commit"
+  exit 0
+else
+  echo "❌ Issues found:"
+  echo ""
+
+  # Show critical issues
+  grep -A 5 "🔥 CRITICAL" /tmp/scan-result.txt | head -30
+
+  echo ""
+  echo "🤖 AI: Please fix these issues and re-run this check"
+  exit 1
+fi
+```
+
+**Usage pattern:**
+
+```markdown
+User: "Add user registration with email validation"
+
+AI Agent:
+1. Implements the feature
+2. Runs quality check (scanner finds 3 critical bugs)
+3. Fixes the bugs
+4. Re-runs quality check (passes)
+5. Commits the code
+
+Total time: 12 minutes (vs. 6 hours debugging in production)
+```
+
+### **Pattern 6: The "AI Agent Decision Tree"**
+
+Train your AI agent to use this decision tree:
+
+```
+Did I modify code in any supported language?
+(JS/TS, Python, Go, Rust, Java, C++, Ruby)
+         │
+         ↓ YES
+Changed more than 50 lines?
+         │
+         ↓ YES
+    Run scanner ←──────────┐
+         │                 │
+         ↓                 │
+Critical issues found? ────┤ YES
+         │ NO              │
+         ↓                 │
+     Warnings?             │
+         │                 │
+         ↓ YES             │
+  Show to user             │
+  Ask if should fix ───────┤
+         │ NO              │
+         ↓                 ↓
+    Commit code      Fix issues
+```
+
+---
+
+> [!IMPORTANT]
+> **Copy the content below to your project's `AGENTS.md`, `.claude/claude_docs/`, or `.cursorrules` file for comprehensive UBS integration guidance.**
+
+## UBS Quick Reference for AI Agents
+
+UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
+
+**Install:** `curl -sSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh | bash`
+
+**Golden Rule:** `./ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+
+**Commands:**
+```bash
+./ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
+./ubs $(git diff --name-only --cached)    # Staged files — before commit
+./ubs --only=js,python src/               # Language filter (3-5x faster)
+./ubs --ci --fail-on-warning .            # CI mode — before PR
+./ubs --help                              # Full command reference
+./ubs sessions --entries 1                # Tail the latest install session log
+```
+
+**Output Format:**
+```
+⚠️  Category (N errors)
+    file.ts:42:5 – Issue description
+    💡 Suggested fix
+Exit code: 1
+```
+Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+
+**Fix Workflow:**
+1. Read finding → category + fix suggestion
+2. Navigate `file:line:col` → view context
+3. Verify real issue (not false positive)
+4. Fix root cause (not symptom)
+5. Re-run `./ubs <file>` → exit 0
+6. Commit
+
+**Speed Critical:** Scope to changed files. `./ubs src/file.ts` (< 1s) vs `./ubs .` (30s). Never full scan for small edits.
+
+**Bug Severity:**
+- **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks
+- **Important** (production): Type narrowing, division-by-zero, resource leaks
+- **Contextual** (judgment): TODO/FIXME, console logs
+
+**Anti-Patterns:**
+- ❌ Ignore findings → ✅ Investigate each
+- ❌ Full scan per edit → ✅ Scope to file
+- ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
+
+---
+
+## 🎬 **See It In Action**
+
+*Examples show JavaScript output; each language has equivalent detections (Python: None checks, Go: nil guards, Rust: Option handling, etc.)*
+
+### **Example 1: Catching a Null Pointer Bug**
+
+```bash
+$ ubs src/
+
+▓▓▓ NULL SAFETY & DEFENSIVE PROGRAMMING
+Detects: Null pointer dereferences, missing guards, unsafe property access
+
+  🔥 CRITICAL (5 found)
+    Unguarded property access after getElementById
+    Consider: const el = document.getElementById('x'); if (!el) return;
+
+      src/components/form.js:42
+        const submitBtn = document.getElementById('submit-button');
+        submitBtn.classList.add('active');  // ← Crashes if element missing
+
+      src/utils/dom.js:87
+        const modal = document.querySelector('.modal');
+        modal.style.display = 'block';  // ← Runtime crash guaranteed
+
+  💡 Fix: Always check for null before accessing properties
+```
+
+**Before:** 3 production crashes this week
+**After:** 0 crashes, caught in 2 seconds
+
+### **Example 2: Security Vulnerability Detection**
+
+```bash
+▓▓▓ SECURITY VULNERABILITIES
+Detects: Code injection, XSS, prototype pollution, timing attacks
+
+  🔥 CRITICAL (3 found)
+    innerHTML without sanitization - XSS risk
+    Use textContent or DOMPurify.sanitize()
+
+      src/comments.js:156
+        element.innerHTML = userComment;  // ← XSS vulnerability!
+
+  🔥 CRITICAL (1 found)
+    Hardcoded API keys detected
+    Use environment variables or secret managers
+
+      src/config.js:23
+        const apiKey = "sk_live_abc123xyz";  // ← Security breach!
+```
+
+**Before:** Security incident, customer data at risk
+**After:** Vulnerability caught before git commit
+
+### **Example 3: Async/Await Gotchas**
+
+```bash
+▓▓▓ ASYNC/AWAIT & PROMISE PITFALLS
+Detects: Missing await, unhandled rejections, race conditions
+
+  🔥 CRITICAL (8 found)
+    await used in non-async function
+    SyntaxError in JavaScript
+
+      src/api/users.js:67
+        function saveUser(data) {
+          await database.insert(data);  // ← SyntaxError!
+        }
+
+  ⚠️  WARNING (12 found)
+    Promises without .catch() or try/catch
+    Unhandled rejections crash Node.js
+
+      src/services/email.js:45
+        sendEmail(user.email).then(result => ...)  // ← No error handling!
+```
+
+**Before:** Silent failures, mysterious bugs in production
+**After:** All async bugs caught and fixed before deploy
+
+---
+
+## 📋 **What It Detects (The Complete Arsenal)**
+
+*Each language module has specialized detections. Examples below are representative (JavaScript shown; Python has `eval()`, Go has goroutine leaks, Rust has `.unwrap()` panics, C++ has buffer overflows, etc.)*
+
+### 🔴 **Critical Issues (Production Blockers)**
+
+These **WILL** cause crashes, security breaches, or data corruption:
+
+| Pattern | Example | Why It's Dangerous |
+|---------|---------|-------------------|
+| `eval()` usage | `eval(userInput)` | Allows arbitrary code execution - **RCE vulnerability** |
+| Direct NaN comparison | `if (x === NaN)` | Always returns false - **logic bug** |
+| Missing await | `asyncFunc()` in async context | Silent failures, race conditions - **data corruption** |
+| Prototype pollution | `obj.__proto__ = {}` | Security vulnerability - **privilege escalation** |
+| Unguarded null access | `el.style.color` without null check | **Runtime crash** guaranteed |
+| `parseInt` without radix | `parseInt("08")` | Returns 0 in some browsers - **calculation bug** |
+| Empty catch blocks | `catch(e) {}` | Swallows errors - **debugging nightmare** |
+| `innerHTML` with user data | `el.innerHTML = userInput` | **XSS vulnerability** |
+| Missing async keyword | `await` without `async function` | **SyntaxError** |
+| Hardcoded secrets | `const key = "sk_live..."` | **Security breach** |
+
+### 🟡 **Warnings (Should Fix Before Shipping)**
+
+These cause bugs, performance issues, or maintenance headaches:
+
+| Pattern | Example | Impact |
+|---------|---------|--------|
+| Promises without `.catch()` | `promise.then(...)` | Unhandled rejections crash Node.js |
+| Division without zero check | `total / count` | Returns `Infinity` or `NaN` |
+| Event listeners without cleanup | `addEventListener` in React | **Memory leak** (app gets slower over time) |
+| `setInterval` without clear | `setInterval(fn, 1000)` | **Timer leak** (infinite timers) |
+| `await` inside loops | `for(...) { await api.call() }` | **Slow** (sequential, not parallel) |
+| Array mutation during iteration | `arr.forEach(() => arr.push(...))` | **Skipped/duplicate** elements |
+| Missing switch default | `switch(x) { case 1: ... }` | Unhandled values cause silent failures |
+| `isNaN()` instead of `Number.isNaN()` | `isNaN("foo")` | Type coercion bugs |
+
+### 🔵 **Info (Code Quality & Best Practices)**
+
+Improvements that make code cleaner and more maintainable:
+
+- Optional chaining opportunities (`obj?.prop?.value`)
+- Nullish coalescing opportunities (`value ?? default`)
+- TypeScript `any` usage (reduces type safety)
+- `console.log` statements (remove before production)
+- Technical debt markers (TODO, FIXME, HACK)
+- Performance optimizations (DOM queries in loops)
+- `var` usage (use `let`/`const` instead)
+- Deep property access without guards
+- Large inline arrays (move to separate files)
+- Complex nested ternaries (readability)
+
+---
+
+## ⚙️ **Advanced Configuration**
+
+### **Command-Line Options (Full Reference)**
+
+```bash
+ubs [OPTIONS] [PROJECT_DIR] [OUTPUT_FILE]
+
+Core Options:
+  -v, --verbose            Show 10 code samples per finding (default: 3)
+  -q, --quiet              Minimal output (summary only)
+  --ci                     CI mode (stable output, no colors by default)
+  --fail-on-warning        Exit with code 1 on warnings (strict mode)
+  -h, --help               Show help and exit
+
+Output Control:
+  --format=FMT             Output format: text|json|sarif (default: text)
+  --no-color               Force disable ANSI colors
+  OUTPUT_FILE              Save report to file (auto-tees to stdout)
+
+File Selection:
+  --include-ext=CSV        File extensions (default: auto-detect by language)
+                           JS: js,jsx,ts,tsx,mjs,cjs | Python: py,pyi,pyx
+                           Go: go | Rust: rs | Java: java | C++: cpp,cc,cxx,c,h
+                           Ruby: rb,rake,ru | Custom: --include-ext=js,ts,vue
+  --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
+                           Example: --exclude=vendor,third-party,legacy
+
+Performance:
+  --jobs=N                 Parallel jobs for ripgrep (default: auto-detect cores)
+                           Set to 1 for deterministic output
+
+Rule Control:
+  --skip=CSV               Skip categories by number (see output for numbers)
+                           Example: --skip=11,14  # Skip debug code + TODOs
+  --skip-type-narrowing    Disable tsserver-based guard analysis (falls back to text heuristics)
+  --rules=DIR              Additional ast-grep rules directory
+                           Rules are merged with built-in rules
+  --no-auto-update         Disable automatic self-update
+
+Environment Variables:
+  JOBS                     Same as --jobs=N
+  NO_COLOR                 Disable colors (respects standard)
+  CI                       Enable CI mode automatically
+
+Arguments:
+  PROJECT_DIR              Directory to scan (default: current directory)
+  OUTPUT_FILE              Save full report to file
+
+Exit Codes:
+  0                        No critical issues (or no issues at all)
+  1                        Critical issues found
+  1                        Warnings found (only with --fail-on-warning)
+  2                        Invalid arguments or configuration
+```
+
+### **Examples**
+
+```bash
+# Basic scan
+ubs .
+
+# Verbose scan with full details
+ubs -v /path/to/project
+
+# Strict mode for CI (fail on any warning)
+ubs --fail-on-warning --ci
+
+# Save report without cluttering terminal
+ubs . report.txt
+
+# Scan Vue.js project
+ubs . --include-ext=js,ts,vue
+
+# Skip categories you don't care about
+ubs . --skip=14  # Skip TODO/FIXME markers
+
+# Maximum performance (use all cores)
+ubs --jobs=0 .  # Auto-detect
+ubs --jobs=16 .  # Explicit core count
+
+# Exclude vendor code
+ubs . --exclude=node_modules,vendor,dist,build
+
+# Custom rules directory
+ubs . --rules=~/.config/ubs/custom-rules
+
+# Combine multiple options
+ubs -v --fail-on-warning --exclude=legacy --include-ext=js,ts,tsx . report.txt
+```
+
+### **Custom AST-Grep Rules**
+
+You can add your own bug detection patterns:
+
+```bash
+# Create custom rules directory
+mkdir -p ~/.config/ubs/rules
+
+# Add a custom rule (YAML format)
+cat > ~/.config/ubs/rules/no-console-in-prod.yml <<'EOF'
+id: custom.no-console-in-prod
+language: javascript
+rule:
+  any:
+    - pattern: console.log($$$)
+    - pattern: console.debug($$$)
+    - pattern: console.info($$$)
+severity: warning
+message: "console statements should be removed before production"
+note: "Use a proper logging library or remove debug statements"
+EOF
+
+# Run with custom rules
+ubs . --rules=~/.config/ubs/rules
+```
+
+**Common custom rules:**
+
+```yaml
+# Enforce specific naming conventions
+id: custom.component-naming
+language: typescript
+rule:
+  pattern: export function $NAME() { $$$ }
+  not:
+    pattern: export function $UPPER() { $$$ }
+severity: info
+message: "React components should start with uppercase letter"
+```
+
+```yaml
+# Catch specific anti-patterns in your codebase
+id: custom.no-direct-state-mutation
+language: typescript
+rule:
+  pattern: this.state.$FIELD = $VALUE
+severity: critical
+message: "Never mutate state directly - use setState()"
+```
+
+### **Excluding False Positives**
+
+If the scanner reports false positives for your specific use case:
+
+```bash
+# Skip entire categories
+ubs . --skip=11,14  # Skip debug code detection and TODO markers
+
+# Exclude specific files/directories
+ubs . --exclude=legacy,third-party,generated
+
+# For persistent config, create a wrapper script
+cat > ~/bin/ubs-custom <<'EOF'
+#!/bin/bash
+ubs "$@" \
+  --exclude=legacy,generated \
+  --skip=14 \
+  --rules=~/.config/ubs/rules
+EOF
+chmod +x ~/bin/ubs-custom
+```
+
+---
+
+## 🎓 **How It Works (Under the Hood)**
+
+### **Multi-Layer Analysis Engine**
+
+The scanner uses a sophisticated 4-layer approach:
+
+```
+Layer 1: PATTERN MATCHING (Fast) ──┐
+├─ Regex-based detection           │
+├─ Optimized with ripgrep          │
+└─ Finds 70% of bugs in <1 second  │
+                                    ├──► Combined Results
+Layer 2: AST ANALYSIS (Deep) ──────┤
+├─ Semantic code understanding      │
+├─ Powered by ast-grep             │
+└─ Catches complex patterns        │
+                                    │
+Layer 3: CONTEXT AWARENESS (Smart) ┤
+├─ Understands surrounding code     │
+├─ Reduces false positives         │
+└─ Knows when rules don't apply    │
+                                    │
+Layer 4: STATISTICAL (Insightful)  │
+├─ Code smell detection            │
+├─ Anomaly identification          │
+└─ Architectural suggestions       │
+                                    ↓
+                         Final Report (3-5 sec)
+```
+
+### **Technology Stack**
+
+| Component | Technology | Purpose | Why This Choice |
+|-----------|-----------|---------|-----------------|
+| **Core Engine** | Bash 4.0+ | Orchestration | Universal compatibility, zero dependencies |
+| **Pattern Matching** | Ripgrep | Text search | 10-100x faster than grep, parallelized |
+| **AST Parser** | ast-grep | Semantic analysis | Understands code structure, not just text |
+| **Fallback** | GNU grep | Text search | Works on any Unix-like system |
+| **Rule Engine** | YAML | Pattern definitions | Human-readable, easy to extend |
+
+### **Performance Optimizations**
+
+```bash
+# Automatic parallelization (uses all CPU cores)
+- Auto-detects: 16-core = 16 parallel jobs
+- Manually set: --jobs=N
+
+# Smart file filtering (only scans relevant files)
+- JS/TS: .js, .jsx, .ts, .tsx, .mjs, .cjs (auto-skip node_modules/dist/build)
+- Python: .py + pyproject/requirements (skip venv/__pycache__)
+- C/C++: .c/.cc/.cpp/.cxx + headers + CMake files (skip build/out)
+- Rust: .rs + Cargo manifests (skip target/.cargo)
+- Go: .go + go.mod/go.sum/go.work (skip vendor/bin)
+- Java: .java + pom.xml + Gradle scripts (skip target/build/out)
+- Ruby: .rb + Gemfile/Gemspec/Rakefile (skip vendor/bundle,tmp)
+- Custom: --include-ext=js,ts,vue
+
+# Efficient streaming (low memory usage)
+- No temp files created
+- Results streamed as found
+- Memory usage: <100MB for most projects
+
+# Incremental scanning (future feature)
+- Only scan changed files (git diff)
+- Cache previous results
+- 10x faster on large projects
+```
+
+---
+
+## 🏆 **Comparison with Other Tools**
+
+| Feature | Ultimate Bug Scanner | ESLint | TypeScript | SonarQube | DeepCode |
+|---------|---------------------|--------|------------|-----------|----------|
+| **Setup Time** | 30 seconds | 30 minutes | 1-2 hours | 2-4 hours | Account required |
+| **Speed (50K lines)** | 3 seconds | 15 seconds | 8 seconds | 2 minutes | Cloud upload |
+| **Zero Config** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
+| **Works Without Types** | ✅ Yes | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
+| **Null Safety** | ✅ Yes | ⚠️ Limited | ✅ Yes | ⚠️ Limited | ⚠️ Limited |
+| **Security Scanning** | ✅ Yes | ⚠️ Plugin | ❌ No | ✅ Yes | ✅ Yes |
+| **Memory Leaks** | ✅ Yes | ❌ No | ❌ No | ⚠️ Limited | ❌ No |
+| **Async/Await** | ✅ Deep | ⚠️ Basic | ✅ Good | ⚠️ Basic | ⚠️ Basic |
+| **CI/CD Ready** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ⚠️ Cloud |
+| **Offline** | ✅ Yes | ✅ Yes | ✅ Yes | ⚠️ Limited | ❌ No |
+| **AI Agent Friendly** | ✅ Built for it | ⚠️ Config heavy | ⚠️ Config heavy | ❌ Complex | ⚠️ Cloud |
+| **Cost** | Free | Free | Free | $$$$ | $$$ |
+
+**When to use what:**
+
+- **Ultimate Bug Scanner**: Quick scans, AI workflows, no config needed
+- **ESLint**: Style enforcement, custom rules, team standards
+- **TypeScript**: Type safety (use WITH this scanner)
+- **SonarQube**: Enterprise compliance, detailed metrics
+- **DeepCode**: ML-powered analysis (if you trust cloud)
+
+**Best combo:** TypeScript + ESLint + Ultimate Bug Scanner = Maximum safety
+
+---
+
 ## 🧠 **Project Justification and Rationale**
 
 ### **Why This Exists (And Why It's Not "Just Another Linter")**
@@ -327,30 +1109,9 @@ Traditional linters were designed for **human developers** in **single-language 
 
 **The paradigm shift:**
 
-<table>
-<tr>
-<th>Traditional Linting (Human-First)</th>
-<th>UBS Approach (LLM-First)</th>
-</tr>
-<tr>
-<td>
-<strong>Goal:</strong> Comprehensive coverage + auto-fix<br>
-<strong>Speed:</strong> 15-60 seconds acceptable<br>
-<strong>Setup:</strong> 30 min config per language<br>
-<strong>Languages:</strong> One tool per language<br>
-<strong>False positives:</strong> Must be <1% (frustrates humans)<br>
-<strong>Output:</strong> Human-readable prose<br>
-</td>
-<td>
-<strong>Goal:</strong> Critical bug detection + fast feedback<br>
-<strong>Speed:</strong> <5 seconds required<br>
-<strong>Setup:</strong> Zero config (instant start)<br>
-<strong>Languages:</strong> One scan for all 7 languages<br>
-<strong>False positives:</strong> 10-20% OK (LLMs filter instantly)<br>
-<strong>Output:</strong> Structured file:line for LLM parsing<br>
-</td>
-</tr>
-</table>
+| Traditional Linting (Human-First) | UBS Approach (LLM-First) |
+|---|---|
+| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 7 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
 
 ### **2. LLMs Don't Need Auto-Fix—They ARE the Auto-Fix Engine**
 
@@ -650,7 +1411,7 @@ Layer 4: Metrics collection  → Time-series quality tracking
    ↓
    LLM fixes them immediately
    ↓
-✅ Fast re-scan (3s) confirms fixes
+   ✅ Fast re-scan (3s) confirms fixes
    ↓
    Then run comprehensive linters (30s) for the remaining 20%
 ```
@@ -973,824 +1734,39 @@ Use it WITH your existing tools. Let ESLint handle style. Let TypeScript handle 
 
 ---
 
-## 🎬 **See It In Action**
+## 🧪 **Development & Internals**
 
-*Examples show JavaScript output; each language has equivalent detections (Python: None checks, Go: nil guards, Rust: Option handling, etc.)*
+### **Python Tooling (uv + CPython 3.13)**
 
-### **Example 1: Catching a Null Pointer Bug**
-
-```bash
-$ ubs src/
-
-▓▓▓ NULL SAFETY & DEFENSIVE PROGRAMMING
-Detects: Null pointer dereferences, missing guards, unsafe property access
-
-  🔥 CRITICAL (5 found)
-    Unguarded property access after getElementById
-    Consider: const el = document.getElementById('x'); if (!el) return;
-
-      src/components/form.js:42
-        const submitBtn = document.getElementById('submit-button');
-        submitBtn.classList.add('active');  // ← Crashes if element missing
-
-      src/utils/dom.js:87
-        const modal = document.querySelector('.modal');
-        modal.style.display = 'block';  // ← Runtime crash guaranteed
-
-  💡 Fix: Always check for null before accessing properties
-```
-
-**Before:** 3 production crashes this week
-**After:** 0 crashes, caught in 2 seconds
-
-### **Example 2: Security Vulnerability Detection**
+All helper scripts (manifest runner, fixtures, inline analyzers inside `ubs`) assume a single source of truth: **CPython 3.13 managed by [uv](https://github.com/astral-sh/uv)** living inside `.venv/` at the repo root.
 
 ```bash
-▓▓▓ SECURITY VULNERABILITIES
-Detects: Code injection, XSS, prototype pollution, timing attacks
+# 1) Install uv (one-time)
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-  🔥 CRITICAL (3 found)
-    innerHTML without sanitization - XSS risk
-    Use textContent or DOMPurify.sanitize()
+# 2) Create the managed environment defined by pyproject.toml / uv.lock
+uv sync --python 3.13
 
-      src/comments.js:156
-        element.innerHTML = userComment;  // ← XSS vulnerability!
+# 3) Activate it whenever you work in this repo (puts .venv/bin first on PATH)
+source .venv/bin/activate
 
-  🔥 CRITICAL (1 found)
-    Hardcoded API keys detected
-    Use environment variables or secret managers
-
-      src/config.js:23
-        const apiKey = "sk_live_abc123xyz";  // ← Security breach!
+# 4) Run any Python entrypoint through the env
+uv run python test-suite/run_manifest.py --case js-core-buggy
+# ...or rely on 'python'/'python3' now that they point at .venv/bin/python3.13
 ```
 
-**Before:** Security incident, customer data at risk
-**After:** Vulnerability caught before git commit
+> [!NOTE]
+> Shell scripts that invoke `python3` (language modules under `modules/`, `test-suite/run_all.sh`, etc.) automatically pick up `.venv/bin/python3` as long as the environment is activated or `.venv/bin` is on your `PATH`. The pinned `pyproject.toml` + `uv.lock` are the single source of truth for this toolchain.
 
-### **Example 3: Async/Await Gotchas**
+Common uv-powered entrypoints:
 
-```bash
-▓▓▓ ASYNC/AWAIT & PROMISE PITFALLS
-Detects: Missing await, unhandled rejections, race conditions
-
-  🔥 CRITICAL (8 found)
-    await used in non-async function
-    SyntaxError in JavaScript
-
-      src/api/users.js:67
-        function saveUser(data) {
-          await database.insert(data);  // ← SyntaxError!
-        }
-
-  ⚠️  WARNING (12 found)
-    Promises without .catch() or try/catch
-    Unhandled rejections crash Node.js
-
-      src/services/email.js:45
-        sendEmail(user.email).then(result => ...)  // ← No error handling!
-```
-
-**Before:** Silent failures, mysterious bugs in production
-**After:** All async bugs caught and fixed before deploy
+- `uv run python test-suite/run_manifest.py --case js-core-buggy` – run the manifest in CI or locally without manually activating the venv.
+- `source .venv/bin/activate && python -m pip list` – verify that every inline `python3` invocation maps to CPython 3.13.
+- `uv run python - <<'PY' …` – mirrors how the language modules embed Python helpers, but now guaranteed to execute inside the managed interpreter.
 
 ---
 
-## 🚀 **Quick Install (30 Seconds)**
-
-### **Option 1: Automated Install (Recommended)**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash
-```
-
-The installer will:
-- ✅ Install the `ubs` command globally
-- ✅ Optionally install `ast-grep` (for advanced AST analysis)
-- ✅ Optionally install `ripgrep` (for 10x faster scanning)
-- ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
-- ✅ Optionally install `typos` (smart spellchecker for docs and identifiers)
-- ✅ Optionally install `Node.js + typescript` (enables deep TypeScript type narrowing analysis)
-- ✅ Auto-run `ubs doctor` post-install and append a session summary to `~/.config/ubs/session.md`
-- ✅ Capture readiness facts (ripgrep/jq/typos/type narrowing) and store them for `ubs sessions --entries 1`
-- ✅ Set up git hooks (block commits with critical bugs)
-- ✅ Set up Claude Code hooks (scan on file save)
-- ✅ Add documentation to your AGENTS.md
-
-Need to revisit what the installer discovered later? Run `ubs sessions --entries 1` to view the most recent session log (or point teammates at the same summary).
-
-Need the “just make it work” button? Run the installer with `--easy-mode` to auto-install every dependency, accept all prompts, detect local coding agents, and wire their quality guardrails with zero extra questions:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh \
-  | bash -s -- --easy-mode
-```
-
-**Total time:** 30 seconds to 2 minutes (depending on dependencies)
-
-Need to keep your shell RC files untouched? Combine `--no-path-modify` (and optionally `--skip-hooks`) with the command above—the installer will still drop `ubs` into your chosen `--install-dir`, but it will skip both PATH edits and the alias helper entirely.
-
-### **Option 2: Manual Install**
-
-```bash
-# Download and install the unified runner
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/ubs \
-  -o /usr/local/bin/ubs && chmod +x /usr/local/bin/ubs
-
-# Verify it works
-ubs --help
-
-# Optional but recommended: Install dependencies
-npm install -g @ast-grep/cli     # AST-based analysis
-brew install ripgrep             # 10x faster searching (or: apt/dnf/cargo install)
-brew install typos-cli           # Spellchecker tuned for code (or: cargo install typos-cli)
-npm install -g typescript        # Enables full tsserver-based type narrowing checks
-```
-
-### **Option 3: Use Without Installing**
-
-```bash
-# Download once
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/ubs \
-  -o ubs && chmod +x ubs
-
-# Run it
-./ubs .
-```
-
-### Installer Safety Nets
-
-#### Uninstall from any shell
-
-Run the installer in `--uninstall` mode via curl if you want to remove UBS and all of its integrations:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash -s -- --uninstall --non-interactive
-```
-
-This command deletes the UBS binary, shell RC snippets/aliases, config under `~/.config/ubs`, and the optional Claude/Git hooks that the installer set up. Because it passes `--non-interactive`, it auto-confirms all prompts and runs unattended.
-
-| Flag | What it does | Why it matters |
-|------|--------------|----------------|
-| `--dry-run` | Prints every install action (downloads, PATH edits, hook writes, cleanup) without touching disk. Dry runs still resolve config, detect agents, and show you exactly what *would* change. | Audit the installer, demo it to teammates, or validate CI steps without modifying a workstation. |
-| `--self-test` | Immediately runs `test-suite/install/run_tests.sh` after installation and exits non-zero if the smoke suite fails. | CI/CD jobs and verified setups can prove the installer still works end-to-end before trusting a release. |
-| `--skip-type-narrowing` | Skip the Node.js + TypeScript readiness probe **and** the cross-language guard analyzers (JS/Rust/Kotlin/Swift). | Useful for air-gapped hosts or environments that want to stay in heuristic-only mode. |
-| `--skip-typos` | Skip the Typos spellchecker installation + diagnostics. | Handy when corp images already provide Typos or when you deliberately disable spellcheck automation. |
-| `--skip-doctor` | Skip the automatic `ubs doctor` run + session summary after install. | Use when CI already runs doctor separately or when you're iterating locally and want a faster finish. |
-
-> ⚠️ `--self-test` requires running `install.sh` from a working tree that contains `test-suite/install/run_tests.sh` (i.e., the repo root). Curl-piping the installer from GitHub can’t self-test because the harness isn’t present, so the flag will error out early instead of giving a false sense of safety.
-
-> ℹ️ After every install the script now double-checks `command -v ubs`. If another copy shadows the freshly written binary, you’ll get an explicit warning with both paths so you can fix PATH order before running scans.
-
-> 🧠 Type narrowing relies on Node.js plus the `typescript` npm package *and* the Python helpers that power the Rust/Kotlin/Swift checks. The installer now checks Node/TypeScript readiness, can optionally run `npm install -g typescript`, and surfaces the status inside `install.sh --diagnose`. Use `--skip-type-narrowing` if you’re on an air-gapped host or plan to keep the heuristic-only mode.
-
-> 🍞 To avoid global npm permission issues, the installer now detects/installs [bun](https://bun.sh/) just like other dependencies and uses `bun install --global typescript` by default, falling back to npm only if bun isn’t available.
->
-> 🍎 The diagnostics also call out Swift guard readiness: if python3 is available we count `.swift` files under your repo and record whether the guard helper will actually run. That fact shows up in `install.sh --diagnose` output and the auto-generated session log so iOS/macOS teams can tell at a glance whether the ObjC-bridging heuristics are active.
-
-**Common combos**
-
-```bash
-# Preview everything without touching dotfiles or hooks
-bash install.sh --dry-run --no-path-modify --skip-hooks --non-interactive
-
-# CI-friendly install that self-tests the smoke harness
-bash install.sh --easy-mode --self-test --skip-hooks
-```
-
----
-
-## 💡 **Basic Usage**
-
-```bash
-# Scan current directory
-ubs .
-
-# Scan specific directory
-ubs /path/to/your/project
-
-# Verbose mode (show more code examples)
-ubs -v .
-
-# Save report to file
-ubs . bug-report.txt
-
-# CI mode (exit code 1 on warnings)
-ubs . --fail-on-warning
-
-# Quiet mode (summary only)
-ubs -q .
-
-# Skip specific categories (e.g., skip TODO markers)
-ubs . --skip=11,14
-
-# Custom file extensions
-ubs . --include-ext=js,ts,vue,svelte
-```
-
----
-
-## 🤖 **AI Agent Integration (The Real Magic)**
-
-### On-Device Agent Guardrails
-
-`install.sh` now inspects your workstation for the most common coding agents (the same set listed below) and, when asked, drops guardrails that remind those agents to run `ubs --fail-on-warning .` before claiming a task is done. In `--easy-mode` this happens automatically; otherwise you can approve each integration individually.
-
-| Agent / IDE | What we wire up | Why it helps |
-|-------------|-----------------|--------------|
-| **Claude Code Desktop** (`.claude/hooks/on-file-write.sh`) | File-save hook that shells out to `ubs --ci` whenever Claude saves JS/TS files. | Keeps Claude from accepting “Apply Patch” without a fresh scan. |
-| **Cursor** (`.cursor/rules`) | Shared rule block that tells Cursor plans/tasks to run `ubs --fail-on-warning .` and summarize outstanding issues. | Cursor’s autonomous jobs inherit the same QA checklist as humans. |
-| **Codex CLI** (`.codex/rules`) | Adds the identical rule block for Anthropic’s Codex terminal workflow. | Ensures Codex sessions never skip the scanner during long refactors. |
-| **Gemini Code Assist** (`.gemini/rules`) | Guidance instructing Gemini agents to run `ubs` before closing a ticket. | Keeps Gemini’s asynchronous fixes aligned with UBS exit criteria. |
-| **Windsurf** (`.windsurf/rules`) | Guardrail text + sample command palette snippet referencing `ubs`. | Windsurf’s multi-step plans stay grounded in the same quality gate. |
-| **Cline** (`.cline/rules`) | Markdown instructions that Cline’s VS Code extension ingests. | Forces every “tool call” from Cline to mention scanner findings. |
-| **OpenCode MCP** (`.opencode/rules`) | Local MCP instructions so HTTP tooling always calls `ubs` before replying. | Makes OpenCode’s multi-agent swarms share the same notion of “done”. |
-
-### **Why This Matters for AI Workflows**
-
-When you're coding with AI, you're moving **10-100x faster** than traditional development. But bugs accumulate just as quickly. Traditional tools slow you down. This scanner keeps pace:
-
-```
-Traditional workflow:              AI-powered workflow with scanner:
-┌──────────────────┐              ┌──────────────────┐
-│ AI writes code   │              │ AI writes code   │
-└────────┬─────────┘              └────────┬─────────┘
-         │                                 │
-         ↓                                 ↓
-┌──────────────────┐              ┌──────────────────┐
-│ You review       │              │ Scanner runs     │
-│ (15 min)         │              │ (3 seconds)      │
-└────────┬─────────┘              └────────┬─────────┘
-         │                                 │
-         ↓                                 ↓
-┌──────────────────┐              ┌──────────────────┐
-│ Tests pass?      │              │ Critical bugs?   │
-└────────┬─────────┘              └────────┬─────────┘
-         │ NO!                              │ YES!
-         ↓                                 ↓
-┌──────────────────┐              ┌──────────────────┐
-│ Debug in prod    │              │ AI fixes them    │
-│ (6 hours)        │              │ (5 minutes)      │
-└──────────────────┘              └────────┬─────────┘
-                                           ↓
-                                  ┌──────────────────┐
-                                  │ Ship with         │
-                                  │ confidence        │
-                                  └──────────────────┘
-
-Total: 6.25 hours                Total: 8 minutes
-```
-
-### **Pattern 1: Claude Code Integration (Real-Time Scanning)**
-
-Drop this into `.claude/hooks/on-file-write.sh`:
-
-```bash
-#!/bin/bash
-# Auto-scan UBS-supported languages (JS/TS, Python, C/C++, Rust, Go, Java, Ruby) on save
-
-if [[ "$FILE_PATH" =~ \.(js|jsx|ts|tsx|mjs|cjs|py|pyw|pyi|c|cc|cpp|cxx|h|hh|hpp|hxx|rs|go|java|rb)$ ]]; then
-  echo "🔬 Quality check running..."
-
-  if ubs "${PROJECT_DIR}" --ci 2>&1 | head -30; then
-    echo "✅ No critical issues"
-  else
-    echo "⚠️  Issues detected - review above"
-  fi
-fi
-```
-
-**Result:** Every time Claude writes code, the scanner catches bugs **instantly**.
-
-### **Pattern 2: Git Pre-Commit Hook (Quality Gate)**
-
-The installer can set this up automatically, or add to `.git/hooks/pre-commit`:
-
-```bash
-#!/bin/bash
-# Block commits with critical bugs
-
-echo "🔬 Running bug scanner..."
-
-if ! ubs . --fail-on-warning 2>&1 | tee /tmp/scan.txt | tail -30; then
-  echo ""
-  echo "❌ Critical issues found. Fix them or use: git commit --no-verify"
-  echo ""
-  echo "Top issues:"
-  grep -A 3 "🔥 CRITICAL" /tmp/scan.txt | head -20
-  exit 1
-fi
-
-echo "✅ Quality check passed - committing..."
-```
-
-**Result:** Bugs **cannot** be committed. Period.
-
-### **Pattern 3: Cursor/Windsurf/Continue Integration**
-
-Add to your `.cursorrules` or similar:
-
-```markdown
-## Code Quality Standards
-
-Before marking any task as complete:
-
-1. Run the bug scanner: `ubs .`
-2. Fix ALL critical issues (🔥)
-3. Review warnings (⚠️) and fix if trivial
-4. Only then mark task complete
-
-If the scanner finds critical issues, your task is NOT done.
-```
-
-**Result:** AI agents have **built-in quality standards**.
-
-### **Pattern 4: CI/CD Pipeline (GitHub Actions Example)**
-
-```yaml
-name: Code Quality Gate
-
-on: [push, pull_request]
-
-jobs:
-  bug-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Install Bug Scanner
-        run: |
-          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash -s -- --non-interactive
-
-      - name: Scan for Bugs
-        run: |
-          ubs . --fail-on-warning --ci
-```
-
-**Result:** Pull requests with critical bugs **cannot merge**.
-
-### **Pattern 5: The Fix-Verify Loop (For AI Agents)**
-
-This is the golden pattern for AI coding workflows:
-
-```bash
-#!/bin/bash
-# Have your AI agent run this after implementing features
-
-echo "🔬 Post-implementation quality check..."
-
-# Run scanner
-if ubs . --fail-on-warning > /tmp/scan-result.txt 2>&1; then
-  echo "✅ All quality checks passed!"
-  echo "📝 Ready to commit"
-  exit 0
-else
-  echo "❌ Issues found:"
-  echo ""
-
-  # Show critical issues
-  grep -A 5 "🔥 CRITICAL" /tmp/scan-result.txt | head -30
-
-  echo ""
-  echo "🤖 AI: Please fix these issues and re-run this check"
-  exit 1
-fi
-```
-
-**Usage pattern:**
-
-```markdown
-User: "Add user registration with email validation"
-
-AI Agent:
-1. Implements the feature
-2. Runs quality check (scanner finds 3 critical bugs)
-3. Fixes the bugs
-4. Re-runs quality check (passes)
-5. Commits the code
-
-Total time: 12 minutes (vs. 6 hours debugging in production)
-```
-
-### **Pattern 6: The "AI Agent Decision Tree"**
-
-Train your AI agent to use this decision tree:
-
-```
-Did I modify code in any supported language?
-(JS/TS, Python, Go, Rust, Java, C++, Ruby)
-         │
-         ↓ YES
-Changed more than 50 lines?
-         │
-         ↓ YES
-    Run scanner ←──────────┐
-         │                 │
-         ↓                 │
-Critical issues found? ────┤ YES
-         │ NO              │
-         ↓                 │
-     Warnings?             │
-         │                 │
-         ↓ YES             │
-  Show to user             │
-  Ask if should fix ───────┤
-         │ NO              │
-         ↓                 ↓
-    Commit code      Fix issues
-```
-
----
-
-> **Copy the content below to your project's `AGENTS.md`, `.claude/claude_docs/`, or `.cursorrules` file for comprehensive UBS integration guidance.**
-
-## UBS Quick Reference for AI Agents
-
-UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
-
-**Install:** `curl -sSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh | bash`
-
-**Golden Rule:** `./ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
-
-**Commands:**
-```bash
-./ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
-./ubs $(git diff --name-only --cached)    # Staged files — before commit
-./ubs --only=js,python src/               # Language filter (3-5x faster)
-./ubs --ci --fail-on-warning .            # CI mode — before PR
-./ubs --help                              # Full command reference
-./ubs sessions --entries 1                # Tail the latest install session log
-```
-
-**Output Format:**
-```
-⚠️  Category (N errors)
-    file.ts:42:5 – Issue description
-    💡 Suggested fix
-Exit code: 1
-```
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
-
-**Fix Workflow:**
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
-3. Verify real issue (not false positive)
-4. Fix root cause (not symptom)
-5. Re-run `./ubs <file>` → exit 0
-6. Commit
-
-**Speed Critical:** Scope to changed files. `./ubs src/file.ts` (< 1s) vs `./ubs .` (30s). Never full scan for small edits.
-
-**Bug Severity:**
-- **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks
-- **Important** (production): Type narrowing, division-by-zero, resource leaks
-- **Contextual** (judgment): TODO/FIXME, console logs
-
-**Anti-Patterns:**
-- ❌ Ignore findings → ✅ Investigate each
-- ❌ Full scan per edit → ✅ Scope to file
-- ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
-
----
-
-## 📋 **What It Detects (The Complete Arsenal)**
-
-*Each language module has specialized detections. Examples below are representative (JavaScript shown; Python has `eval()`, Go has goroutine leaks, Rust has `.unwrap()` panics, C++ has buffer overflows, etc.)*
-
-### 🔴 **Critical Issues (Production Blockers)**
-
-These **WILL** cause crashes, security breaches, or data corruption:
-
-| Pattern | Example | Why It's Dangerous |
-|---------|---------|-------------------|
-| `eval()` usage | `eval(userInput)` | Allows arbitrary code execution - **RCE vulnerability** |
-| Direct NaN comparison | `if (x === NaN)` | Always returns false - **logic bug** |
-| Missing await | `asyncFunc()` in async context | Silent failures, race conditions - **data corruption** |
-| Prototype pollution | `obj.__proto__ = {}` | Security vulnerability - **privilege escalation** |
-| Unguarded null access | `el.style.color` without null check | **Runtime crash** guaranteed |
-| `parseInt` without radix | `parseInt("08")` | Returns 0 in some browsers - **calculation bug** |
-| Empty catch blocks | `catch(e) {}` | Swallows errors - **debugging nightmare** |
-| `innerHTML` with user data | `el.innerHTML = userInput` | **XSS vulnerability** |
-| Missing async keyword | `await` without `async function` | **SyntaxError** |
-| Hardcoded secrets | `const key = "sk_live..."` | **Security breach** |
-
-### 🟡 **Warnings (Should Fix Before Shipping)**
-
-These cause bugs, performance issues, or maintenance headaches:
-
-| Pattern | Example | Impact |
-|---------|---------|--------|
-| Promises without `.catch()` | `promise.then(...)` | Unhandled rejections crash Node.js |
-| Division without zero check | `total / count` | Returns `Infinity` or `NaN` |
-| Event listeners without cleanup | `addEventListener` in React | **Memory leak** (app gets slower over time) |
-| `setInterval` without clear | `setInterval(fn, 1000)` | **Timer leak** (infinite timers) |
-| `await` inside loops | `for(...) { await api.call() }` | **Slow** (sequential, not parallel) |
-| Array mutation during iteration | `arr.forEach(() => arr.push(...))` | **Skipped/duplicate** elements |
-| Missing switch default | `switch(x) { case 1: ... }` | Unhandled values cause silent failures |
-| `isNaN()` instead of `Number.isNaN()` | `isNaN("foo")` | Type coercion bugs |
-
-### 🔵 **Info (Code Quality & Best Practices)**
-
-Improvements that make code cleaner and more maintainable:
-
-- Optional chaining opportunities (`obj?.prop?.value`)
-- Nullish coalescing opportunities (`value ?? default`)
-- TypeScript `any` usage (reduces type safety)
-- `console.log` statements (remove before production)
-- Technical debt markers (TODO, FIXME, HACK)
-- Performance optimizations (DOM queries in loops)
-- `var` usage (use `let`/`const` instead)
-- Deep property access without guards
-- Large inline arrays (move to separate files)
-- Complex nested ternaries (readability)
-
----
-
-## ⚙️ **Advanced Configuration**
-
-### **Command-Line Options (Full Reference)**
-
-```bash
-ubs [OPTIONS] [PROJECT_DIR] [OUTPUT_FILE]
-
-Core Options:
-  -v, --verbose            Show 10 code samples per finding (default: 3)
-  -q, --quiet              Minimal output (summary only)
-  --ci                     CI mode (stable output, no colors by default)
-  --fail-on-warning        Exit with code 1 on warnings (strict mode)
-  -h, --help               Show help and exit
-
-Output Control:
-  --format=FMT             Output format: text|json|sarif (default: text)
-  --no-color               Force disable ANSI colors
-  OUTPUT_FILE              Save report to file (auto-tees to stdout)
-
-File Selection:
-  --include-ext=CSV        File extensions (default: auto-detect by language)
-                           JS: js,jsx,ts,tsx,mjs,cjs | Python: py,pyi,pyx
-                           Go: go | Rust: rs | Java: java | C++: cpp,cc,cxx,c,h
-                           Ruby: rb,rake,ru | Custom: --include-ext=js,ts,vue
-  --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
-                           Example: --exclude=vendor,third-party,legacy
-
-Performance:
-  --jobs=N                 Parallel jobs for ripgrep (default: auto-detect cores)
-                           Set to 1 for deterministic output
-
-Rule Control:
-  --skip=CSV               Skip categories by number (see output for numbers)
-                           Example: --skip=11,14  # Skip debug code + TODOs
-  --skip-type-narrowing    Disable tsserver-based guard analysis (falls back to text heuristics)
-  --rules=DIR              Additional ast-grep rules directory
-                           Rules are merged with built-in rules
-  --no-auto-update         Disable automatic self-update
-
-Environment Variables:
-  JOBS                     Same as --jobs=N
-  NO_COLOR                 Disable colors (respects standard)
-  CI                       Enable CI mode automatically
-
-Arguments:
-  PROJECT_DIR              Directory to scan (default: current directory)
-  OUTPUT_FILE              Save full report to file
-
-Exit Codes:
-  0                        No critical issues (or no issues at all)
-  1                        Critical issues found
-  1                        Warnings found (only with --fail-on-warning)
-  2                        Invalid arguments or configuration
-```
-
-### **Examples**
-
-```bash
-# Basic scan
-ubs .
-
-# Verbose scan with full details
-ubs -v /path/to/project
-
-# Strict mode for CI (fail on any warning)
-ubs --fail-on-warning --ci
-
-# Save report without cluttering terminal
-ubs . report.txt
-
-# Scan Vue.js project
-ubs . --include-ext=js,ts,vue
-
-# Skip categories you don't care about
-ubs . --skip=14  # Skip TODO/FIXME markers
-
-# Maximum performance (use all cores)
-ubs --jobs=0 .  # Auto-detect
-ubs --jobs=16 .  # Explicit core count
-
-# Exclude vendor code
-ubs . --exclude=node_modules,vendor,dist,build
-
-# Custom rules directory
-ubs . --rules=~/.config/ubs/custom-rules
-
-# Combine multiple options
-ubs -v --fail-on-warning --exclude=legacy --include-ext=js,ts,tsx . report.txt
-```
-
-### **Custom AST-Grep Rules**
-
-You can add your own bug detection patterns:
-
-```bash
-# Create custom rules directory
-mkdir -p ~/.config/ubs/rules
-
-# Add a custom rule (YAML format)
-cat > ~/.config/ubs/rules/no-console-in-prod.yml <<'EOF'
-id: custom.no-console-in-prod
-language: javascript
-rule:
-  any:
-    - pattern: console.log($$$)
-    - pattern: console.debug($$$)
-    - pattern: console.info($$$)
-severity: warning
-message: "console statements should be removed before production"
-note: "Use a proper logging library or remove debug statements"
-EOF
-
-# Run with custom rules
-ubs . --rules=~/.config/ubs/rules
-```
-
-**Common custom rules:**
-
-```yaml
-# Enforce specific naming conventions
-id: custom.component-naming
-language: typescript
-rule:
-  pattern: export function $NAME() { $$$ }
-  not:
-    pattern: export function $UPPER() { $$$ }
-severity: info
-message: "React components should start with uppercase letter"
-```
-
-```yaml
-# Catch specific anti-patterns in your codebase
-id: custom.no-direct-state-mutation
-language: typescript
-rule:
-  pattern: this.state.$FIELD = $VALUE
-severity: critical
-message: "Never mutate state directly - use setState()"
-```
-
-### **Excluding False Positives**
-
-If the scanner reports false positives for your specific use case:
-
-```bash
-# Skip entire categories
-ubs . --skip=11,14  # Skip debug code detection and TODO markers
-
-# Exclude specific files/directories
-ubs . --exclude=legacy,third-party,generated
-
-# For persistent config, create a wrapper script
-cat > ~/bin/ubs-custom <<'EOF'
-#!/bin/bash
-ubs "$@" \
-  --exclude=legacy,generated \
-  --skip=14 \
-  --rules=~/.config/ubs/rules
-EOF
-chmod +x ~/bin/ubs-custom
-```
-
----
-
-## 🎓 **How It Works (Under the Hood)**
-
-### **Multi-Layer Analysis Engine**
-
-The scanner uses a sophisticated 4-layer approach:
-
-```
-Layer 1: PATTERN MATCHING (Fast) ──┐
-├─ Regex-based detection           │
-├─ Optimized with ripgrep          │
-└─ Finds 70% of bugs in <1 second  │
-                                    ├──► Combined Results
-Layer 2: AST ANALYSIS (Deep) ──────┤
-├─ Semantic code understanding      │
-├─ Powered by ast-grep             │
-└─ Catches complex patterns        │
-                                    │
-Layer 3: CONTEXT AWARENESS (Smart) ┤
-├─ Understands surrounding code     │
-├─ Reduces false positives         │
-└─ Knows when rules don't apply    │
-                                    │
-Layer 4: STATISTICAL (Insightful)  │
-├─ Code smell detection            │
-├─ Anomaly identification          │
-└─ Architectural suggestions       │
-                                    ↓
-                         Final Report (3-5 sec)
-```
-
-### **Technology Stack**
-
-| Component | Technology | Purpose | Why This Choice |
-|-----------|-----------|---------|-----------------|
-| **Core Engine** | Bash 4.0+ | Orchestration | Universal compatibility, zero dependencies |
-| **Pattern Matching** | Ripgrep | Text search | 10-100x faster than grep, parallelized |
-| **AST Parser** | ast-grep | Semantic analysis | Understands code structure, not just text |
-| **Fallback** | GNU grep | Text search | Works on any Unix-like system |
-| **Rule Engine** | YAML | Pattern definitions | Human-readable, easy to extend |
-
-### **Performance Optimizations**
-
-```bash
-# Automatic parallelization (uses all CPU cores)
-- Auto-detects: 16-core = 16 parallel jobs
-- Manually set: --jobs=N
-
-# Smart file filtering (only scans relevant files)
-- JS/TS: .js, .jsx, .ts, .tsx, .mjs, .cjs (auto-skip node_modules/dist/build)
-- Python: .py + pyproject/requirements (skip venv/__pycache__)
-- C/C++: .c/.cc/.cpp/.cxx + headers + CMake files (skip build/out)
-- Rust: .rs + Cargo manifests (skip target/.cargo)
-- Go: .go + go.mod/go.sum/go.work (skip vendor/bin)
-- Java: .java + pom.xml + Gradle scripts (skip target/build/out)
-- Ruby: .rb + Gemfile/Gemspec/Rakefile (skip vendor/bundle,tmp)
-- Custom: --include-ext=js,ts,vue
-
-# Efficient streaming (low memory usage)
-- No temp files created
-- Results streamed as found
-- Memory usage: <100MB for most projects
-
-# Incremental scanning (future feature)
-- Only scan changed files (git diff)
-- Cache previous results
-- 10x faster on large projects
-```
-
----
-
-## 🏆 **Comparison with Other Tools**
-
-| Feature | Ultimate Bug Scanner | ESLint | TypeScript | SonarQube | DeepCode |
-|---------|---------------------|--------|------------|-----------|----------|
-| **Setup Time** | 30 seconds | 30 minutes | 1-2 hours | 2-4 hours | Account required |
-| **Speed (50K lines)** | 3 seconds | 15 seconds | 8 seconds | 2 minutes | Cloud upload |
-| **Zero Config** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
-| **Works Without Types** | ✅ Yes | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
-| **Null Safety** | ✅ Yes | ⚠️ Limited | ✅ Yes | ⚠️ Limited | ⚠️ Limited |
-| **Security Scanning** | ✅ Yes | ⚠️ Plugin | ❌ No | ✅ Yes | ✅ Yes |
-| **Memory Leaks** | ✅ Yes | ❌ No | ❌ No | ⚠️ Limited | ❌ No |
-| **Async/Await** | ✅ Deep | ⚠️ Basic | ✅ Good | ⚠️ Basic | ⚠️ Basic |
-| **CI/CD Ready** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ⚠️ Cloud |
-| **Offline** | ✅ Yes | ✅ Yes | ✅ Yes | ⚠️ Limited | ❌ No |
-| **AI Agent Friendly** | ✅ Built for it | ⚠️ Config heavy | ⚠️ Config heavy | ❌ Complex | ⚠️ Cloud |
-| **Cost** | Free | Free | Free | $$$$ | $$$ |
-
-**When to use what:**
-
-- **Ultimate Bug Scanner**: Quick scans, AI workflows, no config needed
-- **ESLint**: Style enforcement, custom rules, team standards
-- **TypeScript**: Type safety (use WITH this scanner)
-- **SonarQube**: Enterprise compliance, detailed metrics
-- **DeepCode**: ML-powered analysis (if you trust cloud)
-
-**Best combo:** TypeScript + ESLint + Ultimate Bug Scanner = Maximum safety
-
----
-
-## 🧪 Installer Regression Tests
-
-Working on the installer? Run the smoke suite so we never regress again:
-
-```bash
-bash test-suite/install/run_tests.sh
-```
-
-The harness boots `install.sh` inside disposable `$HOME` directories, asserts that the post-install verification banner appears, and ensures `--no-path-modify` truly leaves shell rc files untouched. CI jobs can call the same script to get signal in under a second.
-
-Prefer a single-command workflow? The installer now has a built-in `--self-test` flag:
-
-```bash
-bash install.sh --easy-mode --self-test --skip-hooks
-```
-
-It installs UBS, runs the same harness above, and fails the whole run if smoke tests fail—perfect for CI or pre-release validation.
-
-> 🧠 When adding or updating JavaScript module test fixtures, prefer authoring AST-grep rules (see `modules/ubs-js.sh` and `test-suite/js/*`) instead of brittle regex-only checks. AST-aware expectations keep manifests stable even as formatting or whitespace shifts.
-
----
-
-## 🚫 Ignoring Paths with `.ubsignore`
+## 🚫 **Ignoring Paths with `.ubsignore`**
 
 Need repo-wide scans to ignore generated code or intentionally buggy fixtures (like this project’s `test-suite/`)? Drop a `.ubsignore` at the root.
 
@@ -1810,7 +1786,7 @@ coverage/
 
 ---
 
-## 🧭 Language Coverage Comparison
+## 🧭 **Language Coverage Comparison**
 
 UBS ships seven language-focused analyzers. Each category below is scored using the following scale:
 

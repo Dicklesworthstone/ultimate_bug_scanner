@@ -933,7 +933,7 @@ resolve_module_path(){
   sd="$(script_dir)"
   md="$MODULE_DIR"
   # Priority: PATH → local modules/ → XDG module dir
-  if command -v "$base" >/dev/null 2>&1; then echo "$(command -v "$base")"; return 0; fi
+  if command -v "$base" >/dev/null 2>&1; then command -v "$base"; return 0; fi
   if [ -x "$sd/modules/$base.sh" ]; then echo "$sd/modules/$base.sh"; return 0; fi
   if [ -x "$md/$base.sh" ]; then echo "$md/$base.sh"; return 0; fi
   echo "$md/$base.sh"
@@ -942,7 +942,7 @@ resolve_module_path(){
 download_module(){
   local lang="$1" path="$2"
   ensure_dir "$(dirname "$path")"
-  local url; url=$(printf "$MODULE_PATH_TEMPLATE" "$lang")
+  local url; url=$(printf '%s' "$MODULE_PATH_TEMPLATE" | sed "s/%s/$lang/")
   say "${BLUE}${INFO}${RESET} fetching module ${BOLD}$lang${RESET} → ${DIM}$path${RESET}"
   if need_cmd curl; then
     curl -fsSL "$url" -o "$path"

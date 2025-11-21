@@ -1227,7 +1227,7 @@ check_cargo() {
 }
 
 run_cargo_subcmd() {
-  local name="$1"; shift
+  shift  # skip name
   local logfile="$1"; shift
   local -a args=("$@")
   local ec=0
@@ -1240,8 +1240,8 @@ run_cargo_subcmd() {
 count_warnings_errors() {
   local file="$1"
   local w e
-  w=$(grep -E "^warning: |: warning:" "$file" 2>/dev/null | wc -l | awk '{print $1+0}')
-  e=$(grep -E "^error: |: error:" "$file" 2>/dev/null | wc -l | awk '{print $1+0}')
+  w=$(grep -E -c "^warning: |: warning:" "$file" 2>/dev/null || true)
+  e=$(grep -E -c "^error: |: error:" "$file" 2>/dev/null || true)
   echo "$w $e"
 }
 
@@ -1751,7 +1751,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
 
   if [[ "$HAS_OUTDATED" -eq 1 ]]; then
     OUT_LOG="$(mktemp)"; TMP_FILES+=("$OUT_LOG"); run_cargo_subcmd "outdated" "$OUT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo outdated -R"
-    outdated_count=$(grep -E "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null | wc -l | awk '{print $1+0}')
+    outdated_count=$(grep -E -c "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null || true)
     if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; add_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "Dependencies up-to-date"; fi
   else
     print_finding "info" 1 "cargo-outdated not installed; skipping update report"
@@ -1831,8 +1831,8 @@ print_category "Detects: crate counts, bin/lib targets, feature flags (Cargo.tom
 print_subheader "Cargo.toml features (heuristic count)"
 cargo_toml="$PROJECT_DIR/Cargo.toml"
 if [[ -f "$cargo_toml" ]]; then
-  feature_count=$(grep -n "^\[features\]" "$cargo_toml" 2>/dev/null | wc -l | awk '{print $1+0}')
-  bin_count=$(grep -E "^\s*\[\[bin\]\]" "$cargo_toml" 2>/dev/null | wc -l | awk '{print $1+0}')
+  feature_count=$(grep -c "^\[features\]" "$cargo_toml" 2>/dev/null || true)
+  bin_count=$(grep -E -c "^\s*\[\[bin\]\]" "$cargo_toml" 2>/dev/null || true)
   workspace=$(grep -c "^\[workspace\]" "$cargo_toml" 2>/dev/null || echo 0)
   say "  ${BLUE}${INFO} Info${RESET} ${WHITE}(features sections:${RESET} ${CYAN}${feature_count}${RESET}${WHITE}, bins:${RESET} ${CYAN}${bin_count}${RESET}${WHITE}, workspace:${RESET} ${CYAN}${workspace}${RESET}${WHITE})${RESET}"
 else

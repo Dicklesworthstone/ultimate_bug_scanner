@@ -1257,7 +1257,7 @@ print_subheader "select statements (review for default/backpressure)"
 sel_count=$("${GREP_RN[@]}" -e "^[[:space:]]*select[[:space:]]*\{" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 print_finding "info" "$sel_count" "select statements present"
 if [[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]]; then
-  s_nd=$(( ast_count "go.select-no-default" ))
+  s_nd=$((ast_count "go.select-no-default"))
   if [ "$s_nd" -gt 0 ]; then print_finding "info" "$s_nd" "select without default (check for intended blocking/timeouts)"; fi
 fi
 
@@ -1658,7 +1658,7 @@ if [ "$RUN_GO_TOOLS" -eq 1 ] && command -v go >/dev/null 2>&1; then
   print_subheader "govulncheck"
   if command -v govulncheck >/dev/null 2>&1; then
     gv_out="$( ( set +o pipefail; cd "$PROJECT_DIR" && govulncheck -format=text "$GOTEST_PKGS" 2>/dev/null || true ) )"
-    gv_cnt=$(printf "%s" "$gv_out" | grep -E '^(Vulnerability|module:|package:|symbol:)' | wc -l | awk '{print $1+0}')
+    gv_cnt=$(printf "%s" "$gv_out" | grep -E -c '^(Vulnerability|module:|package:|symbol:)')
     if [ "$gv_cnt" -gt 0 ]; then print_finding "warning" "$gv_cnt" "govulncheck reported potential vulnerabilities"
       printf "%s\n" "$gv_out" | head -n "$((DETAIL_LIMIT*4))" | sed "s/^/${DIM}      /;s/$/${RESET}/"
     else

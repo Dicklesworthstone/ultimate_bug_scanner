@@ -183,7 +183,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 ### **Option 2: Integrity-first install (signed checksums)**
 
 ```bash
-export UBS_MINISIGN_PUBKEY="REPLACE_WITH_MINISIGN_PUBLIC_KEY"
+export UBS_MINISIGN_PUBKEY="RWQg+jMrKiloMT5L3URISMoRzCMc/pVcVRCTfuY+WIzttzIr4CUJYRUk"
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/scripts/verify.sh | bash
 ```
 

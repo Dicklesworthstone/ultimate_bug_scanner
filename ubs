@@ -91,7 +91,7 @@ trap on_err ERR
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 PROJECT_DIR="."
-FORMAT="text"              # text|json|sarif
+FORMAT="text"              # text|json|jsonl|sarif
 CI_MODE=0
 FAIL_ON_WARNING=0
 VERBOSE=0
@@ -124,6 +124,9 @@ GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
 GIT_BLOB_BASE=""
 SARIF_AUTOMATION_ID=""
+SHOW_VERSION=0
+BEADS_JSONL_PATH=""
+SUGGEST_IGNORE=0
 
 if [[ "${1:-}" == "doctor" ]]; then
   MODE="doctor"
@@ -140,7 +143,8 @@ Usage: ubs [options] [PROJECT_DIR]
        ubs sessions [--entries N] [--raw]
 
 Options:
-  --format=FMT            text|json|sarif (default: text)
+  --format=FMT            text|json|jsonl|sarif (default: text)
+  --version               Print version and exit
   --ci                    CI mode (stable timestamps)
   --fail-on-warning       Exit non-zero if warnings or critical exist
   -v, --verbose           Pass -v to child scanners (if supported)
@@ -151,6 +155,8 @@ Options:
   --comparison=FILE       Baseline JSON to diff combined results against
   --report-json=FILE      Write combined summary JSON to FILE
   --html-report=FILE      Emit shareable HTML report to FILE
+  --beads-jsonl=FILE      Also write combined findings summary as JSONL for Beads/strung
+  --suggest-ignore        Print large-directory ignore suggestions (without modifying files)
   --update-modules        Force re-download of modules before run
   --jobs=N                Parallelism hint (passed to children if supported)
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
@@ -289,6 +295,7 @@ else
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --format=*) FORMAT="${1#*=}"; shift;;
+      --version|-V) SHOW_VERSION=1; shift;;
       --ci) CI_MODE=1; shift;;
       --fail-on-warning) FAIL_ON_WARNING=1; shift;;
       -v|--verbose) VERBOSE=1; shift;;
@@ -311,6 +318,11 @@ else
       --html-report)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; HTML_REPORT_PATH="$1"; SHAREABLE_MODE=1; shift;;
+      --beads-jsonl=*) BEADS_JSONL_PATH="${1#*=}"; shift;;
+      --beads-jsonl)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; BEADS_JSONL_PATH="$1"; shift;;
+      --suggest-ignore) SUGGEST_IGNORE=1; shift;;
       --ignore-file=*) IGNORE_FILE="${1#*=}"; shift;;
       --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
       --module-dir)
@@ -354,6 +366,15 @@ else
   fi
 fi
 SOURCE_PROJECT_DIR="$PROJECT_DIR"
+
+if [[ "$SHOW_VERSION" -eq 1 ]]; then
+  short_sha=""
+  if git rev-parse --short HEAD >/dev/null 2>&1; then
+    short_sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  say "UBS Meta-Runner v${UBS_VERSION}${short_sha:+ (git $short_sha)}"
+  exit 0
+fi
 
 if [[ -n "$CATEGORY_FILTER" ]]; then
   CATEGORY_FILTER="${CATEGORY_FILTER,,}"
@@ -1086,6 +1107,9 @@ trap cleanup EXIT
 COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 
 apply_ignore_filters
+if [[ "$SUGGEST_IGNORE" -eq 1 ]]; then
+  suggest_ignore_candidates
+fi
 
 if [[ -n "$GIT_MODE" ]]; then
   prepare_git_workspace "$GIT_MODE"
@@ -1145,7 +1169,7 @@ run_lang(){
   args+=("$PROJECT_DIR")
 
   case "$fmt" in
-    json)
+    json|jsonl)
       prepare_metrics_dir "$metrics_dir"
       if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" --format=json >"$out_json" 2>"$err"; then
         module_status=$?
@@ -1321,6 +1345,43 @@ merge_sarif_runs(){
     {"version":"2.1.0","runs": (map(toRuns(.)) | add | map(attachMeta))}' "${sarifs[@]}"
 }
 
+write_jsonl_summary(){
+  local dest="$1"
+  if ! generate_combined_json; then return 1; fi
+  local tmp="$TMPDIR_RUN/combined.jsonl"
+  local ts="$(date_iso)"
+  if ! need_cmd jq; then return 1; fi
+  jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
+    .scanners[] | {type:"scanner", project:$project, language, files, critical, warning, info, timestamp:(.timestamp // $ts)}
+  ' "$COMBINED_JSON_FILE" >"$tmp"
+  jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
+    {type:"totals", project:$project, files:(.totals.files//0), critical:(.totals.critical//0),
+     warning:(.totals.warning//0), info:(.totals.info//0), timestamp:(.timestamp // $ts)}
+  ' "$COMBINED_JSON_FILE" >>"$tmp"
+  if [[ -n "$dest" ]]; then
+    mkdir -p "$(dirname "$dest")"
+    cp "$tmp" "$dest"
+  else
+    cat "$tmp"
+  fi
+}
+
+suggest_ignore_candidates(){
+  local threshold=200
+  IFS=',' read -r -a defaults <<<"$DEFAULT_IGNORES"
+  say "${BLUE}${INFO}${RESET} Ignore suggestions (directories with >${threshold} files not already default-ignored):"
+  find "$PROJECT_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while read -r d; do
+    local base=$(basename "$d")
+    local skip=0
+    for df in "${defaults[@]}"; do [[ "$base" == "$df" ]] && skip=1; done
+    [[ "$skip" -eq 1 ]] && continue
+    local count=$(find "$d" -type f 2>/dev/null | wc -l | awk '{print $1+0}')
+    if [[ "$count" -gt $threshold ]]; then
+      say "  ${GRAY}$base${RESET} (${count} files) → consider adding to .ubsignore"
+    fi
+  done
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Banner & preflight
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1403,6 +1464,13 @@ case "$FORMAT" in
       merge_json_scanners || { say "${RED}$X could not produce combined JSON${RESET}"; status=1; }
     fi
     ;;
+  jsonl)
+    if write_jsonl_summary ""; then
+      :
+    else
+      say "${RED}$X could not produce JSONL output${RESET}"; status=1;
+    fi
+    ;;
   sarif)
     merge_sarif_runs
     ;;
@@ -1436,6 +1504,14 @@ case "$FORMAT" in
     fi
     ;;
 esac
+
+if [[ -n "$BEADS_JSONL_PATH" ]]; then
+  if ! write_jsonl_summary "$BEADS_JSONL_PATH"; then
+    say "${YELLOW}${WARN}${RESET} Could not write Beads JSONL to $BEADS_JSONL_PATH"
+  else
+    say "${DIM}${INFO}${RESET} Beads JSONL written to $BEADS_JSONL_PATH"
+  fi
+fi
 
 SHAREABLE_REQUEST=0
 [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] && SHAREABLE_REQUEST=1

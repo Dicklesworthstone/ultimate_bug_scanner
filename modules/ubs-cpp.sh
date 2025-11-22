@@ -496,7 +496,7 @@ id: cpp.raw-delete
 language: cpp
 rule:
   pattern: delete $X
-severity: critical
+severity: error
 message: "Manual delete; prefer smart pointers or RAII to avoid leaks/UB."
 YAML
 
@@ -519,7 +519,7 @@ rule:
   pattern: throw $EX
   inside:
     kind: destructor_definition
-severity: critical
+severity: error
 message: "Throwing in destructor can call std::terminate during stack unwinding."
 YAML
 
@@ -624,7 +624,7 @@ id: cpp.auto_ptr
 language: cpp
 rule:
   pattern: std::auto_ptr<$T>
-severity: critical
+severity: error
 message: "std::auto_ptr is removed; use std::unique_ptr."
 YAML
 
@@ -686,7 +686,7 @@ rule:
     - pattern: strcat($$)
     - pattern: sprintf($$)
     - pattern: scanf($$)
-severity: critical
+severity: error
 message: "Unsafe C APIs; prefer safer alternatives (snprintf, std::string, streams, fmt)."
 YAML
 
@@ -790,7 +790,7 @@ id: cpp.delete-this
 language: cpp
 rule:
   pattern: delete this
-severity: critical
+severity: error
 message: "Deleting this is error-prone and dangerous."
 YAML
 

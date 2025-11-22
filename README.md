@@ -72,7 +72,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 
 ### 🧠 Language-Aware Meta-Runner
 - `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, and Ruby** in the same repo and fans out to per-language scanners.
-- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|sarif` for consistent downstream tooling.
+- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif` for consistent downstream tooling.
 - Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
 
@@ -139,38 +139,27 @@ ubs . --skip=11,14
 # Custom file extensions
 ubs . --include-ext=js,ts,vue,svelte
 ```
----
 
-## 🚀 **New in v5.0: Agent-Native Power Tools**
+### Handy switches
 
-We listened to feedback from AI agents coding in the wild. UBS v5.0 introduces:
-
-### ⚡ **Git-Aware Scanning (The "Quick Mode")**
-Don't scan the whole repo. Scan only what you changed.
 ```bash
-ubs --staged    # Scan files staged for commit (Pre-commit hook style)
-ubs --diff      # Scan modified files (Working tree vs HEAD)
+# Git-aware quick scans (changed files only)
+ubs --staged    # Scan files staged for commit
+ubs --diff      # Scan working tree changes vs HEAD
+
+# Strictness profiles
+ubs --profile=strict   # Fail on warnings, enforce high standards
+ubs --profile=loose    # Skip TODO/debug/code-quality nits when prototyping
+
+# Machine-readable output
+ubs . --format=json    # Pure JSON on stdout; logs go to stderr
+ubs . --format=jsonl   # Line-delimited summary per scanner + totals
+ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"strung"
 ```
 
-### 🔇 **Smart Silence**
-- **Default Ignores:** UBS now automatically ignores `node_modules`, `venv`, `.venv`, `dist`, `build`, `target`, `vendor`, and other artifacts. You no longer need to manually exclude them.
-- **Inline Suppression:** False positive? Shut it up directly in the code.
-  ```python
-  eval("print('safe')") # ubs:ignore
-  ```
-
-### ⚙️ **Strictness Profiles**
-```bash
-ubs --profile=strict   # Fail on warnings, enforce high standards (Library mode)
-ubs --profile=loose    # Skip TODOs, Debug logs, and Code Quality nits (Prototyping mode)
-```
-
-### 🤖 **Machine-Readable Purity**
-When using `--format=json`, UBS now sends all logs/banners to `stderr`. The `stdout` stream is guaranteed to be pure, parseable JSON.
-```bash
-ubs . --format=json | jq .  # Just works.
-```
----
+### Keeping noise low
+- UBS auto-ignores common junk (`node_modules`, virtualenvs, dist/build/target/vendor, editor caches, etc.).
+- Inline suppression is available when a finding is intentional: `eval("print('safe')")  # ubs:ignore`
 
 ## 🚀 **Quick Install (30 Seconds)**
 
@@ -884,6 +873,7 @@ Core Options:
   -q, --quiet              Minimal output (summary only)
   --ci                     CI mode (stable output, no colors by default)
   --fail-on-warning        Exit with code 1 on warnings (strict mode)
+  --version                Print UBS meta-runner version and exit
   --profile=MODE           strict|loose (sets defaults for strictness)
   --baseline=FILE          Compare findings against a baseline JSON (alias for --comparison)
   -h, --help               Show help and exit
@@ -893,7 +883,8 @@ Git Integration:
   --diff, --git-diff       Scan only modified files (working tree vs HEAD)
 
 Output Control:
-  --format=FMT             Output format: text|json|sarif (default: text)
+  --format=FMT             Output format: text|json|jsonl|sarif (default: text)
+  --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
   --no-color               Force disable ANSI colors
   OUTPUT_FILE              Save report to file (auto-tees to stdout)
 
@@ -916,6 +907,7 @@ Rule Control:
   --rules=DIR              Additional ast-grep rules directory
                            Rules are merged with built-in rules
   --no-auto-update         Disable automatic self-update
+  --suggest-ignore         Print large-directory candidates to add to .ubsignore (no changes applied)
 
 Environment Variables:
   JOBS                     Same as --jobs=N
@@ -966,6 +958,15 @@ ubs . --rules=~/.config/ubs/custom-rules
 
 # Combine multiple options
 ubs -v --fail-on-warning --exclude=legacy --include-ext=js,ts,tsx . report.txt
+```
+
+### JSONL schema
+
+`--format=jsonl` (and `--beads-jsonl=FILE`) emit newline-delimited objects for easy piping into tools like Beads or `jq`:
+
+```jsonl
+{"type":"scanner","project":"/path/to/project","language":"python","files":42,"critical":1,"warning":3,"info":12,"timestamp":"2025-11-22T09:04:20Z"}
+{"type":"totals","project":"/path/to/project","files":99,"critical":1,"warning":3,"info":27,"timestamp":"2025-11-22T09:04:22Z"}
 ```
 
 ### **Custom AST-Grep Rules**
@@ -1856,6 +1857,9 @@ Need repo-wide scans to ignore generated code or intentionally buggy fixtures (l
 
 - Format mirrors `.gitignore`: one glob per line, `#` for comments.
 - UBS loads `PROJECT/.ubsignore` automatically; override with `--ignore-file=/path/to/file`.
+- Built-in ignores already cover `node_modules`, virtualenvs, dist/build/target/vendor, editor caches, and more, so you rarely need to add them yourself.
+- Use `--suggest-ignore` to print large top-level directories that might deserve an entry (no files are modified automatically).
+- Inline suppression works for intentional one-offs: `eval("print('safe')")  # ubs:ignore`.
 - Every language module receives the ignore list via their `--exclude` flag, so skips stay consistent.
 - This repository ships with a default `.ubsignore` that excludes `test-suite/`, keeping “real” source scans noise-free.
 

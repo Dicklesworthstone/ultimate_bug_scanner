@@ -942,7 +942,7 @@ rule:
       $A
     except:
       $B
-severity: critical
+severity: error
 message: "Bare 'except' catches all exceptions including SystemExit/KeyboardInterrupt"
 YAML
 
@@ -984,7 +984,7 @@ rule:
     - pattern: |
         def $NAME($A = set(), $$):
           $BODY
-severity: critical
+severity: error
 message: "Mutable default argument; use default=None and set in body"
 YAML
 
@@ -995,7 +995,7 @@ rule:
   any:
     - pattern: eval($$)
     - pattern: exec($$)
-severity: critical
+severity: error
 message: "Avoid eval/exec; leads to code injection"
 YAML
 
@@ -1006,7 +1006,7 @@ rule:
   any:
     - pattern: pickle.load($$)
     - pattern: pickle.loads($$)
-severity: critical
+severity: error
 message: "Unpickling untrusted data is insecure; prefer safer formats"
 YAML
 
@@ -1018,7 +1018,7 @@ rule:
   not:
     has:
       pattern: Loader=$L
-severity: critical
+severity: error
 message: "yaml.load without Loader=SafeLoader; prefer yaml.safe_load"
 YAML
 
@@ -1031,7 +1031,7 @@ rule:
     - pattern: subprocess.call($$, shell=True)
     - pattern: subprocess.check_output($$, shell=True)
     - pattern: subprocess.Popen($$, shell=True)
-severity: critical
+severity: error
 message: "shell=True is dangerous; prefer exec array with shell=False"
 YAML
 
@@ -1247,7 +1247,7 @@ id: py.tempfile-mktemp
 language: python
 rule:
   pattern: tempfile.mktemp($$)
-severity: critical
+severity: error
 message: "tempfile.mktemp is insecure; use NamedTemporaryFile or mkstemp"
 YAML
 
@@ -2428,7 +2428,7 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
       ruff)
         print_subheader "ruff (lint)"
         run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=json || true
-        ruff_count=$(run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=text | grep -c "^" || true)
+        ruff_count=$(run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=concise | grep -c "^" || true)
         if [ "${ruff_count:-0}" -gt 0 ]; then print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"; else print_finding "good" "Ruff clean"; fi
         ;;
       bandit)
@@ -2445,9 +2445,9 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
         if [ -f "$PROJECT_DIR/requirements.txt" ]; then
           run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" || true
         elif [ -f "$PROJECT_DIR/pyproject.toml" ]; then
-          run_uv_tool_text pip-audit -P "$PROJECT_DIR/pyproject.toml" || true
+          run_uv_tool_text pip-audit --path "$PROJECT_DIR/pyproject.toml" || true
         else
-          run_uv_tool_text pip-audit || true
+          run_uv_tool_text pip-audit --path "$PROJECT_DIR" || true
         fi
         print_finding "info" 0 "pip-audit run (if available)" "Review advisories above"
         ;;

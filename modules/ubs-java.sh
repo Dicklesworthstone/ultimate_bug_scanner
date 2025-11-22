@@ -1068,7 +1068,7 @@ rule:
     - pattern: javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier(($H, $S) -> true)
     - pattern: $X.setHostnameVerifier(($H, $S) -> true)
     - pattern: new javax.net.ssl.X509TrustManager { $$ public void checkServerTrusted($$, $$) { } $$ }
-severity: critical
+severity: error
 message: "SSL/TLS verification disabled; enables MITM"
 YAML
 

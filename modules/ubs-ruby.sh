@@ -478,7 +478,7 @@ rule:
     rescue Exception => $e
       $B
     end
-severity: critical
+severity: error
 message: "Rescuing Exception also catches system exits/interrupts; avoid"
 YAML
   cat >"$AST_RULE_DIR/raise-e.yml" <<'YAML'
@@ -515,7 +515,7 @@ rule:
     - pattern: eval($ARG)
     - pattern: instance_eval($ARG)
     - pattern: class_eval($ARG)
-severity: critical
+severity: error
 message: "eval*/_*eval with strings can lead to code injection"
 YAML
   cat >"$AST_RULE_DIR/marshal-load.yml" <<'YAML'
@@ -525,7 +525,7 @@ rule:
   any:
     - pattern: Marshal.load($ANY)
     - pattern: Marshal.restore($ANY)
-severity: critical
+severity: error
 message: "Unmarshalling untrusted data is insecure; prefer JSON or safer formats"
 YAML
   cat >"$AST_RULE_DIR/yaml-unsafe.yml" <<'YAML'
@@ -601,7 +601,7 @@ rule:
 constraints:
   CMD:
     kind: string
-severity: critical
+severity: error
 message: "Shell invocation via single string; use argv array to avoid injection."
 YAML
   cat >"$AST_RULE_DIR/open-pipe.yml" <<'YAML'

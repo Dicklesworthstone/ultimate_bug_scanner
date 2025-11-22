@@ -1582,7 +1582,7 @@ rule:
     - pattern: $X === NaN
     - pattern: $X != NaN
     - pattern: $X !== NaN
-severity: critical
+severity: error
 message: "Direct NaN comparison is always false; use Number.isNaN(x)"
 YAML
   cat >"$AST_RULE_DIR/innerHTML-assign.yml" <<'YAML'
@@ -1629,7 +1629,7 @@ language: javascript
 rule:
   kind: call_expression
   pattern: eval($$)
-severity: critical
+severity: error
 message: "eval() allows arbitrary code execution"
 YAML
   cat >"$AST_RULE_DIR/new-function.yml" <<'YAML'
@@ -1638,7 +1638,7 @@ language: javascript
 rule:
   kind: new_expression
   pattern: new Function($$)
-severity: critical
+severity: error
 message: "new Function() is equivalent to eval()"
 YAML
   cat >"$AST_RULE_DIR/document-write.yml" <<'YAML'
@@ -1646,7 +1646,7 @@ id: js.document-write
 language: javascript
 rule:
   pattern: document.write($$)
-severity: critical
+severity: error
 message: "document.write() is dangerous and breaks SPAs"
 YAML
   cat >"$AST_RULE_DIR/react-useeffect-cleanup.yml" <<'YAML'
@@ -1663,11 +1663,10 @@ YAML
   # React / JSX expansions
   cat >"$AST_RULE_DIR/react-missing-key.yml" <<'YAML'
 id: react.list-missing-key
-language: typescript
+language: tsx
 rule:
   kind: jsx_element
-  inside:
-    pattern: {$ARR.map($FN => $JSX)}
+  pattern: <$_ />
   not:
     has:
       pattern: key={$KEY}
@@ -1676,7 +1675,7 @@ message: "JSX list item missing key prop"
 YAML
   cat >"$AST_RULE_DIR/react-dangerously-set-html.yml" <<'YAML'
 id: react.dangerously-set-html
-language: typescript
+language: tsx
 rule:
   pattern: <$_ dangerouslySetInnerHTML={$OBJ} />
 severity: warning
@@ -1684,10 +1683,11 @@ message: "dangerouslySetInnerHTML used; ensure the HTML is sanitized"
 YAML
   cat >"$AST_RULE_DIR/react-setstate-in-render.yml" <<'YAML'
 id: react.setstate-in-render
-language: typescript
+language: tsx
 rule:
-  pattern: render($$) { $$.setState($$) }
-severity: critical
+  kind: method_definition
+  regex: "render\\s*\\([^)]*\\)\\s*\\{[^}]*setState\\s*\\("
+severity: error
 message: "setState called inside render; causes infinite re-render"
 YAML
   # Node / security
@@ -1744,7 +1744,8 @@ YAML
 id: js.error.empty-catch
 language: javascript
 rule:
-  pattern: catch ($$) { }
+  kind: catch_clause
+  regex: "catch\\s*\\([^)]*\\)\\s*\\{\\s*\\}"
 severity: warning
 message: "Empty catch block hides errors; log or rethrow the exception"
 YAML
@@ -1752,10 +1753,8 @@ YAML
 id: js.error.throw-string
 language: javascript
 rule:
-  pattern: throw $VALUE
-  constraints:
-    VALUE:
-      kind: string
+  kind: throw_statement
+  regex: "throw\\s+['\\\"]"
 severity: warning
 message: "Throwing string literals loses stack traces; use throw new Error('message')"
 YAML
@@ -1809,12 +1808,7 @@ YAML
 id: security.cookie-insecure
 language: typescript
 rule:
-  any:
-    - pattern: res.cookie($NAME, $VAL)
-    - pattern: response.cookie($NAME, $VAL)
-  not:
-    has:
-      pattern: { httpOnly: true, secure: true, sameSite: $S }
+  pattern: $OBJ.cookie($NAME, $VAL)
 severity: warning
 message: "Set-Cookie without httpOnly/secure/sameSite; add them to mitigate XSS/CSRF"
 YAML
@@ -1903,13 +1897,15 @@ ensure_ast_rule_results() {
   rc=0
   shopt -s nullglob
   for rule_file in "$AST_RULE_DIR"/*.yml; do
-    if ! "${AST_GREP_CMD[@]}" scan --rule "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null; then
-      rc=1
+    "${AST_GREP_CMD[@]}" scan --rule "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null
+    cmd_rc=$?
+    if [[ "$cmd_rc" -gt 1 ]]; then
+      rc=$cmd_rc
       break
     fi
   done
   shopt -u nullglob
-  if [[ "$rc" -ne 0 ]]; then
+  if [[ "$rc" -gt 1 ]]; then
     rm -f "$tmp_json"
     return 1
   fi

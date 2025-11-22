@@ -503,7 +503,7 @@ id: swift.try-bang
 language: swift
 rule:
   regex: "\\btry!\\b"
-severity: critical
+severity: error
 message: "try! will crash on error; use try? or do/catch."
 YAML
 
@@ -587,7 +587,7 @@ rule:
   regex: "with(Checked|Unsafe)Continuation\\s*\\{[\\s\\S]*?\\}"
   not:
     regex: "\\bresume\\s*\\("
-severity: critical
+severity: error
 message: "Continuation without resume() along all paths (heuristic)."
 YAML
 
@@ -712,7 +712,7 @@ id: swift.urlsession.delegate.tls-trust
 language: swift
 rule:
   regex: "didReceiveChallenge\\s*\\(.*URLAuthenticationChallenge.*\\)[\\s\\S]*?completionHandler\\s*\\(\\s*\\.useCredential\\s*,\\s*URLCredential\\(trust:"
-severity: critical
+severity: error
 message: "URLSession delegate trusting server trust directly; TLS pinning bypass risk."
 YAML
 
@@ -800,7 +800,7 @@ rule:
   any:
     - regex: "try!\\s*JSONDecoder\\s*\\(\\s*\\)\\s*\\.decode\\s*\\("
     - regex: "try!\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\.decode\\s*\\("
-severity: critical
+severity: error
 message: "JSON decode with try! may crash; use do/catch and surface decoding errors."
 YAML
 
@@ -1191,7 +1191,7 @@ rule:
   regex: "with(Checked|Unsafe)Continuation\\s*\\{[\\s\\S]*\\}"
   not:
     regex: "\\bresume\\s*\\("
-severity: critical
+severity: error
 message: "Continuation used without resume() in body (heuristic)."
 YAML
 

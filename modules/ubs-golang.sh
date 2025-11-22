@@ -1012,7 +1012,7 @@ rule:
     - pattern: exec.CommandContext($CTX, "sh", "-c", $CMD)
     - pattern: exec.Command("bash", "-c", $CMD)
     - pattern: exec.CommandContext($CTX, "bash", "-c", $CMD)
-severity: critical
+severity: error
 message: "shell invocation via sh -c; sanitize inputs or avoid shell."
 YAML
 

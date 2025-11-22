@@ -704,7 +704,7 @@ id: rust.panic-macro
 language: rust
 rule:
   pattern: panic!($$)
-severity: critical
+severity: error
 message: "panic! in non-test code can crash the process"
 YAML
 
@@ -780,7 +780,7 @@ rule:
     - pattern: std::mem::transmute($$)
     - pattern: mem::transmute($$)
     - pattern: transmute($$)
-severity: critical
+severity: error
 message: "std::mem::transmute is unsafe and error-prone; prefer safe conversions"
 YAML
 
@@ -791,7 +791,7 @@ rule:
   any:
     - pattern: std::mem::uninitialized::<$T>()
     - pattern: mem::uninitialized::<$T>()
-severity: critical
+severity: error
 message: "std::mem::uninitialized is UB; use MaybeUninit instead"
 YAML
 
@@ -802,7 +802,7 @@ rule:
   any:
     - pattern: std::mem::zeroed::<$T>()
     - pattern: mem::zeroed::<$T>()
-severity: critical
+severity: error
 message: "std::mem::zeroed can be UB for many types; use MaybeUninit instead"
 YAML
 
@@ -1112,7 +1112,7 @@ rule:
   any:
     - pattern: openssl::ssl::SslVerifyMode::NONE
     - pattern: SslVerifyMode::NONE
-severity: critical
+severity: error
 message: "OpenSSL verification disabled; enables MITM"
 YAML
 

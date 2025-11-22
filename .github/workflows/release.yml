@@ -294,6 +294,11 @@ jobs:
           name: oci-artifacts
           path: oci
 
+      - name: Normalize OCI artifact names
+        run: |
+          mv oci/sbom.spdx.json oci/oci-sbom.spdx.json
+          mv oci/provenance.json oci/oci-provenance.json
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -304,7 +309,7 @@ jobs:
             dist/SHA256SUMS.minisig
             dist/ubs.rb
             dist/sbom.spdx.json
-            oci/sbom.spdx.json
-            oci/provenance.json
+            oci/oci-sbom.spdx.json
+            oci/oci-provenance.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

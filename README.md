@@ -180,6 +180,50 @@ ubs . --format=json | jq .  # Just works.
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash
 ```
 
+### **Option 2: Integrity-first install (signed checksums)**
+
+```bash
+export UBS_MINISIGN_PUBKEY="REPLACE_WITH_MINISIGN_PUBLIC_KEY"
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/scripts/verify.sh | bash
+```
+
+The verifier downloads `SHA256SUMS` + `SHA256SUMS.minisig` from the matching release, validates them with minisign, checks `install.sh`, and only then executes it. Use `--insecure` to bypass verification (not recommended).
+
+### **Option 3: Nix**
+
+Run directly (no install):
+
+```bash
+nix run github:Dicklesworthstone/ultimate_bug_scanner
+```
+
+Dev shell for contributors:
+
+```bash
+nix develop
+```
+
+### **Option 4: Docker / OCI**
+
+Pull & inspect:
+
+```bash
+docker run --rm ghcr.io/dicklesworthstone/ubs-tools ubs --help
+```
+
+Scan host code (risk-aware: grants container access to host FS):
+
+```bash
+docker run --rm -v /:/host ghcr.io/dicklesworthstone/ubs-tools bash -c "cd /host/path && ubs ."
+```
+
+⚠️ Use the host-mount pattern only when you understand the write-access implications.
+
+### Deployment & Security
+
+- Release playbook (how we cut signed releases): [docs/release.md](docs/release.md)
+- Supply chain & verification model: [docs/security.md](docs/security.md)
+
 The installer will:
 - ✅ Install the `ubs` command globally
 - ✅ Optionally install `ast-grep` (for advanced AST analysis)

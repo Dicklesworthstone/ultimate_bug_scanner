@@ -6,10 +6,15 @@ shopt -s lastpipe 2>/dev/null || true
 # Ultimate Bug Scanner - Installation Script
 # https://github.com/Dicklesworthstone/ultimate_bug_scanner
 
-VERSION="5.0.0"
+VERSION_DEFAULT="5.0.0"
+VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/VERSION"
+VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo "$VERSION_DEFAULT")"
 SCRIPT_NAME="ubs"
 INSTALL_NAME="ubs"
 REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master"
+ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
+ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
+MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
 
 # Global copy of original args (needed in update re-exec; must not be local)
 ORIGINAL_ARGS=()
@@ -136,6 +141,9 @@ RUN_VERIFICATION=1
 DRY_RUN=0
 RUN_SELF_TEST=0
 RUN_DOCTOR=1
+INSECURE=0
+CHECKSUM_FILE=""
+CHECKSUM_SIG_FILE=""
 SESSION_AGENT_SUMMARY=""
 SESSION_SUMMARY_FILE=""
 declare -a SESSION_FACT_KEYS=()
@@ -221,7 +229,9 @@ HELP
   print_help_option "--dry-run" "Log every action without modifying the system"
   print_help_option "--self-test" "Run installer smoke tests after install"
   print_help_option "--skip-version-check" "Do not check GitHub for newer releases"
-  print_help_option "--skip-verification" "Skip post-install verification banner"
+  print_help_option "--skip-verification" "Skip checksum/signature verification (NOT recommended)"
+  print_help_option "--insecure" "Bypass all integrity checks (NOT recommended)"
+  print_help_option "--info" "Print installer release + key metadata and exit"
   print_help_option "--diagnose" "Print environment + dependency diagnostics"
   print_help_option "--generate-config" "Create ~/.config/ubs/install.conf"
   echo ""
@@ -438,6 +448,85 @@ log() { print_with_icon "${ARROW}" "$*"; }
 success() { print_with_icon "${CHECK}" "$*"; }
 error() { print_with_icon "${CROSS}" "$*" >&2; }
 warn() { print_with_icon "${WARN}" "$*"; }
+
+# Secure download helpers
+secure_fetch() {
+  local url="$1" out="$2" err_file="$3"
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --compressed -o "$out" "$url" 2>"$err_file"
+  else
+    wget --https-only --secure-protocol=TLSv1_2 --tries=3 --waitretry=1 --timeout=20 -O "$out" "$url" 2>"$err_file"
+  fi
+}
+
+fetch_checksum_bundle() {
+  if [ "$RUN_VERIFICATION" -eq 0 ] || [ "$INSECURE" -eq 1 ]; then
+    return 0
+  fi
+
+  local sums="$WORKDIR/SHA256SUMS"
+  local sig="$WORKDIR/SHA256SUMS.minisig"
+  local err
+  err=$(mktemp_in_workdir "checksums.err.XXXXXX")
+
+  log "Fetching signed checksums from release artifacts..."
+  if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS" "$sums" "$err"; then
+    log_network_failure "Failed to download SHA256SUMS from ${ARTIFACT_BASE}" "$err"
+    error "Checksum download failed. Use --insecure to bypass (not recommended)."
+    exit 1
+  fi
+  if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS.minisig" "$sig" "$err"; then
+    log_network_failure "Failed to download SHA256SUMS.minisig from ${ARTIFACT_BASE}" "$err"
+    error "Checksum signature download failed. Use --insecure to bypass (not recommended)."
+    exit 1
+  fi
+
+  if [ -z "$MINISIGN_PUBKEY" ]; then
+    error "MINISIGN public key not configured. Set UBS_MINISIGN_PUBKEY or rerun with --insecure."
+    exit 1
+  fi
+
+  if ! command -v minisign >/dev/null 2>&1; then
+    error "minisign is required for signature verification (install via your package manager)."
+    exit 1
+  fi
+
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    error "sha256sum not found (install coreutils)."
+    exit 1
+  fi
+
+  if minisign -Vm "$sums" -P "$MINISIGN_PUBKEY" -x "$sig" >/dev/null 2>&1; then
+    CHECKSUM_FILE="$sums"
+    CHECKSUM_SIG_FILE="$sig"
+    success "Checksum signature verified"
+  else
+    error "Signature verification failed for SHA256SUMS"
+    exit 1
+  fi
+}
+
+verify_download_checksum() {
+  local file_path="$1" expected_name="$2"
+  if [ "$RUN_VERIFICATION" -eq 0 ] || [ "$INSECURE" -eq 1 ]; then
+    return 0
+  fi
+  if [ -z "$CHECKSUM_FILE" ] || [ ! -f "$CHECKSUM_FILE" ]; then
+    error "Checksum file not available; cannot verify ${expected_name}."
+    exit 1
+  fi
+  local tmp_sum
+  tmp_sum=$(mktemp_in_workdir "${expected_name}.sha.XXXXXX")
+  if ! grep "  ${expected_name}$" "$CHECKSUM_FILE" > "$tmp_sum"; then
+    error "Checksum entry for ${expected_name} missing in SHA256SUMS"
+    exit 1
+  fi
+  (cd "$(dirname "$file_path")" && sha256sum --check --status "$tmp_sum") || {
+    error "Checksum verification failed for ${expected_name}"
+    exit 1
+  }
+  success "Checksum verified for ${expected_name}"
+}
 
 # Set up cleanup traps
 trap 'cleanup_on_exit; exit 130' INT   # 130 = 128 + SIGINT (2)
@@ -2219,6 +2308,7 @@ install_scanner() {
   install_dir="$(determine_install_dir)"
   local use_sudo=""
   use_sudo="$(maybe_sudo "$install_dir")"
+  local downloaded_from_release=0
 
   log "Installing Ultimate Bug Scanner to $install_dir..."
 
@@ -2248,11 +2338,7 @@ install_scanner() {
 
   download_to_file() {
     local url="$1" out="$2"
-    if command -v curl >/dev/null 2>&1; then
-      with_backoff 3 curl -fsSL "$url" -o "$out" 2>"$download_err"
-    else
-      with_backoff 3 wget -q "$url" -O "$out" 2>"$download_err"
-    fi
+    secure_fetch "$url" "$out" "$download_err"
   }
 
   if [ -f "./$SCRIPT_NAME" ]; then
@@ -2271,10 +2357,12 @@ install_scanner() {
     fi
   else
     log "Downloading from GitHub..."
-    local download_url="${REPO_URL}/${SCRIPT_NAME}"
+    fetch_checksum_bundle
+    local download_url="${ARTIFACT_BASE}/${SCRIPT_NAME}"
 
     if download_to_file "$download_url" "$temp_path"; then
       log "Downloaded successfully"
+      downloaded_from_release=1
     else
       error "Download failed. Check $download_err"
       rm -f "$temp_path"
@@ -2305,6 +2393,12 @@ install_scanner() {
 
   if ! grep -E -q "UBS Meta-Runner|Ultimate Bug Scanner" "$temp_path"; then
     warn "Downloaded file does not contain expected marker; continuing (marker may have changed)"
+  fi
+
+  if [ "$downloaded_from_release" -eq 1 ]; then
+    verify_download_checksum "$temp_path" "$SCRIPT_NAME"
+  elif [ "$RUN_VERIFICATION" -eq 1 ] && [ "$INSECURE" -eq 0 ]; then
+    warn "Skipping checksum verification for local script; use --insecure to suppress this warning if intentional."
   fi
 
   if [ -n "$use_sudo" ]; then
@@ -3045,6 +3139,11 @@ shift
 RUN_VERIFICATION=0
 shift
 ;;
+--insecure)
+INSECURE=1
+RUN_VERIFICATION=0
+shift
+;;
 --dry-run)
 DRY_RUN=1
 shift
@@ -3073,6 +3172,17 @@ exit 0
 generate_config
 exit 0
 ;;
+--info)
+  echo "UBS installer info"
+  echo "  Version: ${VERSION}"
+  echo "  Artifact base: ${ARTIFACT_BASE}"
+  if [ -n "$MINISIGN_PUBKEY" ]; then
+    echo "  Minisign pubkey: ${MINISIGN_PUBKEY}"
+  else
+    echo "  Minisign pubkey: (not configured; set UBS_MINISIGN_PUBKEY)"
+  fi
+  exit 0
+  ;;
 --diagnose)
 diagnostic_check
 exit 0

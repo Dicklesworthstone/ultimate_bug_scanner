@@ -1,0 +1,14 @@
+name: Legacy Release Artifacts (disabled)
+
+# Retained to honor the no-delete policy. The actual release process now lives in
+# .github/workflows/release.yml. This workflow is gated off by default to avoid
+# duplicate releases; run manually if you need the older path.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  noop:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Legacy release workflow replaced by release.yml"

@@ -1,0 +1,308 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+env:
+  COSIGN_VERSION: v2.2.4
+  SYFT_VERSION: v1.4.1
+  UV_VERSION: "0.4.20"
+  JQ_VERSION: "1.7.1"
+  RG_VERSION: "13.0.0"
+
+jobs:
+  gather:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Compute release metadata
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  nix-check:
+    runs-on: ubuntu-latest
+    needs: gather
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.18.1/install
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Run nix flake check
+        run: nix flake check
+
+  build-artifacts:
+    runs-on: ubuntu-latest
+    needs: gather
+    env:
+      TAG: ${{ needs.gather.outputs.tag }}
+      VERSION: ${{ needs.gather.outputs.version }}
+    steps:
+      - name: Ensure minisign secret is present
+        run: |
+          if [ -z "${{ secrets.MINISIGN_SECRET_KEY }}" ]; then
+            echo "MINISIGN_SECRET_KEY is required for releases" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev coreutils minisign
+
+          # jq (static binary)
+          curl -fsSLo /usr/local/bin/jq https://github.com/jqlang/jq/releases/download/${JQ_VERSION}/jq-linux-amd64
+          echo "5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5  /usr/local/bin/jq" | sha256sum --check --status
+          chmod +x /usr/local/bin/jq
+
+          # ripgrep (13.0.0 deb)
+          curl -fsSLo /tmp/ripgrep_${RG_VERSION}_amd64.deb https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep_${RG_VERSION}_amd64.deb
+          echo "6d78bed13722019cb4f9d0cf366715e2dcd589f4cf91897efb28216a6bb319f1  /tmp/ripgrep_${RG_VERSION}_amd64.deb" | sha256sum --check --status
+          sudo dpkg -i /tmp/ripgrep_${RG_VERSION}_amd64.deb
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          uv-version: ${{ env.UV_VERSION }}
+
+      - name: Verify tag matches VERSION file
+        run: |
+          FILE_VERSION=$(cat VERSION | tr -d '\r\n')
+          if [ "$FILE_VERSION" != "$VERSION" ]; then
+            echo "VERSION file ($FILE_VERSION) does not match tag ($VERSION)" >&2
+            exit 1
+          fi
+
+      - name: Create dist directory
+        run: mkdir -p dist
+
+      - name: Generate checksums
+        run: |
+          sha256sum install.sh ubs scripts/verify.sh > dist/SHA256SUMS
+
+      - name: Sign checksums with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          printf "%s" "$MINISIGN_SECRET_KEY" > dist/minisign.key
+          chmod 600 dist/minisign.key
+          minisign -S -s dist/minisign.key -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          rm dist/minisign.key
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      - name: Generate project SBOM (SPDX JSON)
+        run: syft dir:. -o spdx-json > dist/sbom.spdx.json
+
+      - name: Build Homebrew formula
+        run: |
+          UBS_SHA=$(sha256sum ubs | cut -d' ' -f1)
+          cat > dist/ubs.rb <<'RUBY'
+class Ubs < Formula
+  desc "Ultimate Bug Scanner meta-runner"
+  homepage "https://github.com/Dicklesworthstone/ultimate_bug_scanner"
+RUBY
+          {
+            echo "  version \"$VERSION\""
+            echo "  url \"https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v$VERSION/ubs\""
+            echo "  sha256 \"$UBS_SHA\""
+          } >> dist/ubs.rb
+          cat >> dist/ubs.rb <<'RUBY'
+  license "MIT"
+
+  def install
+    chmod 0555, "ubs"
+    bin.install "ubs"
+  end
+
+  test do
+    system "#{bin}/ubs", "--help"
+  end
+end
+RUBY
+
+      - name: Assemble release payload
+        run: |
+          cp install.sh dist/
+          cp ubs dist/
+          cp scripts/verify.sh dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+  oci-image:
+    runs-on: ubuntu-latest
+    needs: gather
+    env:
+      TAG: ${{ needs.gather.outputs.tag }}
+      VERSION: ${{ needs.gather.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Normalize image name
+        run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ubs-tools" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+          provenance: false
+          sbom: false
+
+      - name: Capture image digest
+        id: digest
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          if [ -z "$DIGEST" ]; then
+            echo "Image digest missing from docker/build-push-action output" >&2
+            exit 1
+          fi
+          DIGEST_HASH="${DIGEST#sha256:}"
+          IMAGE_DIGEST="${IMAGE_NAME}@sha256:${DIGEST_HASH}"
+          echo "digest=$IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "sha=$DIGEST_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: ${{ env.SYFT_VERSION }}
+
+      - name: Generate SBOM (SPDX JSON)
+        run: syft ${{ steps.digest.outputs.digest }} -o spdx-json > sbom.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.6.0
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: cosign sign --yes ${{ steps.digest.outputs.digest }}
+
+      - name: Attach SBOM attestation
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: cosign attest --yes --predicate sbom.spdx.json --type spdx ${{ steps.digest.outputs.digest }}
+
+      - name: Generate provenance predicate (SLSA v1)
+        run: |
+          cat > provenance.json <<'EOF'
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    { "name": "${{ env.IMAGE_NAME }}", "digest": { "sha256": "${{ steps.digest.outputs.sha }}" } }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://slsa.dev/provenance/v1",
+      "externalParameters": {
+        "source": "${{ github.repository }}",
+        "ref": "${{ github.ref }}",
+        "sha": "${{ github.sha }}"
+      }
+    },
+    "runDetails": {
+      "builder": { "id": "https://github.com/actions" },
+      "metadata": { "invocationId": "${{ github.run_id }}" }
+    }
+  }
+}
+EOF
+
+      - name: Attach provenance attestation (SLSA v1)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: cosign attest --yes --predicate provenance.json --type https://slsa.dev/provenance/v1 ${{ steps.digest.outputs.digest }}
+
+      - name: Upload OCI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-artifacts
+          path: |
+            sbom.spdx.json
+            provenance.json
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - build-artifacts
+      - oci-image
+      - nix-check
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: Download OCI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: oci-artifacts
+          path: oci
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/install.sh
+            dist/ubs
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+            dist/ubs.rb
+            dist/sbom.spdx.json
+            oci/sbom.spdx.json
+            oci/provenance.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

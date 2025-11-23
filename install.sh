@@ -7,8 +7,13 @@ shopt -s lastpipe 2>/dev/null || true
 # https://github.com/Dicklesworthstone/ultimate_bug_scanner
 
 VERSION_DEFAULT="5.0.0"
-VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/VERSION"
-VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo "$VERSION_DEFAULT")"
+# Handle case when script is piped (BASH_SOURCE[0] not set)
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/VERSION"
+  VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo "$VERSION_DEFAULT")"
+else
+  VERSION="$VERSION_DEFAULT"
+fi
 SCRIPT_NAME="ubs"
 INSTALL_NAME="ubs"
 REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master"
@@ -416,7 +421,7 @@ print_header() {
     ║      ╚═════╝ ╚═════╝ ╚══════╝    ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝     ║
     ║                                                                  ║
 HEADER
-  echo -e "    ║         ${GREEN}🔬 ULTIMATE BUG SCANNER INSTALLER v${VERSION} 🔬${BLUE}             ║"
+  echo -e "    ║         ${GREEN}🔬 ULTIMATE BUG SCANNER INSTALLER v${VERSION} 🔬${BLUE}              ║"
   cat << 'HEADER'
     ║                                                                  ║
     ║   Industrial-Grade Static Analysis for Polyglot AI Codebases     ║

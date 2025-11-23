@@ -6,7 +6,7 @@ shopt -s lastpipe 2>/dev/null || true
 # Ultimate Bug Scanner - Installation Script
 # https://github.com/Dicklesworthstone/ultimate_bug_scanner
 
-VERSION_DEFAULT="5.0.0"
+VERSION_DEFAULT="4.6.5"
 # Handle case when script is piped (BASH_SOURCE[0] not set)
 if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
   VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/VERSION"

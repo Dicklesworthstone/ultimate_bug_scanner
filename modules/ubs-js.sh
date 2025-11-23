@@ -2165,12 +2165,16 @@ print_category "Detects: Division by zero, NaN propagation, floating-point equal
   "Mathematical bugs that produce silent errors or Infinity/NaN values"
 
 print_subheader "Division operations (potential ÷0)"
-count=$(
-  ( "${GREP_RN[@]}" -e "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) \
-    | grep -vE '^\s*//' \
-    | grep -vE "[\"']" \
-    | grep -Ev "/[[:space:]]*(255|2|10|100|1000)\b" \
-    | count_lines)
+if [ "$HAS_AST_GREP" -eq 1 ]; then
+  count=$(ast_search '$L / $R' || echo 0)
+else
+  count=$(
+    ( "${GREP_RN[@]}" -e "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) \
+      | grep -vE '^\s*//' \
+      | grep -vE "[\"']" \
+      | grep -Ev "/[[:space:]]*(255|2|10|100|1000)\b" \
+      | count_lines)
+fi
 if [ "$count" -gt 25 ]; then
   print_finding "warning" "$count" "Division by variable - verify non-zero" "Add guards: if (divisor === 0) throw; or use fallback"
   show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
@@ -2204,7 +2208,11 @@ if [ "$count" -gt 3 ]; then
 fi
 
 print_subheader "Modulo by variable (verify non-zero)"
-count=$("${GREP_RN[@]}" -e "%[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$HAS_AST_GREP" -eq 1 ]; then
+  count=$(ast_search '$L % $R' || echo 0)
+else
+  count=$("${GREP_RN[@]}" -e "%[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fi
 if [ "$count" -gt 10 ]; then
   print_finding "info" "$count" "Modulo operations - verify divisor is non-zero"
 fi

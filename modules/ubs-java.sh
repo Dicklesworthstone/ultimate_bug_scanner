@@ -668,12 +668,14 @@ run_async_error_checks() {
       print_finding "info" 0 "Async fallback disabled" "Run with --fail-on-warning to check async patterns when ast-grep is unavailable"
       return
     fi
-    local get_count then_count
+    local get_count then_count tmp_get tmp_then
     # Check for .get() calls which may block without proper try/catch
-    get_count=$("${GREP_RN[@]}" -e '\.get\s*\(\s*\)' "$PROJECT_DIR" 2>/dev/null | count_lines || echo 0)
+    tmp_get=$("${GREP_RN[@]}" -e '\.get\s*\(\s*\)' "$PROJECT_DIR" || true)
+    get_count=$(echo "$tmp_get" | count_lines)
     # Check for .then* calls without .exceptionally()
-    then_count=$("${GREP_RN[@]}" -e '\.(thenApply|thenCompose|thenAccept|thenRun)\s*\(' "$PROJECT_DIR" 2>/dev/null | \
-      (grep -v 'exceptionally' || true) | count_lines || echo 0)
+    tmp_then=$("${GREP_RN[@]}" -e '\.(thenApply|thenCompose|thenAccept|thenRun)\s*\(' "$PROJECT_DIR" || true)
+    tmp_then=$(echo "$tmp_then" | grep -v 'exceptionally' || true)
+    then_count=$(echo "$tmp_then" | count_lines)
     if [ "$get_count" -gt 0 ]; then
       print_finding "warning" "$get_count" "CompletableFuture.get() calls" "Wrap .get() calls in try/catch or use CompletableFuture chaining"
     fi

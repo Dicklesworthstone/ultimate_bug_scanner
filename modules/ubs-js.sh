@@ -611,10 +611,7 @@ run_async_error_checks() {
   local warn_before=$WARNING_COUNT
   if ! emit_ast_rule_group ASYNC_ERROR_RULE_IDS ASYNC_ERROR_SEVERITY ASYNC_ERROR_SUMMARY ASYNC_ERROR_REMEDIATION \
     "All async operations appear protected" "Async rule checks"; then
-    if [[ "$PROJECT_DIR" != *"buggy"* ]]; then
-      print_finding "good" "Async operations appear protected"
-      return
-    fi
+    # When ast-grep is unavailable and --fail-on-warning is set, use grep-based fallback
     if [[ "$FAIL_ON_WARNING" -eq 0 ]]; then
       print_finding "info" 0 "Async fallback disabled" "Run with --fail-on-warning to surface missing .catch()/try blocks when ast-grep is unavailable"
       return
@@ -1430,8 +1427,14 @@ end_scan_section(){
 
 check_ast_grep() {
   if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
-  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
-  if command -v npx      >/dev/null 2>&1; then AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0; fi
+  # Verify 'sg' is actually ast-grep, not the Unix newgrp command
+  if command -v sg >/dev/null 2>&1 && sg --version 2>&1 | grep -qi "ast-grep"; then
+    AST_GREP_CMD=(sg); HAS_AST_GREP=1; return 0
+  fi
+  # Verify npx can actually run ast-grep before trusting it
+  if command -v npx >/dev/null 2>&1 && npx -y @ast-grep/cli --version >/dev/null 2>&1; then
+    AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0
+  fi
   say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be skipped.${RESET}"
   say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
   HAS_AST_GREP=0; return 1

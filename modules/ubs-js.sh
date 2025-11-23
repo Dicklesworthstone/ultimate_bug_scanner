@@ -1850,7 +1850,7 @@ rule:
     - pattern: $CALLEE($ARGS)
     - regex:
         target: CALLEE
-        pattern: "^(fetch|axios\\.?|.*[Aa]sync$|.*Promise$|Promise\\.|new Promise$|request|req|http|https|api)"
+        pattern: "^(fetch|axios\\.?|superagent|request|req|http|https|api|callApi|post|put|get|del|head|patch|upload|download|.*[Aa]sync$|.*Promise$|Promise\\.|new Promise)"
     - not:
         inside:
           any:
@@ -1858,6 +1858,11 @@ rule:
             - pattern: $EXPR.then($ARGS)
             - pattern: Promise.all($ARGS)
             - pattern: Promise.race($ARGS)
+            - kind: return_statement
+    - not:
+        regex:
+          target: CALLEE
+          pattern: "^(document\\.|window\\.|console\\.|JSON\\.|Math\\.|Date\\.|Array\\.|Object\\.|Set\\.|Map\\.|WeakMap|WeakSet|Intl\\.|Number\\.|String\\.|Boolean\\.|parse|encode|decode|transform|render|append|push|join|filter|map|reduce|forEach|has|get|set)$"
 severity: warning
 message: "Possible unhandled/dangling promise; use await/then/catch"
 YAML
@@ -1868,10 +1873,12 @@ language: javascript
 rule:
   pattern: fetch($ARGS)
   not:
-    inside:
-      any:
-        - pattern: try { $TRY_BODY } catch ($E) { $CATCH_BODY }
-        - pattern: .catch($CATCH)
+    any:
+      - inside:
+          kind: try_statement
+      - inside:
+          kind: return_statement
+      - pattern: .catch($CATCH)
 severity: warning
 message: "fetch() without catch/try; network failures will be unhandled"
 YAML

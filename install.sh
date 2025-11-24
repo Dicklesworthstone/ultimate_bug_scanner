@@ -1222,7 +1222,7 @@ x.foo();
 SMOKE
 
   if [ "$had_ubs" -eq 1 ]; then
-    if safe_timeout 10 ubs "$test_file" --only=js --fail-on-warning --ci >/dev/null 2>&1; then
+    if safe_timeout 10 ubs --fail-on-warning --ci --only=js "$test_file" >/dev/null 2>&1; then
       warn "Smoke test FAILED - scanner did not flag known bugs (exit 0)"
     else
       success "Smoke test PASSED - scanner detects bugs (non-zero exit)"

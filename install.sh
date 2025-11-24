@@ -3467,7 +3467,26 @@ run_post_install_doctor "$install_dir/$INSTALL_NAME" "$install_dir"
 if [ "$RERUN_AFTER_FIX" -eq 1 ] && [ "${UBS_INSTALL_RERUN_DONE:-0}" -eq 0 ]; then
   log "Re-running installer after checksum auto-fix to verify clean state..."
   release_lock
-  UBS_INSTALL_RERUN_DONE=1 exec "$0" "${ORIGINAL_ARGS[@]}"
+  UBS_INSTALL_RERUN_DONE=1
+  export UBS_INSTALL_RERUN_DONE
+
+  # Prefer re-exec'ing the current script file when available
+  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    exec "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+  else
+    # Piped install: fetch a fresh copy and re-run with original args
+    tmp_rerun="$(mktemp -t ubs-install-rerun.XXXXXX.sh)" || {
+      warn "Could not create temp file for rerun; skipping auto-rerun"
+      exit 0
+    }
+    if curl -fsSL "${REPO_URL}/install.sh" -o "$tmp_rerun"; then
+      chmod +x "$tmp_rerun" 2>/dev/null || true
+      exec "$tmp_rerun" "${ORIGINAL_ARGS[@]}"
+    else
+      warn "Failed to download installer for rerun; skipping auto-rerun"
+      exit 0
+    fi
+  fi
 fi
 
 if [ -n "${SESSION_SUMMARY_FILE:-}" ]; then

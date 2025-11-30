@@ -650,6 +650,16 @@ can_use_sudo() {
   return 1
 }
 
+is_windows_admin() {
+  # Best-effort check: net session succeeds only when elevated
+  if command -v net.exe >/dev/null 2>&1; then
+    if net.exe session >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 safe_timeout() {
   # Cross-platform timeout wrapper
   # Usage: safe_timeout <seconds> <command> [args...]
@@ -853,13 +863,16 @@ install_ast_grep() {
           success "ast-grep installed via cargo"
           return 0
         else
-          error "Cargo installation failed"
-          return 1
+          warn "Cargo installation failed, trying binary download..."
         fi
-      else
-        warn "Install Rust/Cargo or download from: https://ast-grep.github.io/"
-        return 1
       fi
+
+      if download_binary_release "ast-grep" "$platform"; then
+        return 0
+      fi
+
+      warn "Install Rust/Cargo or download from: https://ast-grep.github.io/"
+      return 1
       ;;
     *)
       error "Unknown platform. Install manually from: https://ast-grep.github.io/"
@@ -972,7 +985,7 @@ download_binary_release() {
   case "$tool" in
     ripgrep)
       local version="14.1.0"
-      local asset
+      local asset type="tar"
       case "$platform" in
         linux|wsl)
           asset="ripgrep-${version}-${arch}-unknown-linux-musl.tar.gz"
@@ -983,24 +996,45 @@ download_binary_release() {
         freebsd)
           asset="ripgrep-${version}-${arch}-unknown-freebsd.tar.gz"
           ;;
+        windows)
+          case "$arch" in
+            x86_64) asset="ripgrep-${version}-x86_64-pc-windows-gnu.zip"; type="zip" ;;
+            aarch64) asset="ripgrep-${version}-aarch64-pc-windows-msvc.zip"; type="zip" ;;
+            *) warn "No ripgrep binary for $platform-$arch"; return 1 ;;
+          esac
+          ;;
         *) warn "No binary release for $platform"; return 1 ;;
       esac
 
       local url="https://github.com/BurntSushi/ripgrep/releases/download/${version}/${asset}"
-      local tarball_path="$temp_dir/${asset}"
+      local archive_path="$temp_dir/${asset}"
 
-      if with_backoff 3 curl -fsSL "$url" -o "$tarball_path" 2>"$err_log"; then
-        if tar -xzf "$tarball_path" -C "$temp_dir" >/dev/null 2>&1; then
-          local rg_binary
-          rg_binary=$(find "$temp_dir" -name "rg" -type f 2>/dev/null | head -1)
-          if [ -n "$rg_binary" ] && [ -f "$rg_binary" ]; then
-            chmod +x "$rg_binary" 2>/dev/null
-            mv "$rg_binary" "$install_dir/rg"
-            success "ripgrep binary installed to $install_dir/rg"
-            return 0
-          else
-            warn "Could not locate rg binary in extracted archive"
-          fi
+      if with_backoff 3 curl -fsSL "$url" -o "$archive_path" 2>"$err_log"; then
+        case "$type" in
+          tar)
+            tar -xzf "$archive_path" -C "$temp_dir" >/dev/null 2>&1 || true
+            ;;
+          zip)
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -q "$archive_path" -d "$temp_dir" 2>/dev/null || true
+            else
+              tar -xf "$archive_path" -C "$temp_dir" >/dev/null 2>&1 || true
+            fi
+            ;;
+        esac
+
+        local rg_binary
+        rg_binary=$(find "$temp_dir" -type f \( -name "rg" -o -name "rg.exe" \) 2>/dev/null | head -1)
+        if [ -n "$rg_binary" ] && [ -f "$rg_binary" ]; then
+          chmod +x "$rg_binary" 2>/dev/null
+          local target="$install_dir/rg"
+          [[ "$rg_binary" == *.exe ]] && target="$install_dir/rg.exe"
+          mv "$rg_binary" "$target"
+          success "ripgrep binary installed to $target"
+          export PATH="$install_dir:$PATH"
+          return 0
+        else
+          warn "Could not locate rg binary in extracted archive"
         fi
       fi
       ;;
@@ -1013,6 +1047,8 @@ download_binary_release() {
         linux-aarch64|wsl-aarch64)        asset="ast-grep-aarch64-unknown-linux-gnu.zip" ;;
         macos-x86_64) asset="ast-grep-x86_64-apple-darwin.zip" ;;
         macos-aarch64) asset="ast-grep-aarch64-apple-darwin.zip" ;;
+        windows-x86_64) asset="ast-grep-x86_64-pc-windows-msvc.zip" ;;
+        windows-aarch64) asset="ast-grep-aarch64-pc-windows-msvc.zip" ;;
         *) warn "No binary release for $platform-$arch"; return 1 ;;
       esac
 
@@ -1021,21 +1057,22 @@ download_binary_release() {
 
       if with_backoff 3 curl -fsSL "$url" -o "$zip_path" 2>"$err_log"; then
         if command -v unzip >/dev/null 2>&1; then
-          if unzip -q "$zip_path" -d "$temp_dir/ast-grep" 2>/dev/null; then
-            local sg_binary
-            sg_binary=$(find "$temp_dir/ast-grep" \( -name "ast-grep" -o -name "sg" \) -type f 2>/dev/null | head -1)
-            if [ -n "$sg_binary" ] && [ -f "$sg_binary" ]; then
-              chmod +x "$sg_binary" 2>/dev/null
-              mv "$sg_binary" "$install_dir/ast-grep"
-              success "ast-grep binary installed to $install_dir/ast-grep"
-              export PATH="$install_dir:$PATH"
-              return 0
-            else
-              warn "Could not find ast-grep binary in extracted archive"
-            fi
-          fi
+          unzip -q "$zip_path" -d "$temp_dir/ast-grep" 2>/dev/null || true
         else
-          warn "unzip not available, cannot extract ast-grep archive"
+          tar -xf "$zip_path" -C "$temp_dir/ast-grep" 2>/dev/null || true
+        fi
+        local sg_binary
+        sg_binary=$(find "$temp_dir/ast-grep" \( -name "ast-grep" -o -name "ast-grep.exe" -o -name "sg" -o -name "sg.exe" \) -type f 2>/dev/null | head -1)
+        if [ -n "$sg_binary" ] && [ -f "$sg_binary" ]; then
+          chmod +x "$sg_binary" 2>/dev/null
+          local target="$install_dir/ast-grep"
+          [[ "$sg_binary" == *.exe ]] && target="$install_dir/ast-grep.exe"
+          mv "$sg_binary" "$target"
+          success "ast-grep binary installed to $target"
+          export PATH="$install_dir:$PATH"
+          return 0
+        else
+          warn "Could not find ast-grep binary in extracted archive"
         fi
       fi
       ;;
@@ -1048,14 +1085,19 @@ download_binary_release() {
         linux-aarch64|wsl-aarch64) asset="jq-linux-arm64" ;;
         macos-x86_64) asset="jq-macos-amd64" ;;
         macos-aarch64) asset="jq-macos-arm64" ;;
+        windows-x86_64) asset="jq-win64.exe" ;;
+        windows-aarch64) asset="jq-win64.exe" ;; # jq project lacks arm64 build; use win64 as best effort
         *) warn "No binary release for $platform-$arch"; return 1 ;;
       esac
 
       local url="https://github.com/jqlang/jq/releases/download/jq-${version}/${asset}"
 
-      if with_backoff 3 curl -fsSL "$url" -o "$install_dir/jq" 2>"$err_log"; then
-        chmod +x "$install_dir/jq"
-        success "jq binary installed to $install_dir/jq"
+      local target="$install_dir/jq"
+      [[ "$asset" == *.exe ]] && target="$install_dir/jq.exe"
+
+      if with_backoff 3 curl -fsSL "$url" -o "$target" 2>"$err_log"; then
+        chmod +x "$target"
+        success "jq binary installed to $target"
         export PATH="$install_dir:$PATH"
         return 0
       fi
@@ -1937,6 +1979,9 @@ install_jq() {
       ;;
     windows)
       warn "Install jq with scoop/choco or your preferred package manager"
+      if download_binary_release "jq" "$platform"; then
+        return 0
+      fi
       return 1
       ;;
     *)
@@ -2103,13 +2148,21 @@ install_ripgrep() {
         fi
       fi
 
+      if download_binary_release "ripgrep" "$platform"; then
+        return 0
+      fi
+
       if command -v choco >/dev/null 2>&1; then
-        log "Attempting installation via chocolatey..."
-        if choco install ripgrep 2>&1 | tee "$log_file"; then
-          success "ripgrep installed via chocolatey"
-          return 0
+        if is_windows_admin; then
+          log "Attempting installation via chocolatey (non-interactive)..."
+          if choco install ripgrep -y --no-progress 2>&1 | tee "$log_file"; then
+            success "ripgrep installed via chocolatey"
+            return 0
+          else
+            warn "chocolatey installation failed"
+          fi
         else
-          warn "chocolatey installation failed"
+          warn "Chocolatey detected but shell is not elevated; skipping choco (needs admin)."
         fi
       fi
 

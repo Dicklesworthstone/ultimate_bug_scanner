@@ -1342,8 +1342,11 @@ merge_sarif_runs(){
       (if ($repo|length) > 0 then run + {versionControlProvenance:[{repositoryUri:$repo, revisionId:$rev}]}
        else run end)
       | (if ($auto|length) > 0 then . + {automationDetails:{id:$auto}} else . end);
-    {"version":"2.1.0","runs": (map(toRuns(.)) | add | map(attachMeta))}' "${sarifs[@]}"
+    {"version":"2.1.0","runs": (map(toRuns(.)) | add | map(attachMeta(.)))}' "${sarifs[@]}"
 }
+
+
+
 
 write_jsonl_summary(){
   local dest="$1"

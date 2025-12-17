@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# RUST ULTIMATE BUG SCANNER v2.0 - Industrial-Grade Rust Code Analysis
+# RUST ULTIMATE BUG SCANNER v3.0 - Industrial-Grade Rust Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for Rust using ast-grep + semantic patterns
 # + cargo-driven checks (check, clippy, fmt, audit, deny, udeps, outdated)
 # Focus: Ownership/borrowing pitfalls, error handling, async/concurrency,
 # unsafe/raw operations, performance/memory, security, code quality.
+#
+# v3.0 highlights:
+#   - Fix fatal ast-grep detection bug (avoid Unix `sg(1)` group tool collision)
+#   - Fix broken rg strict-gitignore flag usage (previously used invalid --ignore)
+#   - Harden JSON escaping & findings recording (no delimiter corruption; escapes newlines/tabs)
+#   - Fix numeric counting bug in division/modulo checks (pipeline precedence)
+#   - Stop write_ast_rules from clobbering the global EXIT trap
+#   - Implement strict-gitignore behavior even without rg (filelist + git check-ignore)
+#   - Expand ast-grep rule pack + add new categories (20–24) targeting hard-to-lint bugs
 #
 # Features:
 #   - Colorful, CI-friendly TTY output with NO_COLOR support
@@ -52,21 +61,24 @@ trap on_err ERR
 USE_COLOR=1
 if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
 
-if [[ "$USE_COLOR" -eq 1 ]]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
-  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
-  BOLD=''; DIM=''; RESET=''
-fi
+init_colors() {
+  if [[ "$USE_COLOR" -eq 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+    BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+  else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+    BOLD=''; DIM=''; RESET=''
+  fi
+}
+init_colors
 
 CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; SHIELD="🛡"; WRENCH="🛠"; ROCKET="🚀"
 
 # ────────────────────────────────────────────────────────────────────────────
 # CLI Parsing & Configuration
 # ────────────────────────────────────────────────────────────────────────────
-VERSION="2.0"
+VERSION="3.0"
 SELF_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -97,6 +109,9 @@ EMIT_FINDINGS_JSON=""
 LIST_CATEGORIES=0
 DUMP_RULES_DIR=""
 STRICT_GITIGNORE=0
+
+# New (v3.x): internal-only toggles
+AST_GREP_RUN_STYLE=0
 
 print_usage() {
   cat >&2 <<USAGE
@@ -174,6 +189,8 @@ done
 
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
+# IMPORTANT: colors were initialized before arg parsing; re-init here so --no-color works.
+init_colors
 if [[ "$USE_COLOR" -eq 0 ]]; then export NO_COLOR=1; export CARGO_TERM_COLOR=never; fi
 if [[ -n "${OUTPUT_FILE}" ]]; then mkdir -p "$(dirname -- "$OUTPUT_FILE")" 2>/dev/null || true; exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
 
@@ -206,33 +223,55 @@ HAS_OUTDATED=0
 # ────────────────────────────────────────────────────────────────────────────
 # Finding recording (for JSON/text dual-mode)
 # ────────────────────────────────────────────────────────────────────────────
-FINDINGS=()     # each: severity|count|title|desc|category|samples_json
+FIND_SEV=()
+FIND_CNT=()
+FIND_TTL=()
+FIND_DESC=()
+FIND_CAT=()
+FIND_SAMPLES=()
 add_finding() {
-  local severity="$1" count="$2" title="$3" desc="${4:-}" category="${5:-}"
-  local samples="${6:-[]}"
-  FINDINGS+=("${severity}|${count}|${title}|${desc}|${category}|${samples}")
+  local severity="$1" count="$2" title="$3" desc="${4:-}" category="${5:-}" samples="${6:-[]}"
+  FIND_SEV+=("$severity")
+  FIND_CNT+=("$count")
+  FIND_TTL+=("$title")
+  FIND_DESC+=("$desc")
+  FIND_CAT+=("$category")
+  FIND_SAMPLES+=("$samples")
 }
-json_escape() { sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+json_escape() {
+  local s=""
+  if [[ $# -gt 0 ]]; then s="$1"; else s="$(cat 2>/dev/null || true)"; fi
+  s="${s//\\/\\\\}"
+  s="${s//"/\\"}"
+  s="${s//$'	'/\\t}"
+  s="${s//$''/\\r}"
+  s="${s//$'
+'/\\n}"
+  printf '%s' "$s"
+}
 emit_findings_json() {
   local out="$1"
   {
     echo '{'
-    printf '  "meta": {"version":"%s","project_dir":"%s","timestamp":"%s"},\n' "$VERSION" "$(printf '%s' "$PROJECT_DIR" | json_escape)" "$(now)"
+    printf '  "meta": {"version":"%s","project_dir":"%s","timestamp":"%s"},
+' \
+      "$(json_escape "$VERSION")" "$(json_escape "$PROJECT_DIR")" "$(json_escape "$(now)")"
     echo '  "summary": {'
-    printf '    "files": %s, "critical": %s, "warning": %s, "info": %s\n' "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT"
+    printf '    "files": %s, "critical": %s, "warning": %s, "info": %s
+' "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT"
     echo '  },'
     echo '  "findings": ['
-    local first=1
-    for f in "${FINDINGS[@]}"; do
-      IFS='|' read -r sev cnt ttl dsc cat sampl <<<"$f"
+    local first=1 i n
+    n=${#FIND_SEV[@]}
+    for ((i=0;i<n;i++)); do
       [[ $first -eq 0 ]] && echo ','
       first=0
       printf '    {"severity":"%s","count":%s,"category":"%s","title":"%s","description":"%s","samples":%s}' \
-        "$(printf '%s' "$sev" | json_escape)" "$(printf '%s' "$cnt")" \
-        "$(printf '%s' "$cat" | json_escape)" \
-        "$(printf '%s' "$ttl" | json_escape)" \
-        "$(printf '%s' "$dsc" | json_escape)" \
-        "${sampl:-[]}"
+        "$(json_escape "${FIND_SEV[$i]}")" "$(printf '%s' "${FIND_CNT[$i]}" | awk 'END{print $0+0}')" \
+        "$(json_escape "${FIND_CAT[$i]}")" \
+        "$(json_escape "${FIND_TTL[$i]}")" \
+        "$(json_escape "${FIND_DESC[$i]}")" \
+        "${FIND_SAMPLES[$i]:-[]}"
     done
     echo
     echo '  ]'
@@ -346,6 +385,11 @@ CATEGORY_NAME[16]="Domain-Specific Heuristics"
 CATEGORY_NAME[17]="AST-Grep Rule Pack Findings"
 CATEGORY_NAME[18]="Meta Statistics & Inventory"
 CATEGORY_NAME[19]="Resource Lifecycle Correlation"
+CATEGORY_NAME[20]="Async Locking Across Await"
+CATEGORY_NAME[21]="Panic Surfaces & Unwinding"
+CATEGORY_NAME[22]="Suspicious Casts & Truncation"
+CATEGORY_NAME[23]="Parsing & Validation Robustness"
+CATEGORY_NAME[24]="Perf/DoS Hotspots"
 
 # Taint analysis metadata (kept for future wiring)
 TAINT_RULE_IDS=(rust.taint.xss rust.taint.sql rust.taint.command)
@@ -421,25 +465,104 @@ if command -v rg >/dev/null 2>&1; then
   HAS_RG=1
   if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
   RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
-  RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden "${RG_JOBS[@]}")
-  if [[ "$STRICT_GITIGNORE" -eq 1 ]]; then RG_BASE+=(--ignore); else RG_BASE+=(--no-ignore); fi
+  RG_BASE=("--no-config" "--no-messages" "--line-number" "--with-filename" "--hidden" "${RG_JOBS[@]}")
+  if [[ "$STRICT_GITIGNORE" -eq 0 ]]; then RG_BASE+=( "--no-ignore" "--no-ignore-vcs" "--no-ignore-parent" ); fi
   RG_EXCLUDES=()
-  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
+  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( "-g!$d/**" ); done
   RG_INCLUDES=()
-  for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
+  for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( "-g*.$(echo "$e" | xargs)" ); done
   GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
   GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
   GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
 else
-  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
-  GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
-  GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
-  GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
-  if [[ "$STRICT_GITIGNORE" -eq 1 && -f "$PROJECT_DIR/.gitignore" ]]; then
-    if command -v git >/dev/null 2>&1; then
-      export UBS_GIT_CHECK_IGNORE=1
+  # Portable grep fallback + strict-gitignore support (even without rg).
+  UBS_GREP_FILELIST0=""
+  UBS_GREP_READY=0
+  build_grep_filelist() {
+    [[ "$UBS_GREP_READY" -eq 1 ]] && return 0
+    UBS_GREP_FILELIST0="$(mktemp 2>/dev/null || mktemp -t ubs-grep-files.XXXXXX)"
+    TMP_FILES+=("$UBS_GREP_FILELIST0")
+    : >"$UBS_GREP_FILELIST0"
+    local -a ex_prune=()
+    for d in "${EXCLUDE_DIRS[@]}"; do ex_prune+=( -name "$d" -o ); done
+    ex_prune=( \( -type d \( "${ex_prune[@]}" -false \) -prune \) )
+    local -a name_expr=( \( )
+    local first=1
+    for e in "${_EXT_ARR[@]}"; do
+      e="$(echo "$e" | xargs)"
+      if [[ $first -eq 1 ]]; then name_expr+=( -name "*.${e}" ); first=0
+      else name_expr+=( -o -name "*.${e}" ); fi
+    done
+    name_expr+=( \) )
+
+    local -a cand_abs=() cand_rel=()
+    while IFS= read -r -d '' f; do
+      cand_abs+=("$f")
+      local rel="$f"
+      if [[ "$PROJECT_DIR" == "." ]]; then rel="${f#./}"
+      else rel="${f#"$PROJECT_DIR"/}"; fi
+      cand_rel+=("$rel")
+    done < <(find "$PROJECT_DIR" "${ex_prune[@]}" -o \( -type f "${name_expr[@]}" -print0 \) 2>/dev/null || true)
+
+    if [[ "$STRICT_GITIGNORE" -eq 1 && "$(command -v git >/dev/null 2>&1; echo $?)" -eq 0 ]]; then
+      if git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        local tmp_rel tmp_ign
+        tmp_rel="$(mktemp 2>/dev/null || mktemp -t ubs-git-rel.XXXXXX)"; TMP_FILES+=("$tmp_rel")
+        tmp_ign="$(mktemp 2>/dev/null || mktemp -t ubs-git-ign.XXXXXX)"; TMP_FILES+=("$tmp_ign")
+        : >"$tmp_rel"; : >"$tmp_ign"
+        local r
+        for r in "${cand_rel[@]}"; do printf '%s\0' "$r" >>"$tmp_rel"; done
+        git -C "$PROJECT_DIR" check-ignore -z --stdin <"$tmp_rel" >"$tmp_ign" 2>/dev/null || true
+        declare -A _IGN=()
+        if [[ -s "$tmp_ign" ]]; then
+          while IFS= read -r -d '' p; do _IGN["$p"]=1; done <"$tmp_ign" || true
+        fi
+        local i
+        for i in "${!cand_abs[@]}"; do
+          local relp="${cand_rel[$i]}"
+          if [[ -z "${_IGN[$relp]:-}" ]]; then printf '%s\0' "${cand_abs[$i]}" >>"$UBS_GREP_FILELIST0"; fi
+        done
+        unset _IGN
+      else
+        printf '%s\0' "${cand_abs[@]}" >>"$UBS_GREP_FILELIST0"
+      fi
+    else
+      printf '%s\0' "${cand_abs[@]}" >>"$UBS_GREP_FILELIST0"
     fi
-  fi
+    UBS_GREP_READY=1
+  }
+
+  ubs_grep() {
+    build_grep_filelist || true
+    local -a args=($@)
+    [[ ${#args[@]} -gt 0 ]] || return 0
+    local target="${args[$((${#args[@]}-1))]}"
+    local -a cmd=(grep -H --binary-files=without-match)
+    local got_pat=0
+    local i=0
+    while [[ $i -lt $((${#args[@]}-1)) ]]; do
+      case "${args[$i]}" in
+        -n|-i|-w|-E|-F) cmd+=("${args[$i]}");;
+        -e) cmd+=(-e "${args[$((i+1))]}"); got_pat=1; i=$((i+1));;
+        --exclude-dir=*|--include=*|--binary-files=*|-R) :;; # Ignore rg-specific flags
+        *)
+          if [[ $got_pat -eq 0 && "${args[$i]}" != -* ]]; then cmd+=(-e "${args[$i]}"); got_pat=1; fi
+          ;;
+      esac
+      i=$((i+1))
+    done
+    [[ $got_pat -eq 1 ]] || return 0
+    if [[ -f "$target" ]]; then
+      "${cmd[@]}" "$target" 2>/dev/null || true
+      return 0
+    fi
+    [[ -s "$UBS_GREP_FILELIST0" ]] || return 0
+    # shellcheck disable=SC2094
+    xargs -0 "${cmd[@]}" <"$UBS_GREP_FILELIST0" 2>/dev/null || true
+  }
+  GREP_RN=(ubs_grep -n -E)
+  GREP_RNI=(ubs_grep -n -i -E)
+  GREP_RNW=(ubs_grep -n -w -E)
 fi
 
 count_lines() { awk 'END{print (NR+0)}'; }
@@ -543,7 +666,7 @@ run_resource_lifecycle_checks() {
         local summary="${RESOURCE_LIFECYCLE_SUMMARY[$rid]:-Resource imbalance}"
         local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
         local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
-        local title="$summary [$relpath]"
+        local title="$summary [37m[[0m$relpath[37m][0m"
         local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
         print_finding "$severity" "$delta" "$title" "$desc"
         add_finding "$severity" "$delta" "$title" "$desc" "Resource Lifecycle" "$(collect_samples_rg "$acquire_regex" 3)"
@@ -569,11 +692,11 @@ run_async_error_checks() {
     [[ -z "$file" ]] && continue
     local missing=""
     if [[ $have_python3 -eq 1 ]]; then
-      missing=$(python3 <<'PY2' "$file"
+      missing=$(python3 - "$file" <<'PY2'
 import sys, re
 from pathlib import Path
 path = Path(sys.argv[1])
-text = path.read_text()
+text = path.read_text(encoding="utf-8", errors="replace")
 names = re.findall(r'\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*tokio::spawn', text)
 missing = []
 for name in names:
@@ -613,8 +736,7 @@ show_ast_examples() {
     while IFS=: read -r file line col rest; do
       local code=""
       if [[ -f "$file" && -n "$line" ]]; then code="$(sed -n "${line}p" "$file" | sed $'s/\t/  /g')"; fi
-      print_code_sample "$file" "$line" "${code:-$rest}"
-      printed=$((printed+1)); [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+      print_code_sample "$file" "$line" "${code:-$rest}"; printed=$((printed+1)); [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
     done < <( ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" -n "$PROJECT_DIR" 2>/dev/null || true ) | head -n "$limit" )
   fi
 }
@@ -626,8 +748,25 @@ end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCA
 # Tool detection
 # ────────────────────────────────────────────────────────────────────────────
 check_ast_grep() {
-  if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
-  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
+  HAS_AST_GREP=0
+  AST_GREP_CMD=()
+  AST_GREP_RUN_STYLE=0
+  if command -v ast-grep >/dev/null 2>&1; then
+    AST_GREP_CMD=(ast-grep)
+    HAS_AST_GREP=1
+  elif command -v sg >/dev/null 2>&1; then
+    # Avoid Unix sg(1) "switch group" tool collision.
+    if sg --help 2>&1 | grep -q 'Usage: sg group'; then
+      HAS_AST_GREP=0
+    else
+      AST_GREP_CMD=(sg)
+      HAS_AST_GREP=1
+    fi
+  fi
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    if "${AST_GREP_CMD[@]}" run --help >/dev/null 2>&1; then AST_GREP_RUN_STYLE=1; fi
+    return 0
+  fi
   say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be limited.${RESET}"
   say "${DIM}Tip: cargo install ast-grep  or  npm i -g @ast-grep/cli${RESET}"
   HAS_AST_GREP=0; return 1
@@ -654,6 +793,11 @@ list_categories() {
 17 AST-Grep Rule Pack Findings
 18 Meta Statistics & Inventory
 19 Resource Lifecycle Correlation
+20 Async Locking Across Await
+21 Panic Surfaces & Unwinding
+22 Suspicious Casts & Truncation
+23 Parsing & Validation Robustness
+24 Perf/DoS Hotspots
 CATS
 }
 
@@ -663,7 +807,11 @@ CATS
 ast_search() {
   local pattern=$1
   if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-    ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+    if [[ "$AST_GREP_RUN_STYLE" -eq 1 ]]; then
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" run --pattern "$pattern" -l rust "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+    else
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+    fi
   else
     echo 0
   fi
@@ -671,7 +819,7 @@ ast_search() {
 
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
-  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
+  # Do NOT clobber the global EXIT trap; cleanup() handles AST_RULE_DIR.
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ag_rules.XXXXXX)"
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
@@ -955,7 +1103,7 @@ severity: info
 message: "Blocking std::fs in async fn; prefer tokio::fs equivalents"
 YAML
 
-  cat >"$AST_RULE_DIR/block_on-in-async.yml" <<'YAML'
+  cat >"$AST_RULE_DIR/block-on-in-async.yml" <<'YAML'
 id: rust.block-on-in-async
 language: rust
 rule:
@@ -1072,7 +1220,7 @@ rule:
   pattern: format!($S)
   constraints:
     S:
-      regex: '^".*"|^r#".*"#$'
+      regex: '^\".*\"$|^r#\".*\"#$'
 severity: info
 message: "format!(\"literal\") allocates; prefer .to_string() for plain literals"
 YAML
@@ -1147,7 +1295,7 @@ language: rust
 rule:
   all:
     - kind: string_literal
-    - regex: "\"http://[^\"]+\""
+    - regex: '"http://[^"]+"'
 severity: info
 message: "Plain HTTP URL found; ensure HTTPS for production"
 YAML
@@ -1187,6 +1335,205 @@ rule:
   pattern: // FIXME $REST
 severity: info
 message: "FIXME marker present"
+YAML
+
+  # -------------------------------------------------------------------------
+  # v3.x additions: async locking across await + panic surfaces + casts + parsing + perf
+  # -------------------------------------------------------------------------
+  cat >"$AST_RULE_DIR/assert-macros.yml" <<'YAML'
+id: rust.assert-macros
+language: rust
+rule:
+  any:
+    - pattern: assert!($$)
+    - pattern: assert_eq!($$)
+    - pattern: assert_ne!($$)
+    - pattern: assert!(false)
+severity: warning
+message: "assert!/assert_eq!/assert_ne! can panic; verify intent in production paths"
+YAML
+
+  cat >"$AST_RULE_DIR/debug-assert-macros.yml" <<'YAML'
+id: rust.debug-assert-macros
+language: rust
+rule:
+  any:
+    - pattern: debug_assert!($$)
+    - pattern: debug_assert_eq!($$)
+    - pattern: debug_assert_ne!($$)
+severity: info
+message: "debug_assert! present; ensure invariants are also enforced where needed"
+YAML
+
+  cat >"$AST_RULE_DIR/unreachable-unchecked.yml" <<'YAML'
+id: rust.unreachable-unchecked
+language: rust
+rule:
+  any:
+    - pattern: std::hint::unreachable_unchecked()
+    - pattern: core::hint::unreachable_unchecked()
+severity: error
+message: "unreachable_unchecked is UB if reached; ensure it is truly impossible and documented"
+YAML
+
+  cat >"$AST_RULE_DIR/unwrap-unchecked.yml" <<'YAML'
+id: rust.unwrap-unchecked
+language: rust
+rule:
+  any:
+    - pattern: $X.unwrap_unchecked()
+severity: warning
+message: "unwrap_unchecked is unsafe-by-contract; invariants must guarantee Some/Ok"
+YAML
+
+  cat >"$AST_RULE_DIR/panic-in-drop.yml" <<'YAML'
+id: rust.panic-in-drop
+language: rust
+rule:
+  pattern: panic!($$)
+  inside:
+    pattern: impl Drop for $T { $$ fn drop(&mut self) { $$ } $$ }
+severity: error
+message: "panic! in Drop can abort during unwinding; avoid panicking destructors"
+YAML
+
+  cat >"$AST_RULE_DIR/unwrap-in-drop.yml" <<'YAML'
+id: rust.unwrap-in-drop
+language: rust
+rule:
+  any:
+    - pattern: $X.unwrap()
+    - pattern: $X.expect($MSG)
+  inside:
+    pattern: impl Drop for $T { $$ fn drop(&mut self) { $$ } $$ }
+severity: warning
+message: "unwrap/expect in Drop can cause abort-on-panic during unwinding; handle errors safely"
+YAML
+
+  cat >"$AST_RULE_DIR/std-lock-in-async.yml" <<'YAML'
+id: rust.async.std-lock-in-async
+language: rust
+rule:
+  any:
+    - pattern: $M.lock()
+    - pattern: $M.read()
+    - pattern: $M.write()
+  inside:
+    pattern: async fn $N($$) { $$ }
+severity: warning
+message: "std::sync lock used in async fn; can block executor threads"
+YAML
+
+  cat >"$AST_RULE_DIR/std-guard-across-await.yml" <<'YAML'
+id: rust.async.std-guard-across-await
+language: rust
+rule:
+  any:
+    - pattern: async fn $N($$) { $$ let $G = $M.lock().unwrap(); $$ $X.await $$ }
+    - pattern: async fn $N($$) { $$ let $G = $M.lock().expect($MSG); $$ $X.await $$ }
+    - pattern: async fn $N($$) { $$ let $G = $M.read().unwrap(); $$ $X.await $$ }
+    - pattern: async fn $N($$) { $$ let $G = $M.write().unwrap(); $$ $X.await $$ }
+severity: warning
+message: "Potential lock guard held across await (std::sync); consider dropping guard before awaiting"
+YAML
+
+  cat >"$AST_RULE_DIR/tokio-guard-across-await.yml" <<'YAML'
+id: rust.async.tokio-guard-across-await
+language: rust
+rule:
+  any:
+    - pattern: async fn $N($$) { $$ let $G = $M.lock().await; $$ $X.await $$ }
+    - pattern: async fn $N($$) { $$ let $G = $M.read().await; $$ $X.await $$ }
+    - pattern: async fn $N($$) { $$ let $G = $M.write().await; $$ $X.await $$ }
+severity: warning
+message: "Potential async lock guard held across await; consider reducing critical section or explicit drop()"
+YAML
+
+  cat >"$AST_RULE_DIR/casts-as.yml" <<'YAML'
+id: rust.suspicious-as-cast
+language: rust
+rule:
+  any:
+    - pattern: $X as u8
+    - pattern: $X as u16
+    - pattern: $X as u32
+    - pattern: $X as u64
+    - pattern: $X as usize
+    - pattern: $X as i8
+    - pattern: $X as i16
+    - pattern: $X as i32
+    - pattern: $X as i64
+    - pattern: $X as isize
+    - pattern: $X as f32
+    - pattern: $X as f64
+severity: info
+message: "`as` cast can truncate or change sign; prefer TryFrom/TryInto when correctness matters"
+YAML
+
+  cat >"$AST_RULE_DIR/try-into-unwrap.yml" <<'YAML'
+id: rust.try-into-unwrap
+language: rust
+rule:
+  any:
+    - pattern: $X.try_into().unwrap()
+    - pattern: $X.try_into().expect($MSG)
+severity: warning
+message: "try_into().unwrap()/expect() will panic on conversion failure; handle Result or propagate"
+YAML
+
+  cat >"$AST_RULE_DIR/parse-unwrap.yml" <<'YAML'
+id: rust.parse-unwrap
+language: rust
+rule:
+  any:
+    - pattern: $S.parse::<$T>().unwrap()
+    - pattern: $S.parse::<$T>().expect($MSG)
+severity: warning
+message: "parse::<T>().unwrap()/expect() can panic on invalid input; validate/propagate errors"
+YAML
+
+  cat >"$AST_RULE_DIR/serde-json-unwrap.yml" <<'YAML'
+id: rust.serde-json-unwrap
+language: rust
+rule:
+  any:
+    - pattern: serde_json::from_str($S).unwrap()
+    - pattern: serde_json::from_str($S).expect($MSG)
+severity: warning
+message: "serde_json::from_str(...).unwrap()/expect() can panic; add context and validation"
+YAML
+
+  cat >"$AST_RULE_DIR/env-var-unwrap.yml" <<'YAML'
+id: rust.env-var-unwrap
+language: rust
+rule:
+  any:
+    - pattern: std::env::var($K).unwrap()
+    - pattern: std::env::var($K).expect($MSG)
+severity: warning
+message: "env::var(...).unwrap()/expect() panics if missing; handle missing/invalid env vars robustly"
+YAML
+
+  cat >"$AST_RULE_DIR/regex-new-in-loop.yml" <<'YAML'
+id: rust.regex-new-in-loop
+language: rust
+rule:
+  any:
+    - pattern: for $P in $I { $$ regex::Regex::new($re) $$ }
+    - pattern: while $C { $$ regex::Regex::new($re) $$ }
+severity: warning
+message: "Regex::new compiled inside loop; precompile once (lazy_static/once_cell) to avoid perf/DoS risk"
+YAML
+
+  cat >"$AST_RULE_DIR/chars-nth.yml" <<'YAML'
+id: rust.chars-nth
+language: rust
+rule:
+  any:
+    - pattern: $S.chars().nth($N)
+    - pattern: $S.chars().nth($N).unwrap()
+severity: info
+message: "chars().nth(n) is O(n); repeated use can be a perf hotspot"
 YAML
 
   # Copy rules for external usage if requested
@@ -1229,7 +1576,7 @@ check_cargo() {
 run_cargo_subcmd() {
   shift  # skip name
   local logfile="$1"; shift
-  local -a args=("$@")
+  local -a args=($@)
   local ec=0
   if [[ "$RUN_CARGO" -eq 0 || "$HAS_CARGO" -eq 0 ]]; then
     echo "" >"$logfile"; echo 0 >"$logfile.ec"; return 0
@@ -1264,7 +1611,7 @@ cat <<'BANNER'
 ║  ██████╔╝██║   ██║██║  ███╗                 -/   "   \-           ║ 
 ║  ██╔══██╗██║   ██║██║   ██║                /-|       |-\          ║ 
 ║  ██████╔╝╚██████╔╝╚██████╔╝               / /-\     /-\ \         ║ 
-║  ╚═════╝  ╚═════╝  ╚═════╝                 / /-`---'-\ \          ║ 
+║  ╚═════╝  ╚═════╝  ╚═════╝                 / /-`---'-\\ \          ║ 
 ║                                             /         \           ║ 
 ║                                                                   ║ 
 ║  ███████╗  ██████╗   █████╗ ███╗   ██╗███╗   ██╗███████╗██████╗   ║ 
@@ -1392,12 +1739,12 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 2; then
 print_header "2. UNSAFE & MEMORY OPERATIONS"
-print_category "Detects: unsafe blocks, transmute/uninitialized/forget/zeroed, raw ffi hazards" \
+print_category "Detects: unsafe blocks, transmute/uninitialized/zeroed/forget, raw ffi hazards" \
   "These patterns may introduce UB, memory leaks, or hard-to-debug crashes"
 
 print_subheader "unsafe { ... } blocks"
-unsafe_count=$(( $(ast_search 'unsafe { $$ }' || echo 0) + $("${GREP_RN[@]}" -e "unsafe[[:space:]]*\{" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$unsafe_count" -gt 0 ]; then print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"; add_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "unsafe[[:space:]]*\{" 3)"; else print_finding "good" "No unsafe blocks detected"; fi
+unsafe_count=$(( $(ast_search 'unsafe { $$ }' || echo 0) + $("${GREP_RN[@]}" -e "unsafe[[:space:]]*{{" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$unsafe_count" -gt 0 ]; then print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"; add_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "unsafe[[:space:]]*{{" 3)"; else print_finding "good" "No unsafe blocks detected"; fi
 
 print_subheader "transmute, uninitialized, zeroed, forget"
 transmute_count=$(( $(ast_search 'std::mem::transmute($$)' || echo 0) + $("${GREP_RN[@]}" -e "transmute\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
@@ -1411,7 +1758,7 @@ if [ "$forget_count" -gt 0 ]; then print_finding "warning" "$forget_count" "mem:
 
 print_subheader "CStr::from_bytes_with_nul_unchecked"
 cstr_count=$(( $(ast_search 'std::ffi::CStr::from_bytes_with_nul_unchecked($$)' || echo 0) + $("${GREP_RN[@]}" -e "from_bytes_with_nul_unchecked\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$cstr_count" -gt 0 ]; then print_finding "warning" "$cstr_count" "CStr unchecked conversion used"; add_finding "warning" "$cstr_count" "CStr unchecked conversion used" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "from_bytes_with_nul_unchecked\(" 2)"; fi
+if [ "$cstr_count" -gt 0 ]; then print_finding "warning" "$cstr_count" "CStr unchecked conversion used"; add_finding "warning" "$cstr_count" "CStr unchecked conversion used" "" "${CATEGORY_NAME[2]}"; fi
 
 print_subheader "get_unchecked / from_utf8_unchecked / from_raw_parts"
 guc_count=$(( $(ast_search '$S.get_unchecked($I)' || echo 0) + $(ast_search '$S.get_unchecked_mut($I)' || echo 0) ))
@@ -1449,12 +1796,12 @@ mu_total=$((mu_unwrap + mu_expect))
 if [ "$mu_total" -gt 0 ]; then print_finding "warning" "$mu_total" "Poisoned lock handling via unwrap/expect"; show_detailed_finding "\.lock\(\)\.(unwrap|expect)\(" 5; add_finding "warning" "$mu_total" "Poisoned lock handling via unwrap/expect" "" "${CATEGORY_NAME[3]}" "$(collect_samples_rg "\.lock\(\)\.(unwrap|expect)\(" 5)"; fi
 
 print_subheader "await inside loops (sequentialism)"
-await_loop=$(( $(ast_search 'for $P in $I { $$ $F.await $$ }' || echo 0) + $("${GREP_RN[@]}" -e "for[^(]*\{[^\}]*\.[[:alnum:]_]+\.await" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+await_loop=$(( $(ast_search 'for $P in $I { $$ $F.await $$ }' || echo 0) + $("${GREP_RN[@]}" -e "for[^(]*\{[^}]*\.[[:alnum:]_]+\.await" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$await_loop" -gt 0 ]; then print_finding "info" "$await_loop" "await inside loop; consider batched concurrency"; add_finding "info" "$await_loop" "await inside loop; consider batched concurrency" "" "${CATEGORY_NAME[3]}"; fi
 
 print_subheader "Blocking ops inside async (thread::sleep, std::fs)"
 sleep_async=$(( $(ast_search 'std::thread::sleep($$)' || echo 0) + $("${GREP_RN[@]}" -e "thread::sleep\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-fs_async=$(( $(ast_search 'std::fs::read($$)' || echo 0) + $("${GREP_RN[@]}" -e "std::fs::(read|read_to_string|write|rename|copy|remove_file)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+fs_async=$(( $(ast_search 'std::fs::read($$)' || echo 0) + $("${GREP_RN[@]}" -e "std::fs::(read|read_to_string|write|rename|copy|remove_file)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$sleep_async" -gt 0 ]; then print_finding "warning" "$sleep_async" "thread::sleep in async"; add_finding "warning" "$sleep_async" "thread::sleep in async" "" "${CATEGORY_NAME[3]}"; fi
 if [ "$fs_async" -gt 0 ]; then print_finding "info" "$fs_async" "Blocking std::fs in async code"; add_finding "info" "$fs_async" "Blocking std::fs in async code" "" "${CATEGORY_NAME[3]}"; fi
 
@@ -1490,8 +1837,9 @@ fp_eq=$("${GREP_RN[@]}" -e "([[:alnum:]_]\s*(==|!=)\s*[[:alnum:]_]*\.[[:alnum:]_
 if [ "$fp_eq" -gt 0 ]; then print_finding "info" "$fp_eq" "Float equality/inequality check" "Consider epsilon comparisons"; show_detailed_finding "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" 3; add_finding "info" "$fp_eq" "Float equality/inequality check" "Consider epsilon comparisons" "${CATEGORY_NAME[4]}" "$(collect_samples_rg "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" 3)"; else print_finding "good" "No direct float equality checks detected"; fi
 
 print_subheader "Division/modulo by variable (verify non-zero)"
-div_var=$("${GREP_RN[@]}" -e "/[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "https?://|//|/\*" || true | count_lines)
-mod_var=$("${GREP_RN[@]}" -e "%[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "//|/\*" || true | count_lines)
+div_var=$("${GREP_RN[@]}" -e "/[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "https?://|//|/\*" | count_lines || true)
+mod_var=$("${GREP_RN[@]}" -e "%[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "//|/\*" | count_lines || true)
+div_var=$(printf '%s\n' "${div_var:-0}" | awk 'END{print $0+0}'); mod_var=$(printf '%s\n' "${mod_var:-0}" | awk 'END{print $0+0}')
 if [ "$div_var" -gt 0 ]; then print_finding "info" "$div_var" "Division by variables - guard zero divisors"; add_finding "info" "$div_var" "Division by variables - guard zero divisors" "" "${CATEGORY_NAME[4]}"; fi
 if [ "$mod_var" -gt 0 ]; then print_finding "info" "$mod_var" "Modulo by variables - guard zero divisors"; add_finding "info" "$mod_var" "Modulo by variables - guard zero divisors" "" "${CATEGORY_NAME[4]}"; fi
 fi
@@ -1528,7 +1876,7 @@ print_category "Detects: needless allocations, format!(literal), to_owned().to_s
   "Unnecessary allocations and conversions reduce performance"
 
 print_subheader "to_owned().to_string() chain"
-to_owned_to_string=$(( $(ast_search '$X.to_owned().to_string()' || echo 0) + $("${GREP_RN[@]}" -e "\.to_owned\(\)\.to_string\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+to_owned_to_string=$(( $(ast_search '$X.to_owned().to_string()' || echo 0) + $("${GREP_RN[@]}" -e "\.to_owned\(\)\\.to_string\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$to_owned_to_string" -gt 0 ]; then print_finding "info" "$to_owned_to_string" "to_owned().to_string() chain - simplify"; add_finding "info" "$to_owned_to_string" "to_owned().to_string() chain - simplify" "" "${CATEGORY_NAME[6]}"; fi
 
 print_subheader "format!(\"literal\") with no placeholders"
@@ -1564,14 +1912,14 @@ print_category "Detects: TLS verification disabled, weak hash algos, HTTP URLs, 
   "Security misconfigurations can lead to credential leaks and MITM attacks"
 
 print_subheader "Weak hash algorithms (MD5/SHA1)"
-weak_hash=$(( $(ast_search 'md5::$F($$)' || echo 0) + $(ast_search 'sha1::$F($$)' || echo 0) + $("${GREP_RN[@]}" -e "SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+weak_hash=$(( $(ast_search 'md5::$F($$)' || echo 0) + $(ast_search 'sha1::$F($$)' || echo 0) + $("${GREP_RN[@]}" -e "SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$weak_hash" -gt 0 ]; then print_finding "warning" "$weak_hash" "Weak hash algorithm usage (MD5/SHA1)"; show_detailed_finding "md5::|sha1::|SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)" 5; add_finding "warning" "$weak_hash" "Weak hash algorithm usage (MD5/SHA1)" "" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "md5::|sha1::|SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)" 5)"; else print_finding "good" "No MD5/SHA1 found"; fi
 
 print_subheader "TLS verification disabled"
 tls_insecure=$(( $(ast_search 'reqwest::ClientBuilder::new().danger_accept_invalid_certs(true)' || echo 0) \
   + $("${GREP_RN[@]}" -e "danger_accept_invalid_certs\(\s*true\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) \
   + $("${GREP_RN[@]}" -e "SslVerifyMode::NONE" "$PROJECT_DIR" 2>/dev/null | count_lines || true) \
-  + $("${GREP_RN[@]}" -e "TlsConnector::builder\(\)\.danger_accept_invalid_certs\(true\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+  + $("${GREP_RN[@]}" -e "TlsConnector::builder\(\)\\.danger_accept_invalid_certs\(true\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$tls_insecure" -gt 0 ]; then print_finding "critical" "$tls_insecure" "TLS verification disabled"; add_finding "critical" "$tls_insecure" "TLS verification disabled" "" "${CATEGORY_NAME[8]}"; fi
 
 print_subheader "Plain http:// URLs"
@@ -1617,7 +1965,7 @@ print_category "Detects: pub use wildcards, glob imports, re-exports" \
 
 print_subheader "Wildcard imports (use crate::* or ::*)"
 glob_imports=$("${GREP_RN[@]}" -e "use\s+[a-zA-Z0-9_:]+::\*\s*;" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$glob_imports" -gt 0 ]; then print_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names"; show_detailed_finding "use\s+[a-zA-Z0-9_:]+::\*\s*;" 3; add_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names" "" "${CATEGORY_NAME[10]}" "$(collect_samples_rg "use\s+[a-zA-Z0-9_:]+::\*\s*;" 3)"; else print_finding "good" "No wildcard imports detected"; fi
+if [ "$glob_imports" -gt 0 ]; then print_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names"; show_detailed_finding "use\s+[a-zA-Z0-9_:]+::\*\s*;"; add_finding "info" "$glob_imports" "Wildcard imports found; prefer explicit names" "" "${CATEGORY_NAME[10]}" "$(collect_samples_rg "use\s+[a-zA-Z0-9_:]+::\*\s*;")"; else print_finding "good" "No wildcard imports detected"; fi
 
 print_subheader "pub use re-exports (inventory)"
 pub_use=$("${GREP_RN[@]}" -e "pub\s+use\s+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
@@ -1792,7 +2140,7 @@ print_category "Detects: reqwest builder, SQL string concatenation (heuristic), 
   "Domain patterns that often hint at bugs"
 
 print_subheader "reqwest::ClientBuilder inventory"
-reqwest_builder=$("${GREP_RN[@]}" -e "reqwest::ClientBuilder::new\(\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+reqwest_builder=$("${GREP_RN[@]}" -e "reqwest::ClientBuilder::new\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$reqwest_builder" -gt 0 ]; then print_finding "info" "$reqwest_builder" "reqwest ClientBuilder usage - review TLS, timeouts, redirects"; add_finding "info" "$reqwest_builder" "reqwest ClientBuilder usage - review TLS, timeouts, redirects" "" "${CATEGORY_NAME[16]}"; fi
 
 print_subheader "serde_json::from_str without error context (heuristic)"
@@ -1813,7 +2161,7 @@ if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
   run_ast_rules || true
   say "${DIM}${INFO} Above JSON/SARIF lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
   if [[ "$FORMAT" == "sarif" ]]; then
-    say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
+    say "${DIM}Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
   fi
 else
   say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
@@ -1833,7 +2181,7 @@ cargo_toml="$PROJECT_DIR/Cargo.toml"
 if [[ -f "$cargo_toml" ]]; then
   feature_count=$(grep -c "^\[features\]" "$cargo_toml" 2>/dev/null || true)
   bin_count=$(grep -E -c "^\s*\[\[bin\]\]" "$cargo_toml" 2>/dev/null || true)
-  workspace=$(grep -c "^\[workspace\]" "$cargo_toml" 2>/dev/null || echo 0)
+  workspace=$(grep -c "^\ \[workspace\]" "$cargo_toml" 2>/dev/null || echo 0)
   say "  ${BLUE}${INFO} Info${RESET} ${WHITE}(features sections:${RESET} ${CYAN}${feature_count}${RESET}${WHITE}, bins:${RESET} ${CYAN}${bin_count}${RESET}${WHITE}, workspace:${RESET} ${CYAN}${workspace}${RESET}${WHITE})${RESET}"
 else
   print_finding "info" 1 "No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)"
@@ -1851,6 +2199,165 @@ print_category "Detects: std::thread::spawn without join, tokio::spawn without a
 run_resource_lifecycle_checks
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 20: ASYNC LOCKING ACROSS AWAIT
+# ═══════════════════════════════════════════════════════════════════════════
+if category_enabled 20; then
+print_header "20. ASYNC LOCKING ACROSS AWAIT"
+print_category "Detects: locks acquired in async fns and potentially held across await" \
+  "Holding locks across await can deadlock, starve tasks, and cause latency spikes; std::sync locks can block executor threads"
+
+print_subheader "std::sync lock usage inside async fn (blocking risk)"
+std_lock_async=$(( $(ast_search 'async fn $N($$) { $$ $M.lock() $$ }' || echo 0) + $(ast_search 'async fn $N($$) { $$ $M.read() $$ }' || echo 0) + $(ast_search 'async fn $N($$) { $$ $M.write() $$ }' || echo 0) + $("${GREP_RN[@]}" -e "async\s+fn[^{]*\{[^}]*\.(lock|read|write)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$std_lock_async" -gt 0 ]; then
+  print_finding "warning" "$std_lock_async" "Blocking std::sync locks in async functions" "Prefer tokio::sync locks or spawn_blocking; avoid blocking executor threads"
+  add_finding "warning" "$std_lock_async" "Blocking std::sync locks in async functions" "Prefer tokio::sync locks or spawn_blocking; avoid blocking executor threads" "${CATEGORY_NAME[20]}" "$(collect_samples_rg "async\s+fn[^{]*\{[^}]*\.(lock|read|write)\(" 3)"
+else
+  print_finding "good" "No obvious std::sync lock usage inside async fns"
+fi
+
+print_subheader "Potential std::sync guard held across await (heuristic)"
+std_guard_await=$(( $(ast_search 'async fn $N($$) { $$ let $G = $M.lock().unwrap(); $$ $X.await $$ }' || echo 0) + $(ast_search 'async fn $N($$) { $$ let $G = $M.lock().expect($MSG); $$ $X.await $$ }' || echo 0) ))
+if [ "$std_guard_await" -gt 0 ]; then
+  print_finding "warning" "$std_guard_await" "Potential lock guard across await (std::sync)" "Drop the guard before awaiting (scoped blocks or drop(guard))"
+  add_finding "warning" "$std_guard_await" "Potential lock guard across await (std::sync)" "Drop the guard before awaiting (scoped blocks or drop(guard))" "${CATEGORY_NAME[20]}"
+fi
+
+print_subheader "Potential async lock guard held across await (tokio/async locks heuristic)"
+tokio_guard_await=$(( $(ast_search 'async fn $N($$) { $$ let $G = $M.lock().await; $$ $X.await $$ }' || echo 0) + $(ast_search 'async fn $N($$) { $$ let $G = $M.read().await; $$ $X.await $$ }' || echo 0) + $(ast_search 'async fn $N($$) { $$ let $G = $M.write().await; $$ $X.await $$ }' || echo 0) + $("${GREP_RN[@]}" -e "let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^;]*\.(lock|read|write)\(\)\.await" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$tokio_guard_await" -gt 0 ]; then
+  print_finding "warning" "$tokio_guard_await" "Potential async lock guard across await" "Reduce critical section; prefer copying needed data out; explicit drop() before await"
+  add_finding "warning" "$tokio_guard_await" "Potential async lock guard across await" "Reduce critical section; prefer copying needed data out; explicit drop() before await" "${CATEGORY_NAME[20]}"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 21: PANIC SURFACES & UNWINDING
+# ═══════════════════════════════════════════════════════════════════════════
+if category_enabled 21; then
+print_header "21. PANIC SURFACES & UNWINDING"
+print_category "Detects: assert macros, unreachable_unchecked/unwrap_unchecked, panic/unwrap inside Drop" \
+  "Panics in destructors or UB hints can crash/abort in subtle ways; these can slip past linting depending on cfg/features"
+
+print_subheader "assert!/assert_eq!/assert_ne! inventory"
+asserts=$(( $(ast_search 'assert!($$)' || echo 0) + $(ast_search 'assert_eq!($$)' || echo 0) + $(ast_search 'assert_ne!($$)' || echo 0) + $("${GREP_RN[@]}" -e "assert(_eq|_ne)?!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$asserts" -gt 0 ]; then
+  print_finding "warning" "$asserts" "assert! macros present (panic surface)" "If these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input"
+  add_finding "warning" "$asserts" "assert! macros present (panic surface)" "If these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input" "${CATEGORY_NAME[21]}" "$(collect_samples_rg "assert(_eq|_ne)?!\(" 3)"
+else
+  print_finding "good" "No assert! macros detected"
+fi
+
+print_subheader "unreachable_unchecked / unwrap_unchecked"
+uu=$(( $(ast_search 'std::hint::unreachable_unchecked()' || echo 0) + $(ast_search 'core::hint::unreachable_unchecked()' || echo 0) + $(ast_search '$X.unwrap_unchecked()' || echo 0) + $("${GREP_RN[@]}" -e "unreachable_unchecked\(\)|unwrap_unchecked\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$uu" -gt 0 ]; then
+  print_finding "critical" "$uu" "Unchecked UB-adjacent APIs used" "unreachable_unchecked is UB if reached; unwrap_unchecked requires strict invariants"
+  add_finding "critical" "$uu" "Unchecked UB-adjacent APIs used" "unreachable_unchecked is UB if reached; unwrap_unchecked requires strict invariants" "${CATEGORY_NAME[21]}" "$(collect_samples_rg "unreachable_unchecked\(\)|unwrap_unchecked\(" 3)"
+fi
+
+print_subheader "panic!/unwrap/expect inside Drop"
+drop_panic=$(( $(ast_search 'panic!($$)' || echo 0) + $("${GREP_RN[@]}" -e "impl\s+Drop\s+for|fn\s+drop\(&mut\s+self\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+drop_panic_hits=$("${GREP_RN[@]}" -e "fn\s+drop\(&mut\s+self\)|impl\s+Drop\s+for" "$PROJECT_DIR" 2>/dev/null | (grep -A25 -E "panic!\(|\.(unwrap|expect)\("(" || true) | (grep -Ec "panic!\(|\.(unwrap|expect)\("(" || true))
+drop_panic_hits=$(printf '%s\n' "${drop_panic_hits:-0}" | awk 'END{print $0+0}')
+if [ "$drop_panic_hits" -gt 0 ]; then
+  print_finding "warning" "$drop_panic_hits" "Potential panics inside Drop implementations" "Panics during Drop + unwinding can abort; avoid unwrap/expect/panic in destructors"
+  add_finding "warning" "$drop_panic_hits" "Potential panics inside Drop implementations" "Panics during Drop + unwinding can abort; avoid unwrap/expect/panic in destructors" "${CATEGORY_NAME[21]}"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 22: SUSPICIOUS CASTS & TRUNCATION
+# ═══════════════════════════════════════════════════════════════════════════
+if category_enabled 22; then
+print_header "22. SUSPICIOUS CASTS & TRUNCATION"
+print_category "Detects: pervasive `as` casts, try_into().unwrap, numeric narrowing patterns" \
+  "`as` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths"
+
+print_subheader "`as` cast inventory"
+as_casts=$("${GREP_RN[@]}" -e "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+as_casts=$(printf '%s\n' "${as_casts:-0}" | awk 'END{print $0+0}')
+if [ "$as_casts" -gt 0 ]; then
+  print_finding "info" "$as_casts" "`as` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants"
+  add_finding "info" "$as_casts" "`as` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants" "${CATEGORY_NAME[22]}" "$(collect_samples_rg "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" 3)"
+else
+  print_finding "good" "No obvious `as` casts detected"
+fi
+
+print_subheader "try_into().unwrap()/expect() (panic on conversion failure)"
+try_into_unwrap=$(( $(ast_search '$X.try_into().unwrap()' || echo 0) + $(ast_search '$X.try_into().expect($MSG)' || echo 0) + $("${GREP_RN[@]}" -e "\.try_into\(\)\.(unwrap|expect)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$try_into_unwrap" -gt 0 ]; then
+  print_finding "warning" "$try_into_unwrap" "try_into().unwrap()/expect() present" "Handle conversion errors explicitly; panics can be input-dependent"
+  add_finding "warning" "$try_into_unwrap" "try_into().unwrap()/expect() present" "Handle conversion errors explicitly; panics can be input-dependent" "${CATEGORY_NAME[22]}" "$(collect_samples_rg "\.try_into\(\)\.(unwrap|expect)\(" 3)"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 23: PARSING & VALIDATION ROBUSTNESS
+# ═══════════════════════════════════════════════════════════════════════════
+if category_enabled 23; then
+print_header "23. PARSING & VALIDATION ROBUSTNESS"
+print_category "Detects: parse/from_str/env-var unwraps, decode unwraps, missing error context" \
+  "Parsing and decoding failures often happen in prod on edge inputs; unwrap/expect turns them into panics"
+
+print_subheader "parse::<T>().unwrap()/expect()"
+parse_unwrap=$(( $(ast_search '$S.parse::<$T>().unwrap()' || echo 0) + $(ast_search '$S.parse::<$T>().expect($MSG)' || echo 0) + $("${GREP_RN[@]}" -e "\.parse::<[^>]+>\(\)\.(unwrap|expect)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$parse_unwrap" -gt 0 ]; then
+  print_finding "warning" "$parse_unwrap" "parse::<T>().unwrap()/expect() present" "Validate input or propagate errors with context"
+  add_finding "warning" "$parse_unwrap" "parse::<T>().unwrap()/expect() present" "Validate input or propagate errors with context" "${CATEGORY_NAME[23]}" "$(collect_samples_rg "\.parse::<[^>]+>\(\)\.(unwrap|expect)\(" 3)"
+fi
+
+print_subheader "serde_json::from_str(...).unwrap()/expect()"
+serde_unwrap=$(( $(ast_search 'serde_json::from_str($S).unwrap()' || echo 0) + $(ast_search 'serde_json::from_str($S).expect($MSG)' || echo 0) + $("${GREP_RN[@]}" -e "serde_json::from_str\([^)]*\)\.(unwrap|expect)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$serde_unwrap" -gt 0 ]; then
+  print_finding "warning" "$serde_unwrap" "serde_json::from_str(...).unwrap()/expect()" "Add context, validation, and schema checks; avoid panics on malformed JSON"
+  add_finding "warning" "$serde_unwrap" "serde_json::from_str(...).unwrap()/expect()" "Add context, validation, and schema checks; avoid panics on malformed JSON" "${CATEGORY_NAME[23]}" "$(collect_samples_rg "serde_json::from_str\([^)]*\)\.(unwrap|expect)\(" 3)"
+fi
+
+print_subheader "std::env::var(...).unwrap()/expect()"
+env_unwrap=$(( $(ast_search 'std::env::var($K).unwrap()' || echo 0) + $(ast_search 'std::env::var($K).expect($MSG)' || echo 0) + $("${GREP_RN[@]}" -e "std::env::var\([^)]*\)\.(unwrap|expect)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$env_unwrap" -gt 0 ]; then
+  print_finding "warning" "$env_unwrap" "env::var(...).unwrap()/expect()" "Handle missing/invalid env vars with defaults or clear error propagation"
+  add_finding "warning" "$env_unwrap" "env::var(...).unwrap()/expect()" "Handle missing/invalid env vars with defaults or clear error propagation" "${CATEGORY_NAME[23]}" "$(collect_samples_rg "std::env::var\([^)]*\)\.(unwrap|expect)\(" 3)"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 24: PERF/DoS HOTSPOTS
+# ═══════════════════════════════════════════════════════════════════════════
+if category_enabled 24; then
+print_header "24. PERF/DoS HOTSPOTS"
+print_category "Detects: regex compilation in loops, chars().nth(n), format!/allocations in loops" \
+  "Some perf pitfalls become DoS risks on large inputs or hot paths; these often evade linting in non-bench builds"
+
+print_subheader "Regex::new occurrences and in-loop compilation"
+regex_new=$("${GREP_RN[@]}" -e "regex::Regex::new\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+regex_new=$(printf '%s\n' "${regex_new:-0}" | awk 'END{print $0+0}')
+regex_in_loop=$(( $(ast_search 'for $P in $I { $$ regex::Regex::new($re) $$ }' || echo 0) + $(ast_search 'while $C { $$ regex::Regex::new($re) $$ }' || echo 0) ))
+if [ "$regex_in_loop" -gt 0 ]; then
+  print_finding "warning" "$regex_in_loop" "Regex::new compiled inside loop" "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation"
+  add_finding "warning" "$regex_in_loop" "Regex::new compiled inside loop" "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation" "${CATEGORY_NAME[24]}"
+elif [ "$regex_new" -gt 0 ]; then
+  print_finding "info" "$regex_new" "Regex::new present" "Ensure regex is not compiled per request or per iteration"
+  add_finding "info" "$regex_new" "Regex::new present" "Ensure regex is not compiled per request or per iteration" "${CATEGORY_NAME[24]}" "$(collect_samples_rg "regex::Regex::new\(" 3)"
+else
+  print_finding "good" "No regex::Regex::new detected"
+fi
+
+print_subheader "chars().nth(n) (O(n))"
+chars_nth=$(( $(ast_search '$S.chars().nth($N)' || echo 0) + $("${GREP_RN[@]}" -e "\.chars\(\)\\.nth\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$chars_nth" -gt 0 ]; then
+  print_finding "info" "$chars_nth" "chars().nth(n) used" "O(n) indexing; prefer byte indexing where valid or iterators with caching"
+  add_finding "info" "$chars_nth" "chars().nth(n) used" "O(n) indexing; prefer byte indexing where valid or iterators with caching" "${CATEGORY_NAME[24]}" "$(collect_samples_rg "\.chars\(\)\\.nth\(" 3)"
+fi
+
+print_subheader "format!/to_string/allocations inside loops (heuristic)"
+fmt_in_loop=$(( $(ast_search 'for $P in $I { $$ format!($$) $$ }' || echo 0) + $("${GREP_RN[@]}" -e "for[^{]*\{[^}]*format!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$fmt_in_loop" -gt 0 ]; then
+  print_finding "warning" "$fmt_in_loop" "format! inside loop" "Consider preallocating buffers, using write!, or restructuring to reduce allocations"
+  add_finding "warning" "$fmt_in_loop" "format! inside loop" "Consider preallocating buffers, using write!, or restructuring to reduce allocations" "${CATEGORY_NAME[24]}" "$(collect_samples_rg "for[^{]*\{[^}]*format!\(" 3)"
+fi
+fi
+
 # restore pipefail
 end_scan_section
 
@@ -1866,7 +2373,7 @@ echo ""
 say "${WHITE}${BOLD}Summary Statistics:${RESET}"
 say "  ${WHITE}Files scanned:${RESET}    ${CYAN}$TOTAL_FILES${RESET}"
 say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$CRITICAL_COUNT${RESET}"
-say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}"
+say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}
 say "  ${BLUE}Info items:${RESET}       ${BLUE}$INFO_COUNT${RESET}"
 echo ""
 
@@ -1881,7 +2388,7 @@ if [ "$WARNING_COUNT" -gt 0 ]; then
 fi
 if [ "$INFO_COUNT" -gt 0 ]; then
   say "  ${BLUE}${INFO} ${BOLD}Consider INFO suggestions${RESET}"
-  say "  ${DIM}Code quality improvements and best practices${RESET}"
+  say "  ${DIM}Code quality improvements and best practices${RESET}
 fi
 
 if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
@@ -1931,5 +2438,3 @@ if (( CRITICAL_COUNT >= FAIL_CRITICAL_THRESHOLD )); then EXIT_CODE=1; fi
 if (( FAIL_ON_WARNING == 1 )) && (( CRITICAL_COUNT + WARNING_COUNT > 0 )); then EXIT_CODE=1; fi
 if (( FAIL_WARNING_THRESHOLD > 0 )) && (( WARNING_COUNT >= FAIL_WARNING_THRESHOLD )); then EXIT_CODE=1; fi
 exit "$EXIT_CODE"
-fi
-fi

@@ -815,12 +815,16 @@ check_ast_grep() {
 }
 
 check_java_env() {
-  if command -v java >/dev/null 2>&1; then HAS_JAVA=1; JAVA_VERSION_STR="$(java -version 2>&1 | head -n1)"; fi
+  if command -v java >/dev/null 2>&1; then
+    HAS_JAVA=1
+    # java may exist but still return non-zero (e.g., stub prompting install); avoid killing the scan
+    JAVA_VERSION_STR="$(java -version 2>&1 | head -n1 || true)"
+  fi
   local javac_str; javac_str="$(javac -version 2>&1 || true)"
   if [[ -z "$JAVA_VERSION_STR" && -n "$javac_str" ]]; then JAVA_VERSION_STR="$javac_str"; fi
   local ver
   ver="$( (echo "$JAVA_VERSION_STR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '') )"
-  if [[ -z "$ver" ]]; then ver="$(echo "$JAVA_VERSION_STR" | grep -oE '[0-9]+' | head -n1)"; fi
+  if [[ -z "$ver" ]]; then ver="$(echo "$JAVA_VERSION_STR" | grep -oE '[0-9]+' | head -n1 || true)"; fi
   JAVA_MAJOR="$(echo "$ver" | awk -F. '{print ($1+0)}')"
   if [[ "$JAVA_MAJOR" -ge "$JAVA_REQUIRED_MAJOR" ]]; then JAVA_TOOLCHAIN_OK=1; fi
 
@@ -1736,12 +1740,12 @@ str_bytes=$(( $(ast_search 'new String($B)' || echo 0) + $(ast_search '$S.getByt
 if [ "$str_bytes" -gt 0 ]; then print_finding "info" "$str_bytes" "Charset not specified in String/bytes conversion"; fi
 
 print_subheader "Files.readAllBytes / large reads inside loops"
-read_all_bytes_loop=$("${GREP_RN[@]}" -e "for[[:space:]]*\(|while[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | (grep -A4 "Files\.readAllBytes\(" || true) | (grep -c "Files\.readAllBytes\(" || true))
+read_all_bytes_loop=$("${GREP_RN[@]}" -e "for[[:space:]]*\(|while[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | (grep -A4 -F "Files.readAllBytes(" || true) | (grep -c -F "Files.readAllBytes(" || true))
 read_all_bytes_loop=$(echo "$read_all_bytes_loop" | awk 'END{print $0+0}')
 if [ "$read_all_bytes_loop" -gt 0 ]; then print_finding "warning" "$read_all_bytes_loop" "Files.readAllBytes in loop - consider streaming"; fi
 
 print_subheader "Try-with-resources coverage"
-twr_candidates=$("${GREP_RN[@]}" -e "new[[:space:]]+(File(Input|Output)Stream|Buffered(Reader|Writer)|Scanner|FileReader|FileWriter|Connection|PreparedStatement)\(" "$PROJECT_DIR" 2>/dev/null | grep -v "try[[:space:]]*\(" | count_lines || true)
+twr_candidates=$("${GREP_RN[@]}" -e "new[[:space:]]+(File(Input|Output)Stream|Buffered(Reader|Writer)|Scanner|FileReader|FileWriter|Connection|PreparedStatement)\(" "$PROJECT_DIR" 2>/dev/null | grep -vE "try[[:space:]]*\\(" | count_lines || true)
 if [ "$twr_candidates" -gt 0 ]; then
   print_finding "warning" "$twr_candidates" "Closeable created outside try-with-resources" "Wrap AutoCloseable objects in try-with-resources or close them in finally blocks"
   show_detailed_finding "new[[:space:]]+(File(Input|Output)Stream|Buffered(Reader|Writer)|Scanner|Connection|PreparedStatement)\(" 3
@@ -1825,7 +1829,7 @@ legacy=$(( $(ast_search 'new java.util.Vector($$)' || echo 0) + $(ast_search 'ne
 if [ "$legacy" -gt 0 ]; then print_finding "info" "$legacy" "Vector/Hashtable detected"; fi
 
 print_subheader "Collection modification during foreach (heuristic)"
-mod_foreach=$("${GREP_RN[@]}" -e "for\s*\([^)]+:[^)]+\)\s*\{" "$PROJECT_DIR" 2>/dev/null | (grep -A3 "\.remove\(" || true) | (grep -c "\.remove\(" || true))
+mod_foreach=$("${GREP_RN[@]}" -e "for\s*\([^)]+:[^)]+\)\s*\{" "$PROJECT_DIR" 2>/dev/null | (grep -A3 -F ".remove(" || true) | (grep -c -F ".remove(" || true))
 mod_foreach=$(echo "$mod_foreach" | awk 'END{print $0+0}')
 if [ "$mod_foreach" -gt 0 ]; then print_finding "warning" "$mod_foreach" "Possible modification of collection during iteration"; fi
 fi

@@ -11,28 +11,38 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
-shopt -s lastpipe
-shopt -s extglob
+shopt -s lastpipe || true
+shopt -s extglob || true
+
+# Ensure these are always defined (set -u safe), even if we error before color init.
+RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; GRAY=""
+BOLD=""; DIM=""; RESET=""
 
 on_err() {
-  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+  local ec=$?
+  local cmd=${BASH_COMMAND-}
+  local line=${BASH_LINENO[0]-?}
+  local src=${BASH_SOURCE[1]-${BASH_SOURCE[0]-?}}
   echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
   exit "$ec"
 }
 trap on_err ERR
 
+init_colors() {
+  if [[ "$USE_COLOR" -eq 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+    BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+  else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+    BOLD=''; DIM=''; RESET=''
+  fi
+}
+
 # Honor NO_COLOR and non-tty
 USE_COLOR=1
 if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
-
-if [[ "$USE_COLOR" -eq 1 ]]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
-  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
-  BOLD=''; DIM=''; RESET=''
-fi
+init_colors
 
 CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"
 
@@ -232,6 +242,7 @@ done
 # CI auto-detect + color override
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
+init_colors
 
 if [[ "$FAIL_ON_WARNING" -eq 0 ]]; then
   ASYNC_ERROR_SEVERITY[js.async.then-no-catch]='info'
@@ -473,7 +484,10 @@ with open(rule_file, 'r', encoding='utf-8') as fh:
         if not rid or rid not in want:
             continue
         f = obj.get('file') or obj.get('path') or '?'
-        sline = ((obj.get('range') or {}).get('start') or {}).get('line')
+        start = ((obj.get('range') or {}).get('start') or {})
+        sline = start.get('line')
+        if sline is None:
+            sline = start.get('row')
         if isinstance(sline, int):
             sline += 1
         sample = f"{f}:{sline if sline is not None else '?'}"
@@ -1522,7 +1536,10 @@ matches = load_stream(matches_path)
 guards = load_stream(guards_path)
 
 def as_pos(data):
-    return (data.get('line', 0), data.get('column', 0))
+    line = data.get('line')
+    if line is None:
+        line = data.get('row', 0)
+    return (line, data.get('column', 0))
 
 def ge(a, b):
     return a[0] > b[0] or (a[0] == b[0] and a[1] >= b[1])
@@ -1540,6 +1557,10 @@ for guard in guards:
     file_path = guard.get('file')
     cond = guard.get('metaVariables', {}).get('single', {}).get('COND')
     if not file_path or not cond:
+        continue
+    cond_text = cond.get('text') or ''
+    # Only treat explicit short-circuit guards as "guarding" deep chains.
+    if '&&' not in cond_text:
         continue
     rng = cond.get('range') or {}
     start = rng.get('start')
@@ -1617,7 +1638,6 @@ persist_metric_json() {
 
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
-  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ag_rules.XXXXXX)"
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
@@ -1715,7 +1735,7 @@ id: js.eval-call
 language: javascript
 rule:
   kind: call_expression
-  pattern: eval($$)
+  pattern: eval($$$)
 severity: error
 message: "eval() allows arbitrary code execution"
 YAML
@@ -1724,7 +1744,7 @@ id: js.new-function
 language: javascript
 rule:
   kind: new_expression
-  pattern: new Function($$)
+  pattern: new Function($$$)
 severity: error
 message: "new Function() is equivalent to eval()"
 YAML
@@ -1732,7 +1752,7 @@ YAML
 id: js.document-write
 language: javascript
 rule:
-  pattern: document.write($$)
+  pattern: document.write($$$)
 severity: error
 message: "document.write() is dangerous and breaks SPAs"
 YAML
@@ -1740,10 +1760,10 @@ YAML
 id: react.useeffect-missing-cleanup
 language: typescript
 rule:
-  pattern: useEffect(() => { $$ }, $DEPS)
+  pattern: useEffect(() => { $$$ }, $DEPS)
   not:
     has:
-      pattern: return () => { $$ }
+      pattern: return () => { $$$ }
 severity: info
 message: "useEffect without cleanup may leak subscriptions or timers"
 YAML
@@ -1783,9 +1803,9 @@ id: node.child-process-exec
 language: typescript
 rule:
   any:
-    - pattern: require('child_process').exec($$)
-    - pattern: import('child_process').then($$.exec($$))
-    - pattern: exec($$)
+    - pattern: require('child_process').exec($$$)
+    - pattern: import('child_process').then($MOD => $MOD.exec($$$))
+    - pattern: exec($$$)
 severity: warning
 message: "child_process.exec used; sanitize inputs or prefer execFile/spawn"
 YAML
@@ -1863,24 +1883,20 @@ id: js.async.dangling-promise
 language: javascript
 rule:
   all:
-    - pattern: $CALLEE($ARGS)
-    - regex:
-        target: CALLEE
-        pattern: "^(fetch|axios\\.?|superagent|request|req|http|https|api|callApi|post|put|get|del|head|patch|upload|download|.*[Aa]sync$|.*Promise$|Promise\\.|new Promise)"
+    - pattern: $CALLEE($$$)
+    - regex: "^(fetch\\b|axios(\\.[A-Za-z_][A-Za-z0-9_]*)?\\b|superagent\\b|request\\b|req\\b|http\\b|https\\b|api\\b|callApi\\b|post\\b|put\\b|get\\b|del\\b|head\\b|patch\\b|upload\\b|download\\b|Promise\\.[A-Za-z_][A-Za-z0-9_]*\\b|new\\s+Promise\\b|[A-Za-z_$][A-Za-z0-9_$]*(?:\\.[A-Za-z_$][A-Za-z0-9_$]*)*(Async|Promise)\\b)"
     - not:
         inside:
           any:
             - pattern: await $EXPR
-            - pattern: $EXPR.then($ARGS)
-            - pattern: Promise.all($ARGS)
-            - pattern: Promise.race($ARGS)
-            - pattern: Promise.allSettled($ARGS)
+            - pattern: $EXPR.then($$$)
+            - pattern: Promise.all($$$)
+            - pattern: Promise.race($$$)
+            - pattern: Promise.allSettled($$$)
             - kind: return_statement
             - kind: try_statement
     - not:
-        regex:
-          target: CALLEE
-          pattern: "^(document\\.|window\\.|console\\.|JSON\\.|Math\\.|Date\\.|Array\\.|Object\\.|Set\\.|Map\\.|WeakMap|WeakSet|Intl\\.|Number\\.|String\\.|Boolean\\.|parse|encode|decode|transform|render|append|push|join|filter|map|reduce|forEach|has|get|set)$"
+        regex: "^(document\\.|window\\.|console\\.|JSON\\.|Math\\.|Date\\.|Array\\.|Object\\.|Set\\.|Map\\.|WeakMap\\.|WeakSet\\.|Intl\\.|Number\\.|String\\.|Boolean\\.|parse\\b|encode\\b|decode\\b|transform\\b|render\\b|append\\b|push\\b|join\\b|filter\\b|map\\b|reduce\\b|forEach\\b|has\\b|get\\b|set\\b)"
 severity: warning
 message: "Possible unhandled/dangling promise; use await/then/catch"
 YAML
@@ -1924,8 +1940,8 @@ id: security.insecure-crypto-params
 language: typescript
 rule:
   any:
-    - pattern: crypto.pbkdf2($$)
-    - pattern: crypto.pbkdf2Sync($$)
+    - pattern: crypto.pbkdf2($$$)
+    - pattern: crypto.pbkdf2Sync($$$)
 severity: info
 message: "crypto.pbkdf2/Sync called; ensure iteration count and key length meet policy"
 YAML
@@ -2164,16 +2180,15 @@ if [[ "$HAS_AST_GREP" -eq 1 ]]; then
   deep_guard_json=$(analyze_deep_property_guards "$DETAIL_LIMIT")
   if [[ -n "$deep_guard_json" ]]; then
     parsed_counts=""
-    parsed_counts=$(python3 - <<'PY' <<<"$deep_guard_json"
+    parsed_counts=$(python3 - "$deep_guard_json" <<'PY' 2>/dev/null || true
 import json, sys
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(sys.argv[1])
+    print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 except Exception:
     pass
-else:
-    print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 PY
-)
+    )
     if [[ -n "$parsed_counts" ]]; then
       read -r count guarded_inside <<<"$parsed_counts"
     else
@@ -2427,9 +2442,10 @@ print_subheader "eval() usage (CRITICAL SECURITY RISK)"
 eval_count=$( \
   ( \
     if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-      ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern 'eval($$)' "$PROJECT_DIR" 2>/dev/null || true )
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern 'eval($$$)' "$PROJECT_DIR" 2>/dev/null || true )
+    else
+      "${GREP_RN[@]}" -e "(^|[^\"'])[Ee]val[[:space:]]*\\(" "$PROJECT_DIR" 2>/dev/null || true
     fi
-    "${GREP_RN[@]}" -e "(^|[^\"'])[Ee]val[[:space:]]*\\(" "$PROJECT_DIR" 2>/dev/null || true \
   ) \
   | (grep -Ev "^[[:space:]]*(//|/\*|\*)" || true) \
   | count_lines
@@ -2444,7 +2460,7 @@ fi
 print_subheader "new Function() (eval equivalent)"
 count=$( \
   ( \
-    ( [[ "$HAS_AST_GREP" -eq 1 ]] && ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern 'new Function($$)' "$PROJECT_DIR" 2>/dev/null || true ) ) \
+    ( [[ "$HAS_AST_GREP" -eq 1 ]] && ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern 'new Function($$$)' "$PROJECT_DIR" 2>/dev/null ) ) \
     || ( "${GREP_RN[@]}" -e "(^|[^\"'])\\bnew[[:space:]]+Function[[:space:]]*\\(" "$PROJECT_DIR" 2>/dev/null || true ) \
   ) \
   | (grep -Ev "^[[:space:]]*(//|/\*|\*)" || true) \
@@ -2475,7 +2491,7 @@ fi
 print_subheader "document.write (deprecated & dangerous)"
 count=$( \
   ( \
-    ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" --pattern "document.write($$)" "$PROJECT_DIR" 2>/dev/null ) \
+    ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" --pattern "document.write($$$)" "$PROJECT_DIR" 2>/dev/null ) \
     || "${GREP_RNW[@]}" "document\.write" "$PROJECT_DIR" 2>/dev/null \
   ) \
      | (grep -Ev "^[[:space:]]*(//|/\*|\*)" || true) \
@@ -2975,7 +2991,7 @@ if [ "$global_pollution_count" -gt 0 ] && [[ -n "$global_pollution_samples" ]]; 
 fi
 
 print_subheader "Variable shadowing"
-count=$(ast_search 'let $VAR = $$; $$ { let $VAR = $$ }' || echo 0)
+count=$(ast_search 'let $VAR = $$$; $$$ { let $VAR = $$$ }' || echo 0)
 if [ "$count" -gt 3 ]; then
   print_finding "warning" "$count" "Potential variable shadowing" "Inner scope redefines outer variable"
 fi

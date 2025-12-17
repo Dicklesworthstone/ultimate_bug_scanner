@@ -39,8 +39,12 @@ shopt -s compat31 || true
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Default color vars early so on_err can't trip set -u before init_colors runs
+RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+BOLD=''; DIM=''; RESET=''
+
 on_err() {
-  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]-${BASH_SOURCE[0]}}
   echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
   exit "$ec"
 }
@@ -51,18 +55,29 @@ USE_COLOR=1
 if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
 FORCE_COLOR=0
 
-if [[ "$USE_COLOR" -eq 1 ]]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
-  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
-  BOLD=''; DIM=''; RESET=''
-fi
+init_colors() {
+  if [[ "$USE_COLOR" -eq 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+    BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+  else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+    BOLD=''; DIM=''; RESET=''
+  fi
+}
+init_colors
 
 # Symbols (ensure UTF-8 output; run grep under LC_ALL=C separately)
 SAFE_LOCALE="C"
-if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8)$'; then SAFE_LOCALE="C.UTF-8"; fi
+if locale -a 2>/dev/null | grep -qiE '^C\.UTF-8$'; then
+  SAFE_LOCALE="C.UTF-8"
+elif locale -a 2>/dev/null | grep -qiE '^C\.utf8$'; then
+  SAFE_LOCALE="C.utf8"
+elif locale -a 2>/dev/null | grep -qiE '^en_US\.UTF-8$'; then
+  SAFE_LOCALE="en_US.UTF-8"
+elif locale -a 2>/dev/null | grep -qiE '^en_US\.utf8$'; then
+  SAFE_LOCALE="en_US.utf8"
+fi
 export LC_CTYPE="${SAFE_LOCALE}"
 export LC_MESSAGES="${SAFE_LOCALE}"
 export LANG="${SAFE_LOCALE}"
@@ -210,7 +225,22 @@ while [[ $# -gt 0 ]]; do
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
-        PROJECT_DIR="$1"; shift
+        # When PROJECT_DIR is still the default ".", allow a single positional arg to
+        # be interpreted as OUTPUT_FILE (common with --format=json/--format=sarif).
+        # Heuristic: if the arg doesn't exist and its basename contains a dot (e.g., report.json),
+        # treat it as OUTPUT_FILE; otherwise treat it as a project path.
+        if [[ "$PROJECT_DIR" == "." && -z "$OUTPUT_FILE" && ! -e "$1" ]]; then
+          base="${1##*/}"
+          case "$1" in
+            *.py|*.pyi|*.pyx|*.pxd|*.pxi|*.ipynb) PROJECT_DIR="$1" ;;
+            *)
+              if [[ "$base" == *.* ]]; then OUTPUT_FILE="$1"; else PROJECT_DIR="$1"; fi
+              ;;
+          esac
+        else
+          PROJECT_DIR="$1"
+        fi
+        shift
       elif [[ -z "$OUTPUT_FILE" ]] && ! [[ "$1" =~ ^- ]]; then
         OUTPUT_FILE="$1"; shift
       else
@@ -236,17 +266,40 @@ fi
 # CI auto-detect + color override
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
-if [[ -n "${OUTPUT_FILE}" && "$FORCE_COLOR" -eq 0 && "$NO_COLOR_FLAG" -eq 0 ]]; then
+if [[ "$FORCE_COLOR" -eq 1 && "$NO_COLOR_FLAG" -eq 0 ]]; then USE_COLOR=1; fi
+if [[ -n "${OUTPUT_FILE}" && "$FORMAT" == "text" && "$FORCE_COLOR" -eq 0 && "$NO_COLOR_FLAG" -eq 0 ]]; then
   USE_COLOR=0
 fi
+init_colors
 
-# Redirect output early to capture everything
-if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
+# OUTPUT_FILE handling:
+# - text: tee full report (stdout+stderr) into OUTPUT_FILE
+# - json/sarif: treat OUTPUT_FILE as machine-output destination (keep logs on stderr)
+MACHINE_OUT_FILE=""
+if [[ -n "${OUTPUT_FILE}" && ( "$FORMAT" == "json" || "$FORMAT" == "sarif" ) ]]; then
+  MACHINE_OUT_FILE="$OUTPUT_FILE"
+elif [[ -n "${OUTPUT_FILE}" ]]; then
+  exec > >(tee "${OUTPUT_FILE}") 2>&1
+fi
+
+# Structured formats: keep machine output on original stdout, send logs to stderr.
+# - If FORMAT is json/sarif we redirect fd1 -> fd2, and use fd3 (or fd4 tee) for machine output.
+MACHINE_FD=1
+if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
+  exec 3>&1
+  exec 1>&2
+  if [[ -n "${MACHINE_OUT_FILE:-}" ]]; then
+    # Duplicate machine output to both OUTPUT_FILE and original stdout.
+    exec 4> >(tee "$MACHINE_OUT_FILE" >&3)
+    MACHINE_FD=4
+  else
+    MACHINE_FD=3
+  fi
+fi
 
 safe_date() {
   if [[ "$CI_MODE" -eq 1 ]]; then command date -u '+%Y-%m-%dT%H:%M:%SZ' || command date '+%Y-%m-%dT%H:%M:%SZ'; else command date '+%Y-%m-%d %H:%M:%S'; fi
 }
-DATE_CMD="safe_date"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Global Counters
@@ -255,6 +308,8 @@ CRITICAL_COUNT=0
 WARNING_COUNT=0
 INFO_COUNT=0
 TOTAL_FILES=0
+CURRENT_CATEGORY=0
+declare -A CAT_COUNTS=()
 
 # ────────────────────────────────────────────────────────────────────────────
 # Global State
@@ -262,8 +317,9 @@ TOTAL_FILES=0
 HAS_AST_GREP=0
 AST_GREP_CMD=()      # array-safe
 AST_RULE_DIR=""      # created later if ast-grep exists
+AST_CONFIG_FILE=""   # temp sgconfig.yml pointing at AST_RULE_DIR (ast-grep 0.40+)
 HAS_RIPGREP=0
-UVX_CMD=()           # (uvx -q or uv -qx) if available
+UVX_CMD=()           # (uvx or `uv -q tool run`) if available
 HAS_UV=0
 RG_MAX_SIZE_FLAGS=()
 
@@ -359,12 +415,28 @@ print_category() {
 
 print_subheader() { say "\n${YELLOW}${BOLD}$BULLET $1${RESET}"; }
 
+bump_category_count() {
+  local delta=${1:-0}
+  [[ "${CURRENT_CATEGORY:-0}" =~ ^[0-9]+$ ]] || return 0
+  [[ "${CURRENT_CATEGORY:-0}" -gt 0 ]] || return 0
+  CAT_COUNTS["$CURRENT_CATEGORY"]=$(( ${CAT_COUNTS["$CURRENT_CATEGORY"]:-0} + (delta+0) ))
+}
+
 print_finding() {
   local severity=$1
   case $severity in
     good)
-      local title=$2
-      say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}"
+      # Support both:
+      #   print_finding good "Message"
+      #   print_finding good <count> "Message" ["Details..."]
+      if [[ "${2:-}" =~ ^[0-9]+$ && -n "${3:-}" ]]; then
+        local count=$2; local title=$3; local description="${4:-}"
+        say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET} ${WHITE}($count)${RESET}"
+        [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+      else
+        local title=$2
+        say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}"
+      fi
       ;;
     *)
       local raw_count=$2; local title=$3; local description="${4:-}"
@@ -372,18 +444,21 @@ print_finding() {
       case $severity in
         critical)
           CRITICAL_COUNT=$((CRITICAL_COUNT + count))
+          bump_category_count "$count"
           say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"
           say "    ${RED}${BOLD}$title${RESET}"
           [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
           ;;
         warning)
           WARNING_COUNT=$((WARNING_COUNT + count))
+          bump_category_count "$count"
           say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"
           say "    ${YELLOW}$title${RESET}"
           [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
           ;;
         info)
           INFO_COUNT=$((INFO_COUNT + count))
+          bump_category_count "$count"
           say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"
           say "    ${BLUE}$title${RESET}"
           [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
@@ -395,8 +470,10 @@ print_finding() {
 
 print_code_sample() {
   local file=$1; local line=$2; local code=$3
-  say "${GRAY}      $file:$line${RESET}"
-  say "${WHITE}      $code${RESET}"
+  [[ "$QUIET" -eq 1 ]] && return 0
+  # Use printf to avoid echo -e interpreting user code (e.g., "-n", "\t", "\c")
+  printf '%b%s%b\n' "$GRAY" "      $file:$line" "$RESET"
+  printf '%b%s%b\n' "$WHITE" "      $code" "$RESET"
 }
 
 show_detailed_finding() {
@@ -499,7 +576,7 @@ run_async_error_checks() {
 id: py.async.task-no-await
 language: python
 rule:
-  pattern: $TASK = asyncio.create_task($ARGS)
+  pattern: $TASK = asyncio.create_task($$$)
   not:
     any:
       - inside: { pattern: await $TASK }
@@ -550,12 +627,15 @@ with open(path, 'r', encoding='utf-8') as fh:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        rid = obj.get('rule_id') or obj.get('id') or obj.get('ruleId')
+        rid = obj.get('ruleId') or obj.get('rule_id') or obj.get('id')
         if not rid:
             continue
         rng = obj.get('range') or {}
         start = rng.get('start') or {}
-        line_no = start.get('row', 0) + 1
+        line0 = start.get('row')
+        if line0 is None:
+            line0 = start.get('line', 0)
+        line_no = int(line0) + 1
         file_path = obj.get('file', '?')
         entry = stats.setdefault(rid, {'count': 0, 'samples': []})
         entry['count'] += 1
@@ -790,7 +870,10 @@ end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCA
 # ────────────────────────────────────────────────────────────────────────────
 check_ast_grep() {
   if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
-  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
+  if command -v sg       >/dev/null 2>&1; then
+    # `sg` can be either ast-grep or util-linux; validate before accepting.
+    if sg --version 2>&1 | grep -qi 'ast-grep'; then AST_GREP_CMD=(sg); HAS_AST_GREP=1; return 0; fi
+  fi
   if command -v npx      >/dev/null 2>&1; then AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0; fi
   say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be skipped.${RESET}"
   say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
@@ -800,7 +883,8 @@ check_ast_grep() {
 ast_search() {
   local pattern=$1
   if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-    ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" --lang python "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+    # ast-grep 0.40+ requires the `run` subcommand (pattern search)
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" run -p "$pattern" -l python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
   else
     return 1
   fi
@@ -815,9 +899,9 @@ analyze_py_attr_guards() {
   tmp_ifs="$(mktemp -t ubs-py-ifs.XXXXXX 2>/dev/null || mktemp -t ubs-py-ifs)"
 
   # Attribute chains of depth >= 4
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern '$A.$B.$C.$D' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_attrs"
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" run -p '$A.$B.$C.$D' -l python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_attrs"
   # Capture the BODY of any if statement (less brittle)
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern $'if $COND:\n  $BODY' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_ifs"
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" run -p $'if $COND:\n  $BODY' -l python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_ifs"
 
   result=$(python3 - "$tmp_attrs" "$tmp_ifs" "$limit" <<'PYHELP'
 import json, sys
@@ -841,7 +925,10 @@ matches = load_stream(matches_path)
 guards = load_stream(guards_path)
 
 def as_pos(node):
-    return (node.get('line', 0), node.get('column', 0))
+    row = node.get('row')
+    if row is None:
+        row = node.get('line', 0)
+    return (row, node.get('column', 0))
 
 def ge(a, b):
     return a[0] > b[0] or (a[0] == b[0] and a[1] >= b[1])
@@ -858,11 +945,20 @@ def within(target, region):
 bodies_by_file = defaultdict(list)
 for guard in guards:
     file_path = guard.get('file')
+    if not file_path:
+        continue
+    # ast-grep versions vary in whether metaVariables are included in JSON output.
+    # Prefer the BODY meta range when present; otherwise fall back to the whole match range.
+    start = end = None
     body = guard.get('metaVariables', {}).get('single', {}).get('BODY')
-    if not file_path or not body: continue
-    rng = body.get('range') or {}
-    start = rng.get('start'); end = rng.get('end')
-    if not start or not end: continue
+    if body:
+        rng = body.get('range') or {}
+        start = rng.get('start'); end = rng.get('end')
+    if not start or not end:
+        rng = guard.get('range') or {}
+        start = rng.get('start'); end = rng.get('end')
+    if not start or not end:
+        continue
     bodies_by_file[file_path].append((as_pos(start), as_pos(end)))
 
 unguarded = 0
@@ -893,8 +989,11 @@ PYHELP
 
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
-  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t py_ag_rules.XXXXXX)"
+  AST_CONFIG_FILE="$(mktemp -t ubs-sgconfig.XXXXXX 2>/dev/null || mktemp -t ubs-sgconfig)"
+  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true; [[ -n "${AST_CONFIG_FILE:-}" ]] && rm -f "$AST_CONFIG_FILE" || true' EXIT
+  # ast-grep 0.40+ scans a directory of rules via an sgconfig.yml (ruleDirs).
+  printf 'ruleDirs:\n- %s\n' "$AST_RULE_DIR" >"$AST_CONFIG_FILE" 2>/dev/null || true
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
   fi
@@ -976,13 +1075,13 @@ language: python
 rule:
   any:
     - pattern: |
-        def $NAME($A = [], $$):
+        def $NAME($A = [], $$$):
           $BODY
     - pattern: |
-        def $NAME($A = {}, $$):
+        def $NAME($A = {}, $$$):
           $BODY
     - pattern: |
-        def $NAME($A = set(), $$):
+        def $NAME($A = set(), $$$):
           $BODY
 severity: error
 message: "Mutable default argument; use default=None and set in body"
@@ -993,8 +1092,8 @@ id: py.eval-exec
 language: python
 rule:
   any:
-    - pattern: eval($$)
-    - pattern: exec($$)
+    - pattern: eval($$$)
+    - pattern: exec($$$)
 severity: error
 message: "Avoid eval/exec; leads to code injection"
 YAML
@@ -1004,8 +1103,8 @@ id: py.pickle-load
 language: python
 rule:
   any:
-    - pattern: pickle.load($$)
-    - pattern: pickle.loads($$)
+    - pattern: pickle.load($$$)
+    - pattern: pickle.loads($$$)
 severity: error
 message: "Unpickling untrusted data is insecure; prefer safer formats"
 YAML
@@ -1014,7 +1113,7 @@ YAML
 id: py.yaml-unsafe
 language: python
 rule:
-  pattern: yaml.load($ARGS)
+  pattern: yaml.load($$$)
   not:
     has:
       pattern: Loader=$L
@@ -1027,10 +1126,10 @@ id: py.subprocess-shell
 language: python
 rule:
   any:
-    - pattern: subprocess.run($$, shell=True)
-    - pattern: subprocess.call($$, shell=True)
-    - pattern: subprocess.check_output($$, shell=True)
-    - pattern: subprocess.Popen($$, shell=True)
+    - pattern: subprocess.run($$$, shell=True)
+    - pattern: subprocess.call($$$, shell=True)
+    - pattern: subprocess.check_output($$$, shell=True)
+    - pattern: subprocess.Popen($$$, shell=True)
 severity: error
 message: "shell=True is dangerous; prefer exec array with shell=False"
 YAML
@@ -1039,7 +1138,7 @@ YAML
 id: py.os-system
 language: python
 rule:
-  pattern: os.system($$)
+  pattern: os.system($$$)
 severity: warning
 message: "os.system is shell-invocation; prefer subprocess without shell"
 YAML
@@ -1049,9 +1148,9 @@ id: py.requests-verify
 language: python
 rule:
   any:
-    - pattern: requests.$M($URL, $$, verify=False)
-    - pattern: requests.$M($URL, verify=False, $$)
-    - pattern: requests.$M($URL, verify = False, $$)
+    - pattern: requests.$M($URL, $$$, verify=False)
+    - pattern: requests.$M($URL, verify=False, $$$)
+    - pattern: requests.$M($URL, verify = False, $$$)
 severity: warning
 message: "requests with verify=False disables TLS verification"
 YAML
@@ -1061,8 +1160,8 @@ id: py.hashlib-weak
 language: python
 rule:
   any:
-    - pattern: hashlib.md5($$)
-    - pattern: hashlib.sha1($$)
+    - pattern: hashlib.md5($$$)
+    - pattern: hashlib.sha1($$$)
 severity: warning
 message: "Weak hash algorithm (md5/sha1); prefer sha256/sha512"
 YAML
@@ -1072,11 +1171,11 @@ id: py.random-secrets
 language: python
 rule:
   any:
-    - pattern: random.random($$)
-    - pattern: random.randint($$)
-    - pattern: random.randrange($$)
-    - pattern: random.choice($$)
-    - pattern: random.choices($$)
+    - pattern: random.random($$$)
+    - pattern: random.randint($$$)
+    - pattern: random.randrange($$$)
+    - pattern: random.choice($$$)
+    - pattern: random.choices($$$)
 severity: info
 message: "random module is not cryptographically secure; use secrets module"
 YAML
@@ -1085,11 +1184,11 @@ YAML
 id: py.open-no-with
 language: python
 rule:
-  pattern: open($$)
+  pattern: open($$$)
   not:
     inside:
       pattern: |
-        with open($$) as $F:
+        with open($$$) as $F:
           $BODY
 severity: warning
 message: "open() outside of a 'with' block; risk of leaking file handles"
@@ -1099,18 +1198,19 @@ YAML
 id: py.open-no-encoding
 language: python
 rule:
-  any:
-    - pattern: open($FNAME)
-    - pattern: pathlib.Path($P).open($$)
-  not:
-    has:
-      pattern: encoding=$ENC
-  not:
-    any:
-      - has: { pattern: "mode='b'" }
-      - has: { pattern: "mode=\"b\"" }
-      - has: { pattern: "mode='rb'" }
-      - has: { pattern: "mode=\"rb\"" }
+  all:
+    - any:
+        - pattern: open($$$)
+        - pattern: pathlib.Path($P).open($$$)
+    - not:
+        has:
+          pattern: encoding=$ENC
+    - not:
+        any:
+          - has: { pattern: "mode='b'" }
+          - has: { pattern: "mode=\"b\"" }
+          - has: { pattern: "mode='rb'" }
+          - has: { pattern: "mode=\"rb\"" }
 severity: info
 message: "open() without encoding=... may be non-deterministic across locales"
 YAML
@@ -1119,46 +1219,53 @@ YAML
 id: py.resource.open-no-close
 language: python
 rule:
-  pattern: $VAR = open($ARGS)
-  not:
-    inside:
-      pattern: $VAR.close()
+  all:
+    - pattern: |
+        def $FN($$$):
+          $BODY
+    - has:
+        pattern: $VAR = open($$$)
+    - not:
+        has:
+          pattern: $VAR.close()
 severity: warning
-message: "open() assigned to a variable without close() in the same block."
+message: "open() assigned to a variable without close() in the same function."
 YAML
 
   cat >"$AST_RULE_DIR/resource-popen-no-wait.yml" <<'YAML'
 id: py.resource.Popen-no-wait
 language: python
 rule:
-  pattern: $PROC = subprocess.Popen($ARGS)
-  not:
-    inside:
-      pattern: $PROC.wait()
-  not:
-    inside:
-      pattern: $PROC.communicate($$)
-  not:
-    inside:
-      pattern: $PROC.terminate()
-  not:
-    inside:
-      pattern: $PROC.kill()
+  all:
+    - pattern: |
+        def $FN($$$):
+          $BODY
+    - has:
+        pattern: $PROC = subprocess.Popen($$$)
+    - not:
+        any:
+          - has: { pattern: $PROC.wait() }
+          - has: { pattern: $PROC.communicate($$$) }
+          - has: { pattern: $PROC.terminate() }
+          - has: { pattern: $PROC.kill() }
 severity: warning
-message: "subprocess.Popen handle created without wait/communicate/terminate in the same scope."
+message: "subprocess.Popen handle created without wait/communicate/terminate in the same function."
 YAML
 
   cat >"$AST_RULE_DIR/resource-asyncio-task.yml" <<'YAML'
 id: py.resource.asyncio-task-no-await
 language: python
 rule:
-  pattern: $TASK = asyncio.create_task($ARGS)
-  not:
-    inside:
-      pattern: await $TASK
-  not:
-    inside:
-      pattern: $TASK.cancel()
+  all:
+    - pattern: |
+        def $FN($$$):
+          $BODY
+    - has:
+        pattern: $TASK = asyncio.create_task($$$)
+    - not:
+        any:
+          - has: { pattern: await $TASK }
+          - has: { pattern: $TASK.cancel() }
 severity: warning
 message: "asyncio.create_task result neither awaited nor cancelled."
 YAML
@@ -1177,7 +1284,7 @@ id: py.datetime-naive
 language: python
 rule:
   any:
-    - pattern: datetime.datetime.utcnow($$)
+    - pattern: datetime.datetime.utcnow($$$)
     - pattern: datetime.datetime.now()
 severity: info
 message: "Naive datetime; prefer timezone-aware (e.g., datetime.now(tz=UTC))"
@@ -1219,14 +1326,14 @@ id: py.async-blocking
 language: python
 rule:
   pattern: |
-    async def $FN($$):
+    async def $FN($$$):
       $STMTS
   has:
     any:
-      - pattern: time.sleep($$)
-      - pattern: requests.$M($$)
-      - pattern: subprocess.run($$)
-      - pattern: open($$)
+      - pattern: time.sleep($$$)
+      - pattern: requests.$M($$$)
+      - pattern: subprocess.run($$$)
+      - pattern: open($$$)
 severity: warning
 message: "Blocking call inside async function; consider async equivalent"
 YAML
@@ -1246,7 +1353,7 @@ YAML
 id: py.tempfile-mktemp
 language: python
 rule:
-  pattern: tempfile.mktemp($$)
+  pattern: tempfile.mktemp($$$)
 severity: error
 message: "tempfile.mktemp is insecure; use NamedTemporaryFile or mkstemp"
 YAML
@@ -1296,7 +1403,7 @@ YAML
 id: py.subprocess-no-check
 language: python
 rule:
-  pattern: subprocess.run($ARGS)
+  pattern: subprocess.run($$$)
   not:
     has:
       pattern: check=$C
@@ -1343,7 +1450,7 @@ YAML
 id: py.requests-timeout-missing
 language: python
 rule:
-  pattern: requests.$M($URL, $$)
+  pattern: requests.$M($URL, $$$)
   not:
     has:
       pattern: timeout=$T
@@ -1402,12 +1509,12 @@ YAML
 id: py.aiohttp-session-no-close
 language: python
 rule:
-  pattern: $S = aiohttp.ClientSession($$)
+  pattern: $S = aiohttp.ClientSession($$$)
   not:
     inside:
       any:
         - pattern: await $S.close()
-        - pattern: async with aiohttp.ClientSession($$) as $S:
+        - pattern: async with aiohttp.ClientSession($$$) as $S:
 severity: warning
 message: "aiohttp ClientSession not closed/used as async context manager"
 YAML
@@ -1447,33 +1554,86 @@ YAML
 }
 
 run_ast_rules() {
-  [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
+  [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" && -n "${AST_CONFIG_FILE:-}" ]] || return 1
   if [[ "$FORMAT" == "sarif" ]]; then
-    "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --sarif 2>/dev/null || return 1
-    AST_PASSTHROUGH=1; return 0
-  fi
-  if [[ "$FORMAT" == "json" ]]; then
-    "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || return 1
+    # Build SARIF by scanning each rule independently, then merging runs.
+    # This avoids a single invalid rule file breaking the entire SARIF output.
+    local sarif_tmp; sarif_tmp="$(mktemp -t ag_sarif_stream.XXXXXX 2>/dev/null || mktemp -t ag_sarif_stream)"
+    : >"$sarif_tmp"
+    local rule_file
+    for rule_file in "$AST_RULE_DIR"/*.yml "$AST_RULE_DIR"/*.yaml; do
+      [[ -f "$rule_file" ]] || continue
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --format sarif 2>/dev/null || true ) >>"$sarif_tmp"
+      printf '\n__UBS_SARIF_SPLIT__\n' >>"$sarif_tmp"
+    done
+    python3 - "$sarif_tmp" <<'PY' >&"$MACHINE_FD" || { rm -f "$sarif_tmp"; return 1; }
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="replace")
+parts = [p.strip() for p in text.split("__UBS_SARIF_SPLIT__") if p.strip()]
+
+version = None
+runs = []
+for part in parts:
+    try:
+        obj = json.loads(part)
+    except Exception:
+        continue
+    if version is None:
+        v = obj.get("version")
+        if isinstance(v, str) and v:
+            version = v
+    r = obj.get("runs")
+    if isinstance(r, list):
+        runs.extend(r)
+
+out = {"runs": runs, "version": version or "0.0.0"}
+sys.stdout.write(json.dumps(out))
+sys.stdout.write("\n")
+PY
+    rm -f "$sarif_tmp"
     AST_PASSTHROUGH=1; return 0
   fi
   # text summary
   local tmp_stream; tmp_stream="$(mktemp -t ag_stream.XXXXXX 2>/dev/null || mktemp -t ag_stream)"
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_stream"
+  : >"$tmp_stream"
+  local rule_file
+  for rule_file in "$AST_RULE_DIR"/*.yml "$AST_RULE_DIR"/*.yaml; do
+    [[ -f "$rule_file" ]] || continue
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >>"$tmp_stream"
+  done
   if [[ ! -s "$tmp_stream" ]]; then rm -f "$tmp_stream"; return 0; fi
   print_subheader "ast-grep rule-pack summary"
-  python3 - "$tmp_stream" "$DETAIL_LIMIT" <<'PY'
+  while IFS=$'\t' read -r tag a b c d; do
+    case "$tag" in
+      __FINDING__) print_finding "$a" "$(num_clamp "$b")" "$c: $d" ;;
+      __SAMPLE__)  print_code_sample "$a" "$b" "$c" ;;
+    esac
+  done < <(python3 - "$tmp_stream" "$DETAIL_LIMIT" <<'PY'
 import json, sys, collections
 path, limit = sys.argv[1], int(sys.argv[2])
 buckets = collections.OrderedDict()
 def add(obj):
-    rid = obj.get('rule_id') or obj.get('id') or 'unknown'
-    sev = (obj.get('severity') or '').lower() or 'info'
+    rid = obj.get('ruleId') or obj.get('rule_id') or obj.get('id') or 'unknown'
+    sev_raw = (obj.get('severity') or '').lower().strip()
+    if sev_raw in ('critical', 'error', 'fatal'):
+        sev = 'critical'
+    elif sev_raw in ('warning', 'warn'):
+        sev = 'warning'
+    else:
+        sev = 'info'
     file = obj.get('file','?')
     # Suppress asserts in test files
     if rid == 'py.assert-used' and ('test' in file.lower() or 'conftest' in file.lower()):
         return
     rng  = obj.get('range') or {}
-    ln = (rng.get('start') or {}).get('row',0)+1
+    start = (rng.get('start') or {})
+    ln0 = start.get('row')
+    if ln0 is None:
+        ln0 = start.get('line', 0)
+    ln = int(ln0) + 1
     msg = obj.get('message') or rid
     b = buckets.setdefault(rid, {'severity': sev, 'message': msg, 'count': 0, 'samples': []})
     b['count'] += 1
@@ -1496,12 +1656,7 @@ for rid, data in sorted(buckets.items(), key=lambda kv:(sev_rank.get(kv[1]['seve
         s=c.replace('\t',' ').strip()
         print(f"__SAMPLE__\t{f}\t{l}\t{s}")
 PY
-  while IFS=$'\t' read -r tag a b c d; do
-    case "$tag" in
-      __FINDING__) print_finding "$a" "$(num_clamp "$b")" "$c: $d" ;;
-      __SAMPLE__)  print_code_sample "$a" "$b" "$c" ;;
-    esac
-  done <"$tmp_stream"
+  )
   rm -f "$tmp_stream"
   return 0
 }
@@ -1510,8 +1665,9 @@ PY
 # uv integrations & timeout resolution
 # ────────────────────────────────────────────────────────────────────────────
 check_uv() {
-  if command -v uvx >/dev/null 2>&1; then UVX_CMD=(uvx -q); HAS_UV=1; return 0; fi
-  if command -v uv  >/dev/null 2>&1; then UVX_CMD=(uv -qx); HAS_UV=1; return 0; fi
+  # uvx does NOT accept -q (quiet is a top-level `uv` flag), so keep uvx plain.
+  if command -v uvx >/dev/null 2>&1; then UVX_CMD=(uvx); HAS_UV=1; return 0; fi
+  if command -v uv  >/dev/null 2>&1; then UVX_CMD=(uv -q tool run); HAS_UV=1; return 0; fi
   HAS_UV=0; return 1
 }
 
@@ -1558,9 +1714,10 @@ should_skip() {
     for s in "${allow[@]}"; do [[ "$s" == "$cat" ]] && allowed=0; done
     [[ $allowed -eq 1 ]] && return 1
   fi
-  if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
+  if [[ -z "$SKIP_CATEGORIES" ]]; then CURRENT_CATEGORY="$cat"; return 0; fi
   IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
   for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
+  CURRENT_CATEGORY="$cat"
   return 0
 }
 
@@ -1608,7 +1765,7 @@ BANNER
 echo -e "${RESET}"
 
 say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
-say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+say "${WHITE}Started:${RESET}  ${GRAY}$(safe_date)${RESET}"
 
 # Validate target path (allow single files as well as directories)
 if [[ ! -e "$PROJECT_DIR" ]]; then
@@ -1687,10 +1844,10 @@ if [[ "$HAS_AST_GREP" -eq 1 ]]; then
   deep_guard_json=$(analyze_py_attr_guards "$DETAIL_LIMIT")
   if [[ -n "$deep_guard_json" ]]; then
     parsed_counts=""
-    parsed_counts=$(python3 - <<'PY' <<<"$deep_guard_json"
+    parsed_counts=$(python3 - "$deep_guard_json" <<'PY'
 import json, sys
 try:
-    data = json.load(sys.stdin)
+    data = json.loads(sys.argv[1])
     print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 except Exception:
     pass
@@ -2400,12 +2557,13 @@ fi
 # AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough or text summary)
 # ═══════════════════════════════════════════════════════════════════════════
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
+  CURRENT_CATEGORY=0
   print_header "AST-GREP RULE PACK FINDINGS"
   if run_ast_rules; then
     if [[ "$AST_PASSTHROUGH" -eq 1 ]]; then
       say "${DIM}${INFO} Above JSON/SARIF lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
       if [[ "$FORMAT" == "sarif" ]]; then
-        say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
+        say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r <rule.yml> \"$PROJECT_DIR\" --format sarif > report.sarif${RESET}"
       fi
     fi
   else
@@ -2587,50 +2745,76 @@ if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
 fi
 
 # Optional machine-readable summary
-if [[ -n "$SUMMARY_JSON" ]]; then
-  {
-    printf '{'
-    printf '"project":"%s",' "$(printf %s "$PROJECT_DIR" | sed 's/"/\\"/g')"
-    printf '"files":%s,' "$TOTAL_FILES"
-    printf '"critical":%s,' "$CRITICAL_COUNT"
-    printf '"warning":%s,' "$WARNING_COUNT"
-    printf '"info":%s,' "$INFO_COUNT"
-    printf '"timestamp":"%s",' "$(eval "$DATE_CMD")"
-    printf '"format":"%s",' "$FORMAT"
-    printf '"uv_tools":"%s",' "$(printf %s "$UV_TOOLS" | sed 's/"/\\"/g')"
-    printf '"categories":{'
-    printf '"1":%s,"2":%s,"3":%s,"4":%s,"5":%s,"6":%s,"7":%s,"8":%s,' \
-      "$(num_clamp "${CAT1:-0}")" "$(num_clamp "${CAT2:-0}")" "$(num_clamp "${CAT3:-0}")" "$(num_clamp "${CAT4:-0}")" "$(num_clamp "${CAT5:-0}")" "$(num_clamp "${CAT6:-0}")" "$(num_clamp "${CAT7:-0}")" "$(num_clamp "${CAT8:-0}")"
-    printf '"9":%s,"10":%s,"11":%s,"12":%s,"13":%s,"14":%s,"15":%s,"16":%s,' \
-      "$(num_clamp "${CAT9:-0}")" "$(num_clamp "${CAT10:-0}")" "$(num_clamp "${CAT11:-0}")" "$(num_clamp "${CAT12:-0}")" "$(num_clamp "${CAT13:-0}")" "$(num_clamp "${CAT14:-0}")" "$(num_clamp "${CAT15:-0}")" "$(num_clamp "${CAT16:-0}")"
-    printf '"17":%s,"18":%s,"19":%s,"20":%s,"21":%s,"22":%s,"23":%s},' \
-      "$(num_clamp "${CAT17:-0}")" "$(num_clamp "${CAT18:-0}")" "$(num_clamp "${CAT19:-0}")" "$(num_clamp "${CAT20:-0}")" "$(num_clamp "${CAT21:-0}")" "$(num_clamp "${CAT22:-0}")" "$(num_clamp "${CAT23:-0}")"
-    # ast-grep histogram if available
-    if [[ -n "$AST_RULE_DIR" && "$HAS_AST_GREP" -eq 1 ]]; then
-      printf '"ast_grep_rules":['
-      ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) \
-        | python3 - <<'PY'
+emit_summary_json() {
+  printf '{'
+  printf '"project":"%s",' "$(printf %s "$PROJECT_DIR" | sed 's/"/\\"/g')"
+  printf '"files":%s,' "$TOTAL_FILES"
+  printf '"critical":%s,' "$CRITICAL_COUNT"
+  printf '"warning":%s,' "$WARNING_COUNT"
+  printf '"info":%s,' "$INFO_COUNT"
+  printf '"timestamp":"%s",' "$(safe_date)"
+  printf '"format":"%s",' "$FORMAT"
+  printf '"uv_tools":"%s",' "$(printf %s "$UV_TOOLS" | sed 's/"/\\"/g')"
+  printf '"categories":{'
+  printf '"1":%s,"2":%s,"3":%s,"4":%s,"5":%s,"6":%s,"7":%s,"8":%s,' \
+    "$(num_clamp "${CAT_COUNTS[1]:-0}")" "$(num_clamp "${CAT_COUNTS[2]:-0}")" "$(num_clamp "${CAT_COUNTS[3]:-0}")" "$(num_clamp "${CAT_COUNTS[4]:-0}")" "$(num_clamp "${CAT_COUNTS[5]:-0}")" "$(num_clamp "${CAT_COUNTS[6]:-0}")" "$(num_clamp "${CAT_COUNTS[7]:-0}")" "$(num_clamp "${CAT_COUNTS[8]:-0}")"
+  printf '"9":%s,"10":%s,"11":%s,"12":%s,"13":%s,"14":%s,"15":%s,"16":%s,' \
+    "$(num_clamp "${CAT_COUNTS[9]:-0}")" "$(num_clamp "${CAT_COUNTS[10]:-0}")" "$(num_clamp "${CAT_COUNTS[11]:-0}")" "$(num_clamp "${CAT_COUNTS[12]:-0}")" "$(num_clamp "${CAT_COUNTS[13]:-0}")" "$(num_clamp "${CAT_COUNTS[14]:-0}")" "$(num_clamp "${CAT_COUNTS[15]:-0}")" "$(num_clamp "${CAT_COUNTS[16]:-0}")"
+  printf '"17":%s,"18":%s,"19":%s,"20":%s,"21":%s,"22":%s,"23":%s},' \
+    "$(num_clamp "${CAT_COUNTS[17]:-0}")" "$(num_clamp "${CAT_COUNTS[18]:-0}")" "$(num_clamp "${CAT_COUNTS[19]:-0}")" "$(num_clamp "${CAT_COUNTS[20]:-0}")" "$(num_clamp "${CAT_COUNTS[21]:-0}")" "$(num_clamp "${CAT_COUNTS[22]:-0}")" "$(num_clamp "${CAT_COUNTS[23]:-0}")"
+  # ast-grep histogram if available
+  if [[ -n "$AST_RULE_DIR" && -n "${AST_CONFIG_FILE:-}" && "$HAS_AST_GREP" -eq 1 ]]; then
+    printf '"ast_grep_rules":['
+    local tmp_hist; tmp_hist="$(mktemp -t ag_hist.XXXXXX 2>/dev/null || mktemp -t ag_hist)"
+    : >"$tmp_hist"
+    for _rf in "$AST_RULE_DIR"/*.yml "$AST_RULE_DIR"/*.yaml; do
+      [[ -f "$_rf" ]] || continue
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$_rf" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >>"$tmp_hist"
+    done
+    python3 - "$tmp_hist" <<'PY'
 import json,sys,collections
+path=sys.argv[1]
 seen=collections.Counter()
-for line in sys.stdin:
-  line=line.strip()
-  if not line: continue
-  try: rid=(json.loads(line).get('rule_id') or 'unknown'); seen[rid]+=1
-  except: pass
+with open(path,'r',encoding='utf-8',errors='replace') as fh:
+  for line in fh:
+    line=line.strip()
+    if not line:
+      continue
+    try:
+      obj=json.loads(line)
+    except Exception:
+      continue
+    rid=(obj.get('ruleId') or obj.get('rule_id') or obj.get('ruleId') or 'unknown')
+    seen[rid]+=1
 print(",".join(json.dumps({"id":k,"count":v}) for k,v in seen.items()))
 PY
-      printf ']'
-    else printf '"ast_grep_rules":[]'; fi
-    printf '}\n'
-  } > "$SUMMARY_JSON" 2>/dev/null || true
+    rm -f "$tmp_hist"
+    printf ']'
+  else
+    printf '"ast_grep_rules":[]'
+  fi
+  printf '}\n'
+}
+
+if [[ -n "$SUMMARY_JSON" ]]; then
+  emit_summary_json > "$SUMMARY_JSON" 2>/dev/null || true
   say "${DIM}Summary JSON written to: ${SUMMARY_JSON}${RESET}"
 fi
 
+# --format=json: emit machine-readable summary JSON to original stdout
+if [[ "$FORMAT" == "json" ]]; then
+  emit_summary_json >&"$MACHINE_FD"
+fi
+
 echo ""
-say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
+say "${DIM}Scan completed at: $(safe_date)${RESET}"
 
 if [[ -n "$OUTPUT_FILE" ]]; then
-  say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+  if [[ "$FORMAT" == "text" ]]; then
+    say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+  else
+    say "${GREEN}${CHECK} Machine output saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+  fi
 fi
 
 echo ""

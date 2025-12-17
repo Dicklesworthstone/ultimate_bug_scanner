@@ -14,7 +14,22 @@ if [[ ! -f "ubs" ]]; then
     exit 1
 fi
 
-CHECKSUM=$(sha256sum ubs | awk '{print $1}')
+# Compute SHA256 (portable: works on Linux and macOS)
+compute_sha256() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" | awk '{print $NF}'
+    else
+        echo "Error: No SHA256 tool found (need sha256sum, shasum, or openssl)" >&2
+        return 1
+    fi
+}
+
+CHECKSUM=$(compute_sha256 ubs)
 echo "${CHECKSUM}  ubs" > SHA256SUMS
 
 echo "Updated SHA256SUMS:"

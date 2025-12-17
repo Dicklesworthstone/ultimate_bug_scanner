@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
-GUARD_PATTERN = re.compile(r"guard\s+let\s+([A-Za-z_][\w]*)\s*=\s*[^\\n]+\s+else\s*\{", re.MULTILINE)
+GUARD_PATTERN = re.compile(r"guard\s+let\s+([A-Za-z_][\w]*)\s*=\s*[^\n]+\s+else\s*\{", re.MULTILINE)
 NEGATIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*==\s*nil[^)\{]*\)?", re.MULTILINE)
 POSITIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*!=\s*nil[^)\{]*\)?", re.MULTILINE)
 OPTIONAL_CHAIN_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*\?\.[^)\{]*\)?", re.MULTILINE)

@@ -1801,7 +1801,7 @@ if [ "$await_loop" -gt 0 ]; then print_finding "info" "$await_loop" "await insid
 
 print_subheader "Blocking ops inside async (thread::sleep, std::fs)"
 sleep_async=$(( $(ast_search 'std::thread::sleep($$)' || echo 0) + $("${GREP_RN[@]}" -e "thread::sleep\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-fs_async=$(( $(ast_search 'std::fs::read($$)' || echo 0) + $("${GREP_RN[@]}" -e "std::fs::(read|read_to_string|write|rename|copy|remove_file)\("(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+fs_async=$(( $(ast_search 'std::fs::read($$)' || echo 0) + $("${GREP_RN[@]}" -e "std::fs::(read|read_to_string|write|rename|copy|remove_file)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$sleep_async" -gt 0 ]; then print_finding "warning" "$sleep_async" "thread::sleep in async"; add_finding "warning" "$sleep_async" "thread::sleep in async" "" "${CATEGORY_NAME[3]}"; fi
 if [ "$fs_async" -gt 0 ]; then print_finding "info" "$fs_async" "Blocking std::fs in async code"; add_finding "info" "$fs_async" "Blocking std::fs in async code" "" "${CATEGORY_NAME[3]}"; fi
 

@@ -1908,7 +1908,6 @@ tick
   | (grep -A3 -E "\\{[[:space:]]*(\\[[^]]*\\])?" || true) \
   | (grep -vi "\\[weak self\\]" || true) \
   | count_lines || true)
-  )
  if [[ "${count:-0}" -gt 0 ]]; then
   print_finding "warning" "$count" "Potential strong self captures in long-lived closures"; show_detailed_finding "(URLSession\\.|DispatchQueue\\.(global|main)|Timer\\.scheduledTimer|NotificationCenter\\.default\\.addObserver|UIView\\.animate|NSAnimationContext\\.runAnimationGroup|\\.sink\\(|\\.onReceive\\())" 5
  else

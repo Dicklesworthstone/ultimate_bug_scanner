@@ -25,7 +25,7 @@ declare -A MODULE_CHECKSUMS=(
   [python]='4413e8a0a91f379e4c91b5d4b8dc0ee3f97793818753c3e33971f5c3cb527e05'
   [ruby]='3756886cfbb9c8838ef965dc0e323b878b2b6a707b4e58e4646039f25f680026'
   [rust]='e1502d38d4d2899a8a51397311b4026e5934f73e22ea28b9004556a8ec3ae620'
-  [swift]='44b1450a5bab04391472d188360b830a462d8fae87c9c85d2c2a5af2cb18add9'
+  [swift]='93c6b5e0107d0afed0f766f2ad934b7f60c7acf711e1607171c3d09798256417'
 )
 
 # Colors (respect NO_COLOR or non-tty)
@@ -515,22 +515,49 @@ prepare_git_workspace(){
     say "${RED}$X git not found; cannot run --$mode${RESET}"
     exit 1
   fi
-  if ! git -C "$SOURCE_PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+
+  local scan_root="$SOURCE_PROJECT_DIR"
+  if [[ -f "$scan_root" ]]; then
+    scan_root="$(dirname "$scan_root")"
+  fi
+
+  local repo_root
+  if ! repo_root="$(git -C "$scan_root" rev-parse --show-toplevel 2>/dev/null)"; then
     say "${RED}$X not a git repository; cannot run --$mode${RESET}"
     exit 1
   fi
-  
-  local files=()
-  local git_cmd=""
-  if [[ "$mode" == "staged" ]]; then
-    git_cmd="git -C \"$SOURCE_PROJECT_DIR\" diff --name-only --cached --diff-filter=ACMR"
+
+  local scan_rel=""
+  if [[ "$scan_root" == "$repo_root" ]]; then
+    scan_rel=""
+  elif [[ "$scan_root" == "$repo_root/"* ]]; then
+    scan_rel="${scan_root#"$repo_root"/}"
   else
-    git_cmd="git -C \"$SOURCE_PROJECT_DIR\" diff --name-only --diff-filter=ACMR HEAD"
+    say "${RED}$X scan path is outside git root; cannot run --$mode${RESET}"
+    exit 1
   fi
-  
-  while IFS= read -r file; do
-    [[ -n "$file" ]] && files+=("$file")
-  done < <(eval "$git_cmd")
+
+  local raw_files=()
+  if [[ "$mode" == "staged" ]]; then
+    while IFS= read -r file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
+      git -C "$repo_root" diff --name-only --cached --diff-filter=ACMR
+    )
+  else
+    while IFS= read -r file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
+      git -C "$repo_root" diff --name-only --diff-filter=ACMR HEAD
+    )
+  fi
+
+  local files=()
+  if [[ -n "$scan_rel" ]]; then
+    for file in "${raw_files[@]}"; do
+      if [[ "$file" == "$scan_rel/"* ]]; then
+        files+=("${file#"$scan_rel"/}")
+      fi
+    done
+  else
+    files=("${raw_files[@]}")
+  fi
   
   if [[ ${#files[@]} -eq 0 ]]; then
     say "${GREEN}${CHECK} No changed files to scan.${RESET}"
@@ -552,7 +579,7 @@ prepare_git_workspace(){
   local file_list="$TMPDIR_RUN/files_to_scan.txt"
   printf "%s\n" "${files[@]}" > "$file_list"
   
-  if rsync -a --files-from="$file_list" "$SOURCE_PROJECT_DIR/" "$dest/" >/dev/null 2>&1; then
+  if rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
     FILTERED_PROJECT_DIR="$dest"
     PROJECT_DIR="$FILTERED_PROJECT_DIR"
     say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
@@ -1056,7 +1083,7 @@ check_and_update_self(){
   fi
 
   local remote_version
-  remote_version=$(echo "$remote_content" | grep -oE 'UBS_VERSION="[0-9.]+"' | head -n1 | cut -d'"' -f2)
+  remote_version=$(printf '%s' "$remote_content" | grep -oE 'UBS_VERSION="[0-9.]+"' | head -n1 | cut -d'"' -f2)
   
   if [[ -z "$remote_version" ]]; then return 0; fi
 
@@ -1068,7 +1095,7 @@ check_and_update_self(){
     # Write new content to temp file
     local tmp_self
     tmp_self=$(mktemp)
-    echo "$remote_content" > "$tmp_self"
+    printf '%s' "$remote_content" > "$tmp_self"
     chmod +x "$tmp_self"
     
     # Move over current script
@@ -1105,7 +1132,11 @@ check_and_update_self "$@"
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
-cleanup(){ rm -rf "$TMPDIR_RUN" || true; }
+cleanup(){
+  local dir="${TMPDIR_RUN:-}"
+  [[ -n "$dir" && "$dir" != "/" ]] || return 0
+  rm -rf "$dir" 2>/dev/null || true
+}
 trap cleanup EXIT
 COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 
@@ -1163,7 +1194,8 @@ run_lang(){
     say_err "${DIM}Scanning $lang...${RESET}"
   fi
 
-  local args=("--ci")
+  local args=()
+  [[ "$CI_MODE" -eq 1 ]] && args+=("--ci")
   [[ "$FAIL_ON_WARNING" -eq 1 ]] && args+=("--fail-on-warning")
   [[ "$VERBOSE" -eq 1 ]] && args+=('-v')
   [[ "${QUIET:-0}" -eq 1 ]] && args+=('-q')
@@ -1175,54 +1207,67 @@ run_lang(){
   case "$fmt" in
     json|jsonl)
       prepare_metrics_dir "$metrics_dir"
-      # Add --report-json to capture detailed findings (module writes to file, separate from stdout)
-      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" --report-json="$out_findings" --format=json >"$out_json" 2>"$err"; then
-        module_status=$?
-        restore_original_paths "$out_json"
-        if need_cmd jq && jq -e . "$out_json" >/dev/null 2>&1; then
-          jq --arg language "$lang" '. + {language: $language}' "$out_json" > "$out_json.tmp" && mv "$out_json.tmp" "$out_json"
-          attach_metrics_to_json "$out_json" "$metrics_dir"
-          echo "$module_status" >"$status_file"
-          return 0
-        fi
+      local -a report_args=()
+      if [[ "$lang" == "js" ]]; then
+        report_args=(--report-json="$out_findings")
+      fi
+
+      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+        "$module" "${args[@]}" "${report_args[@]}" --format=json >"$out_json" 2>"$err"; then
+        module_status=0
       else
         module_status=$?
       fi
-      prepare_metrics_dir "$metrics_dir"
-      # Fallback: run in text mode but still capture findings via --report-json
-      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" --report-json="$out_findings" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
-        module_status=$?
+      restore_original_paths "$out_json"
+      if need_cmd jq && jq -e . "$out_json" >/dev/null 2>&1; then
+        jq --arg language "$lang" '. + {language: $language}' "$out_json" > "$out_json.tmp" && mv "$out_json.tmp" "$out_json"
+        attach_metrics_to_json "$out_json" "$metrics_dir"
+      else
+        prepare_metrics_dir "$metrics_dir"
+        if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+          "$module" "${args[@]}" "${report_args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
+          module_status=0
+        else
+          module_status="${PIPESTATUS[0]}"
+        fi
+        restore_original_paths "$out_txt"
+        parse_text_to_json "$lang" "$out_txt" "$out_json"
+        attach_metrics_to_json "$out_json" "$metrics_dir"
       fi
-      restore_original_paths "$out_txt"
-      parse_text_to_json "$lang" "$out_txt" "$out_json"
-      attach_metrics_to_json "$out_json" "$metrics_dir"
       ;;
     sarif)
       prepare_metrics_dir "$metrics_dir"
-      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" --format=sarif >"$out_sarif" 2>"$err"; then
-        module_status=$?
-        restore_original_paths "$out_sarif"
-        if need_cmd jq && jq -e . "$out_sarif" >/dev/null 2>&1; then
-          attach_metrics_to_json "$out_json" "$metrics_dir" 2>/dev/null || true
-          echo "$module_status" >"$status_file"
-          return 0
-        fi
+      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+        "$module" "${args[@]}" --format=sarif >"$out_sarif" 2>"$err"; then
+        module_status=0
       else
         module_status=$?
       fi
-      prepare_metrics_dir "$metrics_dir"
-      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
-        module_status=$?
+      restore_original_paths "$out_sarif"
+      if need_cmd jq && jq -e . "$out_sarif" >/dev/null 2>&1; then
+        parse_sarif_to_json "$lang" "$out_sarif" "$out_json" || true
+        attach_metrics_to_json "$out_json" "$metrics_dir" 2>/dev/null || true
+      else
+        prepare_metrics_dir "$metrics_dir"
+        if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+          "$module" "${args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
+          module_status=0
+        else
+          module_status="${PIPESTATUS[0]}"
+        fi
+        restore_original_paths "$out_txt"
+        minimal_sarif_from_text "$lang" "$out_txt" >"$out_sarif"
+        parse_text_to_json "$lang" "$out_txt" "$out_json"
+        attach_metrics_to_json "$out_json" "$metrics_dir"
       fi
-      restore_original_paths "$out_txt"
-      minimal_sarif_from_text "$lang" "$out_txt" >"$out_sarif"
-      parse_text_to_json "$lang" "$out_txt" "$out_json"
-      attach_metrics_to_json "$out_json" "$metrics_dir"
       ;;
     text|*)
       prepare_metrics_dir "$metrics_dir"
-      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" | apply_inline_suppressions >"$out_txt" 2>"$err"; then
-        module_status=$?
+      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+        "$module" "${args[@]}" 2>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
+        module_status=0
+      else
+        module_status="${PIPESTATUS[0]}"
       fi
       restore_original_paths "$out_txt"
       parse_text_to_json "$lang" "$out_txt" "$out_json"
@@ -1309,6 +1354,22 @@ minimal_sarif_from_text(){
 SARIF
 }
 
+parse_sarif_to_json(){
+  local lang="$1" sarif="$2" json="$3"
+  [[ -f "$sarif" ]] || return 1
+  if ! need_cmd jq; then return 1; fi
+  local critical warning info files
+  critical=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "error")] | length' "$sarif" 2>/dev/null || echo 0)
+  warning=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "warning")] | length' "$sarif" 2>/dev/null || echo 0)
+  info=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "note")] | length' "$sarif" 2>/dev/null || echo 0)
+  files=$(jq '[.runs[]?.results[]?.locations[]?.physicalLocation?.artifactLocation?.uri?] | unique | length' "$sarif" 2>/dev/null || echo 0)
+  critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
+  local proj_display="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  cat >"$json" <<JSON
+{"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
+JSON
+}
+
 merge_json_scanners(){
   # Exclude *.findings.json from summary merge (those are detailed findings)
   local jsons=()
@@ -1324,7 +1385,7 @@ merge_json_scanners(){
   fi
   # First merge the summary JSONs
   local base_json
-  base_json=$(jq -s --arg project "$PROJECT_DIR" --arg ts "$(date_iso)" '
+  base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" '
     def nz(x): if (x|type)=="number" then x else 0 end;
     {project:$project, timestamp:$ts, scanners: .,
      totals:{
@@ -1540,7 +1601,17 @@ done
 
 # Wait & collect statuses
 status=0
-for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+for pid in "${pids[@]}"; do
+  rc=0
+  if wait "$pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [[ "$rc" -gt "$status" ]]; then
+    status="$rc"
+  fi
+done
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Emit unified result
@@ -1550,14 +1621,18 @@ case "$FORMAT" in
     if generate_combined_json; then
       cat "$COMBINED_JSON_FILE"
     else
-      merge_json_scanners || { say "${RED}$X could not produce combined JSON${RESET}"; status=1; }
+      if ! merge_json_scanners; then
+        say "${RED}$X could not produce combined JSON${RESET}"
+        [[ "$status" -lt 1 ]] && status=1
+      fi
     fi
     ;;
   jsonl)
     if write_jsonl_summary ""; then
       :
     else
-      say "${RED}$X could not produce JSONL output${RESET}"; status=1;
+      say "${RED}$X could not produce JSONL output${RESET}"
+      [[ "$status" -lt 1 ]] && status=1
     fi
     ;;
   sarif)
@@ -1588,8 +1663,10 @@ case "$FORMAT" in
       fi
       crit=$(printf '%s' "$totals" | jq -r '.critical')
       warn=$(printf '%s' "$totals" | jq -r '.warning')
-      if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then status=1; fi
-      if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then status=1; fi
+      desired=0
+      if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
+      if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then desired=1; fi
+      if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
     fi
     ;;
 esac
@@ -1609,10 +1686,13 @@ if [[ $SHAREABLE_REQUEST -eq 1 ]]; then
   if generate_combined_json; then
     SHAREABLE_JSON_FILE="$COMBINED_JSON_FILE"
     SHAREABLE_TIMESTAMP="$(date_iso)"
-    python3 - "$SHAREABLE_JSON_FILE" "${COMPARISON_FILE:-}" \
-      "${REPORT_JSON_PATH:-}" "${HTML_REPORT_PATH:-}" \
-      "${GIT_REMOTE_HTTP:-}" "${GIT_COMMIT_SHA:-}" "${GIT_BLOB_BASE:-}" \
-      "$SHAREABLE_TIMESTAMP" <<'PY'
+    if ! need_cmd python3; then
+      say "${YELLOW}${WARN}${RESET} python3 not available; cannot build shareable artifacts"
+    else
+      python3 - "$SHAREABLE_JSON_FILE" "${COMPARISON_FILE:-}" \
+        "${REPORT_JSON_PATH:-}" "${HTML_REPORT_PATH:-}" \
+        "${GIT_REMOTE_HTTP:-}" "${GIT_COMMIT_SHA:-}" "${GIT_BLOB_BASE:-}" \
+        "$SHAREABLE_TIMESTAMP" <<'PY' 1>&2
 import json, sys, pathlib, datetime, html
 combined_path, baseline_path, out_json, out_html, repo_url, commit, blob_base, ts = sys.argv[1:9]
 root = pathlib.Path(combined_path)
@@ -1669,7 +1749,9 @@ if baseline is not None:
     }
 
 if out_json:
-    pathlib.Path(out_json).write_text(json.dumps(shareable, indent=2))
+    out_path = pathlib.Path(out_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(shareable, indent=2), encoding="utf-8")
 
 if out_html:
     totals_html = f"""
@@ -1704,10 +1786,13 @@ if out_html:
     <table><tr><th>Language</th><th>Critical</th><th>Warning</th><th>Info</th></tr>{scanners_html}</table>
     </body></html>
     """
-    pathlib.Path(out_html).write_text(doc)
+    out_path = pathlib.Path(out_html)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(doc, encoding="utf-8")
 
 print(f"Shareable summary written (critical={cur_totals['critical']}, warning={cur_totals['warning']}, info={cur_totals['info']})")
 PY
+    fi
   else
     say "${YELLOW}${WARN}${RESET} jq not available; cannot build shareable artifacts"
   fi

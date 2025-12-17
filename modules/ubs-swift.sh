@@ -709,36 +709,33 @@ with open(stream,'r',encoding='utf-8',errors='ignore') as fh:
   msg=(o.get('message') or '')
   code=first_line(o.get('lines') or '')
   idx[file].append({'rid':rid,'row':row,'col':col,'severity':sev,'message':msg,'code':code})
-[[ -s "$AG_FILE_INDEX_FILE" ]] && AG_FILE_INDEX_READY=1 || AG_FILE_INDEX_READY=0
-  return 0
-}$'\t' read -r tag a b c d; do
-    case "$tag" in
-    __FINDING__)
-     local sev cnt rid msg cat
-     sev="$(normalize_severity "$a")"
-     cnt="$(num_clamp "$b")"
-     rid="$c"; msg="$d"
-     cat="${AG_RULE_CATEGORY[$rid]:-0}"
-     set_category "$cat"
-     print_finding "$sev" "$cnt" "$rid: $msg"
-     ;;
-    __SAMPLE__) print_code_sample "$a" "$b" "$c" ;;
-   esac
-  done <"$tmp"
- else
-  declare -A counts=()
-  local line rid
-  while IFS= read -r line; do
-   rid="$(printf '%s' "$line" | sed -nE 's/.*"(rule_id|rule_id)"[[:space:]]*:[[:space:]]*"([^"]+)".*/\2/p')"
-   [[ -n "$rid" ]] || continue
-   counts["$rid"]=$(( ${counts["$rid"]:-0} + 1 ))
-  done <"$AG_STREAM_FILE"
-  for rid in "${!counts[@]}"; do
-   set_category "${AG_RULE_CATEGORY[$rid]:-0}"
-   print_finding "info" "${counts[$rid]}" "$rid"
-  done
+print(json.dumps(idx, ensure_ascii=False))
+PY
+ [[ -s "$AG_FILE_INDEX_FILE" ]] && AG_FILE_INDEX_READY=1 || AG_FILE_INDEX_READY=0
+ return 0
+}
+
+write_ast_rules(){
+ [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
+ AST_RULE_DIR="$(mktemp_dir swift_ag_rules)"
+ cleanup_add "$AST_RULE_DIR"
+ if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
+  cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
  fi
-  return 0
+ if [[ -n "$DUMP_RULES_DIR" ]]; then
+  mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
+ fi
+
+ cat >"$AST_RULE_DIR/c04-urlsession-task-no-resume.yml" <<'YAML'
+id: swift.urlsession.task-no-resume
+language: swift
+rule:
+  regex: "\\.(dataTask|uploadTask|downloadTask)\\s*\\("
+severity: info
+message: "URLSession task created (correlation will check resume/cancel); ensure lifecycle management."
+YAML
+
+ return 0
 }
 
 run_ast_rules(){

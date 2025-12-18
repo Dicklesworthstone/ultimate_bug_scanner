@@ -2,5 +2,8 @@
 {"id":"ultimate_bug_scanner-mep","ts":"2025-12-17T20:47:49.328065Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
 {"id":"ultimate_bug_scanner-iua","ts":"2025-12-17T21:02:39.640503Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
 {"id":"ultimate_bug_scanner-xkw","ts":"2025-12-17T21:09:22.959438Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-26z","ts":"2025-12-17T23:12:35.39209Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-5y3","ts":"2025-12-17T23:12:35.405569Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
+{"id":"ultimate_bug_scanner-js-fail-fast-without-ast2","ts":"2025-12-18T02:10:28.866514Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
+{"id":"ultimate_bug_scanner-install-ast-grep-required","ts":"2025-12-18T02:10:28.873254Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
+{"id":"ultimate_bug_scanner-js-module-env-ast-grep-bin2","ts":"2025-12-18T02:10:28.879564Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
+{"id":"ultimate_bug_scanner-ubs-env-error-exitcode","ts":"2025-12-18T02:10:28.885867Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
+{"id":"ultimate_bug_scanner-js-ts-degraded-mode-contract","ts":"2025-12-18T02:10:28.89266Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}

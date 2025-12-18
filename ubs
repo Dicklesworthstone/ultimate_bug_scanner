@@ -73,7 +73,7 @@ import sys, pathlib, re
 root = pathlib.Path(sys.argv[1]).resolve()
 blob = sys.argv[2].rstrip('/')
 input_path = pathlib.Path(sys.argv[3])
-pattern = re.compile(r'^(\s*)([^:\s][^:]*?):(\d+)(?::(\d+))?')
+pattern = re.compile(r'^(\s*)((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?')
 
 def to_url(path_str, line):
     candidate = pathlib.Path(path_str)
@@ -91,7 +91,8 @@ with input_path.open('r', encoding='utf-8', errors='ignore') as fh:
         if not m:
             sys.stdout.write(raw)
             continue
-        url = to_url(m.group(2), m.group(3))
+        path_str = (m.group(2) or "").strip()
+        url = to_url(path_str, m.group(3))
         if not url:
             sys.stdout.write(raw)
             continue
@@ -876,7 +877,7 @@ except Exception:
     output_stream = sys.stdout
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-FINDING_PATTERN = re.compile(r'^\s*([^:\s]+):(\d+)(?::(\d+))?')
+FINDING_PATTERN = re.compile(r'^\s*((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?')
 SUPPRESSION_MARKERS = ["ubs:ignore", "ubs: disable", "nolint", "noqa"]
 
 def strip_ansi(text):
@@ -902,7 +903,7 @@ def main():
                 output_stream.write(line)
                 continue
             
-            file_path_str = match.group(1)
+            file_path_str = (match.group(1) or "").strip()
             try:
                 line_no = int(match.group(2))
             except ValueError:

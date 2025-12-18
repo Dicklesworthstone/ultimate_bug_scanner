@@ -70,6 +70,7 @@ JSON_FINDINGS_TMP=""
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
 AST_RULE_RESULTS_JSON=""
+AST_RULE_DIR=""
 
 # Async error coverage spec (rule ids -> metadata)
 ASYNC_ERROR_RULE_IDS=(js.async.then-no-catch js.async.promiseall-no-try js.async.await-no-try js.async.dangling-promise)
@@ -546,6 +547,30 @@ show_detailed_finding() {
     print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
   done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+ast_count_patterns() {
+  [[ "$HAS_AST_GREP" -eq 1 ]] || return 1
+  local total=0 pattern count
+  for pattern in "$@"; do
+    count="$(ast_search "$pattern" || echo 0)"
+    total=$((total + count))
+  done
+  echo "$total"
+}
+
+show_ast_detailed_patterns() {
+  local limit=${1:-$DETAIL_LIMIT}; shift || true
+  [[ "$HAS_AST_GREP" -eq 1 ]] || return 1
+  local printed=0 pattern
+  for pattern in "$@"; do
+    while IFS=: read -r file line code; do
+      [[ -n "$file" && -n "$line" ]] || continue
+      print_code_sample "$file" "$line" "$code"
+      printed=$((printed + 1))
+      [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && return 0
+    done < <(( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" "$PROJECT_DIR" 2>/dev/null || true ) | head -n "$limit" || true) || true
+  done
 }
 
 run_resource_lifecycle_checks() {
@@ -1479,25 +1504,85 @@ end_scan_section(){
 # ast-grep: detection, rule packs, and wrappers
 # ────────────────────────────────────────────────────────────────────────────
 
-check_ast_grep() {
-  if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
-  # Verify 'sg' is actually ast-grep, not the Unix newgrp command
-  if command -v sg >/dev/null 2>&1 && sg --version 2>&1 | grep -qi "ast-grep"; then
-    AST_GREP_CMD=(sg); HAS_AST_GREP=1; return 0
+verify_ast_grep_bin() {
+  local bin="$1"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  if ! "$bin" --version 2>&1 | grep -qi "ast-grep"; then return 1; fi
+  if ! "$bin" scan -h >/dev/null 2>&1; then return 1; fi
+
+  # UBS depends on JSON-stream output for AST-powered rules. Confirm support for
+  # `--json=stream` via either `run -p` or legacy `--pattern` form.
+  local tmpdir tmpfile
+  tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-ag-verify.XXXXXX)" || return 1
+  tmpfile="$tmpdir/verify.js"
+  printf 'const x = 1; x = 2;\n' >"$tmpfile" 2>/dev/null || true
+
+  if "$bin" run -p '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
+    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf -- "$tmpdir" 2>/dev/null || true
+    return 0
   fi
+  if "$bin" --pattern '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
+    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf -- "$tmpdir" 2>/dev/null || true
+    return 0
+  fi
+
+  [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf -- "$tmpdir" 2>/dev/null || true
+  return 1
+}
+
+check_ast_grep() {
+  if [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" == "1" ]]; then
+    say "${YELLOW}${WARN} UBS_TEST_FORCE_NO_AST_GREP=1 set; forcing ast-grep unavailable (test mode).${RESET}"
+    HAS_AST_GREP=0
+    return 1
+  fi
+
+  if [[ -n "${UBS_AST_GREP_BIN:-}" ]]; then
+    local candidate="${UBS_AST_GREP_BIN}"
+    local resolved=""
+    if [[ -x "$candidate" ]]; then
+      resolved="$candidate"
+    else
+      resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    if [[ -n "$resolved" ]] && verify_ast_grep_bin "$resolved"; then
+      AST_GREP_CMD=("$resolved"); HAS_AST_GREP=1; return 0
+    fi
+    if [[ -n "$resolved" ]]; then
+      say "${YELLOW}${WARN} UBS_AST_GREP_BIN points to a non-ast-grep binary (${resolved}); ignoring.${RESET}"
+    else
+      say "${YELLOW}${WARN} UBS_AST_GREP_BIN is set but not executable or not found: ${candidate}${RESET}"
+    fi
+  fi
+
+  local resolved=""
+  if command -v ast-grep >/dev/null 2>&1; then
+    resolved="$(command -v ast-grep 2>/dev/null || true)"
+    if [[ -n "$resolved" ]] && verify_ast_grep_bin "$resolved"; then
+      AST_GREP_CMD=("$resolved"); HAS_AST_GREP=1; return 0
+    fi
+    [[ -n "$resolved" ]] && say "${YELLOW}${WARN} ast-grep found but is not usable: ${resolved}${RESET}"
+  fi
+
+  if command -v sg >/dev/null 2>&1; then
+    resolved="$(command -v sg 2>/dev/null || true)"
+    if [[ -n "$resolved" ]] && verify_ast_grep_bin "$resolved"; then
+      AST_GREP_CMD=("$resolved"); HAS_AST_GREP=1; return 0
+    fi
+  fi
+
   # Verify npx can actually run ast-grep before trusting it
   if command -v npx >/dev/null 2>&1 && npx -y @ast-grep/cli --version >/dev/null 2>&1; then
     AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0
   fi
-  say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be skipped.${RESET}"
-  say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
   HAS_AST_GREP=0; return 1
 }
 
 ast_search() {
   local pattern=$1
   if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-    ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+    # Count matches via JSON stream to avoid multi-line match inflation.
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) | count_lines
   else
     return 1
   fi
@@ -2139,6 +2224,38 @@ if check_ast_grep; then
   say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
   write_ast_rules || true
 else
+  TS_SENSITIVE_EXTS=()
+  for e in "${_EXT_ARR[@]}"; do
+    e="$(echo "$e" | xargs)"
+    case "$e" in
+      ts|tsx|jsx) TS_SENSITIVE_EXTS+=("$e") ;;
+    esac
+  done
+
+  if [[ "${#TS_SENSITIVE_EXTS[@]}" -gt 0 ]]; then
+    TS_NAME_EXPR=( \( )
+    first=1
+    for e in "${TS_SENSITIVE_EXTS[@]}"; do
+      if [[ $first -eq 1 ]]; then TS_NAME_EXPR+=( -name "*.${e}" ); first=0
+      else TS_NAME_EXPR+=( -o -name "*.${e}" ); fi
+    done
+    TS_NAME_EXPR+=( \) )
+
+    TS_SENSITIVE_MATCH=$(
+      ( set +o pipefail; find "$PROJECT_DIR" -xdev "${EX_PRUNE[@]}" -o \( -type f "${TS_NAME_EXPR[@]}" -print -quit \) 2>/dev/null || true ) \
+      | head -n 1 || true
+    )
+
+    if [[ -n "$TS_SENSITIVE_MATCH" ]]; then
+      echo ""
+      say "${RED}${BOLD}${CROSS} Environment error: ast-grep is required for TS/TSX/JSX scans${RESET}"
+      say "${DIM}Found file: ${WHITE}${TS_SENSITIVE_MATCH}${RESET}"
+      say "${DIM}Without a syntax-aware AST engine, JS/TS scanning is too noisy to be trustworthy.${RESET}"
+      say "${DIM}Fix: install ast-grep (https://ast-grep.github.io/) or re-run the UBS installer.${RESET}"
+      exit 2
+    fi
+  fi
+
   say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
 fi
 
@@ -2269,10 +2386,27 @@ elif [ "$count" -gt 0 ]; then
 fi
 
 print_subheader "Incorrect NaN checks (== NaN instead of Number.isNaN)"
-count=$("${GREP_RN[@]}" -e "(===|==|!==|!=)[[:space:]]*NaN" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+  count="$(ast_count_patterns \
+    '$X === NaN' 'NaN === $X' \
+    '$X == NaN'  'NaN == $X' \
+    '$X !== NaN' 'NaN !== $X' \
+    '$X != NaN'  'NaN != $X' \
+    || echo 0)"
+else
+  count=$("${GREP_RN[@]}" -e "(===|==|!==|!=)[[:space:]]*NaN" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fi
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Direct NaN comparison (always false!)" "Use Number.isNaN(x)"
-  show_detailed_finding "(===|==|!==|!=)[[:space:]]*NaN" 5
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    show_ast_detailed_patterns 5 \
+      '$X === NaN' 'NaN === $X' \
+      '$X == NaN'  'NaN == $X' \
+      '$X !== NaN' 'NaN !== $X' \
+      '$X != NaN'  'NaN != $X'
+  else
+    show_detailed_finding "(===|==|!==|!=)[[:space:]]*NaN" 5
+  fi
 else
   print_finding "good" "No direct NaN comparisons"
 fi
@@ -2370,13 +2504,21 @@ print_category "Detects: Loose equality, type confusion, implicit conversions" \
   "JavaScript's type coercion causes subtle bugs that are hard to debug"
 
 print_subheader "Loose equality (== instead of ===)"
-count=$("${GREP_RN[@]}" -e "(^|[^=!<>])==($|[^=])|(^|[^=!<>])!=($|[^=])" "$PROJECT_DIR" 2>/dev/null \
-  | (grep -vE "===|!==" || true) \
-  | wc -l | awk '{print $1+0}')
-count=${count:-0}
+if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+  count="$(ast_count_patterns '$L == $R' '$L != $R' || echo 0)"
+else
+  count=$("${GREP_RN[@]}" -e "(^|[^=!<>])==($|[^=])|(^|[^=!<>])!=($|[^=])" "$PROJECT_DIR" 2>/dev/null \
+    | (grep -vE "===|!==" || true) \
+    | wc -l | awk '{print $1+0}')
+  count=${count:-0}
+fi
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Loose equality causes type coercion bugs" "Always prefer strict equality"
-  show_detailed_finding "(^|[^=!<>])==($|[^=])|(^|[^=!<>])!=($|[^=])" 5
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    show_ast_detailed_patterns 5 '$L == $R' '$L != $R'
+  else
+    show_detailed_finding "(^|[^=!<>])==($|[^=])|(^|[^=!<>])!=($|[^=])" 5
+  fi
 else
   print_finding "good" "All comparisons use strict equality"
 fi
@@ -2387,11 +2529,107 @@ count=$( ("${GREP_RN[@]}" -e "===[[:space:]]*('|\"|true|false|null)" "$PROJECT_D
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Type comparisons - verify both sides match"; fi
 
 print_subheader "typeof checks with wrong string literals"
-count=$( ("${GREP_RN[@]}" -e "typeof[[:space:]]*\(.+\)[[:space:]]*===?[[:space:]]*['\"][A-Za-z]+['\"]" "$PROJECT_DIR" 2>/dev/null || true) \
-  | (grep -Ev "undefined|string|number|boolean|function|object|symbol|bigint" || true) | count_lines)
+count=0
+typeof_samples=""
+if [[ "$HAS_AST_GREP" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+  typeof_report=$(
+    (
+      set +o pipefail
+      "${AST_GREP_CMD[@]}" --pattern 'typeof $X === $Y' "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern 'typeof $X == $Y'  "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern 'typeof $X !== $Y' "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern 'typeof $X != $Y'  "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern '$Y === typeof $X' "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern '$Y == typeof $X'  "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern '$Y !== typeof $X' "$PROJECT_DIR" --json=stream 2>/dev/null || true
+      "${AST_GREP_CMD[@]}" --pattern '$Y != typeof $X'  "$PROJECT_DIR" --json=stream 2>/dev/null || true
+    ) | python3 -c "$(cat <<'PY'
+import json
+import sys
+
+limit = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+valid = {"undefined", "string", "number", "boolean", "function", "object", "symbol", "bigint"}
+
+count = 0
+samples = []
+seen = set()
+
+def unquote(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) >= 2 and text[0] in ("'", '"') and text[-1] == text[0]:
+        return text[1:-1]
+    return ""
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        continue
+
+    meta = (obj.get("metaVariables") or {}).get("single", {}) or {}
+    y_text = (meta.get("Y") or {}).get("text") or ""
+    y_val = unquote(y_text)
+    if not y_val or y_val in valid:
+        continue
+
+    file_path = obj.get("file") or ""
+    rng = (obj.get("range") or {}).get("start", {}) or {}
+    line_no = int(rng.get("line", 0) or 0) + 1
+    code = (obj.get("lines") or obj.get("text") or "").rstrip().replace("\t", " ")
+
+    key = (file_path, line_no, y_val)
+    if key in seen:
+        continue
+    seen.add(key)
+
+    count += 1
+    if len(samples) < limit:
+        samples.append((file_path, line_no, code))
+
+print(count)
+for file_path, line_no, code in samples:
+    print(f"{file_path}\t{line_no}\t{code}")
+PY
+)" "$DETAIL_LIMIT" 2>/dev/null || true
+  )
+  count=$(printf '%s\n' "$typeof_report" | head -n1 | awk 'END{print $0+0}')
+  typeof_samples=$(printf '%s\n' "$typeof_report" | tail -n +2)
+else
+  typeof_pattern="typeof[[:space:]]*(\\([^)]*\\)|[A-Za-z_$][A-Za-z0-9_$.]*)[[:space:]]*===?[[:space:]]*['\"][A-Za-z]+['\"]"
+  count=$(
+    ( "${GREP_RN[@]}" -e "$typeof_pattern" "$PROJECT_DIR" 2>/dev/null || true ) \
+    | (grep -Ev "undefined|string|number|boolean|function|object|symbol|bigint" || true) \
+    | count_lines
+  )
+  typeof_samples=$(
+    ( "${GREP_RN[@]}" -e "$typeof_pattern" "$PROJECT_DIR" 2>/dev/null || true ) \
+    | (grep -Ev "undefined|string|number|boolean|function|object|symbol|bigint" || true) \
+    | head -n 3 || true
+  )
+fi
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Invalid typeof comparison" "Valid: undefined|string|number|boolean|function|object|symbol|bigint"
-  show_detailed_finding "typeof[[:space:]]*\(.+\)[[:space:]]*===?[[:space:]]*['\"][A-Za-z]+['\"]" 3
+  if [[ -n "$typeof_samples" ]]; then
+    sample_limit=3
+    if printf '%s\n' "$typeof_samples" | head -n1 | grep -q $'\t'; then
+      while IFS=$'\t' read -r sample_path sample_line sample_text; do
+        [ -z "$sample_path" ] && continue
+        print_code_sample "$sample_path" "$sample_line" "$sample_text"
+        sample_limit=$((sample_limit - 1))
+        [ "$sample_limit" -le 0 ] && break
+      done <<<"$typeof_samples"
+    else
+      while IFS=: read -r sample_path sample_line sample_text; do
+        [ -z "$sample_path" ] && continue
+        print_code_sample "$sample_path" "$sample_line" "$sample_text"
+        sample_limit=$((sample_limit - 1))
+        [ "$sample_limit" -le 0 ] && break
+      done <<<"$typeof_samples"
+    fi
+  fi
 fi
 
 print_subheader "Truthy/falsy confusion in conditions"
@@ -2778,10 +3016,18 @@ else
 fi
 
 print_subheader "debugger statements (MUST REMOVE)"
-count=$("${GREP_RNW[@]}" "debugger" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+  count="$(ast_search 'debugger' || echo 0)"
+else
+  count=$("${GREP_RNW[@]}" "debugger" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fi
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "debugger statements in code" "Remove before commit"
-  show_detailed_finding "\bdebugger\b" 5
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    show_ast_detailed_patterns 5 'debugger'
+  else
+    show_detailed_finding "\bdebugger\b" 5
+  fi
 else
   print_finding "good" "No debugger statements"
 fi
@@ -2881,23 +3127,43 @@ fi
 
 print_subheader "Global variable pollution"
 global_pollution_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 root = Path(sys.argv[1]).resolve()
+if not root.exists():
+    print("0")
+    raise SystemExit(0)
+
+base_root = root if root.is_dir() else root.parent
 exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
 
-assign_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=')
-decl_re = re.compile(r'\b(const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)')
-destruct_re = re.compile(r'\b(const|let|var)\s+\{([^}]*)\}')
-func_params_re = re.compile(r'\bfunction\b(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*\(([^)]*)\)')
-class_method_re = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*\{', re.MULTILINE)
+IDENT = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*$')
+ASSIGN_LINE_RE = re.compile(r'^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=')
+DECL_RE = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)')
+FUNC_NAME_RE = re.compile(r'\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\b')
+CLASS_NAME_RE = re.compile(r'\bclass\s+([A-Za-z_$][A-Za-z0-9_$]*)\b')
+CATCH_PARAM_RE = re.compile(r'\bcatch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\b')
+DESTRUCT_OBJ_RE = re.compile(r'\b(?:const|let|var)\s*\{([^}]*)\}')
+DESTRUCT_ARR_RE = re.compile(r'\b(?:const|let|var)\s*\[([^]]*)\]')
+FUNC_PARAMS_RE = re.compile(r'\bfunction\b(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\(([^)]*)\)')
+# Best-effort for class/object methods (TypeScript return types + generics).
+CLASS_METHOD_RE = re.compile(
+    r'^\s*(?:public|private|protected|static|async|get|set|\*)*\s*'
+    r'([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<[^>]+>\s*)?\(([^)]*)\)\s*'
+    r'(?::\s*[^{]+)?\{',
+    re.MULTILINE,
+)
 skip_keywords = {'if', 'for', 'while', 'switch', 'catch', 'with', 'function', 'class'}
-arrow_paren_re = re.compile(r'\(([^)]*)\)\s*=>')
-arrow_single_re = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=>')
+ARROW_PAREN_RE = re.compile(r'\(([^)]*)\)\s*(?::\s*[^=]*?)?\s*=>')
+ARROW_SINGLE_RE = re.compile(r'([A-Za-z_$][A-Za-z0-9_$]*)\s*=>')
 
 def record_params(store, blob):
     for raw in blob.split(','):
@@ -2907,14 +3173,140 @@ def record_params(store, blob):
         if token.startswith('{') or token.startswith('['):
             continue
         token = token.split('=')[0].strip()
+        token = token.split(':')[0].strip()
+        token = token.rstrip('?')
         if token.startswith('...'):
             token = token[3:]
-        if re.match(r'[A-Za-z_][A-Za-z0-9_]*$', token):
+        if IDENT.match(token):
             store.add(token)
 
 issues = []
 
-def scan_file(path):
+@lru_cache(maxsize=4096)
+def declared_for(path_str):
+    path = Path(path_str)
+    try:
+        text = path.read_text(encoding='utf-8')
+    except Exception:
+        try:
+            text = path.read_text(encoding='latin-1')
+        except Exception:
+            return set()
+    declared = set(DECL_RE.findall(text))
+    declared.update(FUNC_NAME_RE.findall(text))
+    declared.update(CLASS_NAME_RE.findall(text))
+    declared.update(CATCH_PARAM_RE.findall(text))
+    for match in DESTRUCT_OBJ_RE.finditer(text):
+        entries = match.group(1).split(',')
+        for entry in entries:
+            token = entry.strip()
+            if not token:
+                continue
+            token = token.split(':')[0].strip()
+            token = token.split('=')[0].strip()
+            token = token.lstrip('*&')
+            token = token.rstrip('?')
+            if IDENT.match(token):
+                declared.add(token)
+    for match in DESTRUCT_ARR_RE.finditer(text):
+        entries = match.group(1).split(',')
+        for entry in entries:
+            token = entry.strip()
+            if not token:
+                continue
+            token = token.split('=')[0].strip()
+            token = token.split(':')[0].strip()
+            token = token.lstrip('*&')
+            token = token.rstrip('?')
+            if IDENT.match(token):
+                declared.add(token)
+    for match in FUNC_PARAMS_RE.finditer(text):
+        record_params(declared, match.group(1))
+    for match in CLASS_METHOD_RE.finditer(text):
+        name = match.group(1)
+        if name in skip_keywords:
+            continue
+        record_params(declared, match.group(2))
+    for match in ARROW_PAREN_RE.finditer(text):
+        record_params(declared, match.group(1))
+    for match in ARROW_SINGLE_RE.finditer(text):
+        token = match.group(1)
+        if token.startswith(('function', 'class')):
+            continue
+        if IDENT.match(token):
+            declared.add(token)
+    return declared
+
+def find_ast_grep_cmd():
+    candidate = os.environ.get("UBS_AST_GREP_BIN") or ""
+    if candidate:
+        resolved = ""
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            resolved = candidate
+        else:
+            resolved = shutil.which(candidate) or ""
+        if resolved:
+            try:
+                out = subprocess.check_output([resolved, "--version"], stderr=subprocess.STDOUT, text=True)
+                if "ast-grep" in out.lower():
+                    return [resolved]
+            except Exception:
+                pass
+
+    for name in ("ast-grep", "sg"):
+        resolved = shutil.which(name)
+        if not resolved:
+            continue
+        if name == "sg":
+            try:
+                out = subprocess.check_output([resolved, "--version"], stderr=subprocess.STDOUT, text=True)
+                if "ast-grep" not in out.lower():
+                    continue
+            except Exception:
+                continue
+        return [resolved]
+
+    npx = shutil.which("npx")
+    if npx:
+        try:
+            out = subprocess.check_output([npx, "-y", "@ast-grep/cli", "--version"], stderr=subprocess.STDOUT, text=True)
+            if "ast-grep" in out.lower():
+                return [npx, "-y", "@ast-grep/cli"]
+        except Exception:
+            pass
+    return None
+
+def iter_ast_assignments(ast_cmd, path):
+    cmd = [*ast_cmd, "run", "--pattern", "$X = $Y", "--json=stream", str(path)]
+    if path.is_dir():
+        for ext in exts:
+            cmd.extend(["--globs", f"**/*{ext}"])
+        for d in skip_dirs:
+            cmd.extend(["--globs", f"!**/{d}/**"])
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        file_path = obj.get("file") or ""
+        if not file_path or not any(file_path.endswith(ext) for ext in exts):
+            continue
+        meta = obj.get("metaVariables", {}).get("single", {})
+        lhs = (meta.get("X") or {}).get("text") or ""
+        if not IDENT.fullmatch(lhs):
+            continue
+        rng = obj.get("range", {}).get("start", {}) or {}
+        line_no = int(rng.get("line", 0) or 0) + 1
+        snippet = (obj.get("lines") or obj.get("text") or "").strip()
+        yield file_path, line_no, lhs, snippet
+    proc.wait()
+
+def scan_file_fallback(path):
     try:
         text = path.read_text(encoding='utf-8')
     except Exception:
@@ -2923,33 +3315,7 @@ def scan_file(path):
         except Exception:
             return
     is_jsx = path.suffix in {'.jsx', '.tsx'}
-    declared = set(name for _, name in decl_re.findall(text))
-    for match in destruct_re.finditer(text):
-        entries = match.group(2).split(',')
-        for entry in entries:
-            token = entry.strip()
-            if not token:
-                continue
-            token = token.split(':')[0].strip()
-            token = token.split('=')[0].strip()
-            token = token.lstrip('*&')
-            if re.match(r'[A-Za-z_][A-Za-z0-9_]*$', token):
-                declared.add(token)
-    for match in func_params_re.finditer(text):
-        record_params(declared, match.group(1))
-    for match in class_method_re.finditer(text):
-        name = match.group(1)
-        if name in skip_keywords:
-            continue
-        record_params(declared, match.group(2))
-    for match in arrow_paren_re.finditer(text):
-        record_params(declared, match.group(1))
-    for match in arrow_single_re.finditer(text):
-        token = match.group(1)
-        if token.startswith(('function', 'class')):
-            continue
-        if re.match(r'[A-Za-z_][A-Za-z0-9_]*$', token):
-            declared.add(token)
+    declared = declared_for(str(path))
     lines = text.splitlines()
     for idx, line in enumerate(lines, 1):
         stripped = line.strip()
@@ -2958,7 +3324,7 @@ def scan_file(path):
         # Heuristic: skip JSX attributes/props to avoid false positives
         if is_jsx and '<' in stripped and '>' in stripped:
             continue
-        match = assign_re.match(line)
+        match = ASSIGN_LINE_RE.match(line)
         if not match:
             continue
         prefix = line[:match.start(1)]
@@ -2969,18 +3335,35 @@ def scan_file(path):
             continue
         issues.append((path, idx, stripped))
 
-for dirpath, dirnames, filenames in os.walk(root):
-    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
-    for fname in filenames:
-        lower = fname.lower()
-        if not any(lower.endswith(ext) for ext in exts):
+ast_cmd = find_ast_grep_cmd()
+if ast_cmd:
+    for file_path, line_no, name, snippet in iter_ast_assignments(ast_cmd, root):
+        fpath = Path(file_path)
+        if not fpath.is_absolute():
+            fpath = (base_root / fpath).resolve()
+        if fpath.suffix.lower() not in exts:
             continue
-        scan_file(Path(dirpath) / fname)
+        declared = declared_for(str(fpath))
+        if name in declared:
+            continue
+        issues.append((fpath, line_no, snippet))
+else:
+    if root.is_file():
+        if root.suffix.lower() in exts:
+            scan_file_fallback(root)
+    else:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            for fname in filenames:
+                lower = fname.lower()
+                if not any(lower.endswith(ext) for ext in exts):
+                    continue
+                scan_file_fallback(Path(dirpath) / fname)
 
 print(len(issues))
 for path, line_no, text in issues[:25]:
     try:
-        rel = path.relative_to(root)
+        rel = path.relative_to(base_root)
     except ValueError:
         rel = path
     safe_text = text.replace('\t', ' ').strip()

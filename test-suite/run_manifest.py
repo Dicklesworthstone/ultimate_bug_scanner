@@ -76,11 +76,41 @@ def parse_text_summary(stdout: str, project_label: str) -> Optional[Dict[str, An
     }
 
 
+def parse_module_text_summary(stdout: str, project_label: str) -> Optional[Dict[str, Any]]:
+    marker = "Summary Statistics:"
+    if marker not in stdout:
+        return None
+    block = stdout.split(marker, 1)[-1]
+    files = re.search(r"Files scanned:\s+(\d+)", block)
+    critical = re.search(r"Critical issues:\s+(\d+)", block)
+    warning = re.search(r"Warning issues:\s+(\d+)", block)
+    info = re.search(r"Info items:\s+(\d+)", block)
+    if not (files and critical and warning and info):
+        return None
+    return {
+        "project": project_label,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "totals": {
+            "files": int(files.group(1)),
+            "critical": int(critical.group(1)),
+            "warning": int(warning.group(1)),
+            "info": int(info.group(1)),
+        },
+    }
+
+
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def check_expectations(expect: Dict[str, Any], exit_code: int, summary: Optional[Dict[str, Any]], stdout: str, fail_on_warning: bool) -> List[str]:
+def check_expectations(
+    expect: Dict[str, Any],
+    exit_code: int,
+    summary: Optional[Dict[str, Any]],
+    stdout: str,
+    stderr: str,
+    fail_on_warning: bool,
+) -> List[str]:
     errors: List[str] = []
     derived_exit = exit_code
     if summary and isinstance(summary, dict):
@@ -95,7 +125,14 @@ def check_expectations(expect: Dict[str, Any], exit_code: int, summary: Optional
             derived_exit = 1
     if expect:
         need = expect.get("exit_code")
-        if need == "zero" and derived_exit != 0:
+        if isinstance(need, int):
+            if exit_code != need:
+                errors.append(f"expected exit {need} but got {exit_code}")
+        elif isinstance(need, str) and need.isdigit():
+            expected_code = int(need)
+            if exit_code != expected_code:
+                errors.append(f"expected exit {expected_code} but got {exit_code}")
+        elif need == "zero" and derived_exit != 0:
             errors.append(f"expected exit 0 but derived {derived_exit}")
         elif need == "nonzero" and derived_exit == 0:
             errors.append("expected non-zero exit but derived 0")
@@ -115,6 +152,12 @@ def check_expectations(expect: Dict[str, Any], exit_code: int, summary: Optional
     for substring in (expect or {}).get("forbid_substrings", []) or []:
         if substring in stdout:
             errors.append(f"forbidden substring '{substring}' present in stdout")
+    for substring in (expect or {}).get("require_substrings_stderr", []) or []:
+        if substring not in stderr:
+            errors.append(f"missing substring '{substring}' in stderr")
+    for substring in (expect or {}).get("forbid_substrings_stderr", []) or []:
+        if substring in stderr:
+            errors.append(f"forbidden substring '{substring}' present in stderr")
     return errors
 
 
@@ -175,7 +218,9 @@ def main() -> None:
         case_path_abs = resolve_path(REPO_ROOT, case["path"])
         case_path_arg = os.path.relpath(case_path_abs, REPO_ROOT)
         case_args = case.get("args", [])
-        cmd = [str(ubs_path), *default_args, *case_args, case_path_arg]
+        case_ubs_bin = case.get("ubs_bin")
+        case_ubs_path = resolve_path(manifest_dir, case_ubs_bin) if case_ubs_bin else ubs_path
+        cmd = [str(case_ubs_path), *default_args, *case_args, case_path_arg]
         env = os.environ.copy()
         env.update(default_env)
         env.update({k: str(v) for k, v in (case.get("env", {}) or {}).items()})
@@ -184,11 +229,23 @@ def main() -> None:
 
         artifacts_dir = artifacts_root / case_id
         ensure_dir(artifacts_dir)
+        shims = case.get("bin_shims") or {}
         stdout_path = artifacts_dir / "stdout.log"
         stderr_path = artifacts_dir / "stderr.log"
         summary_path = artifacts_dir / "result.json"
 
         start = time.time()
+        if shims:
+            shim_dir = artifacts_dir / "bin_shims"
+            ensure_dir(shim_dir)
+            for name, body in shims.items():
+                shim_path = shim_dir / name
+                shim_path.write_text(str(body))
+                try:
+                    shim_path.chmod(0o755)
+                except OSError:
+                    pass
+            env["PATH"] = f"{shim_dir}{os.pathsep}{env.get('PATH', '')}"
         proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True, env=env)
         duration = time.time() - start
         stdout_path.write_text(proc.stdout)
@@ -198,7 +255,11 @@ def main() -> None:
         if summary is None:
             summary = parse_text_summary(proc.stdout, case_path_arg)
             if summary is None:
-                summary_error = "Unable to parse UBS output"
+                summary = parse_module_text_summary(proc.stdout, case_path_arg)
+            if summary is None:
+                allow_unparseable = bool((case.get("expect") or {}).get("allow_unparseable_output", False))
+                if not allow_unparseable:
+                    summary_error = "Unable to parse UBS output"
         summary_blob = {
             "id": case_id,
             "command": cmd,
@@ -209,7 +270,14 @@ def main() -> None:
         summary_path.write_text(json.dumps(summary_blob, indent=2))
 
         fail_on_warning = any(arg == "--fail-on-warning" for arg in cmd)
-        errors = check_expectations(case.get("expect", {}), proc.returncode, summary if isinstance(summary, dict) else None, proc.stdout, fail_on_warning)
+        errors = check_expectations(
+            case.get("expect", {}),
+            proc.returncode,
+            summary if isinstance(summary, dict) else None,
+            proc.stdout,
+            proc.stderr,
+            fail_on_warning,
+        )
         status = "pass"
         if summary_error:
             errors.append(summary_error)

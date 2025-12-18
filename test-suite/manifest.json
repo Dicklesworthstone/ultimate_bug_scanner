@@ -94,6 +94,93 @@
       }
     },
     {
+      "id": "js-module-buggy-ast-grep-path-shim",
+      "description": "Regression: ignore bogus ast-grep earlier in PATH and still run verified JS AST analysis.",
+      "path": "test-suite/js/buggy",
+      "language": "js",
+      "tags": [
+        "js",
+        "ast-grep",
+        "tooling",
+        "regression"
+      ],
+      "args": [
+        "--only=js"
+      ],
+      "bin_shims": {
+        "ast-grep": "#!/usr/bin/env bash\nif [[ \"${1:-}\" == \"--version\" ]]; then\n  echo \"ast-grep 0.0.0\"\n  exit 0\nfi\nexit 64\n"
+      },
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          },
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "SECURITY VULNERABILITIES"
+        ],
+        "require_substrings_stderr": [
+          "ast-grep ("
+        ],
+        "forbid_substrings_stderr": [
+          "bin_shims/ast-grep"
+        ]
+      }
+    },
+    {
+      "id": "js-module-env-error-missing-ast-grep-jsx",
+      "description": "Regression: JS module must fail fast (exit 2) when JSX/TS/TSX is present but ast-grep is unavailable.",
+      "path": "test-suite/frameworks/react",
+      "language": "js",
+      "tags": [
+        "js",
+        "ast-grep",
+        "env-error",
+        "regression"
+      ],
+      "ubs_bin": "../modules/ubs-js.sh",
+      "env": {
+        "UBS_TEST_FORCE_NO_AST_GREP": "1"
+      },
+      "args": [],
+      "expect": {
+        "exit_code": 2,
+        "allow_unparseable_output": true,
+        "require_substrings": [
+          "Environment error: ast-grep is required for TS/TSX/JSX scans"
+        ],
+        "forbid_substrings": [
+          "regex fallback mode"
+        ]
+      }
+    },
+    {
+      "id": "js-typeof-invalid-string-literals-detected",
+      "description": "Regression: detect invalid typeof string literals (non-parenthesized typeof form) via AST-confirmed matches.",
+      "path": "test-suite/buggy/05-type-coercion.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "typeof",
+        "ast-grep",
+        "regression"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": [
+          "Invalid typeof comparison"
+        ]
+      }
+    },
+    {
       "id": "js-module-clean",
       "description": "module-specific clean fixture (allows single warning until tuned).",
       "path": "test-suite/js/clean",
@@ -652,6 +739,28 @@
             "max": 0
           }
         }
+      }
+    },
+    {
+      "id": "js-jsx-multiline-props-no-global-pollution",
+      "description": "JSX multiline props should not trigger global variable pollution false positives.",
+      "path": "test-suite/frameworks/react/clean-component.jsx",
+      "language": "js",
+      "tags": [
+        "js",
+        "jsx",
+        "react",
+        "global-pollution",
+        "regression"
+      ],
+      "args": [
+        "--only=js"
+      ],
+      "expect": {
+        "forbid_substrings": [
+          "Global variable assignments",
+          "Possible global variable pollution"
+        ]
       }
     },
     {

@@ -21,11 +21,26 @@ declare -A MODULE_CHECKSUMS=(
   [cpp]='b451503aa899e0b79aa6328eb0af11730ce0c4b5e95e5db4839293adc64c7e93'
   [golang]='5b57e9880a9ce20726fda62ff317d32d6972686fdc9ede68bfab133cae1d34be'
   [java]='4bd80dcf4a91f230038c97cf177610b3fa1481d9e9759cd134b15fe0510af22b'
-  [js]='e06841bebf109b7b075eb74c3957c2a748ea2f83b85677e8312b231c670b1cdb'
+  [js]='d0eb5bfc0b59111addd6eb6ef3b4d771d0317574519c461d4c7110261b94106c'
   [python]='4413e8a0a91f379e4c91b5d4b8dc0ee3f97793818753c3e33971f5c3cb527e05'
   [ruby]='3756886cfbb9c8838ef965dc0e323b878b2b6a707b4e58e4646039f25f680026'
   [rust]='e1502d38d4d2899a8a51397311b4026e5934f73e22ea28b9004556a8ec3ae620'
   [swift]='b6918b42391ff54c9ee8166c23cf06ba77bb61168a439986e83c8b3332d828ca'
+)
+
+# Pinned ast-grep release for tool-cache auto-provisioning (JS/TS accuracy).
+AST_GREP_VERSION="0.40.1"
+AST_GREP_BASE_URL="https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}"
+TOOLS_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/tools"
+TOOLS_DIR="${UBS_TOOLS_DIR:-$TOOLS_DIR_DEFAULT}"
+
+# Known-good ast-grep asset digests (sha256) for supply-chain verification.
+declare -A AST_GREP_ASSET_SHA256=(
+  [aarch64-apple-darwin]='d40d260d6a2c6c6963079e79d3c57e7988b2de08edca7cfa6c270b5fef591dd7'
+  [x86_64-apple-darwin]='1ffefbce66ceb4eabd307157ca02991d9734adfb43ac9f4b298788e935b6e04a'
+  [aarch64-unknown-linux-gnu]='24f7d0a99dfa45cf65c6e175e1bceaac24f04d2b84807d832c4205a17d2270ab'
+  [x86_64-unknown-linux-gnu]='774d6080dedbf8859a51e78d2be1cb84715454627b3995c2ff533ed755975012'
+  [x86_64-pc-windows-msvc]='4ac3d772c3d87aff8913708219ad3ca73cff2fff4846fd12f9967e87e55fc94e'
 )
 
 # Colors (respect NO_COLOR or non-tty)
@@ -113,6 +128,8 @@ SESSION_RAW=0
 SESSION_LOG_DIR_OVERRIDE=""
 VERIFY_MODULE_ERR=""
 ALL_LANGS=(js python cpp rust golang java ruby swift)
+UPDATE_ONLY=0
+FORCE_SELF_UPDATE=0
 CATEGORY_FILTER=""
 COMPARISON_FILE=""
 REPORT_JSON_PATH=""
@@ -128,6 +145,10 @@ SHOW_VERSION=0
 BEADS_JSONL_PATH=""
 SUGGEST_IGNORE=0
 JSONL_DETAIL=1               # 1=include findings, 0=summary only (for backward compat)
+
+# Tool cache / JS AST engine
+AST_GREP_BIN=""
+AST_GREP_SOURCE=""
 
 if [[ "${1:-}" == "doctor" ]]; then
   MODE="doctor"
@@ -149,6 +170,7 @@ Options:
   --ci                    CI mode (stable timestamps)
   --fail-on-warning       Exit non-zero if warnings or critical exist
   -v, --verbose           Pass -v to child scanners (if supported)
+  -q, --quiet             Reduce console output (also passes -q to scanners)
   --only=CSV              Restrict to languages: js,python,cpp,rust,golang,java,ruby,swift
   --exclude=CSV           Exclude languages
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
@@ -159,6 +181,8 @@ Options:
   --beads-jsonl=FILE      Also write combined findings to JSONL for Beads/strung
   --jsonl-summary-only    JSONL output: emit only summary counts, no individual findings
   --suggest-ignore        Print large-directory ignore suggestions (without modifying files)
+  --update                Update the installed ubs binary and exit
+  --non-interactive       No-op (accepted for installer/cron compatibility)
   --update-modules        Force re-download of modules before run
   --jobs=N                Parallelism hint (passed to children if supported)
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
@@ -302,6 +326,8 @@ else
       --fail-on-warning) FAIL_ON_WARNING=1; shift;;
       -v|--verbose) VERBOSE=1; shift;;
       -q|--quiet) QUIET=1; shift;;
+      --update) UPDATE_ONLY=1; FORCE_SELF_UPDATE=1; shift;;
+      --non-interactive) shift;;
       --only=*) ONLY_LANGS="${1#*=}"; shift;;
       --exclude=*) EXCLUDE_LANGS="${1#*=}"; shift;;
       --category=*) CATEGORY_FILTER="${1#*=}"; shift;;
@@ -350,22 +376,26 @@ else
         shift;;
     esac
   done
-  if [[ -d "$PROJECT_DIR" ]]; then
-    if ! PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)"; then
-      say "${RED}$X cannot access project directory${RESET}: $PROJECT_DIR"
-      exit 2
-    fi
-  elif [[ -f "$PROJECT_DIR" ]]; then
-    proj_dir="$(dirname "$PROJECT_DIR")"
-    proj_base="$(basename "$PROJECT_DIR")"
-    if ! proj_dir="$(cd "$proj_dir" 2>/dev/null && pwd -P)"; then
-      say "${RED}$X cannot access project path${RESET}: $PROJECT_DIR"
-      exit 2
-    fi
-    PROJECT_DIR="$proj_dir/$proj_base"
+  if [[ "$UPDATE_ONLY" -eq 1 ]]; then
+    PROJECT_DIR="$(pwd -P)"
   else
-    say "${RED}$X path not found${RESET}: $PROJECT_DIR"
-    exit 2
+    if [[ -d "$PROJECT_DIR" ]]; then
+      if ! PROJECT_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd -P)"; then
+        say "${RED}$X cannot access project directory${RESET}: $PROJECT_DIR"
+        exit 2
+      fi
+    elif [[ -f "$PROJECT_DIR" ]]; then
+      proj_dir="$(dirname "$PROJECT_DIR")"
+      proj_base="$(basename "$PROJECT_DIR")"
+      if ! proj_dir="$(cd "$proj_dir" 2>/dev/null && pwd -P)"; then
+        say "${RED}$X cannot access project path${RESET}: $PROJECT_DIR"
+        exit 2
+      fi
+      PROJECT_DIR="$proj_dir/$proj_base"
+    else
+      say "${RED}$X path not found${RESET}: $PROJECT_DIR"
+      exit 2
+    fi
   fi
 fi
 SOURCE_PROJECT_DIR="$PROJECT_DIR"
@@ -604,6 +634,231 @@ compute_sha256(){
   return 1
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool cache: ast-grep (JS/TS accuracy)
+# ─────────────────────────────────────────────────────────────────────────────
+detect_os_target(){
+  local raw
+  raw="$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  case "$raw" in
+    darwin) echo "apple-darwin"; return 0 ;;
+    linux) echo "unknown-linux-gnu"; return 0 ;;
+    msys*|mingw*|cygwin*) echo "pc-windows-msvc"; return 0 ;;
+  esac
+  return 1
+}
+
+detect_arch_target(){
+  local raw
+  raw="$(uname -m 2>/dev/null)"
+  case "$raw" in
+    x86_64|amd64) echo "x86_64"; return 0 ;;
+    arm64|aarch64) echo "aarch64"; return 0 ;;
+  esac
+  return 1
+}
+
+ast_grep_target_triple(){
+  local arch os
+  arch="$(detect_arch_target)" || return 1
+  os="$(detect_os_target)" || return 1
+  echo "${arch}-${os}"
+}
+
+find_ast_grep_in_path(){
+  local -a dirs
+  IFS=':' read -r -a dirs <<<"${PATH:-}"
+  local name dir candidate
+  for name in ast-grep sg; do
+    for dir in "${dirs[@]}"; do
+      [[ -n "$dir" ]] || continue
+      candidate="$dir/$name"
+      [[ -x "$candidate" ]] || continue
+      if verify_ast_grep_bin "$candidate"; then
+        echo "$candidate"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+download_url_to_file(){
+  local url="$1" dest="$2"
+  if need_cmd curl; then
+    curl -fsSL "$url" -o "$dest"
+    return 0
+  fi
+  if need_cmd wget; then
+    wget -q "$url" -O "$dest"
+    return 0
+  fi
+  return 1
+}
+
+extract_zip_member(){
+  local zip_path="$1" member="$2" out_path="$3"
+  if need_cmd python3; then
+    python3 - "$zip_path" "$member" "$out_path" <<'PY' 2>/dev/null || return 1
+import sys, zipfile
+from pathlib import Path
+
+zip_path, member, out_path = sys.argv[1:4]
+z = zipfile.ZipFile(zip_path)
+if member not in z.namelist():
+    raise SystemExit(2)
+dest = Path(out_path)
+dest.parent.mkdir(parents=True, exist_ok=True)
+with z.open(member) as src, dest.open('wb') as out:
+    out.write(src.read())
+PY
+    return 0
+  fi
+  if need_cmd unzip; then
+    unzip -p "$zip_path" "$member" >"$out_path"
+    return 0
+  fi
+  return 1
+}
+
+ensure_ast_grep_tool_cache(){
+  local target expected asset url tool_root zip_path bin_name bin_path
+  target="$(ast_grep_target_triple)" || return 1
+  expected="${AST_GREP_ASSET_SHA256[$target]:-}"
+  [[ -n "$expected" ]] || return 1
+
+  asset="app-${target}.zip"
+  url="${AST_GREP_BASE_URL}/${asset}"
+  tool_root="$TOOLS_DIR/ast-grep/${AST_GREP_VERSION}/${target}"
+  zip_path="$tool_root/$asset"
+
+  bin_name="ast-grep"
+  if [[ "$target" == *pc-windows-msvc ]]; then
+    bin_name="ast-grep.exe"
+  fi
+  bin_path="$tool_root/$bin_name"
+
+  ensure_dir "$tool_root"
+
+  local need_download=0
+  if [[ ! -f "$zip_path" ]]; then
+    need_download=1
+  else
+    local current_sha
+    if ! current_sha="$(compute_sha256 "$zip_path")"; then
+      return 2
+    fi
+    [[ "$current_sha" == "$expected" ]] || need_download=1
+  fi
+
+  if [[ "$need_download" -eq 1 ]]; then
+    [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading ast-grep ${AST_GREP_VERSION} (${target})..."
+    local tmp_zip
+    tmp_zip="$(mktemp -t ubs-ast-grep.XXXXXX 2>/dev/null || mktemp)"
+    if ! download_url_to_file "$url" "$tmp_zip"; then
+      say_err "${RED}${X}${RESET} failed to download ast-grep: $url"
+      say_err "${DIM}Install ast-grep manually (https://ast-grep.github.io/) or re-run install.sh.${RESET}"
+      return 1
+    fi
+    local sha
+    if ! sha="$(compute_sha256 "$tmp_zip")"; then
+      say_err "${RED}${X}${RESET} cannot verify ast-grep download (no sha256 tool available)"
+      return 2
+    fi
+    if [[ "$sha" != "$expected" ]]; then
+      say_err "${RED}${X}${RESET} ast-grep checksum mismatch for ${asset}"
+      say_err "${DIM}Expected: ${expected}${RESET}"
+      say_err "${DIM}Got:      ${sha}${RESET}"
+      return 1
+    fi
+    mv "$tmp_zip" "$zip_path"
+  fi
+
+  if ! extract_zip_member "$zip_path" "$bin_name" "$bin_path"; then
+    say_err "${RED}${X}${RESET} failed to extract ${bin_name} from ${zip_path}"
+    return 1
+  fi
+  chmod +x "$bin_path" 2>/dev/null || true
+  if ! verify_ast_grep_bin "$bin_path"; then
+    say_err "${RED}${X}${RESET} extracted ast-grep did not execute correctly: $bin_path"
+    return 1
+  fi
+  echo "$bin_path"
+}
+
+ensure_ast_grep(){
+  local found
+  if found="$(find_ast_grep_in_path)"; then
+    AST_GREP_BIN="$found"
+    AST_GREP_SOURCE="path"
+    return 0
+  fi
+
+  local target
+  target="$(ast_grep_target_triple)" || {
+    say_err "${RED}${X}${RESET} Environment error: unsupported platform for ast-grep tool cache"
+    return 1
+  }
+
+  if [[ -z "${AST_GREP_ASSET_SHA256[$target]:-}" ]]; then
+    say_err "${RED}${X}${RESET} Environment error: no ast-grep asset configured for $target"
+    return 1
+  fi
+  if ! ( need_cmd curl || need_cmd wget ); then
+    say_err "${RED}${X}${RESET} Environment error: need curl or wget to auto-provision ast-grep"
+    return 1
+  fi
+  if ! checksum_tool_name >/dev/null 2>&1; then
+    say_err "${RED}${X}${RESET} Environment error: need sha256sum, shasum, or openssl to verify ast-grep downloads"
+    return 1
+  fi
+  if ! ( need_cmd python3 || need_cmd unzip ); then
+    say_err "${RED}${X}${RESET} Environment error: need python3 or unzip to extract ast-grep tool cache"
+    return 1
+  fi
+
+  found="$(ensure_ast_grep_tool_cache)" || return $?
+  AST_GREP_BIN="$found"
+  AST_GREP_SOURCE="cache"
+  return 0
+}
+
+ast_grep_cached_bin_path(){
+  local target bin_name
+  target="$(ast_grep_target_triple)" || return 1
+  bin_name="ast-grep"
+  if [[ "$target" == *pc-windows-msvc ]]; then
+    bin_name="ast-grep.exe"
+  fi
+  echo "$TOOLS_DIR/ast-grep/${AST_GREP_VERSION}/${target}/${bin_name}"
+}
+
+verify_ast_grep_bin(){
+  local bin="$1"
+  [[ -n "$bin" && -x "$bin" ]] || return 1
+  "$bin" --version 2>&1 | grep -qi "ast-grep" || return 1
+  "$bin" scan -h >/dev/null 2>&1 || return 1
+
+  # UBS depends on JSON-stream output for AST-powered rules. Confirm the binary
+  # supports `--json=stream` (via either `run -p` or the legacy `--pattern` form).
+  local tmpdir tmpfile
+  tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-ag-verify.XXXXXX)" || return 1
+  tmpfile="$tmpdir/verify.js"
+  printf 'const x = 1; x = 2;\n' >"$tmpfile" 2>/dev/null || true
+
+  if "$bin" run -p '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
+    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
+    return 0
+  fi
+  if "$bin" --pattern '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
+    [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
+    return 0
+  fi
+
+  [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
+  return 1
+}
+
 apply_inline_suppressions(){
   if ! need_cmd python3; then cat; return 0; fi
   local py_script
@@ -758,6 +1013,7 @@ run_doctor(){
   DOCTOR_WARNINGS=0
   say "${BOLD}UBS Doctor${RESET}"
   doctor_report info "Module cache: ${DIM}$MODULE_DIR${RESET}"
+  doctor_report info "Tool cache:   ${DIM}$TOOLS_DIR${RESET}"
 
   local checksum_tool
   if checksum_tool=$(checksum_tool_name); then
@@ -778,6 +1034,55 @@ run_doctor(){
     doctor_report ok "Module cache is writable"
   else
     doctor_report err "Module cache is not writable: $MODULE_DIR"
+  fi
+
+  # External dependency readiness (JS/TS AST engine)
+  local ast_bin="" ast_source="" ast_version=""
+  if [[ -n "${UBS_AST_GREP_BIN:-}" ]]; then
+    if [[ -x "${UBS_AST_GREP_BIN}" ]]; then
+      ast_bin="${UBS_AST_GREP_BIN}"
+      ast_source="env"
+    else
+      local resolved
+      resolved="$(command -v "${UBS_AST_GREP_BIN}" 2>/dev/null || true)"
+      if [[ -n "$resolved" && -x "$resolved" ]]; then
+        ast_bin="$resolved"
+        ast_source="env"
+      fi
+    fi
+  fi
+  if [[ -z "$ast_bin" ]]; then
+    if ast_bin="$(find_ast_grep_in_path 2>/dev/null)"; then
+      ast_source="path"
+    else
+      ast_bin=""
+    fi
+  fi
+  if [[ -z "$ast_bin" ]]; then
+    local cached
+    cached="$(ast_grep_cached_bin_path 2>/dev/null || true)"
+    if [[ -n "$cached" && -x "$cached" ]]; then
+      ast_bin="$cached"
+      ast_source="cache"
+    fi
+  fi
+
+  if [[ -n "$ast_bin" ]] && verify_ast_grep_bin "$ast_bin"; then
+    ast_version="$("$ast_bin" --version 2>/dev/null | head -n 1 || true)"
+    doctor_report ok "ast-grep: ready (${ast_source}) ${DIM}${ast_version}${RESET}"
+    doctor_report info "ast-grep bin: ${DIM}$ast_bin${RESET}"
+  else
+    if [[ "$fix" -eq 1 ]]; then
+      if ensure_ast_grep; then
+        ast_version="$("$AST_GREP_BIN" --version 2>/dev/null | head -n 1 || true)"
+        doctor_report ok "ast-grep: installed (${AST_GREP_SOURCE}) ${DIM}${ast_version}${RESET}"
+        doctor_report info "ast-grep bin: ${DIM}${AST_GREP_BIN}${RESET}"
+      else
+        doctor_report err "ast-grep: missing/unusable (JS/TS scans will fail)."
+      fi
+    else
+      doctor_report warn "ast-grep: missing/unusable (JS/TS scans will fail). Run: ubs doctor --fix"
+    fi
   fi
 
   local lang module_path verify_status
@@ -886,7 +1191,7 @@ if [[ "$MODE" == "sessions" ]]; then
   exit 0
 fi
 
-if [[ "$MODE" != "doctor" ]]; then
+if [[ "$MODE" != "doctor" && "$UPDATE_ONLY" -eq 0 ]]; then
   if [[ -z "$IGNORE_FILE" && -f "$SOURCE_PROJECT_DIR/.ubsignore" ]]; then
     IGNORE_FILE="$SOURCE_PROJECT_DIR/.ubsignore"
   fi
@@ -1042,7 +1347,7 @@ ensure_module(){
 # ─────────────────────────────────────────────────────────────────────────────
 check_and_update_self(){
   # Skip if explicitly disabled
-  if [[ "${UBS_NO_AUTO_UPDATE:-0}" -eq 1 || "${CI_MODE:-0}" -eq 1 ]]; then return 0; fi
+  if [[ "${FORCE_SELF_UPDATE:-0}" -eq 0 && ( "${UBS_NO_AUTO_UPDATE:-0}" -eq 1 || "${CI_MODE:-0}" -eq 1 ) ]]; then return 0; fi
   
   # Only update if we're running the installed binary (not a local repo script)
   # Heuristic: if the script dir contains .git, we're likely in a dev environment
@@ -1057,7 +1362,7 @@ check_and_update_self(){
   ensure_dir "$(dirname "$last_check_file")"
 
   # Check at most once every 24 hours
-  if [[ -f "$last_check_file" ]]; then
+  if [[ "${FORCE_SELF_UPDATE:-0}" -eq 0 && -f "$last_check_file" ]]; then
     local last_check
     last_check=$(cat "$last_check_file" 2>/dev/null || echo 0)
     local now
@@ -1127,6 +1432,11 @@ fi
 
 # Run auto-update before main logic
 check_and_update_self "$@"
+
+if [[ "$UPDATE_ONLY" -eq 1 ]]; then
+  [[ "${QUIET:-0}" -eq 0 ]] && say_err "${GREEN}${CHECK}${RESET} Update check complete."
+  exit 0
+fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Execution / aggregation
@@ -1582,6 +1892,23 @@ langs=( $(select_langs) )
 if [[ ${#langs[@]} -eq 0 ]]; then say "${YELLOW}${WARN}${RESET} no recognizable languages in ${PROJECT_DIR}"; exit 0; fi
 say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
 
+# Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
+if [[ " ${langs[*]} " == *" js "* ]]; then
+  if ensure_ast_grep; then
+    export UBS_AST_GREP_BIN="$AST_GREP_BIN"
+    if [[ "${QUIET:-0}" -eq 0 ]]; then
+      say_err "${DIM}${INFO}${RESET} ast-grep (${AST_GREP_SOURCE}): ${AST_GREP_BIN}"
+    fi
+  else
+    say_err "${RED}${X}${RESET} Environment error: ast-grep is required for accurate JS/TS scanning."
+    say_err "${DIM}Fix: install ast-grep (https://ast-grep.github.io/) or run the UBS installer.${RESET}"
+    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" ]]; then
+      printf '{"error":"environment","exit_code":2,"failed_modules":["js"]}\n'
+    fi
+    exit 2
+  fi
+fi
+
 # Resolve & ensure modules
 declare -A MODULE_PATHS
 for L in "${langs[@]}"; do
@@ -1593,14 +1920,19 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 # Execute modules concurrently
 # ─────────────────────────────────────────────────────────────────────────────
+declare -A PID_LANG=()
 pids=()
 for L in "${langs[@]}"; do
   run_lang "$L" "${MODULE_PATHS[$L]}" "$FORMAT" &
-  pids+=($!)
+  pid=$!
+  pids+=("$pid")
+  PID_LANG["$pid"]="$L"
 done
 
 # Wait & collect statuses
 status=0
+HAS_ENV_ERROR=0
+ENV_ERROR_LANGS=()
 for pid in "${pids[@]}"; do
   rc=0
   if wait "$pid"; then
@@ -1608,35 +1940,110 @@ for pid in "${pids[@]}"; do
   else
     rc=$?
   fi
+  if [[ "$rc" -eq 2 ]]; then
+    HAS_ENV_ERROR=1
+    ENV_ERROR_LANGS+=("${PID_LANG[$pid]:-unknown}")
+  fi
   if [[ "$rc" -gt "$status" ]]; then
     status="$rc"
   fi
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Environment error handling (exit code 2)
+# ─────────────────────────────────────────────────────────────────────────────
+json_escape(){
+  local s="${1:-}"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+env_error_excerpt(){
+  local lang="$1"
+  local err_file="$TMPDIR_RUN/$lang.err"
+  local txt_file="$TMPDIR_RUN/$lang.txt"
+  if [[ -s "$err_file" ]]; then
+    sed -E 's/\x1B\[[0-9;]*[mK]//g' "$err_file" | tail -n 50
+    return 0
+  fi
+  if [[ -s "$txt_file" ]]; then
+    sed -E 's/\x1B\[[0-9;]*[mK]//g' "$txt_file" \
+      | awk 'f{print} /Environment error:/{f=1}' \
+      | tail -n 50
+  fi
+}
+
+emit_env_error_report(){
+  say_err "${RED}${X}${RESET} Environment error: one or more scanners could not run correctly."
+  say_err "${DIM}This is a tooling/dependency problem, not a code-quality failure.${RESET}"
+  for lang in "${ENV_ERROR_LANGS[@]}"; do
+    say_err ""
+    say_err "${RED}${X}${RESET} ${BOLD}${lang}${RESET} (exit 2)"
+    env_error_excerpt "$lang" | sed 's/^/  /' >&2 || true
+  done
+}
+
+emit_env_error_json(){
+  local proj; proj="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
+  local modules_json=""
+  local first=1
+  for lang in "${ENV_ERROR_LANGS[@]}"; do
+    local lang_json; lang_json="$(json_escape "$lang")"
+    if [[ $first -eq 1 ]]; then
+      modules_json="\"$lang_json\""
+      first=0
+    else
+      modules_json+=",\"$lang_json\""
+    fi
+  done
+  printf '{"error":"environment","exit_code":2,"project":"%s","failed_modules":[%s]}\n' "$proj" "$modules_json"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Emit unified result
 # ─────────────────────────────────────────────────────────────────────────────
 case "$FORMAT" in
   json)
-    if generate_combined_json; then
-      cat "$COMBINED_JSON_FILE"
+    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+      emit_env_error_report
+      emit_env_error_json
+      status=2
     else
-      if ! merge_json_scanners; then
-        say "${RED}$X could not produce combined JSON${RESET}"
-        [[ "$status" -lt 1 ]] && status=1
+      if generate_combined_json; then
+        cat "$COMBINED_JSON_FILE"
+      else
+        if ! merge_json_scanners; then
+          say "${RED}$X could not produce combined JSON${RESET}"
+          [[ "$status" -lt 1 ]] && status=1
+        fi
       fi
     fi
     ;;
   jsonl)
-    if write_jsonl_summary ""; then
-      :
+    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+      emit_env_error_report
+      emit_env_error_json
+      status=2
     else
-      say "${RED}$X could not produce JSONL output${RESET}"
-      [[ "$status" -lt 1 ]] && status=1
+      if write_jsonl_summary ""; then
+        :
+      else
+        say "${RED}$X could not produce JSONL output${RESET}"
+        [[ "$status" -lt 1 ]] && status=1
+      fi
     fi
     ;;
   sarif)
-    merge_sarif_runs
+    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+      emit_env_error_report
+      status=2
+    else
+      merge_sarif_runs
+    fi
     ;;
   text|*)
     for L in "${langs[@]}"; do
@@ -1651,27 +2058,39 @@ case "$FORMAT" in
         cat "$TMPDIR_RUN/$L.sarif"
       fi
     done
-    # Combined human summary (if JSON pieces exist)
-    if need_cmd jq && ls "$TMPDIR_RUN"/*.json >/dev/null 2>&1; then
-      say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
-      if generate_combined_json; then
-        jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"' "$COMBINED_JSON_FILE"
-        totals=$(jq -r '.totals' "$COMBINED_JSON_FILE")
-      else
-        merge_json_scanners | jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
-        totals=$(merge_json_scanners | jq -r '.totals')
+    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+      say "\n${RED}${BOLD}──────── Environment Error ────────${RESET}"
+      say "${RED}${X}${RESET} One or more scanners could not run correctly (exit 2)."
+      say "${DIM}This is a tooling/dependency problem, not a code-quality failure.${RESET}"
+      say "${DIM}See the affected scanner output above for remediation guidance.${RESET}"
+      status=2
+    else
+      # Combined human summary (if JSON pieces exist)
+      if need_cmd jq && ls "$TMPDIR_RUN"/*.json >/dev/null 2>&1; then
+        say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
+        if generate_combined_json; then
+          jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"' "$COMBINED_JSON_FILE"
+          totals=$(jq -r '.totals' "$COMBINED_JSON_FILE")
+        else
+          merge_json_scanners | jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
+          totals=$(merge_json_scanners | jq -r '.totals')
+        fi
+        crit=$(printf '%s' "$totals" | jq -r '.critical')
+        warn=$(printf '%s' "$totals" | jq -r '.warning')
+        desired=0
+        if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
+        if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then desired=1; fi
+        if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
       fi
-      crit=$(printf '%s' "$totals" | jq -r '.critical')
-      warn=$(printf '%s' "$totals" | jq -r '.warning')
-      desired=0
-      if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
-      if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then desired=1; fi
-      if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
     fi
     ;;
 esac
 
-if [[ -n "$BEADS_JSONL_PATH" ]]; then
+if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+  [[ -n "$BEADS_JSONL_PATH" ]] && say_err "${YELLOW}${WARN}${RESET} Skipping Beads JSONL export due to environment error."
+  [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] \
+    && say_err "${YELLOW}${WARN}${RESET} Skipping shareable artifacts due to environment error."
+elif [[ -n "$BEADS_JSONL_PATH" ]]; then
   if ! write_jsonl_summary "$BEADS_JSONL_PATH"; then
     say "${YELLOW}${WARN}${RESET} Could not write Beads JSONL to $BEADS_JSONL_PATH"
   else
@@ -1680,9 +2099,11 @@ if [[ -n "$BEADS_JSONL_PATH" ]]; then
 fi
 
 SHAREABLE_REQUEST=0
-[[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] && SHAREABLE_REQUEST=1
+if [[ "$HAS_ENV_ERROR" -eq 0 ]]; then
+  [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] && SHAREABLE_REQUEST=1
+fi
 
-if [[ $SHAREABLE_REQUEST -eq 1 ]]; then
+if [[ "$HAS_ENV_ERROR" -eq 0 && $SHAREABLE_REQUEST -eq 1 ]]; then
   if generate_combined_json; then
     SHAREABLE_JSON_FILE="$COMBINED_JSON_FILE"
     SHAREABLE_TIMESTAMP="$(date_iso)"

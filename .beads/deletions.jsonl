@@ -1,11 +1,11 @@
-{"id":"ultimate_bug_scanner-ank","ts":"2025-12-17T20:43:04.278436Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-mep","ts":"2025-12-17T20:47:49.328065Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-iua","ts":"2025-12-17T21:02:39.640503Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-xkw","ts":"2025-12-17T21:09:22.959438Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-js-fail-fast-without-ast2","ts":"2025-12-18T02:10:28.866514Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-install-ast-grep-required","ts":"2025-12-18T02:10:28.873254Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-js-module-env-ast-grep-bin2","ts":"2025-12-18T02:10:28.879564Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-ubs-env-error-exitcode","ts":"2025-12-18T02:10:28.885867Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-js-ts-degraded-mode-contract","ts":"2025-12-18T02:10:28.89266Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-js-global-pollution-fp-fix2","ts":"2025-12-18T03:59:03.023666Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
-{"id":"ultimate_bug_scanner-tests-js-env-error-no-ast2","ts":"2025-12-18T06:01:46.566569Z","by":"git-history-backfill","reason":"recovered from git history (pruned from manifest)"}
+{"id":"ultimate_bug_scanner-install-ast-grep-required"}
+{"id":"ultimate_bug_scanner-js-ts-degraded-mode-contract"}
+{"id":"ultimate_bug_scanner-tests-js-env-error-no-ast2"}
+{"id":"ultimate_bug_scanner-xkw"}
+{"id":"ultimate_bug_scanner-mep"}
+{"id":"ultimate_bug_scanner-js-fail-fast-without-ast2"}
+{"id":"ultimate_bug_scanner-ubs-env-error-exitcode"}
+{"id":"ultimate_bug_scanner-js-module-env-ast-grep-bin2"}
+{"id":"ultimate_bug_scanner-ank"}
+{"id":"ultimate_bug_scanner-iua"}
+{"id":"ultimate_bug_scanner-js-global-pollution-fp-fix2"}

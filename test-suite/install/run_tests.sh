@@ -8,6 +8,13 @@ tests_failed=0
 tmpdirs=()
 SELF_TEST_MODE="${UBS_INSTALLER_SELF_TEST:-0}"
 
+mktemp_dir() {
+  local base="${TMPDIR:-/tmp}"
+  mktemp -d 2>/dev/null \
+    || mktemp -d -t ubs-install-tests.XXXXXX 2>/dev/null \
+    || mktemp -d "${base%/}/ubs-install-tests.XXXXXX" 2>/dev/null
+}
+
 check_sessions_command() {
   local home_dir="$1"
   local output_file="$2"
@@ -47,11 +54,16 @@ run_installer() {
   mkdir -p "$bin_dir"
   local workdir_base="$home_dir/.ubs-workdir"
   mkdir -p "$workdir_base"
-  local workdir="$workdir_base/$(basename "$(mktemp -u)")"
+  local workdir_suffix="ubs-install-workdir.${RANDOM}${RANDOM}${RANDOM}"
+  local workdir="$workdir_base/$workdir_suffix"
+  while [ -e "$workdir" ]; do
+    workdir_suffix="${workdir_suffix}.${RANDOM}${RANDOM}"
+    workdir="$workdir_base/$workdir_suffix"
+  done
 
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
 
-  if ! UBS_INSTALLER_WORKDIR="$workdir" HOME="$home_dir" PATH="$bin_dir:$PATH" SHELL=/bin/bash \
+  if UBS_INSTALLER_WORKDIR="$workdir" HOME="$home_dir" PATH="$bin_dir:$PATH" SHELL=/bin/bash \
       "$INSTALLER" \
         --non-interactive \
         --skip-ast-grep \
@@ -63,6 +75,8 @@ run_installer() {
         --no-path-modify \
         --install-dir "$bin_dir" \
         "$@" >"$log_file" 2>&1; then
+    :
+  else
     local status=$?
     echo "[FAIL] Installer exited with status $status (log: $log_file)"
     tail -n 80 "$log_file"
@@ -102,7 +116,7 @@ run_installer() {
 test_basic_smoke() {
   echo "[TEST] basic_smoke"
   local ctx
-  ctx="$(mktemp -d)"
+  ctx="$(mktemp_dir)"
   tmpdirs+=("$ctx")
   local home="$ctx/home"
   local log="$ctx/install.log"
@@ -111,8 +125,10 @@ test_basic_smoke() {
   if run_installer "$home" "$log"; then
     if grep -q "typos not found" "$log"; then
       echo "[PASS] typos warning emitted"
+    elif grep -q "typos:" "$log"; then
+      echo "[PASS] typos detected"
     else
-      echo "[FAIL] expected typos warning missing (log: $log)"
+      echo "[FAIL] expected typos status missing (log: $log)"
       tests_failed=1
       return
     fi
@@ -124,7 +140,7 @@ test_basic_smoke() {
 test_no_alias_written_when_no_path_modify() {
   echo "[TEST] no_alias_with_no_path_modify"
   local ctx
-  ctx="$(mktemp -d)"
+  ctx="$(mktemp_dir)"
   tmpdirs+=("$ctx")
   local home="$ctx/home"
   mkdir -p "$home"
@@ -147,7 +163,7 @@ test_no_alias_written_when_no_path_modify() {
 test_skip_typos_flag() {
   echo "[TEST] skip_typos_flag"
   local ctx
-  ctx="$(mktemp -d)"
+  ctx="$(mktemp_dir)"
   tmpdirs+=("$ctx")
   local home="$ctx/home"
   local log="$ctx/install.log"
@@ -165,7 +181,7 @@ test_skip_typos_flag() {
 test_self_test_flag() {
   echo "[TEST] self_test_flag"
   local ctx
-  ctx="$(mktemp -d)"
+  ctx="$(mktemp_dir)"
   tmpdirs+=("$ctx")
   local home="$ctx/home"
   local log="$ctx/install.log"

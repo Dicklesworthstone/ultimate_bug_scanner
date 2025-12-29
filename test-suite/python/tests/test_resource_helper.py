@@ -72,6 +72,42 @@ class ResourceHelperTests(unittest.TestCase):
         self.assertIn("popen_handle", kinds)
         self.assertIn("asyncio_task", kinds)
 
+    def test_release_in_nested_scope_marks_outer_resource(self) -> None:
+        lines = run_helper(
+            {
+                "nested.py": """
+                import asyncio
+
+                def outer():
+                    fh = open("/tmp/demo.txt", "w")
+
+                    async def inner():
+                        fh.close()
+
+                    asyncio.run(inner())
+                """,
+            }
+        )
+        self.assertEqual(lines, [])
+
+    def test_reassignment_marks_latest_resource_as_released(self) -> None:
+        lines = run_helper(
+            {
+                "reassign.py": """
+                def demo():
+                    fh = open("/tmp/a.txt", "w")
+                    fh = open("/tmp/b.txt", "w")
+                    fh.close()
+                """,
+            }
+        )
+        entries = parse(lines)
+        self.assertEqual(len(entries), 1)
+        loc, kind, _ = entries[0]
+        self.assertIn("reassign.py", loc)
+        self.assertTrue(loc.endswith(":3"), loc)
+        self.assertEqual(kind, "file_handle")
+
     def test_clean_project_stays_quiet(self) -> None:
         lines = run_helper(
             {
@@ -92,6 +128,30 @@ class ResourceHelperTests(unittest.TestCase):
                         task = asyncio.create_task(asyncio.sleep(0))
                         await task
                     asyncio.run(runner())
+                """,
+            }
+        )
+        self.assertEqual(lines, [])
+
+    def test_chained_cleanup_does_not_report(self) -> None:
+        lines = run_helper(
+            {
+                "chained.py": """
+                import asyncio
+                import socket
+                import subprocess
+
+                def tidy():
+                    open("/tmp/demo.txt", "w").close()
+                    socket.socket().close()
+                    subprocess.Popen(["sleep", "0"]).wait()
+
+                async def runner():
+                    await asyncio.create_task(asyncio.sleep(0))
+                    await asyncio.gather(asyncio.create_task(asyncio.sleep(0)))
+                    asyncio.create_task(asyncio.sleep(0)).cancel()
+
+                asyncio.run(runner())
                 """,
             }
         )

@@ -12,7 +12,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.0.0"
+UBS_VERSION="5.0.3"
 REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master"
 MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 

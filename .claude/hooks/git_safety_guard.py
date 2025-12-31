@@ -91,6 +91,67 @@ RM_RF_ALLOWED_PREFIXES = (
 RM_SEPARATORS = {"&&", "||", ";", "|"}
 
 
+def has_rm_recursive_force(command: str) -> bool:
+    """Check if command contains rm with both recursive and force flags.
+
+    Handles all variants:
+    - rm -rf, rm -fr (combined short flags)
+    - rm -r -f, rm -f -r (separate short flags)
+    - rm --recursive --force (long flags)
+    - rm -r --force, rm --recursive -f (mixed)
+    """
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+
+    i = 0
+    while i < len(tokens):
+        if tokens[i] != "rm":
+            i += 1
+            continue
+
+        i += 1
+        has_recursive = False
+        has_force = False
+
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--":
+                i += 1
+                break
+            if tok in RM_SEPARATORS:
+                break
+            if not tok.startswith("-"):
+                break
+
+            # Check for flags
+            if tok == "--recursive":
+                has_recursive = True
+            elif tok == "--force":
+                has_force = True
+            elif tok.startswith("--"):
+                pass  # Other long options
+            else:
+                # Short options like -r, -f, -rf, -ri, etc.
+                if "r" in tok.lower():
+                    has_recursive = True
+                if "f" in tok.lower():
+                    has_force = True
+            i += 1
+
+        if has_recursive and has_force:
+            return True
+
+        # Skip to next command separator or end
+        while i < len(tokens) and tokens[i] not in RM_SEPARATORS:
+            i += 1
+        if i < len(tokens):
+            i += 1  # Skip the separator
+
+    return False
+
+
 def rm_rf_targets_are_safe(command: str) -> bool:
     """Allow `rm -rf` only when *all* targets are clearly temp paths.
 
@@ -168,18 +229,16 @@ def main():
         sys.exit(0)
 
     # Check if command matches any destructive pattern
-    rm_rf_verified = False
     for pattern, reason in DESTRUCTIVE_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
             if pattern.startswith("rm\\s+"):
-                if not rm_rf_targets_are_safe(command):
-                    reason = (
-                        "rm -rf is destructive. Only explicit temp paths are allowed "
-                        f"({', '.join(RM_RF_ALLOWED_PREFIXES)})."
-                    )
-                else:
-                    rm_rf_verified = True
+                if rm_rf_targets_are_safe(command):
+                    # rm targets are safe temp paths, allow this pattern
                     continue
+                reason = (
+                    "rm -rf is destructive. Only explicit temp paths are allowed "
+                    f"({', '.join(RM_RF_ALLOWED_PREFIXES)})."
+                )
             output = {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -196,8 +255,27 @@ def main():
             print(json.dumps(output))
             sys.exit(0)
 
+    # Catch rm with recursive+force that bypassed the regex patterns
+    # (e.g., "rm -r -f /path" or "rm --recursive --force /path")
+    if has_rm_recursive_force(command) and not rm_rf_targets_are_safe(command):
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    f"BLOCKED by git_safety_guard.py\n\n"
+                    f"Reason: rm -rf is destructive. Only explicit temp paths are allowed "
+                    f"({', '.join(RM_RF_ALLOWED_PREFIXES)}).\n\n"
+                    f"Command: {command}\n\n"
+                    f"If this operation is truly needed, ask the user for explicit "
+                    f"permission and have them run the command manually."
+                )
+            }
+        }
+        print(json.dumps(output))
+        sys.exit(0)
+
     # Allow all other commands
-    _ = rm_rf_verified
     sys.exit(0)
 
 

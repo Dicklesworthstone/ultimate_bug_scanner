@@ -43,7 +43,7 @@ compute_sha256() {
 }
 
 VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/VERSION"
-VERSION_DEFAULT="5.0.0"
+VERSION_DEFAULT="5.0.3"
 VERSION="$(normalize_version "${UBS_VERSION:-$(cat "$VERSION_FILE" 2>/dev/null || echo "$VERSION_DEFAULT")}")" \
   || VERSION="$VERSION_DEFAULT"
 
@@ -63,7 +63,7 @@ Actions:
   - Executes install.sh locally with any extra args you pass via --install-args.
 
 Environment:
-  UBS_VERSION            Override version (defaults to ./VERSION or 5.0.0).
+  UBS_VERSION            Override version (defaults to ./VERSION or 5.0.3).
   UBS_ARTIFACT_BASE      Override release base URL.
   UBS_MINISIGN_PUBKEY    Required minisign public key (base64 line from `minisign -G`).
 USAGE

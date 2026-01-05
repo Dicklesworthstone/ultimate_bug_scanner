@@ -2541,7 +2541,11 @@ else
 fi
 if [ "$count" -gt 25 ]; then
   print_finding "warning" "$count" "Division by variable - verify non-zero" "Add guards: if (divisor === 0) throw; or use fallback"
-  show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    show_ast_detailed_patterns 5 '$L / $R'
+  else
+    show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
+  fi
 elif [ "$count" -gt 0 ]; then
   print_finding "info" "$count" "Division operations found"
 fi

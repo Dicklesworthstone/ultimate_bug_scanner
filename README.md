@@ -1134,6 +1134,207 @@ Layer 4: STATISTICAL (Insightful)  │
 | **Fallback** | GNU grep | Text search | Works on any Unix-like system |
 | **Rule Engine** | YAML | Pattern definitions | Human-readable, easy to extend |
 
+### **AST Rule Architecture: Ancestor-Aware Pattern Matching**
+
+UBS's ast-grep rules use a sophisticated technique called **ancestor traversal** to drastically reduce false positives. The key directive `stopBy: end` ensures patterns check the *entire* ancestor chain rather than just the immediate parent.
+
+**The Problem Without Ancestor Traversal:**
+
+```javascript
+// This code is SAFE - the fetch is properly handled:
+async function safeFetch() {
+  try {
+    fetch('/api');  // Inside try block - exception will be caught
+  } catch (e) {
+    handleError(e);
+  }
+}
+
+// Naive AST rule checking only immediate parent:
+// ❌ False positive! Reports "fetch without catch" because
+//    fetch()'s immediate parent is the ExpressionStatement,
+//    not the try block.
+```
+
+**The Solution - Ancestor Traversal with `stopBy: end`:**
+
+```yaml
+# ast-grep rule with proper ancestor checking
+rule:
+  all:
+    - pattern: fetch($ARGS)
+    - not:
+        inside:
+          kind: try_statement
+          stopBy: end           # ← Key directive: traverse ALL ancestors
+    - not:
+        inside:
+          pattern: $_.catch($$)  # Check for .catch() in chain
+          stopBy: end
+```
+
+The `stopBy: end` directive instructs ast-grep to walk up the *entire* ancestor tree until it finds a match (or reaches the root). Without it, only the immediate parent is checked—missing try blocks, function boundaries, and method chains.
+
+**Real-World Impact:**
+
+| Scenario | Without `stopBy: end` | With `stopBy: end` |
+|----------|----------------------|-------------------|
+| `try { fetch() } catch {}` | ❌ False positive | ✅ Correctly ignored |
+| `fetch().then().catch()` | ❌ False positive | ✅ Correctly ignored |
+| `return fetch()` | ❌ False positive | ✅ Correctly ignored |
+| `fetch()` standalone | ✅ Detected | ✅ Detected |
+
+This technique is applied across 19+ rules in the JavaScript module alone, covering:
+- Promise chain detection (`.then()`, `.catch()`, `.finally()`)
+- Try-catch context awareness
+- Return statement handling
+- Async/await scope analysis
+
+### **Inline Suppression Comments**
+
+When a finding is intentional or a known false positive, suppress it inline:
+
+```javascript
+// Suppress a single line:
+eval(trustedCode);  // ubs:ignore
+
+// Suppress with reason (recommended):
+eval(adminScript);  // ubs:ignore -- admin-only trusted input
+```
+
+```python
+# Python suppression:
+exec(validated_code)  # ubs:ignore
+
+# Ruby suppression:
+eval(safe_string)  # ubs:ignore
+```
+
+**Suppression Rules:**
+- Must appear on the **same line** as the flagged code
+- Works across all 8 supported languages
+- Suppresses all findings on that line (use sparingly)
+- Survives formatting tools that preserve trailing comments
+
+**Anti-patterns to avoid:**
+```javascript
+// ❌ Wrong - comment on previous line doesn't suppress:
+// ubs:ignore
+eval(code);  // Still flagged!
+
+// ❌ Wrong - don't blanket-suppress large blocks:
+/* ubs:ignore */  // Doesn't work for block comments
+```
+
+### **Cross-Language Async Error Detection**
+
+UBS detects unhandled async errors consistently across all 8 languages. The patterns adapt to each language's idioms while providing equivalent coverage:
+
+| Language | Pattern | What UBS Detects |
+|----------|---------|------------------|
+| **JavaScript/TypeScript** | `promise.then()` without `.catch()` | Dangling promises, missing `await`, unhandled rejections |
+| **Python** | `asyncio.create_task()` without `await` | Orphaned tasks, missing `await`, unclosed coroutines |
+| **Go** | Goroutine without error channel | Fire-and-forget goroutines, leaked contexts |
+| **Rust** | `.unwrap()` / `.expect()` after partial guard | Panic after `if let Some`, missing `?` operator |
+| **Java** | `CompletableFuture` without `.exceptionally()` | Swallowed exceptions, missing `join()` |
+| **Ruby** | `Thread.new` without `.join` | Zombie threads, unhandled thread exceptions |
+| **C++** | `std::async` without `.get()` | Ignored futures, exception propagation |
+| **Swift** | `Task {}` without error handling | Unstructured concurrency leaks |
+
+**JavaScript Promise Chain Analysis:**
+
+The scanner understands complex promise chains:
+
+```javascript
+// ✅ Handled - .catch() at end of chain:
+fetch('/api')
+  .then(r => r.json())
+  .then(data => process(data))
+  .catch(handleError);  // Scanner recognizes this catches all above
+
+// ✅ Handled - .catch() before .then():
+fetch('/api')
+  .catch(e => fallback)  // Early catch
+  .then(r => r.json());
+
+// ❌ Unhandled - .finally() doesn't catch:
+fetch('/api')
+  .then(r => r.json())
+  .finally(cleanup);  // Flagged: finally doesn't handle rejections
+
+// ❌ Unhandled - no error handling:
+async function leaky() {
+  fetch('/api');  // Flagged: fire-and-forget promise
+}
+```
+
+### **Helper Script Verification**
+
+Language-specific helper scripts (Python AST walkers, Go analyzers, TypeScript type checkers) are verified with SHA-256 checksums before execution:
+
+```bash
+# Helper checksums embedded in each module:
+modules/helpers/
+├── resource_lifecycle_py.py    # SHA-256 verified
+├── resource_lifecycle_go.go    # SHA-256 verified
+├── resource_lifecycle_java.py  # SHA-256 verified
+├── type_narrowing_ts.js        # SHA-256 verified
+├── type_narrowing_rust.py      # SHA-256 verified
+├── type_narrowing_kotlin.py    # SHA-256 verified
+└── type_narrowing_swift.py     # SHA-256 verified
+```
+
+The `ubs doctor` command validates all helper checksums:
+
+```bash
+$ ubs doctor
+🏥 UBS Environment Audit
+────────────────────────
+✓ helper checksum verified (resource_lifecycle_py.py)
+✓ helper checksum verified (type_narrowing_ts.js)
+...
+```
+
+If a helper is modified or corrupted, the scanner fails safely with remediation guidance rather than executing unverified code.
+
+### **Unified Severity Normalization**
+
+All 8 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Language Tool Output      →   UBS Normalized Severity      │
+├─────────────────────────────────────────────────────────────┤
+│  ESLint "error"            →   critical                     │
+│  Pylint "E" / "F"          →   critical                     │
+│  Clippy "deny"             →   critical                     │
+│  Go vet "error"            →   critical                     │
+│  SpotBugs "High"           →   critical                     │
+│  RuboCop "Fatal/Error"     →   critical                     │
+├─────────────────────────────────────────────────────────────┤
+│  ESLint "warn"             →   warning                      │
+│  Pylint "W" / "R"          →   warning                      │
+│  Clippy "warn"             →   warning                      │
+│  Go vet "warning"          →   warning                      │
+│  SpotBugs "Medium"         →   warning                      │
+│  RuboCop "Warning"         →   warning                      │
+├─────────────────────────────────────────────────────────────┤
+│  ESLint "suggestion"       →   info                         │
+│  Pylint "C" / "I"          →   info                         │
+│  Clippy "note"             →   info                         │
+│  SpotBugs "Low"            →   info                         │
+│  RuboCop "Convention"      →   info                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Benefits of normalization:**
+- **Consistent exit codes**: Exit 1 always means "critical issues found" across all languages
+- **Unified JSON/SARIF output**: Downstream tools parse one schema, not 8 different formats
+- **Predictable `--fail-on-warning`**: Same behavior whether scanning Python, Rust, or TypeScript
+- **Cross-language metrics**: Compare code quality across polyglot projects fairly
+
+The `normalize_severity()` function in each module handles edge cases like tool-specific severity strings, numeric levels, and legacy format variations.
+
 ### **Performance Optimizations**
 
 ```bash

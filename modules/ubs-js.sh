@@ -3287,7 +3287,11 @@ else
 fi
 if [ "$count" -gt 0 ]; then
   print_finding "warning" "$count" "Using 'var' instead of let/const" "var is function-scoped and hoisted"
-  show_detailed_finding "^[[:space:]]*var[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*" 5
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    show_ast_detailed_patterns 5 'var $X'
+  else
+    show_detailed_finding "^[[:space:]]*var[[:space:]]+[A-Za-z_$][A-Za-z0-9_$]*" 5
+  fi
 else
   print_finding "good" "No var declarations (using let/const)"
 fi

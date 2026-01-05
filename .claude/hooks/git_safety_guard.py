@@ -91,6 +91,16 @@ RM_RF_ALLOWED_PREFIXES = (
 RM_SEPARATORS = {"&&", "||", ";", "|"}
 
 
+def _is_rm_command(token: str) -> bool:
+    """Check if a token is the rm command (handles full paths like /bin/rm)."""
+    if token == "rm":
+        return True
+    # Handle absolute paths: /bin/rm, /usr/bin/rm, etc.
+    if token.endswith("/rm"):
+        return True
+    return False
+
+
 def has_rm_recursive_force(command: str) -> bool:
     """Check if command contains rm with both recursive and force flags.
 
@@ -107,7 +117,7 @@ def has_rm_recursive_force(command: str) -> bool:
 
     i = 0
     while i < len(tokens):
-        if tokens[i] != "rm":
+        if not _is_rm_command(tokens[i]):
             i += 1
             continue
 
@@ -167,7 +177,7 @@ def rm_rf_targets_are_safe(command: str) -> bool:
 
     i = 0
     while i < len(tokens):
-        if tokens[i] != "rm":
+        if not _is_rm_command(tokens[i]):
             i += 1
             continue
 

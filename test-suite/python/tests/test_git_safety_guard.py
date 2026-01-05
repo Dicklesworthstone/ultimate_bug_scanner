@@ -57,6 +57,26 @@ class GitSafetyGuardTests(unittest.TestCase):
         data = json.loads(out)
         self.assertEqual(data["hookSpecificOutput"]["permissionDecision"], "deny")
 
+    def test_denies_bin_rm_rf_non_temp(self) -> None:
+        """Regression test: /bin/rm -rf must be blocked like rm -rf."""
+        code, out = run_hook("/bin/rm -rf /home/user")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_denies_usr_bin_rm_rf_non_temp(self) -> None:
+        """Regression test: /usr/bin/rm -rf must be blocked like rm -rf."""
+        code, out = run_hook("/usr/bin/rm -rf /home/user")
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_allows_bin_rm_rf_temp_dir(self) -> None:
+        """Full path rm -rf should be allowed for temp directories."""
+        code, out = run_hook("/bin/rm -rf /tmp/test-dir")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "")
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

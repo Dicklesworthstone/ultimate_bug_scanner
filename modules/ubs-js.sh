@@ -2134,6 +2134,8 @@ rule:
           any:
             - pattern: await $EXPR
             - pattern: $EXPR.then($$$)
+            - pattern: $EXPR.catch($$$)
+            - pattern: $EXPR.finally($$$)
             - pattern: Promise.all($$$)
             - pattern: Promise.race($$$)
             - pattern: Promise.allSettled($$$)
@@ -2142,6 +2144,8 @@ rule:
           stopBy: end
     - not:
         regex: "^(document\\.|window\\.|console\\.|JSON\\.|Math\\.|Date\\.|Array\\.|Object\\.|Set\\.|Map\\.|WeakMap\\.|WeakSet\\.|Intl\\.|Number\\.|String\\.|Boolean\\.|parse\\b|encode\\b|decode\\b|transform\\b|render\\b|append\\b|push\\b|join\\b|filter\\b|map\\b|reduce\\b|forEach\\b|has\\b|get\\b|set\\b)"
+    - not:
+        regex: "\\.(catch|then|finally)\\s*\\("
 severity: warning
 message: "Possible unhandled/dangling promise; use await/then/catch"
 YAML
@@ -2161,8 +2165,13 @@ rule:
           kind: return_statement
           stopBy: end
     - not:
-        has:
-          pattern: .catch($CATCH)
+        inside:
+          pattern: $_.catch($$$)
+          stopBy: end
+    - not:
+        inside:
+          pattern: await $EXPR
+          stopBy: end
 severity: warning
 message: "fetch() without catch/try; network failures will be unhandled"
 YAML

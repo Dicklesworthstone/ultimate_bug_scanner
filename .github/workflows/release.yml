@@ -299,6 +299,10 @@ jobs:
           mv oci/sbom.spdx.json oci/oci-sbom.spdx.json
           mv oci/provenance.json oci/oci-provenance.json
 
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
@@ -313,3 +317,32 @@ jobs:
             oci/oci-provenance.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  # ==========================================================================
+  # Notify Package Managers to Update
+  # ==========================================================================
+  notify-homebrew-tap:
+    name: Notify Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: publish
+    steps:
+      - name: Trigger formula update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: Dicklesworthstone/homebrew-tap
+          event-type: formula-update
+          client-payload: |
+            {
+              "tool": "ubs",
+              "version": "${{ needs.publish.outputs.version }}"
+            }
+
+      - name: Log dispatch
+        run: |
+          echo "✅ Dispatched formula-update event to homebrew-tap"
+          echo "   Tool: ubs"
+          echo "   Version: ${{ needs.publish.outputs.version }}"

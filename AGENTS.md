@@ -408,3 +408,157 @@ One query → 15-30 operations: greps multiple patterns → reads relevant secti
 - Understanding unfamiliar subsystems before modifying
 - Answering "how" questions that span 3+ files
 - Finding all touching points for a cross-cutting concern
+
+---
+
+## cass — Cross-Agent Session Search
+
+`cass` indexes prior agent conversations (Claude Code, Codex, Cursor, Gemini, ChatGPT, Aider, etc.) into a unified, searchable index so you can reuse solved problems.
+
+**NEVER run bare `cass`** — it launches an interactive TUI. Always use `--robot` or `--json`.
+
+### Quick Start
+
+```bash
+# Check if index is healthy (exit 0=ok, 1=run index first)
+cass health
+
+# Search across all agent histories
+cass search "authentication error" --robot --limit 5
+
+# View a specific result (from search output)
+cass view /path/to/session.jsonl -n 42 --json
+
+# Expand context around a line
+cass expand /path/to/session.jsonl -n 42 -C 3 --json
+
+# Learn the full API
+cass capabilities --json      # Feature discovery
+cass robot-docs guide         # LLM-optimized docs
+```
+
+### Key Flags
+
+| Flag | Purpose |
+|------|---------|
+| `--robot` / `--json` | Machine-readable JSON output (required!) |
+| `--fields minimal` | Reduce payload: `source_path`, `line_number`, `agent` only |
+| `--limit N` | Cap result count |
+| `--agent NAME` | Filter to specific agent (claude, codex, cursor, etc.) |
+| `--days N` | Limit to recent N days |
+
+**stdout = data only, stderr = diagnostics. Exit 0 = success.**
+
+### Robot Mode Etiquette
+
+- Prefer `cass --robot-help` and `cass robot-docs <topic>` for machine-first docs
+- The CLI is forgiving: globals placed before/after subcommand are auto-normalized
+- If parsing fails, follow the actionable errors with examples
+- Use `--color=never` in non-TTY automation for ANSI-free output
+
+### Pre-Flight Health Check
+
+```bash
+cass health --json
+```
+
+Returns in <50ms:
+- **Exit 0:** Healthy—proceed with queries
+- **Exit 1:** Unhealthy—run `cass index --full` first
+
+### Exit Codes
+
+| Code | Meaning | Retryable |
+|------|---------|-----------|
+| 0 | Success | N/A |
+| 1 | Health check failed | Yes—run `cass index --full` |
+| 2 | Usage/parsing error | No—fix syntax |
+| 3 | Index/DB missing | Yes—run `cass index --full` |
+
+Treat cass as a way to avoid re-solving problems other agents already handled.
+
+<!-- bv-agent-instructions-v1 -->
+
+---
+
+## Beads Workflow Integration
+
+This project uses Beads for issue tracking. Issues are stored in `.beads/` and tracked in git.
+
+### Essential Commands
+
+```bash
+# CLI commands for agents
+bd ready              # Show issues ready to work (no blockers)
+bd list --status=open # All open issues
+bd show <id>          # Full issue details with dependencies
+bd create --title="..." --type=task --priority=2
+bd update <id> --status=in_progress
+bd close <id> --reason="Completed"
+bd close <id1> <id2>  # Close multiple issues at once
+bd sync --flush-only  # Export to JSONL
+```
+
+### Workflow Pattern
+
+1. **Start**: Run `bd ready` to find actionable work
+2. **Claim**: Use `bd update <id> --status=in_progress`
+3. **Work**: Implement the task
+4. **Complete**: Use `bd close <id>`
+5. **Sync**: Always run `bd sync --flush-only` at session end
+
+### Key Concepts
+
+- **Dependencies**: Issues can block other issues. `bd ready` shows only unblocked work.
+- **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
+- **Types**: task, bug, feature, epic, question, docs
+- **Blocking**: `bd dep add <issue> <depends-on>` to add dependencies
+
+<!-- end-bv-agent-instructions -->
+
+---
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync --flush-only
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Verify** - All changes committed AND pushed
+6. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+
+---
+
+Note for Codex/GPT-5.2:
+
+You constantly bother me and stop working with concerned questions that look similar to this:
+
+```
+Unexpected changes (need guidance)
+
+- Working tree still shows edits I did not make in Cargo.toml, Cargo.lock, src/cli/commands/upgrade.rs, src/storage/sqlite.rs, tests/conformance.rs, tests/storage_deps.rs. Please advise whether to keep/commit/revert these before any further work. I did not touch them.
+
+Next steps (pick one)
+
+1. Decide how to handle the unrelated modified files above so we can resume cleanly.
+2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
+3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
+```
+
+NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into think YOU made the changes and simply don't recall it for some reason.

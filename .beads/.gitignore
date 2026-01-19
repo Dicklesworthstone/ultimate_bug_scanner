@@ -30,3 +30,9 @@ beads.right.meta.json
 !issues.jsonl
 !metadata.json
 !config.json
+
+# Local history backups
+.br_history/
+
+# bv (beads viewer) lock file
+.bv.lock

@@ -848,7 +848,10 @@ ensure_ast_grep_tool_cache(){
   if [[ "$need_download" -eq 1 ]]; then
     [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading ast-grep ${AST_GREP_VERSION} (${target})..."
     local tmp_zip
-    tmp_zip="$(mktemp -t ubs-ast-grep.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-ast-grep.XXXXXX" 2>/dev/null)"
+    tmp_zip="$(mktemp -t ubs-ast-grep.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-ast-grep.XXXXXX" 2>/dev/null)" || {
+      say_err "${RED}$X failed to create temp file for module download${RESET}"
+      return 1
+    }
     if ! download_url_to_file "$url" "$tmp_zip"; then
       say_err "${RED}${X}${RESET} failed to download ast-grep: $url"
       say_err "${DIM}Install ast-grep manually (https://ast-grep.github.io/) or re-run install.sh.${RESET}"
@@ -2006,7 +2009,8 @@ parse_text_to_json(){
       | head -n1 || true)
   fi
   critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
-  local proj_display="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  local proj_display
+  proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
   cat >"$json" <<JSON
 {"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
 JSON
@@ -2063,14 +2067,18 @@ SARIF
 parse_sarif_to_json(){
   local lang="$1" sarif="$2" json="$3"
   [[ -f "$sarif" ]] || return 1
-  if ! need_cmd jq; then return 1; fi
+  if ! need_cmd jq; then
+    say "${YELLOW}${WARN}${RESET} jq not available; cannot parse SARIF"
+    return 1
+  fi
   local critical warning info files
   critical=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "error")] | length' "$sarif" 2>/dev/null || echo 0)
   warning=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "warning")] | length' "$sarif" 2>/dev/null || echo 0)
   info=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "note")] | length' "$sarif" 2>/dev/null || echo 0)
   files=$(jq '[.runs[]?.results[]?.locations[]?.physicalLocation?.artifactLocation?.uri?] | unique | length' "$sarif" 2>/dev/null || echo 0)
   critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
-  local proj_display="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  local proj_display
+  proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
   cat >"$json" <<JSON
 {"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
 JSON
@@ -2488,7 +2496,7 @@ case "$FORMAT" in
         warn=$(printf '%s' "$totals" | jq -r '.warning')
         desired=0
         if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
-        if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then desired=1; fi
+        if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
         if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
       fi
     fi
@@ -2514,7 +2522,10 @@ case "$FORMAT" in
 	  [[ -n "$BEADS_JSONL_PATH" ]] && say_err "${YELLOW}${WARN}${RESET} Skipping Beads JSONL export due to environment error."
 	  [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] \
     && say_err "${YELLOW}${WARN}${RESET} Skipping shareable artifacts due to environment error."
-elif [[ -n "$BEADS_JSONL_PATH" ]]; then
+	  exit "$status"
+	fi
+
+if [[ -n "$BEADS_JSONL_PATH" ]]; then
   if ! write_jsonl_summary "$BEADS_JSONL_PATH"; then
     say "${YELLOW}${WARN}${RESET} Could not write Beads JSONL to $BEADS_JSONL_PATH"
   else

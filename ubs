@@ -82,7 +82,7 @@ else
 fi
 CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
 say(){
-  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" ]]; then
+  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" || "${FORMAT:-text}" == "toon" ]]; then
     echo -e "$*" >&2
   else
     echo -e "$*"
@@ -142,7 +142,8 @@ trap on_err ERR
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 PROJECT_DIR="."
-FORMAT="text"              # text|json|jsonl|sarif
+# Format precedence: CLI > UBS_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > "text"
+FORMAT="${UBS_OUTPUT_FORMAT:-${TOON_DEFAULT_FORMAT:-text}}"  # text|json|jsonl|sarif|toon
 CI_MODE=0
 FAIL_ON_WARNING=0
 VERBOSE=0
@@ -205,7 +206,7 @@ Usage: ubs [options] [PROJECT_DIR]
        ubs sessions [--entries N] [--raw]
 
 Options:
-  --format=FMT            text|json|jsonl|sarif (default: text)
+  --format=FMT            text|json|jsonl|sarif|toon (default: text)
   --version               Print version and exit
   --ci                    CI mode (stable timestamps)
   --fail-on-warning       Exit non-zero if warnings or critical exist
@@ -233,6 +234,9 @@ Options:
   -h, --help              Show this help
 
 Environment Variables:
+  UBS_OUTPUT_FORMAT=FMT       Default output format (text|json|jsonl|sarif|toon)
+                              Overridden by --format CLI flag
+  TOON_DEFAULT_FORMAT=FMT     Global fallback format if UBS_OUTPUT_FORMAT not set
   UBS_MAX_DIR_SIZE_MB=N       Max directory size in MB before refusing to scan (default: 1000)
                               Set to 0 to disable this safety check
   UBS_REFUSE_HOME_ROOT=0|1    Whether to refuse scanning \$HOME or / (default: 1)
@@ -243,9 +247,11 @@ Examples:
   ubs --staged                # scan only staged files (pre-commit style)
   ubs --diff                  # scan only modified files (quick check)
   ubs --format=json --ci .    # machine-readable combined JSON
+  ubs --format=toon .         # TOON format (~50% smaller than JSON)
   ubs --only=js,python .      # restrict language set
   ubs doctor --fix            # validate cached modules & redownload corrupted copies
   ubs sessions --entries 1    # view the most recent installer summary
+  UBS_OUTPUT_FORMAT=toon ubs .  # set default format via env var
   UBS_MAX_DIR_SIZE_MB=0 ubs . # disable size check for large directories
 USAGE
 }
@@ -1909,7 +1915,7 @@ run_lang(){
   args+=("$PROJECT_DIR")
 
   case "$fmt" in
-    json|jsonl)
+    json|jsonl|toon)
       prepare_metrics_dir "$metrics_dir"
       local -a report_args=()
       if [[ "$lang" == "js" ]]; then
@@ -2319,7 +2325,7 @@ if [[ " ${langs[*]} " == *" js "* ]]; then
   else
     say_err "${RED}${X}${RESET} Environment error: ast-grep is required for accurate JS/TS scanning."
     say_err "${DIM}Fix: install ast-grep (https://ast-grep.github.io/) or run the UBS installer.${RESET}"
-    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" ]]; then
+    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "toon" ]]; then
       printf '{"error":"environment","exit_code":2,"failed_modules":["js"]}\n'
     fi
     exit 2
@@ -2462,6 +2468,35 @@ case "$FORMAT" in
       merge_sarif_runs
     fi
     ;;
+  toon)
+    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+      emit_env_error_report
+      emit_env_error_json
+      status=2
+    else
+      # Check if toon (TOON encoder) is available
+      if command -v toon >/dev/null 2>&1; then
+        if generate_combined_json; then
+          cat "$COMBINED_JSON_FILE" | toon
+        else
+          if ! merge_json_scanners | toon; then
+            say "${RED}$X could not produce TOON output${RESET}"
+            [[ "$status" -lt 1 ]] && status=1
+          fi
+        fi
+      else
+        say_err "${YELLOW}Warning: toon (TOON encoder) not found in PATH; falling back to --format=json${RESET}"
+        if generate_combined_json; then
+          cat "$COMBINED_JSON_FILE"
+        else
+          if ! merge_json_scanners; then
+            say "${RED}$X could not produce combined JSON${RESET}"
+            [[ "$status" -lt 1 ]] && status=1
+          fi
+        fi
+      fi
+    fi
+    ;;
   text|*)
     for L in "${langs[@]}"; do
       say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
@@ -2506,7 +2541,7 @@ case "$FORMAT" in
 	# Ensure exit status reflects merged totals in machine formats too.
 	# Some modules emit machine output but always exit 0; the meta-runner should still fail
 	# when critical findings exist (or warnings in --fail-on-warning mode).
-	if [[ "$HAS_ENV_ERROR" -eq 0 && ( "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" ) ]]; then
+	if [[ "$HAS_ENV_ERROR" -eq 0 && ( "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ) ]]; then
 	  if need_cmd jq && generate_combined_json; then
 	    crit=$(jq -r '.totals.critical // 0' "$COMBINED_JSON_FILE" 2>/dev/null || echo 0)
 	    warn=$(jq -r '.totals.warning // 0' "$COMBINED_JSON_FILE" 2>/dev/null || echo 0)

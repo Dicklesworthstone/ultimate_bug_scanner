@@ -79,7 +79,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 
 ### 🧠 Language-Aware Meta-Runner
 - `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Ruby, and Swift** in the same repo and fans out to per-language scanners.
-- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif` for consistent downstream tooling.
+- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
 - Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
 
@@ -163,6 +163,7 @@ ubs --profile=loose    # Skip TODO/debug/code-quality nits when prototyping
 # Machine-readable output
 ubs . --format=json    # Pure JSON on stdout; logs go to stderr
 ubs . --format=jsonl   # Line-delimited summary per scanner + totals
+ubs . --format=toon    # TOON format (~50% smaller than JSON, LLM-optimized)
 ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"strung"
 ```
 
@@ -936,7 +937,7 @@ Git Integration:
   --diff, --git-diff       Scan only modified files (working tree vs HEAD)
 
 Output Control:
-  --format=FMT             Output format: text|json|jsonl|sarif (default: text)
+  --format=FMT             Output format: text|json|jsonl|sarif|toon (default: text)
   --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
   --no-color               Force disable ANSI colors
   OUTPUT_FILE              Save report to file (auto-tees to stdout)

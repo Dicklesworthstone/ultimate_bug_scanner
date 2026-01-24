@@ -1720,6 +1720,86 @@
           }
         }
       }
+    },
+    {
+      "id": "toon-format-js-buggy",
+      "description": "TOON format output for JS buggy fixtures (validates TOON encoding works).",
+      "path": "test-suite/buggy",
+      "language": "js",
+      "tags": [
+        "toon",
+        "format",
+        "js"
+      ],
+      "args": [
+        "--only=js",
+        "--format=toon"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "project:",
+          "scanners[",
+          "findings["
+        ]
+      }
+    },
+    {
+      "id": "toon-format-env-var",
+      "description": "TOON format via UBS_OUTPUT_FORMAT env var.",
+      "path": "test-suite/buggy",
+      "language": "js",
+      "tags": [
+        "toon",
+        "format",
+        "env"
+      ],
+      "env": {
+        "UBS_OUTPUT_FORMAT": "toon"
+      },
+      "args": [
+        "--only=js"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": [
+          "project:",
+          "scanners["
+        ]
+      }
+    },
+    {
+      "id": "toon-format-fallback",
+      "description": "TOON format falls back to JSON when toon binary is not in PATH.",
+      "path": "test-suite/buggy",
+      "language": "js",
+      "tags": [
+        "toon",
+        "format",
+        "fallback"
+      ],
+      "args": [
+        "--only=js",
+        "--format=toon"
+      ],
+      "env": {
+        "PATH": "/usr/bin:/bin"
+      },
+      "expect": {
+        "exit_code": "nonzero",
+        "require_substrings": [
+          "\"project\":",
+          "\"scanners\":"
+        ],
+        "require_substrings_stderr": [
+          "Warning: toon (TOON encoder) not found in PATH"
+        ]
+      }
     }
   ]
 }

@@ -969,6 +969,7 @@ File Selection:
                            Ruby: rb,rake,ru | Custom: --include-ext=js,ts,vue
   --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
                            Example: --exclude=legacy (deps ignored by default)
+  --skip-size-check        Skip directory size guard (use with care)
 
 Performance:
   --jobs=N                 Parallel jobs for ripgrep (default: auto-detect cores)
@@ -987,6 +988,8 @@ Environment Variables:
   JOBS                     Same as --jobs=N
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
+  UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
+  UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -998,6 +1001,12 @@ Exit Codes:
   1                        Warnings found (only with --fail-on-warning)
   2                        Invalid arguments or environment error (e.g., missing ast-grep for JS/TS)
 ```
+
+**Directory size guard**
+
+UBS computes scan size **after ignore filters** (defaults + `.ubsignore`) and prints:
+`Scan size after ignores: XMB (limit YMB)` before enforcing the limit. Override via
+`UBS_MAX_DIR_SIZE_MB` or `UBS_SKIP_SIZE_CHECK=1`, or pass `--skip-size-check`.
 
 ### Environment errors (exit 2)
 
@@ -1048,6 +1057,10 @@ ubs --jobs=16 .  # Explicit core count
 
 # Exclude vendor code
 ubs . --exclude=node_modules,vendor,dist,build
+
+# Large directories (size guard)
+UBS_MAX_DIR_SIZE_MB=5000 ubs .
+UBS_SKIP_SIZE_CHECK=1 ubs .
 
 # Custom rules directory
 ubs . --rules=~/.config/ubs/custom-rules

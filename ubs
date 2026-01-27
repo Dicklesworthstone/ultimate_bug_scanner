@@ -54,6 +54,48 @@ json_escape(){
   printf '%s' "$s"
 }
 
+load_ignore_patterns(){
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  if ! need_cmd python3; then
+    say "${YELLOW}${WARN}${RESET} python3 is required to parse ignore file $file (skipping)"
+    return 0
+  fi
+  local csv
+  csv=$(python3 - "$file" <<'PY' 2>/dev/null
+import sys, pathlib
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    sys.exit(0)
+patterns = []
+seen = set()
+for raw in path.read_text().splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith('#'):
+        continue
+    stripped = stripped.rstrip('/')
+    if stripped.startswith('./'):
+        stripped = stripped[2:]
+    if not stripped or stripped in seen:
+        continue
+    seen.add(stripped)
+    patterns.append(stripped)
+print(",".join(patterns))
+PY
+)
+  csv="${csv//$'\n'/}"
+  csv="${csv%,}"
+  if [[ -n "$csv" ]]; then
+    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+      GLOBAL_EXCLUDE_PATTERNS="$GLOBAL_EXCLUDE_PATTERNS,$csv"
+    else
+      GLOBAL_EXCLUDE_PATTERNS="$csv"
+    fi
+    local human="${csv//,/ }"
+    say "${DIM}${INFO}${RESET} Ignoring paths from ${file} → ${human}"
+  fi
+}
+
 HELPER_ASSETS=(
   "helpers/resource_lifecycle_py.py"
   "helpers/resource_lifecycle_go.go"
@@ -191,6 +233,7 @@ IGNORE_FILE=""
 DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels"
 # Safety guards: maximum directory size (MB) and whether to refuse home/root dirs
 MAX_DIR_SIZE_MB="${UBS_MAX_DIR_SIZE_MB:-1000}"  # 1GB default; set 0 to disable
+SKIP_SIZE_CHECK="${UBS_SKIP_SIZE_CHECK:-0}"
 REFUSE_HOME_ROOT="${UBS_REFUSE_HOME_ROOT:-1}"  # 1 = refuse, 0 = allow
 GLOBAL_EXCLUDE_PATTERNS="$DEFAULT_IGNORES"
 FILTERED_PROJECT_DIR=""
@@ -264,6 +307,7 @@ Options:
   --update-modules        Force re-download of modules before run
   --jobs=N                Parallelism hint (passed to children if supported)
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
+  --skip-size-check       Skip directory size guard (use with care)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift type narrowing checks (falls back to basic heuristics)
   --no-auto-update        Disable auto-update (even if UBS_ENABLE_AUTO_UPDATE=1)
   --staged                Scan only files staged for commit (git index)
@@ -279,6 +323,7 @@ Environment Variables:
                               Set to a specific toon_rust encoder path if needed (do not use Node.js toon)
   UBS_MAX_DIR_SIZE_MB=N       Max directory size in MB before refusing to scan (default: 1000)
                               Set to 0 to disable this safety check
+  UBS_SKIP_SIZE_CHECK=1       Skip directory size guard entirely
   UBS_REFUSE_HOME_ROOT=0|1    Whether to refuse scanning \$HOME or / (default: 1)
                               Set to 0 to allow scanning these directories
 
@@ -446,6 +491,7 @@ else
       --suggest-ignore) SUGGEST_IGNORE=1; shift;;
       --jsonl-summary-only) JSONL_DETAIL=0; shift;;
       --ignore-file=*) IGNORE_FILE="${1#*=}"; shift;;
+      --skip-size-check) SKIP_SIZE_CHECK=1; shift;;
       --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
       --module-dir)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -597,10 +643,13 @@ PY
 }
 
 # Check 2: Refuse directories larger than MAX_DIR_SIZE_MB (unless set to 0)
-if [[ "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
+if [[ "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
   dir_size_mb="$(dir_size_mb_filtered "$SOURCE_PROJECT_DIR" "$GLOBAL_EXCLUDE_PATTERNS")"
+  if [[ "${QUIET:-0}" -eq 0 ]]; then
+    say "${DIM}${INFO}${RESET} Scan size after ignores: ${dir_size_mb}MB (limit ${MAX_DIR_SIZE_MB}MB)"
+  fi
   if [[ "$dir_size_mb" -gt "$MAX_DIR_SIZE_MB" ]]; then
-    say "${RED}${X}${RESET} ${BOLD}Directory too large${RESET}: ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB"
+    say "${RED}${X}${RESET} ${BOLD}Directory too large (after ignores)${RESET}: ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB"
     say "${DIM}UBS copies the scan target to /tmp before analysis, which can exhaust disk space.${RESET}"
     say "${DIM}This safety check prevents accidental scans of large directories like \$HOME.${RESET}"
     say ""
@@ -701,48 +750,6 @@ resolve_git_metadata(){
       GIT_BLOB_BASE=""
       ;;
   esac
-}
-
-load_ignore_patterns(){
-  local file="$1"
-  [[ -f "$file" ]] || return 0
-  if ! need_cmd python3; then
-    say "${YELLOW}${WARN}${RESET} python3 is required to parse ignore file $file (skipping)"
-    return 0
-  fi
-  local csv
-  csv=$(python3 - "$file" <<'PY' 2>/dev/null
-import sys, pathlib
-path = pathlib.Path(sys.argv[1])
-if not path.exists():
-    sys.exit(0)
-patterns = []
-seen = set()
-for raw in path.read_text().splitlines():
-    stripped = raw.strip()
-    if not stripped or stripped.startswith('#'):
-        continue
-    stripped = stripped.rstrip('/')
-    if stripped.startswith('./'):
-        stripped = stripped[2:]
-    if not stripped or stripped in seen:
-        continue
-    seen.add(stripped)
-    patterns.append(stripped)
-print(",".join(patterns))
-PY
-)
-  csv="${csv//$'\n'/}"
-  csv="${csv%,}"
-  if [[ -n "$csv" ]]; then
-    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
-      GLOBAL_EXCLUDE_PATTERNS="$GLOBAL_EXCLUDE_PATTERNS,$csv"
-    else
-      GLOBAL_EXCLUDE_PATTERNS="$csv"
-    fi
-    local human="${csv//,/ }"
-    say "${DIM}${INFO}${RESET} Ignoring paths from ${file} → ${human}"
-  fi
 }
 
 prepare_git_workspace(){

@@ -2349,17 +2349,17 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 22; then
 print_header "22. SUSPICIOUS CASTS & TRUNCATION"
-print_category "Detects: pervasive `as` casts, try_into().unwrap, numeric narrowing patterns" \
-  "`as` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths"
+print_category "Detects: pervasive \`as\` casts, try_into().unwrap, numeric narrowing patterns" \
+  "\`as\` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths"
 
-print_subheader "`as` cast inventory"
+print_subheader "\`as\` cast inventory"
 as_casts=$("${GREP_RN[@]}" -e "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 as_casts=$(printf '%s\n' "${as_casts:-0}" | awk 'END{print $0+0}')
 if [ "$as_casts" -gt 0 ]; then
-  print_finding "info" "$as_casts" "`as` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants"
-  add_finding "info" "$as_casts" "`as` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants" "${CATEGORY_NAME[22]}" "$(collect_samples_rg "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" 3)"
+  print_finding "info" "$as_casts" "\`as\` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants"
+  add_finding "info" "$as_casts" "\`as\` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants" "${CATEGORY_NAME[22]}" "$(collect_samples_rg "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" 3)"
 else
-  print_finding "good" "No obvious `as` casts detected"
+  print_finding "good" "No obvious \`as\` casts detected"
 fi
 
 print_subheader "try_into().unwrap()/expect() (panic on conversion failure)"

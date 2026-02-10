@@ -575,24 +575,31 @@ dir_size_mb_filtered(){
   local dir="$1"
   local patterns_csv="${2:-}"
   local result=""
+  local du_can_exclude=0
   if need_cmd du; then
     local -a du_args=()
     if [[ -n "$patterns_csv" ]] && du --help 2>/dev/null | grep -q -- '--exclude'; then
+      du_can_exclude=1
       local -a pats=()
       IFS=',' read -r -a pats <<<"$patterns_csv"
       for pat in "${pats[@]}"; do
         [[ -n "$pat" ]] && du_args+=( "--exclude=$pat" )
       done
     fi
-    result=$(du -sm "${du_args[@]}" "$dir" 2>/dev/null | cut -f1)
-    if [[ "$result" =~ ^[0-9]+$ ]]; then
-      echo "$result"
-      return 0
-    fi
-    result=$(du -sk "${du_args[@]}" "$dir" 2>/dev/null | cut -f1)
-    if [[ "$result" =~ ^[0-9]+$ ]]; then
-      echo $((result / 1024))
-      return 0
+    # Only use du when no patterns are needed or du supports --exclude;
+    # otherwise fall through to the Python fallback which handles exclusions
+    # correctly on all platforms (fixes macOS/BSD du which lacks --exclude).
+    if [[ -z "$patterns_csv" || "$du_can_exclude" -eq 1 ]]; then
+      result=$(du -sm "${du_args[@]}" "$dir" 2>/dev/null | cut -f1)
+      if [[ "$result" =~ ^[0-9]+$ ]]; then
+        echo "$result"
+        return 0
+      fi
+      result=$(du -sk "${du_args[@]}" "$dir" 2>/dev/null | cut -f1)
+      if [[ "$result" =~ ^[0-9]+$ ]]; then
+        echo $((result / 1024))
+        return 0
+      fi
     fi
   fi
   if need_cmd python3; then

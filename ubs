@@ -22,7 +22,7 @@ declare -A MODULE_CHECKSUMS=(
   [golang]='b157d6e8f2684246c8add2a6cd0b3da698a8f3aace6e7c367ed76336e21ff4c6'
   [java]='6b120bd6bd199d45e5f80d295888aeab10c1439abe064797047e776258b37256'
   [js]='f92889318e794d96277f55d6dee9da3947c122786ee929d7eaf380d4332a38c0'
-  [python]='e7697af93a7a2b0e413ecb17bf878656ee92229a7fbe47c1fa77f779dd6c9a43'
+  [python]='95c474454917bffa003a3823731a37dfaa1e855ee1cfaced8d8efa129d1cd39e'
   [ruby]='3490a56a174f4873d01a83d4ceac8bdb7b6d56024c9aff25257af28c9d805405'
   [rust]='d3bed67cbb0a234765129ae133e6c4a92f6c1fd0dd3afc5c7635fe864382d809'
   [swift]='b350c2ae42725f96a2c94eaf7c70ff4864ecae53e0fc7d9a3fee5988128c8a2a'
@@ -696,7 +696,7 @@ fi
 
 ensure_dir(){ mkdir -p "$1" 2>/dev/null || { say "${RED}$X cannot create $1${RESET}"; exit 1; }; }
 
-script_dir(){ local src="${BASH_SOURCE[0]}"; while [ -h "$src" ]; do src="$(readlink "$src")"; done; cd -P "$(dirname "$src")" && pwd; }
+script_dir(){ local src="${BASH_SOURCE[0]}"; while [ -h "$src" ]; do local dir; dir="$(cd -P "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"; [[ "$src" != /* ]] && src="$dir/$src"; done; cd -P "$(dirname "$src")" && pwd; }
 
 prepare_metrics_dir(){
   local dir="$1"

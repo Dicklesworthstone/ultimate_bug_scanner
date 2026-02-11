@@ -2745,7 +2745,14 @@ PY
         ;;
       bandit)
         print_subheader "bandit (security)"
-        _EXC=""; for d in "${EXCLUDE_DIRS[@]}"; do _EXC="${_EXC:+$_EXC,}$d"; done
+        _EXC=""
+        for d in "${EXCLUDE_DIRS[@]}"; do
+          if [[ "$d" == /* ]]; then
+            _EXC="${_EXC:+$_EXC,}$d"
+          else
+            _EXC="${_EXC:+$_EXC,}$PROJECT_DIR/$d"
+          fi
+        done
         if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "${_EXC:-}" ; then
           print_finding "info" 0 "Bandit scan completed" "See output above"
         else

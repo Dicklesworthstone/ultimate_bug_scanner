@@ -19,7 +19,7 @@ else
 fi
 SCRIPT_NAME="ubs"
 INSTALL_NAME="ubs"
-REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main"
+REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master"
 ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
 ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
 MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)

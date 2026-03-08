@@ -1,11 +1,66 @@
 
-# 🔬 Ultimate Bug Scanner v5.0
+# Ultimate Bug Scanner v5.0
 
 ### **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 [![Version](https://img.shields.io/badge/version-5.0.6-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+
+---
+
+**UBS is a polyglot bug scanner built for the way code actually gets written now: fast, by AI agents, across multiple languages at once.** It watches eight languages simultaneously, catches the bugs that LLMs reliably produce (missing `await`, null dereferences, `eval()`, XSS, resource leaks), and returns structured results in under five seconds. No configuration files. No per-language setup. One command, one report, and your agent or CI pipeline knows immediately whether the code is safe to ship.
+
+This is a Polis fork. Upstream lives at [Dicklesworthstone/ultimate_bug_scanner](https://github.com/Dicklesworthstone/ultimate_bug_scanner). We carry the expanded CLI reference and integrate UBS into the Polis agent ecosystem as the default quality gate.
+
+---
+
+## Current Status
+
+| Area | Status | Notes |
+|------|--------|-------|
+| JS/TS scanning (ast-grep + regex) | ✅ Working | Full AST analysis, React hooks, taint engine |
+| Python scanning | ✅ Working | AST resource lifecycle, asyncio tracking |
+| Go scanning | ✅ Working | Goroutine/context/defer hygiene via AST walker |
+| Java scanning | ✅ Working | JDBC, executor, try-with-resources via ast-grep |
+| Rust scanning | ✅ Working | Clippy integration, unwrap/Option analysis |
+| C/C++ scanning | ✅ Working | Buffer overflow, malloc/free, UB detection |
+| Ruby scanning | ✅ Working | Rails patterns, eval/shell, bundle hygiene |
+| Swift scanning | ✅ Working | Guard-let, optional binding, ObjC bridging |
+| JSON/JSONL/SARIF output | ✅ Working | Unified schema across all languages |
+| TOON output (token-optimized) | ✅ Working | ~50% smaller than JSON for LLM consumption |
+| Baseline comparison (`--comparison`) | ✅ Working | Delta detection for CI regression tracking |
+| HTML reports | ✅ Working | Standalone dashboard, PR-attachable |
+| Claude Code hooks | ✅ Working | Auto-scan on file save |
+| Beads JSONL integration | ✅ Working | `--beads-jsonl` for issue-tracking pipelines |
+| Homebrew install | ✅ Working | `brew install dicklesworthstone/tap/ubs` |
+| Kotlin type narrowing | ⚠️ Beta | Runs via Java module, `.kt` file detection |
+| Swift guard helper standalone | ⚠️ Beta | Recently split from Java module |
+| Auto-update system | ⚠️ Opt-in | Disabled by default for supply-chain safety |
+| Incremental scanning (cache) | ⚠️ Not yet | `--staged` and `--diff` cover the common case |
+
+---
+
+## Part of Polis
+
+UBS is the quality gate in a larger agent ecosystem. Each tool handles one concern:
+
+| Tool | Role | Repository |
+|------|------|------------|
+| **Ergon** | Work orchestration | [Perttulands/ergon-work-orchestration](https://github.com/Perttulands/ergon-work-orchestration) |
+| **Hermes** | Agent relay | [Perttulands/hermes-relay](https://github.com/Perttulands/hermes-relay) |
+| **Cerberus** | Gate / access control | [Perttulands/cerberus-gate](https://github.com/Perttulands/cerberus-gate) |
+| **Chiron** | Agent training | [Perttulands/chiron-trainer](https://github.com/Perttulands/chiron-trainer) |
+| **Learning Loop** | Feedback integration | [Perttulands/learning-loop](https://github.com/Perttulands/learning-loop) |
+| **Senate** | Decision framework | [Perttulands/senate](https://github.com/Perttulands/senate) |
+| **Beads** | Event threading | [Perttulands/beads-polis](https://github.com/Perttulands/beads-polis) |
+| **Truthsayer** | Verification | [Perttulands/truthsayer](https://github.com/Perttulands/truthsayer) |
+| **UBS** | Bug scanning (this repo) | [Perttulands/ultimate_bug_scanner](https://github.com/Perttulands/ultimate_bug_scanner) |
+| **Horkos** | Oath / contract enforcement | [Perttulands/horkos-oathkeeper](https://github.com/Perttulands/horkos-oathkeeper) |
+| **Argus** | Watcher / monitoring | [Perttulands/argus-watcher](https://github.com/Perttulands/argus-watcher) |
+| **Polis Utils** | Shared utilities | [Perttulands/polis-utils](https://github.com/Perttulands/polis-utils) |
+
+---
 
 <div align="center">
 
@@ -34,13 +89,13 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_sca
   | bash -s -- --easy-mode
 ```
 
-Note: Windows users must run the installer one-liner from within Git Bash, or use WSL for Windows. 
+Note: Windows users must run the installer one-liner from within Git Bash, or use WSL for Windows.
 
 </div>
 
 ---
 
-## 🤖 Agent Quickstart (JSON/TOON)
+## Agent Quickstart (JSON/TOON)
 
 **Use machine-readable output in agent contexts.** stdout = data, stderr = diagnostics, exit 0 = success.
 
@@ -58,7 +113,7 @@ ubs --staged --format=json
 ubs . --profile=strict --fail-on-warning --format=json
 ```
 
-## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
+## The Problem: AI Moves Fast, Bugs Move Faster
 
 You're coding faster than ever with Claude Code, Codex, Cursor, and other AI coding agents. You're shipping features in minutes that used to take days. **But here's the painful truth:**
 
@@ -67,43 +122,43 @@ You're coding faster than ever with Claude Code, Codex, Cursor, and other AI cod
 **JavaScript/TypeScript example** *(similar patterns exist in Python, Go, Rust, Java, C++, Ruby)*:
 
 ```javascript
-// ❌ CRITICAL BUG #1: Null pointer crash waiting to happen
+// Null pointer crash waiting to happen
 const submitButton = document.getElementById('submit');
-submitButton.addEventListener('click', handleSubmit);  // 💥 Crashes if element doesn't exist
+submitButton.addEventListener('click', handleSubmit);  // Crashes if element doesn't exist
 
-// ❌ CRITICAL BUG #2: XSS vulnerability
+// XSS vulnerability
 function displayUserComment(comment) {
-  document.getElementById('comments').innerHTML = comment;  // 🚨 Security hole
+  document.getElementById('comments').innerHTML = comment;  // Security hole
 }
 
-// ❌ CRITICAL BUG #3: Silent failure (missing await)
+// Silent failure (missing await)
 async function saveUser(data) {
-  const result = validateUser(data);  // 💥 Should be 'await validateUser(data)'
+  const result = validateUser(data);  // Should be 'await validateUser(data)'
   await saveToDatabase(result);  // Saves undefined!
 }
 
-// ❌ CRITICAL BUG #4: Always false comparison
-if (calculatedValue === NaN) {  // 💥 This NEVER works (always false)
+// Always false comparison
+if (calculatedValue === NaN) {  // This NEVER works (always false)
   console.log("Invalid calculation");
 }
 
-// ❌ CRITICAL BUG #5: parseInt footgun
-const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (octal!)
+// parseInt footgun
+const zipCode = parseInt(userInput);  // "08" becomes 0 in old browsers (octal!)
 ```
 
 **Each of these bugs could cost 3-6 hours to debug in production.** Similar issues plague every language: unguarded null access, missing `await`, security holes from `eval()`, buffer overflows from `strcpy()`, `.unwrap()` panics, goroutine leaks... **You've probably hit all of them.**
 
 ---
 
-## 🎯 **The Solution: Your 24/7 Bug Hunting Partner**
+## The Solution: Language-Aware Multi-Scanner
 
-### 🧠 Language-Aware Meta-Runner
+### Language-Aware Meta-Runner
 - `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Ruby, and Swift** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
-- Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
+- Modules download lazily (PATH -> repo `modules/` -> cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
 
-### 🔐 Supply-Chain Safeguards
+### Supply-Chain Safeguards
 - Every lazily-downloaded module (and its helper assets) ships with pinned SHA-256 checksums baked into the meta-runner. Files fetched from GitHub are verified before they can execute, preventing tampering between releases.
 - The cache lives under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules` by default; use `--module-dir` to relocate it (e.g., inside a CI workspace) while retaining the same verification guarantees.
 - Run `ubs doctor` at any time to audit your environment. It checks for curl/wget availability, writable cache directories, and per-language module integrity. Add `--fix` to redownload missing or corrupted modules proactively.
@@ -111,17 +166,17 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - **Developer Pre-commit Hook**: The repository ships with a `.githooks/pre-commit` hook that auto-updates `SHA256SUMS` when modules change and blocks commits with stale checksums. This ensures every release has verified checksums without manual intervention.
 - **Minisign Support**: For additional assurance, set `UBS_MINISIGN_PUBKEY` to verify cryptographic signatures on `SHA256SUMS` via [minisign](https://jedisct1.github.io/minisign/).
 
-### 🎛 Category Packs & Shareable Reports
+### Category Packs & Shareable Reports
 - `--category=resource-lifecycle` focuses the scanners on Python/Go/Java resource hygiene (context managers, defer symmetry, try-with-resources). UBS automatically narrows the language set to those with lifecycle packs enabled and suppresses unrelated categories.
 - `--comparison=<baseline.json>` diff the latest combined summary against a stored run. Deltas feed into console output, JSON, HTML, and SARIF automation metadata so CI can detect regressions.
 - `--report-json=<file>` writes an enriched summary (project, totals, git metadata, optional comparison block) that you can archive or share with teammates/CI.
-- `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
+- `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns -- ideal for attaching to PRs or chat updates.
 - All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output automatically annotates `path:line` references, JSON gains `git.*` metadata, and merged SARIF runs now include `versionControlProvenance` plus `automationDetails` keyed by the comparison id.
 
 #### Resource lifecycle heuristics in each language
-- **Python** – Category 16 now correlates every `open()` call against matching `with open(...)` usage and explicit `encoding=` parameters, while Category 19 uses the new AST helper at `modules/helpers/resource_lifecycle_py.py` to walk every file, socket, subprocess, asyncio task, and context cancellation path. The helper resolves alias imports, context managers, and awaited tasks so the diff counts (`acquire=X, release=Y, context-managed=Z`) show the exact imbalance per file.
-- **Go** – Category 5/17 now run a Go AST walker (`modules/helpers/resource_lifecycle_go.go`) that detects `context.With*` calls missing cancel, `time.NewTicker/NewTimer` without `Stop`, `os.Open/sql.Open` without `Close`, and mutex `Lock`/`Unlock` symmetry. Findings come straight from the AST positions, so “ticker missing Stop()” lines map to the exact `file:line` instead of coarse regex summaries.
-- **Java** – Category 5 surfaces `FileInputStream`, readers/writers, JDBC handles, etc. that were created outside try-with-resources, while Category 19 keeps tracking executor services and file streams that never close. The new summary text matches the manifest fixtures, so CI will fail if regression swallows these warnings.
+- **Python** -- Category 16 now correlates every `open()` call against matching `with open(...)` usage and explicit `encoding=` parameters, while Category 19 uses the new AST helper at `modules/helpers/resource_lifecycle_py.py` to walk every file, socket, subprocess, asyncio task, and context cancellation path. The helper resolves alias imports, context managers, and awaited tasks so the diff counts (`acquire=X, release=Y, context-managed=Z`) show the exact imbalance per file.
+- **Go** -- Category 5/17 now run a Go AST walker (`modules/helpers/resource_lifecycle_go.go`) that detects `context.With*` calls missing cancel, `time.NewTicker/NewTimer` without `Stop`, `os.Open/sql.Open` without `Close`, and mutex `Lock`/`Unlock` symmetry. Findings come straight from the AST positions, so "ticker missing Stop()" lines map to the exact `file:line` instead of coarse regex summaries.
+- **Java** -- Category 5 surfaces `FileInputStream`, readers/writers, JDBC handles, etc. that were created outside try-with-resources, while Category 19 keeps tracking executor services and file streams that never close. The new summary text matches the manifest fixtures, so CI will fail if regression swallows these warnings.
 
 #### Shareable output quickstart
 ```bash
@@ -141,7 +196,7 @@ ubs --ci --only=python --category=resource-lifecycle \
 
 ---
 
-## 💡 **Basic Usage**
+## Basic Usage
 
 ```bash
 # Scan current directory
@@ -191,7 +246,7 @@ ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"s
 - UBS auto-ignores common junk (`node_modules`, virtualenvs, dist/build/target/vendor, editor caches, etc.).
 - Inline suppression is available when a finding is intentional: `eval("print('safe')")  # ubs:ignore`
 
-## 🚀 **Quick Install (30 Seconds)**
+## Quick Install (30 Seconds)
 
 ### **Recommended: Homebrew (macOS/Linux)**
 
@@ -254,7 +309,7 @@ Scan host code (risk-aware: grants container access to host FS):
 docker run --rm -v /:/host ghcr.io/dicklesworthstone/ubs-tools bash -c "cd /host/path && ubs ."
 ```
 
-⚠️ Use the host-mount pattern only when you understand the write-access implications.
+Use the host-mount pattern only when you understand the write-access implications.
 
 ### Deployment & Security
 
@@ -262,21 +317,21 @@ docker run --rm -v /:/host ghcr.io/dicklesworthstone/ubs-tools bash -c "cd /host
 - Supply chain & verification model: [docs/security.md](docs/security.md)
 
 The installer will:
-- ✅ Install the `ubs` command globally
-- ✅ Install/ensure `ast-grep` (required for accurate JS/TS scanning; UBS can auto-provision a pinned binary)
-- ✅ Optionally install `ripgrep` (for 10x faster scanning)
-- ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
-- ✅ Optionally install `typos` (smart spellchecker for docs and identifiers)
-- ✅ Optionally install `Node.js + typescript` (enables deep TypeScript type narrowing analysis)
-- ✅ Auto-run `ubs doctor` post-install and append a session summary to `~/.config/ubs/session.md`
-- ✅ Capture readiness facts (ripgrep/jq/typos/type narrowing) and store them for `ubs sessions --entries 1`
-- ✅ Set up git hooks (block commits with critical bugs)
-- ✅ Set up Claude Code hooks (scan on file save)
-- ✅ Add documentation to your AGENTS.md
+- Install the `ubs` command globally
+- Install/ensure `ast-grep` (required for accurate JS/TS scanning; UBS can auto-provision a pinned binary)
+- Optionally install `ripgrep` (for 10x faster scanning)
+- Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
+- Optionally install `typos` (smart spellchecker for docs and identifiers)
+- Optionally install `Node.js + typescript` (enables deep TypeScript type narrowing analysis)
+- Auto-run `ubs doctor` post-install and append a session summary to `~/.config/ubs/session.md`
+- Capture readiness facts (ripgrep/jq/typos/type narrowing) and store them for `ubs sessions --entries 1`
+- Set up git hooks (block commits with critical bugs)
+- Set up Claude Code hooks (scan on file save)
+- Add documentation to your AGENTS.md
 
 Need to revisit what the installer discovered later? Run `ubs sessions --entries 1` to view the most recent session log (or point teammates at the same summary).
 
-Need the “just make it work” button? Run the installer with `--easy-mode` to auto-install every dependency, accept all prompts, detect local coding agents, and wire their quality guardrails with zero extra questions:
+Need the "just make it work" button? Run the installer with `--easy-mode` to auto-install every dependency, accept all prompts, detect local coding agents, and wire their quality guardrails with zero extra questions:
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh?$(date +%s)" \
@@ -285,7 +340,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_sca
 
 **Total time:** 30 seconds to 2 minutes (depending on dependencies)
 
-Need to keep your shell RC files untouched? Combine `--no-path-modify` (and optionally `--skip-hooks`) with the command above—the installer will still drop `ubs` into your chosen `--install-dir`, but it will skip both PATH edits and the alias helper entirely.
+Need to keep your shell RC files untouched? Combine `--no-path-modify` (and optionally `--skip-hooks`) with the command above -- the installer will still drop `ubs` into your chosen `--install-dir`, but it will skip both PATH edits and the alias helper entirely.
 
 ### **Option 2: Manual Install**
 
@@ -337,16 +392,16 @@ This command deletes the UBS binary, shell RC snippets/aliases, config under `~/
 | `--skip-doctor` | Skip the automatic `ubs doctor` run + session summary after install. | Use when CI already runs doctor separately or when you're iterating locally and want a faster finish. |
 
 > [!WARNING]
-> `--self-test` requires running `install.sh` from a working tree that contains `test-suite/install/run_tests.sh` (i.e., the repo root). Curl-piping the installer from GitHub can’t self-test because the harness isn’t present, so the flag will error out early instead of giving a false sense of safety.
+> `--self-test` requires running `install.sh` from a working tree that contains `test-suite/install/run_tests.sh` (i.e., the repo root). Curl-piping the installer from GitHub can't self-test because the harness isn't present, so the flag will error out early instead of giving a false sense of safety.
 
 > [!NOTE]
-> After every install the script now double-checks `command -v ubs`. If another copy shadows the freshly written binary, you’ll get an explicit warning with both paths so you can fix PATH order before running scans.
+> After every install the script now double-checks `command -v ubs`. If another copy shadows the freshly written binary, you'll get an explicit warning with both paths so you can fix PATH order before running scans.
 
 > [!TIP]
-> Type narrowing relies on Node.js plus the `typescript` npm package *and* the Python helpers that power the Rust/Kotlin/Swift checks. The installer now checks Node/TypeScript readiness, can optionally run `npm install -g typescript`, and surfaces the status inside `install.sh --diagnose`. Use `--skip-type-narrowing` if you’re on an air-gapped host or plan to keep the heuristic-only mode.
+> Type narrowing relies on Node.js plus the `typescript` npm package *and* the Python helpers that power the Rust/Kotlin/Swift checks. The installer now checks Node/TypeScript readiness, can optionally run `npm install -g typescript`, and surfaces the status inside `install.sh --diagnose`. Use `--skip-type-narrowing` if you're on an air-gapped host or plan to keep the heuristic-only mode.
 
 > [!TIP]
-> To avoid global npm permission issues, the installer now detects/installs [bun](https://bun.sh/) just like other dependencies and uses `bun install --global typescript` by default, falling back to npm only if bun isn’t available.
+> To avoid global npm permission issues, the installer now detects/installs [bun](https://bun.sh/) just like other dependencies and uses `bun install --global typescript` by default, falling back to npm only if bun isn't available.
 >
 > The diagnostics also call out Swift guard readiness: if python3 is available we count `.swift` files under your repo and record whether the guard helper will actually run. That fact shows up in `install.sh --diagnose` output and the auto-generated session log so iOS/macOS teams can tell at a glance whether the ObjC-bridging heuristics are active.
 
@@ -360,7 +415,7 @@ bash install.sh --dry-run --no-path-modify --skip-hooks --non-interactive
 bash install.sh --easy-mode --self-test --skip-hooks
 ```
 
-### 🔄 **Auto-Update**
+### Auto-Update
 
 The `ubs` meta-runner supports an **opt-in** auto-update check (once every 24 hours). This is **disabled by default** for supply-chain safety.
 
@@ -381,31 +436,29 @@ Ultimate Bug Scanner is like having a senior developer review every line of code
 ```bash
 $ ubs .
 
-╔══════════════════════════════════════════════════════════════════════╗
-║  🔬 ULTIMATE BUG SCANNER v4.4 - Scanning your project...             ║
-╚══════════════════════════════════════════════════════════════════════╝
++----------------------------------------------------------------------+
+|  ULTIMATE BUG SCANNER v5.0 - Scanning your project...                |
++----------------------------------------------------------------------+
 
 Project:  /Users/you/awesome-app
 Files:    247 JS/TS + 58 Python + 24 Go + 16 Java + 11 Ruby + 12 C++/Rust files
 Finished: 3.2 seconds
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 Summary Statistics:
   Files scanned:    247
-  🔥 Critical:      0    ← Would have crashed in production!
-  ⚠️  Warnings:      8    ← Should fix before shipping
-  ℹ️  Info:          23   ← Code quality improvements
+  Critical:         0    <- Would have crashed in production!
+  Warnings:         8    <- Should fix before shipping
+  Info:             23   <- Code quality improvements
 
-✨ EXCELLENT! No critical issues found ✨
+EXCELLENT! No critical issues found
 
 ```
 
 ---
 
-## ⚡ **Why Developers + AI Agents Will Love This Tool**
+## Why Developers + AI Agents Will Love This Tool
 
-### 🚀 **1. Catches What Humans & AI Miss**
+### **1. Catches What Humans & AI Miss**
 
 **18 specialized detection categories** covering the bugs that *actually* matter:
 
@@ -446,32 +499,32 @@ Summary Statistics:
 </tr>
 </table>
 
-### 💨 **2. Blazing Fast (Because Your Time Matters)**
+### **2. Blazing Fast (Because Your Time Matters)**
 
 ```
-Small project (5K lines):     0.8 seconds  ⚡
-Medium project (50K lines):   3.2 seconds  🚀
-Large project (200K lines):  12 seconds    💨
-Huge project (1M lines):     58 seconds    🏃
+Small project (5K lines):     0.8 seconds
+Medium project (50K lines):   3.2 seconds
+Large project (200K lines):  12 seconds
+Huge project (1M lines):     58 seconds
 ```
 
 **That's 10,000+ lines analyzed per second.** Faster than you can say "but it worked on my machine."
 
-### 🤖 **3. Built FOR AI Agents, BY Developers Who Use AI**
+### **3. Built FOR AI Agents, BY Developers Who Use AI**
 
 Unlike traditional linters that fight AI-generated code, this scanner **embraces** it:
 
 ```markdown
-✅ Designed for Claude Code, Cursor, Windsurf, Aider, Continue, Copilot
-✅ Zero configuration - works with ANY JS/TS, Python, C/C++, Rust, Go, Java, or Ruby project
-✅ Integrates with git hooks, CI/CD, file watchers
-✅ Actionable output (tells you WHAT's wrong and HOW to fix it)
-✅ Fails fast in CI (catch bugs before they merge)
-✅ React Hooks dependency analysis that spots missing deps, unstable objects, and stale closures
-✅ Lightweight taint analysis that traces req.body/window.location/localStorage → innerHTML/res.send/eval/exec/db.query and flags flows without DOMPurify/escapeHtml/parameterized SQL
+Designed for Claude Code, Cursor, Windsurf, Aider, Continue, Copilot
+Zero configuration - works with ANY JS/TS, Python, C/C++, Rust, Go, Java, or Ruby project
+Integrates with git hooks, CI/CD, file watchers
+Actionable output (tells you WHAT's wrong and HOW to fix it)
+Fails fast in CI (catch bugs before they merge)
+React Hooks dependency analysis that spots missing deps, unstable objects, and stale closures
+Lightweight taint analysis that traces req.body/window.location/localStorage -> innerHTML/res.send/eval/exec/db.query and flags flows without DOMPurify/escapeHtml/parameterized SQL
 ```
 
-### 📊 **4. Real-World Impact**
+### **4. Real-World Impact**
 
 <table>
 <tr>
@@ -482,38 +535,38 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 <tr>
 <td><strong>AI implements user auth</strong></td>
 <td>
-  • 3 null pointer crashes (9h debugging)<br>
-  • 1 XSS vulnerability (8h + incident)<br>
-  • 2 race conditions (4h debugging)<br>
+  3 null pointer crashes (9h debugging)<br>
+  1 XSS vulnerability (8h + incident)<br>
+  2 race conditions (4h debugging)<br>
   <strong>Total: ~21 hours + security incident</strong>
 </td>
 <td>
-  • All issues caught in 4 seconds<br>
-  • Fixed before commit (15 min)<br>
+  All issues caught in 4 seconds<br>
+  Fixed before commit (15 min)<br>
   <strong>Total: 15 minutes</strong><br>
-  <strong>Savings: 84x faster</strong> ⚡
+  <strong>Savings: 84x faster</strong>
 </td>
 </tr>
 <tr>
 <td><strong>Refactor payment flow</strong></td>
 <td>
-  • Division by zero in edge case (3h)<br>
-  • Unhandled promise rejection (2h)<br>
-  • Missing error logging (1h)<br>
+  Division by zero in edge case (3h)<br>
+  Unhandled promise rejection (2h)<br>
+  Missing error logging (1h)<br>
   <strong>Total: 6 hours debugging</strong>
 </td>
 <td>
-  • Caught instantly (3 sec)<br>
-  • Fixed before merge (10 min)<br>
+  Caught instantly (3 sec)<br>
+  Fixed before merge (10 min)<br>
   <strong>Total: 10 minutes</strong><br>
-  <strong>Savings: 36x faster</strong> 🚀
+  <strong>Savings: 36x faster</strong>
 </td>
 </tr>
 </table>
 
 ---
 
-## 🤖 **AI Agent Integration (The Real Magic)**
+## AI Agent Integration (The Real Magic)
 
 ### On-Device Agent Guardrails
 
@@ -521,12 +574,12 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 
 | Agent / IDE | What we wire up | Why it helps |
 |-------------|-----------------|--------------|
-| **Claude Code Desktop** (`.claude/hooks/on-file-write.sh`) | File-save hook that shells out to `ubs --ci` whenever Claude saves JS/TS files. | Keeps Claude from accepting “Apply Patch” without a fresh scan. |
-| **Cursor** (`.cursor/rules`) | Shared rule block that tells Cursor plans/tasks to run `ubs --fail-on-warning .` and summarize outstanding issues. | Cursor’s autonomous jobs inherit the same QA checklist as humans. |
+| **Claude Code Desktop** (`.claude/hooks/on-file-write.sh`) | File-save hook that shells out to `ubs --ci` whenever Claude saves JS/TS files. | Keeps Claude from accepting "Apply Patch" without a fresh scan. |
+| **Cursor** (`.cursor/rules`) | Shared rule block that tells Cursor plans/tasks to run `ubs --fail-on-warning .` and summarize outstanding issues. | Cursor's autonomous jobs inherit the same QA checklist as humans. |
 | **Codex CLI** (`.codex/rules/ubs.md`) | Adds the identical rule block for OpenAI's Codex terminal workflow. Supports both file and directory formats (v0.77.0+). | Ensures Codex sessions never skip the scanner during long refactors. |
-| **Gemini Code Assist** (`.gemini/rules`) | Guidance instructing Gemini agents to run `ubs` before closing a ticket. | Keeps Gemini’s asynchronous fixes aligned with UBS exit criteria. |
-| **Windsurf** (`.windsurf/rules`) | Guardrail text + sample command palette snippet referencing `ubs`. | Windsurf’s multi-step plans stay grounded in the same quality gate. |
-| **Cline** (`.cline/rules`) | Markdown instructions that Cline’s VS Code extension ingests. | Forces every “tool call” from Cline to mention scanner findings. |
+| **Gemini Code Assist** (`.gemini/rules`) | Guidance instructing Gemini agents to run `ubs` before closing a ticket. | Keeps Gemini's asynchronous fixes aligned with UBS exit criteria. |
+| **Windsurf** (`.windsurf/rules`) | Guardrail text + sample command palette snippet referencing `ubs`. | Windsurf's multi-step plans stay grounded in the same quality gate. |
+| **Cline** (`.cline/rules`) | Markdown instructions that Cline's VS Code extension ingests. | Forces every "tool call" from Cline to mention scanner findings. |
 | **OpenCode MCP** (`.opencode/rules`) | Local MCP instructions so HTTP tooling always calls `ubs` before replying. | Makes OpenCode's multi-agent swarms share the same notion of "done". |
 
 #### Codex CLI v0.77.0+ Migration Note
@@ -536,7 +589,7 @@ Starting with Codex CLI v0.77.0, the rules storage changed from a **single file*
 | Codex Version | Rules Location | UBS Installer Behavior |
 |---------------|----------------|------------------------|
 | < v0.77.0 | `.codex/rules` (file) | Appends UBS quick reference to file |
-| ≥ v0.77.0 | `.codex/rules/` (directory) | Creates `.codex/rules/ubs.md` |
+| >= v0.77.0 | `.codex/rules/` (directory) | Creates `.codex/rules/ubs.md` |
 
 **If you upgraded Codex and encounter issues**, migrate manually:
 
@@ -555,31 +608,31 @@ When you're coding with AI, you're moving **10-100x faster** than traditional de
 
 ```
 Traditional workflow:              AI-powered workflow with scanner:
-┌──────────────────┐              ┌──────────────────┐
-│ AI writes code   │              │ AI writes code   │
-└────────┬─────────┘              └────────┬─────────┘
-         │                                 │
-         ↓                                 ↓
-┌──────────────────┐              ┌──────────────────┐
-│ You review       │              │ Scanner runs     │
-│ (15 min)         │              │ (3 seconds)      │
-└────────┬─────────┘              └────────┬─────────┘
-         │                                 │
-         ↓                                 ↓
-┌──────────────────┐              ┌──────────────────┐
-│ Tests pass?      │              │ Critical bugs?   │
-└────────┬─────────┘              └────────┬─────────┘
-         │ NO!                              │ YES!
-         ↓                                 ↓
-┌──────────────────┐              ┌──────────────────┐
-│ Debug in prod    │              │ AI fixes them    │
-│ (6 hours)        │              │ (5 minutes)      │
-└──────────────────┘              └────────┬─────────┘
-                                           ↓
-                                  ┌──────────────────┐
-                                  │ Ship with         │
-                                  │ confidence        │
-                                  └──────────────────┘
++------------------+              +------------------+
+| AI writes code   |              | AI writes code   |
++--------+---------+              +--------+---------+
+         |                                 |
+         v                                 v
++------------------+              +------------------+
+| You review       |              | Scanner runs     |
+| (15 min)         |              | (3 seconds)      |
++--------+---------+              +--------+---------+
+         |                                 |
+         v                                 v
++------------------+              +------------------+
+| Tests pass?      |              | Critical bugs?   |
++--------+---------+              +--------+---------+
+         | NO!                              | YES!
+         v                                 v
++------------------+              +------------------+
+| Debug in prod    |              | AI fixes them    |
+| (6 hours)        |              | (5 minutes)      |
++------------------+              +--------+---------+
+                                           v
+                                  +------------------+
+                                  | Ship with         |
+                                  | confidence        |
+                                  +------------------+
 
 Total: 6.25 hours                Total: 8 minutes
 ```
@@ -593,12 +646,12 @@ Drop this into `.claude/hooks/on-file-write.sh`:
 # Auto-scan UBS-supported languages (JS/TS, Python, C/C++, Rust, Go, Java, Ruby) on save
 
 if [[ "$FILE_PATH" =~ \.(js|jsx|ts|tsx|mjs|cjs|py|pyw|pyi|c|cc|cpp|cxx|h|hh|hpp|hxx|rs|go|java|rb)$ ]]; then
-  echo "🔬 Quality check running..."
+  echo "Quality check running..."
 
   if ubs "${PROJECT_DIR}" --ci 2>&1 | head -30; then
-    echo "✅ No critical issues"
+    echo "No critical issues"
   else
-    echo "⚠️  Issues detected - review above"
+    echo "Issues detected - review above"
   fi
 fi
 ```
@@ -613,18 +666,18 @@ The installer can set this up automatically, or add to `.git/hooks/pre-commit`:
 #!/bin/bash
 # Block commits with critical bugs
 
-echo "🔬 Running bug scanner..."
+echo "Running bug scanner..."
 
 if ! ubs . --fail-on-warning 2>&1 | tee /tmp/scan.txt | tail -30; then
   echo ""
-  echo "❌ Critical issues found. Fix them or use: git commit --no-verify"
+  echo "Critical issues found. Fix them or use: git commit --no-verify"
   echo ""
   echo "Top issues:"
-  grep -A 3 "🔥 CRITICAL" /tmp/scan.txt | head -20
+  grep -A 3 "CRITICAL" /tmp/scan.txt | head -20
   exit 1
 fi
 
-echo "✅ Quality check passed - committing..."
+echo "Quality check passed - committing..."
 ```
 
 **Result:** Bugs **cannot** be committed. Period.
@@ -639,8 +692,8 @@ Add to your `.cursorrules` or similar:
 Before marking any task as complete:
 
 1. Run the bug scanner: `ubs .`
-2. Fix ALL critical issues (🔥)
-3. Review warnings (⚠️) and fix if trivial
+2. Fix ALL critical issues
+3. Review warnings and fix if trivial
 4. Only then mark task complete
 
 If the scanner finds critical issues, your task is NOT done.
@@ -680,22 +733,22 @@ This is the golden pattern for AI coding workflows:
 #!/bin/bash
 # Have your AI agent run this after implementing features
 
-echo "🔬 Post-implementation quality check..."
+echo "Post-implementation quality check..."
 
 # Run scanner
 if ubs . --fail-on-warning > /tmp/scan-result.txt 2>&1; then
-  echo "✅ All quality checks passed!"
-  echo "📝 Ready to commit"
+  echo "All quality checks passed!"
+  echo "Ready to commit"
   exit 0
 else
-  echo "❌ Issues found:"
+  echo "Issues found:"
   echo ""
 
   # Show critical issues
-  grep -A 5 "🔥 CRITICAL" /tmp/scan-result.txt | head -30
+  grep -A 5 "CRITICAL" /tmp/scan-result.txt | head -30
 
   echo ""
-  echo "🤖 AI: Please fix these issues and re-run this check"
+  echo "AI: Please fix these issues and re-run this check"
   exit 1
 fi
 ```
@@ -722,24 +775,24 @@ Train your AI agent to use this decision tree:
 ```
 Did I modify code in any supported language?
 (JS/TS, Python, Go, Rust, Java, C++, Ruby)
-         │
-         ↓ YES
+         |
+         v YES
 Changed more than 50 lines?
-         │
-         ↓ YES
-    Run scanner ←──────────┐
-         │                 │
-         ↓                 │
-Critical issues found? ────┤ YES
-         │ NO              │
-         ↓                 │
-     Warnings?             │
-         │                 │
-         ↓ YES             │
-  Show to user             │
-  Ask if should fix ───────┤
-         │ NO              │
-         ↓                 ↓
+         |
+         v YES
+    Run scanner <----------+
+         |                 |
+         v                 |
+Critical issues found? ----+ YES
+         | NO              |
+         v                 |
+     Warnings?             |
+         |                 |
+         v YES             |
+  Show to user             |
+  Ask if should fix -------+
+         | NO              |
+         v                 v
     Commit code      Fix issues
 ```
 
@@ -759,10 +812,10 @@ UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Fl
 
 **Commands:**
 ```bash
-ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
-ubs $(git diff --name-only --cached)    # Staged files — before commit
+ubs file.ts file2.py                    # Specific files (< 1s) -- USE THIS
+ubs $(git diff --name-only --cached)    # Staged files -- before commit
 ubs --only=js,python src/               # Language filter (3-5x faster)
-ubs --ci --fail-on-warning .            # CI mode — before PR
+ubs --ci --fail-on-warning .            # CI mode -- before PR
 ubs --help                              # Full command reference
 ubs sessions --entries 1                # Tail the latest install session log
 ubs .                                   # Whole project (ignores things like .venv and node_modules automatically)
@@ -770,19 +823,19 @@ ubs .                                   # Whole project (ignores things like .ve
 
 **Output Format:**
 ```
-⚠️  Category (N errors)
-    file.ts:42:5 – Issue description
-    💡 Suggested fix
+Category (N errors)
+    file.ts:42:5 - Issue description
+    Suggested fix
 Exit code: 1
 ```
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+Parse: `file:line:col` -> location | fix suggestion -> how to fix | Exit 0/1 -> pass/fail
 
 **Fix Workflow:**
-1. Read finding → category + fix suggestion
-2. Navigate `file:line:col` → view context
+1. Read finding -> category + fix suggestion
+2. Navigate `file:line:col` -> view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
+5. Re-run `ubs <file>` -> exit 0
 6. Commit
 
 **Speed Critical:** Scope to changed files. `ubs src/file.ts` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
@@ -793,14 +846,14 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - **Contextual** (judgment): TODO/FIXME, console logs
 
 **Anti-Patterns:**
-- ❌ Ignore findings → ✅ Investigate each
-- ❌ Full scan per edit → ✅ Scope to file
-- ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
+- Do not ignore findings -> Investigate each
+- Do not full scan per edit -> Scope to file
+- Do not fix symptom (`if (x) { x.y }`) -> Root cause (`x?.y`)
 ````
 
 ---
 
-## 🎬 **See It In Action**
+## See It In Action
 
 *Examples show JavaScript output; each language has equivalent detections (Python: None checks, Go: nil guards, Rust: Option handling, etc.)*
 
@@ -809,22 +862,22 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 ```bash
 $ ubs src/
 
-▓▓▓ NULL SAFETY & DEFENSIVE PROGRAMMING
+NULL SAFETY & DEFENSIVE PROGRAMMING
 Detects: Null pointer dereferences, missing guards, unsafe property access
 
-  🔥 CRITICAL (5 found)
+  CRITICAL (5 found)
     Unguarded property access after getElementById
     Consider: const el = document.getElementById('x'); if (!el) return;
 
       src/components/form.js:42
         const submitBtn = document.getElementById('submit-button');
-        submitBtn.classList.add('active');  // ← Crashes if element missing
+        submitBtn.classList.add('active');  // <- Crashes if element missing
 
       src/utils/dom.js:87
         const modal = document.querySelector('.modal');
-        modal.style.display = 'block';  // ← Runtime crash guaranteed
+        modal.style.display = 'block';  // <- Runtime crash guaranteed
 
-  💡 Fix: Always check for null before accessing properties
+  Fix: Always check for null before accessing properties
 ```
 
 **Before:** 3 production crashes this week
@@ -833,22 +886,22 @@ Detects: Null pointer dereferences, missing guards, unsafe property access
 ### **Example 2: Security Vulnerability Detection**
 
 ```bash
-▓▓▓ SECURITY VULNERABILITIES
+SECURITY VULNERABILITIES
 Detects: Code injection, XSS, prototype pollution, timing attacks
 
-  🔥 CRITICAL (3 found)
+  CRITICAL (3 found)
     innerHTML without sanitization - XSS risk
     Use textContent or DOMPurify.sanitize()
 
       src/comments.js:156
-        element.innerHTML = userComment;  // ← XSS vulnerability!
+        element.innerHTML = userComment;  // <- XSS vulnerability!
 
-  🔥 CRITICAL (1 found)
+  CRITICAL (1 found)
     Hardcoded API keys detected
     Use environment variables or secret managers
 
       src/config.js:23
-        const apiKey = "sk_live_abc123xyz";  // ← Security breach!
+        const apiKey = "sk_live_abc123xyz";  // <- Security breach!
 ```
 
 **Before:** Security incident, customer data at risk
@@ -857,24 +910,24 @@ Detects: Code injection, XSS, prototype pollution, timing attacks
 ### **Example 3: Async/Await Gotchas**
 
 ```bash
-▓▓▓ ASYNC/AWAIT & PROMISE PITFALLS
+ASYNC/AWAIT & PROMISE PITFALLS
 Detects: Missing await, unhandled rejections, race conditions
 
-  🔥 CRITICAL (8 found)
+  CRITICAL (8 found)
     await used in non-async function
     SyntaxError in JavaScript
 
       src/api/users.js:67
         function saveUser(data) {
-          await database.insert(data);  // ← SyntaxError!
+          await database.insert(data);  // <- SyntaxError!
         }
 
-  ⚠️  WARNING (12 found)
+  WARNING (12 found)
     Promises without .catch() or try/catch
     Unhandled rejections crash Node.js
 
       src/services/email.js:45
-        sendEmail(user.email).then(result => ...)  // ← No error handling!
+        sendEmail(user.email).then(result => ...)  // <- No error handling!
 ```
 
 **Before:** Silent failures, mysterious bugs in production
@@ -882,11 +935,11 @@ Detects: Missing await, unhandled rejections, race conditions
 
 ---
 
-## 📋 **What It Detects (The Complete Arsenal)**
+## What It Detects (The Complete Arsenal)
 
 *Each language module has specialized detections. Examples below are representative (JavaScript shown; Python has `eval()`, Go has goroutine leaks, Rust has `.unwrap()` panics, C++ has buffer overflows, etc.)*
 
-### 🔴 **Critical Issues (Production Blockers)**
+### Critical Issues (Production Blockers)
 
 These **WILL** cause crashes, security breaches, or data corruption:
 
@@ -903,7 +956,7 @@ These **WILL** cause crashes, security breaches, or data corruption:
 | Missing async keyword | `await` without `async function` | **SyntaxError** |
 | Hardcoded secrets | `const key = "sk_live..."` | **Security breach** |
 
-### 🟡 **Warnings (Should Fix Before Shipping)**
+### Warnings (Should Fix Before Shipping)
 
 These cause bugs, performance issues, or maintenance headaches:
 
@@ -918,7 +971,7 @@ These cause bugs, performance issues, or maintenance headaches:
 | Missing switch default | `switch(x) { case 1: ... }` | Unhandled values cause silent failures |
 | `isNaN()` instead of `Number.isNaN()` | `isNaN("foo")` | Type coercion bugs |
 
-### 🔵 **Info (Code Quality & Best Practices)**
+### Info (Code Quality & Best Practices)
 
 Improvements that make code cleaner and more maintainable:
 
@@ -935,61 +988,84 @@ Improvements that make code cleaner and more maintainable:
 
 ---
 
-## ⚙️ **Advanced Configuration**
+## Advanced Configuration
 
 ### **Command-Line Options (Full Reference)**
 
 ```bash
+# Invocation forms:
 ubs [OPTIONS] [PROJECT_DIR] [OUTPUT_FILE]
+ubs [OPTIONS] FILE1 FILE2 ...
+ubs --files=FILE1,FILE2,... [OPTIONS] [PROJECT_DIR]
+ubs doctor [OPTIONS]
+ubs sessions [--entries N] [--raw]
 
 Core Options:
-  -v, --verbose            Show 10 code samples per finding (default: 3)
+  -v, --verbose            Show 10 code samples per finding
   -q, --quiet              Minimal output (summary only)
   --ci                     CI mode (stable output, no colors by default)
   --fail-on-warning        Exit with code 1 on warnings (strict mode)
-  --version                Print UBS meta-runner version and exit
-  --profile=MODE           strict|loose (sets defaults for strictness)
-  --baseline=FILE          Compare findings against a baseline JSON (alias for --comparison)
+  --version, -V            Print UBS meta-runner version and exit
+  --profile=MODE           strict|loose (strict implies --fail-on-warning)
   -h, --help               Show help and exit
 
 Git Integration:
   --staged                 Scan only files staged for commit
   --diff, --git-diff       Scan only modified files (working tree vs HEAD)
+  --files=F1,F2,...        Scan an explicit comma-separated file list
 
 Output Control:
   --format=FMT             Output format: text|json|jsonl|sarif|toon (default: text)
-  --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
+  --beads-jsonl=FILE       Write JSONL findings alongside normal output for Beads
+  --jsonl-summary-only     Emit only summary counts in JSONL (no individual findings)
+  --report-json=FILE       Write enriched JSON summary to FILE
+  --html-report=FILE       Write standalone HTML report to FILE
   --no-color               Force disable ANSI colors
-  OUTPUT_FILE              Save report to file (auto-tees to stdout)
+  OUTPUT_FILE              Save report to file (positional)
+
+Baseline Comparison:
+  --comparison=FILE        Diff latest combined summary against a stored baseline run
+  --baseline=FILE          Alias for --comparison
+
+Language and Module Control:
+  --only=CSV               Run only these language scanners (e.g. python,golang)
+  --exclude=CSV            Skip these language scanners (e.g. java,swift)
+  --module-dir=DIR         Use DIR as the module cache directory
+  --category=CSV           Restrict scan to these category pack(s) (e.g. resource-lifecycle)
+  --skip=CSV               Skip categories by number within language modules
+  --skip-type-narrowing    Disable cross-language guard analyzers (JS/Rust/Kotlin/Swift)
 
 File Selection:
-  --include-ext=CSV        File extensions (default: auto-detect by language)
-                           JS: js,jsx,ts,tsx,mjs,cjs | Python: py,pyi,pyx
-                           Go: go | Rust: rs | Java: java | C++: cpp,cc,cxx,c,h
-                           Ruby: rb,rake,ru | Custom: --include-ext=js,ts,vue
-  --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
-                           Example: --exclude=legacy (deps ignored by default)
-  --skip-size-check        Skip directory size guard (use with care)
+  --ignore-file=PATH       Use PATH as ignore file instead of .ubsignore
+  --skip-size-check        Skip directory size guard
 
 Performance:
   --jobs=N                 Parallel jobs for ripgrep (default: auto-detect cores)
-                           Set to 1 for deterministic output
 
-Rule Control:
-  --skip=CSV               Skip categories by number (see output for numbers)
-                           Example: --skip=11,14  # Skip debug code + TODOs
-  --skip-type-narrowing    Disable tsserver-based guard analysis (falls back to text heuristics)
-  --rules=DIR              Additional ast-grep rules directory
-                           Rules are merged with built-in rules
-  --no-auto-update         Disable automatic self-update
-  --suggest-ignore         Print large-directory candidates to add to .ubsignore (no changes applied)
+Update and Maintenance:
+  --update                 Self-update ubs binary in-place
+  --update-modules         Re-download and verify all cached language modules
+  --no-auto-update         Disable the automatic daily update check
+  --non-interactive        Suppress interactive prompts (accept defaults)
+  --suggest-ignore         Print large-directory candidates for .ubsignore (no changes applied)
+
+Subcommands:
+  doctor [--fix]           Audit environment: caches, dependencies, module checksums.
+                           --fix redownloads missing or corrupted modules.
+  sessions [--entries N]   Show install session logs.
+  [--raw]                  --entries N limits entries shown; --raw prints unformatted log.
 
 Environment Variables:
   JOBS                     Same as --jobs=N
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
+  UBS_ENABLE_AUTO_UPDATE   Set to 1 to opt in to auto-update (disabled by default)
+  UBS_NO_AUTO_UPDATE       Set to 1 to disable auto-update even if enabled
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
+  UBS_REFUSE_HOME_ROOT     Set to 0 to allow scanning $HOME or / directly
+  UBS_PROFILE              Set default profile (overridden by --profile)
+  UBS_SKIP_CATEGORIES      Pass category skip list to child modules (set by --skip)
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1024,7 +1100,7 @@ Or install the dependency manually:
 brew install ast-grep            # or: cargo install ast-grep, npm i -g @ast-grep/cli
 ```
 
-If you’re intentionally scanning non-JS languages only, exclude JS:
+If you're intentionally scanning non-JS languages only, exclude JS:
 
 ```bash
 ubs --exclude=js .
@@ -1152,33 +1228,33 @@ chmod +x ~/bin/ubs-custom
 
 ---
 
-## 🎓 **How It Works (Under the Hood)**
+## How It Works (Under the Hood)
 
 ### **Multi-Layer Analysis Engine**
 
-The scanner uses a sophisticated 4-layer approach:
+The scanner uses a 4-layer approach:
 
 ```
-Layer 1: PATTERN MATCHING (Fast) ──┐
-├─ Regex-based detection           │
-├─ Optimized with ripgrep          │
-└─ Finds 70% of bugs in <1 second  │
-                                    ├──► Combined Results
-Layer 2: AST ANALYSIS (Deep) ──────┤
-├─ Semantic code understanding      │
-├─ Powered by ast-grep             │
-└─ Catches complex patterns        │
-                                    │
-Layer 3: CONTEXT AWARENESS (Smart) ┤
-├─ Understands surrounding code     │
-├─ Reduces false positives         │
-└─ Knows when rules don't apply    │
-                                    │
-Layer 4: STATISTICAL (Insightful)  │
-├─ Code smell detection            │
-├─ Anomaly identification          │
-└─ Architectural suggestions       │
-                                    ↓
+Layer 1: PATTERN MATCHING (Fast) --+
+|- Regex-based detection           |
+|- Optimized with ripgrep          |
+|- Finds 70% of bugs in <1 second |
+                                    +---> Combined Results
+Layer 2: AST ANALYSIS (Deep) ------+
+|- Semantic code understanding      |
+|- Powered by ast-grep             |
+|- Catches complex patterns        |
+                                    |
+Layer 3: CONTEXT AWARENESS (Smart) +
+|- Understands surrounding code     |
+|- Reduces false positives         |
+|- Knows when rules don't apply    |
+                                    |
+Layer 4: STATISTICAL (Insightful)  |
+|- Code smell detection            |
+|- Anomaly identification          |
+|- Architectural suggestions       |
+                                    v
                          Final Report (3-5 sec)
 ```
 
@@ -1194,7 +1270,7 @@ Layer 4: STATISTICAL (Insightful)  │
 
 ### **AST Rule Architecture: Ancestor-Aware Pattern Matching**
 
-UBS's ast-grep rules use a sophisticated technique called **ancestor traversal** to drastically reduce false positives. The key directive `stopBy: end` ensures patterns check the *entire* ancestor chain rather than just the immediate parent.
+UBS's ast-grep rules use a technique called **ancestor traversal** to reduce false positives. The key directive `stopBy: end` ensures patterns check the *entire* ancestor chain rather than just the immediate parent.
 
 **The Problem Without Ancestor Traversal:**
 
@@ -1209,12 +1285,12 @@ async function safeFetch() {
 }
 
 // Naive AST rule checking only immediate parent:
-// ❌ False positive! Reports "fetch without catch" because
+// False positive! Reports "fetch without catch" because
 //    fetch()'s immediate parent is the ExpressionStatement,
 //    not the try block.
 ```
 
-**The Solution - Ancestor Traversal with `stopBy: end`:**
+**The Solution -- Ancestor Traversal with `stopBy: end`:**
 
 ```yaml
 # ast-grep rule with proper ancestor checking
@@ -1224,23 +1300,23 @@ rule:
     - not:
         inside:
           kind: try_statement
-          stopBy: end           # ← Key directive: traverse ALL ancestors
+          stopBy: end           # <- Key directive: traverse ALL ancestors
     - not:
         inside:
           pattern: $_.catch($$)  # Check for .catch() in chain
           stopBy: end
 ```
 
-The `stopBy: end` directive instructs ast-grep to walk up the *entire* ancestor tree until it finds a match (or reaches the root). Without it, only the immediate parent is checked—missing try blocks, function boundaries, and method chains.
+The `stopBy: end` directive instructs ast-grep to walk up the *entire* ancestor tree until it finds a match (or reaches the root). Without it, only the immediate parent is checked -- missing try blocks, function boundaries, and method chains.
 
 **Real-World Impact:**
 
 | Scenario | Without `stopBy: end` | With `stopBy: end` |
 |----------|----------------------|-------------------|
-| `try { fetch() } catch {}` | ❌ False positive | ✅ Correctly ignored |
-| `fetch().then().catch()` | ❌ False positive | ✅ Correctly ignored |
-| `return fetch()` | ❌ False positive | ✅ Correctly ignored |
-| `fetch()` standalone | ✅ Detected | ✅ Detected |
+| `try { fetch() } catch {}` | False positive | Correctly ignored |
+| `fetch().then().catch()` | False positive | Correctly ignored |
+| `return fetch()` | False positive | Correctly ignored |
+| `fetch()` standalone | Detected | Detected |
 
 This technique is applied across 19+ rules in the JavaScript module alone, covering:
 - Promise chain detection (`.then()`, `.catch()`, `.finally()`)
@@ -1276,11 +1352,11 @@ eval(safe_string)  # ubs:ignore
 
 **Anti-patterns to avoid:**
 ```javascript
-// ❌ Wrong - comment on previous line doesn't suppress:
+// Wrong - comment on previous line doesn't suppress:
 // ubs:ignore
 eval(code);  // Still flagged!
 
-// ❌ Wrong - don't blanket-suppress large blocks:
+// Wrong - don't blanket-suppress large blocks:
 /* ubs:ignore */  // Doesn't work for block comments
 ```
 
@@ -1304,23 +1380,23 @@ UBS detects unhandled async errors consistently across all 8 languages. The patt
 The scanner understands complex promise chains:
 
 ```javascript
-// ✅ Handled - .catch() at end of chain:
+// Handled - .catch() at end of chain:
 fetch('/api')
   .then(r => r.json())
   .then(data => process(data))
   .catch(handleError);  // Scanner recognizes this catches all above
 
-// ✅ Handled - .catch() before .then():
+// Handled - .catch() before .then():
 fetch('/api')
   .catch(e => fallback)  // Early catch
   .then(r => r.json());
 
-// ❌ Unhandled - .finally() doesn't catch:
+// Unhandled - .finally() doesn't catch:
 fetch('/api')
   .then(r => r.json())
   .finally(cleanup);  // Flagged: finally doesn't handle rejections
 
-// ❌ Unhandled - no error handling:
+// Unhandled - no error handling:
 async function leaky() {
   fetch('/api');  // Flagged: fire-and-forget promise
 }
@@ -1346,10 +1422,10 @@ The `ubs doctor` command validates all helper checksums:
 
 ```bash
 $ ubs doctor
-🏥 UBS Environment Audit
-────────────────────────
-✓ helper checksum verified (resource_lifecycle_py.py)
-✓ helper checksum verified (type_narrowing_ts.js)
+UBS Environment Audit
+---------------------
+  helper checksum verified (resource_lifecycle_py.py)
+  helper checksum verified (type_narrowing_ts.js)
 ...
 ```
 
@@ -1360,29 +1436,29 @@ If a helper is modified or corrupted, the scanner fails safely with remediation 
 All 8 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Language Tool Output      →   UBS Normalized Severity      │
-├─────────────────────────────────────────────────────────────┤
-│  ESLint "error"            →   critical                     │
-│  Pylint "E" / "F"          →   critical                     │
-│  Clippy "deny"             →   critical                     │
-│  Go vet "error"            →   critical                     │
-│  SpotBugs "High"           →   critical                     │
-│  RuboCop "Fatal/Error"     →   critical                     │
-├─────────────────────────────────────────────────────────────┤
-│  ESLint "warn"             →   warning                      │
-│  Pylint "W" / "R"          →   warning                      │
-│  Clippy "warn"             →   warning                      │
-│  Go vet "warning"          →   warning                      │
-│  SpotBugs "Medium"         →   warning                      │
-│  RuboCop "Warning"         →   warning                      │
-├─────────────────────────────────────────────────────────────┤
-│  ESLint "suggestion"       →   info                         │
-│  Pylint "C" / "I"          →   info                         │
-│  Clippy "note"             →   info                         │
-│  SpotBugs "Low"            →   info                         │
-│  RuboCop "Convention"      →   info                         │
-└─────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------+
+|  Language Tool Output      ->   UBS Normalized Severity      |
++-------------------------------------------------------------+
+|  ESLint "error"            ->   critical                     |
+|  Pylint "E" / "F"          ->   critical                     |
+|  Clippy "deny"             ->   critical                     |
+|  Go vet "error"            ->   critical                     |
+|  SpotBugs "High"           ->   critical                     |
+|  RuboCop "Fatal/Error"     ->   critical                     |
++-------------------------------------------------------------+
+|  ESLint "warn"             ->   warning                      |
+|  Pylint "W" / "R"          ->   warning                      |
+|  Clippy "warn"             ->   warning                      |
+|  Go vet "warning"          ->   warning                      |
+|  SpotBugs "Medium"         ->   warning                      |
+|  RuboCop "Warning"         ->   warning                      |
++-------------------------------------------------------------+
+|  ESLint "suggestion"       ->   info                         |
+|  Pylint "C" / "I"          ->   info                         |
+|  Clippy "note"             ->   info                         |
+|  SpotBugs "Low"            ->   info                         |
+|  RuboCop "Convention"      ->   info                         |
++-------------------------------------------------------------+
 ```
 
 **Benefits of normalization:**
@@ -1423,21 +1499,21 @@ The `normalize_severity()` function in each module handles edge cases like tool-
 
 ---
 
-## 🏆 **Comparison with Other Tools**
+## Comparison with Other Tools
 
 | Feature | Ultimate Bug Scanner | ESLint | TypeScript | SonarQube | DeepCode |
 |---------|---------------------|--------|------------|-----------|----------|
 | **Setup Time** | 30 seconds | 30 minutes | 1-2 hours | 2-4 hours | Account required |
 | **Speed (50K lines)** | 3 seconds | 15 seconds | 8 seconds | 2 minutes | Cloud upload |
-| **Zero Config** | ✅ Yes | ❌ No | ❌ No | ❌ No | ❌ No |
-| **Works Without Types** | ✅ Yes | ✅ Yes | ❌ No | ✅ Yes | ✅ Yes |
-| **Null Safety** | ✅ Yes | ⚠️ Limited | ✅ Yes | ⚠️ Limited | ⚠️ Limited |
-| **Security Scanning** | ✅ Yes | ⚠️ Plugin | ❌ No | ✅ Yes | ✅ Yes |
-| **Memory Leaks** | ✅ Yes | ❌ No | ❌ No | ⚠️ Limited | ❌ No |
-| **Async/Await** | ✅ Deep | ⚠️ Basic | ✅ Good | ⚠️ Basic | ⚠️ Basic |
-| **CI/CD Ready** | ✅ Yes | ✅ Yes | ✅ Yes | ✅ Yes | ⚠️ Cloud |
-| **Offline** | ✅ Yes | ✅ Yes | ✅ Yes | ⚠️ Limited | ❌ No |
-| **AI Agent Friendly** | ✅ Built for it | ⚠️ Config heavy | ⚠️ Config heavy | ❌ Complex | ⚠️ Cloud |
+| **Zero Config** | Yes | No | No | No | No |
+| **Works Without Types** | Yes | Yes | No | Yes | Yes |
+| **Null Safety** | Yes | Limited | Yes | Limited | Limited |
+| **Security Scanning** | Yes | Plugin needed | No | Yes | Yes |
+| **Memory Leaks** | Yes | No | No | Limited | No |
+| **Async/Await** | Deep | Basic | Good | Basic | Basic |
+| **CI/CD Ready** | Yes | Yes | Yes | Yes | Cloud |
+| **Offline** | Yes | Yes | Yes | Limited | No |
+| **AI Agent Friendly** | Built for it | Config heavy | Config heavy | Complex | Cloud |
 | **Cost** | Free | Free | Free | $$$$ | $$$ |
 
 **When to use what:**
@@ -1452,7 +1528,7 @@ The `normalize_severity()` function in each module handles edge cases like tool-
 
 ---
 
-## 🧠 **Project Justification and Rationale**
+## Project Justification and Rationale
 
 ### **Why This Exists (And Why It's Not "Just Another Linter")**
 
@@ -1508,26 +1584,26 @@ Traditional linters were designed for **human developers** in **single-language 
 |---|---|
 | **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 8 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
 
-### **2. LLMs Don't Need Auto-Fix—They ARE the Auto-Fix Engine**
+### **2. LLMs Don't Need Auto-Fix -- They ARE the Auto-Fix Engine**
 
 **Why traditional linters have auto-fix:**
 ```javascript
 // ESLint flags: "Use === instead of =="
-if (value == null)  // ❌
+if (value == null)  // flagged
 
 // ESLint auto-fix (rigid, no context):
-if (value === null)  // ✅ Technically correct, but...
+if (value === null)  // Technically correct, but...
 ```
 
 **Why UBS doesn't (and shouldn't):**
 ```javascript
 // UBS flags: "Type coercion bug: == should be ==="
-if (value == null)  // ❌
+if (value == null)  // flagged
 
 // Claude reads the error and understands context:
-if (value !== null && value !== undefined)  // ✅ Better - handles both
+if (value !== null && value !== undefined)  // Better - handles both
 // OR
-if (value != null)  // ✅ Or keeps == for null/undefined (intentional)
+if (value != null)  // Or keeps == for null/undefined (intentional)
 ```
 
 **The hard part is DETECTION, not fixing.** Once flagged, LLMs can:
@@ -1580,25 +1656,25 @@ ubs .
 ```
 
 **This matters because:**
-- LLMs generate code across languages in one session (Python API → Go service → TypeScript UI → Rust worker)
+- LLMs generate code across languages in one session (Python API -> Go service -> TypeScript UI -> Rust worker)
 - Configuring 7 tools is error-prone for LLMs
 - Humans don't want to maintain 7 different config files
 - CI/CD pipelines want one command, one exit code
 
 ### **Type Narrowing Coverage Across Languages**
 
-- **TypeScript** – UBS shells out to `tsserver` (via the bundled helper) whenever Node.js + the `typescript` package are available. The installer surfaces a "Type narrowing readiness" diagnostic so you immediately know if tsserver-powered guards are running.
-- **Rust** – A Python helper inspects `if let Some/Ok` guard clauses and flags subsequent `.unwrap()`/`.expect()` calls outside of exiting blocks. Fixtures and manifest cases keep this regression-tested.
-- **Kotlin** – The Java module scans `.kt` sources for `if (value == null)` guards that merely log and keep running before hitting `value!!`, catching the same pitfall on JVM teams that mix Java + Kotlin.
-- **Swift** – The dedicated `ubs-swift` module now ships the guard-`let` helper directly, so optional chaining/Objective‑C bridging heuristics fire even when you run `ubs --only=swift` locally (no piggybacking on the Java module). It catches cases where code logs and keeps going before force-unwrapping `value!`, protecting iOS/macOS pipelines that blend Swift + ObjC.
+- **TypeScript** -- UBS shells out to `tsserver` (via the bundled helper) whenever Node.js + the `typescript` package are available. The installer surfaces a "Type narrowing readiness" diagnostic so you immediately know if tsserver-powered guards are running.
+- **Rust** -- A Python helper inspects `if let Some/Ok` guard clauses and flags subsequent `.unwrap()`/`.expect()` calls outside of exiting blocks. Fixtures and manifest cases keep this regression-tested.
+- **Kotlin** -- The Java module scans `.kt` sources for `if (value == null)` guards that merely log and keep running before hitting `value!!`, catching the same pitfall on JVM teams that mix Java + Kotlin.
+- **Swift** -- The dedicated `ubs-swift` module now ships the guard-`let` helper directly, so optional chaining/Objective-C bridging heuristics fire even when you run `ubs --only=swift` locally (no piggybacking on the Java module). It catches cases where code logs and keeps going before force-unwrapping `value!`, protecting iOS/macOS pipelines that blend Swift + ObjC.
 
 ### **Resource Lifecycle AST Coverage**
 
-- **Python** – `modules/helpers/resource_lifecycle_py.py` now reasons over the AST, tracking `with`/`async with`, alias imports, and `.open()`/`.connect()` calls so `ubs-python` warns only when a handle is truly leaking. Pathlib `Path.open()` and similar patterns are handled without brittle regexes.
-- **Java** – New ast-grep rules (`java.resource.executor-no-shutdown`, `java.resource.thread-no-join`, `java.resource.jdbc-no-close`, `java.resource.resultset-no-close`, `java.resource.statement-no-close`) ensure ExecutorServices, raw `Thread`s, `java.sql.Connection`s, `Statement`/`PreparedStatement`/`CallableStatement`, and `ResultSet` handles all get proper shutdown/close semantics before the regex fallback ever runs.
-- **C++ / Rust / Ruby** – These modules already relied on ast-grep rule packs; the “Universal AST Adoption” epic is now complete with every language module (JS, Python, Go, C++, Rust, Java, Ruby, Swift, Kotlin) running semantic detectors instead of fragile grep-only heuristics.
+- **Python** -- `modules/helpers/resource_lifecycle_py.py` now reasons over the AST, tracking `with`/`async with`, alias imports, and `.open()`/`.connect()` calls so `ubs-python` warns only when a handle is truly leaking. Pathlib `Path.open()` and similar patterns are handled without brittle regexes.
+- **Java** -- New ast-grep rules (`java.resource.executor-no-shutdown`, `java.resource.thread-no-join`, `java.resource.jdbc-no-close`, `java.resource.resultset-no-close`, `java.resource.statement-no-close`) ensure ExecutorServices, raw `Thread`s, `java.sql.Connection`s, `Statement`/`PreparedStatement`/`CallableStatement`, and `ResultSet` handles all get proper shutdown/close semantics before the regex fallback ever runs.
+- **C++ / Rust / Ruby** -- These modules already relied on ast-grep rule packs; the "Universal AST Adoption" epic is now complete with every language module (JS, Python, Go, C++, Rust, Java, Ruby, Swift, Kotlin) running semantic detectors instead of fragile grep-only heuristics.
 
-#### Python – AST helper in action
+#### Python -- AST helper in action
 
 ```python
 import asyncio, subprocess
@@ -1616,14 +1692,14 @@ asyncio.run(leak_task())
 
 ```
 $ ./ubs --only=python test-suite/python/buggy/resource_lifecycle.py
-  🔥 File handles opened without context manager/close [resource_lifecycle.py:4]
+  CRITICAL: File handles opened without context manager/close [resource_lifecycle.py:4]
     File handle fh opened without context manager or close()
-  ⚠ Popen handles not waited or terminated [resource_lifecycle.py:7]
+  WARNING: Popen handles not waited or terminated [resource_lifecycle.py:7]
 ```
 
 The helper catches the unguarded file handle, zombie subprocess, and orphaned asyncio task because it walks the AST (tracking aliases and async contexts) instead of grepping for strings.
 
-#### Go – AST helper validating cleanups
+#### Go -- AST helper validating cleanups
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1640,44 +1716,44 @@ _ = f
 
 ```
 $ ./ubs --only=golang test-suite/golang/buggy/resource_lifecycle.go
-  🔥 context.With* without deferred cancel [resource_lifecycle.go:10]
-  ⚠ time.NewTicker not stopped [resource_lifecycle.go:13]
-  ⚠ time.NewTimer not stopped [resource_lifecycle.go:15]
-  ⚠ os.Open/OpenFile without defer Close() [resource_lifecycle.go:17]
+  CRITICAL: context.With* without deferred cancel [resource_lifecycle.go:10]
+  WARNING: time.NewTicker not stopped [resource_lifecycle.go:13]
+  WARNING: time.NewTimer not stopped [resource_lifecycle.go:15]
+  WARNING: os.Open/OpenFile without defer Close() [resource_lifecycle.go:17]
 ```
 
 Because the helper hashes AST positions, the manifest can assert on deterministic substrings (context/ticker/timer/file) and we avoid flakiness from color codes or log headings.
 
-Use `--skip-type-narrowing` (or `UBS_SKIP_TYPE_NARROWING=1`) when you want to bypass all of these guard analyzers—for example on air-gapped CI environments or when validating legacy projects one language at a time.
+Use `--skip-type-narrowing` (or `UBS_SKIP_TYPE_NARROWING=1`) when you want to bypass all of these guard analyzers -- for example on air-gapped CI environments or when validating legacy projects one language at a time.
 
 ### **4. Speed Enables Tight Iteration Loops**
 
-The **generate → scan → fix** cycle needs to be **fast** for AI workflows:
+The **generate -> scan -> fix** cycle needs to be **fast** for AI workflows:
 
 ```
-┌─────────────────────────────────────────┐
-│  Traditional Linter (30-45 seconds)     │
-├─────────────────────────────────────────┤
-│  Claude generates code:        10s      │
-│  Run ESLint + Pylint + ...     30s  ⏳  │
-│  Claude reads findings:         5s      │
-│  Claude fixes bugs:            15s      │
-│  Re-run linters:               30s  ⏳  │
-│  ──────────────────────────────────     │
-│  Total iteration:              90s      │
-└─────────────────────────────────────────┘
++------------------------------------------+
+|  Traditional Linter (30-45 seconds)      |
++------------------------------------------+
+|  Claude generates code:        10s       |
+|  Run ESLint + Pylint + ...     30s       |
+|  Claude reads findings:         5s       |
+|  Claude fixes bugs:            15s       |
+|  Re-run linters:               30s       |
+|  ---------------------------------       |
+|  Total iteration:              90s       |
++------------------------------------------+
 
-┌─────────────────────────────────────────┐
-│  UBS (3-5 seconds)                      │
-├─────────────────────────────────────────┤
-│  Claude generates code:        10s      │
-│  Run UBS:                       3s  ⚡  │
-│  Claude reads findings:         2s      │
-│  Claude fixes bugs:            10s      │
-│  Re-run UBS:                    3s  ⚡  │
-│  ──────────────────────────────────     │
-│  Total iteration:              28s      │
-└─────────────────────────────────────────┘
++------------------------------------------+
+|  UBS (3-5 seconds)                       |
++------------------------------------------+
+|  Claude generates code:        10s       |
+|  Run UBS:                       3s       |
+|  Claude reads findings:         2s       |
+|  Claude fixes bugs:            10s       |
+|  Re-run UBS:                    3s       |
+|  ---------------------------------       |
+|  Total iteration:              28s       |
++------------------------------------------+
 
 3x faster feedback loop = 3x more iterations in the same time
 ```
@@ -1692,16 +1768,16 @@ UBS targets the bugs **AI agents actually generate**, not every possible code sm
 
 | Pattern | Why LLMs Generate It | Traditional Linters |
 |---------|---------------------|---------------------|
-| Missing `await` | Forgets `async` keyword, syntax looks fine | ❌ TypeScript only |
-| Unguarded null access | "Optimistic" coding - assumes happy path | ⚠️ Requires strict config |
-| `eval()` / code injection | Reaches for "easy" dynamic solution | ✅ Most flag this |
-| Memory leaks (event listeners) | Doesn't think about cleanup lifecycle | ❌ ESLint plugin needed |
-| `innerHTML` XSS | Doesn't threat-model user input | ⚠️ Security plugins only |
-| Division by zero | Doesn't consider edge cases | ❌ Most miss this |
-| Hardcoded secrets | Uses placeholder, forgets to externalize | ⚠️ Requires secrets scanner |
-| Goroutine leaks | Forgets context cancellation | ❌ Go-specific tooling |
-| `.unwrap()` panics | Assumes success path | ✅ Clippy catches |
-| Buffer overflows | Forgets bounds checking | ⚠️ Sanitizers only |
+| Missing `await` | Forgets `async` keyword, syntax looks fine | TypeScript only |
+| Unguarded null access | "Optimistic" coding - assumes happy path | Requires strict config |
+| `eval()` / code injection | Reaches for "easy" dynamic solution | Most flag this |
+| Memory leaks (event listeners) | Doesn't think about cleanup lifecycle | ESLint plugin needed |
+| `innerHTML` XSS | Doesn't threat-model user input | Security plugins only |
+| Division by zero | Doesn't consider edge cases | Most miss this |
+| Hardcoded secrets | Uses placeholder, forgets to externalize | Requires secrets scanner |
+| Goroutine leaks | Forgets context cancellation | Go-specific tooling |
+| `.unwrap()` panics | Assumes success path | Clippy catches |
+| Buffer overflows | Forgets bounds checking | Sanitizers only |
 
 **UBS is optimized for this specific threat model.**
 
@@ -1712,16 +1788,16 @@ This is genuinely **not available in standard linters**:
 ```python
 # Code LLM generates:
 def get_theme(user):
-    return user.profile.settings.theme  # ❌ Unguarded chain
+    return user.profile.settings.theme  # Unguarded chain
 
-# ESLint/Pylint: ✅ No error (syntactically correct)
-# TypeScript: ✅ No error (if types claim non-null)
+# ESLint/Pylint: No error (syntactically correct)
+# TypeScript: No error (if types claim non-null)
 
 # UBS Deep Guard Analysis:
 # 1. Scans for: user.profile.settings.theme (found at line 42)
 # 2. Scans for: if user and user.profile and user.profile.settings
 # 3. Correlates: NO MATCHING GUARD FOUND
-# 4. Reports: ⚠️ Unguarded deep property access
+# 4. Reports: WARNING - Unguarded deep property access
 ```
 
 **This requires:**
@@ -1730,37 +1806,37 @@ def get_theme(user):
 - Cross-reference matching with context awareness
 - Contextual suggestions
 
-**Nobody else does this by default** because it's not a lint rule—it's a **correlation analysis** across multiple code patterns.
+**Nobody else does this by default** because it's not a lint rule -- it's a **correlation analysis** across multiple code patterns.
 
 ### **7. Complementary, Not Competitive**
 
 **UBS is designed to work WITH existing tools, not replace them:**
 
 ```
-┌────────────────────────────────────────────────────┐
-│  Your Quality Stack (Recommended)                  │
-├────────────────────────────────────────────────────┤
-│  TypeScript           → Type safety                │
-│  ESLint/Clippy/etc    → Comprehensive linting      │
-│  Jest/PyTest          → Unit tests                 │
-│  ✨ UBS                → AI-generated bug oracle   │
-│  GitHub Actions       → CI/CD integration          │
-└────────────────────────────────────────────────────┘
++----------------------------------------------------+
+|  Your Quality Stack (Recommended)                  |
++----------------------------------------------------+
+|  TypeScript           -> Type safety                |
+|  ESLint/Clippy/etc    -> Comprehensive linting      |
+|  Jest/PyTest          -> Unit tests                 |
+|  UBS                  -> AI-generated bug oracle    |
+|  GitHub Actions       -> CI/CD integration          |
++----------------------------------------------------+
 ```
 
 **Use UBS for:**
-- ✅ Fast multi-language scanning in AI workflows
-- ✅ Critical bug detection before commits
-- ✅ Git hooks that block obviously broken code
-- ✅ Claude/Cursor/AI agent quality guardrails
-- ✅ Polyglot projects where configuring 7 linters is painful
+- Fast multi-language scanning in AI workflows
+- Critical bug detection before commits
+- Git hooks that block obviously broken code
+- Claude/Cursor/AI agent quality guardrails
+- Polyglot projects where configuring 7 linters is painful
 
 **Use ESLint/Pylint/Clippy/etc for:**
-- ✅ Comprehensive style enforcement
-- ✅ Framework-specific rules (React hooks, etc.)
-- ✅ Custom team conventions
-- ✅ Auto-formatting
-- ✅ Deep single-language analysis
+- Comprehensive style enforcement
+- Framework-specific rules (React hooks, etc.)
+- Custom team conventions
+- Auto-formatting
+- Deep single-language analysis
 
 **They solve different problems.** UBS is the "smoke detector" (fast, catches critical issues). Traditional linters are the "building inspector" (thorough, catches everything).
 
@@ -1770,10 +1846,10 @@ What makes this hard to replicate:
 
 **Multi-layer analysis:**
 ```
-Layer 1: Ripgrep (regex)     → 70% of bugs in 0.5s
-Layer 2: ast-grep (AST)      → Complex semantic patterns
-Layer 3: Correlation logic   → Cross-pattern analysis (novel)
-Layer 4: Metrics collection  → Time-series quality tracking
+Layer 1: Ripgrep (regex)     -> 70% of bugs in 0.5s
+Layer 2: ast-grep (AST)      -> Complex semantic patterns
+Layer 3: Correlation logic   -> Cross-pattern analysis (novel)
+Layer 4: Metrics collection  -> Time-series quality tracking
 ```
 
 **This combination of speed + semantic understanding + correlation is unique.**
@@ -1802,21 +1878,21 @@ Layer 4: Metrics collection  → Time-series quality tracking
 
 **For LLM workflows, you want:**
 ```
-✅ Fast scan (3s) that catches 80% of critical bugs
-   ↓
+Fast scan (3s) that catches 80% of critical bugs
+   |
    LLM fixes them immediately
-   ↓
-   ✅ Fast re-scan (3s) confirms fixes
-   ↓
+   |
+   Fast re-scan (3s) confirms fixes
+   |
    Then run comprehensive linters (30s) for the remaining 20%
 ```
 
 **Not:**
 ```
-❌ Comprehensive scan (30s) that catches 100% of issues
-   ↓
+Comprehensive scan (30s) that catches 100% of issues
+   |
    LLM waits... workflow broken... context switch...
-   ↓
+   |
    Slower iteration = fewer features shipped
 ```
 
@@ -1888,7 +1964,7 @@ Better to flag 100 issues where 20 are safe than miss 1 critical bug.
 
 ### **Q: "Isn't this just reinventing the wheel? ESLint already exists."**
 
-**A:** It's not reinventing the wheel—it's building a different vehicle for a different road.
+**A:** It's not reinventing the wheel -- it's building a different vehicle for a different road.
 
 ESLint is a **truck** (heavy, comprehensive, hauls everything).
 UBS is a **sports car** (fast, targeted, gets you there quickly).
@@ -1919,7 +1995,7 @@ These are fundamentally incompatible goals. ESLint would never accept "10-20% fa
 - It's cross-pattern analysis that requires a different architecture
 - Existing linters don't have this capability baked into their core
 
-Contributing patterns misses the point—**the integration IS the innovation.**
+Contributing patterns misses the point -- **the integration IS the innovation.**
 
 ---
 
@@ -1933,8 +2009,8 @@ Contributing patterns misses the point—**the integration IS the innovation.**
 | **Speed** | ~10-20s on medium projects | ~3s (optimized for speed) |
 | **Target user** | Security teams, human developers | LLM agents |
 | **Rule focus** | Security + custom patterns | AI-generated bug patterns |
-| **Multi-language** | ✅ Yes | ✅ Yes |
-| **Correlation analysis** | ❌ Pattern matching only | ✅ Deep guards, metrics |
+| **Multi-language** | Yes | Yes |
+| **Correlation analysis** | Pattern matching only | Deep guards, metrics |
 | **LLM integration** | Not designed for it | Purpose-built |
 
 **Use Semgrep if:** You need custom security rules and have time to configure them.
@@ -1973,17 +2049,17 @@ Contributing patterns misses the point—**the integration IS the innovation.**
 **A:** Controversial choice, but intentional:
 
 **Advantages of Bash:**
-- ✅ **Zero dependencies** - runs on any Unix-like system
-- ✅ **Universal availability** - every dev machine has Bash 4.0+
-- ✅ **Shell integration** - git hooks, CI/CD, file watchers are natural
-- ✅ **Module system** - each language scanner is standalone
-- ✅ **Rapid prototyping** - adding new patterns is trivial
-- ✅ **LLM-readable** - AI agents can understand and modify rules
+- **Zero dependencies** - runs on any Unix-like system
+- **Universal availability** - every dev machine has Bash 4.0+
+- **Shell integration** - git hooks, CI/CD, file watchers are natural
+- **Module system** - each language scanner is standalone
+- **Rapid prototyping** - adding new patterns is trivial
+- **LLM-readable** - AI agents can understand and modify rules
 
 **Disadvantages:**
-- ❌ Not as "elegant" as Python
-- ❌ String handling can be verbose
-- ❌ No static typing
+- Not as "elegant" as Python
+- String handling can be verbose
+- No static typing
 
 **Bottom line:** For a tool that orchestrates existing CLI tools (ripgrep, ast-grep, jq, typos) and needs to be universally available, Bash is pragmatic.
 
@@ -2052,14 +2128,14 @@ ubs .
 
 **They're complementary:**
 ```
-┌─────────────────────────────────────┐
-│  Complete Security Stack            │
-├─────────────────────────────────────┤
-│  Snyk/Dependabot  → Dependencies    │
-│  ✨ UBS            → Your code bugs │
-│  SAST tools       → Deep security   │
-│  GitHub Advanced  → Secrets in Git  │
-└─────────────────────────────────────┘
++---------------------------------+
+|  Complete Security Stack        |
++---------------------------------+
+|  Snyk/Dependabot -> Dependencies|
+|  UBS             -> Your code   |
+|  SAST tools      -> Deep sec    |
+|  GitHub Advanced -> Secrets     |
++---------------------------------+
 ```
 
 **Security scanners won't catch:** "You forgot `await` and your async function silently fails."
@@ -2077,8 +2153,7 @@ Use both.
 
 **Roadmap considerations:**
 - **PHP** - High demand, lots of legacy code
-- **Swift** - iOS development
-- **Kotlin** - Android development
+- **Kotlin** - Android development (partial support via Java module today)
 - **Scala** - JVM ecosystem
 - **Elixir** - Growing adoption
 
@@ -2129,7 +2204,7 @@ Use it WITH your existing tools. Let ESLint handle style. Let TypeScript handle 
 
 ---
 
-## 🧪 **Development & Internals**
+## Development & Internals
 
 ### **Python Tooling (uv + CPython 3.13)**
 
@@ -2155,15 +2230,15 @@ uv run python test-suite/run_manifest.py --case js-core-buggy
 
 Common uv-powered entrypoints:
 
-- `uv run python test-suite/run_manifest.py --case js-core-buggy` – run the manifest in CI or locally without manually activating the venv.
-- `source .venv/bin/activate && python -m pip list` – verify that every inline `python3` invocation maps to CPython 3.13.
-- `uv run python - <<'PY' …` – mirrors how the language modules embed Python helpers, but now guaranteed to execute inside the managed interpreter.
+- `uv run python test-suite/run_manifest.py --case js-core-buggy` -- run the manifest in CI or locally without manually activating the venv.
+- `source .venv/bin/activate && python -m pip list` -- verify that every inline `python3` invocation maps to CPython 3.13.
+- `uv run python - <<'PY' ...` -- mirrors how the language modules embed Python helpers, but now guaranteed to execute inside the managed interpreter.
 
 ---
 
-## 🚫 **Ignoring Paths with `.ubsignore`**
+## Ignoring Paths with `.ubsignore`
 
-Need repo-wide scans to ignore generated code or intentionally buggy fixtures (like this project’s `test-suite/`)? Drop a `.ubsignore` at the root.
+Need repo-wide scans to ignore generated code or intentionally buggy fixtures (like this project's `test-suite/`)? Drop a `.ubsignore` at the root.
 
 - Format mirrors `.gitignore`: one glob per line, `#` for comments.
 - UBS loads `PROJECT/.ubsignore` automatically; override with `--ignore-file=/path/to/file`.
@@ -2171,7 +2246,7 @@ Need repo-wide scans to ignore generated code or intentionally buggy fixtures (l
 - Use `--suggest-ignore` to print large top-level directories that might deserve an entry (no files are modified automatically).
 - Inline suppression works for intentional one-offs: `eval("print('safe')")  # ubs:ignore`.
 - Every language module receives the ignore list via their `--exclude` flag, so skips stay consistent.
-- This repository ships with a default `.ubsignore` that excludes `test-suite/`, keeping “real” source scans noise-free.
+- This repository ships with a default `.ubsignore` that excludes `test-suite/`, keeping "real" source scans noise-free.
 
 Example:
 
@@ -2184,33 +2259,33 @@ coverage/
 
 ---
 
-## 🧭 **Language Coverage Comparison**
+## Language Coverage Comparison
 
 UBS ships seven language-focused analyzers. Each category below is scored using the following scale:
 
-- **0 – Not covered**
-- **1 – Simple heuristics/regex only**
-- **2 – Multi-signal/static heuristics (context-aware passes)**
-- **3 – Deep analysis (AST-grep rule packs, taint/dataflow engines, or toolchain integrations such as `cargo clippy`)**
+- **0 -- Not covered**
+- **1 -- Simple heuristics/regex only**
+- **2 -- Multi-signal/static heuristics (context-aware passes)**
+- **3 -- Deep analysis (AST-grep rule packs, taint/dataflow engines, or toolchain integrations such as `cargo clippy`)**
 
 | Issue Category | JS / TS | Python | Go | C / C++ | Rust | Java | Ruby |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Null / Nil Safety | **2** – DOM guard & optional-chaining heuristics (cat.1) | **2** – `None` guard + dataclass fallbacks | **1** – Basic nil/pointer guards | **2** – Raw pointer/nullptr/RAII checks | **3** – Borrow/Option misuse via clippy + rules | **2** – Optional/null equality audits | **1** – Nil guard reminders |
-| Numeric & Type Coercion | **2** – NaN/loose equality/float equality (cat.2/4) | **2** – Division-by-zero & float precision | **1** – Limited arithmetic heuristics | **2** – UB risk & narrowing warnings | **2** – Float/overflow watchers (cat.4) | **1** – Basic comparisons only | **1** – Simple arithmetic foot-guns |
-| Collections & Memory | **2** – Array mutation/leak detectors | **2** – Dict/list iteration pitfalls | **1** – Slice/map heuristics | **3** – malloc/free, iterator invalidation, UB (cat.1/5/7) | **2** – Vec/String/iterator audits | **2** – Collections & generics misuse | **1** – Enumerator/default mutability hints |
-| Async / Concurrency | **3** – AST-grep + fallback for missing `await`, React hooks dep analyzer | **2** – Async/Await pitfall scans | **3** – Goroutine/channel/context/defer hygiene | **2** – `std::thread` join + `std::async` wait tracking | **2** – Async macros, Send/Sync checks | **2** – ExecutorService shutdown, `synchronized` monitors | **1** – Basic thread/promise hints |
-| Error Handling & Logging | **2** – Promise rejection / try–catch auditing | **2** – Exception swallow/logging checks | **2** – Error wrapping, panic usage | **2** – Throw-in-dtor, catch-by-value | **2** – Result/expect/panic usage | **2** – Logging best practices, try-with-resources | **1** – Rescue/raise heuristics |
-| Security & Taint | **3** – Lightweight taint engine + security heuristics (cat.7) | **2** – Eval/exec/SQL string heuristics | **2** – HTTP/crypto/command checks | **1** – Limited dedicated security (mostly UB) | **2** – Security category (cat.8) | **3** – SQL concat, `Runtime.exec`, SSL/crypto checks | **2** – Rails mass-assignment, shell/eval warnings |
-| Resource Lifecycle & I/O | **3** – AST event-listener/timer/observer tracking + heuristics | **2** – Context-manager & file lifecycle hints | **2** – `defer`/file close + HTTP resource hygiene | **2** – Thread join/malloc/free & resource correlation | **2** – Drop/RAII heuristics + correlation | **3** – Executor/file stream cleanup detections | **2** – File open/close + block usage hints |
-| Build / Tooling Hygiene | **0** – Not covered yet | **2** – `uv` extras, packaging, notebook hygiene | **2** – Go toolchain sanity (`go vet`, module drift) | **1** – CMake/CXX standard reminders | **3** – `cargo fmt/clippy/test/check` integrations | **2** – Maven/Gradle best-effort builds | **2** – Bundler/Rake/AST rule packs |
-| Code Quality Markers | **1** – TODO/HACK detectors | **1** | **1** | **1** | **1** | **1** | **1** |
-| Domain-Specific Extras | **3** – React hooks, Node I/O, taint flows | **2** – Typing strictness, notebook linting | **2** – Context propagation, HTTP server/client reviews | **2** – Modernization, macro/STL idioms | **3** – Unsafe/FFI audits, cargo inventory | **3** – SQL/Executor/annotation/path handling | **2** – Rails practicals, bundle hygiene |
+| Null / Nil Safety | **2** -- DOM guard & optional-chaining heuristics (cat.1) | **2** -- `None` guard + dataclass fallbacks | **1** -- Basic nil/pointer guards | **2** -- Raw pointer/nullptr/RAII checks | **3** -- Borrow/Option misuse via clippy + rules | **2** -- Optional/null equality audits | **1** -- Nil guard reminders |
+| Numeric & Type Coercion | **2** -- NaN/loose equality/float equality (cat.2/4) | **2** -- Division-by-zero & float precision | **1** -- Limited arithmetic heuristics | **2** -- UB risk & narrowing warnings | **2** -- Float/overflow watchers (cat.4) | **1** -- Basic comparisons only | **1** -- Simple arithmetic foot-guns |
+| Collections & Memory | **2** -- Array mutation/leak detectors | **2** -- Dict/list iteration pitfalls | **1** -- Slice/map heuristics | **3** -- malloc/free, iterator invalidation, UB (cat.1/5/7) | **2** -- Vec/String/iterator audits | **2** -- Collections & generics misuse | **1** -- Enumerator/default mutability hints |
+| Async / Concurrency | **3** -- AST-grep + fallback for missing `await`, React hooks dep analyzer | **2** -- Async/Await pitfall scans | **3** -- Goroutine/channel/context/defer hygiene | **2** -- `std::thread` join + `std::async` wait tracking | **2** -- Async macros, Send/Sync checks | **2** -- ExecutorService shutdown, `synchronized` monitors | **1** -- Basic thread/promise hints |
+| Error Handling & Logging | **2** -- Promise rejection / try-catch auditing | **2** -- Exception swallow/logging checks | **2** -- Error wrapping, panic usage | **2** -- Throw-in-dtor, catch-by-value | **2** -- Result/expect/panic usage | **2** -- Logging best practices, try-with-resources | **1** -- Rescue/raise heuristics |
+| Security & Taint | **3** -- Lightweight taint engine + security heuristics (cat.7) | **2** -- Eval/exec/SQL string heuristics | **2** -- HTTP/crypto/command checks | **1** -- Limited dedicated security (mostly UB) | **2** -- Security category (cat.8) | **3** -- SQL concat, `Runtime.exec`, SSL/crypto checks | **2** -- Rails mass-assignment, shell/eval warnings |
+| Resource Lifecycle & I/O | **3** -- AST event-listener/timer/observer tracking + heuristics | **2** -- Context-manager & file lifecycle hints | **2** -- `defer`/file close + HTTP resource hygiene | **2** -- Thread join/malloc/free & resource correlation | **2** -- Drop/RAII heuristics + correlation | **3** -- Executor/file stream cleanup detections | **2** -- File open/close + block usage hints |
+| Build / Tooling Hygiene | **0** -- Not covered yet | **2** -- `uv` extras, packaging, notebook hygiene | **2** -- Go toolchain sanity (`go vet`, module drift) | **1** -- CMake/CXX standard reminders | **3** -- `cargo fmt/clippy/test/check` integrations | **2** -- Maven/Gradle best-effort builds | **2** -- Bundler/Rake/AST rule packs |
+| Code Quality Markers | **1** -- TODO/HACK detectors | **1** | **1** | **1** | **1** | **1** | **1** |
+| Domain-Specific Extras | **3** -- React hooks, Node I/O, taint flows | **2** -- Typing strictness, notebook linting | **2** -- Context propagation, HTTP server/client reviews | **2** -- Modernization, macro/STL idioms | **3** -- Unsafe/FFI audits, cargo inventory | **3** -- SQL/Executor/annotation/path handling | **2** -- Rails practicals, bundle hygiene |
 
-Use this matrix to decide which language module’s findings you want to prioritize or extend. For example, if you need deeper Go resource-lifecycle audits, you can extend category 5 (defer/cleanup) or contribute new AST-grep rules; for JavaScript security you can build on the taint engine already running in category 7.
+Use this matrix to decide which language module's findings you want to prioritize or extend. For example, if you need deeper Go resource-lifecycle audits, you can extend category 5 (defer/cleanup) or contribute new AST-grep rules; for JavaScript security you can build on the taint engine already running in category 7.
 
 ---
 
-## 🛡️ **Safety Guards for AI Coding Agents**
+## Safety Guards for AI Coding Agents
 
 When AI agents modify code at speed, a single destructive command can wipe hours of work. UBS ships with a **Git Safety Guard** that intercepts dangerous operations before they execute, designed specifically for Claude Code but applicable to any agent workflow.
 
@@ -2244,16 +2319,16 @@ The installer sets this up automatically when it detects Claude Code (`.claude/`
 ```bash
 # The installer creates this structure:
 .claude/
-└── hooks/
-    ├── git_safety_guard.py   # Command interceptor
-    └── on-file-write.sh      # Auto-scan on save
+  hooks/
+    git_safety_guard.py   # Command interceptor
+    on-file-write.sh      # Auto-scan on save
 ```
 
 The guard produces actionable error messages explaining *why* a command was blocked and *what to do instead*, so AI agents can self-correct without human intervention.
 
 ---
 
-## 🔧 **Extended Agent Detection**
+## Extended Agent Detection
 
 Beyond the core agent integrations (Claude Code, Cursor, Codex), the installer detects and configures **12+ coding agents** automatically. When run with `--easy-mode`, all detected agents receive UBS guardrails without prompting.
 
@@ -2298,7 +2373,7 @@ ubs sessions --entries=5  # Last 5 sessions
 
 ---
 
-## 🔬 **AST-Based Type Narrowing Analysis**
+## AST-Based Type Narrowing Analysis
 
 Beyond regex pattern matching, UBS includes **deep AST-based analyzers** for language-specific type safety issues. These helpers provide precise line-number mapping and understand language semantics that regex cannot capture.
 
@@ -2316,11 +2391,11 @@ Beyond regex pattern matching, UBS includes **deep AST-based analyzers** for lan
 The TypeScript analyzer, for example, walks the AST to detect patterns like:
 
 ```typescript
-// ❌ Detected: Using property without null check
+// Detected: Using property without null check
 if (!user) return;
 console.log(user.name);  // user might be undefined here (type not narrowed)
 
-// ✅ Safe: Proper type guard
+// Safe: Proper type guard
 if (user === null || user === undefined) return;
 console.log(user.name);  // user is definitely defined
 ```
@@ -2343,7 +2418,7 @@ This falls back to basic heuristics instead of AST analysis, reducing scan time 
 
 ---
 
-## ⚡ **ast-grep Auto-Provisioning**
+## ast-grep Auto-Provisioning
 
 UBS automatically downloads and manages [ast-grep](https://ast-grep.github.io/) for enhanced JavaScript/TypeScript analysis. This happens transparently on first use.
 
@@ -2351,11 +2426,11 @@ UBS automatically downloads and manages [ast-grep](https://ast-grep.github.io/) 
 
 | Platform | Binary | SHA-256 Verified |
 |----------|--------|------------------|
-| macOS ARM64 | `ast-grep-aarch64-apple-darwin` | ✓ |
-| macOS Intel | `ast-grep-x86_64-apple-darwin` | ✓ |
-| Linux ARM64 | `ast-grep-aarch64-unknown-linux-gnu` | ✓ |
-| Linux x64 | `ast-grep-x86_64-unknown-linux-gnu` | ✓ |
-| Windows x64 | `ast-grep-x86_64-pc-windows-msvc.exe` | ✓ |
+| macOS ARM64 | `ast-grep-aarch64-apple-darwin` | Yes |
+| macOS Intel | `ast-grep-x86_64-apple-darwin` | Yes |
+| Linux ARM64 | `ast-grep-aarch64-unknown-linux-gnu` | Yes |
+| Linux x64 | `ast-grep-x86_64-unknown-linux-gnu` | Yes |
+| Windows x64 | `ast-grep-x86_64-pc-windows-msvc.exe` | Yes |
 
 Binaries are cached at `$TOOLS_DIR/ast-grep/<version>/<platform>/` and reused across scans.
 
@@ -2363,11 +2438,11 @@ Binaries are cached at `$TOOLS_DIR/ast-grep/<version>/<platform>/` and reused ac
 
 **Regex-only detection:**
 ```javascript
-// Regex sees: "await" keyword present ✓
+// Regex sees: "await" keyword present
 const result = await fetch(url);
 // But misses: promise not awaited in callback
 items.forEach(async (item) => {
-  fetch(item.url);  // ❌ Missing await - regex can't detect this
+  fetch(item.url);  // Missing await - regex can't detect this
 });
 ```
 
@@ -2378,7 +2453,7 @@ items.forEach(async (item) => {
 // - Promise return types
 // - Missing await in nested scopes
 items.forEach(async (item) => {
-  fetch(item.url);  // 🔥 CRITICAL: Unhandled promise in async callback
+  fetch(item.url);  // CRITICAL: Unhandled promise in async callback
 });
 ```
 
@@ -2388,7 +2463,7 @@ If ast-grep fails to download (network issues, unsupported platform), UBS falls 
 
 ---
 
-## 🏥 **Maintenance Commands**
+## Maintenance Commands
 
 UBS includes built-in maintenance tools for environment auditing and session management.
 
@@ -2412,14 +2487,14 @@ ubs doctor --module-dir=/custom/path  # Check specific cache location
 
 **Example output:**
 ```
-🏥 UBS Environment Audit
-────────────────────────
-✓ curl available (curl 8.4.0)
-✓ Cache directory writable (/home/user/.local/share/ubs/modules)
-✓ sha256sum available
-✓ 8/8 modules verified
-✓ ast-grep v0.40.1 ready
-✓ All checks passed
+UBS Environment Audit
+---------------------
+  curl available (curl 8.4.0)
+  Cache directory writable (/home/user/.local/share/ubs/modules)
+  sha256sum available
+  8/8 modules verified
+  ast-grep v0.40.1 ready
+  All checks passed
 ```
 
 ### `ubs sessions`
@@ -2442,7 +2517,7 @@ Session logs capture:
 
 ---
 
-## 🧪 **Test Suite Infrastructure**
+## Test Suite Infrastructure
 
 UBS includes a comprehensive manifest-driven test suite for regression testing across all supported languages.
 
@@ -2515,7 +2590,7 @@ This enables debugging test failures and tracking scanner behavior changes acros
 
 ---
 
-## 🔄 **Auto-Update System**
+## Auto-Update System
 
 UBS includes a background auto-update mechanism that keeps your installation current without manual intervention.
 
@@ -2557,7 +2632,7 @@ FORCE_SELF_UPDATE=1 ubs .
 
 ---
 
-## 📊 **Beads/Strung JSONL Integration**
+## Beads/Strung JSONL Integration
 
 For integration with [Beads](https://github.com/Dicklesworthstone/beads) or similar issue-tracking systems, UBS can emit findings as newline-delimited JSON (JSONL).
 
@@ -2593,15 +2668,15 @@ ubs . --beads-jsonl=.beads/scan-results.jsonl
 
 ---
 
-## 📜 **License**
+## License
 
-MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) file
+MIT License (with OpenAI/Anthropic Rider) -- see [LICENSE](LICENSE) file
 
 **TL;DR:** Use it anywhere. Modify it. Share it. Commercial use OK. No restrictions.
 
 ---
 
-## 🙏 **Acknowledgments**
+## Acknowledgments
 
 This project wouldn't exist without:
 
@@ -2612,25 +2687,25 @@ This project wouldn't exist without:
 
 ---
 
-## 📞 **Support**
+## Support
 
 ### **Issues & Questions**
 
-- 🐛 [Report bugs](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues)
-- 💡 [Request features](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues)
-- 📖 [Documentation](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+- [Report bugs](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues)
+- [Request features](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues)
+- [Documentation](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 ---
 
-## 💎 **The Bottom Line**
+## The Bottom Line
 
 **Every hour spent debugging production bugs is an hour not spent building features.**
 
 The Ultimate Bug Scanner gives you:
-- ✅ **Confidence** that code won't fail in production
-- ✅ **Speed** (catch bugs in seconds, not hours)
-- ✅ **Quality gates** for AI-generated code
-- ✅ **Peace of mind** when you deploy
+- **Confidence** that code won't fail in production
+- **Speed** (catch bugs in seconds, not hours)
+- **Quality gates** for AI-generated code
+- **Peace of mind** when you deploy
 
 ### **One Command. Three Seconds. Zero Production Bugs.**
 
@@ -2650,20 +2725,20 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_sca
 [![View on GitHub](https://img.shields.io/badge/View_on-GitHub-blue?style=for-the-badge&logo=github)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 [![Documentation](https://img.shields.io/badge/Read-Documentation-orange?style=for-the-badge)](https://github.com/Dicklesworthstone/ultimate_bug_scanner/wiki)
 
-**Star this repo** if it saved you from a production bug ⭐
+**Star this repo** if it saved you from a production bug
 
 </div>
 
-## ✉️ **Works Great with MCP Agent Mail**
+## Works Great with MCP Agent Mail
 
 [MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) is a Git-backed mailbox system that lets your coding agents coordinate work, hand off tasks, and keep durable histories of every change discussion.
 
 - **UBS + MCP Agent Mail together**: run `ubs --fail-on-warning .` as a standard guardrail step in your MCP Agent Mail workflows so any agent proposing code changes must attach a clean scan (or a summary of remaining issues) to their reply.
-- **Ideal pattern**: one agent writes or refactors code, a “QA agent” triggered via MCP Agent Mail runs UBS against the touched paths, then posts a concise findings report back into the same thread for humans or other agents to act on.
+- **Ideal pattern**: one agent writes or refactors code, a "QA agent" triggered via MCP Agent Mail runs UBS against the touched paths, then posts a concise findings report back into the same thread for humans or other agents to act on.
 - **Result**: your multi-agent automation keeps all the communication history in MCP Agent Mail while UBS continuously enforces fast, language-agnostic quality checks on every change.
 
 ---
 
-## 🤝 **About Contributions**
+## About Contributions
 
 > *About Contributions:* Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.

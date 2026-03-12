@@ -20,7 +20,47 @@ def write_file(path: Path, content: str) -> None:
     path.write_text(textwrap.dedent(content), encoding="utf-8")
 
 
-def make_fake_module(path: Path, language: str, critical: int, warning: int, info: int) -> None:
+def make_fake_ast_grep(path: Path) -> None:
+    write_file(
+        path,
+        """\
+        #!/usr/bin/env bash
+        set -euo pipefail
+        case "${1:-}" in
+          --version)
+            echo "ast-grep 0.40.1"
+            ;;
+          scan)
+            if [[ "${2:-}" == "-h" ]]; then
+              echo "scan help"
+              exit 0
+            fi
+            echo '{"matches":[]}'
+            ;;
+          run)
+            echo '{"matches":[]}'
+            ;;
+          --pattern)
+            echo '{"matches":[]}'
+            ;;
+          *)
+            echo "ast-grep fake"
+            ;;
+        esac
+        """,
+    )
+    path.chmod(0o755)
+
+
+def make_fake_module(
+    path: Path,
+    language: str,
+    critical: int,
+    warning: int,
+    info: int,
+    findings: list[dict[str, object]] | None = None,
+) -> None:
+    findings_json = json.dumps({"findings": findings or []})
     write_file(
         path,
         f"""\
@@ -30,11 +70,18 @@ def make_fake_module(path: Path, language: str, critical: int, warning: int, inf
           printf '%s\\n' "$*" >> "$UBS_TEST_ARGS_LOG"
         fi
         format="text"
+        report_json=""
         for arg in "$@"; do
           case "$arg" in
             --format=*) format="${{arg#--format=}}" ;;
+            --report-json=*) report_json="${{arg#--report-json=}}" ;;
           esac
         done
+        if [[ -n "$report_json" ]]; then
+          cat <<'EOF' > "$report_json"
+        {findings_json}
+        EOF
+        fi
         case "$format" in
           json)
             cat <<'EOF'
@@ -69,6 +116,7 @@ class MetaRunnerContractTests(unittest.TestCase):
         self.args_log = self.tmpdir / "module-args.log"
         self.project.mkdir()
         self.fake_bin.mkdir()
+        make_fake_ast_grep(self.fake_bin / "ast-grep")
 
     def tearDown(self) -> None:
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -106,17 +154,36 @@ class MetaRunnerContractTests(unittest.TestCase):
 
     def test_jsonl_output_emits_scanner_and_totals_records(self) -> None:
         write_file(self.project / "src" / "main.js", "console.log('ok');\n")
-        make_fake_module(self.fake_bin / "ubs-js", "js", critical=0, warning=2, info=1)
+        make_fake_module(
+            self.fake_bin / "ubs-js",
+            "js",
+            critical=0,
+            warning=2,
+            info=1,
+            findings=[
+                {
+                    "ruleId": "js.contract-warning",
+                    "severity": "warning",
+                    "message": "jsonl finding",
+                    "path": "src/main.js",
+                    "line": 1,
+                }
+            ],
+        )
 
         result = self.run_ubs("--format=jsonl", "--no-auto-update")
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
         records = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
         types = {record["type"] for record in records}
+        self.assertIn("finding", types)
         self.assertIn("scanner", types)
         self.assertIn("totals", types)
+        finding = next(record for record in records if record["type"] == "finding")
         scanner = next(record for record in records if record["type"] == "scanner")
         totals = next(record for record in records if record["type"] == "totals")
+        self.assertEqual(finding["language"], "js")
+        self.assertEqual(finding["message"], "jsonl finding")
         self.assertEqual(scanner["language"], "js")
         self.assertEqual(totals["warning"], 2)
 
@@ -133,6 +200,16 @@ class MetaRunnerContractTests(unittest.TestCase):
         runs = payload["runs"]
         drivers = {run["tool"]["driver"]["name"] for run in runs}
         self.assertEqual(drivers, {"ubs-js", "ubs-python"})
+        self.assertEqual(len(runs), 2)
+        results = [result for run in runs for result in run["results"]]
+        self.assertEqual(len(results), 2)
+        uris = {
+            loc["physicalLocation"]["artifactLocation"]["uri"]
+            for run in runs
+            for result in run["results"]
+            for loc in result["locations"]
+        }
+        self.assertEqual(uris, {"src/js.txt", "src/python.txt"})
 
     def test_ci_and_fail_on_warning_propagate_and_fail_closed(self) -> None:
         write_file(self.project / "frontend.js", "console.log('ok');\n")

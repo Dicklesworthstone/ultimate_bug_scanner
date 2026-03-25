@@ -1673,10 +1673,8 @@ YAML
 id: rust.instant-subtraction
 language: rust
 rule:
-  pattern: $A - $DUR
-  inside:
-    any:
-      - pattern: Instant::now() - $DUR
+  any:
+    - pattern: Instant::now() - $DUR
 severity: warning
 message: "Instant subtraction panics if duration exceeds system uptime; use checked_sub()"
 YAML
@@ -1686,25 +1684,10 @@ id: rust.i64-negate-overflow
 language: rust
 rule:
   any:
-    - pattern: (-$X) as i64
     - pattern: $X.wrapping_neg()
     - pattern: -($X as i64)
 severity: info
 message: "Negating i64::MIN wraps silently to i64::MIN; consider checked_neg() or promote to i128"
-YAML
-
-  cat >"$AST_RULE_DIR/hashmap-entry-zero-value.yml" <<'YAML'
-id: rust.hashmap-index-panic
-language: rust
-rule:
-  pattern: $MAP[$KEY]
-  not:
-    inside:
-      any:
-        - pattern: $MAP.get($KEY)
-        - pattern: $MAP.contains_key($KEY)
-severity: info
-message: "HashMap indexing panics if key is missing; prefer .get() or .entry()"
 YAML
 
   cat >"$AST_RULE_DIR/write-not-atomic.yml" <<'YAML'
@@ -1722,10 +1705,14 @@ YAML
 id: rust.thread-spawn-no-join
 language: rust
 rule:
-  pattern: std::thread::spawn($CLOSURE)
+  any:
+    - pattern: std::thread::spawn($CLOSURE)
+    - pattern: thread::spawn($CLOSURE)
   not:
     inside:
-      pattern: let $HANDLE = std::thread::spawn($CLOSURE)
+      any:
+        - pattern: let $HANDLE = std::thread::spawn($CLOSURE)
+        - pattern: let $HANDLE = thread::spawn($CLOSURE)
 severity: warning
 message: "thread::spawn result discarded; panics in the thread will be silently lost. Keep the JoinHandle"
 YAML
@@ -1734,10 +1721,14 @@ YAML
 id: rust.tokio-spawn-no-handle
 language: rust
 rule:
-  pattern: tokio::spawn($FUTURE)
+  any:
+    - pattern: tokio::spawn($FUTURE)
+    - pattern: task::spawn($FUTURE)
   not:
     inside:
-      pattern: let $HANDLE = tokio::spawn($FUTURE)
+      any:
+        - pattern: let $HANDLE = tokio::spawn($FUTURE)
+        - pattern: let $HANDLE = task::spawn($FUTURE)
 severity: info
 message: "tokio::spawn result discarded; errors in the task will be silently lost"
 YAML

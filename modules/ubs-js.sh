@@ -2278,18 +2278,6 @@ severity: info
 message: "Chained ?? operators have left-to-right precedence; add parentheses to clarify intent"
 YAML
 
-  cat >"$AST_RULE_DIR/js-json-parse-no-try.yml" <<'YAML'
-id: js.json-parse-no-try
-language: typescript
-rule:
-  pattern: JSON.parse($X)
-  not:
-    inside:
-      kind: try_statement
-severity: warning
-message: "JSON.parse without try/catch crashes on malformed input"
-YAML
-
   cat >"$AST_RULE_DIR/js-usememo-empty-deps.yml" <<'YAML'
 id: js.react.useMemo-empty-deps
 language: typescript
@@ -2310,15 +2298,6 @@ severity: info
 message: "sortUndefined: -1 sorts nulls to top; use 1 to sort to bottom (common expectation)"
 YAML
 
-  cat >"$AST_RULE_DIR/js-require-user-admin.yml" <<'YAML'
-id: js.auth.requireUser-in-admin
-language: typescript
-rule:
-  pattern: requireUser($$$)
-severity: info
-message: "requireUser() in this route; verify requireAdmin() isn't needed for admin-only endpoints"
-YAML
-
   cat >"$AST_RULE_DIR/js-non-atomic-write.yml" <<'YAML'
 id: js.fs.writeFileSync-not-atomic
 language: typescript
@@ -2328,16 +2307,6 @@ rule:
     - pattern: writeFileSync($PATH, $DATA)
 severity: info
 message: "writeFileSync is not atomic; for durability, write to temp file and rename"
-YAML
-
-  cat >"$AST_RULE_DIR/js-stale-closure-useeffect.yml" <<'YAML'
-id: js.react.useEffect-empty-deps
-language: typescript
-rule:
-  any:
-    - pattern: useEffect(() => { $$$ }, [])
-severity: info
-message: "useEffect with empty deps runs once; verify no referenced values change over the component lifecycle"
 YAML
 
   cat >"$AST_RULE_DIR/js-operator-precedence-nullish.yml" <<'YAML'

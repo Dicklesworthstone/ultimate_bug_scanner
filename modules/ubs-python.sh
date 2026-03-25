@@ -1663,21 +1663,6 @@ severity: info
 message: "Database execute without exception handling; consider retry logic for OperationalError/SQLITE_BUSY"
 YAML
 
-  cat >"$AST_RULE_DIR/write-not-atomic.yml" <<'YAML'
-id: py.write-not-atomic
-language: python
-rule:
-  any:
-    - pattern: |
-        with open($PATH, "w") as $F:
-            $$$
-    - pattern: |
-        with open($PATH, "wb") as $F:
-            $$$
-severity: info
-message: "Non-atomic write (truncates then writes); for durability, write to temp file and os.rename()"
-YAML
-
   cat >"$AST_RULE_DIR/signal-handler-too-complex.yml" <<'YAML'
 id: py.signal-handler-io
 language: python

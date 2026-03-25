@@ -1502,8 +1502,8 @@ rule:
     any:
       - pattern: $V, $OK := $MAP[$KEY]
       - pattern: $V, _ := $MAP[$KEY]
-severity: warning
-message: "Map lookup without comma-ok returns zero value for missing keys; use v, ok := m[k]"
+severity: info
+message: "Map lookup without comma-ok returns zero value for missing keys; use v, ok := m[k] when zero-value ambiguity matters"
 YAML
 
   cat >"$AST_RULE_DIR/go-sort-slice-param.yml" <<'YAML'
@@ -1531,14 +1531,14 @@ YAML
 id: go.os-remove-no-error-check
 language: go
 rule:
-  pattern: |
-    os.Remove($PATH)
+  pattern: os.Remove($PATH)
   not:
     inside:
       any:
         - pattern: $ERR := os.Remove($PATH)
         - pattern: $ERR = os.Remove($PATH)
         - pattern: if $ERR := os.Remove($PATH); $$$
+        - pattern: $ERR := os.RemoveAll($PATH)
 severity: warning
 message: "os.Remove error ignored; handle or check for os.ErrNotExist at minimum"
 YAML
@@ -1562,7 +1562,7 @@ YAML
 id: go.fmt-errorf-no-wrap
 language: go
 rule:
-  pattern: fmt.Errorf($FMT, $ERR)
+  pattern: fmt.Errorf($$$)
   not:
     has:
       regex: "%w"

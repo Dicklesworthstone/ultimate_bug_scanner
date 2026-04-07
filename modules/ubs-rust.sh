@@ -647,7 +647,7 @@ filter_test_lines() {
       continue
     fi
     # Rule 1: files under tests/ or benches/
-    if [[ "$_ftl_f" == */tests/* || "$_ftl_f" == */benches/* ]]; then
+    if [[ "$_ftl_f" == */tests/* || "$_ftl_f" == tests/* || "$_ftl_f" == */benches/* || "$_ftl_f" == benches/* ]]; then
       continue
     fi
     # Rule 2: at or below #[cfg(test)]

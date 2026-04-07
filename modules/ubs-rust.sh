@@ -616,7 +616,7 @@ _ubs_test_boundary() {
     # Find earliest test boundary: #[cfg(test)] or bare `mod tests {`
     local b1 b2 b=0
     b1=$(grep -n '#\[cfg(test)\]' "$file" 2>/dev/null | head -1 | cut -d: -f1)
-    b2=$(grep -n '^[[:space:]]*mod tests' "$file" 2>/dev/null | head -1 | cut -d: -f1)
+    b2=$(grep -n -E '^[[:space:]]*mod tests([[:space:]]|\{|;|$)' "$file" 2>/dev/null | head -1 | cut -d: -f1)
     b1=${b1:-0}; b2=${b2:-0}
     if [[ "$b1" -gt 0 && "$b2" -gt 0 ]]; then
       b=$(( b1 < b2 ? b1 : b2 ))

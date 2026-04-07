@@ -129,7 +129,12 @@ ARROW="${BLUE}→${RESET}"
 WARN="${YELLOW}⚠${RESET}"
 
 # Flags
-NON_INTERACTIVE=0
+# Auto-detect CI/non-interactive environments
+if [ "${CI:-}" = "true" ] || [ "${NONINTERACTIVE:-}" = "1" ] || [ ! -t 0 ]; then
+  NON_INTERACTIVE=1
+else
+  NON_INTERACTIVE=0
+fi
 EASY_MODE=0
 QUIET=0
 SYSTEM_WIDE=0
@@ -3479,7 +3484,13 @@ if [ "$NON_INTERACTIVE" -eq 1 ] || [ "$EASY_MODE" -eq 1 ]; then
     exit 1
   fi
 else
-  if ask "Install ast-grep now? (required)"; then
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
+    warn "ast-grep not found — attempting automatic installation (non-interactive mode)"
+    if ! install_ast_grep; then
+      warn "ast-grep installation failed in non-interactive mode. Continuing without it (reduced JS/TS accuracy)."
+      SKIP_AST_GREP=1
+    fi
+  elif ask "Install ast-grep now? (required)"; then
     if ! install_ast_grep; then
       error "ast-grep installation failed. Fix the error above and re-run, or pass --skip-ast-grep to proceed without it."
       exit 1

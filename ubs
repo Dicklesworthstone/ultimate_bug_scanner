@@ -40,10 +40,10 @@ declare -A MODULE_CHECKSUMS=(
   [golang]='338e4c66deaaca1bcc22a18342e0a05de3691d7d5bc22761aa3e715d615baa1b'
   [java]='a72bc83c468c4374e8284c65d40540d5c107fcfe55c125dd15d625a096e0fc84'
   [js]='e0629ce300f49ba1dd3c72c2928328f33b851977f10179a331f9d9ef2d03bed6'
-  [python]='eaf683e2dba29b3431b4d8374bdf4f5a44f89bb9c86d32b99ec1b6e8349c0bf7'
+  [python]='ab063e2cda654bb34f58f11005c79ebe987c0663a7be9f5af36e53ffae8d5d7d'
   [ruby]='a0b06277361045ebf13fcc20019ec6ae3a77a420eb10e52d6bd76993a740de0d'
   [rust]='f066c2c61c3d5e0eeb750d195f39bc2f0754578c950017ee71111de3f401cf19'
-  [swift]='b94398f113f4c21ed3658ffa7527caedaec825fbcb4f43f629c5edff6f30959c'
+  [swift]='95831892e6a6868581039d0e6aa74695090aab9820e8e1c46557c5f09837725c'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).

@@ -2065,9 +2065,12 @@ print_subheader "Division by variable (possible ÷0)"
 count=0
 division_report=""
 if [[ "$HAS_AST_GREP" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
-  division_report=$(
-    ( set +o pipefail; "${AST_GREP_CMD[@]}" run -p '$A / $B' -l python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) \
-      | python3 - "$DETAIL_LIMIT" <<'PY'
+  # SC2259 fix: write the Python script to a temp file so the pipe-to-
+  # stdin path actually reaches sys.stdin. Previously `python3 - <<'PY'`
+  # had the heredoc override the pipe, making sys.stdin empty and
+  # silently returning count=0 for every run.
+  _ubs_py_script=$(mktemp "${TMPDIR:-/tmp}/ubs-div-XXXXXX.py")
+  cat >"$_ubs_py_script" <<'PY'
 import json
 import re
 import sys
@@ -2105,7 +2108,11 @@ print(count)
 for sample in samples:
     print(sample)
 PY
+  division_report=$(
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" run -p '$A / $B' -l python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) \
+      | python3 "$_ubs_py_script" "$DETAIL_LIMIT"
   )
+  rm -f "$_ubs_py_script"
   count=$(printf '%s\n' "$division_report" | head -n 1 | awk 'END{print $0+0}')
 else
   count=$(

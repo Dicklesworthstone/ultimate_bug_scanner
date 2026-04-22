@@ -2660,7 +2660,11 @@ if [[ -n "$SUMMARY_JSON" ]]; then
   if [[ -n "${AG_STREAM_FILE:-}" && -s "${AG_STREAM_FILE:-}" && "$HAS_AST_GREP" -eq 1 ]]; then
       printf '"ast_grep_rules":['
    if command -v python3 >/dev/null 2>&1; then
-    cat "$AG_STREAM_FILE" 2>/dev/null | python3 - <<'PY'
+    # SC2259 fix: write the Python script to a temp file so piped input
+    # reaches sys.stdin. `python3 - <<'PY'` previously had the heredoc
+    # override the pipe, making the rule-count output silently empty.
+    _ubs_sw_script=$(mktemp "${TMPDIR:-/tmp}/ubs-sw-XXXXXX.py")
+    cat >"$_ubs_sw_script" <<'PY'
 import json,sys,collections
 seen=collections.Counter()
 for line in sys.stdin:
@@ -2673,6 +2677,8 @@ for line in sys.stdin:
     pass
 print(",".join(json.dumps({"id":k,"count":v}) for k,v in seen.items()))
 PY
+    cat "$AG_STREAM_FILE" 2>/dev/null | python3 "$_ubs_sw_script"
+    rm -f "$_ubs_sw_script"
    else
     awk -F'"' '/"rule_id":/{c[$4]++} END{first=1; for(k in c){ if(!first) printf ","; first=0; printf "{\"id\":%c%s%c,\"count\":%d}",34,k,34,c[k]} }' "$AG_STREAM_FILE" 2>/dev/null || true
    fi

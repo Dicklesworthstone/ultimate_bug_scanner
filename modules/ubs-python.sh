@@ -32,6 +32,14 @@
 # Adds portable timeout resolution (timeout/gtimeout) and UTF‑8-safe output.
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Bail early on ancient bash (macOS ships bash 3.2; `shopt -s lastpipe`
+# requires 4.2+ and would silently abort the module under `set -e`).
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "ERROR: ubs-python.sh requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
+  echo "       On macOS: 'brew install bash' and re-run via /opt/homebrew/bin/bash." >&2
+  exit 2
+fi
+
 set -Eeuo pipefail
 shopt -s lastpipe
 shopt -s extglob
@@ -242,6 +250,12 @@ while [[ $# -gt 0 ]]; do
         fi
         shift
       elif [[ -z "$OUTPUT_FILE" ]] && ! [[ "$1" =~ ^- ]]; then
+        if [[ -e "$1" && -s "$1" ]]; then
+          echo "error: refusing to use existing non-empty file '$1' as OUTPUT_FILE (would be overwritten)." >&2
+          echo "       To scan multiple paths, pass them via --paths-from=FILE, or use the meta-runner 'ubs'." >&2
+          echo "       To write the report somewhere, pass a fresh (non-existing) path as the second positional argument." >&2
+          exit 2
+        fi
         OUTPUT_FILE="$1"; shift
       else
         echo "Unexpected argument: $1" >&2; exit 2

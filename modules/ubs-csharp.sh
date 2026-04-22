@@ -17,6 +17,12 @@
 #   --summary-json=FILE Write machine-readable summary JSON
 #   --emit-findings-json=FILE Write full findings JSON (same as stdout in --format=json)
 
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "ERROR: ubs-csharp.sh requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
+  echo "       On macOS: 'brew install bash' and re-run via /opt/homebrew/bin/bash." >&2
+  exit 2
+fi
+
 set -Eeuo pipefail
 shopt -s lastpipe 2>/dev/null || true
 

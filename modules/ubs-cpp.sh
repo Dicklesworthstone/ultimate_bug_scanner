@@ -11,6 +11,12 @@
 # detail wrappers, category list command, and correctness/robustness fixes.
 # ═══════════════════════════════════════════════════════════════════════════
 
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "ERROR: ubs-cpp.sh requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
+  echo "       On macOS: 'brew install bash' and re-run via /opt/homebrew/bin/bash." >&2
+  exit 2
+fi
+
 set -Eeuo pipefail
 shopt -s lastpipe
 shopt -s extglob
@@ -150,6 +156,11 @@ while [[ $# -gt 0 ]]; do
       if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
         PROJECT_DIR="$1"; shift
       elif [[ -z "$OUTPUT_FILE" ]] && ! [[ "$1" =~ ^- ]]; then
+        if [[ -e "$1" && -s "$1" ]]; then
+          echo "error: refusing to use existing non-empty file '$1' as OUTPUT_FILE (would be overwritten)." >&2
+          echo "       To scan multiple paths, use the meta-runner 'ubs'. To save a report, pass a fresh (non-existing) path." >&2
+          exit 2
+        fi
         OUTPUT_FILE="$1"; shift
       else
         echo "Unexpected argument: $1" >&2; exit 2

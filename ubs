@@ -34,16 +34,16 @@ MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='7feb11e7e8ad5bcd2771a7f809521233bc69fd97a97ff07d0ca4e40d2831b910'
-  [csharp]='f3d38ad3842780263765d8b6718cc459514119f780cc1d39c9425bf0bf9a51a1'
-  [elixir]='15a87bc4d2aabfb63448c59df787fa193e44611176c5926151ff4b22aea71457'
-  [golang]='4818c7a0261c8609dfca84788f252f123959ce1dc1cb1686d2c74232861afe88'
-  [java]='e91cf81a39f9323292b7cd0778a9ee56ed879a25eaea612ac4c289dce8c6560b'
-  [js]='e79aa9a39cc5808e922abf319ba375c150a5a84b56de979fd4669d9c89ed43c4'
-  [python]='6859a06bf7af4d15278cc4356af5a6f88517a28e94e2595163deaa557f343aa3'
-  [ruby]='90d4279f66795ba08d49b99a881466e8078068bc704eaa7cab3f73751af4c5af'
-  [rust]='6cda1fde50b95db9468762a381faa377559b2ce14d2dd1ff16ec8a99bce6b8e5'
-  [swift]='1429436c7de226ef2302dc8860e9737a44cbf23028da97437a0c89baa6b7870b'
+  [cpp]='0227e3b3f2ad0729787eb726c752e6b0d5208f8c31fb5a9570a2df186c573e7b'
+  [csharp]='8f460436b1e0d4a1b5c69960f65b607a76f544f8e4d45a3052bc26825475d859'
+  [elixir]='476279666bf7171a93756e3afa17c246aa6fae2e925e163e543d1277fc3b8fa8'
+  [golang]='338e4c66deaaca1bcc22a18342e0a05de3691d7d5bc22761aa3e715d615baa1b'
+  [java]='a72bc83c468c4374e8284c65d40540d5c107fcfe55c125dd15d625a096e0fc84'
+  [js]='e0629ce300f49ba1dd3c72c2928328f33b851977f10179a331f9d9ef2d03bed6'
+  [python]='eaf683e2dba29b3431b4d8374bdf4f5a44f89bb9c86d32b99ec1b6e8349c0bf7'
+  [ruby]='06ff4bb8eb6e24beb350c164a068267bc9fa2fbb6d36bd0895093559c700cb18'
+  [rust]='f066c2c61c3d5e0eeb750d195f39bc2f0754578c950017ee71111de3f401cf19'
+  [swift]='b94398f113f4c21ed3658ffa7527caedaec825fbcb4f43f629c5edff6f30959c'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -2328,7 +2328,7 @@ run_lang(){
       fi
 
       if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
-        "$module" "${args[@]}" "${report_args[@]}" --format=json >"$out_json" 2>"$err"; then
+        "$BASH" "$module" "${args[@]}" "${report_args[@]}" --format=json >"$out_json" 2>"$err"; then
         module_status=0
       else
         module_status=$?
@@ -2343,7 +2343,7 @@ run_lang(){
       else
         prepare_metrics_dir "$metrics_dir"
         if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
-          "$module" "${args[@]}" "${report_args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
+          "$BASH" "$module" "${args[@]}" "${report_args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
           module_status=0
         else
           module_status="${PIPESTATUS[0]}"
@@ -2356,7 +2356,7 @@ run_lang(){
     sarif)
       prepare_metrics_dir "$metrics_dir"
       if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
-        "$module" "${args[@]}" --format=sarif >"$out_sarif" 2>"$err"; then
+        "$BASH" "$module" "${args[@]}" --format=sarif >"$out_sarif" 2>"$err"; then
         module_status=0
       else
         module_status=$?
@@ -2368,7 +2368,7 @@ run_lang(){
       else
         prepare_metrics_dir "$metrics_dir"
         if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
-          "$module" "${args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
+          "$BASH" "$module" "${args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
           module_status=0
         else
           module_status="${PIPESTATUS[0]}"
@@ -2382,7 +2382,7 @@ run_lang(){
     text|*)
       prepare_metrics_dir "$metrics_dir"
       if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
-        "$module" "${args[@]}" 2>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
+        "$BASH" "$module" "${args[@]}" 2>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
         module_status=0
       else
         module_status="${PIPESTATUS[0]}"

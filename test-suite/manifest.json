@@ -1173,6 +1173,62 @@
       }
     },
     {
+      "id": "rust-security-shell-command-buggy",
+      "description": "Rust security fixture with shell -c command execution and a hardcoded Stripe-style secret literal.",
+      "path": "test-suite/rust/buggy/security_injection.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 2
+          }
+        },
+        "require_substrings": [
+          "Shell command execution via -c",
+          "Possible hardcoded secrets"
+        ]
+      }
+    },
+    {
+      "id": "rust-security-shell-command-clean",
+      "description": "Rust security clean fixture that invokes a command directly without shell interpretation.",
+      "path": "test-suite/rust/clean/security_injection.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "rust-async-errors-buggy",
       "description": "Rust awaits lacking ?/match handling + tokio::spawn handles dropped.",
       "path": "test-suite/rust/async_errors/buggy",

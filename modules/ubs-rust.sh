@@ -1451,8 +1451,12 @@ YAML
 id: rust.command.shell-c
 language: rust
 rule:
-  pattern: std::process::Command::new($S).arg("-c").arg($CMD)
-severity: warning
+  any:
+    - pattern: std::process::Command::new($S).arg("-c").arg($CMD)
+    - pattern: Command::new($S).arg("-c").arg($CMD)
+    - pattern: std::process::Command::new($S).arg("/C").arg($CMD)
+    - pattern: Command::new($S).arg("/C").arg($CMD)
+severity: error
 message: "Command::new(shell).arg(\"-c\", ...) invites shell injection; avoid shells or strictly validate input."
 YAML
 
@@ -2190,8 +2194,8 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 8; then
 print_header "8. SECURITY FINDINGS"
-print_category "Detects: TLS verification disabled, weak hash algos, HTTP URLs, secrets" \
-  "Security misconfigurations can lead to credential leaks and MITM attacks"
+print_category "Detects: TLS verification disabled, weak hash algos, shell command injection, HTTP URLs, secrets" \
+  "Security misconfigurations can lead to credential leaks, command injection, and MITM attacks"
 
 print_subheader "Weak hash algorithms (MD5/SHA1)"
 weak_hash=$(( $(ast_search 'md5::$F($$)' || echo 0) + $(ast_search 'sha1::$F($$)' || echo 0) + $("${GREP_RN[@]}" -e "SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
@@ -2204,13 +2208,30 @@ tls_insecure=$(( $(ast_search 'reqwest::ClientBuilder::new().danger_accept_inval
   + $("${GREP_RN[@]}" -e "TlsConnector::builder\(\)\\.danger_accept_invalid_certs\(true\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$tls_insecure" -gt 0 ]; then print_finding "critical" "$tls_insecure" "TLS verification disabled"; add_finding "critical" "$tls_insecure" "TLS verification disabled" "" "${CATEGORY_NAME[8]}"; fi
 
+print_subheader "Shell command execution through -c"
+shell_command_ast=$(( \
+  $(ast_search 'std::process::Command::new($S).arg("-c").arg($CMD)' || echo 0) \
+  + $(ast_search 'Command::new($S).arg("-c").arg($CMD)' || echo 0) \
+  + $(ast_search 'std::process::Command::new($S).arg("/C").arg($CMD)' || echo 0) \
+  + $(ast_search 'Command::new($S).arg("/C").arg($CMD)' || echo 0) ))
+shell_command_rg=$("${GREP_RN[@]}" -e "(std::process::)?Command::new\([^)]*\)[^;]*\.arg\(\"(-c|/C)\"\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+shell_command=$(( shell_command_ast>0?shell_command_ast:shell_command_rg ))
+if [ "$shell_command" -gt 0 ]; then
+  print_finding "critical" "$shell_command" "Shell command execution via -c" "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input"
+  show_detailed_finding "(std::process::)?Command::new\([^)]*\)[^;]*\.arg\(\"(-c|/C)\"\)" 5
+  add_finding "critical" "$shell_command" "Shell command execution via -c" "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "(std::process::)?Command::new\([^)]*\)[^;]*\.arg\(\"(-c|/C)\"\)" 5)"
+else
+  print_finding "good" "No shell -c Command usage detected"
+fi
+
 print_subheader "Plain http:// URLs"
 http_url=$(( $(ast_search '"http://$REST"' || echo 0) + $("${GREP_RN[@]}" -e "http://[A-Za-z0-9]" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$http_url" -gt 0 ]; then print_finding "info" "$http_url" "Plain HTTP URL(s) detected"; add_finding "info" "$http_url" "Plain HTTP URL(s) detected" "" "${CATEGORY_NAME[8]}"; fi
 
 print_subheader "Hardcoded secrets/credentials (heuristic)"
-secret_heur=$("${GREP_RNI[@]}" -e "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$secret_heur" -gt 0 ]; then print_finding "critical" "$secret_heur" "Possible hardcoded secrets"; show_detailed_finding "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" 3; add_finding "critical" "$secret_heur" "Possible hardcoded secrets" "" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|BEGIN RSA PRIVATE KEY" 3)"; fi
+secret_pattern="password[[:space:]]*=|api_?key[[:space:]]*=|secret[[:space:]]*=|token[[:space:]]*=|sk_(live|test)_[A-Za-z0-9_]{3,}|AKIA[0-9A-Z]{16}|BEGIN RSA PRIVATE KEY"
+secret_heur=$("${GREP_RNI[@]}" -e "$secret_pattern" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$secret_heur" -gt 0 ]; then print_finding "critical" "$secret_heur" "Possible hardcoded secrets"; show_detailed_finding "$secret_pattern" 3; add_finding "critical" "$secret_heur" "Possible hardcoded secrets" "" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "$secret_pattern" 3)"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

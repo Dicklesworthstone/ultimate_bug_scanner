@@ -21,6 +21,8 @@ func insecureHandler(w http.ResponseWriter, r *http.Request) {
 
 	cmd := exec.Command("sh", "-c", "ls "+user)
 	cmd.Run() // command injection
+	_ = exec.Command("cmd", "/C", "dir "+user).Run()
+	_ = exec.Command("powershell", "-Command", "Get-ChildItem "+user).Run()
 
 	req, _ := http.NewRequest("GET", "https://example.com", nil)
 	client.Do(req) // missing Timeout

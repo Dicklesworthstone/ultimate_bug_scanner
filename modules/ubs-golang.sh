@@ -1409,8 +1409,8 @@ rule:
   pattern: time.After($$)
   inside:
     kind: for_statement
-severity: info
-message: "time.After in loop allocates per-iteration; prefer a reusable time.Timer."
+severity: warning
+message: "time.After in loop leaks timers until they fire; use time.NewTimer with Stop/Reset"
 YAML
 
   # ───── Encoding/JSON ─────────────────────────────────────────────────────
@@ -1447,8 +1447,12 @@ rule:
     - pattern: exec.CommandContext($CTX, "sh", "-c", $CMD)
     - pattern: exec.Command("bash", "-c", $CMD)
     - pattern: exec.CommandContext($CTX, "bash", "-c", $CMD)
+    - pattern: exec.Command("cmd", "/C", $CMD)
+    - pattern: exec.CommandContext($CTX, "cmd", "/C", $CMD)
+    - pattern: exec.Command("powershell", "-Command", $CMD)
+    - pattern: exec.CommandContext($CTX, "powershell", "-Command", $CMD)
 severity: error
-message: "shell invocation via sh -c; sanitize inputs or avoid shell."
+message: "shell invocation via command interpreter; sanitize inputs or avoid shell."
 YAML
 
   cat >"$AST_RULE_DIR/go-tls-insecure-skip.yml" <<'YAML'
@@ -1544,13 +1548,8 @@ YAML
 id: go.missing-sync-before-remove
 language: go
 rule:
-  any:
-    - pattern: |
-        $F.Close()
-        os.Remove($PATH)
-    - pattern: |
-        $F.Close()
-        os.Rename($SRC, $DST)
+  kind: source_file
+  regex: '(?s)\.Close\(\)\s*\n\s*os\.(Remove|Rename)\('
 severity: info
 message: "Close without Sync before Remove/Rename; buffered data may be lost on crash. Call f.Sync() first"
 YAML
@@ -1585,17 +1584,6 @@ rule:
     - pattern: exec.Command("pgrep", "-f", $PATTERN)
 severity: info
 message: "pgrep matches substrings by default; use -x (exact) or anchor the pattern to avoid false positives"
-YAML
-
-  cat >"$AST_RULE_DIR/go-time-after-leak.yml" <<'YAML'
-id: go.time-after-in-loop
-language: go
-rule:
-  pattern: time.After($DUR)
-  inside:
-    kind: for_statement
-severity: warning
-message: "time.After in loop leaks timers until they fire; use time.NewTimer with Stop/Reset"
 YAML
 
   # Strict mode severity bumps (best-effort)
@@ -3548,12 +3536,12 @@ if [ "$count" -eq 0 ] && [[ "$HAS_RG" -eq 1 ]]; then
 fi
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "InsecureSkipVerify enabled"; fi
 
-print_subheader "exec sh -c (command injection risk)"
+print_subheader "exec shell interpreter (command injection risk)"
 count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.exec-sh-c" || echo 0)
 if [ "$count" -eq 0 ] && [[ "$HAS_RG" -eq 1 ]]; then
-  count=$(rg --no-config --no-messages -g '*.go' -n 'exec\.Command(Context)?\(\s*"(sh|bash)"\s*,\s*"-?c"' "$PROJECT_DIR" 2>/dev/null | wc -l | awk '{print $1+0}')
+  count=$(rg --no-config --no-messages -g '*.go' -n 'exec\.Command(Context)?\(\s*"(sh|bash)"\s*,\s*"-?c"|exec\.Command(Context)?\(\s*"cmd"\s*,\s*"/C"|exec\.Command(Context)?\(\s*"powershell"\s*,\s*"-Command"' "$PROJECT_DIR" 2>/dev/null | wc -l | awk '{print $1+0}')
 fi
-if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "exec.Command(*, \"sh\", \"-c\", ...) detected"; fi
+if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "exec.Command shell interpreter detected"; fi
 [[ "$VERBOSE" -eq 1 && "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" && "$count" -gt 0 ]] && show_ast_samples "go.exec-sh-c" "$DETAIL_LIMIT" || true
 
 print_subheader "exec without context"

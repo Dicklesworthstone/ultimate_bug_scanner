@@ -743,6 +743,26 @@ parse_grep_line() {
   return 1
 }
 
+# Parse ast-grep match output from both modern `run` style
+# (file:line:code) and older grep-like style (file:line:col:code).
+# Sets: PARSED_AST_FILE, PARSED_AST_LINE, PARSED_AST_COL, PARSED_AST_CODE
+parse_ast_match_line() {
+  local rawline="$1"
+  PARSED_AST_FILE="" PARSED_AST_LINE="" PARSED_AST_COL="" PARSED_AST_CODE=""
+  parse_grep_line "$rawline" || return 1
+  if [[ ! -f "$PARSED_FILE" && "$PARSED_FILE" =~ ^(.+):([0-9]+)$ ]]; then
+    PARSED_AST_FILE="${BASH_REMATCH[1]}"
+    PARSED_AST_LINE="${BASH_REMATCH[2]}"
+    PARSED_AST_COL="$PARSED_LINE"
+    PARSED_AST_CODE="$PARSED_CODE"
+    return 0
+  fi
+  PARSED_AST_FILE="$PARSED_FILE"
+  PARSED_AST_LINE="$PARSED_LINE"
+  PARSED_AST_COL=0
+  PARSED_AST_CODE="$PARSED_CODE"
+}
+
 show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
@@ -864,12 +884,98 @@ show_ast_examples() {
         line="${BASH_REMATCH[2]}"
         col="${BASH_REMATCH[3]}"
         rest="${BASH_REMATCH[4]}"
+      elif [[ "$rawline" =~ ^([A-Za-z]:.+):([0-9]+):(.*)$ ]] || [[ "$rawline" =~ ^(.+):([0-9]+):(.*)$ ]]; then
+        file="${BASH_REMATCH[1]}"
+        line="${BASH_REMATCH[2]}"
+        col=0
+        rest="${BASH_REMATCH[3]}"
       else
         continue
       fi
       if [[ -f "$file" && -n "$line" ]]; then code="$(sed -n "${line}p" "$file" | sed $'s/\t/  /g')"; fi
       print_code_sample "$file" "$line" "${code:-$rest}"; printed=$((printed+1)); [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
     done < <( ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" -n "$PROJECT_DIR" 2>/dev/null || true ) | head -n "$limit" )
+  fi
+}
+
+ast_pattern_lines() {
+  local pattern="$1"
+  if [[ "$HAS_AST_GREP" -ne 1 ]]; then
+    return 1
+  fi
+  if [[ "$AST_GREP_RUN_STYLE" -eq 1 ]]; then
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" run --pattern "$pattern" -l rust "$PROJECT_DIR" 2>/dev/null || true )
+  else
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" -n "$PROJECT_DIR" 2>/dev/null || true )
+  fi
+}
+
+show_ast_pattern_examples() {
+  local limit="$1"
+  shift
+  local printed=0 pattern rawline file line col rest code key
+  declare -A seen=()
+  [[ "$HAS_AST_GREP" -eq 1 ]] || return 1
+  for pattern in "$@"; do
+    while IFS= read -r rawline; do
+      [[ -z "$rawline" ]] && continue
+      parse_ast_match_line "$rawline" || continue
+      file="$PARSED_AST_FILE"
+      line="$PARSED_AST_LINE"
+      col="$PARSED_AST_COL"
+      rest="$PARSED_AST_CODE"
+      key="$file:$line:$col"
+      [[ -n "${seen[$key]:-}" ]] && continue
+      seen["$key"]=1
+      code="$rest"
+      if [[ -f "$file" && -n "$line" ]]; then
+        code="$(sed -n "${line}p" "$file" | sed $'s/\t/  /g')"
+      fi
+      print_code_sample "$file" "$line" "$code"
+      printed=$((printed + 1))
+      [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && return 0
+    done < <(ast_pattern_lines "$pattern")
+  done
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_ast_or_rg() {
+  local rg_pattern="$1"
+  local limit="${2:-$DETAIL_LIMIT}"
+  shift 2
+  local samples=()
+  local pattern rawline file line col rest code key
+  declare -A seen=()
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    for pattern in "$@"; do
+      while IFS= read -r rawline; do
+        [[ -z "$rawline" ]] && continue
+        parse_ast_match_line "$rawline" || continue
+        file="$PARSED_AST_FILE"
+        line="$PARSED_AST_LINE"
+        col="$PARSED_AST_COL"
+        rest="$PARSED_AST_CODE"
+        key="$file:$line:$col"
+        [[ -n "${seen[$key]:-}" ]] && continue
+        seen["$key"]=1
+        code="$rest"
+        if [[ -f "$file" && -n "$line" ]]; then
+          code="$(sed -n "${line}p" "$file" | sed $'s/\t/  /g')"
+        fi
+        samples+=("$file:$line:$code")
+        [[ ${#samples[@]} -ge $limit ]] && break 2
+      done < <(ast_pattern_lines "$pattern")
+    done
+    printf '['
+    local i=0
+    for line in "${samples[@]}"; do
+      [[ $i -gt 0 ]] && printf ','
+      printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+      i=$((i + 1))
+    done
+    printf ']'
+  else
+    collect_samples_rg "$rg_pattern" "$limit"
   fi
 }
 
@@ -955,6 +1061,23 @@ ast_search() {
     fi
   else
     echo 0
+  fi
+}
+
+count_ast_or_rg() {
+  local rg_pattern="$1"
+  shift
+  local ast_hits=0
+  local hit pattern
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    for pattern in "$@"; do
+      hit="$(ast_search "$pattern" || echo 0)"
+      hit="$(printf '%s\n' "${hit:-0}" | awk 'END{print $0+0}')"
+      ast_hits=$((ast_hits + hit))
+    done
+    printf '%s\n' "$ast_hits"
+  else
+    "${GREP_RN[@]}" -e "$rg_pattern" "$PROJECT_DIR" 2>/dev/null | filter_test_lines | count_lines || true
   fi
 }
 
@@ -1062,7 +1185,7 @@ YAML
 id: rust.unsafe-block
 language: rust
 rule:
-  pattern: unsafe { $$ }
+  pattern: unsafe { $$$BODY }
 severity: info
 message: "unsafe block present; verify invariants and minimal scope"
 YAML
@@ -1072,9 +1195,9 @@ id: rust.mem-transmute
 language: rust
 rule:
   any:
-    - pattern: std::mem::transmute($$)
-    - pattern: mem::transmute($$)
-    - pattern: transmute($$)
+    - pattern: std::mem::transmute($X)
+    - pattern: mem::transmute($X)
+    - pattern: transmute($X)
 severity: error
 message: "std::mem::transmute is unsafe and error-prone; prefer safe conversions"
 YAML
@@ -1106,8 +1229,8 @@ id: rust.mem-forget
 language: rust
 rule:
   any:
-    - pattern: std::mem::forget($$)
-    - pattern: mem::forget($$)
+    - pattern: std::mem::forget($X)
+    - pattern: mem::forget($X)
 severity: warning
 message: "mem::forget leaks memory; ensure this is intentional"
 YAML
@@ -2029,18 +2152,53 @@ print_category "Detects: unsafe blocks, transmute/uninitialized/zeroed/forget, r
   "These patterns may introduce UB, memory leaks, or hard-to-debug crashes"
 
 print_subheader "unsafe { ... } blocks"
-unsafe_count=$(( $(ast_search 'unsafe { $$ }' || echo 0) + $("${GREP_RN[@]}" -e "unsafe[[:space:]]*{{" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$unsafe_count" -gt 0 ]; then print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"; add_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "unsafe[[:space:]]*{{" 3)"; else print_finding "good" "No unsafe blocks detected"; fi
+# shellcheck disable=SC2016
+unsafe_count=$(count_ast_or_rg 'unsafe[[:space:]]*\{' 'unsafe { $$$BODY }')
+if [ "$unsafe_count" -gt 0 ]; then
+  print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"
+  # shellcheck disable=SC2016
+  add_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope" "${CATEGORY_NAME[2]}" "$(collect_samples_ast_or_rg "unsafe[[:space:]]*\{" 3 'unsafe { $$$BODY }')"
+else
+  print_finding "good" "No unsafe blocks detected"
+fi
 
 print_subheader "transmute, uninitialized, zeroed, forget"
-transmute_count=$(( $(ast_search 'std::mem::transmute($$)' || echo 0) + $("${GREP_RN[@]}" -e "transmute\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-uninit_count=$(( $(ast_search 'std::mem::uninitialized::<$T>()' || echo 0) + $("${GREP_RN[@]}" -e "uninitialized::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-zeroed_count=$(( $(ast_search 'std::mem::zeroed::<$T>()' || echo 0) + $("${GREP_RN[@]}" -e "zeroed::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-forget_count=$(( $(ast_search 'std::mem::forget($$)' || echo 0) + $("${GREP_RN[@]}" -e "mem::forget\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$transmute_count" -gt 0 ]; then print_finding "critical" "$transmute_count" "mem::transmute usage"; show_detailed_finding "transmute\(" 3; add_finding "critical" "$transmute_count" "mem::transmute usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "transmute\(" 3)"; fi
-if [ "$uninit_count" -gt 0 ]; then print_finding "critical" "$uninit_count" "mem::uninitialized usage"; show_detailed_finding "uninitialized::<" 3; add_finding "critical" "$uninit_count" "mem::uninitialized usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "uninitialized::<" 3)"; fi
-if [ "$zeroed_count" -gt 0 ]; then print_finding "critical" "$zeroed_count" "mem::zeroed usage"; show_detailed_finding "zeroed::<" 3; add_finding "critical" "$zeroed_count" "mem::zeroed usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "zeroed::<" 3)"; fi
-if [ "$forget_count" -gt 0 ]; then print_finding "warning" "$forget_count" "mem::forget leaks memory"; show_detailed_finding "mem::forget\(" 3; add_finding "warning" "$forget_count" "mem::forget leaks memory" "" "${CATEGORY_NAME[2]}" "$(collect_samples_rg "mem::forget\(" 3)"; fi
+# shellcheck disable=SC2016
+transmute_count=$(count_ast_or_rg 'transmute\(' 'std::mem::transmute($X)' 'mem::transmute($X)' 'transmute($X)')
+# shellcheck disable=SC2016
+uninit_count=$(count_ast_or_rg 'uninitialized::<' 'std::mem::uninitialized::<$T>()' 'mem::uninitialized::<$T>()')
+# shellcheck disable=SC2016
+zeroed_count=$(count_ast_or_rg 'zeroed::<' 'std::mem::zeroed::<$T>()' 'mem::zeroed::<$T>()')
+# shellcheck disable=SC2016
+forget_count=$(count_ast_or_rg 'mem::forget\(' 'std::mem::forget($X)' 'mem::forget($X)')
+if [ "$transmute_count" -gt 0 ]; then
+  print_finding "critical" "$transmute_count" "mem::transmute usage"
+  # shellcheck disable=SC2016
+  show_ast_pattern_examples 3 'std::mem::transmute($X)' 'mem::transmute($X)' 'transmute($X)' || show_detailed_finding "transmute\(" 3
+  # shellcheck disable=SC2016
+  add_finding "critical" "$transmute_count" "mem::transmute usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_ast_or_rg "transmute\(" 3 'std::mem::transmute($X)' 'mem::transmute($X)' 'transmute($X)')"
+fi
+if [ "$uninit_count" -gt 0 ]; then
+  print_finding "critical" "$uninit_count" "mem::uninitialized usage"
+  # shellcheck disable=SC2016
+  show_ast_pattern_examples 3 'std::mem::uninitialized::<$T>()' 'mem::uninitialized::<$T>()' || show_detailed_finding "uninitialized::<" 3
+  # shellcheck disable=SC2016
+  add_finding "critical" "$uninit_count" "mem::uninitialized usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_ast_or_rg "uninitialized::<" 3 'std::mem::uninitialized::<$T>()' 'mem::uninitialized::<$T>()')"
+fi
+if [ "$zeroed_count" -gt 0 ]; then
+  print_finding "critical" "$zeroed_count" "mem::zeroed usage"
+  # shellcheck disable=SC2016
+  show_ast_pattern_examples 3 'std::mem::zeroed::<$T>()' 'mem::zeroed::<$T>()' || show_detailed_finding "zeroed::<" 3
+  # shellcheck disable=SC2016
+  add_finding "critical" "$zeroed_count" "mem::zeroed usage" "" "${CATEGORY_NAME[2]}" "$(collect_samples_ast_or_rg "zeroed::<" 3 'std::mem::zeroed::<$T>()' 'mem::zeroed::<$T>()')"
+fi
+if [ "$forget_count" -gt 0 ]; then
+  print_finding "warning" "$forget_count" "mem::forget leaks memory"
+  # shellcheck disable=SC2016
+  show_ast_pattern_examples 3 'std::mem::forget($X)' 'mem::forget($X)' || show_detailed_finding "mem::forget\(" 3
+  # shellcheck disable=SC2016
+  add_finding "warning" "$forget_count" "mem::forget leaks memory" "" "${CATEGORY_NAME[2]}" "$(collect_samples_ast_or_rg "mem::forget\(" 3 'std::mem::forget($X)' 'mem::forget($X)')"
+fi
 
 print_subheader "CStr::from_bytes_with_nul_unchecked"
 cstr_count=$(( $(ast_search 'std::ffi::CStr::from_bytes_with_nul_unchecked($$)' || echo 0) + $("${GREP_RN[@]}" -e "from_bytes_with_nul_unchecked\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
@@ -2551,10 +2709,14 @@ else
 fi
 
 print_subheader "unreachable_unchecked / unwrap_unchecked"
-uu=$(( $(ast_search 'std::hint::unreachable_unchecked()' || echo 0) + $(ast_search 'core::hint::unreachable_unchecked()' || echo 0) + $(ast_search '$X.unwrap_unchecked()' || echo 0) + $("${GREP_RN[@]}" -e "unreachable_unchecked\(\)|unwrap_unchecked\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+# shellcheck disable=SC2016
+uu=$(count_ast_or_rg 'unreachable_unchecked\(\)|unwrap_unchecked\(' 'std::hint::unreachable_unchecked()' 'core::hint::unreachable_unchecked()' '$X.unwrap_unchecked()')
 if [ "$uu" -gt 0 ]; then
   print_finding "critical" "$uu" "Unchecked UB-adjacent APIs used" "unreachable_unchecked is UB if reached; unwrap_unchecked requires strict invariants"
-  add_finding "critical" "$uu" "Unchecked UB-adjacent APIs used" "unreachable_unchecked is UB if reached; unwrap_unchecked requires strict invariants" "${CATEGORY_NAME[21]}" "$(collect_samples_rg "unreachable_unchecked\(\)|unwrap_unchecked\(" 3)"
+  # shellcheck disable=SC2016
+  show_ast_pattern_examples 3 'std::hint::unreachable_unchecked()' 'core::hint::unreachable_unchecked()' '$X.unwrap_unchecked()' || true
+  # shellcheck disable=SC2016
+  add_finding "critical" "$uu" "Unchecked UB-adjacent APIs used" "unreachable_unchecked is UB if reached; unwrap_unchecked requires strict invariants" "${CATEGORY_NAME[21]}" "$(collect_samples_ast_or_rg "unreachable_unchecked\(\)|unwrap_unchecked\(" 3 'std::hint::unreachable_unchecked()' 'core::hint::unreachable_unchecked()' '$X.unwrap_unchecked()')"
 fi
 
 print_subheader "panic!/unwrap/expect inside Drop"

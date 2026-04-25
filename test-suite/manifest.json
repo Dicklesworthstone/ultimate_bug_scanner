@@ -1174,6 +1174,63 @@
       }
     },
     {
+      "id": "rust-unsafe-memory-buggy",
+      "description": "Rust unsafe memory APIs should be caught as code, not just text inventory.",
+      "path": "test-suite/rust/buggy/unsafe_memory.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "unsafe",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=2,21",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 3
+          }
+        },
+        "require_substrings": [
+          "mem::transmute usage",
+          "mem::zeroed usage",
+          "Unchecked UB-adjacent APIs used"
+        ]
+      }
+    },
+    {
+      "id": "rust-unsafe-memory-mentions-clean",
+      "description": "Rust unsafe API names in docs, strings, and safe method names should not become critical memory-safety findings.",
+      "path": "test-suite/rust/clean/unsafe_mentions.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "unsafe",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=2,21"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "rust-security-shell-command-buggy",
       "description": "Rust security fixture with shell -c command execution and a hardcoded Stripe-style secret literal.",
       "path": "test-suite/rust/buggy/security_injection.rs",

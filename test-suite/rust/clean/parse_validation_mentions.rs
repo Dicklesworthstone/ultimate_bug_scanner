@@ -6,6 +6,10 @@ fn documentation_mentions_only() -> &'static str {
     std::env::var("APP_MODE").expect("configured")
     payload.len() as u8
     values.iter().count() as u16
+    panic!("docs only")
+    todo!()
+    dbg!(value)
+    println!("debug docs")
     "#
 }
 
@@ -28,6 +32,7 @@ fn bounded_packet_len(packet: &[u8]) -> u8 {
 fn notes() {
     // env::var("SECRET").unwrap() should stay documentation, not executable code.
     // payload.len() as u8 should stay documentation, not a truncation warning.
+    // panic!(), todo!(), dbg!(), and println!() should stay documentation too.
     let _ = documentation_mentions_only();
     let _ = bounded_packet_len(b"ok");
 }

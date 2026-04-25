@@ -2763,38 +2763,76 @@ print_category "Detects: unwrap/expect, panic/unreachable/todo/unimplemented, db
   "Panic-prone and debug macros frequently leak into production and cause crashes"
 
 print_subheader "unwrap()/expect() usage"
-u_count_ast=$(ast_search '$X.unwrap()' || echo 0)
-e_count_ast=$(ast_search '$X.expect($MSG)' || echo 0)
-u_count_rg=$("${GREP_RN[@]}" -e "\.unwrap\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-e_count_rg=$("${GREP_RN[@]}" -e "\.expect\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-u_total=$(( u_count_ast>0?u_count_ast:u_count_rg ))
-e_total=$(( e_count_ast>0?e_count_ast:e_count_rg ))
+# shellcheck disable=SC2016
+unwrap_patterns=('$X.unwrap()')
+# shellcheck disable=SC2016
+expect_patterns=('$X.expect($MSG)')
+u_total=$(count_ast_or_rg "\.unwrap\(" "${unwrap_patterns[@]}")
+e_total=$(count_ast_or_rg "\.expect\(" "${expect_patterns[@]}")
 ue_total=$((u_total + e_total))
 if [ "$ue_total" -gt 0 ]; then
   print_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer \`?\` or match to propagate/handle errors"
-  show_detailed_finding "\.(unwrap|expect)\(" 5
-  add_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer \`?\` or match to propagate/handle errors" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "\.(unwrap|expect)\(" 5)"
+  show_ast_pattern_examples 5 "${unwrap_patterns[@]}" "${expect_patterns[@]}" || show_detailed_finding "\.(unwrap|expect)\(" 5
+  add_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer \`?\` or match to propagate/handle errors" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "\.(unwrap|expect)\(" 5 "${unwrap_patterns[@]}" "${expect_patterns[@]}")"
 else
   print_finding "good" "No unwrap/expect detected"
 fi
 
 print_subheader "panic!/unreachable!/todo!/unimplemented!"
-p_count=$(( $(ast_search 'panic!($$)' || echo 0) + $("${GREP_RN[@]}" -e "panic!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-u_count=$(( $(ast_search 'unreachable!($$)' || echo 0) + $("${GREP_RN[@]}" -e "unreachable!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-t_count=$(( $(ast_search 'todo!($$)' || echo 0) + $("${GREP_RN[@]}" -e "todo!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-ui_count=$(( $(ast_search 'unimplemented!($$)' || echo 0) + $("${GREP_RN[@]}" -e "unimplemented!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$p_count" -gt 0 ]; then print_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code"; show_detailed_finding "panic!\(" 5; add_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "panic!\(" 5)"; else print_finding "good" "No panic! macros"; fi
-if [ "$u_count" -gt 0 ]; then print_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic"; add_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "unreachable!\(" 3)"; fi
-if [ "$t_count" -gt 0 ]; then print_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)"; add_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "todo!\(" 3)"; fi
-if [ "$ui_count" -gt 0 ]; then print_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove"; add_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "unimplemented!\(" 3)"; fi
+# shellcheck disable=SC2016
+panic_patterns=('panic!($$$ARGS)')
+# shellcheck disable=SC2016
+unreachable_patterns=('unreachable!($$$ARGS)')
+# shellcheck disable=SC2016
+todo_patterns=('todo!($$$ARGS)')
+# shellcheck disable=SC2016
+unimplemented_patterns=('unimplemented!($$$ARGS)')
+p_count=$(count_ast_or_rg "panic!\(" "${panic_patterns[@]}")
+u_count=$(count_ast_or_rg "unreachable!\(" "${unreachable_patterns[@]}")
+t_count=$(count_ast_or_rg "todo!\(" "${todo_patterns[@]}")
+ui_count=$(count_ast_or_rg "unimplemented!\(" "${unimplemented_patterns[@]}")
+if [ "$p_count" -gt 0 ]; then
+  print_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code"
+  show_ast_pattern_examples 5 "${panic_patterns[@]}" || show_detailed_finding "panic!\(" 5
+  add_finding "critical" "$p_count" "panic! macro(s) present" "Avoid panic! in library code" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "panic!\(" 5 "${panic_patterns[@]}")"
+else
+  print_finding "good" "No panic! macros"
+fi
+if [ "$u_count" -gt 0 ]; then
+  print_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic"
+  add_finding "warning" "$u_count" "unreachable! may panic if reached" "Double-check logic" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "unreachable!\(" 3 "${unreachable_patterns[@]}")"
+fi
+if [ "$t_count" -gt 0 ]; then
+  print_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)"
+  add_finding "warning" "$t_count" "todo! placeholders present" "Implement or gate with cfg(test)" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "todo!\(" 3 "${todo_patterns[@]}")"
+fi
+if [ "$ui_count" -gt 0 ]; then
+  print_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove"
+  add_finding "warning" "$ui_count" "unimplemented! placeholders present" "Implement or remove" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "unimplemented!\(" 3 "${unimplemented_patterns[@]}")"
+fi
 
 print_subheader "dbg!/println!/eprintln!"
-dbg_count=$(( $(ast_search 'dbg!($$)' || echo 0) + $("${GREP_RN[@]}" -e "dbg!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-pln_count=$(( $(ast_search 'println!($$)' || echo 0) + $("${GREP_RN[@]}" -e "println!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-epln_count=$(( $(ast_search 'eprintln!($$)' || echo 0) + $("${GREP_RN[@]}" -e "eprintln!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-if [ "$dbg_count" -gt 0 ]; then print_finding "info" "$dbg_count" "dbg! macros present"; add_finding "info" "$dbg_count" "dbg! macros present" "" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "dbg!\(" 3)"; fi
-if [ "$pln_count" -gt 0 ]; then print_finding "info" "$pln_count" "println! found - prefer logging"; add_finding "info" "$pln_count" "println! found - prefer logging" "" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "println!\(" 3)"; fi
-if [ "$epln_count" -gt 0 ]; then print_finding "info" "$epln_count" "eprintln! found - prefer logging"; add_finding "info" "$epln_count" "eprintln! found - prefer logging" "" "${CATEGORY_NAME[1]}" "$(collect_samples_rg "eprintln!\(" 3)"; fi
+# shellcheck disable=SC2016
+dbg_patterns=('dbg!($$$ARGS)')
+# shellcheck disable=SC2016
+println_patterns=('println!($$$ARGS)')
+# shellcheck disable=SC2016
+eprintln_patterns=('eprintln!($$$ARGS)')
+dbg_count=$(count_ast_or_rg "dbg!\(" "${dbg_patterns[@]}")
+pln_count=$(count_ast_or_rg "println!\(" "${println_patterns[@]}")
+epln_count=$(count_ast_or_rg "eprintln!\(" "${eprintln_patterns[@]}")
+if [ "$dbg_count" -gt 0 ]; then
+  print_finding "info" "$dbg_count" "dbg! macros present"
+  add_finding "info" "$dbg_count" "dbg! macros present" "" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "dbg!\(" 3 "${dbg_patterns[@]}")"
+fi
+if [ "$pln_count" -gt 0 ]; then
+  print_finding "info" "$pln_count" "println! found - prefer logging"
+  add_finding "info" "$pln_count" "println! found - prefer logging" "" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "println!\(" 3 "${println_patterns[@]}")"
+fi
+if [ "$epln_count" -gt 0 ]; then
+  print_finding "info" "$epln_count" "eprintln! found - prefer logging"
+  add_finding "info" "$epln_count" "eprintln! found - prefer logging" "" "${CATEGORY_NAME[1]}" "$(collect_samples_ast_or_rg "eprintln!\(" 3 "${eprintln_patterns[@]}")"
+fi
 
 print_subheader "Guard clauses that still unwrap later"
 run_rust_type_narrowing_checks

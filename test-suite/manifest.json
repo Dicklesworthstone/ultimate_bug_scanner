@@ -1342,6 +1342,36 @@
       }
     },
     {
+      "id": "rust-macro-mentions-clean",
+      "description": "Rust panic/debug macro names in comments and strings should not become category 1 findings.",
+      "path": "test-suite/rust/clean/parse_validation_mentions.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "macros",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=1"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          },
+          "info": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "rust-perf-hotspots-buggy",
       "description": "Rust hot-loop Regex::new, chars().nth, and string allocations should be reported as executable code.",
       "path": "test-suite/rust/buggy/perf_hotspots.rs",

@@ -1158,6 +1158,202 @@ collect_samples_async_context() {
   printf ']'
 }
 
+rust_loop_context_matches() {
+  local mode="$1"
+  [[ "$have_python3" -eq 1 ]] || return 1
+  python3 - "$PROJECT_DIR" "$mode" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+mode = sys.argv[2]
+
+patterns = {
+    "regex_new": re.compile(r"\b(?:regex::)?Regex::new\s*\("),
+    "string_alloc": re.compile(r"\bformat!\s*\(|\.to_string\s*\(|\.to_owned\s*\(|\bString::from\s*\("),
+}
+
+pattern = patterns[mode]
+
+
+def rust_files(path: Path):
+    if path.is_file():
+        if path.suffix == ".rs":
+            yield path
+        return
+    skip_dirs = {".git", "target", ".cargo", "node_modules"}
+    for child in path.rglob("*.rs"):
+        if skip_dirs.intersection(child.parts):
+            continue
+        yield child
+
+
+def mask_range(chars, start, end):
+    for pos in range(start, min(end, len(chars))):
+        if chars[pos] != "\n":
+            chars[pos] = " "
+
+
+def mask_comments_and_strings(text: str) -> str:
+    chars = list(text)
+    i = 0
+    n = len(chars)
+    state = "code"
+    while i < n:
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                start = i
+                i += 2
+                while i < n and chars[i] != "\n":
+                    i += 1
+                mask_range(chars, start, i)
+                continue
+            if ch == "/" and nxt == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "block"
+                continue
+            if ch == "r":
+                j = i + 1
+                while j < n and chars[j] == "#":
+                    j += 1
+                if j < n and chars[j] == '"':
+                    hashes = j - i - 1
+                    close = '"' + ("#" * hashes)
+                    end = text.find(close, j + 1)
+                    if end == -1:
+                        end = n - 1
+                    else:
+                        end += len(close)
+                    mask_range(chars, i, end)
+                    i = end
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "string"
+                continue
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        elif state == "string":
+            if ch == "\\":
+                chars[i] = " "
+                if i + 1 < n and chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                    i += 2
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def find_matching_brace(text: str, open_index: int) -> int:
+    depth = 0
+    for idx in range(open_index, len(text)):
+        ch = text[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+loop_start = re.compile(r"\b(?:for\b[^{;]*|while\b[^{;]*|loop\s*)\{", re.MULTILINE)
+seen = set()
+
+for path in rust_files(root):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    masked = mask_comments_and_strings(text)
+    lines = text.splitlines()
+    for loop_match in loop_start.finditer(masked):
+        open_brace = masked.rfind("{", loop_match.start(), loop_match.end())
+        if open_brace < 0:
+            continue
+        close_brace = find_matching_brace(masked, open_brace)
+        if close_brace < 0:
+            continue
+        body = masked[open_brace:close_brace + 1]
+        for hit in pattern.finditer(body):
+            offset = open_brace + hit.start()
+            line = line_number(masked, offset)
+            key = (str(path), line, mode, hit.group(0))
+            if key in seen:
+                continue
+            seen.add(key)
+            code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+            if "ubs:ignore" in code:
+                continue
+            print(f"{path}:{line}:{code}")
+PY
+}
+
+count_loop_context_matches() {
+  local mode="$1"
+  if [[ "$have_python3" -eq 1 ]]; then
+    rust_loop_context_matches "$mode" | count_lines || true
+  else
+    return 1
+  fi
+}
+
+show_loop_context_examples() {
+  local mode="$1"
+  local limit="${2:-$DETAIL_LIMIT}"
+  local printed=0
+  [[ "$have_python3" -eq 1 ]] || return 1
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(rust_loop_context_matches "$mode" | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_loop_context() {
+  local mode="$1"
+  local limit="${2:-$DETAIL_LIMIT}"
+  if [[ "$have_python3" -ne 1 ]]; then
+    printf '[]'
+    return
+  fi
+  mapfile -t lines < <(rust_loop_context_matches "$mode" | head -n "$limit")
+  printf '['
+  local i=0
+  local line
+  for line in "${lines[@]}"; do
+    [[ $i -gt 0 ]] && printf ','
+    printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+    i=$((i + 1))
+  done
+  printf ']'
+}
+
 begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; set +e; trap - ERR; }
 end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
 
@@ -3036,31 +3232,47 @@ print_category "Detects: regex compilation in loops, chars().nth(n), format!/all
   "Some perf pitfalls become DoS risks on large inputs or hot paths; these often evade linting in non-bench builds"
 
 print_subheader "Regex::new occurrences and in-loop compilation"
-regex_new=$("${GREP_RN[@]}" -e "regex::Regex::new\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-regex_new=$(printf '%s\n' "${regex_new:-0}" | awk 'END{print $0+0}')
-regex_in_loop=$(( $(ast_search 'for $P in $I { $$ regex::Regex::new($re) $$ }' || echo 0) + $(ast_search 'while $C { $$ regex::Regex::new($re) $$ }' || echo 0) ))
+# shellcheck disable=SC2016
+regex_new_patterns=('regex::Regex::new($RE)' 'Regex::new($RE)')
+regex_new=$(count_ast_or_rg "(regex::)?Regex::new\(" "${regex_new_patterns[@]}")
+if [[ "$have_python3" -eq 1 ]]; then
+  regex_in_loop=$(count_loop_context_matches "regex_new")
+else
+  regex_in_loop=$("${GREP_RN[@]}" -e "(for|while|loop)[^{]*\{[^}]*((regex::)?Regex::new)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fi
 if [ "$regex_in_loop" -gt 0 ]; then
   print_finding "warning" "$regex_in_loop" "Regex::new compiled inside loop" "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation"
-  add_finding "warning" "$regex_in_loop" "Regex::new compiled inside loop" "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation" "${CATEGORY_NAME[24]}"
+  show_loop_context_examples "regex_new" 3 || show_detailed_finding "(for|while|loop)[^{]*\{[^}]*((regex::)?Regex::new)\(" 3
+  add_finding "warning" "$regex_in_loop" "Regex::new compiled inside loop" "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation" "${CATEGORY_NAME[24]}" "$(collect_samples_loop_context "regex_new" 3)"
 elif [ "$regex_new" -gt 0 ]; then
   print_finding "info" "$regex_new" "Regex::new present" "Ensure regex is not compiled per request or per iteration"
-  add_finding "info" "$regex_new" "Regex::new present" "Ensure regex is not compiled per request or per iteration" "${CATEGORY_NAME[24]}" "$(collect_samples_rg "regex::Regex::new\(" 3)"
+  show_ast_pattern_examples 3 "${regex_new_patterns[@]}" || show_detailed_finding "(regex::)?Regex::new\(" 3
+  add_finding "info" "$regex_new" "Regex::new present" "Ensure regex is not compiled per request or per iteration" "${CATEGORY_NAME[24]}" "$(collect_samples_ast_or_rg "(regex::)?Regex::new\(" 3 "${regex_new_patterns[@]}")"
 else
   print_finding "good" "No regex::Regex::new detected"
 fi
 
-print_subheader "chars().nth(n) (O(n))"
-chars_nth=$(( $(ast_search '$S.chars().nth($N)' || echo 0) + $("${GREP_RN[@]}" -e "\.chars\(\)\\.nth\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+print_subheader "chars().nth(n)/nth_back(n) (O(n))"
+# shellcheck disable=SC2016
+chars_nth_patterns=('$S.chars().nth($N)' '$S.chars().nth_back($N)')
+chars_nth=$(count_ast_or_rg "\.chars\(\)\.nth(_back)?\(" "${chars_nth_patterns[@]}")
 if [ "$chars_nth" -gt 0 ]; then
-  print_finding "info" "$chars_nth" "chars().nth(n) used" "O(n) indexing; prefer byte indexing where valid or iterators with caching"
-  add_finding "info" "$chars_nth" "chars().nth(n) used" "O(n) indexing; prefer byte indexing where valid or iterators with caching" "${CATEGORY_NAME[24]}" "$(collect_samples_rg "\.chars\(\)\\.nth\(" 3)"
+  print_finding "info" "$chars_nth" "chars().nth(n)/nth_back(n) used" "O(n) indexing; prefer byte indexing where valid or iterators with caching"
+  show_ast_pattern_examples 3 "${chars_nth_patterns[@]}" || show_detailed_finding "\.chars\(\)\.nth(_back)?\(" 3
+  add_finding "info" "$chars_nth" "chars().nth(n)/nth_back(n) used" "O(n) indexing; prefer byte indexing where valid or iterators with caching" "${CATEGORY_NAME[24]}" "$(collect_samples_ast_or_rg "\.chars\(\)\.nth(_back)?\(" 3 "${chars_nth_patterns[@]}")"
 fi
 
 print_subheader "format!/to_string/allocations inside loops (heuristic)"
-fmt_in_loop=$(( $(ast_search 'for $P in $I { $$ format!($$) $$ }' || echo 0) + $("${GREP_RN[@]}" -e "for[^{]*\{[^}]*format!\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+alloc_loop_rg="(for|while|loop)[^{]*\{[^}]*(format!|\.to_string\(\)|\.to_owned\(\)|String::from\()"
+if [[ "$have_python3" -eq 1 ]]; then
+  fmt_in_loop=$(count_loop_context_matches "string_alloc")
+else
+  fmt_in_loop=$("${GREP_RN[@]}" -e "$alloc_loop_rg" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fi
 if [ "$fmt_in_loop" -gt 0 ]; then
-  print_finding "warning" "$fmt_in_loop" "format! inside loop" "Consider preallocating buffers, using write!, or restructuring to reduce allocations"
-  add_finding "warning" "$fmt_in_loop" "format! inside loop" "Consider preallocating buffers, using write!, or restructuring to reduce allocations" "${CATEGORY_NAME[24]}" "$(collect_samples_rg "for[^{]*\{[^}]*format!\(" 3)"
+  print_finding "warning" "$fmt_in_loop" "String allocation inside loop" "Consider preallocating buffers, using write!, or restructuring to reduce allocations"
+  show_loop_context_examples "string_alloc" 3 || show_detailed_finding "$alloc_loop_rg" 3
+  add_finding "warning" "$fmt_in_loop" "String allocation inside loop" "Consider preallocating buffers, using write!, or restructuring to reduce allocations" "${CATEGORY_NAME[24]}" "$(collect_samples_loop_context "string_alloc" 3)"
 fi
 fi
 

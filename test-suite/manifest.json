@@ -1341,6 +1341,66 @@
       }
     },
     {
+      "id": "rust-perf-hotspots-buggy",
+      "description": "Rust hot-loop Regex::new, chars().nth, and string allocations should be reported as executable code.",
+      "path": "test-suite/rust/buggy/perf_hotspots.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "perf",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=24",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 2
+          },
+          "info": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Regex::new compiled inside loop",
+          "chars().nth(n)/nth_back(n) used",
+          "String allocation inside loop"
+        ]
+      }
+    },
+    {
+      "id": "rust-perf-hotspots-mentions-clean",
+      "description": "Rust perf hotspot names in comments and strings should not become category 24 findings.",
+      "path": "test-suite/rust/clean/perf_hotspot_mentions.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "perf",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=24"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "max": 0
+          },
+          "info": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "rust-security-shell-command-buggy",
       "description": "Rust security fixture with shell -c command execution and a hardcoded Stripe-style secret literal.",
       "path": "test-suite/rust/buggy/security_injection.rs",

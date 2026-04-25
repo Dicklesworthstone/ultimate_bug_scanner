@@ -1866,7 +1866,7 @@ else
 fi
 
 print_subheader "ProcessBuilder shell interpreter"
-pb_shell_pattern='new[[:space:]]+ProcessBuilder[[:space:]]*\([[:space:]]*"(sh|bash)"[[:space:]]*,[[:space:]]*"-?c"|new[[:space:]]+ProcessBuilder[[:space:]]*\([[:space:]]*"cmd([.]exe)?"[[:space:]]*,[[:space:]]*"/[cC]"|new[[:space:]]+ProcessBuilder[[:space:]]*\([[:space:]]*"(powershell|pwsh)([.]exe)?"[[:space:]]*,[[:space:]]*"-(Command|EncodedCommand)"'
+pb_shell_pattern='(new[[:space:]]+)?ProcessBuilder[[:space:]]*\([[:space:]]*"(sh|bash)"[[:space:]]*,[[:space:]]*"-?c"|(new[[:space:]]+)?ProcessBuilder[[:space:]]*\([[:space:]]*"cmd([.]exe)?"[[:space:]]*,[[:space:]]*"/[cC]"|(new[[:space:]]+)?ProcessBuilder[[:space:]]*\([[:space:]]*"(powershell|pwsh)([.]exe)?"[[:space:]]*,[[:space:]]*"-(Command|EncodedCommand)"|ProcessBuilder[[:space:]]*\([[:space:]]*(listOf|arrayOf)[[:space:]]*\([[:space:]]*"(sh|bash)"[[:space:]]*,[[:space:]]*"-?c"|ProcessBuilder[[:space:]]*\([[:space:]]*(listOf|arrayOf)[[:space:]]*\([[:space:]]*"cmd([.]exe)?"[[:space:]]*,[[:space:]]*"/[cC]"|ProcessBuilder[[:space:]]*\([[:space:]]*(listOf|arrayOf)[[:space:]]*\([[:space:]]*"(powershell|pwsh)([.]exe)?"[[:space:]]*,[[:space:]]*"-(Command|EncodedCommand)"'
 pb_shell=$("${GREP_RN[@]}" -e "$pb_shell_pattern" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$pb_shell" -gt 0 ]; then
   print_finding "critical" "$pb_shell" "ProcessBuilder shell interpreter invoked" "Pass arguments directly as argv, or strictly validate and escape every shell fragment"

@@ -1353,6 +1353,54 @@
       }
     },
     {
+      "id": "kotlin-security-command-buggy",
+      "description": "Kotlin ProcessBuilder shell interpreters should be caught by the Java-family scanner.",
+      "path": "test-suite/kotlin/security_buggy",
+      "language": "java",
+      "tags": [
+        "kotlin",
+        "security",
+        "buggy"
+      ],
+      "args": [
+        "--only=java",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "ProcessBuilder shell interpreter invoked"
+        ]
+      }
+    },
+    {
+      "id": "kotlin-security-command-clean",
+      "description": "Kotlin ProcessBuilder with a fixed executable and argv should remain non-critical.",
+      "path": "test-suite/kotlin/security_clean",
+      "language": "java",
+      "tags": [
+        "kotlin",
+        "security",
+        "clean"
+      ],
+      "args": [
+        "--only=java"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "kotlin-type-narrowing-buggy",
       "description": "Kotlin null guards that do not exit before using the guarded value with '!!'.",
       "path": "test-suite/kotlin/type_narrowing/buggy",

@@ -1399,6 +1399,202 @@ collect_samples_loop_context() {
   printf ']'
 }
 
+rust_drop_panic_matches() {
+  [[ "$have_python3" -eq 1 ]] || return 1
+  python3 - "$PROJECT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+
+def rust_files(path: Path):
+    if path.is_file():
+        if path.suffix == ".rs":
+            yield path
+        return
+    skip_dirs = {".git", "target", ".cargo", "node_modules"}
+    for child in path.rglob("*.rs"):
+        if skip_dirs.intersection(child.parts):
+            continue
+        yield child
+
+
+def mask_range(chars, start, end):
+    for pos in range(start, min(end, len(chars))):
+        if chars[pos] != "\n":
+            chars[pos] = " "
+
+
+def mask_comments_and_strings(text: str) -> str:
+    chars = list(text)
+    i = 0
+    n = len(chars)
+    state = "code"
+    while i < n:
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                start = i
+                i += 2
+                while i < n and chars[i] != "\n":
+                    i += 1
+                mask_range(chars, start, i)
+                continue
+            if ch == "/" and nxt == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "block"
+                continue
+            if ch == "r":
+                j = i + 1
+                while j < n and chars[j] == "#":
+                    j += 1
+                if j < n and chars[j] == '"':
+                    hashes = j - i - 1
+                    close = '"' + ("#" * hashes)
+                    end = text.find(close, j + 1)
+                    if end == -1:
+                        end = n - 1
+                    else:
+                        end += len(close)
+                    mask_range(chars, i, end)
+                    i = end
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "string"
+                continue
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        elif state == "string":
+            if ch == "\\":
+                chars[i] = " "
+                if i + 1 < n and chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                    i += 2
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def find_matching_brace(text: str, open_index: int) -> int:
+    depth = 0
+    for idx in range(open_index, len(text)):
+        ch = text[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+impl_drop = re.compile(r"\bimpl\b[^{};]*\bDrop\b[^{};]*\bfor\b[^{;]*\{", re.MULTILINE)
+drop_fn = re.compile(r"\bfn\s+drop\s*\(\s*&mut\s+self\s*\)\s*(?:->[^{]+)?\{", re.MULTILINE)
+panic_surface = re.compile(
+    r"\b(?:panic|unreachable|todo|unimplemented|assert|assert_eq|assert_ne)!\s*\(|\.(?:unwrap|expect)\s*\("
+)
+seen = set()
+
+for path in rust_files(root):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    masked = mask_comments_and_strings(text)
+    lines = text.splitlines()
+    for impl_match in impl_drop.finditer(masked):
+        impl_open = masked.rfind("{", impl_match.start(), impl_match.end())
+        if impl_open < 0:
+            continue
+        impl_close = find_matching_brace(masked, impl_open)
+        if impl_close < 0:
+            continue
+        impl_body = masked[impl_open:impl_close + 1]
+        for fn_match in drop_fn.finditer(impl_body):
+            fn_open = impl_open + impl_body.find("{", fn_match.start(), fn_match.end())
+            if fn_open < impl_open:
+                continue
+            fn_close = find_matching_brace(masked, fn_open)
+            if fn_close < 0 or fn_close > impl_close:
+                continue
+            drop_body = masked[fn_open:fn_close + 1]
+            for hit in panic_surface.finditer(drop_body):
+                offset = fn_open + hit.start()
+                line = line_number(masked, offset)
+                key = (str(path), line, hit.group(0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+                if "ubs:ignore" in code:
+                    continue
+                print(f"{path}:{line}:{code}")
+PY
+}
+
+count_drop_panic_matches() {
+  if [[ "$have_python3" -eq 1 ]]; then
+    rust_drop_panic_matches | count_lines || true
+  else
+    return 1
+  fi
+}
+
+show_drop_panic_examples() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  local printed=0
+  [[ "$have_python3" -eq 1 ]] || return 1
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(rust_drop_panic_matches | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_drop_panic() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  if [[ "$have_python3" -ne 1 ]]; then
+    printf '[]'
+    return
+  fi
+  mapfile -t lines < <(rust_drop_panic_matches | head -n "$limit")
+  printf '['
+  local i=0
+  local line
+  for line in "${lines[@]}"; do
+    [[ $i -gt 0 ]] && printf ','
+    printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+    i=$((i + 1))
+  done
+  printf ']'
+}
+
 rust_format_literal_matches() {
   [[ "$have_python3" -eq 1 ]] || return 1
   python3 - "$PROJECT_DIR" <<'PY'
@@ -3515,12 +3711,12 @@ if [ "$uu" -gt 0 ]; then
 fi
 
 print_subheader "panic!/unwrap/expect inside Drop"
-drop_panic=$(( $(ast_search 'panic!($$)' || echo 0) + $("${GREP_RN[@]}" -e "impl\s+Drop\s+for|fn\s+drop\(&mut\s+self\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
-drop_panic_hits=$("${GREP_RN[@]}" -e "fn\s+drop\(&mut\s+self\)|impl\s+Drop\s+for" "$PROJECT_DIR" 2>/dev/null | (grep -A25 -E "panic!\(|\.(unwrap|expect)\(" || true) | (grep -Ec "panic!\(|\.(unwrap|expect)\(" || true))
+drop_panic_hits=$(count_drop_panic_matches || echo 0)
 drop_panic_hits=$(printf '%s\n' "${drop_panic_hits:-0}" | awk 'END{print $0+0}')
 if [ "$drop_panic_hits" -gt 0 ]; then
   print_finding "warning" "$drop_panic_hits" "Potential panics inside Drop implementations" "Panics during Drop + unwinding can abort; avoid unwrap/expect/panic in destructors"
-  add_finding "warning" "$drop_panic_hits" "Potential panics inside Drop implementations" "Panics during Drop + unwinding can abort; avoid unwrap/expect/panic in destructors" "${CATEGORY_NAME[21]}"
+  show_drop_panic_examples 3 || true
+  add_finding "warning" "$drop_panic_hits" "Potential panics inside Drop implementations" "Panics during Drop + unwinding can abort; avoid unwrap/expect/panic in destructors" "${CATEGORY_NAME[21]}" "$(collect_samples_drop_panic 3)"
 fi
 fi
 

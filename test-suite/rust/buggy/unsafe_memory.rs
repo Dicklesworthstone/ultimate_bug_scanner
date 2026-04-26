@@ -52,3 +52,14 @@ fn raw_parts(ptr: *const u8, len: usize) -> &'static [u8] {
 fn raw_parts_mut(ptr: *mut u8, len: usize) -> &'static mut [u8] {
     unsafe { slice::from_raw_parts_mut(ptr, len) }
 }
+
+struct PanicsDuringDrop {
+    detail: Option<String>,
+}
+
+impl Drop for PanicsDuringDrop {
+    fn drop(&mut self) {
+        let detail = self.detail.as_ref().expect("drop detail should exist");
+        panic!("failed while dropping {detail}");
+    }
+}

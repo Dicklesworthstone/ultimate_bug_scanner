@@ -1207,7 +1207,8 @@
           "Unchecked indexing APIs in use",
           "UTF-8 unchecked conversion APIs",
           "slice::from_raw_parts(_mut) usage",
-          "Unsafe Send/Sync implementations"
+          "Unsafe Send/Sync implementations",
+          "Potential panics inside Drop implementations"
         ]
       }
     },

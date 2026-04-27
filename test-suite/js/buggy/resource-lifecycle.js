@@ -13,4 +13,14 @@ notifier.start();
 
 const observer = new MutationObserver(() => {});
 observer.observe(document.body, { childList: true });
-// missing removeEventListener, clearInterval, disconnect
+
+function exportReport(blob) {
+  const href = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = href;
+  link.download = 'report.csv';
+  link.click();
+}
+
+exportReport(new Blob(['id,total\n1,42\n'], { type: 'text/csv' }));
+// missing removeEventListener, clearInterval, disconnect, and revokeObjectURL

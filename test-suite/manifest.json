@@ -868,7 +868,7 @@
     },
     {
       "id": "js-resource-lifecycle",
-      "description": "JS resource cleanup regression (listeners/timers).",
+      "description": "JS resource cleanup regression (listeners/timers/object URLs).",
       "path": "test-suite/js/buggy/resource-lifecycle.js",
       "language": "js",
       "tags": [
@@ -888,8 +888,89 @@
           }
         },
         "require_substrings": [
-          "resource-lifecycle.js"
+          "resource-lifecycle.js",
+          "Object URLs created without URL.revokeObjectURL"
         ]
+      }
+    },
+    {
+      "id": "js-resource-lifecycle-clean",
+      "description": "JS resource cleanup clean baseline with revoked object URLs.",
+      "path": "test-suite/js/clean/resource-lifecycle.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "resource",
+        "clean"
+      ],
+      "env": {
+        "UBS_TEST_FORCE_NO_AST_GREP": "1"
+      },
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
+      "id": "js-typescript-object-url-lifecycle-buggy",
+      "description": "TypeScript object URL creation should require URL.revokeObjectURL cleanup.",
+      "path": "test-suite/js/resource_lifecycle/object-url-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "resource",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Object URLs created without URL.revokeObjectURL"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-object-url-lifecycle-clean",
+      "description": "TypeScript object URL cleanup baseline with explicit revokeObjectURL disposal.",
+      "path": "test-suite/js/resource_lifecycle/object-url-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "resource",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "max": 0
+          }
+        }
       }
     },
     {

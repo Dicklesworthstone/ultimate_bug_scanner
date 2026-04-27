@@ -3481,6 +3481,15 @@ if [ "$timeout_count" -gt $((clear_timeout + 20)) ]; then
   print_finding "info" "$diff" "Many setTimeout without clear" "Clear pending timeouts on unmount"
 fi
 
+print_subheader "Object URLs without revokeObjectURL"
+object_url_count=$("${GREP_RN[@]}" -e "URL\.createObjectURL[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+revoke_url_count=$("${GREP_RN[@]}" -e "URL\.revokeObjectURL[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$object_url_count" -gt "$revoke_url_count" ]; then
+  diff=$((object_url_count - revoke_url_count))
+  print_finding "warning" "$diff" "Object URLs created without URL.revokeObjectURL" "Revoke Blob/Object URLs after downloads, previews, or media loads finish"
+  show_detailed_finding "URL\.createObjectURL[[:space:]]*\(" 3
+fi
+
 print_subheader "Large inline arrays/objects (memory waste)"
 count=$("${GREP_RN[@]}" -e "\[.*,.*,.*,.*,.*,.*,.*,.*,.*,.*,.*,.*,.*,.*,.*,.*," "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 3 ]; then

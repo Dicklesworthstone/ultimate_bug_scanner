@@ -620,6 +620,62 @@
       }
     },
     {
+      "id": "js-typescript-window-open-noopener-buggy",
+      "description": "TypeScript window.open(_blank) should require noopener/noreferrer.",
+      "path": "test-suite/js/security/window-open-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "window.open(_blank) without noopener/noreferrer"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-window-open-noopener-clean",
+      "description": "TypeScript window.open(_blank) with noopener/noreferrer should stay clean.",
+      "path": "test-suite/js/security/window-open-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "golang-buggy",
       "description": "Go buggy fixtures exercising goroutine/context/network pitfalls.",
       "path": "test-suite/golang/buggy",

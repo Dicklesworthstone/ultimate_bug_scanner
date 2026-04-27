@@ -3163,6 +3163,14 @@ if [ "$count" -gt 0 ]; then
   show_detailed_finding "$proto_pattern" 3
 fi
 
+print_subheader "window.open(_blank) without noopener"
+count=$("${GREP_RN[@]}" -e "window\.open[[:space:]]*\([^,]+,[[:space:]]*['\"]_blank['\"]" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -Ev "noopener|noreferrer|ubs:ignore" || true) | count_lines)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "window.open(_blank) without noopener/noreferrer" "Pass 'noopener,noreferrer' to prevent reverse-tabnabbing via window.opener"
+  show_detailed_finding "window\.open[[:space:]]*\([^,]+,[[:space:]]*['\"]_blank['\"]" 3
+fi
+
 print_subheader "Hardcoded secrets/credentials"
 count=$("${GREP_RNI[@]}" -e "\b(password|api_?key|secret|token)\b[[:space:]]*[:=][[:space:]]*['\"]([^'\"]+)['\"]" "$PROJECT_DIR" 2>/dev/null |   (grep -v "process\.env" || true) | count_lines)
 if [ "$count" -gt 0 ]; then

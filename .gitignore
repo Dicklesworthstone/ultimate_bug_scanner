@@ -27,6 +27,18 @@ temp/
 # Beads ephemeral files
 .beads/last-touched
 .beads/.bv.lock
+.beads/.local_version
+.beads/daemon.lock
+.beads/daemon.log
+.beads/daemon-*.log
+.beads/daemon-*.log.gz
+.beads/*.db
+.beads/*.db-*
+.beads/*.sqlite
+.beads/*.sqlite-*
+.beads/*.sqlite3
+.beads/*.sqlite3-*
+.beads/*.migrated
 
 # Python environments
 .venv/
@@ -63,6 +75,17 @@ storage.sqlite3-*
 # Prompt dump files (agent-generated diagnostic exports)
 prompt_dump*.md
 modules/prompt_dump*.md
+
+# Agent-generated planning/reasoning scratch artifacts
+modes-of-reasoning-*.md
+reasoning-mode-*.md
+*_modes_of_reasoning*.md
+MOR_*.md
+artifact-*.json
+artifacts/*.json
+
+# Tool caches
+.ruff_cache/
 
 # macOS resource fork files
 ._*

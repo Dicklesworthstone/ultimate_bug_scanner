@@ -2,7 +2,7 @@
 # 🔬 Ultimate Bug Scanner v5.0
 
 <div align="center">
-  <img src="ubs_illustration.webp" alt="Ultimate Bug Scanner - The AI Coding Agent's Secret Weapon">
+  <img src="docs/assets/ubs_illustration.webp" alt="Ultimate Bug Scanner - The AI Coding Agent's Secret Weapon">
 </div>
 
 ### **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**

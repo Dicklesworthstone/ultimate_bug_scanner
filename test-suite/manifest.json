@@ -484,6 +484,64 @@
       }
     },
     {
+      "id": "js-typescript-promise-all-map-return-buggy",
+      "description": "TypeScript Promise.all over a block-bodied map callback should require the callback to return the promise.",
+      "path": "test-suite/js/async_errors/promise-all-map-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "async",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Promise.all map callback does not return a promise"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-promise-all-map-return-clean",
+      "description": "TypeScript Promise.all over a block-bodied map callback with an explicit return should avoid the focused callback-return warning.",
+      "path": "test-suite/js/async_errors/promise-all-map-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "async",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--skip=1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Promise.all map callback does not return a promise"
+        ]
+      }
+    },
+    {
       "id": "js-react-hooks-buggy",
       "description": "React hooks dependency regression (missing deps, unstable dependencies).",
       "path": "test-suite/js/buggy/react_hooks.js",

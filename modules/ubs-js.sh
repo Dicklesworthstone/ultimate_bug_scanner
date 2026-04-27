@@ -3218,6 +3218,103 @@ if [ "$async_foreach_count" -gt 0 ]; then
   done <<<"$async_foreach_samples"
 fi
 
+print_subheader "Promise.all map callbacks without return"
+promise_all_map_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
+
+map_block_re = re.compile(
+    r'\.\s*map\s*\(\s*(?!async\b)(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{',
+    re.DOTALL,
+)
+return_re = re.compile(r'\breturn\b')
+
+def matching_brace(text: str, open_index: int) -> int:
+    depth = 0
+    for idx in range(open_index, len(text)):
+        char = text[idx]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+issues = []
+if root.is_file():
+    candidates = [root]
+    sample_root = root.parent
+else:
+    candidates = []
+    sample_root = root
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            candidates.append(Path(dirpath) / fname)
+
+for path in candidates:
+    if path.suffix.lower() not in exts:
+        continue
+    try:
+        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+    except Exception:
+        continue
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if 'Promise.all' not in line or not stripped or stripped.startswith(("//", "/*", "*")):
+            continue
+        expression_lines = []
+        paren_balance = 0
+        for expr_idx in range(idx, min(len(lines), idx + 35)):
+            current = lines[expr_idx].strip()
+            expression_lines.append(current)
+            paren_balance += current.count('(') - current.count(')')
+            if expr_idx > idx and paren_balance <= 0:
+                break
+        expression = '\n'.join(expression_lines)
+        if 'ubs:ignore' in expression:
+            continue
+        for match in map_block_re.finditer(expression):
+            open_brace = match.end() - 1
+            close_brace = matching_brace(expression, open_brace)
+            if close_brace < 0:
+                continue
+            callback_body = expression[open_brace + 1:close_brace]
+            if return_re.search(callback_body):
+                continue
+            sample_line = idx + expression[:match.start()].count('\n') + 1
+            try:
+                rel = path.relative_to(sample_root)
+            except ValueError:
+                rel = path
+            sample_text = lines[sample_line - 1].strip().replace('\t', ' ')
+            issues.append((str(rel), sample_line, sample_text))
+
+print(len(issues))
+for entry in issues[:25]:
+    print('\t'.join(str(part) for part in entry))
+PY
+)
+promise_all_map_count=$(printf '%s\n' "$promise_all_map_report" | head -n1 | awk 'END{print $0+0}')
+promise_all_map_samples=$(printf '%s\n' "$promise_all_map_report" | tail -n +2)
+if [ "$promise_all_map_count" -gt 0 ]; then
+  print_finding "warning" "$promise_all_map_count" "Promise.all map callback does not return a promise" "Return the promise from the map callback or use an expression-bodied callback"
+  sample_limit=3
+  while IFS=$'\t' read -r sample_path sample_line sample_text; do
+    [ -z "$sample_path" ] && continue
+    print_code_sample "$sample_path" "$sample_line" "$sample_text"
+    sample_limit=$((sample_limit - 1))
+    [ "$sample_limit" -le 0 ] && break
+  done <<<"$promise_all_map_samples"
+fi
+
 run_async_error_checks
 run_hooks_dependency_checks
 run_type_narrowing_checks

@@ -456,6 +456,62 @@
       }
     },
     {
+      "id": "js-typescript-async-event-listener-buggy",
+      "description": "TypeScript event listeners should not receive async callbacks directly because addEventListener ignores the returned Promise.",
+      "path": "test-suite/js/async_errors/async-event-listener-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "async",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "async event listener callback is not awaited"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-async-event-listener-clean",
+      "description": "TypeScript event listeners that explicitly handle async errors should stay clean.",
+      "path": "test-suite/js/async_errors/async-event-listener-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "async",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "js-typescript-async-foreach-clean",
       "description": "TypeScript async iteration using for...of should stay clean.",
       "path": "test-suite/js/async_errors/async-foreach-clean.ts",

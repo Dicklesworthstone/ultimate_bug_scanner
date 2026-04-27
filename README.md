@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.1.20-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.1.21-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1294,7 +1294,7 @@ UBS detects unhandled async errors consistently across all 9 languages. The patt
 
 | Language | Pattern | What UBS Detects |
 |----------|---------|------------------|
-| **JavaScript/TypeScript** | `promise.then()` without `.catch()`, `forEach(async ...)`, async array predicates, async timer callbacks, `Promise.all(map(...))` without callback return | Dangling promises, missing `await`, unawaitable async callbacks, unhandled rejections |
+| **JavaScript/TypeScript** | `promise.then()` without `.catch()`, `forEach(async ...)`, async array predicates, async timer/event callbacks, `Promise.all(map(...))` without callback return | Dangling promises, missing `await`, unawaitable async callbacks, unhandled rejections |
 | **Python** | `asyncio.create_task()` without `await` | Orphaned tasks, missing `await`, unclosed coroutines |
 | **Go** | Goroutine without error channel | Fire-and-forget goroutines, leaked contexts |
 | **Rust** | `.unwrap()` / `.expect()` after partial guard | Panic after `if let Some`, missing `?` operator |

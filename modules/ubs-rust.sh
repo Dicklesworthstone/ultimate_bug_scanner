@@ -1768,6 +1768,186 @@ collect_samples_path_traversal() {
   printf ']'
 }
 
+rust_command_executable_matches() {
+  [[ "$have_python3" -eq 1 ]] || return 1
+  python3 - "$PROJECT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+skip_dirs = {".git", "target", ".cargo", "node_modules"}
+identifier = r"[A-Za-z_][A-Za-z0-9_]*"
+call = re.compile(
+    rf"\b(?:std::process::)?Command\s*::\s*new\s*\(\s*&?\s*"
+    rf"(?P<expr>{identifier}(?:\s*\.\s*{identifier})*)"
+)
+untrusted = re.compile(
+    r"(?:^|_)(?:user|input|cmd|command|program|exe|binary|tool|shell|path|request|req|param|name|key)(?:$|_)"
+)
+adapter_methods = {"as_str", "as_ref", "to_string", "into_string"}
+
+
+def rust_files(path: Path):
+    if path.is_file():
+        if path.suffix == ".rs":
+            yield path
+        return
+    for child in path.rglob("*.rs"):
+        if skip_dirs.intersection(child.parts):
+            continue
+        yield child
+
+
+def mask_range(chars, start, end):
+    for pos in range(start, min(end, len(chars))):
+        if chars[pos] != "\n":
+            chars[pos] = " "
+
+
+def mask_comments_and_strings(text: str) -> str:
+    chars = list(text)
+    i = 0
+    n = len(chars)
+    state = "code"
+    while i < n:
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                start = i
+                i += 2
+                while i < n and chars[i] != "\n":
+                    i += 1
+                mask_range(chars, start, i)
+                continue
+            if ch == "/" and nxt == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "block"
+                continue
+            if ch == "r":
+                j = i + 1
+                while j < n and chars[j] == "#":
+                    j += 1
+                if j < n and chars[j] == '"':
+                    hashes = j - i - 1
+                    close = '"' + ("#" * hashes)
+                    end = text.find(close, j + 1)
+                    if end == -1:
+                        end = n - 1
+                    else:
+                        end += len(close)
+                    mask_range(chars, i, end)
+                    i = end
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "string"
+                continue
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        elif state == "string":
+            if ch == "\\":
+                chars[i] = " "
+                if i + 1 < n and chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                    i += 2
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+def suspicious_expr(expr: str) -> bool:
+    parts = [part.strip().lower() for part in expr.split(".") if part.strip()]
+    while parts and parts[-1] in adapter_methods:
+        parts.pop()
+    return any(untrusted.search(part) for part in parts)
+
+
+seen = set()
+for path in rust_files(root):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    masked = mask_comments_and_strings(text)
+    lines = text.splitlines()
+    for hit in call.finditer(masked):
+        expr = hit.group("expr")
+        if not suspicious_expr(expr):
+            continue
+        line = line_number(masked, hit.start())
+        code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+        if "ubs:ignore" in code:
+            continue
+        key = (str(path), line, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        print(f"{path}:{line}:{code}")
+PY
+}
+
+count_command_executable_matches() {
+  if [[ "$have_python3" -eq 1 ]]; then
+    rust_command_executable_matches | count_lines || true
+  else
+    return 1
+  fi
+}
+
+show_command_executable_examples() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  local printed=0
+  [[ "$have_python3" -eq 1 ]] || return 1
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(rust_command_executable_matches | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_command_executable() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  if [[ "$have_python3" -ne 1 ]]; then
+    printf '[]'
+    return
+  fi
+  mapfile -t lines < <(rust_command_executable_matches | head -n "$limit")
+  printf '['
+  local i=0
+  local line
+  for line in "${lines[@]}"; do
+    [[ $i -gt 0 ]] && printf ','
+    printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+    i=$((i + 1))
+  done
+  printf ']'
+}
+
 rust_format_literal_matches() {
   [[ "$have_python3" -eq 1 ]] || return 1
   python3 - "$PROJECT_DIR" <<'PY'
@@ -3606,6 +3786,15 @@ if [ "$shell_command" -gt 0 ]; then
   add_finding "critical" "$shell_command" "Shell command execution via -c/-lc" "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "(std::process::)?Command::new\([^)]*\)[^;]*\.(arg|args)\([^;]*(\"(-c|-lc|/C|/c)\")" 5)"
 else
   print_finding "good" "No shell -c/-lc Command usage detected"
+fi
+
+print_subheader "Command::new executable from untrusted-looking value"
+command_executable_hits=$(count_command_executable_matches || echo 0)
+command_executable_hits=$(printf '%s\n' "${command_executable_hits:-0}" | awk 'END{print $0+0}')
+if [ "$command_executable_hits" -gt 0 ]; then
+  print_finding "critical" "$command_executable_hits" "Command executable from untrusted-looking value" "Use a fixed executable allowlist; pass user data only as argv after validation"
+  show_command_executable_examples 3 || true
+  add_finding "critical" "$command_executable_hits" "Command executable from untrusted-looking value" "Use a fixed executable allowlist; pass user data only as argv after validation" "${CATEGORY_NAME[8]}" "$(collect_samples_command_executable 3)"
 fi
 
 print_subheader "Path join/push with untrusted-looking segment"

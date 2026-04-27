@@ -1558,7 +1558,7 @@
     },
     {
       "id": "rust-security-shell-command-buggy",
-      "description": "Rust security fixture with shell -c command execution and a hardcoded Stripe-style secret literal.",
+      "description": "Rust security fixture with shell -c command execution, untrusted path joins, and a hardcoded Stripe-style secret literal.",
       "path": "test-suite/rust/buggy/security_injection.rs",
       "language": "rust",
       "tags": [
@@ -1577,10 +1577,14 @@
         "totals": {
           "critical": {
             "min": 2
+          },
+          "warning": {
+            "min": 1
           }
         },
         "require_substrings": [
           "Shell command execution via -c/-lc",
+          "Path join/push with untrusted-looking segment",
           "Possible hardcoded secrets"
         ]
       }

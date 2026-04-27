@@ -1595,6 +1595,179 @@ collect_samples_drop_panic() {
   printf ']'
 }
 
+rust_path_traversal_matches() {
+  [[ "$have_python3" -eq 1 ]] || return 1
+  python3 - "$PROJECT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+skip_dirs = {".git", "target", ".cargo", "node_modules"}
+pathish = re.compile(r"(?:^|_|\.)((?:path|dir|root|base|folder|upload|download|dest|target|tmp|temp|cache|out)s?)(?:$|_|\.)")
+untrusted = re.compile(r"(?:^|_)(?:user|input|upload|file|filename|path|rel|relative|request|req|param|name|key|entry|member|archive)(?:$|_)")
+call = re.compile(
+    r"\b(?P<recv>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+    r"\s*\.\s*(?P<method>join|push)\s*\(\s*&?\s*(?P<arg>[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def rust_files(path: Path):
+    if path.is_file():
+        if path.suffix == ".rs":
+            yield path
+        return
+    for child in path.rglob("*.rs"):
+        if skip_dirs.intersection(child.parts):
+            continue
+        yield child
+
+
+def mask_range(chars, start, end):
+    for pos in range(start, min(end, len(chars))):
+        if chars[pos] != "\n":
+            chars[pos] = " "
+
+
+def mask_comments_and_strings(text: str) -> str:
+    chars = list(text)
+    i = 0
+    n = len(chars)
+    state = "code"
+    while i < n:
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                start = i
+                i += 2
+                while i < n and chars[i] != "\n":
+                    i += 1
+                mask_range(chars, start, i)
+                continue
+            if ch == "/" and nxt == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "block"
+                continue
+            if ch == "r":
+                j = i + 1
+                while j < n and chars[j] == "#":
+                    j += 1
+                if j < n and chars[j] == '"':
+                    hashes = j - i - 1
+                    close = '"' + ("#" * hashes)
+                    end = text.find(close, j + 1)
+                    if end == -1:
+                        end = n - 1
+                    else:
+                        end += len(close)
+                    mask_range(chars, i, end)
+                    i = end
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "string"
+                continue
+        elif state == "block":
+            if ch == "*" and nxt == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 2
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        elif state == "string":
+            if ch == "\\":
+                chars[i] = " "
+                if i + 1 < n and chars[i + 1] != "\n":
+                    chars[i + 1] = " "
+                    i += 2
+                    continue
+            if ch == '"':
+                chars[i] = " "
+                i += 1
+                state = "code"
+                continue
+            if ch != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def line_number(text: str, offset: int) -> int:
+    return text.count("\n", 0, offset) + 1
+
+
+seen = set()
+for path in rust_files(root):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    masked = mask_comments_and_strings(text)
+    lines = text.splitlines()
+    for hit in call.finditer(masked):
+        recv = hit.group("recv").lower()
+        arg = hit.group("arg").lower()
+        if not pathish.search(recv):
+            continue
+        if not untrusted.search(arg):
+            continue
+        line = line_number(masked, hit.start())
+        code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
+        if "ubs:ignore" in code:
+            continue
+        key = (str(path), line, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        print(f"{path}:{line}:{code}")
+PY
+}
+
+count_path_traversal_matches() {
+  if [[ "$have_python3" -eq 1 ]]; then
+    rust_path_traversal_matches | count_lines || true
+  else
+    return 1
+  fi
+}
+
+show_path_traversal_examples() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  local printed=0
+  [[ "$have_python3" -eq 1 ]] || return 1
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(rust_path_traversal_matches | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_path_traversal() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  if [[ "$have_python3" -ne 1 ]]; then
+    printf '[]'
+    return
+  fi
+  mapfile -t lines < <(rust_path_traversal_matches | head -n "$limit")
+  printf '['
+  local i=0
+  local line
+  for line in "${lines[@]}"; do
+    [[ $i -gt 0 ]] && printf ','
+    printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+    i=$((i + 1))
+  done
+  printf ']'
+}
+
 rust_format_literal_matches() {
   [[ "$have_python3" -eq 1 ]] || return 1
   python3 - "$PROJECT_DIR" <<'PY'
@@ -3412,6 +3585,15 @@ if [ "$shell_command" -gt 0 ]; then
   add_finding "critical" "$shell_command" "Shell command execution via -c/-lc" "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input" "${CATEGORY_NAME[8]}" "$(collect_samples_rg "(std::process::)?Command::new\([^)]*\)[^;]*\.(arg|args)\([^;]*(\"(-c|-lc|/C|/c)\")" 5)"
 else
   print_finding "good" "No shell -c/-lc Command usage detected"
+fi
+
+print_subheader "Path join/push with untrusted-looking segment"
+path_traversal_hits=$(count_path_traversal_matches || echo 0)
+path_traversal_hits=$(printf '%s\n' "${path_traversal_hits:-0}" | awk 'END{print $0+0}')
+if [ "$path_traversal_hits" -gt 0 ]; then
+  print_finding "warning" "$path_traversal_hits" "Path join/push with untrusted-looking segment" "Reject absolute paths and '..' components; canonicalize and verify the result stays under the intended root"
+  show_path_traversal_examples 3 || true
+  add_finding "warning" "$path_traversal_hits" "Path join/push with untrusted-looking segment" "Reject absolute paths and '..' components; canonicalize and verify the result stays under the intended root" "${CATEGORY_NAME[8]}" "$(collect_samples_path_traversal 3)"
 fi
 
 print_subheader "Plain http:// URLs"

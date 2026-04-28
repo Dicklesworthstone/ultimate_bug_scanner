@@ -708,6 +708,62 @@
       }
     },
     {
+      "id": "js-typescript-async-sort-comparator-buggy",
+      "description": "TypeScript sort/toSorted comparators should not be async because sort expects a synchronous numeric comparator.",
+      "path": "test-suite/js/async_errors/async-sort-comparator-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "async",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "async sort comparator returns a Promise"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-async-sort-comparator-clean",
+      "description": "TypeScript code that precomputes async sort keys and uses a synchronous comparator should stay clean.",
+      "path": "test-suite/js/async_errors/async-sort-comparator-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "async",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
+    },
+    {
       "id": "js-typescript-async-promise-executor-buggy",
       "description": "TypeScript Promise constructors should not receive async executors because thrown errors are not captured by the constructed Promise.",
       "path": "test-suite/js/async_errors/async-promise-executor-buggy.ts",

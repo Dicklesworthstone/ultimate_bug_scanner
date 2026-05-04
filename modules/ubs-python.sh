@@ -10377,6 +10377,17 @@ class HardcodedSecretAnalyzer(ast.NodeVisitor):
             return looks_like_secret_literal(literal)
         return self.env_fallback(node)
 
+    def check_argument_defaults(self, node):
+        positional_args = list(getattr(node.args, 'posonlyargs', [])) + list(node.args.args)
+        positional_defaults = list(node.args.defaults)
+        if positional_defaults:
+            for arg, default in zip(positional_args[-len(positional_defaults):], positional_defaults):
+                if is_sensitive_name(arg.arg) and self.value_is_hardcoded_secret(default):
+                    self.remember_issue(default)
+        for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            if default is not None and is_sensitive_name(arg.arg) and self.value_is_hardcoded_secret(default):
+                self.remember_issue(default)
+
     def visit_Assign(self, node):
         sensitive_target = any(is_sensitive_name(name) for target in node.targets for name in target_names(target))
         if sensitive_target and self.value_is_hardcoded_secret(node.value):
@@ -10406,6 +10417,18 @@ class HardcodedSecretAnalyzer(ast.NodeVisitor):
             key_name = literal_string(node.args[0]) or ''
             if is_sensitive_name(key_name) and self.value_is_hardcoded_secret(node.args[1]):
                 self.remember_issue(node)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self.check_argument_defaults(node)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node):
+        self.check_argument_defaults(node)
+        self.generic_visit(node)
+
+    def visit_Lambda(self, node):
+        self.check_argument_defaults(node)
         self.generic_visit(node)
 
 def analyze(path, issues):

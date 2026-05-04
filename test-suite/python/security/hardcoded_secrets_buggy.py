@@ -24,6 +24,13 @@ def jwt_secret() -> str:
     return os.getenv("JWT_SECRET", "fallback_jwt_secret_123456")
 
 
+def issue_token(access_token: str = "default_access_token_1234567890") -> str:
+    return access_token
+
+
+make_client = lambda client_secret="lambda_client_secret_1234567890": client_secret
+
+
 class ProviderConfig:
     clientSecret = "provider_client_secret_123456"
 

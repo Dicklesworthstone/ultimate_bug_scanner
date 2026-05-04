@@ -31,6 +31,14 @@ def jwt_secret() -> str:
     return required_env("JWT_SECRET")
 
 
+def issue_token(access_token: str = required_env("ACCESS_TOKEN")) -> str:
+    return access_token
+
+
+def build_callback(retry_count: int = 3) -> int:
+    return retry_count
+
+
 class ProviderConfig:
     clientSecret = required_env("PROVIDER_CLIENT_SECRET")
 

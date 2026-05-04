@@ -3659,6 +3659,69 @@
       }
     },
     {
+      "id": "js-typescript-constant-time-compare-buggy",
+      "description": "TypeScript code should not compare HMACs, signatures, API keys, CSRF tokens, or reset tokens with ==/!=.",
+      "path": "test-suite/js/security/constant-time-compare-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "crypto",
+        "timing",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-constant-time-compare-clean",
+      "description": "TypeScript code using crypto.timingSafeEqual or reviewed constant-time helpers should stay clean.",
+      "path": "test-suite/js/security/constant-time-compare-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "crypto",
+        "timing",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "js-typescript-hardcoded-secrets-buggy",
       "description": "TypeScript auth and integration config should not keep literal secrets or literal process.env fallbacks.",
       "path": "test-suite/js/security/hardcoded-secrets-buggy.ts",

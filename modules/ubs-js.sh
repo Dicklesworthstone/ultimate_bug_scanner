@@ -6590,6 +6590,228 @@ if [ "$cookie_security_count" -gt 0 ]; then
   done <<<"$cookie_security_samples"
 fi
 
+print_subheader "Secret/token comparisons without timing-safe equality"
+constant_time_compare_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
+
+compare_re = re.compile(r'(?<![=!<>])(?P<left>.+?)\s*(?P<op>===|!==|==|!=)\s*(?P<right>.+)')
+assignment_re = re.compile(r'\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?P<expr>.+)')
+loose_assignment_re = re.compile(r'\b(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?!=)(?P<expr>.+)')
+identifier_re = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
+safe_compare_re = re.compile(
+    r'\b(?:crypto\.)?(?:timingSafeEqual|safeEqual|safeCompare|constantTimeEqual|compareDigest|verifyWebhookSignature)\s*\('
+    r'|\b(?:subtle|crypto\.subtle)\s*\.\s*verify\s*\(',
+    re.IGNORECASE,
+)
+sensitive_re = re.compile(
+    r'(?:'
+    r'\b(?:token|secret|signature|sig|hmac|digest|csrf|xsrf|nonce|otp|mfa|reset|'
+    r'password|passwd|pwd|auth|bearer|credential|session|jwt|webhook|invite|'
+    r'verification|recovery)\b|'
+    r'\bapi\s+key\b|'
+    r'\bauthorization\b|'
+    r'\bx-signature\b'
+    r')',
+    re.IGNORECASE,
+)
+nullish_re = re.compile(r'^(?:null|undefined|true|false|0|1|NaN|Number\.NaN|""|\'\'|``)$')
+length_re = re.compile(r'\b(?:length|byteLength|size)\b')
+pure_string_literal_re = re.compile(r'^\s*(?:"[^"]*"|\'[^\']*\'|`[^`]*`)\s*$')
+keywords = {
+    'if', 'return', 'const', 'let', 'var', 'true', 'false', 'null', 'undefined',
+    'await', 'async', 'function', 'typeof', 'instanceof', 'new', 'this',
+}
+
+def split_identifier_terms(text):
+    text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', text)
+    text = re.sub(r'[_\-.]+', ' ', text)
+    return text
+
+def strip_line_comments(line: str) -> str:
+    out = []
+    quote = ''
+    escape = False
+    idx = 0
+    while idx < len(line):
+        ch = line[idx]
+        if quote:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            idx += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            out.append(ch)
+            idx += 1
+            continue
+        if ch == '/' and idx + 1 < len(line) and line[idx + 1] == '/':
+            break
+        out.append(ch)
+        idx += 1
+    return ''.join(out)
+
+def code_line(source_line):
+    stripped = source_line.strip()
+    if not stripped or stripped.startswith(("//", "/*", "*")):
+        return ""
+    return re.sub(r'/\*.*?\*/', '', strip_line_comments(source_line))
+
+def statement_from(lines, idx, max_lines=8):
+    parts = []
+    paren_balance = 0
+    brace_balance = 0
+    saw_code = False
+    for line_idx in range(idx, min(len(lines), idx + max_lines)):
+        current = code_line(lines[line_idx]).strip()
+        if not current:
+            if parts:
+                break
+            continue
+        parts.append(current)
+        saw_code = True
+        paren_balance += current.count('(') - current.count(')')
+        brace_balance += current.count('{') - current.count('}')
+        if line_idx > idx and paren_balance <= 0 and brace_balance <= 0:
+            break
+        if (';' in current or current.endswith('{')) and paren_balance <= 0 and brace_balance <= 0:
+            break
+    return ' '.join(parts) if saw_code else ""
+
+def operand_identifiers(operand):
+    return {
+        token
+        for token in identifier_re.findall(operand)
+        if token not in keywords
+    }
+
+def is_sensitive_text(text):
+    return bool(sensitive_re.search(split_identifier_terms(text)))
+
+def is_sensitive_operand_text(text):
+    if pure_string_literal_re.match(text.strip()):
+        return False
+    return is_sensitive_text(text)
+
+def collect_sensitive_vars(lines):
+    sensitive_vars = set()
+    for idx, raw in enumerate(lines):
+        stripped = code_line(raw).strip()
+        if not stripped or 'ubs:ignore' in stripped or '=>' in stripped:
+            continue
+        statement = statement_from(lines, idx, max_lines=5)
+        if not statement or safe_compare_re.search(statement):
+            continue
+        match = assignment_re.search(statement) or loose_assignment_re.search(statement)
+        if not match:
+            continue
+        name = match.group('name')
+        expr = match.group('expr')
+        if is_sensitive_text(name) or is_sensitive_operand_text(expr):
+            sensitive_vars.add(name)
+    return sensitive_vars
+
+def operand_is_sensitive(operand, sensitive_vars):
+    if is_sensitive_operand_text(operand):
+        return True
+    return bool(operand_identifiers(operand) & sensitive_vars)
+
+def clean_operand_text(operand):
+    clean = operand.strip()
+    clean = re.sub(r'^(?:if|while)\s*\(\s*', '', clean)
+    clean = re.split(r'\s*(?:&&|\|\||[;{])', clean, maxsplit=1)[0].strip()
+    while clean and clean[-1] in ';{}){':
+        clean = clean[:-1].strip()
+    return clean
+
+def operand_is_nullish_or_shape_check(operand):
+    clean = clean_operand_text(operand)
+    if nullish_re.match(clean):
+        return True
+    if length_re.search(clean):
+        return True
+    if re.match(r'^[0-9]+(?:\.[0-9]+)?$', clean):
+        return True
+    return False
+
+def unsafe_secret_compare(statement, sensitive_vars):
+    if safe_compare_re.search(statement) or 'ubs:ignore' in statement:
+        return False
+    match = compare_re.search(statement)
+    if not match:
+        return False
+    left = clean_operand_text(match.group('left'))
+    right = clean_operand_text(match.group('right'))
+    if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
+        return False
+    return operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars)
+
+issues = []
+if root.is_file():
+    candidates = [root]
+    sample_root = root.parent
+else:
+    candidates = []
+    sample_root = root
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            candidates.append(Path(dirpath) / fname)
+
+for path in candidates:
+    if path.suffix.lower() not in exts:
+        continue
+    try:
+        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+    except Exception:
+        continue
+    sensitive_vars = collect_sensitive_vars(lines)
+    seen_lines = set()
+    for idx, raw in enumerate(lines):
+        stripped = code_line(raw).strip()
+        if not stripped or 'ubs:ignore' in stripped or ('==' not in stripped and '!=' not in stripped):
+            continue
+        statement = statement_from(lines, idx)
+        if not statement or not unsafe_secret_compare(statement, sensitive_vars):
+            continue
+        if idx in seen_lines:
+            continue
+        seen_lines.add(idx)
+        try:
+            rel = path.relative_to(sample_root)
+        except ValueError:
+            rel = path
+        issues.append((str(rel), idx + 1, stripped.replace('\t', ' ')))
+
+print(len(issues))
+for entry in issues[:25]:
+    print('\t'.join(str(part) for part in entry))
+PY
+)
+constant_time_compare_count=$(printf '%s\n' "$constant_time_compare_report" | head -n1 | awk 'END{print $0+0}')
+constant_time_compare_samples=$(printf '%s\n' "$constant_time_compare_report" | tail -n +2)
+if [ "$constant_time_compare_count" -gt 0 ]; then
+  print_finding "critical" "$constant_time_compare_count" "Secret, signature, or token compared with ==/!=" "Use crypto.timingSafeEqual(), WebCrypto verify(), or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, and reset secrets"
+  sample_limit=3
+  while IFS=$'\t' read -r sample_path sample_line sample_text; do
+    [ -z "$sample_path" ] && continue
+    print_code_sample "$sample_path" "$sample_line" "$sample_text"
+    sample_limit=$((sample_limit - 1))
+    [ "$sample_limit" -le 0 ] && break
+  done <<<"$constant_time_compare_samples"
+fi
+
 print_subheader "Security tokens generated with Math.random"
 random_security_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
 import os

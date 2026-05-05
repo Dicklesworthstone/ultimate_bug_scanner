@@ -5097,7 +5097,7 @@
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 7
+            "min": 8
           }
         },
         "require_substrings": [
@@ -6701,6 +6701,67 @@
         },
         "require_substrings": [
           "Security token generated with non-cryptographic randomness"
+        ]
+      }
+    },
+    {
+      "id": "rust-constant-time-compare-buggy",
+      "description": "Rust bearer tokens, webhook signatures, CSRF values, reset secrets, and API keys should not be compared with == or !=.",
+      "path": "test-suite/rust/buggy/constant_time_compare.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "constant-time",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 7
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "rust-constant-time-compare-clean",
+      "description": "Rust code using subtle::ConstantTimeEq or reviewed constant-time helpers for secret comparisons should stay clean.",
+      "path": "test-suite/rust/clean/constant_time_compare.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "constant-time",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
         ]
       }
     },

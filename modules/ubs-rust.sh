@@ -3699,6 +3699,310 @@ collect_samples_security_randomness() {
   printf ']'
 }
 
+rust_constant_time_compare_matches() {
+  [[ "$have_python3" -eq 1 ]] || return 1
+  python3 - "$PROJECT_DIR" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+skip_dirs = {".git", "target", ".cargo", "node_modules"}
+
+compare_re = re.compile(r"(?<![=!<>])(?P<left>.+?)\s*(?P<op>==|!=)\s*(?!=)\s*(?P<right>.+)")
+assign_re = re.compile(
+    r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?"
+    r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)"
+)
+identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+safe_compare_re = re.compile(
+    r"\b(?:subtle::)?ConstantTimeEq\b"
+    r"|\.(?:ct_eq|constant_time_eq|timing_safe_eq|timing_safe_compare|safe_eq|safe_compare|secure_compare)\s*\("
+    r"|\b(?:constant_time_eq|constant_time_compare|timing_safe_eq|timing_safe_compare|"
+    r"safe_eq|safe_compare|secure_compare|crypto_memcmp)\s*\("
+    r"|\bring::constant_time::verify_slices_are_equal\s*\(",
+    re.IGNORECASE,
+)
+sensitive_re = re.compile(
+    r"(?:"
+    r"\b(?:token|secret|signature|sig|hmac|mac|digest|csrf|xsrf|nonce|otp|totp|mfa|reset|"
+    r"password|passwd|pwd|auth|bearer|credential|session|jwt|webhook|invite|"
+    r"verification|recovery)\b|"
+    r"\bapi\s+key\b|"
+    r"\bauthorization\b|"
+    r"\bx-signature\b"
+    r")",
+    re.IGNORECASE,
+)
+nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
+shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")
+pure_string_literal_re = re.compile(r'^\s*(?:"(?:\\.|[^"\\])*"|r#*"[^"]*"#*|b"(?:\\.|[^"\\])*")\s*$')
+keywords = {
+    "if", "while", "match", "return", "let", "mut", "const", "static", "true",
+    "false", "None", "Some", "Ok", "Err", "self", "Self", "crate", "super",
+}
+
+
+def rust_files(path: Path):
+    if path.is_file():
+        if path.suffix == ".rs":
+            yield path
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for name in filenames:
+            candidate = Path(dirpath) / name
+            if candidate.suffix == ".rs":
+                yield candidate
+
+
+def strip_line_comments(line: str) -> str:
+    out = []
+    quote = ""
+    raw_hashes = None
+    escape = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        nxt = line[i + 1] if i + 1 < len(line) else ""
+        if raw_hashes is not None:
+            out.append(ch)
+            if ch == '"' and line.startswith("#" * raw_hashes, i + 1):
+                out.extend("#" * raw_hashes)
+                i += raw_hashes + 1
+                raw_hashes = None
+                continue
+            i += 1
+            continue
+        if quote:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "r":
+            j = i + 1
+            while j < len(line) and line[j] == "#":
+                j += 1
+            if j < len(line) and line[j] == '"':
+                raw_hashes = j - i - 1
+                out.extend(line[i:j + 1])
+                i = j + 1
+                continue
+        if ch == '"':
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def statement_from(lines, line_no, max_lines=8):
+    idx = line_no - 1
+    parts = []
+    balance = 0
+    for current_idx in range(idx, min(len(lines), idx + max_lines)):
+        current = strip_line_comments(lines[current_idx]).strip()
+        if not current:
+            if parts:
+                break
+            continue
+        parts.append(current)
+        balance += current.count("(") + current.count("{") - current.count(")") - current.count("}")
+        if current_idx > idx and balance <= 0:
+            break
+        if current_idx == idx and balance <= 0 and not current.endswith(("{", "(", ",")):
+            break
+    return " ".join(parts)
+
+
+def split_identifier_terms(text: str) -> str:
+    text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", text)
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"[_\-.]+", " ", text)
+    return text
+
+
+def is_sensitive_text(text: str) -> bool:
+    return bool(sensitive_re.search(split_identifier_terms(text)))
+
+
+def is_sensitive_operand_text(text: str) -> bool:
+    stripped = text.strip()
+    if pure_string_literal_re.match(stripped):
+        return False
+    return is_sensitive_text(stripped)
+
+
+def operand_identifiers(operand: str):
+    return {
+        token
+        for token in identifier_re.findall(operand)
+        if token not in keywords
+    }
+
+
+def clean_operand_text(operand: str) -> str:
+    clean = operand.strip()
+    clean = re.sub(r"^(?:if|while|match)\s*\(?\s*", "", clean)
+    clean = re.split(r"\s*(?:&&|\|\||[;{])", clean, maxsplit=1)[0].strip()
+    while clean and clean[-1] in ";{}){":
+        clean = clean[:-1].strip()
+    while clean.startswith(("&", "*")):
+        clean = clean[1:].strip()
+    return clean
+
+
+def operand_is_nullish_or_shape_check(operand: str) -> bool:
+    clean = clean_operand_text(operand)
+    if nullish_re.match(clean):
+        return True
+    if shape_re.search(clean):
+        return True
+    if re.match(r"^[0-9]+(?:\.[0-9]+)?(?:u?size|u8|u16|u32|u64|i8|i16|i32|i64)?$", clean):
+        return True
+    return False
+
+
+def has_ignore(lines, line_no):
+    idx = line_no - 1
+    return (
+        0 <= idx < len(lines) and "ubs:ignore" in lines[idx]
+    ) or (
+        0 <= idx - 1 < len(lines) and "ubs:ignore" in lines[idx - 1]
+    )
+
+
+def source_line(lines, line_no):
+    idx = line_no - 1
+    if 0 <= idx < len(lines):
+        return lines[idx].strip().replace("\t", " ")
+    return ""
+
+
+def collect_sensitive_vars(lines):
+    sensitive = set()
+    for line_no, raw in enumerate(lines, start=1):
+        if has_ignore(lines, line_no):
+            continue
+        stripped = strip_line_comments(raw).strip()
+        if not stripped:
+            continue
+        statement = statement_from(lines, line_no, max_lines=5)
+        if not statement or safe_compare_re.search(statement):
+            continue
+        match = assign_re.match(statement)
+        if not match:
+            continue
+        name = match.group("lhs")
+        rhs = match.group("rhs")
+        if is_sensitive_text(name) or is_sensitive_operand_text(rhs) or (operand_identifiers(rhs) & sensitive):
+            sensitive.add(name)
+    return sensitive
+
+
+def operand_is_sensitive(operand: str, sensitive_vars) -> bool:
+    if is_sensitive_operand_text(operand):
+        return True
+    return bool(operand_identifiers(operand) & sensitive_vars)
+
+
+def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
+    if safe_compare_re.search(statement) or "ubs:ignore" in statement:
+        return False
+    for clause in re.split(r"\s*(?:&&|\|\|)\s*", statement):
+        match = compare_re.search(clause)
+        if not match:
+            continue
+        left = clean_operand_text(match.group("left"))
+        right = clean_operand_text(match.group("right"))
+        if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
+            continue
+        if operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars):
+            return True
+    return False
+
+
+issues = []
+for rust_file in rust_files(root):
+    try:
+        text = rust_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    if "==" not in text and "!=" not in text:
+        continue
+    lines = text.splitlines()
+    sensitive_vars = collect_sensitive_vars(lines)
+    seen = set()
+    for line_no, raw in enumerate(lines, start=1):
+        if has_ignore(lines, line_no):
+            continue
+        stripped = strip_line_comments(raw).strip()
+        if not stripped or ("==" not in stripped and "!=" not in stripped):
+            continue
+        statement = statement_from(lines, line_no)
+        if not statement or not unsafe_secret_compare(statement, sensitive_vars):
+            continue
+        key = (str(rust_file), line_no)
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append((rust_file, line_no, source_line(lines, line_no)))
+
+for path, line_no, code in issues:
+    print(f"{path}:{line_no}:{code}")
+PY
+}
+
+count_constant_time_compare_matches() {
+  if [[ "$have_python3" -eq 1 ]]; then
+    rust_constant_time_compare_matches | count_lines || true
+  else
+    return 1
+  fi
+}
+
+show_constant_time_compare_examples() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  local printed=0
+  [[ "$have_python3" -eq 1 ]] || return 1
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(rust_constant_time_compare_matches | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_constant_time_compare() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  if [[ "$have_python3" -ne 1 ]]; then
+    printf '[]'
+    return
+  fi
+  mapfile -t lines < <(rust_constant_time_compare_matches | head -n "$limit")
+  printf '['
+  local i=0
+  local line
+  for line in "${lines[@]}"; do
+    [[ $i -gt 0 ]] && printf ','
+    printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+    i=$((i + 1))
+  done
+  printf ']'
+}
+
 rust_format_literal_matches() {
   [[ "$have_python3" -eq 1 ]] || return 1
   python3 - "$PROJECT_DIR" <<'PY'
@@ -5488,7 +5792,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 8; then
 print_header "8. SECURITY FINDINGS"
-print_category "Detects: TLS verification disabled, weak hash algos, security-sensitive non-crypto randomness, shell command injection, request-derived response headers/open redirects/outbound URLs, HTTP URLs, secrets" \
+print_category "Detects: TLS verification disabled, weak hash algos, security-sensitive non-crypto randomness, timing-unsafe secret comparisons, shell command injection, request-derived response headers/open redirects/outbound URLs, HTTP URLs, secrets" \
   "Security misconfigurations can lead to credential leaks, command injection, and MITM attacks"
 
 print_subheader "Weak hash algorithms (MD5/SHA1)"
@@ -5511,6 +5815,17 @@ if [ "$security_randomness_hits" -gt 0 ]; then
   add_finding "critical" "$security_randomness_hits" "Security token generated with non-cryptographic randomness" "Use OsRng/getrandom/ring::rand/openssl::rand or a framework helper backed by OS cryptographic randomness for tokens, sessions, CSRF nonces, OTPs, salts, API keys, and secrets" "${CATEGORY_NAME[8]}" "$(collect_samples_security_randomness 3)"
 else
   print_finding "good" "No security-sensitive non-crypto randomness detected"
+fi
+
+print_subheader "Secret/token comparisons without timing-safe equality"
+constant_time_compare_hits=$(count_constant_time_compare_matches || echo 0)
+constant_time_compare_hits=$(printf '%s\n' "${constant_time_compare_hits:-0}" | awk 'END{print $0+0}')
+if [ "$constant_time_compare_hits" -gt 0 ]; then
+  print_finding "critical" "$constant_time_compare_hits" "Secret, signature, or token compared with ==/!=" "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures"
+  show_constant_time_compare_examples 3 || true
+  add_finding "critical" "$constant_time_compare_hits" "Secret, signature, or token compared with ==/!=" "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures" "${CATEGORY_NAME[8]}" "$(collect_samples_constant_time_compare 3)"
+else
+  print_finding "good" "No secret comparisons using ==/!= detected"
 fi
 
 print_subheader "Shell command execution through -c/-lc"

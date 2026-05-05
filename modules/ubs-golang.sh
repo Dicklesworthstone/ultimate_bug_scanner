@@ -5411,14 +5411,17 @@ def operand_is_sensitive(operand: str, sensitive_vars) -> bool:
 def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
     if SAFE_COMPARE_RE.search(statement) or 'ubs:ignore' in statement:
         return False
-    match = COMPARE_RE.search(statement)
-    if not match:
-        return False
-    left = clean_operand_text(match.group('left'))
-    right = clean_operand_text(match.group('right'))
-    if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
-        return False
-    return operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars)
+    for clause in re.split(r'\s*(?:&&|\|\|)\s*', statement):
+        match = COMPARE_RE.search(clause)
+        if not match:
+            continue
+        left = clean_operand_text(match.group('left'))
+        right = clean_operand_text(match.group('right'))
+        if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
+            continue
+        if operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars):
+            return True
+    return False
 
 issues = []
 for path in iter_files(ROOT):

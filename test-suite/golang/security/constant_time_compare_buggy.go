@@ -40,3 +40,7 @@ func rejectWrongResetToken(token string, user account) bool {
 func verifySignatureInline(signature string, expectedSignature string) bool {
 	return signature == expectedSignature
 }
+
+func verifyLengthGuardedResetToken(token string, expectedResetToken string) bool {
+	return len(token) == 64 && token == expectedResetToken
+}

@@ -145,7 +145,11 @@ const authMiddleware = async (req, res, next) => {
     }
 
     const token = authHeader.substring(7);
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+      algorithms: ['HS256'],
+      issuer: process.env.JWT_ISSUER,
+      audience: process.env.JWT_AUDIENCE
+    });
 
     req.user = decoded;
     next();
@@ -201,7 +205,12 @@ app.post('/api/login',
       const token = jwt.sign(
         { userId: user.id, email: user.email },
         process.env.JWT_SECRET,
-        { expiresIn: '24h' }
+        {
+          algorithm: 'HS256',
+          expiresIn: '24h',
+          issuer: process.env.JWT_ISSUER,
+          audience: process.env.JWT_AUDIENCE
+        }
       );
 
       res.json({ token, userId: user.id });

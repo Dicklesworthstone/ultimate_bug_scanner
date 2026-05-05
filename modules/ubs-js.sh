@@ -6152,6 +6152,9 @@ import_jsonwebtoken_re = re.compile(
     r'\bimport\s+(?:(?P<default>[A-Za-z_$][A-Za-z0-9_$]*)\s*,?\s*)?'
     r'(?P<named>\{[^}]+\})?\s+from\s+[\'"]jsonwebtoken[\'"]'
 )
+import_jsonwebtoken_namespace_re = re.compile(
+    r'\bimport\s+\*\s+as\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+[\'"]jsonwebtoken[\'"]'
+)
 import_jose_re = re.compile(r'\bimport\s+(?P<named>\{[^}]+\})\s+from\s+[\'"]jose[\'"]')
 import_jwt_decode_re = re.compile(
     r'\bimport\s+(?:\{\s*jwtDecode\s*(?:as\s+(?P<named>[A-Za-z_$][A-Za-z0-9_$]*))?\s*\}|(?P<default>[A-Za-z_$][A-Za-z0-9_$]*))\s+from\s+[\'"]jwt-decode[\'"]'
@@ -6168,6 +6171,32 @@ unsafe_verify_re = re.compile(
     r'|\balgorithms?\s*:\s*\[[^\]]*[\'"]none[\'"][^\]]*\]',
     re.IGNORECASE,
 )
+issuer_re = re.compile(r'\bissuer\s*:', re.IGNORECASE)
+audience_re = re.compile(r'\baudience\s*:', re.IGNORECASE)
+
+def mask_string_literals(text):
+    chars = list(text)
+    quote = ''
+    escape = False
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            if ch != '\n':
+                chars[i] = ' '
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            chars[i] = ' '
+        i += 1
+    return ''.join(chars)
 
 def code_line(source_line):
     stripped = source_line.strip()
@@ -6202,8 +6231,11 @@ def names_from_named_import(named_text, wanted):
         if not part:
             continue
         pieces = re.split(r'\s+as\s+', part)
-        imported = pieces[0].strip()
-        local = pieces[-1].strip()
+        if len(pieces) == 1 and ':' in part:
+            imported, local = [piece.strip() for piece in part.split(':', 1)]
+        else:
+            imported = pieces[0].strip()
+            local = pieces[-1].strip()
         if imported in wanted:
             names.add(local)
     return names
@@ -6216,6 +6248,9 @@ def collect_names(lines):
         line = code_line(raw)
         if not line:
             continue
+        m = import_jsonwebtoken_namespace_re.search(line)
+        if m:
+            jwt_objects.add(m.group('name'))
         m = import_jsonwebtoken_re.search(line)
         if m:
             if m.group('default'):
@@ -6243,12 +6278,16 @@ def collect_names(lines):
     return jwt_objects, decode_names, verify_names
 
 def line_has_candidate_call(text, decode_names, verify_names):
-    if member_decode_re.search(text) or member_verify_re.search(text):
+    call_text = mask_string_literals(text)
+    if member_decode_re.search(call_text) or member_verify_re.search(call_text):
         return True
     for name in decode_names | verify_names:
-        if re.search(rf'(?<![\w$.]){re.escape(name)}\s*\(', text):
+        if re.search(rf'(?<![\w$.]){re.escape(name)}\s*\(', call_text):
             return True
     return False
+
+def verify_lacks_claim_binding(statement):
+    return not (issuer_re.search(statement) and audience_re.search(statement))
 
 issues = []
 if root.is_file():
@@ -6279,24 +6318,29 @@ for path in candidates:
         statement = statement_from(lines, idx)
         if not statement or 'ubs:ignore' in statement:
             continue
+        call_statement = mask_string_literals(statement)
         unsafe = False
-        for match in member_decode_re.finditer(statement):
+        for match in member_decode_re.finditer(call_statement):
             if match.group('name') in jwt_objects:
                 unsafe = True
                 break
         if not unsafe:
-            for match in decode_call_re.finditer(statement):
+            for match in decode_call_re.finditer(call_statement):
                 if match.group('name') in decode_names:
                     unsafe = True
                     break
         if not unsafe:
-            for match in member_verify_re.finditer(statement):
-                if match.group('name') in jwt_objects and unsafe_verify_re.search(statement):
+            for match in member_verify_re.finditer(call_statement):
+                if match.group('name') in jwt_objects and (
+                    unsafe_verify_re.search(statement) or verify_lacks_claim_binding(statement)
+                ):
                     unsafe = True
                     break
         if not unsafe:
-            for match in verify_call_re.finditer(statement):
-                if match.group('name') in verify_names and unsafe_verify_re.search(statement):
+            for match in verify_call_re.finditer(call_statement):
+                if match.group('name') in verify_names and (
+                    unsafe_verify_re.search(statement) or verify_lacks_claim_binding(statement)
+                ):
                     unsafe = True
                     break
         if not unsafe:

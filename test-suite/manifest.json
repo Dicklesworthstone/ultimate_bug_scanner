@@ -447,7 +447,7 @@
         "exit_code": "nonzero",
         "totals": {
           "warning": {
-            "min": 1
+            "min": 11
           }
         },
         "require_substrings": [

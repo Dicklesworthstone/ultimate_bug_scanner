@@ -28,3 +28,13 @@ export async function verifyJose(token: string, publicKey: CryptoKey): Promise<u
   });
   return payload;
 }
+
+export function documentationMentionsDoNotCount(): number {
+  const decodeExample = "jwt.decode(token)";
+  const unsafeVerifyExample = "jwt.verify(token, key, { ignoreExpiration: true })";
+  /*
+   * These strings document unsafe examples; they are not executable verifier calls.
+   * jwt.verify(token, key, { algorithms: ["none"] })
+   */
+  return decodeExample.length + unsafeVerifyExample.length;
+}

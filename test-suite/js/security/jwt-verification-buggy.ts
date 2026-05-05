@@ -1,7 +1,10 @@
 import jwt from "jsonwebtoken";
+import * as jwtNamespace from "jsonwebtoken";
 import { decode as decodeToken, verify } from "jsonwebtoken";
-import { decodeJwt } from "jose";
+import { decodeJwt, jwtVerify } from "jose";
 import jwtDecode from "jwt-decode";
+
+const { verify: verifyFromRequire } = require("jsonwebtoken");
 
 type Request = {
   headers: {
@@ -35,4 +38,27 @@ export function verifiesButIgnoresExpiration(token: string): unknown {
 
 export function acceptsNoneAlgorithm(token: string): unknown {
   return jwt.verify(token, SECRET, { algorithms: ["none"] });
+}
+
+export function verifiesSignatureWithoutIssuerAudience(token: string, publicKey: string): string | object {
+  return jwt.verify(token, publicKey, { algorithms: ["RS256"] });
+}
+
+export function verifiesAliasWithoutClaimBinding(token: string): string | object {
+  return verify(token, SECRET);
+}
+
+export async function verifiesJoseWithoutClaimBinding(
+  token: string,
+  publicKey: CryptoKey,
+): Promise<unknown> {
+  return jwtVerify(token, publicKey);
+}
+
+export function trustsNamespaceDecode(token: string): string | object | null {
+  return jwtNamespace.decode(token);
+}
+
+export function verifiesRequireAliasWithoutClaimBinding(token: string): string | object {
+  return verifyFromRequire(token, SECRET);
 }

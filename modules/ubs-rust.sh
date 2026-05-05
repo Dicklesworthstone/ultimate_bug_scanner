@@ -3757,61 +3757,6 @@ def rust_files(path: Path):
                 yield candidate
 
 
-def mask_block_comments_preserve_lines(text: str) -> str:
-    chars = list(text)
-    quote = ""
-    raw_hashes = None
-    escape = False
-    i = 0
-    while i < len(chars):
-        ch = chars[i]
-        nxt = chars[i + 1] if i + 1 < len(chars) else ""
-        if raw_hashes is not None:
-            if ch == '"' and text.startswith("#" * raw_hashes, i + 1):
-                i += raw_hashes + 1
-                raw_hashes = None
-                continue
-            i += 1
-            continue
-        if quote:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == quote:
-                quote = ""
-            i += 1
-            continue
-        if ch == "r":
-            j = i + 1
-            while j < len(chars) and chars[j] == "#":
-                j += 1
-            if j < len(chars) and chars[j] == '"':
-                raw_hashes = j - i - 1
-                i = j + 1
-                continue
-        if ch == '"':
-            quote = ch
-            i += 1
-            continue
-        if ch == "/" and nxt == "*":
-            chars[i] = chars[i + 1] = " "
-            i += 2
-            while i < len(chars):
-                ch = chars[i]
-                nxt = chars[i + 1] if i + 1 < len(chars) else ""
-                if ch == "*" and nxt == "/":
-                    chars[i] = chars[i + 1] = " "
-                    i += 2
-                    break
-                if ch != "\n":
-                    chars[i] = " "
-                i += 1
-            continue
-        i += 1
-    return "".join(chars)
-
-
 def strip_line_comments(line: str) -> str:
     out = []
     quote = ""
@@ -4096,6 +4041,61 @@ def rust_files(path: Path):
             candidate = Path(dirpath) / name
             if candidate.suffix == ".rs":
                 yield candidate
+
+
+def mask_block_comments_preserve_lines(text: str) -> str:
+    chars = list(text)
+    quote = ""
+    raw_hashes = None
+    escape = False
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if raw_hashes is not None:
+            if ch == '"' and text.startswith("#" * raw_hashes, i + 1):
+                i += raw_hashes + 1
+                raw_hashes = None
+                continue
+            i += 1
+            continue
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "r":
+            j = i + 1
+            while j < len(chars) and chars[j] == "#":
+                j += 1
+            if j < len(chars) and chars[j] == '"':
+                raw_hashes = j - i - 1
+                i = j + 1
+                continue
+        if ch == '"':
+            quote = ch
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            chars[i] = chars[i + 1] = " "
+            i += 2
+            while i < len(chars):
+                ch = chars[i]
+                nxt = chars[i + 1] if i + 1 < len(chars) else ""
+                if ch == "*" and nxt == "/":
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    break
+                if ch != "\n":
+                    chars[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(chars)
 
 
 def strip_line_comments(line: str) -> str:

@@ -12,7 +12,7 @@ func verifyHMACToken(tokenString string, secret []byte) (*jwt.Token, error) {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return secret, nil
-	})
+	}, jwt.WithIssuer("https://issuer.example.com"), jwt.WithAudience("api://example"))
 }
 
 func verifyHMACClaims(tokenString string, secret []byte) (*jwt.Token, error) {
@@ -22,11 +22,15 @@ func verifyHMACClaims(tokenString string, secret []byte) (*jwt.Token, error) {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return secret, nil
-	})
+	}, jwt.WithIssuer("https://issuer.example.com"), jwt.WithAudience("api://example"))
 }
 
 func verifyWithValidMethods(tokenString string, secret []byte) (*jwt.Token, error) {
-	parser := jwt.NewParser(jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+	parser := jwt.NewParser(
+		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+		jwt.WithIssuer("https://issuer.example.com"),
+		jwt.WithAudience("api://example"),
+	)
 	return parser.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return secret, nil
 	})

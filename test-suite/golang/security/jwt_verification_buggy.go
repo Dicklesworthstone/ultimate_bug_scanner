@@ -25,6 +25,12 @@ func acceptAnySigningMethodWithClaims(tokenString string, secret []byte) (*jwt.T
 	})
 }
 
+func acceptValidMethodWithoutIssuerAudience(tokenString string, secret []byte) (*jwt.Token, error) {
+	return jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		return secret, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+}
+
 func createNoneAlgorithmToken(claims jwt.Claims) *jwt.Token {
 	return jwt.NewWithClaims(jwt.SigningMethodNone, claims)
 }

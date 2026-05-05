@@ -5107,7 +5107,7 @@
     },
     {
       "id": "golang-jwt-verification-buggy",
-      "description": "Go JWT parsing should not use decode-only parsing, none-alg tokens, disabled claims validation, or parse callbacks that omit signing-method validation.",
+      "description": "Go JWT parsing should not use decode-only parsing, none-alg tokens, disabled claims validation, parse callbacks that omit signing-method validation, or verified tokens without issuer/audience binding.",
       "path": "test-suite/golang/security/jwt_verification_buggy.go",
       "language": "golang",
       "tags": [
@@ -5125,7 +5125,7 @@
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 5
+            "min": 6
           }
         },
         "require_substrings": [
@@ -5135,7 +5135,7 @@
     },
     {
       "id": "golang-jwt-verification-clean",
-      "description": "Go JWT parsing with explicit signing-method validation or WithValidMethods should stay clean.",
+      "description": "Go JWT parsing with explicit signing-method validation plus issuer/audience binding should stay clean.",
       "path": "test-suite/golang/security/jwt_verification_clean.go",
       "language": "golang",
       "tags": [

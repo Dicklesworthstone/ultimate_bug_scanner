@@ -5466,7 +5466,7 @@ PY
 }
 
 run_jwt_verification_checks() {
-  print_subheader "JWT verification and signing-method validation"
+  print_subheader "JWT verification, signing-method validation, and claim binding"
   if ! command -v python3 >/dev/null 2>&1; then
     print_finding "info" 0 "python3 not available" "Install python3 to enable JWT verification checks"
     return
@@ -5476,7 +5476,7 @@ run_jwt_verification_checks() {
     case "$tag" in
       __COUNT__)
         if [[ "$a" -gt 0 ]]; then
-          print_finding "critical" "$a" "JWT parse/decode verification bypass risk" "Avoid ParseUnverified, SigningMethodNone, and WithoutClaimsValidation; validate token.Method or use jwt.WithValidMethods before trusting claims"
+          print_finding "critical" "$a" "JWT parse/decode verification bypass risk" "Avoid ParseUnverified, SigningMethodNone, and WithoutClaimsValidation; validate token.Method or use jwt.WithValidMethods, and bind issuer/audience before trusting claims"
         else
           print_finding "good" "No JWT parse/decode verification bypass patterns detected"
         fi
@@ -5508,6 +5508,18 @@ SAFE_METHOD_RE = re.compile(
     r'(?:\bSigningMethod[A-Za-z0-9_]*\b|\bAlg\s*\()|'
     r'(?:\bSigningMethod[A-Za-z0-9_]*\b|\bAlg\s*\().*?'
     r'(?:\b[A-Za-z_][A-Za-z0-9_]*\.Method\b|\.Method\b)',
+    re.DOTALL,
+)
+ISSUER_BINDING_RE = re.compile(
+    r'\bWithIssuer\s*\(|\bVerifyIssuer\s*\(|'
+    r'\b(?:Issuer|issuer|iss)\b\s*(?:==|!=)|'
+    r'\[\s*["\']iss["\']\s*\]',
+    re.DOTALL,
+)
+AUDIENCE_BINDING_RE = re.compile(
+    r'\bWithAudience\s*\(|\bVerifyAudience\s*\(|'
+    r'\b(?:Audience|audience|aud)\b\s*(?:==|!=)|'
+    r'\[\s*["\']aud["\']\s*\]',
     re.DOTALL,
 )
 
@@ -5688,6 +5700,8 @@ def analyze_file(path):
             context = function_context(lines, line_no)
             if not SAFE_METHOD_RE.search(context):
                 reason = 'method-unvalidated'
+            elif not (ISSUER_BINDING_RE.search(context) and AUDIENCE_BINDING_RE.search(context)):
+                reason = 'claims-unbound'
         if not reason:
             continue
         key = (relpath(path), line_no)

@@ -5125,7 +5125,7 @@
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 6
+            "min": 7
           }
         },
         "require_substrings": [
@@ -6826,7 +6826,7 @@
     },
     {
       "id": "rust-jwt-verification-buggy",
-      "description": "Rust JWT code should not decode claims without verification or disable signature, expiration, or audience validation.",
+      "description": "Rust JWT code should not decode claims without verification, disable signature/expiration/audience validation, or accept tokens without issuer/audience binding.",
       "path": "test-suite/rust/buggy/jwt_verification.rs",
       "language": "rust",
       "tags": [
@@ -6845,7 +6845,7 @@
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 5
+            "min": 6
           }
         },
         "require_substrings": [
@@ -6855,7 +6855,7 @@
     },
     {
       "id": "rust-jwt-verification-clean",
-      "description": "Rust JWT code that uses jsonwebtoken::decode with real keys and enabled claim validation should stay clean.",
+      "description": "Rust JWT code that uses jsonwebtoken::decode with real keys, enabled validation, and required issuer/audience binding should stay clean.",
       "path": "test-suite/rust/clean/jwt_verification.rs",
       "language": "rust",
       "tags": [

@@ -4027,6 +4027,34 @@ signature_disabled_re = re.compile(r"\.insecure_disable_signature_validation\s*\
 claim_validation_disabled_re = re.compile(
     r"\bvalidate_(?:exp|aud)\s*(?::|=)\s*false\b"
 )
+verified_decode_re = re.compile(
+    r"(?:\bjsonwebtoken\s*::\s*)?decode\s*"
+    + call_suffix
+)
+decode_validation_arg_re = re.compile(
+    r"(?:\bjsonwebtoken\s*::\s*)?decode\s*(?:::<[^>\n]+>)?\s*"
+    r"\(\s*[^,]+,\s*[^,]+,\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)"
+)
+fn_start_re = re.compile(
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?"
+    r"(?:(?:const|async|unsafe)\s+)*"
+    r"(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+    r"fn\b"
+)
+issuer_binding_re = re.compile(r"\.set_issuer\s*\(")
+audience_binding_re = re.compile(r"\.set_audience\s*\(")
+required_issuer_re = re.compile(
+    r"\.set_required_spec_claims\s*\([^)]*[\"']iss[\"']|"
+    r"\.required_spec_claims\s*\.\s*insert\s*\(\s*[\"']iss[\"']|"
+    r"\.required_spec_claims\s*=.*[\"']iss[\"']",
+    re.DOTALL,
+)
+required_audience_re = re.compile(
+    r"\.set_required_spec_claims\s*\([^)]*[\"']aud[\"']|"
+    r"\.required_spec_claims\s*\.\s*insert\s*\(\s*[\"']aud[\"']|"
+    r"\.required_spec_claims\s*=.*[\"']aud[\"']",
+    re.DOTALL,
+)
 block_comment_re = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
@@ -4166,6 +4194,26 @@ def statement_from(lines, line_no, max_lines=10):
     return " ".join(parts)
 
 
+def function_context(lines, line_no, max_lines=180):
+    start = line_no - 1
+    while start > 0 and not fn_start_re.match(strip_line_comments(lines[start])):
+        start -= 1
+    if not fn_start_re.match(strip_line_comments(lines[start])):
+        return statement_from(lines, line_no, max_lines=24)
+    parts = []
+    balance = 0
+    saw_open = False
+    for idx in range(start, min(len(lines), start + max_lines)):
+        current = strip_line_comments(lines[idx])
+        parts.append(current.strip())
+        balance += current.count("{") - current.count("}")
+        if "{" in current:
+            saw_open = True
+        if saw_open and idx > start and balance <= 0:
+            break
+    return " ".join(part for part in parts if part)
+
+
 def mask_string_literals(text: str) -> str:
     chars = list(text)
     quote = ""
@@ -4241,6 +4289,39 @@ def risky_jwt_statement(statement: str) -> bool:
     )
 
 
+def line_has_jwt_candidate(line: str) -> bool:
+    code = block_comment_re.sub(" ", mask_string_literals(line))
+    return bool(
+        decode_only_re.search(code)
+        or signature_disabled_re.search(code)
+        or claim_validation_disabled_re.search(code)
+        or verified_decode_re.search(code)
+    )
+
+
+def lacks_claim_binding(context: str) -> bool:
+    code = block_comment_re.sub(" ", context)
+    return not (
+        issuer_binding_re.search(code)
+        and audience_binding_re.search(code)
+        and required_issuer_re.search(code)
+        and required_audience_re.search(code)
+    )
+
+
+def binding_context_for_decode(statement: str, context: str) -> str:
+    match = decode_validation_arg_re.search(statement)
+    if not match:
+        return context
+    validation_var = re.escape(match.group(1))
+    related_parts = [
+        part
+        for part in context.split(";")
+        if re.search(rf"\b{validation_var}\b", part)
+    ]
+    return "; ".join(related_parts) if related_parts else context
+
+
 issues = []
 for rust_file in rust_files(root):
     try:
@@ -4248,11 +4329,13 @@ for rust_file in rust_files(root):
     except OSError:
         continue
     if not any(token in text for token in (
+        "decode",
         "insecure_decode",
         "dangerous_unsafe_decode",
         "insecure_disable_signature_validation",
         "validate_exp",
         "validate_aud",
+        "Validation",
     )):
         continue
     source_lines = text.splitlines()
@@ -4262,18 +4345,18 @@ for rust_file in rust_files(root):
         if has_ignore(source_lines, line_no):
             continue
         stripped = strip_line_comments(raw).strip()
-        if not stripped or not any(token in stripped for token in (
-            "insecure_decode",
-            "dangerous_unsafe_decode",
-            "insecure_disable_signature_validation",
-            "validate_exp",
-            "validate_aud",
-        )):
+        if not stripped or not line_has_jwt_candidate(stripped):
             continue
         statement = statement_from(scan_lines, line_no)
         if not statement or "ubs:ignore" in statement:
             continue
-        if not risky_jwt_statement(statement):
+        context = function_context(scan_lines, line_no)
+        binding_context = binding_context_for_decode(statement, context)
+        code = block_comment_re.sub(" ", mask_string_literals(statement))
+        if not (
+            risky_jwt_statement(statement)
+            or (verified_decode_re.search(code) and lacks_claim_binding(binding_context))
+        ):
             continue
         key = (str(rust_file), line_no)
         if key in seen:
@@ -6151,13 +6234,13 @@ else
   print_finding "good" "No secret comparisons using ==/!= detected"
 fi
 
-print_subheader "JWT decode or validation bypass"
+print_subheader "JWT decode, validation bypass, or missing claim binding"
 jwt_verification_hits=$(count_jwt_verification_matches || echo 0)
 jwt_verification_hits=$(printf '%s\n' "${jwt_verification_hits:-0}" | awk 'END{print $0+0}')
 if [ "$jwt_verification_hits" -gt 0 ]; then
-  print_finding "critical" "$jwt_verification_hits" "JWT decode/validation bypass risk" "Use jsonwebtoken::decode with a real DecodingKey and Validation that keeps signature, expiration, and audience checks enabled; avoid dangerous::insecure_decode, dangerous_unsafe_decode, insecure_disable_signature_validation(), validate_exp=false, and validate_aud=false"
+  print_finding "critical" "$jwt_verification_hits" "JWT decode/validation bypass risk" "Use jsonwebtoken::decode with a real DecodingKey and Validation that keeps signature, expiration, issuer, and audience checks enabled and required; avoid dangerous::insecure_decode, dangerous_unsafe_decode, insecure_disable_signature_validation(), validate_exp=false, and validate_aud=false"
   show_jwt_verification_examples 3 || true
-  add_finding "critical" "$jwt_verification_hits" "JWT decode/validation bypass risk" "Use jsonwebtoken::decode with a real DecodingKey and Validation that keeps signature, expiration, and audience checks enabled; avoid dangerous::insecure_decode, dangerous_unsafe_decode, insecure_disable_signature_validation(), validate_exp=false, and validate_aud=false" "${CATEGORY_NAME[8]}" "$(collect_samples_jwt_verification 3)"
+  add_finding "critical" "$jwt_verification_hits" "JWT decode/validation bypass risk" "Use jsonwebtoken::decode with a real DecodingKey and Validation that keeps signature, expiration, issuer, and audience checks enabled and required; avoid dangerous::insecure_decode, dangerous_unsafe_decode, insecure_disable_signature_validation(), validate_exp=false, and validate_aud=false" "${CATEGORY_NAME[8]}" "$(collect_samples_jwt_verification 3)"
 else
   print_finding "good" "No JWT decode/validation bypass patterns detected"
 fi

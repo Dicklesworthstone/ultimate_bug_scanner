@@ -12,8 +12,7 @@ pub fn verify_token(token: &str, key: &DecodingKey) -> jsonwebtoken::errors::Res
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_audience(&["frontend"]);
     validation.set_issuer(&["issuer"]);
-    validation.required_spec_claims.insert("exp".to_string());
-    validation.required_spec_claims.insert("aud".to_string());
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     decode::<Claims>(token, key, &validation).map(|data| data.claims)
 }
 
@@ -22,6 +21,19 @@ pub fn verify_rsa_token(token: &str, key: &DecodingKey) -> jsonwebtoken::errors:
     validation.validate_exp = true;
     validation.validate_aud = true;
     validation.set_audience(&["backend"]);
+    validation.set_issuer(&["issuer"]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+    decode::<Claims>(token, key, &validation).map(|data| data.claims)
+}
+
+pub(crate) async fn verify_scoped_token(
+    token: &str,
+    key: &DecodingKey,
+) -> jsonwebtoken::errors::Result<Claims> {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&["service"]);
+    validation.set_issuer(&["issuer"]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud"]);
     decode::<Claims>(token, key, &validation).map(|data| data.claims)
 }
 

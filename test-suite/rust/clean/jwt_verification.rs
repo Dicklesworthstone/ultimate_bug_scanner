@@ -24,3 +24,13 @@ pub fn verify_rsa_token(token: &str, key: &DecodingKey) -> jsonwebtoken::errors:
     validation.set_audience(&["backend"]);
     decode::<Claims>(token, key, &validation).map(|data| data.claims)
 }
+
+pub fn documentation_mentions_do_not_count() -> usize {
+    let decode_docs = "dangerous::insecure_decode::<Claims>(token)";
+    let validation_docs = "Validation { validate_exp: false, validate_aud: false }";
+    /*
+       This comment documents what not to do:
+       validation.insecure_disable_signature_validation();
+    */
+    decode_docs.len() + validation_docs.len()
+}

@@ -3757,6 +3757,61 @@ def rust_files(path: Path):
                 yield candidate
 
 
+def mask_block_comments_preserve_lines(text: str) -> str:
+    chars = list(text)
+    quote = ""
+    raw_hashes = None
+    escape = False
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
+        nxt = chars[i + 1] if i + 1 < len(chars) else ""
+        if raw_hashes is not None:
+            if ch == '"' and text.startswith("#" * raw_hashes, i + 1):
+                i += raw_hashes + 1
+                raw_hashes = None
+                continue
+            i += 1
+            continue
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "r":
+            j = i + 1
+            while j < len(chars) and chars[j] == "#":
+                j += 1
+            if j < len(chars) and chars[j] == '"':
+                raw_hashes = j - i - 1
+                i = j + 1
+                continue
+        if ch == '"':
+            quote = ch
+            i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            chars[i] = chars[i + 1] = " "
+            i += 2
+            while i < len(chars):
+                ch = chars[i]
+                nxt = chars[i + 1] if i + 1 < len(chars) else ""
+                if ch == "*" and nxt == "/":
+                    chars[i] = chars[i + 1] = " "
+                    i += 2
+                    break
+                if ch != "\n":
+                    chars[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(chars)
+
+
 def strip_line_comments(line: str) -> str:
     out = []
     quote = ""
@@ -4027,6 +4082,7 @@ signature_disabled_re = re.compile(r"\.insecure_disable_signature_validation\s*\
 claim_validation_disabled_re = re.compile(
     r"\bvalidate_(?:exp|aud)\s*(?::|=)\s*false\b"
 )
+block_comment_re = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 def rust_files(path: Path):
@@ -4177,7 +4233,7 @@ def source_line(lines, line_no):
 
 
 def risky_jwt_statement(statement: str) -> bool:
-    code = mask_string_literals(statement)
+    code = block_comment_re.sub(" ", mask_string_literals(statement))
     return bool(
         decode_only_re.search(code)
         or signature_disabled_re.search(code)
@@ -4199,10 +4255,11 @@ for rust_file in rust_files(root):
         "validate_aud",
     )):
         continue
-    lines = text.splitlines()
+    source_lines = text.splitlines()
+    scan_lines = mask_block_comments_preserve_lines(text).splitlines()
     seen = set()
-    for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
+    for line_no, raw in enumerate(scan_lines, start=1):
+        if has_ignore(source_lines, line_no):
             continue
         stripped = strip_line_comments(raw).strip()
         if not stripped or not any(token in stripped for token in (
@@ -4213,7 +4270,7 @@ for rust_file in rust_files(root):
             "validate_aud",
         )):
             continue
-        statement = statement_from(lines, line_no)
+        statement = statement_from(scan_lines, line_no)
         if not statement or "ubs:ignore" in statement:
             continue
         if not risky_jwt_statement(statement):
@@ -4222,7 +4279,7 @@ for rust_file in rust_files(root):
         if key in seen:
             continue
         seen.add(key)
-        issues.append((rust_file, line_no, source_line(lines, line_no)))
+        issues.append((rust_file, line_no, source_line(source_lines, line_no)))
 
 for path, line_no, code in issues:
     print(f"{path}:{line_no}:{code}")

@@ -8,6 +8,171 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+Scope window: full project history remains documented below; this update reconstructs `v5.1.2...v5.2.75` in detail and updates the open comparison target to `v5.2.75`.
+
+## Version Timeline
+
+| Marker | Date | Release state | Evidence |
+|--------|------|---------------|----------|
+| `v5.2.75` | 2026-05-06 | Latest git tag, tag-only | [`v5.2.75` tag](https://github.com/Dicklesworthstone/ultimate_bug_scanner/tree/v5.2.75) |
+| `v5.2.61` | 2026-05-06 | Latest GitHub Release observed | [`v5.2.61` release](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.2.61) |
+| `v5.1.2` | 2026-04-25 | Previous changelog baseline release | [`v5.1.2` release](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.1.2) |
+| `v5.0.7` | 2026-03-25 | Prior detailed release section | [`v5.0.7` release](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.0.7) |
+| `v4.6.0` | 2025-11-17 | Early public tag | [`v4.6.0` tag](https://github.com/Dicklesworthstone/ultimate_bug_scanner/tree/v4.6.0) |
+
+## [v5.2.75] - 2026-05-06 **[Tag]**
+
+> Current reconstruction point. This section covers the post-`v5.1.2` expansion train (`v5.1.3...v5.2.75`): 197 non-merge commits, 176 `v5.1.x`/`v5.2.x` tags, GitHub Release assets through `v5.2.61`, and git-only tags from `v5.2.62` through `v5.2.75`.
+
+### Release and Tag State
+
+- **Latest git tag:** [`v5.2.75`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/tree/v5.2.75), tagged at commit [`6cb0180`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6cb0180).
+- **Latest GitHub Release:** [`v5.2.61`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.2.61), published 2026-05-06 and marked latest in GitHub release metadata.
+- **Tag-only window:** `v5.2.62` through `v5.2.75` are git tags without corresponding GitHub Release assets at the time this changelog was reconstructed.
+- **Research memo:** detailed evidence, tracker workstreams, and coverage ledger are in [`docs/reports/CHANGELOG_RESEARCH.md`](docs/reports/CHANGELOG_RESEARCH.md).
+
+### Version Spine Since `v5.1.2`
+
+| Version range | Dates | Status | Capability wave | Inspect first |
+|---------------|-------|--------|-----------------|---------------|
+| `v5.1.3` - `v5.1.11` | 2026-04-26 to 2026-04-27 | Release/tag mixed | Rust safety expansion plus runner checksum/fetch hardening after the `v5.1.2` module-download regression | [`fb7a68f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/fb7a68f), [`4ef6c42`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/4ef6c42), [`60f9c23`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/60f9c23) |
+| `v5.1.12` - `v5.1.32` | 2026-04-27 to 2026-04-28 | Release/tag mixed | JavaScript/TypeScript browser, async, and trust-boundary rules | [`df1a38f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/df1a38f), [`8a8e9b5`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/8a8e9b5), [`144a80c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/144a80c) |
+| `v5.1.33` - `v5.1.42` | 2026-04-28 | Release/tag mixed | Archive-extraction path traversal across Python, Go, Java, Ruby, C#, Swift, C++, Elixir, and Kotlin | [`75ea78c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/75ea78c), [`008f1ef`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/008f1ef), [`0cae370`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/0cae370) |
+| `v5.1.43` - `v5.1.75` | 2026-04-28 to 2026-04-29 | Release/tag mixed | Python web-security pack: Flask/Django/FastAPI sinks, deserialization, cookies, uploads, header/open-redirect/SSRF families | [`7bbee86`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/7bbee86), [`1f3d436`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/1f3d436), [`906edf6`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/906edf6) |
+| `v5.1.76` - `v5.1.87` | 2026-04-29 to 2026-04-30 | Release/tag mixed | JavaScript/TypeScript security hardening: JWT bypass, CORS, cookies, randomness, TLS, SSRF, response headers, path traversal | [`2c81897`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/2c81897), [`ed9fcbd`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/ed9fcbd), [`f2d7477`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f2d7477) |
+| `v5.1.88` - `v5.2.20` | 2026-04-30 to 2026-05-02 | Release/tag mixed | Cross-language path traversal and SSRF: headers, route values, servlet/Rack/Ktor/ASP.NET/Swift/Elixir sources | [`39e40d7`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/39e40d7), [`5310071`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/5310071), [`20e3fe7`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/20e3fe7) |
+| `v5.2.21` - `v5.2.38` | 2026-05-02 to 2026-05-03 | Release/tag mixed | Open redirect and response header injection coverage across all supported language families | [`968fb3a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/968fb3a), [`b78839c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b78839c), [`c554c3e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c554c3e) |
+| `v5.2.39` - `v5.2.48` | 2026-05-03 to 2026-05-04 | Release/tag mixed | Security-sensitive randomness and hardcoded-secret detectors across Elixir, Ruby, Java/Kotlin, C#, Swift, C++, JS/TS, Rust, and Go | [`2911f58`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/2911f58), [`41c507b`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/41c507b), [`c39b4b2`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c39b4b2) |
+| `v5.2.49` - `v5.2.57` | 2026-05-04 to 2026-05-05 | Release/tag mixed | Secret comparison, hardcoded-secret environment fallbacks, credentialed CORS, and insecure cookie expansion | [`7ad487e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/7ad487e), [`61639f3`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/61639f3), [`872ddeb`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/872ddeb) |
+| `v5.2.58` - `v5.2.67` | 2026-05-05 to 2026-05-06 | Release/tag mixed through `v5.2.61`, then tag-only | JWT verification and claim-binding, prototype pollution, reverse-proxy SSRF, and credentialed CORS follow-up | [`52be770`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/52be770), [`d23de5d`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/d23de5d), [`f3c36ec`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f3c36ec) |
+| `v5.2.68` - `v5.2.75` | 2026-05-06 | **Tag-only** | Request-derived SQL injection taint and route parameter propagation for Rust, Go, and TypeScript | [`039e94e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/039e94e), [`3fc8537`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3fc8537), [`6cb0180`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6cb0180) |
+
+### Representative commits
+
+- **Latest tag:** [`6cb0180`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6cb0180) tracks destructured TypeScript route params as SQL taint sources.
+- **Latest GitHub Release:** [`v5.2.61`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.2.61) is the newest published release asset set observed during reconstruction.
+- **Rust SQL taint:** [`3fc8537`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3fc8537) detects request-derived SQL injection in Rust.
+- **Go SQL taint:** [`933f440`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/933f440) treats `PathValue` route parameters as tainted SQL sources.
+- **Cross-language header injection:** [`c554c3e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c554c3e) closes the response-header injection wave with C++ coverage and clearer TOON encoder errors.
+
+### Rust Detector Expansion
+
+UBS gained a broad Rust audit wave before the later cross-language security packs. This work moved the Rust module beyond obvious panics and unwraps into protocol and trust-boundary bugs that commonly appear in agent-written web services and CLI tools.
+
+**Delivered capability**
+
+- Detect request-derived SQL injection in raw query construction, including later placeholder-aware fixes so tainted SQL text is still flagged when a call uses bind placeholders ([`3fc8537`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3fc8537)).
+- Detect credentialed wildcard CORS and JWT verification bypass or insufficient issuer/audience binding ([`88e881c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/88e881c), [`d23de5d`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/d23de5d), [`c10266b`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c10266b)).
+- Detect archive extraction path traversal and predictable temp-file writes ([`4a63349`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/4a63349), [`96146c1`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/96146c1)).
+- Detect request-derived SSRF URLs, open redirects, response header injection, and path traversal sources shared with the larger web-security family ([`a8d859f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/a8d859f), [`968fb3a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/968fb3a), [`9d54688`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/9d54688)).
+- Add Rust-specific bug patterns for iterator/unsafe-API filtering, panic-prone `Drop`, direct indexing panic surfaces, command/path trust boundaries, and unsafe initialization APIs ([`fb7a68f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/fb7a68f), [`85b39c1`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/85b39c1), [`86105bc`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/86105bc), [`8c39136`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/8c39136), [`d12814a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/d12814a), [`b8b04a1`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b8b04a1)).
+
+**Closed workstreams**
+
+- Lightweight taint analysis (`ultimate_bug_scanner-4jg`).
+- Async error path coverage (`ultimate_bug_scanner-e3j`).
+- Type-narrowing and resource lifecycle helper expansion (`ultimate_bug_scanner-4se`, `ultimate_bug_scanner-4sm`, `ultimate_bug_scanner-8d7`).
+
+### JavaScript and TypeScript Detector Expansion
+
+The JS/TS module received the densest single-language expansion: browser API misuse, Node/Express trust boundaries, cancellation leaks, token validation, route-parameter taint, and AST-backed false-positive controls.
+
+**Delivered capability**
+
+- Detect browser trust-boundary bugs such as unsafe `window.open` targets, unsafe JSX blank targets, unsanitized React HTML sinks, wildcard `postMessage` origins, and missing origin checks ([`df1a38f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/df1a38f), [`8a8e9b5`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/8a8e9b5), [`b2e8509`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b2e8509), [`11651c6`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/11651c6), [`9fb2788`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/9fb2788)).
+- Add async callback misuse coverage for React effects, `forEach`, `map`, array predicates, timers, `addEventListener`, `new Promise`, EventEmitter listeners, sort/flatMap/reduce callbacks, direct `await` on `map(async ...)`, `Promise.all` over `forEach`, and async JSX handlers ([`5b679ec`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/5b679ec), [`9761a4d`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/9761a4d), [`fe4254d`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/fe4254d), [`1fc0b34`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/1fc0b34), [`e153597`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/e153597), [`144a80c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/144a80c)).
+- Add web security detectors for JWT verification bypass, insecure cookies, credentialed wildcard CORS, randomness, disabled TLS verification, SSRF, response header injection, open redirect, archive extraction traversal, and filesystem path traversal ([`2c81897`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/2c81897), [`79aa5ac`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/79aa5ac), [`ed9fcbd`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/ed9fcbd), [`cb47d26`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/cb47d26), [`8f3633a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/8f3633a), [`f2d7477`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f2d7477)).
+- Add TypeScript-specific prototype-pollution, proxy-target SSRF, raw SQL injection, and destructured route-parameter taint propagation ([`f3c36ec`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f3c36ec), [`5c8f4b8`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/5c8f4b8), [`039e94e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/039e94e), [`0a77f0a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/0a77f0a), [`6cb0180`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6cb0180)).
+
+**Closed workstreams**
+
+- TS server narrowing analyzer (`ultimate_bug_scanner-stk`).
+- JS/TS AST scanning guarantee and high-severity AST confirmation (`ultimate_bug_scanner-js-ts-ast-guarantee`, `ultimate_bug_scanner-js-highsev-ast-confirm`).
+- JS global-pollution false-positive follow-up (`ultimate_bug_scanner-js-global-pollution-fp-fix2`).
+
+### Python Web-Security Pack
+
+Python coverage expanded from general static checks into framework-aware request/response flows. The detector set now covers bugs that appear in Flask, Django, FastAPI, Starlette-style middleware, `requests`/HTTPX integrations, CSV/Excel export paths, and upload handling.
+
+**Delivered capability**
+
+- Detect Python request-derived open redirects, path traversal, SSRF-prone outbound URLs, JWT verification bypasses, interpolated SQL sinks, and command-injection dataflow ([`7bbee86`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/7bbee86), [`b4c9cbb`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b4c9cbb), [`1f3d436`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/1f3d436), [`ed1c12f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/ed1c12f), [`0822f25`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/0822f25), [`3308c97`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3308c97)).
+- Add unsafe deserialization, missing HTTP timeout, unsafe upload path, cookie/CORS, response-header injection, Host-header poisoning, template/NoSQL/LDAP/email-header injection, and subprocess-timeout families ([`4e3b29e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/4e3b29e), [`03314a5`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/03314a5), [`a73be83`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/a73be83), [`ad51dba`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/ad51dba), [`8cb3c8d`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/8cb3c8d), [`e911430`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/e911430), [`9fbf35a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/9fbf35a), [`906edf6`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/906edf6)).
+- Improve helper-driven Python resource lifecycle analysis through AST migration and follow-up fixes, then propagate checksum updates so installed scanners accepted the helper changes.
+
+**Closed workstreams**
+
+- Python resource helper and lifecycle AST migration (`ultimate_bug_scanner-41t`, `ultimate_bug_scanner-mma`).
+- Bandit `.ubsignore` forwarding and test coverage (`ultimate_bug_scanner-2yvh`).
+
+### Cross-Language Web Vulnerability Families
+
+After the single-language Rust, JS/TS, and Python waves, UBS moved into repeated cross-language vulnerability families. The project pattern became: introduce one detector family, add intentionally buggy and clean fixtures, update the manifest, then regenerate module checksums.
+
+**Delivered capability**
+
+- **Archive extraction traversal:** Python, Go, Java, Ruby, C#, Swift, C++, Elixir, Kotlin, JS/TS, and Rust received zip-slip style extraction checks ([`75ea78c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/75ea78c), [`008f1ef`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/008f1ef), [`0cae370`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/0cae370), [`78c8f4e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/78c8f4e)).
+- **Request-derived path traversal:** JS/TS, Python, Go, C/C++, Java, Ruby, C#, Swift, Elixir, and Kotlin now recognize common request/header/route-derived filesystem sinks ([`f2d7477`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f2d7477), [`39e40d7`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/39e40d7), [`876b87a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/876b87a), [`d6ae4de`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/d6ae4de), [`817c395`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/817c395)).
+- **SSRF:** Go, Java/Kotlin, Ruby, C#, Swift, Elixir, C/C++, Rust, and JS/TS picked up request-derived outbound URL detection, including host/header sources and reverse proxy target flows ([`5310071`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/5310071), [`6c96eeb`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6c96eeb), [`64a6a22`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/64a6a22), [`a8d859f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/a8d859f), [`868a781`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/868a781)).
+- **Open redirects:** C/C++, Elixir, Swift, Ruby, C#, Java/Kotlin, Go, Rust, Python, and JS/TS now detect request-derived redirect targets ([`f66395a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f66395a), [`867146e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/867146e), [`42aa7ca`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/42aa7ca), [`5fadcc3`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/5fadcc3)).
+- **Response header injection:** Rust, Go, Java/Kotlin, C#, Ruby, Swift, Elixir, C/C++, and JS/TS received request-derived header sink detection, plus follow-up fixes for multiline Java/Kotlin sinks ([`9d54688`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/9d54688), [`3e0ef11`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3e0ef11), [`b78839c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b78839c), [`ccff15c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/ccff15c), [`c554c3e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c554c3e)).
+
+**Closed workstreams**
+
+- Lightweight taint analysis (`ultimate_bug_scanner-4jg`) provided the underlying model for many of these request-derived sink rules.
+- Resource lifecycle and type narrowing packs continued supplying helper coverage for languages where pure regex is too noisy.
+
+### Secrets, Randomness, JWT, CORS, and Cookie Hardening
+
+The next security wave targeted classes where simple grep is usually noisy unless narrowed by context: hardcoded credentials, security-sensitive randomness, secret comparisons, JWT parse/decode misuse, issuer/audience validation, cookie settings, and credentialed CORS.
+
+**Delivered capability**
+
+- Detect security-sensitive non-crypto randomness in Elixir, Ruby, Java/Kotlin, C#, Swift, C/C++, JS/TS, and related fixtures ([`2911f58`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/2911f58), [`054d692`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/054d692), [`41c507b`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/41c507b), [`a0f1e25`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/a0f1e25)).
+- Add hardcoded-secret detectors and environment-fallback follow-ups for JS/TS, Elixir, Rust, Go, Java/Kotlin, Ruby, Swift, and C# ([`1044a09`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/1044a09), [`f72212b`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/f72212b), [`c39b4b2`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c39b4b2), [`cdb6ffe`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/cdb6ffe)).
+- Detect non-constant secret comparisons in JS/TS, Go, and Rust ([`7ad487e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/7ad487e), [`61639f3`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/61639f3), [`1eb42a3`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/1eb42a3)).
+- Add JWT parse/decode verification bypass and issuer/audience binding checks for Go, Rust, and JS/TS ([`52be770`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/52be770), [`d23de5d`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/d23de5d), [`c823e4f`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c823e4f), [`8a61546`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/8a61546)).
+- Expand credentialed wildcard CORS and insecure auth/session cookie checks in JS/TS, Go, Rust, and Python ([`ed9fcbd`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/ed9fcbd), [`2e44bb5`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/2e44bb5), [`872ddeb`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/872ddeb), [`88e881c`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/88e881c)).
+
+### SQL Injection and Route-Parameter Taint Follow-Up
+
+The latest tag-only slice (`v5.2.68` - `v5.2.75`) focused on request-derived SQL injection in Rust, Go, and TypeScript. This is the newest capability area and should be inspected first when cutting the next GitHub Release.
+
+**Delivered capability**
+
+- TypeScript raw SQL detection now tracks tainted strings from request parameters, including destructured route params and `params.<name>` patterns common in modern app routers ([`039e94e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/039e94e), [`0a77f0a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/0a77f0a), [`6cb0180`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6cb0180)).
+- Go SQL injection detection now treats `r.PathValue(...)`, request fields, and related request-derived values as tainted SQL sources; follow-up fixes preserve detection even when placeholders are present ([`933f440`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/933f440), [`6c45624`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6c45624), [`bb9e705`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/bb9e705)).
+- Rust SQL injection detection catches request-derived raw query construction and placeholder-masked tainted SQL strings ([`3fc8537`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3fc8537)).
+
+### Runner, Installer, Output, and Integrity Work
+
+While detector coverage expanded, the project also hardened distribution and agent-facing operation.
+
+**Delivered capability**
+
+- Pin module fetches to the installed release tag after the `v5.1.2` checksum mismatch regression, while preserving update checks against the current upstream version ([`v5.1.2`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.1.2)).
+- Keep module and helper SHA-256 checksums current after detector/helper edits; later work added version/tag drift checks and release closeout scripts.
+- Add TOON output and `tru` integration with graceful fallback, plus README/help updates for token-efficient agent consumption.
+- Improve CLI UX and automation surfaces such as `--version`, JSONL output, and Beads export helper behavior.
+- Expand installer handling for `ast-grep` requirements, checksum auto-fix, install smoke tests, and secure distribution documentation.
+
+**Closed workstreams**
+
+- Runner and installer compatibility (`ultimate_bug_scanner-fbq`, `ultimate_bug_scanner-install-ast-grep-required`, `ultimate_bug_scanner-e3m`, `ultimate_bug_scanner-6q2`, `ultimate_bug_scanner-fln`).
+- TOON output and encoder integration (`ultimate_bug_scanner-1tc`, `ultimate_bug_scanner-2kp`, `ultimate_bug_scanner-9vy`, `ultimate_bug_scanner-psu`).
+- Release workflow and supply-chain docs (`ultimate_bug_scanner-1de`), with secure distribution work still tracked separately as in progress.
+
+### Notes for Future Agents
+
+- Do not infer release status from tags. `v5.2.75` is the newest tag; `v5.2.61` is the newest GitHub Release at the time of this update.
+- The recent version train is intentionally granular: most tags represent one detector slice plus fixtures, manifest updates, version bump, and checksum refresh.
+- For a release cut after this changelog, inspect `v5.2.62...v5.2.75` first because those commits are tag-only and not yet represented by GitHub Release assets.
+- The Beads tracker captures the larger workstreams; the newest detector slices are mostly evidenced directly by git commits and tags.
+
+**Full diff:** [`v5.1.2...v5.2.75`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/v5.1.2...v5.2.75)
+
+---
+
 ## [v5.1.2] - 2026-04-25 **[Release]**
 
 ### Bug fix
@@ -33,7 +198,7 @@ UBS now scans C# codebases, bringing the total to 9 supported languages.
 
 - Multi-file scanning with `--files` flag for targeted analysis ([`9ce7471`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/9ce7471b51e24c632e9b5ff4cc0f0ad938ed3bde))
 - TOON format output (`--format=toon`) for ~50% smaller token cost via the `tru` encoder ([`5e9cee8`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/5e9cee81ab5241473fd0cf37fbed4668fe303f45))
-- `TOON_BIN` env var support for `toon_rust` (`tru`) binary ([`6ab8f16`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6ab8f16b79d9c06ea3b7a9b75e4bcf3e3b17bffc))
+- `TOON_BIN` env var support for `toon_rust` (`tru`) binary ([`6ab8f16`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/6ab8f16))
 - `--skip-size-check` flag and `load_ignore_patterns` for `.ubsignore`-aware size calculation ([`c27235e`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c27235e219e40ea4acd99327fcd3d13b6cd1e983))
 - Add Claude Code `SKILL.md` for automatic capability discovery ([`a59f7bb`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/a59f7bba4d66cc2759f074f89a35c66bb37cf470))
 
@@ -63,9 +228,9 @@ UBS now scans C# codebases, bringing the total to 9 supported languages.
 - Remove nonexistent `ubs-c.sh` module reference from `ALL_LANGS` ([`11dd82a`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/11dd82a85a11bd89e2568253f6b64c89a4e876ba))
 - Improve shell script robustness and detection patterns ([`3d9dc12`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/3d9dc127d4ae829203a83e93e71189515f78bbbe))
 - Add safety guards to prevent disk exhaustion (#12) ([`b9f3982`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b9f39825f99b1eedd1d2be75a3b75ed9902c0f2f))
-- Validate `du` output is numeric before size comparison ([`dbd1da0`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/dbd1da0e58c82b8b5f4fb7f6f26f2e3e0df32abb))
-- Initialize helpers before scan ([`b0228a4`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b0228a467e0aed3be16e76f32c56f7c93e5f5e07))
-- Migrate Codex rules to directory format for v0.77.0+ ([`c8f2672`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c8f2672bc7bcb2015b50b3b3bfb2aaa7b998ccd5))
+- Validate `du` output is numeric before size comparison ([`dbd1da0`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/dbd1da0))
+- Initialize helpers before scan ([`b0228a4`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/b0228a4))
+- Migrate Codex rules to directory format for v0.77.0+ ([`c8f2672`](https://github.com/Dicklesworthstone/ultimate_bug_scanner/commit/c8f2672))
 
 ### Continuous Integration
 
@@ -484,7 +649,10 @@ Deep type safety checks that detect missing null guards and type checks:
 ---
 
 <!-- Link references -->
-[Unreleased]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/v5.0.7...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/v5.2.75...HEAD
+[v5.2.75]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/tree/v5.2.75
+[v5.2.61]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.2.61
+[v5.1.2]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.1.2
 [v5.0.7]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.0.7
 [v5.0.6]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.0.6
 [v5.0.5]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.0.5
@@ -498,4 +666,4 @@ Deep type safety checks that detect missing null guards and type checks:
 [v4.6.3]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/v4.6.2...v4.6.3
 [v4.6.2]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/v4.6.1...v4.6.2
 [v4.6.1]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/v4.6.0...v4.6.1
-[v4.6.0]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/compare/689c581...v4.6.0
+[v4.6.0]: https://github.com/Dicklesworthstone/ultimate_bug_scanner/tree/v4.6.0

@@ -44,7 +44,7 @@ shopt -s extglob
 RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; GRAY=""
 BOLD=""; DIM=""; RESET=""
 
-VERSION="7.1.2"
+VERSION="7.1.3"
 
 # Color-safe error trap (works before colors are initialized)
 on_err() {
@@ -113,7 +113,7 @@ declare -A ASYNC_ERROR_SEVERITY=(
 TAINT_RULE_IDS=(go.taint.xss go.taint.sql go.taint.command)
 declare -A TAINT_SUMMARY=(
   [go.taint.xss]='User input flows into fmt.Fprintf/template Execute/ResponseWriter.Write'
-  [go.taint.sql]='User input concatenated into db.Exec/db.Query SQL strings'
+  [go.taint.sql]='User input concatenated into SQL execution/query-builder strings'
   [go.taint.command]='User input reaches exec.Command/CommandContext'
 )
 declare -A TAINT_REMEDIATION=(
@@ -756,11 +756,17 @@ PATH_LIMIT = 6
 
 SOURCE_PATTERNS = [
     re.compile(r"\.FormValue\(", re.IGNORECASE),
+    re.compile(r"\.PostFormValue\(", re.IGNORECASE),
+    re.compile(r"\.(?:Form|PostForm)\.Get\(", re.IGNORECASE),
+    re.compile(r"\.Header\.Get\(", re.IGNORECASE),
     re.compile(r"URL\.Query\(\)\.Get", re.IGNORECASE),
+    re.compile(r"mux\.Vars\(", re.IGNORECASE),
+    re.compile(r"chi\.URLParam\(", re.IGNORECASE),
+    re.compile(r"\.(?:QueryParam|FormParam|Param)\(", re.IGNORECASE),
     re.compile(r"os\.Getenv", re.IGNORECASE),
     re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
-    re.compile(r"io\.ReadAll\([^)]*req\.Body", re.IGNORECASE),
-    re.compile(r"json\.NewDecoder\([^)]*req\.Body", re.IGNORECASE),
+    re.compile(r"io\.ReadAll\([^)]*(?:r|req|request)\.Body", re.IGNORECASE),
+    re.compile(r"json\.NewDecoder\([^)]*(?:r|req|request)\.Body", re.IGNORECASE),
 ]
 
 SANITIZER_REGEXES = [
@@ -775,7 +781,8 @@ SINKS = [
     (re.compile(r"fmt\.Fprint[fLn]?\s*\((.+)\)"), 'go.taint.xss', 'fmt.Fprintf'),
     (re.compile(r"[A-Za-z0-9_]+\.Write\s*\((.+)\)"), 'go.taint.xss', 'ResponseWriter.Write'),
     (re.compile(r"template\.(?:Must\()?[A-Za-z0-9_]+\.Execute\s*\((.+)\)"), 'go.taint.xss', 'template.Execute'),
-    (re.compile(r"\bdb\.(?:Exec|Query|Raw|NamedQuery)\s*\((.+)\)"), 'go.taint.sql', 'db query'),
+    (re.compile(r"\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?\.(?:Exec|ExecContext|Query|QueryContext|QueryRow|QueryRowContext|Raw|NamedQuery|NamedExec|Select|Where|Or|Not|Having|Order)\s*\((?!\))(.+)\)"), 'go.taint.sql', 'SQL query'),
+    (re.compile(r"\b(?:db|tx|conn|pool|repo|store|database|queries|sqlxDB)\.Get\s*\((?!\))(.+)\)"), 'go.taint.sql', 'SQL query'),
     (re.compile(r"exec\.Command(?:Context)?\s*\((.+)\)"), 'go.taint.command', 'exec.Command'),
 ]
 
@@ -833,9 +840,9 @@ def strip_comments(line: str) -> str:
         i += 1
     return ''.join(out).strip()
 
-def parse_assignments(lines):
+def parse_assignments(lines, start_line=1):
     assignments = []
-    for idx, raw in enumerate(lines, start=1):
+    for idx, raw in enumerate(lines, start=start_line):
         line = strip_comments(raw)
         if not line or '=' not in line:
             continue
@@ -861,11 +868,6 @@ def expr_has_sanitizer(expr: str, sink_rule=None) -> bool:
     for regex in SANITIZER_REGEXES:
         if regex.search(expr):
             return True
-    if sink_rule == 'go.taint.sql':
-        if re.search(r"\?", expr) and ',' in expr:
-            return True
-        if re.search(r",\s*(?:\(|args|params|values)\b", expr, re.IGNORECASE):
-            return True
     return False
 
 def expr_has_tainted(expr: str, tainted):
@@ -874,6 +876,103 @@ def expr_has_tainted(expr: str, tainted):
         if re.search(pattern, expr):
             return name, meta
     return None, None
+
+def split_go_args(expr: str):
+    args = []
+    start = 0
+    depth = 0
+    quote = ''
+    escape = False
+    for idx, ch in enumerate(expr):
+        if quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            continue
+        if ch in '([{':
+            depth += 1
+            continue
+        if ch in ')]}' and depth > 0:
+            depth -= 1
+            continue
+        if ch == ',' and depth == 0:
+            args.append(expr[start:idx].strip())
+            start = idx + 1
+    tail = expr[start:].strip()
+    if tail:
+        args.append(tail)
+    return args
+
+def looks_context_arg(arg: str) -> bool:
+    return bool(re.match(
+        r"^(?:ctx|context\.(?:Background|TODO)\(\)|[A-Za-z_][\w]*\.Context\(\))$",
+        arg.strip(),
+    ))
+
+def sql_arg_from_call(expr: str):
+    args = split_go_args(expr)
+    if not args:
+        return ''
+    if len(args) > 1 and looks_context_arg(args[0]):
+        return args[1]
+    return args[0]
+
+def sql_arg_is_parameterized(sql_arg: str) -> bool:
+    return bool(re.search(r"(?:\?|\$\d+|@[A-Za-z_][\w]*|:[A-Za-z_][\w]*)", sql_arg))
+
+def brace_delta(raw: str) -> int:
+    stripped = strip_comments(raw)
+    return stripped.count('{') - stripped.count('}')
+
+def function_ranges(lines):
+    ranges = []
+    start = None
+    depth = 0
+    for idx, raw in enumerate(lines, start=1):
+        stripped = strip_comments(raw)
+        if start is None:
+            if not re.match(r"^\s*func\b", stripped):
+                continue
+            start = idx
+            depth = brace_delta(raw)
+            if depth <= 0:
+                ranges.append((start, idx))
+                start = None
+                depth = 0
+            continue
+        depth += brace_delta(raw)
+        if depth <= 0:
+            ranges.append((start, idx))
+            start = None
+            depth = 0
+    if start is not None:
+        ranges.append((start, len(lines)))
+    return ranges
+
+def analysis_ranges(lines):
+    ranges = function_ranges(lines)
+    if not ranges:
+        return [(1, len(lines))]
+    scoped = []
+    cursor = 1
+    for start, end in ranges:
+        if cursor < start:
+            scoped.append((cursor, start - 1))
+        scoped.append((start, end))
+        cursor = end + 1
+    if cursor <= len(lines):
+        scoped.append((cursor, len(lines)))
+    return [
+        (start, end)
+        for start, end in scoped
+        if any(strip_comments(raw) for raw in lines[start - 1:end])
+    ]
 
 def record_taint(assignments):
     tainted = {}
@@ -906,44 +1005,51 @@ def analyze_file(path: Path, issues):
     except (UnicodeDecodeError, OSError):
         return
     lines = text.splitlines()
-    assignments = parse_assignments(lines)
-    tainted = record_taint(assignments)
-    for idx, raw in enumerate(lines, start=1):
-        stripped = strip_comments(raw)
-        if not stripped:
-            continue
-        for regex, rule, label in SINKS:
-            match = regex.search(stripped)
-            if not match:
+    for start, end in analysis_ranges(lines):
+        scoped_lines = lines[start - 1:end]
+        assignments = parse_assignments(scoped_lines, start)
+        tainted = record_taint(assignments)
+        for idx, raw in enumerate(scoped_lines, start=start):
+            stripped = strip_comments(raw)
+            if not stripped:
                 continue
-            expr = match.group(1)
-            raw_match = regex.search(raw)
-            expr_raw = raw_match.group(1) if raw_match else expr
-            if rule == 'go.taint.sql' and expr_raw and '?' in expr_raw and ',' in expr_raw:
-                continue
-            if not expr or expr_has_sanitizer(expr_raw or expr, rule):
-                continue
-            direct = find_sources(expr)
-            if direct:
-                path_desc = f"{direct[0]} -> {label}"
-            else:
-                ref, meta = expr_has_tainted(expr, tainted)
-                if not ref:
+            for regex, rule, label in SINKS:
+                match = regex.search(stripped)
+                if not match:
                     continue
-                seq = list(meta.get('path', [ref]))
-                if len(seq) >= PATH_LIMIT:
-                    seq = seq[-(PATH_LIMIT-1):]
-                seq.append(label)
-                path_desc = ' -> '.join(seq)
-            try:
-                rel = path.relative_to(BASE_DIR)
-            except ValueError:
-                rel = path.name
-            sample = f"{rel}:{idx} {path_desc}"
-            bucket = issues[rule]
-            bucket['count'] += 1
-            if len(bucket['samples']) < 3:
-                bucket['samples'].append(sample)
+                expr = match.group(1)
+                raw_match = regex.search(raw)
+                expr_raw = raw_match.group(1) if raw_match else expr
+                if not expr or expr_has_sanitizer(expr_raw or expr, rule):
+                    continue
+                taint_expr = expr
+                if rule == 'go.taint.sql':
+                    taint_expr = sql_arg_from_call(expr_raw or expr)
+                    if not taint_expr:
+                        continue
+                    if sql_arg_is_parameterized(taint_expr):
+                        continue
+                direct = find_sources(taint_expr)
+                if direct:
+                    path_desc = f"{direct[0]} -> {label}"
+                else:
+                    ref, meta = expr_has_tainted(taint_expr, tainted)
+                    if not ref:
+                        continue
+                    seq = list(meta.get('path', [ref]))
+                    if len(seq) >= PATH_LIMIT:
+                        seq = seq[-(PATH_LIMIT-1):]
+                    seq.append(label)
+                    path_desc = ' -> '.join(seq)
+                try:
+                    rel = path.relative_to(BASE_DIR)
+                except ValueError:
+                    rel = path.name
+                sample = f"{rel}:{idx} {path_desc}"
+                bucket = issues[rule]
+                bucket['count'] += 1
+                if len(bucket['samples']) < 3:
+                    bucket['samples'].append(sample)
 
 issues = defaultdict(lambda: {'count': 0, 'samples': []})
 for file_path in iter_files(ROOT):

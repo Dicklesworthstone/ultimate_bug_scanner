@@ -4775,7 +4775,7 @@
     },
     {
       "id": "golang-taint-buggy",
-      "description": "Go taint analysis regression (FormValue -> fmt.Fprintf/db.Exec/exec.Command).",
+      "description": "Go taint analysis regression (request/form/header values -> fmt.Fprintf, SQL execution/query-builder strings, and exec.Command).",
       "path": "test-suite/golang/buggy/taint_analysis.go",
       "language": "golang",
       "tags": [
@@ -4802,7 +4802,7 @@
     },
     {
       "id": "golang-taint-clean",
-      "description": "Go taint analysis clean baseline (escaped HTML, parameterized SQL, safe exec.Command args).",
+      "description": "Go taint analysis clean baseline (escaped HTML, parameterized SQL/query builders, safe exec.Command args).",
       "path": "test-suite/golang/clean/taint_analysis.go",
       "language": "golang",
       "tags": [

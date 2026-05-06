@@ -6,6 +6,8 @@
 | `buggy/buggy_concurrency.go` | Concurrency handling | goroutines ignoring errors, WaitGroup misuse |
 | `buggy/resource_lifecycle.go` | Resource lifecycle | context leaks, missing cancel() |
 | `buggy/security_sql.go` | SQL/command injection + http.Client default | string concatenated SQL, exec.Command("sh -c"), no timeout |
+| `buggy/taint_analysis.go` | Request taint analysis | request/form/header values reaching XSS, SQL execution/query-builder strings, and command sinks |
+| `clean/taint_analysis.go` | Request taint analysis | escaped HTML, parameterized SQL/query-builder calls, and cleaned command args |
 | `security/path_traversal_buggy.go` | Request path traversal | request/query/path/upload filenames reaching `os.*` and `http.ServeFile` sinks |
 | `security/path_traversal_clean.go` | Request path traversal | `filepath.Rel` containment and `filepath.Base` filename sanitization before file sinks |
 | `security/header_injection_buggy.go` | Response header injection | request query/form/header/framework values reaching response headers without CR/LF validation |

@@ -2246,6 +2246,311 @@ show_unbounded_request_body_examples() {
   [[ "$printed" -gt 0 ]]
 }
 
+js_request_regex_matches() {
+  python3 - "$PROJECT_DIR" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
+
+source_re = re.compile(
+    r'\b(?:req|request|ctx|context|event)\.(?:body|query|params|headers|cookies|nextUrl|url)\b'
+    r'|\b(?:req|request|ctx|context)\.(?:get|header|param|query)\s*\('
+    r'|\b(?:searchParams|queryParams|URLSearchParams)\.(?:get|getAll)\s*\('
+    r'|\bnew\s+URL\s*\([^)]*(?:req|request|event)\b',
+    re.IGNORECASE,
+)
+sink_re = re.compile(r'(?<![A-Za-z0-9_$.])(?:new\s+)?RegExp\s*\(')
+assign_re = re.compile(r'^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=\s*(.+)$')
+simple_assign_re = re.compile(r'^\s*([A-Za-z_$][\w$]*)\s*=\s*(?![=>=])(.+)$')
+destructure_re = re.compile(r'^\s*(?:const|let|var)\s*\{([^}]+)\}\s*=\s*(.+)$')
+safe_re = re.compile(
+    r'\b(?:RegExp\.escape|escapeRegExp|escapeRegex|regexpEscape|regexEscape|'
+    r'sanitizeRegex|sanitizeRegExp|safeRegex|safeRegExp|validateRegex|validateRegExp|'
+    r'allowedRegex|allowedRegExp|isAllowedRegex|isSafeRegex|assertSafeRegex)[A-Za-z0-9_$]*\s*\('
+    r'|\b(?:ALLOWED|Allowed|allowed)[A-Za-z0-9_$]*\.(?:has|includes)\s*\(',
+    re.IGNORECASE,
+)
+
+def iter_files(path: Path):
+    if path.is_file():
+        if path.suffix.lower() in exts:
+            yield path
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            candidate = Path(dirpath) / fname
+            if candidate.suffix.lower() in exts:
+                yield candidate
+
+def strip_line_comments(line: str) -> str:
+    out = []
+    quote = ''
+    escape = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        nxt = line[i + 1] if i + 1 < len(line) else ''
+        if quote:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '/' and nxt == '/':
+            break
+        if ch == '/' and nxt == '*':
+            i += 2
+            while i + 1 < len(line) and not (line[i] == '*' and line[i + 1] == '/'):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+def statement_from(lines, index, max_lines=14):
+    parts = []
+    paren = brace = bracket = 0
+    for offset in range(index, min(len(lines), index + max_lines)):
+        current = strip_line_comments(lines[offset]).strip()
+        if not current:
+            continue
+        parts.append(current)
+        paren += current.count('(') - current.count(')')
+        brace += current.count('{') - current.count('}')
+        bracket += current.count('[') - current.count(']')
+        if offset > index and paren <= 0 and brace <= 0 and bracket <= 0:
+            break
+        if ';' in current and paren <= 0 and brace <= 0 and bracket <= 0:
+            break
+    return ' '.join(parts)
+
+def split_top_level(text: str):
+    parts = []
+    current = []
+    depth = 0
+    quote = ''
+    escape = False
+    for ch in text:
+        if quote:
+            current.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            current.append(ch)
+            continue
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth = max(0, depth - 1)
+        elif ch == ',' and depth == 0:
+            parts.append(''.join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    tail = ''.join(current).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+def names_from_destructure(blob: str):
+    names = []
+    for part in split_top_level(blob):
+        token = part.strip().split('=')[0].strip()
+        if ':' in token:
+            token = token.split(':', 1)[1].strip()
+        if token.startswith('...'):
+            token = token[3:].strip()
+        if re.match(r'^[A-Za-z_$][\w$]*$', token):
+            names.append(token)
+    return names
+
+def mask_literals(expr: str):
+    out = []
+    quote = ''
+    escape = False
+    template_expr_depth = 0
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        nxt = expr[i + 1] if i + 1 < len(expr) else ''
+        if quote:
+            if quote == '`' and ch == '$' and nxt == '{':
+                out.append(' ')
+                out.append(' ')
+                i += 2
+                quote = ''
+                template_expr_depth = 1
+                continue
+            out.append(' ')
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if template_expr_depth:
+            out.append(ch)
+            if ch in ('"', "'", '`'):
+                quote = ch
+            elif ch == '{':
+                template_expr_depth += 1
+            elif ch == '}':
+                template_expr_depth -= 1
+                if template_expr_depth == 0:
+                    quote = '`'
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            out.append(' ')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+def refs(expr: str, tainted: set[str]):
+    haystack = mask_literals(expr)
+    return [name for name in tainted if re.search(rf'(?<![A-Za-z0-9_$]){re.escape(name)}(?![A-Za-z0-9_$])', haystack)]
+
+def is_safe(expr: str):
+    return bool(safe_re.search(expr))
+
+def has_ignore(lines, index):
+    return (
+        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
+    ) or (
+        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
+    )
+
+def sink_arg(statement: str):
+    match = sink_re.search(statement)
+    if not match:
+        return ''
+    start = match.end()
+    depth = 1
+    quote = ''
+    escape = False
+    for pos in range(start, len(statement)):
+        ch = statement[pos]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                args = split_top_level(statement[start:pos])
+                return args[0] if args else ''
+    return ''
+
+def source_line(lines, index):
+    return lines[index].strip().replace('\t', ' ')
+
+def analyze(path: Path, issues):
+    try:
+        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+    except OSError:
+        return
+    text = '\n'.join(lines)
+    if not (source_re.search(text) and sink_re.search(text)):
+        return
+    tainted: set[str] = set()
+    seen = set()
+    for idx, raw in enumerate(lines):
+        stripped = strip_line_comments(raw).strip()
+        if not stripped or has_ignore(lines, idx):
+            continue
+        statement = statement_from(lines, idx)
+        if not statement or 'ubs:ignore' in statement:
+            continue
+        destruct = destructure_re.match(statement)
+        if destruct:
+            rhs = destruct.group(2)
+            names = names_from_destructure(destruct.group(1))
+            if source_re.search(rhs) or refs(rhs, tainted):
+                tainted.update(names)
+            elif is_safe(rhs):
+                tainted.difference_update(names)
+        assign = assign_re.match(statement) or simple_assign_re.match(statement)
+        if assign:
+            name, rhs = assign.groups()
+            if is_safe(rhs):
+                tainted.discard(name)
+            elif source_re.search(rhs) or refs(rhs, tainted):
+                tainted.add(name)
+        if not sink_re.search(statement):
+            continue
+        arg = sink_arg(statement)
+        if not arg or is_safe(arg):
+            continue
+        if not (source_re.search(arg) or refs(arg, tainted)):
+            continue
+        key = (path, idx + 1)
+        if key in seen:
+            continue
+        seen.add(key)
+        issues.append((path, idx + 1, source_line(lines, idx)))
+
+issues = []
+for file_path in iter_files(root):
+    analyze(file_path, issues)
+
+for path, line_no, code in issues:
+    print(f"{path}:{line_no}:{code}")
+PY
+}
+
+count_request_regex_matches() {
+  js_request_regex_matches | count_lines || true
+}
+
+show_request_regex_examples() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  local printed=0
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(js_request_regex_matches | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
 # Temporarily relax pipefail for grep-heavy scans to avoid ERR on 1/no-match
 begin_scan_section(){
   if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi
@@ -4878,7 +5183,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if should_skip 7; then
 print_header "7. SECURITY VULNERABILITIES"
-print_category "Detects: Code injection, XSS, SQL injection, prototype pollution, timing attacks, unbounded request body reads" \
+print_category "Detects: Code injection, XSS, SQL injection, prototype pollution, timing attacks, unbounded request body reads, request-controlled regex patterns" \
   "Security bugs expose users to attacks and data breaches"
 
 print_subheader "eval() usage (CRITICAL SECURITY RISK)"
@@ -8284,6 +8589,14 @@ count=$("${GREP_RN[@]}" -e "new RegExp\(" "$PROJECT_DIR" 2>/dev/null | count_lin
 complex_regex=$("${GREP_RN[@]}" -e "\([^)]*\+[^)]*\)\+|\([^)]*\*[^)]*\)\+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$complex_regex" -gt 5 ]; then
   print_finding "warning" "$complex_regex" "Complex regex patterns - ReDoS risk" "Nested quantifiers can hang on crafted input"
+fi
+request_regex_hits=$(count_request_regex_matches || echo 0)
+request_regex_hits=$(printf '%s\n' "${request_regex_hits:-0}" | awk 'END{print $0+0}')
+if [ "$request_regex_hits" -gt 0 ]; then
+  print_finding "warning" "$request_regex_hits" "Request-controlled regex pattern reaches regex engine" "Escape user-controlled pattern fragments with RegExp.escape/escapeRegExp or validate against an allow-list before compiling"
+  show_request_regex_examples "$DETAIL_LIMIT" || true
+else
+  print_finding "good" "No request-controlled RegExp construction detected"
 fi
 
 run_taint_analysis_checks

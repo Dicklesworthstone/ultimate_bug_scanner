@@ -6733,12 +6733,264 @@ PY
   )
 }
 
+run_request_regex_checks() {
+  print_subheader "Request-controlled regex patterns"
+  if ! command -v python3 >/dev/null 2>&1; then
+    print_finding "info" 0 "python3 not available" "Install python3 to enable request-controlled regex checks"
+    return
+  fi
+  local printed=0
+  while IFS=$'\t' read -r tag a b c; do
+    case "$tag" in
+      __COUNT__)
+        if [[ "$a" -gt 0 ]]; then
+          print_finding "warning" "$a" "Request-controlled regex pattern reaches regex engine" "Escape pattern fragments with regexp.QuoteMeta or validate against an allow-list before regexp.Compile/Match"
+        else
+          print_finding "good" "No request-controlled regex compilation detected"
+        fi
+        ;;
+      __SAMPLE__)
+        if [[ "$printed" -lt "$DETAIL_LIMIT" && "$printed" -lt "$MAX_DETAILED" ]]; then
+          print_code_sample "$a" "$b" "$c"
+          printed=$((printed + 1))
+        fi
+        ;;
+    esac
+  done < <(python3 - "$PROJECT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(sys.argv[1]).resolve()
+BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
+SKIP_DIRS = {'.git', 'vendor', 'node_modules', '.cache', 'bin', 'build', 'dist'}
+
+SOURCE_RE = re.compile(
+    r'\br\.URL\.Query\(\)\.Get\s*\('
+    r'|\br\.(?:FormValue|PostFormValue|PathValue)\s*\('
+    r'|\b(?:r|req|request)\.Header\.(?:Get|Values)\s*\('
+    r'|\b(?:r|req|request)\.Header\s*\['
+    r'|\b(?:chi\.URLParam|mux\.Vars)\s*\('
+    r'|\b(?:c|ctx|context)\.(?:Param|Query|QueryParam|FormValue|PostForm|GetHeader)\s*\('
+    r'|\b(?:c|ctx|context)\.Request\(\)\.Header\.(?:Get|Values)\s*\(',
+    re.IGNORECASE,
+)
+SINK_RE = re.compile(
+    r'\bregexp\.(?:Compile|CompilePOSIX|MustCompile|MustCompilePOSIX|MatchString|Match)\s*\('
+)
+SAFE_RE = re.compile(
+    r'\bregexp\.QuoteMeta\s*\('
+    r'|\b(?:escapeRegex|escapeRegexp|sanitizeRegex|sanitizeRegexp|safeRegex|safeRegexp|'
+    r'validateRegex|validateRegexp|allowedRegex|allowedRegexp|isSafeRegex|isAllowedRegex)[A-Za-z0-9_]*\s*\('
+    r'|\b(?:allowed|Allowed|ALLOWED)[A-Za-z0-9_]*\s*\['
+    r'|\b(?:allowed|Allowed|ALLOWED)[A-Za-z0-9_]*\.(?:Contains|Has|Lookup)\s*\(',
+    re.IGNORECASE,
+)
+ASSIGN_RE = re.compile(r'^\s*(?:var\s+)?(?P<lhs>[A-Za-z_][A-Za-z0-9_,\s]*)\s*(?::=|=)\s*(?P<rhs>.+)$')
+IDENT_RE = re.compile(r'\b[A-Za-z_][A-Za-z0-9_]*\b')
+PATH_LIMIT = 4
+
+def should_skip(path: Path) -> bool:
+    return any(part in SKIP_DIRS for part in path.parts)
+
+def iter_files(root: Path):
+    if root.is_file():
+        if root.suffix.lower() == '.go':
+            yield root
+        return
+    for path in root.rglob('*.go'):
+        if path.is_file() and not should_skip(path):
+            yield path
+
+def strip_line_comments(line: str) -> str:
+    out = []
+    quote = ''
+    escape = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
+            break
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+def logical_statement(lines, line_no):
+    idx = line_no - 1
+    statement = strip_line_comments(lines[idx])
+    balance = statement.count('(') - statement.count(')')
+    lookahead = idx + 1
+    while balance > 0 and lookahead < len(lines) and lookahead < idx + 10:
+        next_line = strip_line_comments(lines[lookahead])
+        statement += ' ' + next_line.strip()
+        balance += next_line.count('(') - next_line.count(')')
+        lookahead += 1
+    return statement
+
+def has_ignore(lines, line_no):
+    idx = line_no - 1
+    return (
+        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
+    ) or (
+        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
+    )
+
+def relpath(path: Path) -> str:
+    try:
+        return str(path.relative_to(BASE_DIR))
+    except ValueError:
+        return str(path)
+
+def source_line(lines, line_no):
+    idx = line_no - 1
+    if 0 <= idx < len(lines):
+        return lines[idx].strip().replace('\t', ' ')
+    return ''
+
+def lhs_names(lhs):
+    names = []
+    for part in lhs.split(','):
+        name = part.strip()
+        if name and name != '_' and IDENT_RE.fullmatch(name):
+            names.append(name)
+    return names
+
+def refs_in_expr(expr, tainted):
+    refs = []
+    for name in tainted:
+        if re.search(rf'\b{re.escape(name)}\b', expr):
+            refs.append(name)
+    return refs
+
+def taint_from_expr(expr, tainted):
+    if SAFE_RE.search(expr):
+        return None
+    direct = SOURCE_RE.search(expr)
+    if direct:
+        return {'path': [direct.group(0).strip('(')]}
+    refs = refs_in_expr(expr, tainted)
+    if not refs:
+        return None
+    ref = refs[0]
+    path = list(tainted.get(ref, {}).get('path', [ref]))
+    if len(path) >= PATH_LIMIT:
+        path = path[-(PATH_LIMIT - 1):]
+    path.append(ref)
+    return {'path': path}
+
+def first_arg(statement):
+    match = SINK_RE.search(statement)
+    if not match:
+        return ''
+    start = match.end()
+    depth = 1
+    quote = ''
+    escape = False
+    for pos in range(start, len(statement)):
+        ch = statement[pos]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return statement[start:pos].split(',', 1)[0].strip()
+        elif ch == ',' and depth == 1:
+            return statement[start:pos].strip()
+    return ''
+
+def analyze(path, issues):
+    try:
+        text = path.read_text(encoding='utf-8', errors='ignore')
+    except OSError:
+        return
+    if not (SOURCE_RE.search(text) and SINK_RE.search(text)):
+        return
+    lines = text.splitlines()
+    tainted = {}
+    seen = set()
+    for idx, raw in enumerate(lines, start=1):
+        if has_ignore(lines, idx):
+            continue
+        line = logical_statement(lines, idx).strip()
+        if not line:
+            continue
+        assign = ASSIGN_RE.match(line)
+        if assign:
+            names = lhs_names(assign.group('lhs'))
+            rhs = assign.group('rhs')
+            taint = taint_from_expr(rhs, tainted)
+            if taint:
+                for name in names:
+                    tainted[name] = taint
+            elif SAFE_RE.search(rhs):
+                for name in names:
+                    tainted.pop(name, None)
+        if not SINK_RE.search(line):
+            continue
+        arg = first_arg(line)
+        if not arg or SAFE_RE.search(arg):
+            continue
+        direct = SOURCE_RE.search(arg)
+        refs = refs_in_expr(arg, tainted)
+        if not direct and not refs:
+            continue
+        key = (relpath(path), idx)
+        if key in seen:
+            continue
+        seen.add(key)
+        if direct:
+            path_desc = f"{direct.group(0).strip('(')} -> regex engine"
+        else:
+            ref = refs[0]
+            seq = list(tainted.get(ref, {}).get('path', [ref]))
+            if len(seq) >= PATH_LIMIT:
+                seq = seq[-(PATH_LIMIT - 1):]
+            seq.append('regex engine')
+            path_desc = ' -> '.join(seq)
+        issues.append((relpath(path), idx, f"{source_line(lines, idx)}  [{path_desc}]"))
+
+issues = []
+for file_path in iter_files(ROOT):
+    analyze(file_path, issues)
+print(f"__COUNT__\t{len(issues)}")
+for file_name, line_no, code in issues[:25]:
+    print(f"__SAMPLE__\t{file_name}\t{line_no}\t{code}")
+PY
+  )
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 9: CRYPTOGRAPHY & SECURITY
 # ═══════════════════════════════════════════════════════════════════════════
 if should_skip 9; then
 print_header "9. CRYPTOGRAPHY & SECURITY"
-print_category "Detects: weak hashes, security-sensitive non-crypto randomness, timing-unsafe secret comparisons, JWT verification bypasses, InsecureSkipVerify, auth cookie flags, credentialed CORS, shell exec, dynamic SQL strings, request path traversal, response header injection, open redirects, outbound URL SSRF, reverse proxy SSRF, unsafe archive extraction" \
+print_category "Detects: weak hashes, security-sensitive non-crypto randomness, timing-unsafe secret comparisons, JWT verification bypasses, InsecureSkipVerify, auth cookie flags, credentialed CORS, shell exec, dynamic SQL strings, request-controlled regex patterns, request path traversal, response header injection, open redirects, outbound URL SSRF, reverse proxy SSRF, unsafe archive extraction" \
   "Security footguns are easy to miss and costly to fix"
 
 print_subheader "Weak hashes (md5/sha1) and RC4"
@@ -6751,6 +7003,7 @@ run_constant_time_compare_checks
 run_jwt_verification_checks
 run_cookie_security_checks
 run_cors_credentials_checks
+run_request_regex_checks
 
 print_subheader "TLS InsecureSkipVerify=true"
 count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.tls-insecure-skip" || echo 0)

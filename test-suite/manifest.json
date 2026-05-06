@@ -3907,6 +3907,69 @@
       }
     },
     {
+      "id": "js-typescript-redos-regex-buggy",
+      "description": "TypeScript request/query/body values should not be compiled as regular expressions without escaping or allow-list validation.",
+      "path": "test-suite/js/security/redos-regex-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "regex",
+        "redos",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Request-controlled regex pattern reaches regex engine"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-redos-regex-clean",
+      "description": "TypeScript regex construction that escapes user fragments, uses fixed patterns, or routes through allow-listed pattern helpers should stay clean.",
+      "path": "test-suite/js/security/redos-regex-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "regex",
+        "redos",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Request-controlled regex pattern reaches regex engine"
+        ]
+      }
+    },
+    {
       "id": "js-typescript-ssrf-fetch-buggy",
       "description": "TypeScript outbound HTTP clients should not fetch request-derived or host-derived URLs without allow-list validation.",
       "path": "test-suite/js/security/ssrf-fetch-buggy.ts",
@@ -4895,6 +4958,67 @@
             "max": 2
           }
         }
+      }
+    },
+    {
+      "id": "golang-redos-regex-buggy",
+      "description": "Go request/query/header/route values should not be compiled or matched as regular expressions without escaping or allow-list validation.",
+      "path": "test-suite/golang/security/redos_regex_buggy.go",
+      "language": "golang",
+      "tags": [
+        "golang",
+        "security",
+        "regex",
+        "redos",
+        "buggy"
+      ],
+      "args": [
+        "--only=golang",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17,18,19,20,21,22"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Request-controlled regex pattern reaches regex engine"
+        ]
+      }
+    },
+    {
+      "id": "golang-redos-regex-clean",
+      "description": "Go regex construction with regexp.QuoteMeta, fixed patterns, or allow-listed pattern helpers should stay clean.",
+      "path": "test-suite/golang/security/redos_regex_clean.go",
+      "language": "golang",
+      "tags": [
+        "golang",
+        "security",
+        "regex",
+        "redos",
+        "clean"
+      ],
+      "args": [
+        "--only=golang",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17,18,19,20,21,22"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Request-controlled regex pattern reaches regex engine"
+        ]
       }
     },
     {
@@ -7483,6 +7607,69 @@
         },
         "forbid_substrings": [
           "Request-controlled value reaches HTTP response header"
+        ]
+      }
+    },
+    {
+      "id": "rust-redos-regex-buggy",
+      "description": "Rust request/query/header/path values should not be compiled into Regex, RegexBuilder, or RegexSet without escaping or allow-list validation.",
+      "path": "test-suite/rust/buggy/redos_regex.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "regex",
+        "redos",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Request-controlled regex pattern reaches regex engine"
+        ]
+      }
+    },
+    {
+      "id": "rust-redos-regex-clean",
+      "description": "Rust regex construction with regex::escape, fixed patterns, or allow-listed pattern helpers should stay clean.",
+      "path": "test-suite/rust/clean/redos_regex.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "regex",
+        "redos",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Request-controlled regex pattern reaches regex engine"
         ]
       }
     },

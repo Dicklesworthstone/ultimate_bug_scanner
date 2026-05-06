@@ -3356,6 +3356,306 @@ collect_samples_sql_injection() {
   printf ']'
 }
 
+rust_request_regex_matches() {
+  [[ "$have_python3" -eq 1 ]] || return 1
+  python3 - "$PROJECT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+skip_dirs = {".git", "target", ".cargo", "node_modules"}
+
+source_re = re.compile(
+    r'\b(?:params|query|form|body|json|payload|data|input)\s*\.\s*get\s*\('
+    r'|\b(?:req|request|http_request)\s*\.\s*(?:query_string|uri|headers|header|param|query|path|match_info)\s*\('
+    r'|\b(?:headers|header_map)\s*\.\s*get\s*\('
+    r'|\bPath\s*\('
+    r'|\b(?:std::)?env::args(?:_os)?\s*\(',
+    re.IGNORECASE,
+)
+sink_re = re.compile(
+    r'\b(?:(?:regex::)?Regex|(?:regex::)?RegexBuilder|(?:regex::)?RegexSet)\s*::\s*new\s*\(',
+    re.IGNORECASE,
+)
+assign_re = re.compile(
+    r'^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?'
+    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)$'
+)
+path_extractor_re = re.compile(r'\bPath\s*\(\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*:\s*Path\b')
+safe_re = re.compile(
+    r'\b(?:regex::)?escape\s*\('
+    r'|\b(?:escape_regex|escape_regexp|sanitize_regex|sanitize_regexp|safe_regex|safe_regexp|'
+    r'validate_regex|validate_regexp|allowed_regex|allowed_regexp|is_safe_regex|is_allowed_regex)[A-Za-z0-9_]*\s*\('
+    r'|\b(?:ALLOWED|Allowed|allowed)[A-Za-z0-9_]*\.(?:contains|iter)\s*\(',
+    re.IGNORECASE,
+)
+PATH_LIMIT = 5
+
+def rust_files(path: Path):
+    if path.is_file():
+        if path.suffix == ".rs":
+            yield path
+        return
+    for child in path.rglob("*.rs"):
+        if skip_dirs.intersection(child.parts):
+            continue
+        yield child
+
+def strip_line_comments(line: str) -> str:
+    out = []
+    quote = ""
+    raw_hashes = None
+    escape = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        nxt = line[i + 1] if i + 1 < len(line) else ""
+        if raw_hashes is not None:
+            out.append(ch)
+            if ch == '"' and line.startswith("#" * raw_hashes, i + 1):
+                out.extend("#" * raw_hashes)
+                i += raw_hashes + 1
+                raw_hashes = None
+                continue
+            i += 1
+            continue
+        if quote:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "r":
+            j = i + 1
+            while j < len(line) and line[j] == "#":
+                j += 1
+            if j < len(line) and line[j] == '"':
+                raw_hashes = j - i - 1
+                out.extend(line[i : j + 1])
+                i = j + 1
+                continue
+        if ch in ('"', "'"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+def mask_literals(expr: str):
+    chars = list(expr)
+    quote = ""
+    escape = False
+    for i, ch in enumerate(chars):
+        if quote:
+            chars[i] = " "
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in ('"', "'"):
+            chars[i] = " "
+            quote = ch
+    return "".join(chars)
+
+def logical_statement(lines, line_no, max_lines=12):
+    idx = line_no - 1
+    statement = strip_line_comments(lines[idx])
+    balance = statement.count("(") - statement.count(")")
+    lookahead = idx + 1
+    while balance > 0 and lookahead < len(lines) and lookahead < idx + max_lines:
+        nxt = strip_line_comments(lines[lookahead]).strip()
+        statement += " " + nxt
+        balance += nxt.count("(") - nxt.count(")")
+        lookahead += 1
+    return statement
+
+def has_ignore(lines, line_no):
+    idx = line_no - 1
+    return (
+        0 <= idx < len(lines) and "ubs:ignore" in lines[idx]
+    ) or (
+        0 <= idx - 1 < len(lines) and "ubs:ignore" in lines[idx - 1]
+    )
+
+def source_line(lines, line_no):
+    idx = line_no - 1
+    if 0 <= idx < len(lines):
+        return lines[idx].strip().replace("\t", " ")
+    return ""
+
+def refs_in_expr(expr: str, tainted):
+    haystack = mask_literals(expr)
+    return [name for name in tainted if re.search(rf'\b{re.escape(name)}\b', haystack)]
+
+def taint_from_expr(expr: str, tainted):
+    if safe_re.search(expr):
+        return None
+    direct = source_re.search(expr)
+    if direct:
+        return {"path": [direct.group(0).strip()]}
+    refs = refs_in_expr(expr, tainted)
+    if not refs:
+        return None
+    ref = refs[0]
+    path = list(tainted.get(ref, {}).get("path", [ref]))
+    if len(path) >= PATH_LIMIT:
+        path = path[-(PATH_LIMIT - 1):]
+    path.append(ref)
+    return {"path": path}
+
+def path_extractor_taints(statement: str):
+    return {
+        match.group("name"): {"path": [f"Path({match.group('name')}) extractor"]}
+        for match in path_extractor_re.finditer(statement)
+    }
+
+def sink_arg(statement: str):
+    match = sink_re.search(statement)
+    if not match:
+        return ""
+    start = match.end()
+    depth = 1
+    quote = ""
+    escape = False
+    for pos in range(start, len(statement)):
+        ch = statement[pos]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in ('"', "'"):
+            quote = ch
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return statement[start:pos].strip()
+        elif ch == "," and depth == 1:
+            return statement[start:pos].strip()
+    return ""
+
+def analyze(path: Path, issues):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if not (source_re.search(text) and sink_re.search(text)):
+        return
+    lines = text.splitlines()
+    tainted = {}
+    seen = set()
+    for line_no, _ in enumerate(lines, start=1):
+        if has_ignore(lines, line_no):
+            continue
+        raw_line = strip_line_comments(lines[line_no - 1]).strip()
+        if not raw_line:
+            continue
+        statement = logical_statement(lines, line_no).strip()
+        if not statement:
+            continue
+        if re.match(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+\w+\b', raw_line):
+            tainted.clear()
+            tainted.update(path_extractor_taints(statement))
+            continue
+        assign = assign_re.match(statement)
+        if assign:
+            name = assign.group("lhs")
+            rhs = assign.group("rhs")
+            taint = taint_from_expr(rhs, tainted)
+            if taint:
+                tainted[name] = taint
+            elif safe_re.search(rhs):
+                tainted.pop(name, None)
+        if not sink_re.search(statement):
+            continue
+        arg = sink_arg(statement)
+        if not arg or safe_re.search(arg):
+            continue
+        direct = source_re.search(arg)
+        refs = refs_in_expr(arg, tainted)
+        if not direct and not refs:
+            continue
+        key = (path, line_no)
+        if key in seen:
+            continue
+        seen.add(key)
+        if direct:
+            path_desc = [direct.group(0).strip()]
+        else:
+            ref = refs[0]
+            path_desc = list(tainted.get(ref, {}).get("path", [ref]))
+        if len(path_desc) >= PATH_LIMIT:
+            path_desc = path_desc[-(PATH_LIMIT - 1):]
+        path_desc.append("regex engine")
+        issues.append((path, line_no, f"{source_line(lines, line_no)}  [{' -> '.join(path_desc)}]"))
+
+issues = []
+for rust_file in rust_files(root):
+    analyze(rust_file, issues)
+
+for path, line_no, code in issues:
+    print(f"{path}:{line_no}:{code}")
+PY
+}
+
+count_request_regex_matches() {
+  if [[ "$have_python3" -eq 1 ]]; then
+    rust_request_regex_matches | count_lines || true
+  else
+    return 1
+  fi
+}
+
+show_request_regex_examples() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  local printed=0
+  [[ "$have_python3" -eq 1 ]] || return 1
+  while IFS= read -r rawline; do
+    [[ -z "$rawline" ]] && continue
+    parse_grep_line "$rawline" || continue
+    print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
+    printed=$((printed + 1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <(rust_request_regex_matches | head -n "$limit")
+  [[ "$printed" -gt 0 ]]
+}
+
+collect_samples_request_regex() {
+  local limit="${1:-$DETAIL_LIMIT}"
+  if [[ "$have_python3" -ne 1 ]]; then
+    printf '[]'
+    return
+  fi
+  mapfile -t lines < <(rust_request_regex_matches | head -n "$limit")
+  printf '['
+  local i=0
+  local line
+  for line in "${lines[@]}"; do
+    [[ $i -gt 0 ]] && printf ','
+    printf '"%s"' "$(printf '%s' "$line" | json_escape)"
+    i=$((i + 1))
+  done
+  printf ']'
+}
+
 rust_unbounded_request_body_matches() {
   [[ "$have_python3" -eq 1 ]] || return 1
   python3 - "$PROJECT_DIR" <<'PY'
@@ -7142,7 +7442,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 8; then
 print_header "8. SECURITY FINDINGS"
-print_category "Detects: TLS verification disabled, weak hash algos, security-sensitive non-crypto randomness, timing-unsafe secret comparisons, JWT verification bypasses, shell command injection, request-derived response headers/open redirects/outbound URLs/SQL, unbounded request body reads, credentialed CORS, HTTP URLs, secrets" \
+print_category "Detects: TLS verification disabled, weak hash algos, security-sensitive non-crypto randomness, timing-unsafe secret comparisons, JWT verification bypasses, shell command injection, request-derived response headers/open redirects/outbound URLs/SQL/regex, unbounded request body reads, credentialed CORS, HTTP URLs, secrets" \
   "Security misconfigurations can lead to credential leaks, command injection, and MITM attacks"
 
 print_subheader "Weak hash algorithms (MD5/SHA1)"
@@ -7304,6 +7604,17 @@ if [ "$sql_injection_hits" -gt 0 ]; then
   add_finding "critical" "$sql_injection_hits" "Interpolated SQL reaches execution sink" "Use sqlx query macros, .bind(), rusqlite params!, diesel DSL/bind(), or other parameterized placeholders instead of format!/concat SQL" "${CATEGORY_NAME[8]}" "$(collect_samples_sql_injection 3)"
 else
   print_finding "good" "No request-derived SQL construction sinks detected"
+fi
+
+print_subheader "Request-controlled regex patterns"
+request_regex_hits=$(count_request_regex_matches || echo 0)
+request_regex_hits=$(printf '%s\n' "${request_regex_hits:-0}" | awk 'END{print $0+0}')
+if [ "$request_regex_hits" -gt 0 ]; then
+  print_finding "warning" "$request_regex_hits" "Request-controlled regex pattern reaches regex engine" "Escape pattern fragments with regex::escape or validate against an allow-list before Regex::new/RegexSet::new"
+  show_request_regex_examples 3 || true
+  add_finding "warning" "$request_regex_hits" "Request-controlled regex pattern reaches regex engine" "Escape pattern fragments with regex::escape or validate against an allow-list before Regex::new/RegexSet::new" "${CATEGORY_NAME[8]}" "$(collect_samples_request_regex 3)"
+else
+  print_finding "good" "No request-controlled regex compilation detected"
 fi
 
 print_subheader "Unbounded request body reads"

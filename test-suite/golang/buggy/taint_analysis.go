@@ -42,6 +42,11 @@ func queryDirectSource(tx *sql.Tx, r *http.Request) {
 	tx.ExecContext(r.Context(), "DELETE FROM sessions WHERE owner = '"+r.URL.Query().Get("owner")+"'")
 }
 
+func queryDynamicIdentifierWithPlaceholder(r *http.Request) {
+	table := r.FormValue("table")
+	db.Query("SELECT id FROM "+table+" WHERE owner = ?", "system")
+}
+
 func queryBuilder(repo repository, r *http.Request) error {
 	filter := "email = '" + r.PostFormValue("email") + "'"
 	return repo.Where(filter).Find(&[]string{})

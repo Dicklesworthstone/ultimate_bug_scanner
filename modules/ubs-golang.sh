@@ -44,7 +44,7 @@ shopt -s extglob
 RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; GRAY=""
 BOLD=""; DIM=""; RESET=""
 
-VERSION="7.1.3"
+VERSION="7.1.4"
 
 # Color-safe error trap (works before colors are initialized)
 on_err() {
@@ -865,15 +865,18 @@ def find_sources(expr: str):
     return matches
 
 def expr_has_sanitizer(expr: str, sink_rule=None) -> bool:
+    if sink_rule == 'go.taint.sql':
+        return False
     for regex in SANITIZER_REGEXES:
         if regex.search(expr):
             return True
     return False
 
 def expr_has_tainted(expr: str, tainted):
+    haystack = strip_comments(expr)
     for name, meta in tainted.items():
         pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
-        if re.search(pattern, expr):
+        if re.search(pattern, haystack):
             return name, meta
     return None, None
 
@@ -1027,13 +1030,15 @@ def analyze_file(path: Path, issues):
                     taint_expr = sql_arg_from_call(expr_raw or expr)
                     if not taint_expr:
                         continue
-                    if sql_arg_is_parameterized(taint_expr):
-                        continue
                 direct = find_sources(taint_expr)
+                ref = meta = None
+                if not direct:
+                    ref, meta = expr_has_tainted(taint_expr, tainted)
+                if rule == 'go.taint.sql' and sql_arg_is_parameterized(taint_expr) and not direct and not ref:
+                    continue
                 if direct:
                     path_desc = f"{direct[0]} -> {label}"
                 else:
-                    ref, meta = expr_has_tainted(taint_expr, tainted)
                     if not ref:
                         continue
                     seq = list(meta.get('path', [ref]))

@@ -34,6 +34,11 @@ export async function parameterizedRouteParams(_request: RequestLike, { params }
   return db.query("SELECT id FROM tenants WHERE slug = $1", [params.tenant]);
 }
 
+export async function parameterizedDestructuredRouteParams(_request: RequestLike, { params }: RouteContext, db: Database): Promise<unknown> {
+  const { account } = params;
+  return db.query("SELECT id FROM accounts WHERE slug = $1", [account]);
+}
+
 export async function prismaSafeTaggedTemplate(req: RequestLike, prisma: PrismaLike): Promise<unknown> {
   const status = req.body.status;
   return prisma.$queryRaw`SELECT * FROM invoices WHERE status = ${status}`;

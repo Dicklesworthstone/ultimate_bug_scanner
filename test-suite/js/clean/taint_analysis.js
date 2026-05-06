@@ -28,6 +28,11 @@ async function nextRouteSearch(_request, { params }) {
   await db.query('SELECT * FROM tenants WHERE slug = ?', [params.tenant]);
 }
 
+async function nextRouteDestructuredSearch(_request, { params }) {
+  const { account } = params;
+  await db.query('SELECT * FROM accounts WHERE slug = ?', [account]);
+}
+
 router.get('/exec', (req, res) => {
   exec('ls ' + shellescape([req.query.path || '.']), err => {
     if (err) {

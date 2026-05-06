@@ -29,6 +29,12 @@ async function nextRouteSearch(_request, { params }) {
   await db.query(tenantSql);
 }
 
+async function nextRouteDestructuredSearch(_request, { params }) {
+  const { account } = params;
+  const accountSql = "SELECT * FROM accounts WHERE slug = '" + account + "'";
+  await db.query(accountSql);
+}
+
 router.get('/exec', (req, res) => {
   const cmd = 'ls ' + req.query.path;
   exec(cmd, err => {

@@ -32,6 +32,11 @@ export async function rawDbQueryFromRouteParams(_request: RequestLike, { params 
   return db.query("SELECT id FROM tenants WHERE slug = '" + tenant + "'");
 }
 
+export async function rawDbQueryFromDestructuredRouteParams(_request: RequestLike, { params }: RouteContext, db: Database): Promise<unknown> {
+  const { account } = params;
+  return db.query("SELECT id FROM accounts WHERE slug = '" + account + "'");
+}
+
 export async function dynamicTableWithPlaceholder(req: RequestLike, db: Database): Promise<unknown> {
   const table = req.query.table;
   return db.query("SELECT id FROM " + table + " WHERE owner = $1", ["system"]);

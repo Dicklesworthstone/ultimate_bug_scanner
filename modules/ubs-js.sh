@@ -1304,6 +1304,7 @@ SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '
 EXTS = {'.js', '.jsx', '.ts', '.tsx'}
 PATH_LIMIT = 5
 ROUTE_PARAM_FIELDS = r"(?:id|slug|user|username|email|name|status|tenant|account|role|filter|search|sort|limit|offset|where|order|table|column)"
+ROUTE_PARAM_OBJECT = re.compile(r"^\s*\(?\s*(?:await\s+)?((?:context\.)?params)\s*\)?\s*$", re.IGNORECASE)
 
 SOURCE_PATTERNS = [
     (re.compile(r"\b(?:req|request|ctx\.request|context\.req)\.(?:body|query|params)[\w\.\[\]'\"]*", re.IGNORECASE), 'HTTP request payload'),
@@ -1558,6 +1559,15 @@ def find_sources(expr: str):
                 matches.append((snippet, label))
     return matches
 
+def assignment_sources(expr: str):
+    sources = find_sources(expr)
+    if sources:
+        return sources
+    route_params = ROUTE_PARAM_OBJECT.match(expr)
+    if route_params:
+        return [(route_params.group(1), 'Route params')]
+    return []
+
 def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
     for regex in SANITIZER_REGEXES:
         if regex.search(expr):
@@ -1603,7 +1613,7 @@ def extend_path(meta, new_node):
 def record_taint(assignments):
     tainted = {}
     for line_no, target, expr in assignments:
-        sources = find_sources(expr)
+        sources = assignment_sources(expr)
         if sources:
             snippet, label = sources[0]
             tainted[target] = {
@@ -1624,7 +1634,7 @@ def record_taint(assignments):
                 tainted[target] = clone
                 changed = True
                 continue
-            sources = find_sources(expr)
+            sources = assignment_sources(expr)
             if sources:
                 snippet, label = sources[0]
                 tainted[target] = {
@@ -1753,6 +1763,7 @@ unsafe_sink_re = re.compile(r'\$?(?:queryRawUnsafe|executeRawUnsafe)\s*\(', re.I
 assign_re = re.compile(r'^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=;]+)?=\s*(.+)$')
 simple_assign_re = re.compile(r'^\s*([A-Za-z_$][\w$]*)\s*=\s*(?![=>=])(.+)$')
 destructure_re = re.compile(r'^\s*(?:const|let|var)\s*\{([^}]+)\}\s*=\s*(.+)$')
+route_params_object_re = re.compile(r'^\s*\(?\s*(?:await\s+)?(?:context\.)?params\s*\)?\s*$', re.IGNORECASE)
 safe_sql_re = re.compile(
     r'\b(?:sql|Prisma\.sql)\s*`|'
     r'\$queryRaw\s*`|\$executeRaw\s*`|'
@@ -1855,6 +1866,10 @@ def names_from_destructure(blob: str):
     return names
 
 
+def rhs_expression(expr: str):
+    return expr.strip().rstrip(';').strip()
+
+
 def mask_literals_for_refs(expr: str):
     out = []
     quote = ''
@@ -1954,13 +1969,15 @@ def analyze(path: Path, issues):
             continue
 
         destruct = destructure_re.match(statement)
-        if destruct and source_re.search(destruct.group(2)):
+        if destruct:
+            destruct_source = rhs_expression(destruct.group(2))
+        if destruct and (source_re.search(destruct_source) or route_params_object_re.match(destruct_source)):
             tainted.update(names_from_destructure(destruct.group(1)))
 
         assign = assign_re.match(statement) or simple_assign_re.match(statement)
         if assign:
             name, rhs = assign.groups()
-            if source_re.search(rhs) or refs(rhs, tainted):
+            if source_re.search(rhs) or route_params_object_re.match(rhs_expression(rhs)) or refs(rhs, tainted):
                 tainted.add(name)
             elif name in tainted and not refs(rhs, tainted):
                 tainted.discard(name)

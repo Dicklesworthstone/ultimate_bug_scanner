@@ -2,6 +2,8 @@
 
 Date: 2026-04-27
 
+Updated: 2026-05-05
+
 This audit separates preserved project context from ephemeral files that should
 not live in the repository root or source history.
 
@@ -28,10 +30,15 @@ The root `.gitignore` now covers these recurring artifact families:
 - JSON artifact dumps named like `artifact-*.json` or under an `artifacts/` directory.
 - Tool caches such as `.ruff_cache/`.
 
-## Tracked Removal Candidates
+The nested `.beads/.gitignore` now also blocks rotated daemon logs
+(`daemon-*.log`, `daemon-*.log.gz`) and one-time migration scratch outputs
+(`*.migrated`) so Beads runtime artifacts stay out of future commits even when
+agents work from inside `.beads/`.
 
-These files are tracked today but look like runtime detritus rather than source
-or useful project documentation:
+## Removed From Git Tracking
+
+These runtime artifacts were removed from Git tracking on 2026-05-05 with
+`git rm --cached`, leaving local working copies in place as ignored files:
 
 | Path | Size | Reason |
 | --- | ---: | --- |
@@ -43,15 +50,6 @@ or useful project documentation:
 | `.beads/daemon-2026-01-08T21-13-01.994.log.gz` | 2.5M | Compressed daemon runtime log. |
 | `.beads/daemon-2026-01-09T12-50-54.494.log.gz` | 2.5M | Compressed daemon runtime log. |
 | `.beads/deletions.jsonl.migrated` | 4K | One-time migration scratch output. |
-
-Recommended removal from Git tracking, after explicit deletion approval:
-
-```bash
-git rm --cached .beads/daemon-2026-01-05T17-28-29.046.log.gz .beads/daemon-2026-01-06T09-02-19.431.log.gz .beads/daemon-2026-01-07T00-07-35.450.log.gz .beads/daemon-2026-01-07T15-08-43.877.log.gz .beads/daemon-2026-01-08T06-10-58.078.log.gz .beads/daemon-2026-01-08T21-13-01.994.log.gz .beads/daemon-2026-01-09T12-50-54.494.log.gz .beads/deletions.jsonl.migrated
-```
-
-`git rm --cached` would remove these files from future GitHub checkouts while
-leaving the local working copies in place.
 
 ## Root After This Pass
 

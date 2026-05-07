@@ -4482,6 +4482,38 @@
       }
     },
     {
+      "id": "js-typescript-open-redirect-startswith-clean",
+      "description": "TypeScript/Next.js redirects that reject scheme-relative paths after startsWith('/') should stay clean.",
+      "path": "test-suite/js/security/open-redirect-startswith-clean.tsx",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "tsx",
+        "security",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "unvalidated redirect from URL/query/header data"
+        ]
+      }
+    },
+    {
       "id": "js-typescript-archive-extraction-buggy",
       "description": "TypeScript/Node archive extraction should validate entry paths before joining them into destinations.",
       "path": "test-suite/js/security/archive-extraction-buggy.ts",

@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess  # nosec B404 - this harness intentionally runs repo-local UBS commands.
 import sys
 import time
@@ -25,27 +26,60 @@ GOLDEN_PATH = TEST_ROOT / "goldens" / "rule_coverage.json"
 RUNTIME_ROOT = Path(
     os.environ.get(
         "UBS_RULE_QUALITY_TMP",
-        str(TEST_ROOT / "artifacts" / "rule_quality_variants"),
+        str(REPO_ROOT / "rule-quality-variants"),
     )
 )
 
-TARGET_LANGUAGES = {"js", "golang", "rust"}
+SECURITY_COVERAGE_LANGUAGES = {
+    "cpp",
+    "csharp",
+    "elixir",
+    "golang",
+    "java",
+    "js",
+    "python",
+    "ruby",
+    "rust",
+    "swift",
+}
 SMOKE_CASE_IDS = (
+    "cpp-open-redirect-buggy",
+    "cpp-open-redirect-clean",
+    "csharp-open-redirect-buggy",
+    "csharp-open-redirect-clean",
+    "elixir-open-redirect-buggy",
+    "elixir-open-redirect-clean",
+    "java-open-redirect-buggy",
+    "java-open-redirect-clean",
     "js-typescript-request-body-limit-buggy",
     "js-typescript-request-body-limit-clean",
+    "kotlin-open-redirect-buggy",
+    "kotlin-open-redirect-clean",
+    "python-redos-regex-buggy",
+    "python-redos-regex-clean",
+    "ruby-open-redirect-buggy",
+    "ruby-open-redirect-clean",
     "golang-request-body-limit-buggy",
     "golang-request-body-limit-clean",
     "rust-request-body-limit-buggy",
     "rust-request-body-limit-clean",
+    "swift-open-redirect-buggy",
+    "swift-open-redirect-clean",
 )
 CLEAN_FUZZ_CASE_IDS = (
+    "cpp-open-redirect-clean",
+    "csharp-open-redirect-clean",
+    "elixir-open-redirect-clean",
+    "java-open-redirect-clean",
     "js-typescript-request-body-limit-clean",
-    "js-typescript-sql-injection-clean",
+    "kotlin-open-redirect-clean",
+    "python-redos-regex-clean",
+    "ruby-open-redirect-clean",
     "golang-open-redirect-clean",
     "golang-request-body-limit-clean",
     "golang-ssrf-clean",
     "rust-request-body-limit-clean",
-    "rust-sql-injection-clean",
+    "swift-open-redirect-clean",
 )
 METAMORPHIC_CASE_IDS = (
     *SMOKE_CASE_IDS,
@@ -58,51 +92,6 @@ METAMORPHIC_CASE_IDS = (
     "rust-sql-injection-buggy",
     "rust-sql-injection-clean",
 )
-CAMPAIGN_RUNTIME_SLUGS = {
-    "golang": {
-        "constant_time_compare",
-        "cors_credentials",
-        "hardcoded_secrets",
-        "header_injection",
-        "jwt_verification",
-        "open_redirect",
-        "path_traversal",
-        "random_security",
-        "request_body_limit",
-        "reverse_proxy_ssrf",
-        "ssrf",
-        "taint_analysis",
-    },
-    "js": {
-        "constant-time-compare",
-        "cors-credentials",
-        "hardcoded-secrets",
-        "header-injection",
-        "jwt-verification",
-        "open-redirect",
-        "path-traversal",
-        "prototype-pollution",
-        "random-security",
-        "request-body-limit",
-        "reverse-proxy-ssrf",
-        "sql-injection",
-        "ssrf-fetch",
-        "taint_analysis",
-    },
-    "rust": {
-        "constant_time_compare",
-        "cors_credentials",
-        "hardcoded_secrets",
-        "header_injection",
-        "jwt_verification",
-        "open_redirect",
-        "request_body_limit",
-        "security_injection",
-        "security_randomness",
-        "sql_injection",
-        "ssrf",
-    },
-}
 JSON_DECODER = json.JSONDecoder()
 
 sys.path.insert(0, str(TEST_ROOT))
@@ -130,6 +119,12 @@ def normalize_case_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def camel_to_snake(value: str) -> str:
+    value = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", value)
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return value.replace("-", "_").lower()
+
+
 def case_side_and_slug(case: dict[str, Any]) -> tuple[str | None, str | None]:
     path = normalize_case_path(case["path"])
     parts = path.split("/")
@@ -150,8 +145,26 @@ def case_side_and_slug(case: dict[str, Any]) -> tuple[str | None, str | None]:
             stem = stem[: -len(suffix)]
             side = side or suffix_side
             break
+    else:
+        for suffix, suffix_side in (("Buggy", "buggy"), ("Clean", "clean")):
+            if stem.endswith(suffix):
+                stem = camel_to_snake(stem[: -len(suffix)])
+                side = side or suffix_side
+                break
+        else:
+            case_id = case.get("id", "")
+            for suffix, suffix_side in (("-buggy", "buggy"), ("-clean", "clean")):
+                if case_id.endswith(suffix):
+                    stem = case_id[: -len(suffix)]
+                    prefix = f"{case.get('language', '')}-"
+                    if prefix != "-" and stem.startswith(prefix):
+                        stem = stem[len(prefix):]
+                    side = side or suffix_side
+                    break
     if side is None:
         return None, None
+    if path.startswith("test-suite/kotlin/"):
+        stem = f"kotlin_{stem}"
     return side, stem
 
 
@@ -174,17 +187,21 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
     for case in cases:
         language = case.get("language")
         tags = set(case.get("tags", []))
-        if language not in TARGET_LANGUAGES or "security" not in tags:
+        if language not in SECURITY_COVERAGE_LANGUAGES or "security" not in tags:
             continue
         side, slug = case_side_and_slug(case)
         if side and slug:
             grouped[(language, slug)][side] = case
 
     pairs: list[dict[str, Any]] = []
+    unpaired_buggy: list[str] = []
     unpaired_clean: list[str] = []
     for (language, slug), sides in sorted(grouped.items()):
         clean = sides.get("clean")
         buggy = sides.get("buggy")
+        if buggy and not clean:
+            unpaired_buggy.append(f"{language}:{slug}")
+            continue
         if clean and not buggy:
             unpaired_clean.append(f"{language}:{slug}")
             continue
@@ -212,11 +229,14 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    if unpaired_clean:
-        raise AssertionError(f"clean security fixtures without buggy pair: {unpaired_clean}")
+    if unpaired_buggy or unpaired_clean:
+        raise AssertionError(
+            "security fixtures must have buggy/clean pairs; "
+            f"missing clean for {unpaired_buggy}; missing buggy for {unpaired_clean}"
+        )
 
     by_language: dict[str, dict[str, int]] = {}
-    for language in sorted(TARGET_LANGUAGES):
+    for language in sorted(SECURITY_COVERAGE_LANGUAGES):
         language_pairs = [pair for pair in pairs if pair["language"] == language]
         by_language[language] = {
             "security_pairs": len(language_pairs),
@@ -235,7 +255,7 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "version": 1,
-        "scope": "security fixture pairs for Rust, TypeScript/JavaScript, and Go",
+        "scope": "security fixture pairs for every UBS-supported language module",
         "languages": by_language,
         "pairs": pairs,
         "runtime_scopes": runtime_scopes_from_pairs(pairs),
@@ -249,7 +269,7 @@ def runtime_scopes_from_pairs(pairs: list[dict[str, Any]]) -> dict[str, list[str
     for pair in pairs:
         case_ids = [pair["buggy_case"], pair["clean_case"]]
         all_cases.extend(case_ids)
-        if pair["slug"] in CAMPAIGN_RUNTIME_SLUGS.get(pair["language"], set()):
+        if pair["language"] in SECURITY_COVERAGE_LANGUAGES:
             campaign.extend(case_ids)
     return {
         "smoke": list(SMOKE_CASE_IDS),
@@ -504,12 +524,62 @@ def run_runtime_pair_checks(
 
 
 def comment_prefix_for(path: Path) -> str:
-    if path.suffix in {".go", ".rs", ".js", ".jsx", ".ts", ".tsx"}:
+    if path.suffix in {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".cs",
+        ".go",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".rs",
+        ".swift",
+        ".ts",
+        ".tsx",
+    }:
         return "//"
     return "#"
 
 
-def source_with_benign_comments(source: str, path: Path, rng: random.Random | None = None) -> str:
+def is_text_source(path: Path) -> bool:
+    return path.suffix in {
+        ".c",
+        ".cc",
+        ".cpp",
+        ".cxx",
+        ".cs",
+        ".ex",
+        ".exs",
+        ".go",
+        ".h",
+        ".hh",
+        ".hpp",
+        ".java",
+        ".js",
+        ".jsx",
+        ".kt",
+        ".kts",
+        ".py",
+        ".rb",
+        ".rs",
+        ".swift",
+        ".ts",
+        ".tsx",
+    }
+
+
+def source_with_benign_comments(
+    source: str,
+    path: Path,
+    rng: random.Random | None = None,
+) -> str:
     prefix = comment_prefix_for(path)
     lines = source.splitlines()
     if rng is not None and lines:
@@ -523,13 +593,48 @@ def source_with_benign_comments(source: str, path: Path, rng: random.Random | No
     return "\n".join(lines) + "\n"
 
 
-def materialize_variant(case: dict[str, Any], label: str, contents: str) -> Path:
+def materialize_variant(
+    case: dict[str, Any],
+    label: str,
+    rng: random.Random | None = None,
+) -> Path:
     original = REPO_ROOT / case["path"]
     safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label)
     out_dir = RUNTIME_ROOT / str(os.getpid()) / safe_label
     out_dir.mkdir(parents=True, exist_ok=True)
+    if original.is_file():
+        out_path = out_dir / original.name
+        out_path.write_text(
+            source_with_benign_comments(
+                original.read_text(encoding="utf-8"),
+                original,
+                rng,
+            ),
+            encoding="utf-8",
+        )
+        return out_path
+    if not original.is_dir():
+        raise AssertionError(f"cannot materialize variant for missing path: {case['path']}")
+
     out_path = out_dir / original.name
-    out_path.write_text(contents, encoding="utf-8")
+    for source_path in original.rglob("*"):
+        relative = source_path.relative_to(original)
+        target = out_path / relative
+        if source_path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif is_text_source(source_path):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                source_with_benign_comments(
+                    source_path.read_text(encoding="utf-8"),
+                    source_path,
+                    rng,
+                ),
+                encoding="utf-8",
+            )
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, target)
     return out_path
 
 
@@ -537,12 +642,7 @@ def run_metamorphic_checks(manifest: dict[str, Any], timeout: int) -> None:
     cases = case_by_id(manifest)
     for case_id in METAMORPHIC_CASE_IDS:
         case = cases[case_id]
-        original_path = REPO_ROOT / case["path"]
-        transformed = source_with_benign_comments(
-            original_path.read_text(encoding="utf-8"),
-            original_path,
-        )
-        transformed_path = materialize_variant(case, f"metamorphic-{case_id}", transformed)
+        transformed_path = materialize_variant(case, f"metamorphic-{case_id}")
         _, original_summary = run_real_case(
             manifest, case, f"metamorphic-{case_id}-original", timeout
         )
@@ -562,15 +662,8 @@ def run_fuzz_smoke(manifest: dict[str, Any], timeout: int, iterations: int) -> N
     rng = random.Random(0xBEEF)  # nosec B311 - deterministic fuzzing, not cryptography.
     for case_id in CLEAN_FUZZ_CASE_IDS:
         case = cases[case_id]
-        original_path = REPO_ROOT / case["path"]
-        source = original_path.read_text(encoding="utf-8")
         for iteration in range(iterations):
-            transformed = source_with_benign_comments(source, original_path, rng)
-            transformed_path = materialize_variant(
-                case,
-                f"fuzz-{case_id}-{iteration}",
-                transformed,
-            )
+            transformed_path = materialize_variant(case, f"fuzz-{case_id}-{iteration}", rng)
             run_real_case(
                 manifest,
                 case,

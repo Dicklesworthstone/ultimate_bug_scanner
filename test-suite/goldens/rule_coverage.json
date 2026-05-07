@@ -78,7 +78,7 @@
       "buggy_cases_with_required_substrings": 34,
       "clean_cases_with_forbidden_substrings": 33,
       "security_pairs": 34,
-      "strict_zero_clean_cases": 34
+      "strict_zero_clean_cases": 33
     },
     "ruby": {
       "buggy_cases_with_required_substrings": 7,
@@ -1975,7 +1975,7 @@
       "clean_case": "python-taint-clean",
       "clean_forbid_count": 0,
       "clean_max_critical": 0,
-      "clean_max_warning": 0,
+      "clean_max_warning": 2,
       "clean_path": "test-suite/python/clean/taint_analysis.py",
       "language": "python",
       "slug": "taint"

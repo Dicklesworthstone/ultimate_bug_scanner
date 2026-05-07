@@ -96,31 +96,12 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 83,
+      "buggy_cases_with_required_substrings": 86,
       "case_count": 173,
-      "clean_cases_with_forbidden_substrings": 50,
-      "strict_zero_clean_cases": 71,
-      "weak_case_count": 40,
+      "clean_cases_with_forbidden_substrings": 67,
+      "strict_zero_clean_cases": 74,
+      "weak_case_count": 21,
       "weak_cases": [
-        {
-          "id": "golang-async-errors-buggy",
-          "language": "golang",
-          "path": "test-suite/golang/async_errors/buggy",
-          "reasons": [
-            "buggy_missing_require_substrings"
-          ],
-          "side": "buggy"
-        },
-        {
-          "id": "golang-async-errors-clean",
-          "language": "golang",
-          "path": "test-suite/golang/async_errors/clean",
-          "reasons": [
-            "clean_missing_forbid_substrings",
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        },
         {
           "id": "golang-taint-clean",
           "language": "golang",
@@ -132,20 +113,10 @@
           "side": "clean"
         },
         {
-          "id": "js-async-errors-buggy",
-          "language": "js",
-          "path": "test-suite/js/async_errors/buggy",
-          "reasons": [
-            "buggy_missing_require_substrings"
-          ],
-          "side": "buggy"
-        },
-        {
           "id": "js-async-errors-clean",
           "language": "js",
           "path": "test-suite/js/async_errors/clean",
           "reasons": [
-            "clean_missing_forbid_substrings",
             "clean_not_strict_zero_critical_warning"
           ],
           "side": "clean"
@@ -177,124 +148,6 @@
           "reasons": [
             "clean_missing_forbid_substrings",
             "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-type-narrowing-clean",
-          "language": "js",
-          "path": "test-suite/js/type_narrowing/clean",
-          "reasons": [
-            "clean_missing_forbid_substrings",
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-event-emitter-listener-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-event-emitter-listener-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-event-listener-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-event-listener-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-flatmap-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-flatmap-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-foreach-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-foreach-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-map-awaited-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-map-awaited-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-map-ignored-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-map-ignored-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-predicate-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-predicate-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-promise-executor-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-promise-executor-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-reduce-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-reduce-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-sort-comparator-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-sort-comparator-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-timer-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/async-timer-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-typescript-async-use-effect-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/use-effect-async-clean.tsx",
-          "reasons": [
-            "clean_missing_forbid_substrings"
           ],
           "side": "clean"
         },
@@ -345,39 +198,11 @@
           "side": "clean"
         },
         {
-          "id": "js-typescript-promise-all-foreach-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/promise-all-foreach-clean.ts",
-          "reasons": [
-            "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
           "id": "js-typescript-window-open-noopener-clean",
           "language": "js",
           "path": "test-suite/js/security/window-open-clean.ts",
           "reasons": [
             "clean_missing_forbid_substrings"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "rust-async-errors-buggy",
-          "language": "rust",
-          "path": "test-suite/rust/async_errors/buggy",
-          "reasons": [
-            "buggy_missing_require_substrings"
-          ],
-          "side": "buggy"
-        },
-        {
-          "id": "rust-async-errors-clean",
-          "language": "rust",
-          "path": "test-suite/rust/async_errors/clean",
-          "reasons": [
-            "clean_missing_forbid_substrings",
-            "clean_not_strict_zero_critical_warning"
           ],
           "side": "clean"
         },

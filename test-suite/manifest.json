@@ -342,7 +342,11 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "await without try/catch",
+          "await Promise.all() without try/catch"
+        ]
       }
     },
     {
@@ -361,10 +365,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 8
           }
-        }
+        },
+        "forbid_substrings": [
+          "await without try/catch",
+          "await Promise.all() without try/catch"
+        ]
       }
     },
     {
@@ -393,7 +404,7 @@
           }
         },
         "require_substrings": [
-          "async React effect callback"
+          "Do not pass an async function directly to useEffect"
         ]
       }
     },
@@ -424,7 +435,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "Do not pass an async function directly to useEffect"
+        ]
       }
     },
     {
@@ -508,7 +522,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async event listener callback is not awaited"
+        ]
       }
     },
     {
@@ -564,7 +581,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async EventEmitter listener callback is not awaited"
+        ]
       }
     },
     {
@@ -592,7 +612,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async forEach callback is not awaited"
+        ]
       }
     },
     {
@@ -648,7 +671,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async map callback result is ignored"
+        ]
       }
     },
     {
@@ -704,7 +730,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "awaiting map(async ...) does not await the mapped promises"
+        ]
       }
     },
     {
@@ -760,7 +789,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async flatMap callback is not awaited"
+        ]
       }
     },
     {
@@ -816,7 +848,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async reduce callback returns a Promise accumulator"
+        ]
       }
     },
     {
@@ -872,7 +907,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async array predicate callback is not awaited"
+        ]
       }
     },
     {
@@ -928,7 +966,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async sort comparator returns a Promise"
+        ]
       }
     },
     {
@@ -984,7 +1025,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async Promise executor drops thrown errors"
+        ]
       }
     },
     {
@@ -1040,7 +1084,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "async timer callback is not awaited"
+        ]
       }
     },
     {
@@ -1154,7 +1201,10 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "Promise.all receives forEach result"
+        ]
       }
     },
     {
@@ -5933,10 +5983,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "Potentially unsafe type narrowing",
+          "Non-null assertion (!) in property chain"
+        ]
       }
     },
     {
@@ -6005,7 +6062,10 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "HTTP response bodies not obviously closed"
+        ]
       }
     },
     {
@@ -6024,10 +6084,16 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "HTTP response bodies not obviously closed"
+        ]
       }
     },
     {
@@ -8095,7 +8161,10 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "tokio::spawn JoinHandle dropped"
+        ]
       }
     },
     {
@@ -8117,10 +8186,16 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "tokio::spawn JoinHandle dropped"
+        ]
       }
     },
     {

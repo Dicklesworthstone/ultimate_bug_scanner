@@ -32,10 +32,15 @@
       "fixture": "test-suite/golang/buggy/security_sql.go",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
-      "result_count": 4,
+      "result_count": 13,
       "result_rule_ids": [
+        "go.blank-import",
         "go.close-error-ignored",
-        "go.exec-sh-c"
+        "go.exec-command-without-context",
+        "go.exec-sh-c",
+        "go.http-client-without-timeout",
+        "go.http-client-without-transport",
+        "go.http-newrequest-without-context"
       ],
       "sarif_runs": 1
     },
@@ -134,16 +139,72 @@
       "fixture": "test-suite/golang",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
-      "result_count": 74,
+      "result_count": 247,
       "result_rule_ids": [
+        "go.blank-import",
         "go.close-error-ignored",
+        "go.content-type-prefix-match",
+        "go.context-todo",
         "go.context-without-cancel",
+        "go.context.cancel-defer-before-err-check",
+        "go.context.cancel-defer-in-if",
+        "go.defer-close-before-err-check",
+        "go.defer-in-loop",
+        "go.dot-import",
         "go.err-shadow",
+        "go.exec-command-without-context",
+        "go.exec-pgrep-unanchored",
         "go.exec-sh-c",
+        "go.exec-strings-fields",
+        "go.fmt-errorf-no-wrap",
+        "go.fmt.fprintf-error-ignored",
+        "go.goroutine-in-loop",
+        "go.http-client-close-idle-missing",
+        "go.http-client-without-timeout",
+        "go.http-client-without-transport",
+        "go.http-default-client",
+        "go.http-handler-background",
+        "go.http-newrequest-without-context",
         "go.http-response-body-not-closed",
+        "go.http-server-no-timeouts",
+        "go.http-transport-missing-timeouts",
+        "go.http.defer-body-before-err-check",
+        "go.http.defer-body-close-delayed",
+        "go.http.responsewriter-write-ignored",
+        "go.iferr-empty",
+        "go.iferr-return-nil",
         "go.interface-empty",
+        "go.ioutil-deprecated",
+        "go.json-decode-no-limit",
+        "go.json-decode-without-disallow",
+        "go.json.decoder-unbounded-body",
+        "go.json.encode-error-ignored",
+        "go.loop-var-capture",
+        "go.loop-var-capture-for",
+        "go.missing-sync-before-remove",
+        "go.os-remove-no-error-check",
+        "go.panic-call",
+        "go.recover-not-in-defer",
         "go.resource.ticker-no-stop",
-        "go.resource.timer-no-stop"
+        "go.resource.timer-no-stop",
+        "go.resource.timer-not-drained",
+        "go.select-no-default",
+        "go.sort-slice-mutates",
+        "go.sql-dynamic-string",
+        "go.sql.begin-without-defer-rollback",
+        "go.sql.defer-rollback-before-err-check",
+        "go.sql.defer-rollback-delayed",
+        "go.sql.defer-rows-close-before-err-check",
+        "go.sql.defer-rows-close-delayed",
+        "go.sql.rows-err-not-checked",
+        "go.sql.rows-not-closed",
+        "go.template.execute-error-ignored",
+        "go.time-after-in-loop",
+        "go.time-tick",
+        "go.tls-insecure-skip",
+        "go.tls-minversion-missing",
+        "go.waitgroup-add-no-done",
+        "go.write-error-ignored"
       ],
       "sarif_runs": 1
     },
@@ -447,7 +508,7 @@
           "file": "go-blank-import.yml",
           "id": "go.blank-import",
           "language": "go",
-          "match_count": 0
+          "match_count": 1
         },
         {
           "file": "go-content-type-prefix.yml",
@@ -501,7 +562,7 @@
           "file": "go-http-client-without-timeout.yml",
           "id": "go.http-client-without-timeout",
           "language": "go",
-          "match_count": 0
+          "match_count": 1
         },
         {
           "file": "go-http-default-client.yml",
@@ -639,7 +700,7 @@
           "file": "go.exec-command-without-context.yml",
           "id": "go.exec-command-without-context",
           "language": "go",
-          "match_count": 0
+          "match_count": 5
         },
         {
           "file": "go.exec-strings-fields.yml",
@@ -663,7 +724,7 @@
           "file": "go.http-client-without-transport.yml",
           "id": "go.http-client-without-transport",
           "language": "go",
-          "match_count": 0
+          "match_count": 1
         },
         {
           "file": "go.http-handler-background.yml",
@@ -675,7 +736,7 @@
           "file": "go.http-newrequest-without-context.yml",
           "id": "go.http-newrequest-without-context",
           "language": "go",
-          "match_count": 0
+          "match_count": 1
         },
         {
           "file": "go.http-response-body-not-closed.yml",
@@ -1354,31 +1415,22 @@
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 8,
+      "covered_generated_rule_count": 64,
       "covered_generated_rule_ids": [
-        "go.close-error-ignored",
-        "go.context-without-cancel",
-        "go.err-shadow",
-        "go.exec-sh-c",
-        "go.http-response-body-not-closed",
-        "go.interface-empty",
-        "go.resource.ticker-no-stop",
-        "go.resource.timer-no-stop"
-      ],
-      "generated_rule_count": 64,
-      "label": "go-rule-pack",
-      "uncovered_generated_rule_count": 56,
-      "uncovered_generated_rule_ids": [
         "go.blank-import",
+        "go.close-error-ignored",
         "go.content-type-prefix-match",
         "go.context-todo",
+        "go.context-without-cancel",
         "go.context.cancel-defer-before-err-check",
         "go.context.cancel-defer-in-if",
         "go.defer-close-before-err-check",
         "go.defer-in-loop",
         "go.dot-import",
+        "go.err-shadow",
         "go.exec-command-without-context",
         "go.exec-pgrep-unanchored",
+        "go.exec-sh-c",
         "go.exec-strings-fields",
         "go.fmt-errorf-no-wrap",
         "go.fmt.fprintf-error-ignored",
@@ -1389,6 +1441,7 @@
         "go.http-default-client",
         "go.http-handler-background",
         "go.http-newrequest-without-context",
+        "go.http-response-body-not-closed",
         "go.http-server-no-timeouts",
         "go.http-transport-missing-timeouts",
         "go.http.defer-body-before-err-check",
@@ -1396,6 +1449,7 @@
         "go.http.responsewriter-write-ignored",
         "go.iferr-empty",
         "go.iferr-return-nil",
+        "go.interface-empty",
         "go.ioutil-deprecated",
         "go.json-decode-no-limit",
         "go.json-decode-without-disallow",
@@ -1407,6 +1461,8 @@
         "go.os-remove-no-error-check",
         "go.panic-call",
         "go.recover-not-in-defer",
+        "go.resource.ticker-no-stop",
+        "go.resource.timer-no-stop",
         "go.resource.timer-not-drained",
         "go.select-no-default",
         "go.sort-slice-mutates",
@@ -1425,7 +1481,11 @@
         "go.tls-minversion-missing",
         "go.waitgroup-add-no-done",
         "go.write-error-ignored"
-      ]
+      ],
+      "generated_rule_count": 64,
+      "label": "go-rule-pack",
+      "uncovered_generated_rule_count": 0,
+      "uncovered_generated_rule_ids": []
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],

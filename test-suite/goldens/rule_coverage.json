@@ -16,64 +16,17 @@
       "buggy_cases_with_required_substrings": 56,
       "case_count": 112,
       "clean_cases_with_forbidden_substrings": 56,
-      "strict_zero_clean_cases": 54,
-      "weak_case_count": 2,
-      "weak_cases": [
-        {
-          "id": "golang-taint-clean",
-          "language": "golang",
-          "path": "test-suite/golang/clean/taint_analysis.go",
-          "reasons": [
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-taint-clean",
-          "language": "js",
-          "path": "test-suite/js/clean/taint_analysis.js",
-          "reasons": [
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        }
-      ]
+      "strict_zero_clean_cases": 56,
+      "weak_case_count": 0,
+      "weak_cases": []
     },
     "campaign": {
       "buggy_cases_with_required_substrings": 87,
       "case_count": 173,
       "clean_cases_with_forbidden_substrings": 86,
-      "strict_zero_clean_cases": 83,
-      "weak_case_count": 3,
-      "weak_cases": [
-        {
-          "id": "golang-taint-clean",
-          "language": "golang",
-          "path": "test-suite/golang/clean/taint_analysis.go",
-          "reasons": [
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-async-errors-clean",
-          "language": "js",
-          "path": "test-suite/js/async_errors/clean",
-          "reasons": [
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        },
-        {
-          "id": "js-taint-clean",
-          "language": "js",
-          "path": "test-suite/js/clean/taint_analysis.js",
-          "reasons": [
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        }
-      ]
+      "strict_zero_clean_cases": 86,
+      "weak_case_count": 0,
+      "weak_cases": []
     },
     "smoke": {
       "buggy_cases_with_required_substrings": 3,
@@ -107,7 +60,7 @@
       "buggy_cases_with_required_substrings": 16,
       "clean_cases_with_forbidden_substrings": 16,
       "security_pairs": 16,
-      "strict_zero_clean_cases": 15
+      "strict_zero_clean_cases": 16
     },
     "java": {
       "buggy_cases_with_required_substrings": 14,
@@ -119,13 +72,13 @@
       "buggy_cases_with_required_substrings": 25,
       "clean_cases_with_forbidden_substrings": 25,
       "security_pairs": 25,
-      "strict_zero_clean_cases": 24
+      "strict_zero_clean_cases": 25
     },
     "python": {
       "buggy_cases_with_required_substrings": 34,
       "clean_cases_with_forbidden_substrings": 33,
       "security_pairs": 34,
-      "strict_zero_clean_cases": 33
+      "strict_zero_clean_cases": 34
     },
     "ruby": {
       "buggy_cases_with_required_substrings": 7,
@@ -1056,7 +1009,7 @@
       "clean_case": "golang-taint-clean",
       "clean_forbid_count": 3,
       "clean_max_critical": 0,
-      "clean_max_warning": 2,
+      "clean_max_warning": 0,
       "clean_path": "test-suite/golang/clean/taint_analysis.go",
       "language": "golang",
       "slug": "taint"
@@ -1574,7 +1527,7 @@
       "clean_case": "js-taint-clean",
       "clean_forbid_count": 3,
       "clean_max_critical": 0,
-      "clean_max_warning": 2,
+      "clean_max_warning": 0,
       "clean_path": "test-suite/js/clean/taint_analysis.js",
       "language": "js",
       "slug": "taint"
@@ -2022,7 +1975,7 @@
       "clean_case": "python-taint-clean",
       "clean_forbid_count": 0,
       "clean_max_critical": 0,
-      "clean_max_warning": 2,
+      "clean_max_warning": 0,
       "clean_path": "test-suite/python/clean/taint_analysis.py",
       "language": "python",
       "slug": "taint"

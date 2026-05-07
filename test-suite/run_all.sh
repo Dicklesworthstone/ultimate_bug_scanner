@@ -100,6 +100,7 @@ echo ""
 
 if command -v uv >/dev/null 2>&1; then
   uv run python quality/rule_quality_harness.py
+  uv run python -m unittest discover -s quality -p 'test_*.py'
   uv run python ./run_manifest.py "$@"
   uv run python shareable/test_shareable_reports.py
   uv run python shareable/test_meta_runner_modes.py
@@ -109,6 +110,7 @@ if command -v uv >/dev/null 2>&1; then
 else
   echo "[warn] uv not found – falling back to system python3. Run 'uv sync --python 3.13' for the supported toolchain." >&2
   python3 quality/rule_quality_harness.py
+  python3 -m unittest discover -s quality -p 'test_*.py'
   python3 ./run_manifest.py "$@"
   python3 shareable/test_shareable_reports.py
   python3 shareable/test_meta_runner_modes.py

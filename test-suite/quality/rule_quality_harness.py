@@ -1088,6 +1088,29 @@ def build_rule_inventory_coverage(
     return coverage
 
 
+def assert_rule_inventory_fully_covered(
+    rule_inventory_coverage: list[dict[str, Any]],
+) -> None:
+    gaps: list[dict[str, Any]] = []
+    for item in rule_inventory_coverage:
+        uncovered_rule_ids = item.get("uncovered_generated_rule_ids", [])
+        orphaned_corpus_rule_ids = item.get("corpus_result_rule_ids_without_generated_rule", [])
+        if uncovered_rule_ids or orphaned_corpus_rule_ids:
+            gaps.append(
+                {
+                    "corpus_result_rule_ids_without_generated_rule": orphaned_corpus_rule_ids,
+                    "label": item.get("label", ""),
+                    "uncovered_generated_rule_ids": uncovered_rule_ids,
+                }
+            )
+    if gaps:
+        raise AssertionError(
+            "generated ast-grep rules must be exercised by the language corpus "
+            "and corpus SARIF rule ids must come from dumped generated rules: "
+            f"{json.dumps(gaps, sort_keys=True)}"
+        )
+
+
 def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
     checks = [
         {
@@ -1115,6 +1138,7 @@ def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
         corpus_checks,
         per_rule_validation,
     )
+    assert_rule_inventory_fully_covered(rule_inventory_coverage)
     update_or_check_ast_grep_sarif_golden(
         {
             "version": 4,

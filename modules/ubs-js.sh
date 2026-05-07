@@ -942,6 +942,7 @@ ARROW_FUNC_PATTERN = re.compile(r"=\s*\(\s*\{([^}]*)\}\s*\)\s*=>")
 DESTRUCT_PROPS_PATTERN = re.compile(r"const\s*\{([^}]*)\}\s*=\s*props")
 
 STRING_RE = re.compile(r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')", re.S)
+COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n\r]*", re.S)
 TEMPLATE_START = '`'
 file_cache = {}
 
@@ -1049,8 +1050,11 @@ def strip_strings(text):
     text = STRING_RE.sub(' ', text)
     return strip_template_literals(text)
 
+def strip_comments(text):
+    return COMMENT_RE.sub(' ', text)
+
 def extract_identifiers(callback_text):
-    cleaned = strip_strings(callback_text)
+    cleaned = strip_comments(strip_strings(callback_text))
     return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned))
 
 def parse_deps(text):

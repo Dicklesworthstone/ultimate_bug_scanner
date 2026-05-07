@@ -23,6 +23,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_ROOT = REPO_ROOT / "test-suite"
 GOLDEN_PATH = TEST_ROOT / "goldens" / "rule_coverage.json"
+AST_GREP_SARIF_GOLDEN_PATH = TEST_ROOT / "goldens" / "ast_grep_rule_pack_sarif.json"
 RUNTIME_ROOT = Path(
     os.environ.get(
         "UBS_RULE_QUALITY_TMP",
@@ -309,6 +310,42 @@ def update_or_check_golden(current: dict[str, Any], update: bool) -> None:
     print("[coverage-golden] PASS")
 
 
+def update_or_check_ast_grep_sarif_golden(current: dict[str, Any], update: bool) -> None:
+    rendered = json.dumps(current, indent=2, sort_keys=True) + "\n"
+    if update:
+        AST_GREP_SARIF_GOLDEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        AST_GREP_SARIF_GOLDEN_PATH.write_text(rendered, encoding="utf-8")
+        print(
+            "[ast-grep-sarif-golden] updated "
+            f"{AST_GREP_SARIF_GOLDEN_PATH.relative_to(REPO_ROOT)}"
+        )
+        return
+
+    try:
+        expected = JSON_DECODER.decode(
+            AST_GREP_SARIF_GOLDEN_PATH.read_text(encoding="utf-8")
+        )
+    except FileNotFoundError as exc:
+        raise AssertionError(
+            f"missing {AST_GREP_SARIF_GOLDEN_PATH.relative_to(REPO_ROOT)}; "
+            "run with UPDATE_GOLDENS=1 after reviewing current SARIF evidence"
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"invalid JSON in {AST_GREP_SARIF_GOLDEN_PATH.relative_to(REPO_ROOT)}: {exc}"
+        ) from exc
+    if not isinstance(expected, dict):
+        raise AssertionError(
+            f"{AST_GREP_SARIF_GOLDEN_PATH.relative_to(REPO_ROOT)} must contain a JSON object"
+        )
+    if expected != current:
+        raise AssertionError(
+            "ast-grep SARIF evidence golden changed; review rule-pack result drift and rerun "
+            "with UPDATE_GOLDENS=1 if the new evidence is intentional"
+        )
+    print("[ast-grep-sarif-golden] PASS")
+
+
 def case_by_id(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {case["id"]: case for case in manifest["cases"]}
 
@@ -456,7 +493,7 @@ AST_GREP_SARIF_CHECKS = (
 )
 
 
-def run_single_ast_grep_rule_pack_check(spec: dict[str, Any], timeout: int) -> None:
+def run_single_ast_grep_rule_pack_check(spec: dict[str, Any], timeout: int) -> dict[str, Any]:
     label = f"ast-grep-{spec['label']}-sarif"
     cmd = [
         str(REPO_ROOT / "modules" / spec["module"]),
@@ -498,12 +535,28 @@ def run_single_ast_grep_rule_pack_check(spec: dict[str, Any], timeout: int) -> N
     if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
         write_runtime_artifact(label, proc, payload if isinstance(payload, dict) else None)
         raise AssertionError(f"{label} SARIF output lacks runs[]")
+    result_count = sum(
+        1
+        for run in payload["runs"]
+        if isinstance(run, dict)
+        for result in run.get("results", []) or []
+        if isinstance(result, dict)
+    )
     result_rule_ids = {
         result.get("ruleId")
         for run in payload["runs"]
         if isinstance(run, dict)
         for result in run.get("results", []) or []
         if isinstance(result, dict) and isinstance(result.get("ruleId"), str)
+    }
+    driver_rule_ids = {
+        rule_id
+        for run in payload["runs"]
+        if isinstance(run, dict)
+        for rule in ((run.get("tool", {}) or {}).get("driver", {}) or {}).get("rules", []) or []
+        if isinstance(rule, dict)
+        for rule_id in (rule.get("id"), rule.get("name"), rule.get("ruleId"))
+        if isinstance(rule_id, str) and rule_id
     }
     missing_rule_ids = sorted(set(spec.get("expected_rule_ids", ())) - result_rule_ids)
     if missing_rule_ids:
@@ -518,16 +571,41 @@ def run_single_ast_grep_rule_pack_check(spec: dict[str, Any], timeout: int) -> N
         raise AssertionError(
             f"{label} SARIF output did not include expected rule ids: {missing_rule_ids}"
         )
+    summary = {
+        "args": list(spec["args"]),
+        "driver_rule_count": len(driver_rule_ids),
+        "driver_rule_ids": sorted(driver_rule_ids),
+        "expected_rule_ids": list(spec.get("expected_rule_ids", ())),
+        "fixture": spec["fixture"],
+        "module": spec["module"],
+        "result_count": result_count,
+        "result_rule_ids": sorted(result_rule_ids),
+        "sarif_runs": len(payload["runs"]),
+    }
     write_runtime_artifact(
         label,
         proc,
-        {"sarif_runs": len(payload["runs"]), "result_rule_ids": sorted(result_rule_ids)},
+        summary,
     )
+    return summary
 
 
-def run_ast_grep_rule_pack_check(timeout: int) -> None:
-    for spec in AST_GREP_SARIF_CHECKS:
-        run_single_ast_grep_rule_pack_check(spec, timeout)
+def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
+    checks = [
+        {
+            "label": spec["label"],
+            **run_single_ast_grep_rule_pack_check(spec, timeout),
+        }
+        for spec in AST_GREP_SARIF_CHECKS
+    ]
+    update_or_check_ast_grep_sarif_golden(
+        {
+            "version": 1,
+            "scope": "Rust, TypeScript/JavaScript, and Go ast-grep SARIF evidence",
+            "checks": checks,
+        },
+        update_golden,
+    )
     print(f"[ast-grep-rule-pack] PASS ({len(AST_GREP_SARIF_CHECKS)} SARIF checks)")
 
 
@@ -720,7 +798,7 @@ def main(argv: list[str]) -> int:
     print("[manifest-audit] PASS")
 
     if not args.skip_runtime:
-        run_ast_grep_rule_pack_check(args.case_timeout)
+        run_ast_grep_rule_pack_check(args.case_timeout, update_golden)
         run_runtime_pair_checks(manifest, coverage, args.runtime_scope, args.case_timeout)
         run_metamorphic_checks(manifest, args.case_timeout)
         run_fuzz_smoke(manifest, args.case_timeout, args.fuzz_iterations)

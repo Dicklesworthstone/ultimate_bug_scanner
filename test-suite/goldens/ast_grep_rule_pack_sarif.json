@@ -1,0 +1,71 @@
+{
+  "checks": [
+    {
+      "args": [
+        "--format=sarif"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "js.eval-call",
+        "js.innerHTML-assign"
+      ],
+      "fixture": "test-suite/js/buggy/security.js",
+      "label": "js-rule-pack",
+      "module": "ubs-js.sh",
+      "result_count": 2,
+      "result_rule_ids": [
+        "js.eval-call",
+        "js.innerHTML-assign"
+      ],
+      "sarif_runs": 1
+    },
+    {
+      "args": [
+        "--format=sarif"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "go.exec-sh-c"
+      ],
+      "fixture": "test-suite/golang/buggy/security_sql.go",
+      "label": "go-rule-pack",
+      "module": "ubs-golang.sh",
+      "result_count": 4,
+      "result_rule_ids": [
+        "go.close-error-ignored",
+        "go.exec-sh-c"
+      ],
+      "sarif_runs": 1
+    },
+    {
+      "args": [
+        "--no-cargo",
+        "--format=sarif"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "rust.unwrap-call"
+      ],
+      "fixture": "test-suite/rust/buggy/buggy_unwrap.rs",
+      "label": "rust-rule-pack",
+      "module": "ubs-rust.sh",
+      "result_count": 13,
+      "result_rule_ids": [
+        "rust.clone-call",
+        "rust.fixme-comment",
+        "rust.mem-transmute",
+        "rust.mutex-lock-unwrap",
+        "rust.thread-spawn-no-join",
+        "rust.todo-comment",
+        "rust.unsafe-block",
+        "rust.unwrap-call"
+      ],
+      "sarif_runs": 1
+    }
+  ],
+  "scope": "Rust, TypeScript/JavaScript, and Go ast-grep SARIF evidence",
+  "version": 1
+}

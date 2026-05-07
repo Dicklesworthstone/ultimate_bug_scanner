@@ -10,12 +10,12 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
-	_ "net/http/pprof"
-	. "strings"
 	"sort"
 	"strings"
+	. "strings"
 	"sync"
 	"time"
 )
@@ -73,6 +73,12 @@ func contextCoverage(parent context.Context, cond bool, err error) {
 	cancel()
 }
 
+func contextWithoutCancelCoverage(parent context.Context) {
+	ctx, cancel := context.WithTimeout(parent, time.Second)
+	_ = ctx
+	_ = cancel
+}
+
 func httpCoverage(w http.ResponseWriter, r *http.Request, url string, cond bool) error {
 	_ = context.Background()
 
@@ -128,6 +134,9 @@ func jsonCoverage(w http.ResponseWriter, r *http.Request) {
 
 	dec := json.NewDecoder(r.Body)
 	dec.Decode(&dst)
+
+	var legacy interface{}
+	_ = legacy
 }
 
 func fileCoverage(path string, payload []byte) error {
@@ -208,6 +217,18 @@ func ignoredErrorsCoverage(w io.Writer, tmpl *template.Template, data any, path 
 	}
 
 	os.Remove(path)
+}
+
+func droppedErrorCoverage(err error) any {
+	if err != nil {
+		return nil
+	}
+	return "ok"
+}
+
+func waitGroupMissingDoneCoverage(wg *sync.WaitGroup) {
+	wg.Add(1)
+	processItem("missing done")
 }
 
 func commandCoverage(commandLine string) {

@@ -3443,18 +3443,11 @@ YAML
 id: go.http-handler-background
 language: go
 rule:
-  all:
-    - any:
-        - pattern: |
-            func $NAME($W http.ResponseWriter, $R *http.Request, $$$) $RET {
-              $$$
-            }
-        - pattern: |
-            func($W http.ResponseWriter, $R *http.Request, $$$) {
-              $$$
-            }
-    - has:
-        pattern: context.Background()
+  any:
+    - kind: function_declaration
+      regex: "(?s)http\\.ResponseWriter.*context\\.Background\\s*\\("
+    - kind: func_literal
+      regex: "(?s)http\\.ResponseWriter.*context\\.Background\\s*\\("
 severity: warning
 message: "HTTP handler uses context.Background(); prefer r.Context() for cancellation and deadlines."
 YAML
@@ -4124,15 +4117,12 @@ rule:
     - kind: expression_statement
       regex: "\\.Write\\s*\\("
     - inside:
+        stopBy: end
         any:
-          - pattern: |
-              func $NAME($W http.ResponseWriter, $R *http.Request, $$$) $RET {
-                $$$
-              }
-          - pattern: |
-              func($W http.ResponseWriter, $R *http.Request, $$$) {
-                $$$
-              }
+          - kind: function_declaration
+            regex: "\\bhttp\\.ResponseWriter\\b"
+          - kind: func_literal
+            regex: "\\bhttp\\.ResponseWriter\\b"
 severity: info
 message: "http.ResponseWriter.Write(...) return values ignored; consider checking error (or explicitly discarding with _, _ = ...)."
 YAML

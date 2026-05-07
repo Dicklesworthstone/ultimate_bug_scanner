@@ -289,13 +289,18 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
+    robustness_scopes = robustness_scopes_from_pairs(pairs, cases)
     return {
         "version": 2,
         "scope": "security fixture pairs for every UBS-supported language module plus Rust, TypeScript/JavaScript, and Go campaign behavior-rule scopes",
         "languages": by_language,
+        "metamorphic_transform_scopes": metamorphic_transform_scopes_from_robustness(
+            robustness_scopes,
+            cases,
+        ),
         "pairs": pairs,
         "runtime_scopes": runtime_scopes_from_pairs(pairs, cases),
-        "robustness_scopes": robustness_scopes_from_pairs(pairs, cases),
+        "robustness_scopes": robustness_scopes,
     }
 
 
@@ -388,6 +393,30 @@ def robustness_scopes_from_pairs(
             "clean_fuzz": unique_case_ids(campaign_clean_fuzz),
         },
     }
+
+
+def metamorphic_transform_scopes_from_robustness(
+    robustness_scopes: dict[str, dict[str, list[str]]],
+    cases: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    cases_by_id = {case["id"]: case for case in cases}
+    transform_scopes: dict[str, dict[str, Any]] = {}
+    for scope, scope_cases in sorted(robustness_scopes.items()):
+        case_ids = scope_cases.get("metamorphic", [])
+        by_transform: dict[str, list[str]] = defaultdict(list)
+        for case_id in case_ids:
+            case = cases_by_id[case_id]
+            for transform in metamorphic_transforms_for_case(case):
+                by_transform[transform].append(case_id)
+        transform_scopes[scope] = {
+            "by_transform": {
+                transform: by_transform[transform]
+                for transform in sorted(by_transform)
+            },
+            "case_count": len(case_ids),
+            "transformed_scan_count": sum(len(ids) for ids in by_transform.values()),
+        }
+    return transform_scopes
 
 
 def update_or_check_golden(current: dict[str, Any], update: bool) -> None:

@@ -3262,5 +3262,52 @@
     ]
   },
   "scope": "security fixture pairs for every UBS-supported language module plus Rust, TypeScript/JavaScript, and Go campaign behavior-rule scopes",
-  "version": 2
+  "target_clean_baseline_budgets": {
+    "case_count": 5,
+    "cases": [
+      {
+        "critical_max": 0,
+        "forbid_substring_count": 0,
+        "id": "js-core-clean",
+        "language": "js",
+        "path": "test-suite/clean",
+        "warning_max": 0
+      },
+      {
+        "critical_max": 0,
+        "forbid_substring_count": 0,
+        "id": "js-module-clean",
+        "language": "js",
+        "path": "test-suite/js/clean",
+        "warning_max": 0
+      },
+      {
+        "critical_max": 0,
+        "forbid_substring_count": 0,
+        "id": "js-node-clean",
+        "language": "js",
+        "path": "test-suite/frameworks/node/clean-api.js",
+        "warning_max": 0
+      },
+      {
+        "critical_max": 0,
+        "forbid_substring_count": 0,
+        "id": "golang-clean",
+        "language": "golang",
+        "path": "test-suite/golang/clean",
+        "warning_max": 4
+      },
+      {
+        "critical_max": 0,
+        "forbid_substring_count": 0,
+        "id": "rust-clean",
+        "language": "rust",
+        "path": "test-suite/rust/clean",
+        "warning_max": 6
+      }
+    ],
+    "strict_zero_case_count": 3,
+    "warning_budget_total": 10
+  },
+  "version": 3
 }

@@ -182,7 +182,7 @@
     },
     {
       "id": "js-module-clean",
-      "description": "module-specific clean fixture (allows single warning until tuned).",
+      "description": "module-specific clean fixture (should stay warning-free).",
       "path": "test-suite/js/clean",
       "language": "js",
       "tags": [
@@ -200,7 +200,7 @@
             "max": 0
           },
           "warning": {
-            "max": 2
+            "max": 0
           }
         }
       }
@@ -5010,7 +5010,7 @@
             "max": 0
           },
           "warning": {
-            "max": 6
+            "max": 4
           }
         }
       }

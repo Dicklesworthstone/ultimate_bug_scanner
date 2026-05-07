@@ -50,6 +50,13 @@ SECURITY_COVERAGE_LANGUAGES = {
     "swift",
 }
 CAMPAIGN_COVERAGE_LANGUAGES = {"golang", "js", "rust"}
+TARGET_CLEAN_BASELINE_CASE_IDS = (
+    "js-core-clean",
+    "js-module-clean",
+    "js-node-clean",
+    "golang-clean",
+    "rust-clean",
+)
 CAMPAIGN_BEHAVIOR_TAGS = {
     "async",
     "collections",
@@ -293,7 +300,7 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
     runtime_scopes = runtime_scopes_from_pairs(pairs, cases)
     robustness_scopes = robustness_scopes_from_pairs(pairs, cases)
     return {
-        "version": 2,
+        "version": 3,
         "scope": "security fixture pairs for every UBS-supported language module plus Rust, TypeScript/JavaScript, and Go campaign behavior-rule scopes",
         "clean_fuzz_budget_scopes": clean_fuzz_budget_scopes_from_robustness(
             robustness_scopes,
@@ -310,6 +317,7 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
         "pairs": pairs,
         "runtime_scopes": runtime_scopes,
         "robustness_scopes": robustness_scopes,
+        "target_clean_baseline_budgets": target_clean_baseline_budgets(cases),
     }
 
 
@@ -440,6 +448,46 @@ def clean_fuzz_budget_scopes_from_robustness(
             ),
         }
         for scope, scope_cases in sorted(robustness_scopes.items())
+    }
+
+
+def target_clean_baseline_budgets(cases: list[dict[str, Any]]) -> dict[str, Any]:
+    cases_by_id = {case["id"]: case for case in cases}
+    missing_ids = sorted(
+        case_id
+        for case_id in TARGET_CLEAN_BASELINE_CASE_IDS
+        if case_id not in cases_by_id
+    )
+    if missing_ids:
+        raise AssertionError(f"target clean baseline cases missing from manifest: {missing_ids}")
+
+    baseline_cases: list[dict[str, Any]] = []
+    for case_id in TARGET_CLEAN_BASELINE_CASE_IDS:
+        case = cases_by_id[case_id]
+        expect = case.get("expect", {})
+        totals = expect.get("totals", {})
+        critical_max = int(totals.get("critical", {}).get("max", 0))
+        warning_max = int(totals.get("warning", {}).get("max", 0))
+        baseline_cases.append(
+            {
+                "critical_max": critical_max,
+                "forbid_substring_count": len(expect.get("forbid_substrings", [])),
+                "id": case_id,
+                "language": case.get("language", ""),
+                "path": normalize_case_path(case["path"]),
+                "warning_max": warning_max,
+            }
+        )
+
+    return {
+        "case_count": len(baseline_cases),
+        "cases": baseline_cases,
+        "strict_zero_case_count": sum(
+            1
+            for case in baseline_cases
+            if case["critical_max"] == 0 and case["warning_max"] == 0
+        ),
+        "warning_budget_total": sum(case["warning_max"] for case in baseline_cases),
     }
 
 

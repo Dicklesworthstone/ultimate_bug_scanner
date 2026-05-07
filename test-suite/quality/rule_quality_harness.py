@@ -436,19 +436,22 @@ AST_GREP_SARIF_CHECKS = (
         "label": "js-rule-pack",
         "module": "ubs-js.sh",
         "args": ("--format=sarif",),
-        "fixture": "test-suite/js/security/request-body-limit-buggy.ts",
+        "fixture": "test-suite/js/buggy/security.js",
+        "expected_rule_ids": ("js.eval-call", "js.innerHTML-assign"),
     },
     {
         "label": "go-rule-pack",
         "module": "ubs-golang.sh",
         "args": ("--format=sarif",),
-        "fixture": "test-suite/golang/security/ssrf_buggy.go",
+        "fixture": "test-suite/golang/buggy/security_sql.go",
+        "expected_rule_ids": ("go.exec-sh-c",),
     },
     {
         "label": "rust-rule-pack",
         "module": "ubs-rust.sh",
         "args": ("--no-cargo", "--format=sarif"),
-        "fixture": "test-suite/rust/buggy/sql_injection.rs",
+        "fixture": "test-suite/rust/buggy/buggy_unwrap.rs",
+        "expected_rule_ids": ("rust.unwrap-call",),
     },
 )
 
@@ -495,10 +498,30 @@ def run_single_ast_grep_rule_pack_check(spec: dict[str, Any], timeout: int) -> N
     if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
         write_runtime_artifact(label, proc, payload if isinstance(payload, dict) else None)
         raise AssertionError(f"{label} SARIF output lacks runs[]")
+    result_rule_ids = {
+        result.get("ruleId")
+        for run in payload["runs"]
+        if isinstance(run, dict)
+        for result in run.get("results", []) or []
+        if isinstance(result, dict) and isinstance(result.get("ruleId"), str)
+    }
+    missing_rule_ids = sorted(set(spec.get("expected_rule_ids", ())) - result_rule_ids)
+    if missing_rule_ids:
+        write_runtime_artifact(
+            label,
+            proc,
+            {
+                "sarif_runs": len(payload["runs"]),
+                "result_rule_ids": sorted(result_rule_ids),
+            },
+        )
+        raise AssertionError(
+            f"{label} SARIF output did not include expected rule ids: {missing_rule_ids}"
+        )
     write_runtime_artifact(
         label,
         proc,
-        {"sarif_runs": len(payload["runs"])},
+        {"sarif_runs": len(payload["runs"]), "result_rule_ids": sorted(result_rule_ids)},
     )
 
 

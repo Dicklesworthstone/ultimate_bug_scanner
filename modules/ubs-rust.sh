@@ -6213,7 +6213,8 @@ YAML
 id: rust.arc-mutex
 language: rust
 rule:
-  pattern: Arc<Mutex<$T>>
+  kind: generic_type
+  regex: '(^|::)Arc\s*<\s*([A-Za-z_][A-Za-z0-9_]*::)*Mutex\s*<'
 severity: info
 message: "Arc<Mutex<..>> used; verify lock contention and potential deadlocks"
 YAML
@@ -6222,7 +6223,8 @@ YAML
 id: rust.rc-refcell
 language: rust
 rule:
-  pattern: Rc<RefCell<$T>>
+  kind: generic_type
+  regex: '(^|::)Rc\s*<\s*([A-Za-z_][A-Za-z0-9_]*::)*RefCell\s*<'
 severity: warning
 message: "Rc<RefCell<..>> used; runtime borrow panics possible; prefer &mut or owning designs"
 YAML
@@ -6396,10 +6398,8 @@ YAML
 id: rust.format-literal-no-vars
 language: rust
 rule:
-  pattern: format!($S)
-  constraints:
-    S:
-      regex: '^\".*\"$|^r#\".*\"#$'
+  kind: macro_invocation
+  regex: 'format!\s*\(\s*r#*"[^",{}]*"#*\s*\)'
 severity: info
 message: "format!(\"literal\") allocates; prefer .to_string() for plain literals"
 YAML
@@ -6674,7 +6674,7 @@ rule:
     - pattern: $X as f32
     - pattern: $X as f64
 severity: info
-message: "\`as\` cast can truncate or change sign; prefer TryFrom/TryInto when correctness matters"
+message: "`as` cast can truncate or change sign; prefer TryFrom/TryInto when correctness matters"
 YAML
 
   cat >"$AST_RULE_DIR/len-count-narrow-as.yml" <<'YAML'

@@ -1000,7 +1000,7 @@
       "buggy_min_critical": 0,
       "buggy_min_warning": 1,
       "buggy_path": "test-suite/golang/security/request_body_limit_buggy.go",
-      "buggy_require_count": 5,
+      "buggy_require_count": 7,
       "clean_case": "golang-request-body-limit-clean",
       "clean_forbid_count": 1,
       "clean_max_critical": 0,

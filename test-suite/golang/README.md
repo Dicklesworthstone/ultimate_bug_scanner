@@ -18,8 +18,8 @@
 | `security/tls_verification_clean.go` | TLS verification security | TLS clients using normal verification with `MinVersion`, `ServerName`, and root CAs |
 | `security/archive_extraction_buggy.go` | Archive extraction security | tar/zip entry names written with `filepath.Join` without containment checks |
 | `security/archive_extraction_clean.go` | Archive extraction security | `filepath.Rel`/absolute-path validation before tar/zip writes |
-| `security/request_body_limit_buggy.go` | Request body size limits | unbounded `io.ReadAll`, `ioutil.ReadAll`, and `json.NewDecoder(r.Body).Decode` paths |
-| `security/request_body_limit_clean.go` | Request body size limits | `http.MaxBytesReader`/`io.LimitReader` before body reads and JSON decode |
+| `security/request_body_limit_buggy.go` | Request body size limits | unbounded `io.ReadAll`, `ioutil.ReadAll`, `json.NewDecoder(r.Body).Decode`, and raw body alias paths |
+| `security/request_body_limit_clean.go` | Request body size limits | `http.MaxBytesReader`/`io.LimitReader` before direct or aliased body reads and JSON decode |
 | `buggy/performance.go` | Timers + defer in loops | `time.Tick` leaks, defer inside loop |
 | Clean counterparts | Defensive examples | context.WithTimeout, prepared statements, ticker.Stop |
 

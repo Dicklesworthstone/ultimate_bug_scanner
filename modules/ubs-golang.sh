@@ -24,7 +24,7 @@
 #       - context.Background inside HTTP handlers
 #       - http.Transport missing timeouts, CloseIdleConnections hygiene
 #       - err shadowing, empty if err blocks, dropped err returns
-#       - unbounded JSON decode from req.Body (MaxBytesReader heuristic)
+#       - unbounded JSON decode/read from req.Body aliases (MaxBytesReader heuristic)
 #       - dynamic SQL string at Exec/Query sinks, strings.Fields in exec
 #   • New categories 20–22 for crashers, DB robustness, and shutdown hygiene
 # ═══════════════════════════════════════════════════════════════════════════
@@ -5071,17 +5071,21 @@ BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
 SKIP_DIRS = {'.git', 'vendor', 'node_modules', '.cache', 'bin', 'build', 'dist'}
 
 READALL_BODY_RE = re.compile(
-    r'\b(?:io|ioutil)\.ReadAll\s*\(\s*(?P<body>[A-Za-z_][A-Za-z0-9_]*\.Body)\s*\)'
+    r'\b(?:io|ioutil)\.ReadAll\s*\(\s*(?P<body>[A-Za-z_][A-Za-z0-9_]*(?:\.Body)?)\s*\)'
 )
 JSON_DIRECT_BODY_RE = re.compile(
-    r'\bjson\.NewDecoder\s*\(\s*(?P<body>[A-Za-z_][A-Za-z0-9_]*\.Body)\s*\)'
+    r'\bjson\.NewDecoder\s*\(\s*(?P<body>[A-Za-z_][A-Za-z0-9_]*(?:\.Body)?)\s*\)'
     r'\s*\.\s*Decode\s*\('
 )
 JSON_DECODER_ASSIGN_RE = re.compile(
     r'\b(?P<decoder>[A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*'
-    r'json\.NewDecoder\s*\(\s*(?P<body>[A-Za-z_][A-Za-z0-9_]*\.Body)\s*\)'
+    r'json\.NewDecoder\s*\(\s*(?P<body>[A-Za-z_][A-Za-z0-9_]*(?:\.Body)?)\s*\)'
 )
 JSON_DECODE_CALL_RE = re.compile(r'\b(?P<decoder>[A-Za-z_][A-Za-z0-9_]*)\.Decode\s*\(')
+BODY_ALIAS_ASSIGN_RE = re.compile(
+    r'\b(?:var\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*(?::=|=)\s*'
+    r'(?P<body>[A-Za-z_][A-Za-z0-9_]*\.Body)\b'
+)
 
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
@@ -5152,6 +5156,11 @@ def body_is_limited(context: str, body: str) -> bool:
         or re.search(rf'\b(?:io\.)?LimitReader\s*\(\s*{escaped}\b', context)
     )
 
+def resolve_body(body_aliases, body: str) -> str | None:
+    if '.Body' in body:
+        return body
+    return body_aliases.get(body)
+
 def add_issue(issues, seen, path: Path, idx: int, raw: str):
     key = (relpath(path), idx + 1)
     if key in seen:
@@ -5165,6 +5174,7 @@ def analyze(path: Path, issues):
     except OSError:
         return
     seen = set()
+    body_aliases = {}
     decoder_bodies = {}
     for idx, raw in enumerate(lines):
         if has_ignore(lines, idx):
@@ -5172,22 +5182,32 @@ def analyze(path: Path, issues):
         stripped = strip_line_comments(raw).strip()
         if not stripped:
             continue
-        if stripped.startswith('func '):
+        if stripped.startswith(('func ', 'func(', 'func (')):
+            body_aliases.clear()
             decoder_bodies.clear()
+
+        alias_assignment = BODY_ALIAS_ASSIGN_RE.search(stripped)
+        if alias_assignment:
+            body_aliases[alias_assignment.group('alias')] = alias_assignment.group('body')
 
         assignment = JSON_DECODER_ASSIGN_RE.search(stripped)
         if assignment:
-            decoder_bodies[assignment.group('decoder')] = (
-                assignment.group('body'),
-                idx,
-                raw,
-            )
+            decoder_body = resolve_body(body_aliases, assignment.group('body'))
+            if decoder_body:
+                decoder_bodies[assignment.group('decoder')] = (
+                    decoder_body,
+                    idx,
+                    raw,
+                )
 
         for match in (READALL_BODY_RE.search(stripped), JSON_DIRECT_BODY_RE.search(stripped)):
             if not match:
                 continue
+            body = resolve_body(body_aliases, match.group('body'))
+            if not body:
+                continue
             context = context_around(lines, idx)
-            if body_is_limited(context, match.group('body')):
+            if body_is_limited(context, body):
                 continue
             add_issue(issues, seen, path, idx, raw)
 

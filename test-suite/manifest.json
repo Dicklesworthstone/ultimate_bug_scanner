@@ -5700,9 +5700,11 @@
         "require_substrings": [
           "Request body read without explicit byte limit",
           "io.ReadAll(r.Body)",
+          "io.ReadAll(body)",
           "ioutil.ReadAll(req.Body)",
           "json.NewDecoder(r.Body).Decode(&payload)",
-          "decoder := json.NewDecoder(req.Body)"
+          "decoder := json.NewDecoder(req.Body)",
+          "decoder := json.NewDecoder(body)"
         ]
       }
     },

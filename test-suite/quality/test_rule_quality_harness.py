@@ -14,6 +14,16 @@ from typing import Any
 import rule_quality_harness
 
 
+def load_artifact_result(artifact_dir: Path) -> Any:
+    with (artifact_dir / "result.json").open(encoding="utf-8") as result_file:
+        try:
+            return json.load(result_file)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"artifact result is not valid JSON: {artifact_dir / 'result.json'}"
+            ) from exc
+
+
 class ProgressOutputTest(unittest.TestCase):
     def test_log_progress_writes_one_line(self) -> None:
         buffer = io.StringIO()
@@ -110,7 +120,7 @@ class RuntimeArtifactTest(unittest.TestCase):
                     timeout=1,
                 )
 
-        result = json.loads((artifact_dir / "result.json").read_text(encoding="utf-8"))
+        result = load_artifact_result(artifact_dir)
         self.assertEqual(
             (artifact_dir / "stdout.log").read_text(encoding="utf-8"),
             "started scan",
@@ -158,7 +168,7 @@ class RuntimeArtifactTest(unittest.TestCase):
             (artifact_dir / "stdout.log").read_text(encoding="utf-8"),
             "not a UBS summary",
         )
-        result = json.loads((artifact_dir / "result.json").read_text(encoding="utf-8"))
+        result = load_artifact_result(artifact_dir)
         self.assertIsNone(result["summary"])
 
     def test_run_real_case_allows_unparseable_output_with_explicit_opt_in(self) -> None:
@@ -273,6 +283,59 @@ class RuleInventoryCoverageInvariantTest(unittest.TestCase):
 
 
 class AstGrepRulePackHelperTest(unittest.TestCase):
+    def test_ast_grep_rule_pack_specs_include_swift_dumpable_rules(self) -> None:
+        specs = {
+            spec["label"]: spec
+            for spec in rule_quality_harness.AST_GREP_SARIF_CHECKS
+        }
+
+        self.assertIn("swift-rule-pack", specs)
+        self.assertEqual(specs["swift-rule-pack"]["module"], "ubs-swift.sh")
+        self.assertEqual(
+            specs["swift-rule-pack"]["expected_rule_ids"],
+            ("swift.urlsession.task-no-resume",),
+        )
+
+    def test_parses_machine_readable_list_rule_ids(self) -> None:
+        rule_ids = rule_quality_harness.parse_list_rule_ids(
+            "go.exec-sh-c\nrust.unwrap-call\n",
+            "fixture",
+        )
+
+        self.assertEqual(rule_ids, ["go.exec-sh-c", "rust.unwrap-call"])
+
+    def test_rejects_banner_text_in_list_rule_ids(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "non-rule text"):
+            rule_quality_harness.parse_list_rule_ids(
+                "banner text\nswift.urlsession.task-no-resume\n",
+                "fixture",
+            )
+
+    def test_rejects_unsorted_or_duplicate_list_rule_ids(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "sorted and unique"):
+            rule_quality_harness.parse_list_rule_ids(
+                "rust.unwrap-call\nrust.arc-mutex\nrust.unwrap-call\n",
+                "fixture",
+            )
+
+    def test_accepts_list_rule_ids_that_match_dumped_rules(self) -> None:
+        rule_quality_harness.assert_list_rule_ids_match_dumped_rules(
+            [{"label": "swift-rule-pack", "rule_ids": ["swift.urlsession.task-no-resume"]}],
+            [
+                {
+                    "label": "swift-rule-pack",
+                    "rules": [{"id": "swift.urlsession.task-no-resume"}],
+                }
+            ],
+        )
+
+    def test_rejects_list_rule_ids_that_drift_from_dumped_rules(self) -> None:
+        with self.assertRaisesRegex(AssertionError, "listed_not_dumped"):
+            rule_quality_harness.assert_list_rule_ids_match_dumped_rules(
+                [{"label": "js-rule-pack", "rule_ids": ["js.ghost-rule"]}],
+                [{"label": "js-rule-pack", "rules": [{"id": "js.eval-call"}]}],
+            )
+
     def test_counts_ast_grep_json_stream_objects(self) -> None:
         count = rule_quality_harness.count_json_stream_objects(
             '{"ruleId":"go.exec-sh-c"}\n\n{"ruleId":"rust.unwrap-call"}\n',

@@ -154,7 +154,7 @@ def default_case_timeout() -> int:
 
 
 sys.path.insert(0, str(TEST_ROOT))
-from run_manifest import (  # noqa: E402
+from run_manifest import (  # noqa: E402,F401
     check_expectations,
     disabled_case_ids,
     duplicate_case_ids,
@@ -881,6 +881,7 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-js.sh",
         "args": ("--format=sarif",),
         "dump_args": ("--dump-rules={rules_dir}",),
+        "list_args": ("--list-rules",),
         "fixture": "test-suite/js/buggy/security.js",
         "corpus_fixture": "test-suite/js",
         "expected_rule_ids": ("js.eval-call", "js.innerHTML-assign"),
@@ -890,6 +891,7 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-golang.sh",
         "args": ("--format=sarif",),
         "dump_args": ("--dump-rules={rules_dir}",),
+        "list_args": ("--list-rules",),
         "fixture": "test-suite/golang/buggy/security_sql.go",
         "corpus_fixture": "test-suite/golang",
         "expected_rule_ids": ("go.exec-sh-c",),
@@ -899,9 +901,20 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-rust.sh",
         "args": ("--no-cargo", "--format=sarif"),
         "dump_args": ("--no-cargo", "--dump-rules={rules_dir}"),
+        "list_args": ("--no-cargo", "--list-rules"),
         "fixture": "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs",
         "corpus_fixture": "test-suite/rust",
         "expected_rule_ids": ("rust.unwrap-call", "rust.unwrap-unchecked"),
+    },
+    {
+        "label": "swift-rule-pack",
+        "module": "ubs-swift.sh",
+        "args": ("--format=sarif",),
+        "dump_args": ("--dump-rules={rules_dir}",),
+        "list_args": ("--list-rules",),
+        "fixture": "test-suite/swift/ssrf_buggy",
+        "corpus_fixture": "test-suite/swift",
+        "expected_rule_ids": ("swift.urlsession.task-no-resume",),
     },
 )
 
@@ -960,6 +973,24 @@ def count_json_stream_objects(stdout: str, label: str) -> int:
     return count
 
 
+def parse_list_rule_ids(stdout: str, label: str) -> list[str]:
+    rule_ids = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not rule_ids:
+        raise AssertionError(f"{label} did not emit any rule ids")
+    invalid = [
+        rule_id
+        for rule_id in rule_ids
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", rule_id)
+    ]
+    if invalid:
+        raise AssertionError(
+            f"{label} emitted non-rule text in --list-rules output: {invalid[:5]}"
+        )
+    if rule_ids != sorted(set(rule_ids)):
+        raise AssertionError(f"{label} --list-rules output must be sorted and unique")
+    return rule_ids
+
+
 def is_ast_grep_diagnostic_stderr(stderr: str) -> bool:
     stripped = stderr.strip()
     if not stripped:
@@ -999,7 +1030,11 @@ def sarif_result_has_usable_location(result: dict[str, Any]) -> bool:
         if not isinstance(region, dict):
             continue
         start_line = region.get("startLine")
-        if type(start_line) is int and start_line > 0:
+        if (
+            isinstance(start_line, int)
+            and not isinstance(start_line, bool)
+            and start_line > 0
+        ):
             return True
     return False
 
@@ -1134,6 +1169,52 @@ def run_sarif_rule_pack_check(
         raise AssertionError(f"{label} timed out after {timeout}s") from exc
     proc.duration_seconds = round(time.monotonic() - start, 3)  # type: ignore[attr-defined]
     return sarif_summary_from_process(spec, proc, label)
+
+
+def run_list_rule_inventory_check(
+    spec: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    label = f"ast-grep-{spec['label']}-list-rules"
+    cmd = [
+        str(REPO_ROOT / "modules" / spec["module"]),
+        *spec.get("list_args", ("--list-rules",)),
+    ]
+    env = os.environ.copy()
+    env.update({"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0"})
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(  # nosec B603 - validates checked-in module inventory output.
+            cmd,
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        write_timeout_artifact(label, cmd, exc, time.monotonic() - start, timeout)
+        raise AssertionError(f"{label} timed out after {timeout}s") from exc
+    proc.duration_seconds = round(time.monotonic() - start, 3)  # type: ignore[attr-defined]
+    if proc.returncode != 0:
+        write_runtime_artifact(label, proc, None)
+        raise AssertionError(
+            f"{label} failed; stdout/stderr are captured under "
+            f"test-suite/artifacts/rule_quality/{label}/"
+        )
+    if proc.stderr.strip():
+        write_runtime_artifact(label, proc, None)
+        raise AssertionError(f"{label} emitted stderr")
+    rule_ids = parse_list_rule_ids(proc.stdout, label)
+    summary = {
+        "list_args": list(spec.get("list_args", ("--list-rules",))),
+        "module": spec["module"],
+        "rule_count": len(rule_ids),
+        "rule_ids": rule_ids,
+    }
+    write_runtime_artifact(label, proc, summary)
+    return summary
 
 
 def corpus_sarif_spec(spec: dict[str, Any]) -> dict[str, Any]:
@@ -1322,6 +1403,41 @@ def assert_rule_inventory_fully_covered(
         )
 
 
+def assert_list_rule_ids_match_dumped_rules(
+    list_rule_validation: list[dict[str, Any]],
+    per_rule_validation: list[dict[str, Any]],
+) -> None:
+    listed_by_label = {
+        item["label"]: set(item.get("rule_ids", []))
+        for item in list_rule_validation
+    }
+    dumped_by_label = {
+        item["label"]: {
+            rule["id"]
+            for rule in item.get("rules", [])
+            if isinstance(rule, dict) and isinstance(rule.get("id"), str)
+        }
+        for item in per_rule_validation
+    }
+    mismatches: list[dict[str, Any]] = []
+    for label in sorted(set(listed_by_label) | set(dumped_by_label)):
+        listed = listed_by_label.get(label, set())
+        dumped = dumped_by_label.get(label, set())
+        if listed != dumped:
+            mismatches.append(
+                {
+                    "dumped_not_listed": sorted(dumped - listed),
+                    "label": label,
+                    "listed_not_dumped": sorted(listed - dumped),
+                }
+            )
+    if mismatches:
+        raise AssertionError(
+            "--list-rules output must exactly match dumped generated ast-grep rules: "
+            f"{json.dumps(mismatches, sort_keys=True)}"
+        )
+
+
 def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
     log_progress("[ast-grep-rule-pack] checking focused SARIF fixtures")
     checks = [
@@ -1339,6 +1455,14 @@ def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
         }
         for spec in AST_GREP_SARIF_CHECKS
     ]
+    log_progress("[ast-grep-rule-pack] checking list-rules inventories")
+    list_rule_validation = [
+        {
+            "label": spec["label"],
+            **run_list_rule_inventory_check(spec, timeout),
+        }
+        for spec in AST_GREP_SARIF_CHECKS
+    ]
     ast_grep_cmd = ast_grep_command()
     log_progress("[ast-grep-rule-pack] validating dumped ast-grep YAML rules")
     per_rule_validation = [
@@ -1353,12 +1477,17 @@ def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
         per_rule_validation,
     )
     assert_rule_inventory_fully_covered(rule_inventory_coverage)
+    assert_list_rule_ids_match_dumped_rules(
+        list_rule_validation,
+        per_rule_validation,
+    )
     update_or_check_ast_grep_sarif_golden(
         {
             "version": 4,
-            "scope": "Rust, TypeScript/JavaScript, and Go ast-grep SARIF evidence, corpus evidence, and per-rule parser validation",
+            "scope": "Rust, TypeScript/JavaScript, Go, and Swift ast-grep SARIF evidence, corpus evidence, list-rules inventory, and per-rule parser validation",
             "checks": checks,
             "corpus_checks": corpus_checks,
+            "list_rule_validation": list_rule_validation,
             "per_rule_validation": per_rule_validation,
             "rule_inventory_coverage": rule_inventory_coverage,
         },

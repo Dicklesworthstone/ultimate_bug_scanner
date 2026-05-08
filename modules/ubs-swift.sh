@@ -789,7 +789,33 @@ severity: info
 message: "URLSession task created (correlation will check resume/cancel); ensure lifecycle management."
 YAML
 
+ if [[ -n "$DUMP_RULES_DIR" ]]; then
+  cp -R "$AST_RULE_DIR"/. "$DUMP_RULES_DIR"/ 2>/dev/null || true
+ fi
+
  return 0
+}
+
+list_generated_ast_rule_ids() {
+ local rules_dir="$1"
+ ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rules_dir"/*.yml 2>/dev/null || true ) | sort -u
+}
+
+explain_generated_ast_rule() {
+ local rules_dir="$1"
+ local rule_id="$2"
+ local f id
+ shopt -s nullglob
+ for f in "$rules_dir"/*.yml; do
+  id="$(awk '/^id:[[:space:]]*/{print $2; exit}' "$f" 2>/dev/null || true)"
+  if [[ "$id" == "$rule_id" ]]; then
+   cat "$f"
+   shopt -u nullglob
+   return 0
+  fi
+ done
+ shopt -u nullglob
+ return 1
 }
 
 run_ast_rules(){
@@ -2914,6 +2940,21 @@ else
   )
 fi
 [[ "$SWIFT_FILE_COUNT" -gt 0 ]] && HAS_SWIFT_FILES=1 || HAS_SWIFT_FILES=0
+
+if [[ "$LIST_RULES" -eq 1 || -n "$EXPLAIN_RULE_ID" ]]; then
+  QUIET=1; NO_COLOR_FLAG=1; init_colors
+  check_ast_grep || die "ast-grep is required for rule-pack introspection"
+  write_ast_rules || exit 2
+  if [[ "$LIST_RULES" -eq 1 ]]; then
+    list_generated_ast_rule_ids "$AST_RULE_DIR"
+    exit 0
+  fi
+  if explain_generated_ast_rule "$AST_RULE_DIR" "$EXPLAIN_RULE_ID"; then
+    exit 0
+  fi
+  echo "ERROR: unknown Swift ast-grep rule id: $EXPLAIN_RULE_ID" >&2
+  exit 1
+fi
 
 # MACHINE-READABLE MODE: emit ONLY SARIF to stdout and exit.
 if [[ "$FORMAT" == "sarif" ]]; then

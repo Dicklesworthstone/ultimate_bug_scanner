@@ -139,6 +139,24 @@
         "rust.write-not-atomic"
       ],
       "sarif_runs": 1
+    },
+    {
+      "args": [
+        "--format=sarif"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "swift.urlsession.task-no-resume"
+      ],
+      "fixture": "test-suite/swift/ssrf_buggy",
+      "label": "swift-rule-pack",
+      "module": "ubs-swift.sh",
+      "result_count": 2,
+      "result_rule_ids": [
+        "swift.urlsession.task-no-resume"
+      ],
+      "sarif_runs": 1
     }
   ],
   "corpus_checks": [
@@ -373,6 +391,246 @@
         "rust.write-not-atomic"
       ],
       "sarif_runs": 1
+    },
+    {
+      "args": [
+        "--format=sarif"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "swift.urlsession.task-no-resume"
+      ],
+      "fixture": "test-suite/swift",
+      "label": "swift-rule-pack",
+      "module": "ubs-swift.sh",
+      "result_count": 4,
+      "result_rule_ids": [
+        "swift.urlsession.task-no-resume"
+      ],
+      "sarif_runs": 1
+    }
+  ],
+  "list_rule_validation": [
+    {
+      "label": "js-rule-pack",
+      "list_args": [
+        "--list-rules"
+      ],
+      "module": "ubs-js.sh",
+      "rule_count": 37,
+      "rule_ids": [
+        "js.async.await-no-try",
+        "js.async.dangling-promise",
+        "js.async.promiseall-no-try",
+        "js.async.then-no-catch",
+        "js.document-write",
+        "js.dom.innerText-outerHTML",
+        "js.error.empty-catch",
+        "js.error.throw-string",
+        "js.eval-call",
+        "js.fetch.no-catch",
+        "js.fs.writeFileSync-not-atomic",
+        "js.innerHTML-assign",
+        "js.json-parse-without-try",
+        "js.nan-direct-compare",
+        "js.new-function",
+        "js.nullish-coalescing-chain",
+        "js.operator-precedence-ternary-nullish",
+        "js.parseInt-no-radix",
+        "js.react.useMemo-empty-deps",
+        "js.resource.interval-no-clear",
+        "js.resource.listener-no-remove",
+        "js.resource.observer-no-disconnect",
+        "js.taint.header-injection",
+        "js.tanstack.sortUndefined-direction",
+        "js.then-without-catch",
+        "node.child-process-exec",
+        "react.dangerously-set-html",
+        "react.list-missing-key",
+        "react.setstate-in-render",
+        "react.useeffect-missing-cleanup",
+        "security.cookie-insecure",
+        "security.env-in-client",
+        "security.http-url",
+        "security.insecure-crypto",
+        "security.insecure-crypto-params",
+        "security.insecure-random",
+        "ts.non-null-assertion-chain"
+      ]
+    },
+    {
+      "label": "go-rule-pack",
+      "list_args": [
+        "--list-rules"
+      ],
+      "module": "ubs-golang.sh",
+      "rule_count": 64,
+      "rule_ids": [
+        "go.blank-import",
+        "go.close-error-ignored",
+        "go.content-type-prefix-match",
+        "go.context-todo",
+        "go.context-without-cancel",
+        "go.context.cancel-defer-before-err-check",
+        "go.context.cancel-defer-in-if",
+        "go.defer-close-before-err-check",
+        "go.defer-in-loop",
+        "go.dot-import",
+        "go.err-shadow",
+        "go.exec-command-without-context",
+        "go.exec-pgrep-unanchored",
+        "go.exec-sh-c",
+        "go.exec-strings-fields",
+        "go.fmt-errorf-no-wrap",
+        "go.fmt.fprintf-error-ignored",
+        "go.goroutine-in-loop",
+        "go.http-client-close-idle-missing",
+        "go.http-client-without-timeout",
+        "go.http-client-without-transport",
+        "go.http-default-client",
+        "go.http-handler-background",
+        "go.http-newrequest-without-context",
+        "go.http-response-body-not-closed",
+        "go.http-server-no-timeouts",
+        "go.http-transport-missing-timeouts",
+        "go.http.defer-body-before-err-check",
+        "go.http.defer-body-close-delayed",
+        "go.http.responsewriter-write-ignored",
+        "go.iferr-empty",
+        "go.iferr-return-nil",
+        "go.interface-empty",
+        "go.ioutil-deprecated",
+        "go.json-decode-no-limit",
+        "go.json-decode-without-disallow",
+        "go.json.decoder-unbounded-body",
+        "go.json.encode-error-ignored",
+        "go.loop-var-capture",
+        "go.loop-var-capture-for",
+        "go.missing-sync-before-remove",
+        "go.os-remove-no-error-check",
+        "go.panic-call",
+        "go.recover-not-in-defer",
+        "go.resource.ticker-no-stop",
+        "go.resource.timer-no-stop",
+        "go.resource.timer-not-drained",
+        "go.select-no-default",
+        "go.sort-slice-mutates",
+        "go.sql-dynamic-string",
+        "go.sql.begin-without-defer-rollback",
+        "go.sql.defer-rollback-before-err-check",
+        "go.sql.defer-rollback-delayed",
+        "go.sql.defer-rows-close-before-err-check",
+        "go.sql.defer-rows-close-delayed",
+        "go.sql.rows-err-not-checked",
+        "go.sql.rows-not-closed",
+        "go.template.execute-error-ignored",
+        "go.time-after-in-loop",
+        "go.time-tick",
+        "go.tls-insecure-skip",
+        "go.tls-minversion-missing",
+        "go.waitgroup-add-no-done",
+        "go.write-error-ignored"
+      ]
+    },
+    {
+      "label": "rust-rule-pack",
+      "list_args": [
+        "--no-cargo",
+        "--list-rules"
+      ],
+      "module": "ubs-rust.sh",
+      "rule_count": 77,
+      "rule_ids": [
+        "rust.arc-mutex",
+        "rust.assert-macros",
+        "rust.async.std-guard-across-await",
+        "rust.async.std-lock-in-async",
+        "rust.async.tokio-guard-across-await",
+        "rust.await-in-for",
+        "rust.block-on-in-async",
+        "rust.blocking-fs-in-async",
+        "rust.chars-nth",
+        "rust.clone-call",
+        "rust.clone-in-loop",
+        "rust.collect-then-for",
+        "rust.command.shell-c",
+        "rust.cstr-from-bytes-unchecked",
+        "rust.dbg-macro",
+        "rust.debug-assert-macros",
+        "rust.env-var-unwrap",
+        "rust.eprintln-macro",
+        "rust.expect-call",
+        "rust.fixme-comment",
+        "rust.format-literal-no-vars",
+        "rust.from-slice-panic",
+        "rust.from-utf8-unchecked",
+        "rust.get-unchecked",
+        "rust.i64-negate-overflow",
+        "rust.insecure-hash",
+        "rust.instant-now-elapsed",
+        "rust.instant-subtraction",
+        "rust.iter-nth-zero",
+        "rust.len-count-narrow-as",
+        "rust.map-clone",
+        "rust.maybeuninit-assume-init",
+        "rust.mem-forget",
+        "rust.mem-transmute",
+        "rust.mem-uninitialized",
+        "rust.mem-zeroed",
+        "rust.mutex-lock-expect",
+        "rust.mutex-lock-unwrap",
+        "rust.native-tls-danger",
+        "rust.openssl-no-verify",
+        "rust.panic-in-drop",
+        "rust.panic-macro",
+        "rust.parse-float-no-finite-check",
+        "rust.parse-unwrap",
+        "rust.plain-http-url",
+        "rust.println-macro",
+        "rust.ptr-cast",
+        "rust.rc-refcell",
+        "rust.regex-new-in-loop",
+        "rust.regex-new-unwrap",
+        "rust.reqwest-danger-accept",
+        "rust.resource.thread-no-join",
+        "rust.resource.tokio-task-no-await",
+        "rust.serde-json-unwrap",
+        "rust.slice-from-raw-parts",
+        "rust.strict-utf8",
+        "rust.suspicious-as-cast",
+        "rust.thread-sleep-in-async",
+        "rust.thread-spawn-in-async",
+        "rust.thread-spawn-no-join",
+        "rust.to-owned-to-string",
+        "rust.todo-comment",
+        "rust.todo-macro",
+        "rust.tokio-block-in-place",
+        "rust.tokio-spawn-no-handle",
+        "rust.tokio.spawn-no-move",
+        "rust.try-into-unwrap",
+        "rust.unimplemented-macro",
+        "rust.unreachable-macro",
+        "rust.unreachable-unchecked",
+        "rust.unsafe-auto-traits",
+        "rust.unsafe-block",
+        "rust.unwrap-call",
+        "rust.unwrap-in-drop",
+        "rust.unwrap-unchecked",
+        "rust.wrapping-arithmetic",
+        "rust.write-not-atomic"
+      ]
+    },
+    {
+      "label": "swift-rule-pack",
+      "list_args": [
+        "--list-rules"
+      ],
+      "module": "ubs-swift.sh",
+      "rule_count": 1,
+      "rule_ids": [
+        "swift.urlsession.task-no-resume"
+      ]
     }
   ],
   "per_rule_validation": [
@@ -1477,6 +1735,23 @@
           "match_count": 1
         }
       ]
+    },
+    {
+      "dump_args": [
+        "--dump-rules={rules_dir}"
+      ],
+      "fixture": "test-suite/swift/ssrf_buggy",
+      "label": "swift-rule-pack",
+      "module": "ubs-swift.sh",
+      "rule_count": 1,
+      "rules": [
+        {
+          "file": "c04-urlsession-task-no-resume.yml",
+          "id": "swift.urlsession.task-no-resume",
+          "language": "swift",
+          "match_count": 2
+        }
+      ]
     }
   ],
   "rule_inventory_coverage": [
@@ -1687,8 +1962,19 @@
       "label": "rust-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
+    },
+    {
+      "corpus_result_rule_ids_without_generated_rule": [],
+      "covered_generated_rule_count": 1,
+      "covered_generated_rule_ids": [
+        "swift.urlsession.task-no-resume"
+      ],
+      "generated_rule_count": 1,
+      "label": "swift-rule-pack",
+      "uncovered_generated_rule_count": 0,
+      "uncovered_generated_rule_ids": []
     }
   ],
-  "scope": "Rust, TypeScript/JavaScript, and Go ast-grep SARIF evidence, corpus evidence, and per-rule parser validation",
+  "scope": "Rust, TypeScript/JavaScript, Go, and Swift ast-grep SARIF evidence, corpus evidence, list-rules inventory, and per-rule parser validation",
   "version": 4
 }

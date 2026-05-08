@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 139,
-      "case_count": 278,
-      "clean_cases_with_forbidden_substrings": 138,
-      "strict_zero_clean_cases": 138,
+      "buggy_cases_with_required_substrings": 140,
+      "case_count": 280,
+      "clean_cases_with_forbidden_substrings": 139,
+      "strict_zero_clean_cases": 139,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 88,
-      "case_count": 175,
-      "clean_cases_with_forbidden_substrings": 87,
-      "strict_zero_clean_cases": 87,
+      "buggy_cases_with_required_substrings": 89,
+      "case_count": 177,
+      "clean_cases_with_forbidden_substrings": 88,
+      "strict_zero_clean_cases": 88,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,9 +38,9 @@
   },
   "clean_fuzz_budget_scopes": {
     "campaign": {
-      "case_count": 87,
+      "case_count": 88,
       "default_iterations": 3,
-      "default_transformed_scan_count": 261
+      "default_transformed_scan_count": 264
     },
     "smoke": {
       "case_count": 16,
@@ -50,18 +50,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 57,
-      "case_count": 114,
-      "clean_cases_with_forbidden_substrings": 57,
-      "strict_zero_clean_cases": 57,
+      "buggy_cases_with_required_substrings": 58,
+      "case_count": 116,
+      "clean_cases_with_forbidden_substrings": 58,
+      "strict_zero_clean_cases": 58,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 88,
-      "case_count": 175,
-      "clean_cases_with_forbidden_substrings": 87,
-      "strict_zero_clean_cases": 87,
+      "buggy_cases_with_required_substrings": 89,
+      "case_count": 177,
+      "clean_cases_with_forbidden_substrings": 88,
+      "strict_zero_clean_cases": 88,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -94,10 +94,10 @@
       "strict_zero_clean_cases": 8
     },
     "golang": {
-      "buggy_cases_with_required_substrings": 16,
-      "clean_cases_with_forbidden_substrings": 16,
-      "security_pairs": 16,
-      "strict_zero_clean_cases": 16
+      "buggy_cases_with_required_substrings": 17,
+      "clean_cases_with_forbidden_substrings": 17,
+      "security_pairs": 17,
+      "strict_zero_clean_cases": 17
     },
     "java": {
       "buggy_cases_with_required_substrings": 14,
@@ -152,6 +152,8 @@
           "golang-hardcoded-secrets-clean",
           "golang-header-injection-buggy",
           "golang-header-injection-clean",
+          "golang-host-header-poisoning-buggy",
+          "golang-host-header-poisoning-clean",
           "golang-jwt-verification-buggy",
           "golang-jwt-verification-clean",
           "golang-open-redirect-buggy",
@@ -329,6 +331,8 @@
           "golang-hardcoded-secrets-clean",
           "golang-header-injection-buggy",
           "golang-header-injection-clean",
+          "golang-host-header-poisoning-buggy",
+          "golang-host-header-poisoning-clean",
           "golang-jwt-verification-buggy",
           "golang-jwt-verification-clean",
           "golang-open-redirect-buggy",
@@ -494,8 +498,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 175,
-      "transformed_scan_count": 350
+      "case_count": 177,
+      "transformed_scan_count": 354
     },
     "smoke": {
       "by_transform": {
@@ -928,6 +932,20 @@
       "clean_path": "test-suite/golang/security/header_injection_clean.go",
       "language": "golang",
       "slug": "header_injection"
+    },
+    {
+      "buggy_case": "golang-host-header-poisoning-buggy",
+      "buggy_min_critical": 1,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/golang/security/host_header_poisoning_buggy.go",
+      "buggy_require_count": 1,
+      "clean_case": "golang-host-header-poisoning-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/golang/security/host_header_poisoning_clean.go",
+      "language": "golang",
+      "slug": "host_header_poisoning"
     },
     {
       "buggy_case": "golang-jwt-verification-buggy",
@@ -2521,6 +2539,7 @@
         "golang-cors-credentials-clean",
         "golang-hardcoded-secrets-clean",
         "golang-header-injection-clean",
+        "golang-host-header-poisoning-clean",
         "golang-jwt-verification-clean",
         "golang-open-redirect-clean",
         "golang-request-path-traversal-clean",
@@ -2616,6 +2635,8 @@
         "golang-hardcoded-secrets-clean",
         "golang-header-injection-buggy",
         "golang-header-injection-clean",
+        "golang-host-header-poisoning-buggy",
+        "golang-host-header-poisoning-clean",
         "golang-jwt-verification-buggy",
         "golang-jwt-verification-clean",
         "golang-open-redirect-buggy",
@@ -2894,6 +2915,8 @@
       "golang-hardcoded-secrets-clean",
       "golang-header-injection-buggy",
       "golang-header-injection-clean",
+      "golang-host-header-poisoning-buggy",
+      "golang-host-header-poisoning-clean",
       "golang-jwt-verification-buggy",
       "golang-jwt-verification-clean",
       "golang-open-redirect-buggy",
@@ -3134,6 +3157,8 @@
       "golang-hardcoded-secrets-clean",
       "golang-header-injection-buggy",
       "golang-header-injection-clean",
+      "golang-host-header-poisoning-buggy",
+      "golang-host-header-poisoning-clean",
       "golang-jwt-verification-buggy",
       "golang-jwt-verification-clean",
       "golang-open-redirect-buggy",

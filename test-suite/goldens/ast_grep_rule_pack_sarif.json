@@ -209,7 +209,7 @@
       "fixture": "test-suite/golang",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
-      "result_count": 250,
+      "result_count": 251,
       "result_rule_ids": [
         "go.blank-import",
         "go.close-error-ignored",

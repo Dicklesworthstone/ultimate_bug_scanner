@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 138,
-      "case_count": 276,
-      "clean_cases_with_forbidden_substrings": 137,
-      "strict_zero_clean_cases": 137,
+      "buggy_cases_with_required_substrings": 139,
+      "case_count": 278,
+      "clean_cases_with_forbidden_substrings": 138,
+      "strict_zero_clean_cases": 138,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 87,
-      "case_count": 173,
-      "clean_cases_with_forbidden_substrings": 86,
-      "strict_zero_clean_cases": 86,
+      "buggy_cases_with_required_substrings": 88,
+      "case_count": 175,
+      "clean_cases_with_forbidden_substrings": 87,
+      "strict_zero_clean_cases": 87,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,9 +38,9 @@
   },
   "clean_fuzz_budget_scopes": {
     "campaign": {
-      "case_count": 86,
+      "case_count": 87,
       "default_iterations": 3,
-      "default_transformed_scan_count": 258
+      "default_transformed_scan_count": 261
     },
     "smoke": {
       "case_count": 16,
@@ -50,18 +50,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 56,
-      "case_count": 112,
-      "clean_cases_with_forbidden_substrings": 56,
-      "strict_zero_clean_cases": 56,
+      "buggy_cases_with_required_substrings": 57,
+      "case_count": 114,
+      "clean_cases_with_forbidden_substrings": 57,
+      "strict_zero_clean_cases": 57,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 87,
-      "case_count": 173,
-      "clean_cases_with_forbidden_substrings": 86,
-      "strict_zero_clean_cases": 86,
+      "buggy_cases_with_required_substrings": 88,
+      "case_count": 175,
+      "clean_cases_with_forbidden_substrings": 87,
+      "strict_zero_clean_cases": 87,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -106,10 +106,10 @@
       "strict_zero_clean_cases": 14
     },
     "js": {
-      "buggy_cases_with_required_substrings": 25,
-      "clean_cases_with_forbidden_substrings": 25,
-      "security_pairs": 25,
-      "strict_zero_clean_cases": 25
+      "buggy_cases_with_required_substrings": 26,
+      "clean_cases_with_forbidden_substrings": 26,
+      "security_pairs": 26,
+      "strict_zero_clean_cases": 26
     },
     "python": {
       "buggy_cases_with_required_substrings": 34,
@@ -188,6 +188,8 @@
           "js-typescript-hardcoded-secrets-clean",
           "js-typescript-header-injection-buggy",
           "js-typescript-header-injection-clean",
+          "js-typescript-host-header-poisoning-buggy",
+          "js-typescript-host-header-poisoning-clean",
           "js-typescript-jwt-verification-buggy",
           "js-typescript-jwt-verification-clean",
           "js-typescript-message-event-origin-buggy",
@@ -363,6 +365,8 @@
           "js-typescript-hardcoded-secrets-clean",
           "js-typescript-header-injection-buggy",
           "js-typescript-header-injection-clean",
+          "js-typescript-host-header-poisoning-buggy",
+          "js-typescript-host-header-poisoning-clean",
           "js-typescript-jwt-verification-buggy",
           "js-typescript-jwt-verification-clean",
           "js-typescript-message-event-origin-buggy",
@@ -490,8 +494,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 173,
-      "transformed_scan_count": 346
+      "case_count": 175,
+      "transformed_scan_count": 350
     },
     "smoke": {
       "by_transform": {
@@ -1372,6 +1376,20 @@
       "clean_path": "test-suite/js/security/header-injection-clean.ts",
       "language": "js",
       "slug": "header-injection"
+    },
+    {
+      "buggy_case": "js-typescript-host-header-poisoning-buggy",
+      "buggy_min_critical": 0,
+      "buggy_min_warning": 1,
+      "buggy_path": "test-suite/js/security/host-header-poisoning-buggy.ts",
+      "buggy_require_count": 1,
+      "clean_case": "js-typescript-host-header-poisoning-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/js/security/host-header-poisoning-clean.ts",
+      "language": "js",
+      "slug": "host-header-poisoning"
     },
     {
       "buggy_case": "js-typescript-jwt-verification-buggy",
@@ -2521,6 +2539,7 @@
         "js-typescript-fetch-cancellation-clean",
         "js-typescript-hardcoded-secrets-clean",
         "js-typescript-header-injection-clean",
+        "js-typescript-host-header-poisoning-clean",
         "js-typescript-jwt-verification-clean",
         "js-typescript-message-event-origin-clean",
         "js-typescript-open-redirect-clean",
@@ -2633,6 +2652,8 @@
         "js-typescript-hardcoded-secrets-clean",
         "js-typescript-header-injection-buggy",
         "js-typescript-header-injection-clean",
+        "js-typescript-host-header-poisoning-buggy",
+        "js-typescript-host-header-poisoning-clean",
         "js-typescript-jwt-verification-buggy",
         "js-typescript-jwt-verification-clean",
         "js-typescript-message-event-origin-buggy",
@@ -2937,6 +2958,8 @@
       "js-typescript-hardcoded-secrets-clean",
       "js-typescript-header-injection-buggy",
       "js-typescript-header-injection-clean",
+      "js-typescript-host-header-poisoning-buggy",
+      "js-typescript-host-header-poisoning-clean",
       "js-typescript-jwt-verification-buggy",
       "js-typescript-jwt-verification-clean",
       "js-typescript-message-event-origin-buggy",
@@ -3147,6 +3170,8 @@
       "js-typescript-hardcoded-secrets-clean",
       "js-typescript-header-injection-buggy",
       "js-typescript-header-injection-clean",
+      "js-typescript-host-header-poisoning-buggy",
+      "js-typescript-host-header-poisoning-clean",
       "js-typescript-jwt-verification-buggy",
       "js-typescript-jwt-verification-clean",
       "js-typescript-message-event-origin-buggy",

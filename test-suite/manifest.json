@@ -4530,6 +4530,67 @@
       }
     },
     {
+      "id": "js-typescript-host-header-poisoning-buggy",
+      "description": "TypeScript apps should not build absolute password-reset, verification, canonical, or email links from Host/X-Forwarded-Host headers without an allowlist.",
+      "path": "test-suite/js/security/host-header-poisoning-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "host-header",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Host header used to build absolute URL"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-host-header-poisoning-clean",
+      "description": "TypeScript apps that use a configured canonical origin or validate Host/X-Forwarded-Host against an allowlist should stay clean.",
+      "path": "test-suite/js/security/host-header-poisoning-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "host-header",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Host header used to build absolute URL"
+        ]
+      }
+    },
+    {
       "id": "js-typescript-open-redirect-startswith-buggy",
       "description": "TypeScript/Next.js redirects that only check startsWith('/') should still be flagged because scheme-relative URLs also pass, even when comments mention future validation.",
       "path": "test-suite/js/security/open-redirect-startswith-buggy.tsx",

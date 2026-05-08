@@ -5214,7 +5214,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if should_skip 7; then
 print_header "7. SECURITY VULNERABILITIES"
-print_category "Detects: Code injection, XSS, SQL injection, prototype pollution, timing attacks, unbounded request body reads, request-controlled regex patterns" \
+print_category "Detects: Code injection, XSS, SQL injection, prototype pollution, timing attacks, host header poisoning, unbounded request body reads, request-controlled regex patterns" \
   "Security bugs expose users to attacks and data breaches"
 
 print_subheader "eval() usage (CRITICAL SECURITY RISK)"
@@ -5994,6 +5994,217 @@ if [ "$open_redirect_count" -gt 0 ]; then
     sample_limit=$((sample_limit - 1))
     [ "$sample_limit" -le 0 ] && break
   done <<<"$open_redirect_samples"
+fi
+
+print_subheader "Host header used for absolute URL construction"
+host_header_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
+
+assignment_re = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b[^=]*=\s*(.*)')
+source_re = re.compile(
+    r'(?:'
+    r'\b(?:req|request|ctx|context|event)\s*\.\s*headers\s*\.\s*(?:host|hostname)\b|'
+    r'\b(?:req|request|ctx|context|event)\s*\.\s*(?:host|hostname)\b|'
+    r'\b(?:req|request|ctx|context|event)\s*\.\s*headers\s*\[\s*[\'"`](?:host|x-forwarded-host|forwarded|x-original-host)[\'"`]\s*\]|'
+    r'\b(?:req|request|ctx|context|event)\s*\.\s*(?:get|header)\s*\(\s*[\'"`](?:host|x-forwarded-host|forwarded|x-original-host)[\'"`]\s*\)|'
+    r'\b(?:headers|request\.headers|event\.headers)\s*\.\s*get\s*\(\s*[\'"`](?:host|x-forwarded-host|forwarded|x-original-host)[\'"`]\s*\)|'
+    r'\bheaders\s*\(\s*\)\s*\.\s*get\s*\(\s*[\'"`](?:host|x-forwarded-host|forwarded|x-original-host)[\'"`]\s*\)'
+    r')',
+    re.IGNORECASE,
+)
+absolute_url_re = re.compile(
+    r'(?:'
+    r'[\'"`]https?://|'
+    r'\bnew\s+URL\s*\(|'
+    r'\bURL\s*\.\s*canParse\s*\(|'
+    r'\burl\s*\.\s*format\s*\(|'
+    r'\b(?:Response|NextResponse)\s*\.\s*redirect\s*\('
+    r')',
+    re.IGNORECASE,
+)
+safe_re = re.compile(
+    r'(?:'
+    r'\b(?:validate|assert|ensure|require|check)[A-Za-z0-9_$]*(?:Host|Origin|Url|URL|BaseUrl|BaseURL|Canonical|Allowed|Trusted)[A-Za-z0-9_$]*\s*\(|'
+    r'\b(?:is|has)[A-Za-z0-9_$]*(?:Allowed|Trusted|Safe)[A-Za-z0-9_$]*(?:Host|Origin|BaseUrl|BaseURL)?[A-Za-z0-9_$]*\s*\(|'
+    r'\b(?:safe|trusted|allowed|canonical)[A-Za-z0-9_$]*(?:Host|Origin|BaseUrl|BaseURL|Url|URL)[A-Za-z0-9_$]*\s*\(|'
+    r'\b(?:ALLOWED|TRUSTED)_(?:HOSTS|ORIGINS|BASE_URLS|BASE_URL|DOMAINS)\b|'
+    r'\b(?:allowed|trusted)(?:Hosts|Origins|BaseUrls|BaseURLs|Domains)\b|'
+    r'\b(?:PUBLIC|CANONICAL|APP|SITE)_(?:ORIGIN|BASE_URL|URL)\b|'
+    r'\bprocess\s*\.\s*env\s*\.\s*(?:NEXT_PUBLIC_|PUBLIC_|APP_|SITE_|CANONICAL_)?(?:APP_URL|BASE_URL|ORIGIN|SITE_URL)\b'
+    r')',
+    re.IGNORECASE,
+)
+function_boundary_re = re.compile(
+    r'^\s*(?:export\s+)?(?:async\s+)?function\b|'
+    r'^\s*(?:export\s+)?(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>'
+)
+
+def code_line(source_line):
+    stripped = source_line.strip()
+    if not stripped or stripped.startswith(("//", "/*", "*")):
+        return ""
+    out = []
+    quote = ""
+    escaped = False
+    i = 0
+    while i < len(source_line):
+        ch = source_line[i]
+        nxt = source_line[i + 1] if i + 1 < len(source_line) else ""
+        if quote:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            break
+        if ch == "/" and nxt == "*":
+            end = source_line.find("*/", i + 2)
+            if end == -1:
+                break
+            i = end + 2
+            continue
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+def statement_from(lines, idx, max_lines=14):
+    parts = []
+    paren_balance = 0
+    brace_balance = 0
+    saw_code = False
+    for line_idx in range(idx, min(len(lines), idx + max_lines)):
+        current = code_line(lines[line_idx]).strip()
+        if not current:
+            continue
+        parts.append(current)
+        saw_code = True
+        paren_balance += current.count('(') - current.count(')')
+        brace_balance += current.count('{') - current.count('}')
+        if line_idx > idx and paren_balance <= 0 and brace_balance <= 0:
+            break
+        if ';' in current and paren_balance <= 0 and brace_balance <= 0:
+            break
+    return ' '.join(parts) if saw_code else ""
+
+def context_from(lines, idx, max_lines=10):
+    start = max(0, idx - max_lines)
+    for line_idx in range(idx - 1, start - 1, -1):
+        clean = code_line(lines[line_idx])
+        if function_boundary_re.search(clean):
+            start = line_idx
+            break
+        if not clean.strip() and idx - line_idx > 2:
+            start = line_idx + 1
+            break
+    return '\n'.join(
+        clean
+        for source_line in lines[start:idx + 1]
+        for clean in [code_line(source_line)]
+        if clean.strip()
+    )
+
+def has_safe_validation(text, var_name=""):
+    if not safe_re.search(text):
+        return False
+    return not var_name or re.search(rf'\b{re.escape(var_name)}\b', text)
+
+def tainted_ref(text, tainted_vars):
+    for name in tainted_vars:
+        if re.search(rf'\b{re.escape(name)}\b', text):
+            return name
+    return ""
+
+def iter_files(path: Path):
+    if path.is_file():
+        if path.suffix.lower() in exts:
+            yield path
+        return
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            candidate = Path(dirpath) / fname
+            if candidate.suffix.lower() in exts:
+                yield candidate
+
+issues = []
+sample_root = root.parent if root.is_file() else root
+for path in iter_files(root):
+    try:
+        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+    except OSError:
+        continue
+    text = '\n'.join(lines)
+    if not source_re.search(text):
+        continue
+    tainted_vars = {}
+    seen_lines = set()
+    for idx, line in enumerate(lines):
+        stripped = code_line(line).strip()
+        if not stripped or 'ubs:ignore' in stripped:
+            continue
+        if function_boundary_re.search(stripped):
+            tainted_vars = {}
+            continue
+        statement = statement_from(lines, idx)
+        assignment = assignment_re.search(stripped)
+        if assignment:
+            name = assignment.group(1)
+            if has_safe_validation(statement):
+                tainted_vars.pop(name, None)
+            elif source_re.search(statement) or tainted_ref(statement, tainted_vars):
+                tainted_vars[name] = idx
+            else:
+                tainted_vars.pop(name, None)
+        direct = bool(source_re.search(statement))
+        ref = tainted_ref(statement, tainted_vars)
+        if not direct and not ref:
+            continue
+        if not absolute_url_re.search(statement):
+            continue
+        if has_safe_validation(statement) or has_safe_validation(context_from(lines, idx), ref):
+            continue
+        if idx in seen_lines:
+            continue
+        seen_lines.add(idx)
+        try:
+            rel = path.relative_to(sample_root)
+        except ValueError:
+            rel = path
+        issues.append((str(rel), idx + 1, stripped.replace('\t', ' ')))
+
+print(len(issues))
+for entry in issues[:25]:
+    print('\t'.join(str(part) for part in entry))
+PY
+)
+host_header_count=$(printf '%s\n' "$host_header_report" | head -n1 | awk 'END{print $0+0}')
+host_header_samples=$(printf '%s\n' "$host_header_report" | tail -n +2)
+if [ "$host_header_count" -gt 0 ]; then
+  print_finding "warning" "$host_header_count" "Host header used to build absolute URL" "Use a configured canonical origin or validate Host/X-Forwarded-Host against an explicit allow-list before generating links"
+  sample_limit=3
+  while IFS=$'\t' read -r sample_path sample_line sample_text; do
+    [ -z "$sample_path" ] && continue
+    print_code_sample "$sample_path" "$sample_line" "$sample_text"
+    sample_limit=$((sample_limit - 1))
+    [ "$sample_limit" -le 0 ] && break
+  done <<<"$host_header_samples"
 fi
 
 print_subheader "fetch without AbortSignal cancellation"

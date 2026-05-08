@@ -5,6 +5,7 @@ import contextlib
 import io
 import unittest
 from pathlib import Path
+from typing import Any
 
 import rule_quality_harness
 
@@ -121,6 +122,70 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
         self.assertFalse(
             rule_quality_harness.is_ast_grep_diagnostic_stderr("Cannot parse rule")
         )
+
+
+class SarifShapeTest(unittest.TestCase):
+    @staticmethod
+    def valid_payload() -> dict[str, Any]:
+        return {
+            "runs": [
+                {
+                    "results": [
+                        {
+                            "locations": [
+                                {
+                                    "physicalLocation": {
+                                        "artifactLocation": {"uri": "fixture.go"},
+                                        "region": {"startLine": 7},
+                                    }
+                                }
+                            ],
+                            "message": {"text": "command uses shell interpolation"},
+                            "ruleId": "go.exec-sh-c",
+                        }
+                    ],
+                    "tool": {"driver": {"name": "UBS"}},
+                }
+            ]
+        }
+
+    def test_accepts_usable_sarif_result_shape(self) -> None:
+        rule_quality_harness.validate_sarif_payload_shape(
+            self.valid_payload(),
+            "fixture",
+        )
+
+    def test_rejects_result_without_rule_id(self) -> None:
+        payload = self.valid_payload()
+        payload["runs"][0]["results"][0]["ruleId"] = ""
+
+        with self.assertRaisesRegex(AssertionError, "non-empty ruleId"):
+            rule_quality_harness.validate_sarif_payload_shape(payload, "fixture")
+
+    def test_rejects_result_without_message_text(self) -> None:
+        payload = self.valid_payload()
+        payload["runs"][0]["results"][0]["message"] = {"text": "   "}
+
+        with self.assertRaisesRegex(AssertionError, "message text"):
+            rule_quality_harness.validate_sarif_payload_shape(payload, "fixture")
+
+    def test_rejects_result_without_usable_location(self) -> None:
+        payload = self.valid_payload()
+        payload["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+            "region"
+        ] = {"startLine": 0}
+
+        with self.assertRaisesRegex(AssertionError, "positive startLine"):
+            rule_quality_harness.validate_sarif_payload_shape(payload, "fixture")
+
+    def test_rejects_boolean_start_line(self) -> None:
+        payload = self.valid_payload()
+        payload["runs"][0]["results"][0]["locations"][0]["physicalLocation"][
+            "region"
+        ] = {"startLine": True}
+
+        with self.assertRaisesRegex(AssertionError, "positive startLine"):
+            rule_quality_harness.validate_sarif_payload_shape(payload, "fixture")
 
 
 class RunManifestExpectationTest(unittest.TestCase):

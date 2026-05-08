@@ -894,6 +894,64 @@ def is_ast_grep_diagnostic_stderr(stderr: str) -> bool:
     )
 
 
+def is_nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def sarif_result_has_message(result: dict[str, Any]) -> bool:
+    message = result.get("message")
+    if not isinstance(message, dict):
+        return False
+    return any(is_nonempty_string(message.get(key)) for key in ("text", "markdown"))
+
+
+def sarif_result_has_usable_location(result: dict[str, Any]) -> bool:
+    locations = result.get("locations")
+    if not isinstance(locations, list) or not locations:
+        return False
+    for location in locations:
+        if not isinstance(location, dict):
+            continue
+        physical = location.get("physicalLocation")
+        if not isinstance(physical, dict):
+            continue
+        artifact = physical.get("artifactLocation")
+        if not isinstance(artifact, dict) or not is_nonempty_string(artifact.get("uri")):
+            continue
+        region = physical.get("region")
+        if not isinstance(region, dict):
+            continue
+        start_line = region.get("startLine")
+        if type(start_line) is int and start_line > 0:
+            return True
+    return False
+
+
+def validate_sarif_payload_shape(payload: Any, label: str) -> None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
+        raise AssertionError(f"{label} SARIF output lacks runs[]")
+    for run_index, run in enumerate(payload["runs"]):
+        if not isinstance(run, dict):
+            raise AssertionError(f"{label} SARIF run[{run_index}] is not an object")
+        results = run.get("results", [])
+        if results is None:
+            results = []
+        if not isinstance(results, list):
+            raise AssertionError(f"{label} SARIF run[{run_index}].results is not a list")
+        for result_index, result in enumerate(results):
+            result_label = f"{label} SARIF run[{run_index}].results[{result_index}]"
+            if not isinstance(result, dict):
+                raise AssertionError(f"{result_label} is not an object")
+            if not is_nonempty_string(result.get("ruleId")):
+                raise AssertionError(f"{result_label} lacks a non-empty ruleId")
+            if not sarif_result_has_message(result):
+                raise AssertionError(f"{result_label} lacks non-empty message text")
+            if not sarif_result_has_usable_location(result):
+                raise AssertionError(
+                    f"{result_label} lacks a physical location with URI and positive startLine"
+                )
+
+
 def sarif_summary_from_process(
     spec: dict[str, Any],
     proc: subprocess.CompletedProcess[str],
@@ -914,9 +972,11 @@ def sarif_summary_from_process(
     except json.JSONDecodeError as exc:
         write_runtime_artifact(label, proc, None)
         raise AssertionError(f"{label} did not emit valid SARIF JSON: {exc}") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
+    try:
+        validate_sarif_payload_shape(payload, label)
+    except AssertionError:
         write_runtime_artifact(label, proc, payload if isinstance(payload, dict) else None)
-        raise AssertionError(f"{label} SARIF output lacks runs[]")
+        raise
     result_count = sum(
         1
         for run in payload["runs"]

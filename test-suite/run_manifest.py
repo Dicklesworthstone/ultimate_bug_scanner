@@ -42,6 +42,18 @@ def resolve_path(base: Path, value: str) -> Path:
     return (base / p).resolve()
 
 
+def missing_selected_case_ids(
+    cases: Sequence[Dict[str, Any]],
+    selected_ids: set[str],
+) -> List[str]:
+    available_ids = {
+        case["id"]
+        for case in cases
+        if isinstance(case.get("id"), str)
+    }
+    return sorted(selected_ids - available_ids)
+
+
 def is_nonnegative_int(value: Any) -> bool:
     return type(value) is int and value >= 0
 
@@ -269,6 +281,11 @@ def main() -> None:
         return
 
     selected_ids = set(args.cases or [])
+    missing_case_ids = missing_selected_case_ids(cases, selected_ids)
+    if missing_case_ids:
+        for case_id in missing_case_ids:
+            print(f"[{case_id}] FAIL\n  - no such manifest case id", file=sys.stderr)
+        sys.exit(1)
 
     manifest_dir = args.manifest.parent
     artifacts_root = resolve_path(manifest_dir, defaults.get("artifacts_dir", "artifacts"))

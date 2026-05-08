@@ -142,6 +142,7 @@ sys.path.insert(0, str(TEST_ROOT))
 from run_manifest import (  # noqa: E402
     check_expectations,
     extract_json_from_stdout,
+    missing_selected_case_ids,
     parse_module_text_summary,
     parse_text_summary,
     parse_toon_summary,

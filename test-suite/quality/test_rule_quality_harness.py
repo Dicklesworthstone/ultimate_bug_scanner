@@ -336,6 +336,32 @@ class RunManifestExpectationTest(unittest.TestCase):
         self.assertIn("missing substring 'must appear' in stdout", errors)
         self.assertIn("forbidden substring 'must not appear' present in stdout", errors)
 
+    def test_missing_selected_case_ids_rejects_typos(self) -> None:
+        missing = rule_quality_harness.missing_selected_case_ids(
+            [
+                {"id": "rust-request-body-limit-buggy"},
+                {"id": "golang-request-body-limit-clean"},
+            ],
+            {
+                "golang-request-body-limit-clean",
+                "not-a-case",
+                "rust-request-body-limit-buggy",
+            },
+        )
+
+        self.assertEqual(missing, ["not-a-case"])
+
+    def test_missing_selected_case_ids_ignores_cases_without_ids(self) -> None:
+        missing = rule_quality_harness.missing_selected_case_ids(
+            [
+                {"id": "js-typescript-request-body-limit-buggy"},
+                {"description": "malformed manifest entry"},
+            ],
+            {"js-typescript-request-body-limit-buggy"},
+        )
+
+        self.assertEqual(missing, [])
+
 
 class CommandConstructionTest(unittest.TestCase):
     @staticmethod

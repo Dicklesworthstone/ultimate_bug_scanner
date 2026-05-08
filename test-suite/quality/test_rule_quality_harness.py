@@ -88,6 +88,48 @@ class RunManifestExpectationTest(unittest.TestCase):
             {"critical": 6, "warning": 8, "info": 10, "files": 12},
         )
 
+    def test_parse_meta_runner_text_summary(self) -> None:
+        summary = rule_quality_harness.parse_text_summary(
+            "\n".join(
+                [
+                    "scanner output",
+                    "──────── Combined Summary ────────",
+                    "Files: 12",
+                    "Critical: 3",
+                    "Warning: 4",
+                    "Info: 5",
+                ]
+            ),
+            "fixture",
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["totals"],
+            {"files": 12, "critical": 3, "warning": 4, "info": 5},
+        )
+
+    def test_parse_direct_module_text_summary(self) -> None:
+        summary = rule_quality_harness.parse_module_text_summary(
+            "\n".join(
+                [
+                    "module output",
+                    "Summary Statistics:",
+                    "Files scanned:    6",
+                    "Critical issues:  1",
+                    "Warning issues:   2",
+                    "Info items:       3",
+                ]
+            ),
+            "fixture",
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["totals"],
+            {"files": 6, "critical": 1, "warning": 2, "info": 3},
+        )
+
     def test_check_expectations_derives_fail_on_warning_exit(self) -> None:
         errors = rule_quality_harness.check_expectations(
             {"exit_code": "zero"},

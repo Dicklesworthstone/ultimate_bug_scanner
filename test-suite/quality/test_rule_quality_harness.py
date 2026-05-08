@@ -204,6 +204,34 @@ class RunManifestExpectationTest(unittest.TestCase):
         self.assertEqual(summary["totals"]["critical"], 2)
         self.assertEqual(summary["totals"]["warning"], 3)
 
+    def test_extract_json_summary_accepts_direct_module_counts(self) -> None:
+        summary = rule_quality_harness.extract_json_from_stdout(
+            '{"project":"fixture","files":1,"critical":0,"warning":6,"info":2}'
+        )
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(summary["files"], 1)
+        self.assertEqual(summary["warning"], 6)
+
+    def test_extract_json_summary_rejects_unknown_json_noise(self) -> None:
+        summary = rule_quality_harness.extract_json_from_stdout(
+            "\n".join(
+                [
+                    '{"event":"progress","ok":true}',
+                    '{"ruleId":"go.exec-sh-c","severity":"critical","message":"shell"}',
+                ]
+            )
+        )
+
+        self.assertIsNone(summary)
+
+    def test_extract_json_summary_rejects_non_integer_counts(self) -> None:
+        summary = rule_quality_harness.extract_json_from_stdout(
+            '{"project":"fixture","totals":{"files":1,"critical":false,"warning":0,"info":0}}'
+        )
+
+        self.assertIsNone(summary)
+
     def test_parse_toon_summary_sums_scanner_totals(self) -> None:
         stdout = "\n".join(
             [

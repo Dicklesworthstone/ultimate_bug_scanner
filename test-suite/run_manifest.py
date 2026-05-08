@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = Path(__file__).with_name("manifest.json")
 JSON_DECODER = json.JSONDecoder()
+SUMMARY_COUNT_KEYS = ("files", "critical", "warning", "info")
 
 
 def load_manifest(path: Path) -> Dict[str, Any]:
@@ -41,12 +42,29 @@ def resolve_path(base: Path, value: str) -> Path:
     return (base / p).resolve()
 
 
+def is_nonnegative_int(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def has_summary_counts(obj: Dict[str, Any]) -> bool:
+    return all(is_nonnegative_int(obj.get(key)) for key in SUMMARY_COUNT_KEYS)
+
+
+def is_ubs_summary_object(obj: Dict[str, Any]) -> bool:
+    totals = obj.get("totals")
+    if isinstance(totals, dict) and has_summary_counts(totals):
+        return True
+    return has_summary_counts(obj)
+
+
 def extract_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
-    """Extract UBS summary JSON object from stdout, ignoring individual findings.
+    """Extract a UBS summary JSON object from stdout, ignoring findings/noise.
 
     UBS outputs JSONL findings (one per line) followed by text summary.
     When --format=json is used, a summary object with 'totals' key is emitted.
-    This function looks for that summary object, not individual findings.
+    Direct module JSON output uses top-level count fields instead. Unknown JSON
+    objects are treated as noise so malformed summaries cannot satisfy manifest
+    expectations by accident.
     """
     decoder = json.JSONDecoder()
     lines = stdout.splitlines()
@@ -57,16 +75,10 @@ def extract_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
                 # raw_decode stops at end of JSON, ignoring trailing content
                 obj, _ = decoder.raw_decode(candidate)
                 if isinstance(obj, dict):
-                    # Only return if this looks like a UBS summary object
-                    # (has 'totals' or 'project' key), not an individual finding
-                    # (which has 'ruleId', 'severity', 'message' keys)
-                    if "totals" in obj or "project" in obj:
+                    if is_ubs_summary_object(obj):
                         return obj
-                    # Skip individual findings - they have ruleId/severity/message
                     if "ruleId" in obj or ("severity" in obj and "message" in obj):
                         continue
-                    # Unknown JSON structure - return it for backwards compat
-                    return obj
             except json.JSONDecodeError:
                 continue
     return None

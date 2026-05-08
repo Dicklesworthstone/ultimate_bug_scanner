@@ -892,6 +892,13 @@ def logical_statement(lines, line_no):
     lookahead = idx + 1
     while lookahead < len(lines) and lookahead < idx + 10:
         upcoming = strip_line_comments(lines[lookahead]).lstrip()
+        if not upcoming:
+            probe = lookahead + 1
+            while probe < len(lines) and probe < idx + 10:
+                upcoming = strip_line_comments(lines[probe]).lstrip()
+                if upcoming:
+                    break
+                probe += 1
         if balance <= 0 and has_end and not upcoming.startswith('|>'):
             break
         next_line = strip_line_comments(lines[lookahead]).strip()
@@ -1172,6 +1179,13 @@ def logical_statement(lines, line_no):
     lookahead = idx + 1
     while lookahead < len(lines) and lookahead < idx + 10:
         upcoming = strip_line_comments(lines[lookahead]).lstrip()
+        if not upcoming:
+            probe = lookahead + 1
+            while probe < len(lines) and probe < idx + 10:
+                upcoming = strip_line_comments(lines[probe]).lstrip()
+                if upcoming:
+                    break
+                probe += 1
         if balance <= 0 and has_end and not upcoming.startswith('|>'):
             break
         next_line = strip_line_comments(lines[lookahead]).strip()
@@ -1762,6 +1776,13 @@ def logical_statement(lines, line_no):
     lookahead = idx + 1
     while lookahead < len(lines) and lookahead < idx + 8:
         upcoming = strip_line_comments(lines[lookahead]).lstrip()
+        if not upcoming:
+            probe = lookahead + 1
+            while probe < len(lines) and probe < idx + 8:
+                upcoming = strip_line_comments(lines[probe]).lstrip()
+                if upcoming:
+                    break
+                probe += 1
         if balance <= 0 and has_end and not upcoming.startswith('|>'):
             break
         next_line = strip_line_comments(lines[lookahead]).strip()

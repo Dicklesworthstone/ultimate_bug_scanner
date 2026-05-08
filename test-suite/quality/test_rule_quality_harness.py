@@ -829,6 +829,21 @@ class ScopeConstructionTest(unittest.TestCase):
             scopes["campaign"]["clean_fuzz"],
             ["rust-clean", "js-behavior-clean"],
         )
+        self.assertEqual(
+            scopes["all"]["metamorphic"],
+            [
+                "rust-buggy",
+                "rust-clean",
+                "python-buggy",
+                "python-clean",
+                "js-behavior-buggy",
+                "js-behavior-clean",
+            ],
+        )
+        self.assertEqual(
+            scopes["all"]["clean_fuzz"],
+            ["rust-clean", "python-clean", "js-behavior-clean"],
+        )
 
 
 class MetamorphicTransformTest(unittest.TestCase):

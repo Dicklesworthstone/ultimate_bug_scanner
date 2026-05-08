@@ -101,6 +101,7 @@ SMOKE_CASE_IDS = (
 CLEAN_FUZZ_CASE_IDS = (
     "cpp-open-redirect-clean",
     "csharp-open-redirect-clean",
+    "elixir-header-injection-clean",
     "elixir-open-redirect-clean",
     "java-open-redirect-clean",
     "js-typescript-request-body-limit-clean",
@@ -437,6 +438,10 @@ def robustness_scopes_from_pairs(
     campaign_metamorphic.extend(campaign_behavior_case_ids(cases))
     campaign_clean_fuzz = clean_case_ids_for_languages(pairs, CAMPAIGN_COVERAGE_LANGUAGES)
     campaign_clean_fuzz.extend(campaign_behavior_case_ids(cases, {"clean"}))
+    all_metamorphic = pair_case_ids_for_languages(pairs, SECURITY_COVERAGE_LANGUAGES)
+    all_metamorphic.extend(campaign_behavior_case_ids(cases))
+    all_clean_fuzz = clean_case_ids_for_languages(pairs, SECURITY_COVERAGE_LANGUAGES)
+    all_clean_fuzz.extend(campaign_behavior_case_ids(cases, {"clean"}))
     return {
         "smoke": {
             "metamorphic": list(METAMORPHIC_CASE_IDS),
@@ -445,6 +450,10 @@ def robustness_scopes_from_pairs(
         "campaign": {
             "metamorphic": unique_case_ids(campaign_metamorphic),
             "clean_fuzz": unique_case_ids(campaign_clean_fuzz),
+        },
+        "all": {
+            "metamorphic": unique_case_ids(all_metamorphic),
+            "clean_fuzz": unique_case_ids(all_clean_fuzz),
         },
     }
 
@@ -1632,9 +1641,9 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--robustness-scope",
-        choices=("smoke", "campaign"),
+        choices=("smoke", "campaign", "all"),
         default=os.environ.get("UBS_RULE_ROBUSTNESS_SCOPE", "smoke"),
-        help="metamorphic/fuzz breadth: smoke=default fast slice, campaign=Rust/TypeScript/Go security and behavior-rule cases",
+        help="metamorphic/fuzz breadth: smoke=default fast slice, campaign=Rust/TypeScript/Go security and behavior-rule cases, all=every paired security fixture",
     )
     parser.add_argument("--skip-runtime", action="store_true")
     parser.add_argument("--update-goldens", action="store_true")

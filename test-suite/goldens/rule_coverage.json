@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 140,
-      "case_count": 280,
-      "clean_cases_with_forbidden_substrings": 139,
-      "strict_zero_clean_cases": 139,
+      "buggy_cases_with_required_substrings": 141,
+      "case_count": 282,
+      "clean_cases_with_forbidden_substrings": 140,
+      "strict_zero_clean_cases": 140,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 89,
-      "case_count": 177,
-      "clean_cases_with_forbidden_substrings": 88,
-      "strict_zero_clean_cases": 88,
+      "buggy_cases_with_required_substrings": 90,
+      "case_count": 179,
+      "clean_cases_with_forbidden_substrings": 89,
+      "strict_zero_clean_cases": 89,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,9 +38,9 @@
   },
   "clean_fuzz_budget_scopes": {
     "campaign": {
-      "case_count": 88,
+      "case_count": 89,
       "default_iterations": 3,
-      "default_transformed_scan_count": 264
+      "default_transformed_scan_count": 267
     },
     "smoke": {
       "case_count": 16,
@@ -50,18 +50,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 58,
-      "case_count": 116,
-      "clean_cases_with_forbidden_substrings": 58,
-      "strict_zero_clean_cases": 58,
+      "buggy_cases_with_required_substrings": 59,
+      "case_count": 118,
+      "clean_cases_with_forbidden_substrings": 59,
+      "strict_zero_clean_cases": 59,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 89,
-      "case_count": 177,
-      "clean_cases_with_forbidden_substrings": 88,
-      "strict_zero_clean_cases": 88,
+      "buggy_cases_with_required_substrings": 90,
+      "case_count": 179,
+      "clean_cases_with_forbidden_substrings": 89,
+      "strict_zero_clean_cases": 89,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -124,10 +124,10 @@
       "strict_zero_clean_cases": 7
     },
     "rust": {
-      "buggy_cases_with_required_substrings": 15,
-      "clean_cases_with_forbidden_substrings": 15,
-      "security_pairs": 15,
-      "strict_zero_clean_cases": 15
+      "buggy_cases_with_required_substrings": 16,
+      "clean_cases_with_forbidden_substrings": 16,
+      "security_pairs": 16,
+      "strict_zero_clean_cases": 16
     },
     "swift": {
       "buggy_cases_with_required_substrings": 7,
@@ -236,6 +236,8 @@
           "rust-hardcoded-secrets-clean",
           "rust-header-injection-buggy",
           "rust-header-injection-clean",
+          "rust-host-header-poisoning-buggy",
+          "rust-host-header-poisoning-clean",
           "rust-jwt-verification-buggy",
           "rust-jwt-verification-clean",
           "rust-open-redirect-buggy",
@@ -415,6 +417,8 @@
           "rust-hardcoded-secrets-clean",
           "rust-header-injection-buggy",
           "rust-header-injection-clean",
+          "rust-host-header-poisoning-buggy",
+          "rust-host-header-poisoning-clean",
           "rust-jwt-verification-buggy",
           "rust-jwt-verification-clean",
           "rust-open-redirect-buggy",
@@ -498,8 +502,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 177,
-      "transformed_scan_count": 354
+      "case_count": 179,
+      "transformed_scan_count": 358
     },
     "smoke": {
       "by_transform": {
@@ -2292,6 +2296,20 @@
       "slug": "header-injection"
     },
     {
+      "buggy_case": "rust-host-header-poisoning-buggy",
+      "buggy_min_critical": 1,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/rust/buggy/host_header_poisoning.rs",
+      "buggy_require_count": 1,
+      "clean_case": "rust-host-header-poisoning-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/rust/clean/host_header_poisoning.rs",
+      "language": "rust",
+      "slug": "host-header-poisoning"
+    },
+    {
       "buggy_case": "rust-jwt-verification-buggy",
       "buggy_min_critical": 6,
       "buggy_min_warning": 0,
@@ -2581,6 +2599,7 @@
         "rust-cors-credentials-clean",
         "rust-hardcoded-secrets-clean",
         "rust-header-injection-clean",
+        "rust-host-header-poisoning-clean",
         "rust-jwt-verification-clean",
         "rust-open-redirect-clean",
         "rust-redos-regex-clean",
@@ -2719,6 +2738,8 @@
         "rust-hardcoded-secrets-clean",
         "rust-header-injection-buggy",
         "rust-header-injection-clean",
+        "rust-host-header-poisoning-buggy",
+        "rust-host-header-poisoning-clean",
         "rust-jwt-verification-buggy",
         "rust-jwt-verification-clean",
         "rust-open-redirect-buggy",
@@ -3109,6 +3130,8 @@
       "rust-hardcoded-secrets-clean",
       "rust-header-injection-buggy",
       "rust-header-injection-clean",
+      "rust-host-header-poisoning-buggy",
+      "rust-host-header-poisoning-clean",
       "rust-jwt-verification-buggy",
       "rust-jwt-verification-clean",
       "rust-open-redirect-buggy",
@@ -3241,6 +3264,8 @@
       "rust-hardcoded-secrets-clean",
       "rust-header-injection-buggy",
       "rust-header-injection-clean",
+      "rust-host-header-poisoning-buggy",
+      "rust-host-header-poisoning-clean",
       "rust-jwt-verification-buggy",
       "rust-jwt-verification-clean",
       "rust-open-redirect-buggy",

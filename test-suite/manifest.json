@@ -8009,6 +8009,66 @@
       }
     },
     {
+      "id": "rust-host-header-poisoning-buggy",
+      "description": "Rust apps should not build absolute password-reset, verification, canonical, or email links from Host/X-Forwarded-Host headers without an allowlist.",
+      "path": "test-suite/rust/buggy/host_header_poisoning.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "host-header",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Request Host header used to build absolute URL"
+        ]
+      }
+    },
+    {
+      "id": "rust-host-header-poisoning-clean",
+      "description": "Rust apps that use a configured canonical origin or validate Host/X-Forwarded-Host against an allowlist should stay clean.",
+      "path": "test-suite/rust/clean/host_header_poisoning.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "host-header",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Request Host header used to build absolute URL"
+        ]
+      }
+    },
+    {
       "id": "rust-header-injection-buggy",
       "description": "Rust request and header values should not reach non-Location response headers without CR/LF validation or header-safe encoding.",
       "path": "test-suite/rust/buggy/header_injection.rs",

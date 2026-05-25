@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.2.76"
+UBS_VERSION="5.3.0"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -289,6 +289,13 @@ SESSION_LOG_DIR_OVERRIDE=""
 VERIFY_MODULE_ERR=""
 VERIFY_HELPER_ERR=""
 ALL_LANGS=(js python cpp rust golang java ruby swift csharp elixir)
+# Per-language category skip lists, populated by --skip-LANG=N flags.
+# Bare --skip=N continues to apply globally via UBS_SKIP_CATEGORIES (issue #52).
+declare -A SKIP_BY_LANG=()
+# Track whether the user passed a bare --skip=N (separate from --skip-LANG=N)
+# so we can warn when it might silence different categories in different
+# language modules.
+BARE_SKIP_USED=0
 UPDATE_ONLY=0
 FORCE_SELF_UPDATE=0
 CATEGORY_FILTER=""
@@ -352,6 +359,10 @@ Options:
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
   --skip-size-check       Skip directory size guard (use with care)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift/C# type narrowing checks (falls back to basic heuristics)
+  --skip-LANG=CSV         Skip categories in ONE language only (LANG is js/python/cpp/rust/golang/java/ruby/swift/csharp/elixir;
+                          aliases c/cs/ex accepted). Example: --skip-js=8 --skip-rust=3
+                          Use this instead of bare --skip=N in polyglot repos: category numbers are NOT stable across
+                          languages (e.g. JS cat 8 = Function & Scope Issues, Rust cat 8 = SECURITY FINDINGS). Issue #52.
   --no-dotnet             Pass through to the C# module: skip dotnet checks
   --no-build              Pass through to the C# module: skip dotnet build
   --no-test               Pass through to the C# module: skip dotnet test
@@ -574,6 +585,23 @@ else
         shift;;
       --skip=*)
         export UBS_SKIP_CATEGORIES="${1#*=}"
+        BARE_SKIP_USED=1
+        shift;;
+      --skip-*=*)
+        # --skip-LANG=N[,M,...] applies only to the matching language module
+        # (issue #52). LANG accepts the same aliases as --only / --exclude
+        # (e.g. --skip-c is normalized to --skip-cpp at run time, after the
+        # normalize_lang helper is defined). The earlier --skip-size-check /
+        # --skip-type-narrowing arms above shadow this glob for those flags.
+        _sk_lang_key="${1#--skip-}"
+        _sk_lang_key="${_sk_lang_key%%=*}"
+        _sk_lang_val="${1#*=}"
+        if [[ -n "${SKIP_BY_LANG[$_sk_lang_key]:-}" ]]; then
+          SKIP_BY_LANG["$_sk_lang_key"]="${SKIP_BY_LANG[$_sk_lang_key]},$_sk_lang_val"
+        else
+          SKIP_BY_LANG["$_sk_lang_key"]="$_sk_lang_val"
+        fi
+        unset _sk_lang_key _sk_lang_val
         shift;;
       -h|--help) usage; exit 0;;
       *)
@@ -2344,6 +2372,294 @@ normalize_lang(){
   esac
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-language category name lookup (issue #52)
+# ─────────────────────────────────────────────────────────────────────────────
+# Used to render an informative warning when bare --skip=N is set while more
+# than one language module is scheduled to run. Numbers are NOT stable across
+# modules — e.g. JS cat 8 = Function & Scope Issues, Rust cat 8 = SECURITY
+# FINDINGS — so silencing one number in every language at once is a footgun.
+# Source: print_header "N. NAME" lines harvested from each modules/ubs-*.sh.
+category_name_for(){
+  local lang="$1" cat="$2"
+  case "$lang" in
+    js)
+      case "$cat" in
+        1) echo "NULL SAFETY & DEFENSIVE PROGRAMMING";;
+        2) echo "MATH & ARITHMETIC PITFALLS";;
+        3) echo "ARRAY & COLLECTION SAFETY";;
+        4) echo "TYPE COERCION & COMPARISON TRAPS";;
+        5) echo "ASYNC/AWAIT & PROMISE PITFALLS";;
+        6) echo "ERROR HANDLING ANTI-PATTERNS";;
+        7) echo "SECURITY VULNERABILITIES";;
+        8) echo "FUNCTION & SCOPE ISSUES";;
+        9) echo "PARSING & TYPE CONVERSION BUGS";;
+        10) echo "CONTROL FLOW GOTCHAS";;
+        11) echo "DEBUGGING & PRODUCTION CODE";;
+        12) echo "MEMORY LEAKS & PERFORMANCE";;
+        13) echo "VARIABLE & SCOPE ISSUES";;
+        14) echo "CODE QUALITY MARKERS";;
+        15) echo "REGEX & STRING SAFETY";;
+        16) echo "DOM MANIPULATION SAFETY";;
+        17) echo "TYPESCRIPT STRICTNESS";;
+        18) echo "NODE.JS I/O & MODULES";;
+        19) echo "RESOURCE LIFECYCLE CORRELATION";;
+        *) echo "(no category $cat)";;
+      esac;;
+    python)
+      case "$cat" in
+        1) echo "NONE / DEFENSIVE PROGRAMMING";;
+        2) echo "NUMERIC / ARITHMETIC PITFALLS";;
+        3) echo "COLLECTION SAFETY";;
+        4) echo "COMPARISON & TYPE CHECKING TRAPS";;
+        5) echo "ASYNC/AWAIT PITFALLS";;
+        6) echo "ERROR HANDLING ANTI-PATTERNS";;
+        7) echo "SECURITY VULNERABILITIES";;
+        8) echo "FUNCTION & SCOPE ISSUES (incl. CRITICAL Mutable default args)";;
+        9) echo "PARSING & TYPE CONVERSION BUGS";;
+        10) echo "CONTROL FLOW GOTCHAS";;
+        11) echo "DEBUGGING & PRODUCTION CODE";;
+        12) echo "PERFORMANCE & MEMORY";;
+        13) echo "VARIABLE & SCOPE";;
+        14) echo "CODE QUALITY MARKERS";;
+        15) echo "REGEX & STRING SAFETY";;
+        16) echo "I/O & RESOURCE SAFETY";;
+        17) echo "TYPING STRICTNESS";;
+        18) echo "PYTHON I/O & MODULE USAGE";;
+        19) echo "RESOURCE LIFECYCLE CORRELATION";;
+        20) echo "UV-POWERED EXTRA ANALYZERS";;
+        21) echo "DEPRECATIONS & PY3.13 MIGRATIONS";;
+        22) echo "PACKAGING & CONFIG HYGIENE";;
+        23) echo "NOTEBOOK HYGIENE";;
+        *) echo "(no category $cat)";;
+      esac;;
+    rust)
+      case "$cat" in
+        1) echo "OWNERSHIP & ERROR HANDLING MACROS";;
+        2) echo "UNSAFE & MEMORY OPERATIONS";;
+        3) echo "CONCURRENCY & ASYNC PITFALLS";;
+        4) echo "NUMERIC & FLOATING-POINT";;
+        5) echo "COLLECTIONS & ITERATORS";;
+        6) echo "STRING & ALLOCATION SMELLS";;
+        7) echo "FILESYSTEM & PROCESS";;
+        8) echo "SECURITY FINDINGS (incl. critical TLS bypass, hardcoded secrets)";;
+        9) echo "CODE QUALITY MARKERS";;
+        10) echo "MODULE & VISIBILITY ISSUES";;
+        11) echo "TESTS & BENCHES HYGIENE";;
+        12) echo "LINTS & STYLE (fmt/clippy)";;
+        13) echo "BUILD HEALTH (check/test)";;
+        14) echo "DEPENDENCY HYGIENE";;
+        15) echo "API MISUSE (COMMON)";;
+        16) echo "DOMAIN-SPECIFIC HEURISTICS";;
+        17) echo "AST-GREP RULE PACK FINDINGS";;
+        18) echo "META STATISTICS & INVENTORY";;
+        19) echo "RESOURCE LIFECYCLE CORRELATION";;
+        20) echo "ASYNC LOCKING ACROSS AWAIT";;
+        21) echo "PANIC SURFACES & UNWINDING";;
+        22) echo "SUSPICIOUS CASTS & TRUNCATION";;
+        23) echo "PARSING & VALIDATION ROBUSTNESS";;
+        24) echo "PERF/DoS HOTSPOTS";;
+        *) echo "(no category $cat)";;
+      esac;;
+    golang)
+      case "$cat" in
+        1) echo "CONCURRENCY & GOROUTINE SAFETY";;
+        2) echo "CHANNELS & SELECT";;
+        3) echo "CONTEXT PROPAGATION & CANCELLATION";;
+        4) echo "HTTP CLIENT/SERVER SAFETY";;
+        5) echo "RESOURCE LIFECYCLE & DEFER";;
+        6) echo "ERROR HANDLING & WRAPPING";;
+        7) echo "JSON & ENCODING";;
+        8) echo "FILESYSTEM & I/O";;
+        9) echo "CRYPTOGRAPHY & SECURITY";;
+        10) echo "REFLECTION & UNSAFE";;
+        11) echo "IMPORT HYGIENE";;
+        12) echo "MODULE & BUILD HYGIENE";;
+        13) echo "TESTING PRACTICES";;
+        14) echo "LOGGING & PRINTF";;
+        15) echo "STYLE & MODERNIZATION";;
+        16) echo "PANIC/RECOVER & TIME PATTERNS (AST Pack)";;
+        17) echo "RESOURCE LIFECYCLE CORRELATION";;
+        18) echo "GO TOOLING (OPTIONAL)";;
+        19) echo "DEPENDENCY & BUILD DRIFT";;
+        20) echo "NIL PANICS FROM DEFER ORDERING (AST)";;
+        21) echo "DATABASE & SQL ROBUSTNESS";;
+        22) echo "SHUTDOWN & RESOURCE RELEASE (HTTP/NET)";;
+        *) echo "(no category $cat)";;
+      esac;;
+    java)
+      case "$cat" in
+        1) echo "NULL & OPTIONAL PITFALLS";;
+        2) echo "EQUALITY & HASHCODE";;
+        3) echo "CONCURRENCY & THREADING";;
+        4) echo "SECURITY";;
+        5) echo "I/O & RESOURCES";;
+        6) echo "LOGGING & DEBUGGING";;
+        7) echo "REGEX & STRING PITFALLS";;
+        8) echo "COLLECTIONS & GENERICS";;
+        9) echo "SWITCH & CONTROL FLOW";;
+        10) echo "STREAMS & PERFORMANCE";;
+        11) echo "SERIALIZATION & COMPATIBILITY";;
+        12) echo "JAVA 21 FEATURES (INFO)";;
+        13) echo "SQL CONSTRUCTION (HEURISTICS)";;
+        14) echo "ANNOTATIONS & NULLNESS (HEURISTICS)";;
+        15) echo "AST-GREP RULE PACK FINDINGS";;
+        16) echo "BUILD HEALTH (Maven/Gradle)";;
+        17) echo "META STATISTICS & INVENTORY";;
+        18) echo "MISC API MISUSE";;
+        19) echo "RESOURCE SAFETY & RESOURCE LIFECYCLE CORRELATION";;
+        20) echo "PATH HANDLING & FILESYSTEM";;
+        21) echo "HARD-CODED SECRETS (HEURISTICS)";;
+        22) echo "LOGGING BEST PRACTICES";;
+        *) echo "(no category $cat)";;
+      esac;;
+    cpp)
+      case "$cat" in
+        1) echo "MEMORY & RAII";;
+        2) echo "EXCEPTIONS & ERROR HANDLING";;
+        3) echo "CONCURRENCY & ATOMICS";;
+        4) echo "MODERNIZATION (C++20+)";;
+        5) echo "POINTER & LIFETIME HAZARDS";;
+        6) echo "NUMERIC & ARITHMETIC PITFALLS";;
+        7) echo "UNDEFINED BEHAVIOR RISK ZONE";;
+        8) echo "HEADER & INCLUDE HYGIENE";;
+        9) echo "STL & ALGORITHMS";;
+        10) echo "STRING & I/O SAFETY";;
+        11) echo "MACROS & PREPROCESSOR TRAPS";;
+        12) echo "CMAKE & BUILD HYGIENE";;
+        13) echo "CODE QUALITY MARKERS";;
+        14) echo "PERFORMANCE & ALLOCATION PRESSURE";;
+        15) echo "TEST/DEBUG LEFTOVERS";;
+        16) echo "RESOURCE LIFECYCLE CORRELATION";;
+        *) echo "(no category $cat)";;
+      esac;;
+    ruby)
+      case "$cat" in
+        1) echo "NIL / DEFENSIVE PROGRAMMING";;
+        2) echo "NUMERIC / ARITHMETIC PITFALLS";;
+        3) echo "COLLECTION SAFETY";;
+        4) echo "COMPARISON & IDIOMS";;
+        5) echo "EXCEPTIONS & ERROR HANDLING";;
+        6) echo "SECURITY VULNERABILITIES";;
+        7) echo "SHELL / SUBPROCESS SAFETY";;
+        8) echo "I/O & RESOURCE LIFECYCLE CORRELATION";;
+        9) echo "PARSING & TYPE CONVERSION BUGS";;
+        10) echo "CONTROL FLOW GOTCHAS";;
+        11) echo "DEBUGGING & PRODUCTION CODE";;
+        12) echo "PERFORMANCE & MEMORY";;
+        13) echo "VARIABLE & SCOPE";;
+        14) echo "CODE QUALITY MARKERS";;
+        15) echo "REGEX & STRING SAFETY";;
+        16) echo "CONCURRENCY & PARALLELISM";;
+        17) echo "RUBY/RAILS PRACTICALS";;
+        19) echo "BUNDLER-POWERED EXTRA ANALYZERS";;
+        *) echo "(no category $cat)";;
+      esac;;
+    swift)
+      case "$cat" in
+        1) echo "OPTIONALS / FORCE OPERATIONS";;
+        2) echo "CONCURRENCY / TASK";;
+        3) echo "CLOSURES / CAPTURE LISTS";;
+        4) echo "URLSESSION / NETWORKING";;
+        5) echo "ERROR HANDLING";;
+        6) echo "SECURITY";;
+        7) echo "CRYPTO / HASHING";;
+        8) echo "FILES & I/O";;
+        9) echo "THREADING / MAIN";;
+        10) echo "PERFORMANCE";;
+        11) echo "DEBUG / PRODUCTION";;
+        12) echo "REGEX";;
+        13) echo "SWIFTUI / COMBINE";;
+        14) echo "MEMORY / RETAIN";;
+        15) echo "CODE QUALITY MARKERS";;
+        16) echo "RESOURCE LIFECYCLE";;
+        17) echo "INFO.PLIST / ATS";;
+        18) echo "DEPRECATED APIs";;
+        19) echo "BUILD / SIGNING";;
+        20) echo "PACKAGING / SPM";;
+        21) echo "UI/UX SAFETY";;
+        22) echo "TESTS / HYGIENE";;
+        23) echo "LOCALIZATION / INTERNATIONALIZATION";;
+        *) echo "(no category $cat)";;
+      esac;;
+    csharp)
+      case "$cat" in
+        1) echo "Exceptions & Nullability Hazards";;
+        2) echo "Resources & IDisposable Footguns";;
+        3) echo "Concurrency & Async Pitfalls";;
+        4) echo "Numeric & Floating-Point Traps";;
+        5) echo "Collections & LINQ Gotchas";;
+        6) echo "Strings & Allocation Smells";;
+        7) echo "Filesystem / Process / IO Risks";;
+        8) echo "Security Red Flags";;
+        9) echo "Code Quality Markers";;
+        10) echo "API Misuse & Correctness";;
+        11) echo "Tests / Debug Leftovers";;
+        12) echo "Formatting & Analyzer Signals";;
+        13) echo "Build & Test Health";;
+        14) echo "Dependency Hygiene (NuGet)";;
+        15) echo "Exception Handling Anti-patterns";;
+        16) echo "ASP.NET / Web Pitfalls";;
+        17) echo "AST-Grep Rule Pack";;
+        18) echo "Project Inventory";;
+        19) echo "Resource Lifecycle Correlation";;
+        20) echo "Async Locks / Semaphores / Await-in-Lock";;
+        21) echo "Exception Surfaces & Rethrow Issues";;
+        22) echo "Suspicious Casts & Truncation";;
+        23) echo "Parsing & Validation Robustness";;
+        24) echo "Perf / DoS Hotspots";;
+        *) echo "(no category $cat)";;
+      esac;;
+    elixir)
+      case "$cat" in
+        1) echo "PATTERN MATCHING & GUARDS";;
+        2) echo "ERROR HANDLING & EXCEPTIONS";;
+        3) echo "PROCESS & OTP LIFECYCLE";;
+        4) echo "SECURITY VULNERABILITIES";;
+        5) echo "PHOENIX-SPECIFIC ISSUES";;
+        6) echo "ECTO & DATABASE";;
+        7) echo "CONCURRENCY & MESSAGING";;
+        8) echo "I/O & RESOURCE LIFECYCLE";;
+        9) echo "DEBUGGING & PRODUCTION CODE";;
+        10) echo "PERFORMANCE & MEMORY";;
+        11) echo "CODE QUALITY MARKERS";;
+        12) echo "CONFIGURATION & ENVIRONMENT";;
+        13) echo "TESTING PATTERNS";;
+        14) echo "DEPENDENCY & MIX HYGIENE";;
+        15) echo "STRING & BINARY SAFETY";;
+        16) echo "MIX-POWERED EXTRA ANALYZERS";;
+        *) echo "(no category $cat)";;
+      esac;;
+    *) echo "(unknown language $lang)";;
+  esac
+}
+
+# Emit a stderr warning when bare --skip=N is set while >1 language module
+# will run. Category numbers are not stable across modules (issue #52), so
+# users hitting this footgun should switch to per-language --skip-LANG=N.
+warn_ambiguous_skip(){
+  local skip_csv="$1"; shift
+  local -a active_langs=("$@")
+  [[ -z "$skip_csv" ]] && return 0
+  [[ "${#active_langs[@]}" -lt 2 ]] && return 0
+  IFS=',' read -r -a _wac <<<"$skip_csv"
+  local cat lang line
+  say_err ""
+  say_err "${YELLOW}${WARN} WARNING:${RESET} bare --skip=${skip_csv} silences DIFFERENT categories in each language module."
+  say_err "${YELLOW}${WARN}${RESET} Category numbers are NOT stable across modules (issue #52). What --skip=${skip_csv} hides:"
+  for cat in "${_wac[@]}"; do
+    cat="${cat//[[:space:]]/}"
+    [[ -z "$cat" ]] && continue
+    for lang in "${active_langs[@]}"; do
+      line="$(category_name_for "$lang" "$cat")"
+      say_err "${YELLOW}${WARN}${RESET}   ${WHITE}--skip=${cat}${RESET} in ${CYAN}${lang}${RESET}: ${line}"
+    done
+  done
+  say_err "${YELLOW}${WARN}${RESET} To silence in only one language, use --skip-LANG=${skip_csv} (e.g. --skip-js=${skip_csv} or --skip-rust=${skip_csv})."
+  say_err ""
+  unset _wac
+}
+
 # Build selected language set
 select_langs(){
   local detected=()
@@ -2419,7 +2735,21 @@ run_lang(){
   if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#SCAN_FILES[@]} -eq 0 ]]; then
     args+=("--exclude=$GLOBAL_EXCLUDE_PATTERNS")
   fi
-  [[ -n "${UBS_SKIP_CATEGORIES:-}" ]] && args+=("--skip=$UBS_SKIP_CATEGORIES")
+  # Issue #52: combine the global (bare --skip=N) and per-language
+  # (--skip-LANG=N) skip CSVs before forwarding to the module. The module
+  # accepts a single comma-separated --skip= value.
+  local _combined_skip=""
+  if [[ -n "${UBS_SKIP_CATEGORIES:-}" ]]; then
+    _combined_skip="$UBS_SKIP_CATEGORIES"
+  fi
+  if [[ -n "${SKIP_BY_LANG[$lang]:-}" ]]; then
+    if [[ -n "$_combined_skip" ]]; then
+      _combined_skip="${_combined_skip},${SKIP_BY_LANG[$lang]}"
+    else
+      _combined_skip="${SKIP_BY_LANG[$lang]}"
+    fi
+  fi
+  [[ -n "$_combined_skip" ]] && args+=("--skip=$_combined_skip")
   args+=("$PROJECT_DIR")
 
   case "$fmt" in
@@ -2809,6 +3139,32 @@ say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"
 langs=( $(select_langs) )
 if [[ ${#langs[@]} -eq 0 ]]; then say "${YELLOW}${WARN}${RESET} no recognizable languages in ${PROJECT_DIR}"; exit 0; fi
 say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
+
+# Issue #52: warn when bare --skip=N silences different categories per module.
+if [[ "$BARE_SKIP_USED" -eq 1 && -n "${UBS_SKIP_CATEGORIES:-}" ]]; then
+  warn_ambiguous_skip "$UBS_SKIP_CATEGORIES" "${langs[@]}"
+fi
+
+# Issue #52: normalize per-language skip keys (e.g. --skip-c → --skip-cpp)
+# now that normalize_lang is defined.
+if [[ "${#SKIP_BY_LANG[@]}" -gt 0 ]]; then
+  declare -A _SKIP_NORMALIZED=()
+  for _slk in "${!SKIP_BY_LANG[@]}"; do
+    _sln="$(normalize_lang "$_slk")"
+    if [[ -n "${_SKIP_NORMALIZED[$_sln]:-}" ]]; then
+      _SKIP_NORMALIZED["$_sln"]="${_SKIP_NORMALIZED[$_sln]},${SKIP_BY_LANG[$_slk]}"
+    else
+      _SKIP_NORMALIZED["$_sln"]="${SKIP_BY_LANG[$_slk]}"
+    fi
+  done
+  # Replace SKIP_BY_LANG with the normalized map.
+  unset SKIP_BY_LANG
+  declare -A SKIP_BY_LANG=()
+  for _slk in "${!_SKIP_NORMALIZED[@]}"; do
+    SKIP_BY_LANG["$_slk"]="${_SKIP_NORMALIZED[$_slk]}"
+  done
+  unset _SKIP_NORMALIZED _slk _sln
+fi
 
 # Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
 if [[ " ${langs[*]} " == *" js "* ]]; then

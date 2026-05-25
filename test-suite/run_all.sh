@@ -108,6 +108,7 @@ if command -v uv >/dev/null 2>&1; then
   uv run python ./run_manifest.py "$@"
   uv run python shareable/test_shareable_reports.py
   uv run python shareable/test_meta_runner_modes.py
+  uv run python shareable/test_skip_categories.py
   uv run python python/tests/test_resource_helper.py
   uv run python java/tests/test_resource_lifecycle_helper.py
   uv run python csharp/tests/test_helper_scanners.py
@@ -118,6 +119,7 @@ else
   python3 ./run_manifest.py "$@"
   python3 shareable/test_shareable_reports.py
   python3 shareable/test_meta_runner_modes.py
+  python3 shareable/test_skip_categories.py
   python3 python/tests/test_resource_helper.py
   python3 java/tests/test_resource_lifecycle_helper.py
   python3 csharp/tests/test_helper_scanners.py

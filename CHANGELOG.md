@@ -8,6 +8,28 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.0] - 2026-05-24
+
+### Fixes
+
+- **#51 — `ubs:ignore` now respected by every count pipeline.** PR #24 introduced the `count_lines()` helper that strips per-line `// ubs:ignore` / `# ubs:ignore` markers, but a subset of rules in 6 language modules piped their `GREP_RN` output straight through `grep -c` / `grep -cw`, bypassing the helper. Those rules silently ignored the marker. This release routes every source-scanning count through `count_lines()`. 21 bypass patterns fixed across `ubs-js.sh` (7), `ubs-python.sh` (8), `ubs-java.sh` (3 unique × 7 duplicates from copy-pasted templates = 10 lines), `ubs-cpp.sh` (2), `ubs-golang.sh` (1), and `ubs-swift.sh` (1). Tool-output counters (cargo audit log, xcodebuild output, mix dialyzer output, SARIF JSON, Cargo.toml section headers) are intentionally left as `grep -c` since `ubs:ignore` is not meaningful there.
+
+### Features
+
+- **#52 — per-language `--skip-LANG=N` plus loud warning on ambiguous bare `--skip=N`.** Category numbers are NOT stable across language modules — `--skip=8` silences `FUNCTION & SCOPE ISSUES` in JS but `SECURITY FINDINGS` (critical TLS bypass, hardcoded secrets) in Rust. Two changes ship together:
+  - **New flag `--skip-LANG=N[,M,...]`** silences categories in one language module only. `LANG` accepts the same aliases as `--only` / `--exclude` (e.g. `--skip-c=5`, `--skip-cs=8`, `--skip-ex=4`). Bare `--skip=N` still applies globally for backwards compatibility; the two combine into a single `--skip=` CSV per module.
+  - **Stderr warning on ambiguous bare `--skip=N`.** When bare `--skip=N` is used AND two or more language modules will run, UBS now prints a stderr warning that names what category `N` maps to in each active module and recommends the `--skip-LANG=N` form. Single-language runs (`--only=js --skip=8`) stay quiet; per-language flag use stays quiet. Built on top of an embedded category-name lookup harvested from each module's `print_header "N. NAME"` lines.
+
+### Tests
+
+- New regression suite `test-suite/shareable/test_skip_categories.py` (wired into `run_all.sh`) covers all four scenarios:
+  - #51 `Function declarations in blocks` rule: fires baseline, suppressed when every matching line carries `// ubs:ignore`.
+  - #52 single-language `--skip=N`: no warning.
+  - #52 polyglot `--skip=N`: warning emitted, names cat per language.
+  - #52 `--skip-LANG=N`: only the target module is affected; Python's critical `Mutable default arguments` (cat 8) keeps firing when only `--skip-js=8` is set.
+
+---
+
 Scope window: full project history remains documented below; this update reconstructs `v5.1.2...v5.2.75` in detail and updates the open comparison target to `v5.2.75`.
 
 ## Version Timeline

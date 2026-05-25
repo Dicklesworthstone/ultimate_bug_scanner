@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.3.1"
+UBS_VERSION="5.3.2"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -46,13 +46,13 @@ declare -A MODULE_CHECKSUMS=(
   [cpp]='f054b77189ac66e81fa5c918d4605430272ccb67d9c875f126673182fda85805'
   [csharp]='aa49faa22bf85a0cb3da4a667e1ab2d2b8960473ec2f8694aac3dffe9f8861f6'
   [elixir]='a231939f444a0f8dc8db97122d08898f589d8cd0dbca4e44197bb16f01b6cae9'
-  [golang]='080807d72d3f639c45efc7a98e0aeaafb78842cc60382a19f4195823e5f6d0cc'
+  [golang]='5c7a1c943e2d5278b84772e1897ef621c7e4fb7b1103844d695475f7b1bbb9ea'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
   [js]='d472bc608e90ca35f32000253a71c7c001507c56603d5a3d231de59804521551'
   [python]='e61c1b4885519572f8aead605fe7be5df066a5160edbbb42b6e1a3bf75f94fde'
   [ruby]='0973251abcd905bb6892ede0448657f460aca67f821ccc97e60645be2a1c5447'
   [rust]='26249823d0ddd77ef86aed424dbe587ee53cb3e30c186810a5292d0dae325740'
-  [swift]='6a8d188056d6d012d1ca43abf78e4b445f6d8f1187e0a793bb5ea6993d55c015'
+  [swift]='abb8b2e29fa7aa735db056757e6daa4c4b6d618e3251448ed3e9855cf491e9c0'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).

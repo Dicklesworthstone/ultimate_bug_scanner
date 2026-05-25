@@ -8,6 +8,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.2] - 2026-05-24
+
+### Fixes
+
+- **#51 follow-up — two more source-scanning count pipelines now honor `// ubs:ignore`.** Second-pass fresh-eyes review found two further bypass sites that v5.3.0 / v5.3.1 missed: `modules/ubs-golang.sh` "exec shell interpreter" rg-fallback (cat 5 SECURITY — pipes `rg ... | wc -l` directly, ignoring per-line markers), and `modules/ubs-swift.sh` "URLSession task creation sites" (cat 14 NETWORKING — strips line content via `awk -F: '{print $1":"$2}' | sort -u | wc -l` for unique-tuple counting, so `// ubs:ignore` in the content was dropped before any counter could see it). Golang fix pipes through `count_lines()`; Swift fix inserts `grep -v 'ubs:ignore'` BEFORE the content-stripping awk so the marker has a chance to filter. `MODULE_CHECKSUMS` (golang, swift) and `SHA256SUMS` refreshed.
+
+---
+
 ## [v5.3.1] - 2026-05-24
 
 ### Fixes

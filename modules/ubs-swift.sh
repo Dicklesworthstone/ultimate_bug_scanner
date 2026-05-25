@@ -3177,7 +3177,11 @@ print_header "4. URLSESSION / NETWORKING"
 tick
 
  print_subheader "URLSession task creation sites (review resume/cancel)"
- count=$("${GREP_RN[@]}" -e "\\.(dataTask|uploadTask|downloadTask)\\s*\\(" "$PROJECT_DIR" 2>/dev/null | awk -F: '{print $1":"$2}' | sort -u | wc -l | awk '{print $1+0}' || true)
+ # `grep -v 'ubs:ignore'` runs BEFORE the awk that strips content for the
+ # unique (file:line) tuple count — otherwise per-line `// ubs:ignore`
+ # markers would be silently dropped along with the content they
+ # appear in (same invariant as #51).
+ count=$("${GREP_RN[@]}" -e "\\.(dataTask|uploadTask|downloadTask)\\s*\\(" "$PROJECT_DIR" 2>/dev/null | grep -v 'ubs:ignore' | awk -F: '{print $1":"$2}' | sort -u | wc -l | awk '{print $1+0}' || true)
   if [[ "${count:-0}" -gt 0 ]]; then print_finding "info" "$count" "URLSession tasks created"; else print_finding "good" "No URLSession task creation detected"; fi
  tick
 

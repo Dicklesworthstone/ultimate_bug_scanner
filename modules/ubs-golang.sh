@@ -7461,7 +7461,9 @@ if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "InsecureSkipVerify
 print_subheader "exec shell interpreter (command injection risk)"
 count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.exec-sh-c" || echo 0)
 if [ "$count" -eq 0 ] && [[ "$HAS_RG" -eq 1 ]]; then
-  count=$(rg --no-config --no-messages -g '*.go' -n 'exec\.Command(Context)?\(\s*"(sh|bash)"\s*,\s*"-?c"|exec\.Command(Context)?\(\s*"cmd"\s*,\s*"/C"|exec\.Command(Context)?\(\s*"powershell"\s*,\s*"-Command"' "$PROJECT_DIR" 2>/dev/null | wc -l | awk '{print $1+0}')
+  # source-scanning fallback: route through count_lines so per-line `# ubs:ignore`
+  # markers are honored (same invariant as #51).
+  count=$(rg --no-config --no-messages -g '*.go' -n 'exec\.Command(Context)?\(\s*"(sh|bash)"\s*,\s*"-?c"|exec\.Command(Context)?\(\s*"cmd"\s*,\s*"/C"|exec\.Command(Context)?\(\s*"powershell"\s*,\s*"-Command"' "$PROJECT_DIR" 2>/dev/null | count_lines)
 fi
 if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "exec.Command shell interpreter detected"; fi
 [[ "$VERBOSE" -eq 1 && "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" && "$count" -gt 0 ]] && show_ast_samples "go.exec-sh-c" "$DETAIL_LIMIT" || true

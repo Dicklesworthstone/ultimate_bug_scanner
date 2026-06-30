@@ -2963,19 +2963,45 @@ COPILOT
 }
 
 setup_git_hook() {
-  if [ ! -d ".git" ]; then
-    log "Not in a git repository. Skipping..."
+  # Robustly determine whether we're inside a real git repository and where
+  # its hooks live. A bare/empty ".git" directory (e.g. $HOME/.git on some
+  # hosts) is NOT a real repo: the old `[ -d .git ]` check treated it as one
+  # and then `cat > .git/hooks/pre-commit` failed because .git/hooks/ was
+  # absent, aborting the whole installer under `set -e` even though the binary
+  # had already installed successfully (issue #58).
+  #
+  # `git rev-parse --git-dir` returns the real git directory for genuine repos
+  # (correctly handling subdirectories, worktrees/submodules where .git is a
+  # file, and $GIT_DIR) and fails for non-repos / empty .git dirs, which is
+  # exactly the "skip gracefully" case.
+  local git_dir=""
+  if command -v git >/dev/null 2>&1; then
+    git_dir="$(git rev-parse --git-dir 2>/dev/null)" || git_dir=""
+  fi
+
+  if [ -z "$git_dir" ] || [ ! -d "$git_dir" ]; then
+    log "Not in a git repository — skipping pre-commit hook setup."
+    log "Re-run the installer with --setup-git-hook from inside a repo to add it later."
     return 0
   fi
 
   if dry_run_enabled; then
-    log_dry_run "Would configure git pre-commit hook at .git/hooks/pre-commit."
+    log_dry_run "Would configure git pre-commit hook at ${git_dir}/hooks/pre-commit."
     return 0
   fi
 
   log "Setting up git pre-commit hook..."
 
-  local hook_file=".git/hooks/pre-commit"
+  # Ensure the hooks directory exists before writing into it. Freshly created
+  # or unusually-laid-out git dirs may not have hooks/ yet; without this the
+  # heredoc redirection below fails with "No such file or directory".
+  local hooks_dir="${git_dir}/hooks"
+  if ! mkdir -p "$hooks_dir" 2>/dev/null; then
+    warn "Could not create git hooks directory ($hooks_dir) — skipping pre-commit hook setup."
+    return 0
+  fi
+
+  local hook_file="${hooks_dir}/pre-commit"
 
   if [ -f "$hook_file" ]; then
     cp "$hook_file" "${hook_file}.backup"

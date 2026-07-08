@@ -39,3 +39,10 @@ export function bearerTokenCheck(req: RequestLike, expectedToken: string): boole
 export function legacyInequalityCheck(token: string, user: User): boolean {
   return token != user.resetToken;
 }
+
+// Regression guard for issue #61: a real self-comparison of the SAME secret
+// concept on both sides (token vs token) must still be flagged, even after the
+// public-nonce (token vs nonce) false positive was narrowed away.
+export function sessionTokenCheck(userToken: string, validToken: string): boolean {
+  return userToken === validToken;
+}

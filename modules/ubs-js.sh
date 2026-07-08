@@ -8154,20 +8154,32 @@ safe_compare_re = re.compile(
     r'|\b(?:subtle|crypto\.subtle)\s*\.\s*verify\s*\(',
     re.IGNORECASE,
 )
-sensitive_re = re.compile(
-    r'(?:'
-    r'\b(?:token|secret|signature|sig|hmac|digest|csrf|xsrf|nonce|otp|mfa|reset|'
-    r'password|passwd|pwd|auth|bearer|credential|session|jwt|webhook|invite|'
-    r'verification|recovery)\b|'
-    r'\bapi\s+key\b|'
-    r'\bauthorization\b|'
-    r'\bx-signature\b'
-    r')',
-    re.IGNORECASE,
-)
+# Map each weak sensitive term to a *concept family*.  Synonyms that name the
+# same kind of secret share a family, so a real self-comparison like
+# `req.headers.authorization === expectedToken` (authorization vs token, both
+# bearer-auth credentials) still counts as "same concept on both sides", while
+# `doneToken !== sessionNonce` (a bearer token vs an unrelated correlation
+# nonce) does not.  See issue #61.
+TERM_FAMILY = {
+    'token': 'token', 'bearer': 'token', 'jwt': 'token',
+    'authorization': 'token', 'auth': 'token',
+    'secret': 'secret', 'password': 'secret', 'passwd': 'secret',
+    'pwd': 'secret', 'credential': 'secret',
+    'signature': 'signature', 'sig': 'signature', 'hmac': 'signature',
+    'digest': 'signature',
+    'csrf': 'csrf', 'xsrf': 'csrf',
+    'otp': 'otp', 'mfa': 'otp',
+    'session': 'session',
+    'nonce': 'nonce',
+    'reset': 'reset', 'recovery': 'reset',
+    'webhook': 'webhook',
+    'invite': 'invite',
+    'verification': 'verification',
+}
+term_word_re = re.compile(r'[a-z][a-z0-9]*')
 nullish_re = re.compile(r'^(?:null|undefined|true|false|0|1|NaN|Number\.NaN|""|\'\'|``)$')
 length_re = re.compile(r'\b(?:length|byteLength|size)\b')
-pure_string_literal_re = re.compile(r'^\s*(?:"[^"]*"|\'[^\']*\'|`[^`]*`)\s*$')
+string_literal_re = re.compile(r'''(["'`])(?:\\.|(?!\1).)*?\1''')
 keywords = {
     'if', 'return', 'const', 'let', 'var', 'true', 'false', 'null', 'undefined',
     'await', 'async', 'function', 'typeof', 'instanceof', 'new', 'this',
@@ -8177,6 +8189,30 @@ def split_identifier_terms(text):
     text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', text)
     text = re.sub(r'[_\-.]+', ' ', text)
     return text
+
+def strip_string_literals(text):
+    # Replace the *contents* of string/template literals with an empty pair of
+    # quotes so a sensitive word that only ever appears inside a literal (e.g.
+    # an allow-list like `new Set(["completion_token", ...])`) cannot taint a
+    # variable name.  This mirrors the Go fix in #54 for the same flat-taint
+    # bug class, and kills the "file-wide name taint via literal contents"
+    # false positive described in #61.
+    return string_literal_re.sub(lambda m: m.group(1) * 2, text)
+
+def weak_families(text):
+    # Concept families implied by an operand's *code text* (identifiers), with
+    # string-literal contents stripped first.  Empty result => not sensitive.
+    norm = split_identifier_terms(strip_string_literals(text)).lower()
+    fams = set()
+    if re.search(r'\bapi\s+key\b', norm):
+        fams.add('apikey')
+    if re.search(r'\bx\s+signature\b', norm):
+        fams.add('signature')
+    for word in term_word_re.findall(norm):
+        fam = TERM_FAMILY.get(word)
+        if fam:
+            fams.add(fam)
+    return fams
 
 def strip_line_comments(line: str) -> str:
     out = []
@@ -8241,12 +8277,7 @@ def operand_identifiers(operand):
     }
 
 def is_sensitive_text(text):
-    return bool(sensitive_re.search(split_identifier_terms(text)))
-
-def is_sensitive_operand_text(text):
-    if pure_string_literal_re.match(text.strip()):
-        return False
-    return is_sensitive_text(text)
+    return bool(weak_families(text))
 
 def collect_sensitive_vars(lines):
     sensitive_vars = set()
@@ -8262,14 +8293,13 @@ def collect_sensitive_vars(lines):
             continue
         name = match.group('name')
         expr = match.group('expr')
-        if is_sensitive_text(name) or is_sensitive_operand_text(expr):
+        # Taint the variable name only if its own name, or its assigned
+        # expression's *code* (string-literal contents stripped), names a
+        # secret.  A sensitive word appearing only inside a string literal on
+        # the RHS no longer taints the name (issue #61 / #54 parity).
+        if weak_families(name) or weak_families(expr):
             sensitive_vars.add(name)
     return sensitive_vars
-
-def operand_is_sensitive(operand, sensitive_vars):
-    if is_sensitive_operand_text(operand):
-        return True
-    return bool(operand_identifiers(operand) & sensitive_vars)
 
 def clean_operand_text(operand):
     clean = operand.strip()
@@ -8299,7 +8329,29 @@ def unsafe_secret_compare(statement, sensitive_vars):
     right = clean_operand_text(match.group('right'))
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
         return False
-    return operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars)
+
+    left_fams = weak_families(left)
+    right_fams = weak_families(right)
+    left_taint = bool(operand_identifiers(left) & sensitive_vars)
+    right_taint = bool(operand_identifiers(right) & sensitive_vars)
+    left_sensitive = bool(left_fams) or left_taint
+    right_sensitive = bool(right_fams) or right_taint
+
+    if not (left_sensitive or right_sensitive):
+        return False
+
+    # When BOTH operands look sensitive purely by their identifier *names*
+    # (no data-flow taint from an assigned secret), require that they name the
+    # SAME secret concept.  A genuine timing-attack self-comparison uses one
+    # concept on both sides (userToken === validToken; authorization ===
+    # expectedToken).  Comparing two *different* concepts (doneToken !==
+    # sessionNonce) is almost always an unrelated/public value such as a
+    # correlation nonce, not a real secret check -- so it is not flagged.
+    # See issue #61.
+    if left_fams and right_fams and not (left_taint or right_taint):
+        return bool(left_fams & right_fams)
+
+    return True
 
 issues = []
 if root.is_file():

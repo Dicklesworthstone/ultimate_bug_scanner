@@ -183,23 +183,34 @@ say_err(){ echo -e "$*" >&2; }
 looks_like_toon_rust_encoder(){
   local bin="${1:-}"
   [[ -z "$bin" ]] && return 1
-  # Hard ban: never accept (or invoke) the Node.js encoder as the TOON backend.
-  local base="${bin##*/}"
-  if [[ "$base" == "toon" || "$base" == "toon.exe" ]]; then
-    return 1
-  fi
 
-  # `tru --help` begins with "TOON reference implementation in Rust (JSON <-> TOON)".
-  # `tru --version` prints "tru X.Y.Z".
+  # Identify toon_rust by CONTENT, not by basename. Historically the binary was
+  # named `tru`, but Dicklesworthstone/toon_rust now installs it as `toon`
+  # (see issue #62), so a basename ban produces false negatives that silently
+  # fall back to JSON. The Node.js `toon` CLI and upstream toon-format's `toon`
+  # binary are different projects; they are rejected here because their
+  # --help/--version output does not carry the signatures matched below.
+  #
+  # `tru`/`toon` from toon_rust print, on `--help`:
+  #   "TOON reference implementation in Rust (JSON <-> TOON)"
+  # and, on `--version`, either "tru X.Y.Z" or "toon X.Y.Z".
   local help ver
   help="$("$bin" --help 2>&1 | head -n 5 || true)"
   if [[ "$help" == *"TOON reference implementation in Rust"* ]]; then
     return 0
   fi
 
+  # Fallback: match the version banner only for the Rust encoder's names.
+  # (The --help phrase above is the primary, spoofing-resistant signal; this
+  # only helps if --help is unavailable but --version still identifies it.)
   ver="$("$bin" --version 2>&1 | head -n 1 || true)"
-  if [[ "$ver" =~ ^tru[[:space:]][0-9] ]]; then
-    return 0
+  if [[ "$ver" =~ ^(tru|toon)[[:space:]][0-9] ]]; then
+    # A bare "toon X.Y.Z" version banner is also emitted by the unrelated
+    # Node.js `toon` CLI, so require the --help phrase to have matched for the
+    # `toon`-named case; only the `tru` name is accepted on version alone.
+    if [[ "$ver" =~ ^tru[[:space:]][0-9] ]]; then
+      return 0
+    fi
   fi
 
   return 1

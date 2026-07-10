@@ -8,6 +8,20 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.5] - 2026-07-10 [Release]
+
+### Fixes
+
+- **#61 — the JS/TS "Secret/token comparisons without timing-safe equality" rule no longer fires on public nonces or literal-tainted names.** The rule's file-wide, scope-blind identifier taint produced false-positive CRITICALs in two shapes: (1) a sensitive word appearing only inside a string literal (e.g. `"completion_token"` in a `Set` of strings) tainted the same-named variable for the whole file — string-literal contents are now stripped before deciding taint (same flat-taint class fixed for Go in #54); (2) a comparison of two differently-named sensitive concepts (e.g. `doneToken !== sessionNonce`) was flagged even though it is not a secret self-comparison — weak terms are now grouped into concept families, and a purely name-based (no data-flow taint) two-sided comparison is only flagged when both operands name the SAME concept. Real checks such as `userToken === validToken` still fire. Adds a public-nonce clean fixture, manifest case, and a positive control to the buggy fixture.
+- **toon_rust#62 — the TOON encoder is now identified by content, not basename.** `looks_like_toon_rust_encoder` hard-banned any binary named `toon` and only accepted `tru`; toon_rust now installs its Rust encoder as `toon`, so the basename ban rejected a correct install and UBS silently fell back to JSON output. The probe now matches the `--help`/`--version` signature of the Rust reference implementation, accepting the real encoder under either name while still rejecting the unrelated Node.js `toon` CLI.
+
+### Housekeeping
+
+- Rotated the minisign release-signing key (README/`docs/security.md` pubkey).
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.5`; `SHA256SUMS` refreshed against the bumped `ubs` bytes. Resolves the version-tag checksum drift reported in #63 (main's js module vs the v5.3.4 tag).
+
+---
+
 ## [v5.3.4] - 2026-07-06 [Release]
 
 ### Fixes

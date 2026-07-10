@@ -69,6 +69,20 @@ jobs:
       - name: Install ast-grep (npm)
         run: npm install -g @ast-grep/cli >/dev/null
 
+      - name: Install toon_rust encoder (tru)
+        # The toon-format-* manifest cases validate real TOON encoding, which
+        # needs the toon_rust reference encoder on PATH (default probe: `tru`).
+        # Pinned release + sha256 sidecar verification.
+        run: |
+          TOON_RUST_TAG="v0.2.3"
+          curl -fsSLO "https://github.com/Dicklesworthstone/toon_rust/releases/download/${TOON_RUST_TAG}/toon-linux-amd64.tar.xz"
+          curl -fsSLO "https://github.com/Dicklesworthstone/toon_rust/releases/download/${TOON_RUST_TAG}/toon-linux-amd64.tar.xz.sha256"
+          sha256sum -c <(awk '{print $1"  toon-linux-amd64.tar.xz"}' toon-linux-amd64.tar.xz.sha256)
+          tar -xf toon-linux-amd64.tar.xz
+          sudo install -m 0755 toon /usr/local/bin/tru
+          rm -f toon toon-linux-amd64.tar.xz toon-linux-amd64.tar.xz.sha256
+          tru --version
+
       - name: Sync Python dependencies
         run: uv sync --locked --python 3.13
 

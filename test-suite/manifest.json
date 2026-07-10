@@ -3795,6 +3795,37 @@
       }
     },
     {
+      "id": "js-typescript-constant-time-compare-public-nonce-buggy",
+      "description": "True-positive twin of the #61 regression: a SAME-concept comparison (sessionNonce === expectedNonce, doneToken !== expectedToken) and a taint-backed one-sided HMAC digest comparison must still be flagged after the public-nonce narrowing.",
+      "path": "test-suite/js/security/constant-time-compare-public-nonce-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "crypto",
+        "timing",
+        "buggy",
+        "regression"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 3
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "js-typescript-constant-time-compare-public-nonce-clean",
       "description": "Regression for #61: a public correlation nonce (doneToken !== sessionNonce, different concepts) and an unrelated variable tainted only by a string-literal's contents must not be flagged as secret/token comparisons.",
       "path": "test-suite/js/security/constant-time-compare-public-nonce-clean.ts",

@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 141,
-      "case_count": 282,
-      "clean_cases_with_forbidden_substrings": 140,
-      "strict_zero_clean_cases": 140,
+      "buggy_cases_with_required_substrings": 142,
+      "case_count": 284,
+      "clean_cases_with_forbidden_substrings": 141,
+      "strict_zero_clean_cases": 141,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 90,
-      "case_count": 179,
-      "clean_cases_with_forbidden_substrings": 89,
-      "strict_zero_clean_cases": 89,
+      "buggy_cases_with_required_substrings": 91,
+      "case_count": 181,
+      "clean_cases_with_forbidden_substrings": 90,
+      "strict_zero_clean_cases": 90,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,14 +38,14 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 171,
+      "case_count": 172,
       "default_iterations": 3,
-      "default_transformed_scan_count": 513
+      "default_transformed_scan_count": 516
     },
     "campaign": {
-      "case_count": 89,
+      "case_count": 90,
       "default_iterations": 3,
-      "default_transformed_scan_count": 267
+      "default_transformed_scan_count": 270
     },
     "smoke": {
       "case_count": 17,
@@ -55,18 +55,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 59,
-      "case_count": 118,
-      "clean_cases_with_forbidden_substrings": 59,
-      "strict_zero_clean_cases": 59,
+      "buggy_cases_with_required_substrings": 60,
+      "case_count": 120,
+      "clean_cases_with_forbidden_substrings": 60,
+      "strict_zero_clean_cases": 60,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 90,
-      "case_count": 179,
-      "clean_cases_with_forbidden_substrings": 89,
-      "strict_zero_clean_cases": 89,
+      "buggy_cases_with_required_substrings": 91,
+      "case_count": 181,
+      "clean_cases_with_forbidden_substrings": 90,
+      "strict_zero_clean_cases": 90,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -111,10 +111,10 @@
       "strict_zero_clean_cases": 14
     },
     "js": {
-      "buggy_cases_with_required_substrings": 26,
-      "clean_cases_with_forbidden_substrings": 26,
-      "security_pairs": 26,
-      "strict_zero_clean_cases": 26
+      "buggy_cases_with_required_substrings": 27,
+      "clean_cases_with_forbidden_substrings": 27,
+      "security_pairs": 27,
+      "strict_zero_clean_cases": 27
     },
     "python": {
       "buggy_cases_with_required_substrings": 34,
@@ -251,6 +251,8 @@
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
           "js-typescript-constant-time-compare-clean",
+          "js-typescript-constant-time-compare-public-nonce-buggy",
+          "js-typescript-constant-time-compare-public-nonce-clean",
           "js-typescript-cookie-security-buggy",
           "js-typescript-cookie-security-clean",
           "js-typescript-cors-credentials-buggy",
@@ -528,6 +530,8 @@
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
           "js-typescript-constant-time-compare-clean",
+          "js-typescript-constant-time-compare-public-nonce-buggy",
+          "js-typescript-constant-time-compare-public-nonce-clean",
           "js-typescript-cookie-security-buggy",
           "js-typescript-cookie-security-clean",
           "js-typescript-cors-credentials-buggy",
@@ -671,8 +675,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 343,
-      "transformed_scan_count": 522
+      "case_count": 345,
+      "transformed_scan_count": 526
     },
     "campaign": {
       "by_transform": {
@@ -715,6 +719,8 @@
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
           "js-typescript-constant-time-compare-clean",
+          "js-typescript-constant-time-compare-public-nonce-buggy",
+          "js-typescript-constant-time-compare-public-nonce-clean",
           "js-typescript-cookie-security-buggy",
           "js-typescript-cookie-security-clean",
           "js-typescript-cors-credentials-buggy",
@@ -896,6 +902,8 @@
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
           "js-typescript-constant-time-compare-clean",
+          "js-typescript-constant-time-compare-public-nonce-buggy",
+          "js-typescript-constant-time-compare-public-nonce-clean",
           "js-typescript-cookie-security-buggy",
           "js-typescript-cookie-security-clean",
           "js-typescript-cors-credentials-buggy",
@@ -1039,8 +1047,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 179,
-      "transformed_scan_count": 358
+      "case_count": 181,
+      "transformed_scan_count": 362
     },
     "smoke": {
       "by_transform": {
@@ -1406,7 +1414,7 @@
     },
     {
       "buggy_case": "golang-constant-time-compare-buggy",
-      "buggy_min_critical": 8,
+      "buggy_min_critical": 9,
       "buggy_min_warning": 0,
       "buggy_path": "test-suite/golang/security/constant_time_compare_buggy.go",
       "buggy_require_count": 1,
@@ -1851,6 +1859,20 @@
       "clean_path": "test-suite/js/security/constant-time-compare-clean.ts",
       "language": "js",
       "slug": "constant-time-compare"
+    },
+    {
+      "buggy_case": "js-typescript-constant-time-compare-public-nonce-buggy",
+      "buggy_min_critical": 3,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/js/security/constant-time-compare-public-nonce-buggy.ts",
+      "buggy_require_count": 1,
+      "clean_case": "js-typescript-constant-time-compare-public-nonce-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/js/security/constant-time-compare-public-nonce-clean.ts",
+      "language": "js",
+      "slug": "constant-time-compare-public-nonce"
     },
     {
       "buggy_case": "js-typescript-cookie-security-buggy",
@@ -3141,6 +3163,7 @@
         "java-ssrf-clean",
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-clean",
+        "js-typescript-constant-time-compare-public-nonce-clean",
         "js-typescript-cookie-security-clean",
         "js-typescript-cors-credentials-clean",
         "js-typescript-dangerously-set-html-clean",
@@ -3367,6 +3390,8 @@
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-buggy",
         "js-typescript-constant-time-compare-clean",
+        "js-typescript-constant-time-compare-public-nonce-buggy",
+        "js-typescript-constant-time-compare-public-nonce-clean",
         "js-typescript-cookie-security-buggy",
         "js-typescript-cookie-security-clean",
         "js-typescript-cors-credentials-buggy",
@@ -3627,6 +3652,7 @@
         "golang-tls-verification-clean",
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-clean",
+        "js-typescript-constant-time-compare-public-nonce-clean",
         "js-typescript-cookie-security-clean",
         "js-typescript-cors-credentials-clean",
         "js-typescript-dangerously-set-html-clean",
@@ -3737,6 +3763,8 @@
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-buggy",
         "js-typescript-constant-time-compare-clean",
+        "js-typescript-constant-time-compare-public-nonce-buggy",
+        "js-typescript-constant-time-compare-public-nonce-clean",
         "js-typescript-cookie-security-buggy",
         "js-typescript-cookie-security-clean",
         "js-typescript-cors-credentials-buggy",
@@ -4048,6 +4076,8 @@
       "js-typescript-archive-extraction-clean",
       "js-typescript-constant-time-compare-buggy",
       "js-typescript-constant-time-compare-clean",
+      "js-typescript-constant-time-compare-public-nonce-buggy",
+      "js-typescript-constant-time-compare-public-nonce-clean",
       "js-typescript-cookie-security-buggy",
       "js-typescript-cookie-security-clean",
       "js-typescript-cors-credentials-buggy",
@@ -4264,6 +4294,8 @@
       "js-typescript-archive-extraction-clean",
       "js-typescript-constant-time-compare-buggy",
       "js-typescript-constant-time-compare-clean",
+      "js-typescript-constant-time-compare-public-nonce-buggy",
+      "js-typescript-constant-time-compare-public-nonce-clean",
       "js-typescript-cookie-security-buggy",
       "js-typescript-cookie-security-clean",
       "js-typescript-cors-credentials-buggy",

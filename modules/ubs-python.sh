@@ -8766,6 +8766,159 @@ PY
 )
 }
 
+# ── 'is' / 'is not' compared against a literal ─────────────────────────────
+#
+# Identity comparison with a literal (`x is "foo"`, `x is 1`, `x is True`) is a
+# CPython-interning accident waiting to happen; only `None` is a legitimate
+# `is` operand. The original implementation was a bare ripgrep for
+# ` is <literal>`, which matched the English word "is" whenever a string
+# literal or comment happened to contain it — LLM prompt templates in
+# triple-quoted strings were flagged on every prose line, and the text sat
+# inside a string so no `# ubs:ignore` comment could suppress it (#66).
+#
+# The check now parses each file and inspects real ast.Compare nodes, so only
+# an actual `is`/`is not` operator in code can produce a finding.
+run_is_literal_comparison_checks() {
+  print_subheader "'is' with literals"
+  if ! command -v python3 >/dev/null 2>&1; then
+    # Regex fallback preserves historical behaviour when python3 is absent.
+    local fallback_pattern=" is[[:space:]]*(True|False|[0-9]+|''|\"\"|'.*'|\".*\")"
+    local fallback_count
+    fallback_count=$("${GREP_RN[@]}" -e "$fallback_pattern" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+    if [ "$fallback_count" -gt 0 ]; then
+      print_finding "warning" "$fallback_count" "Using 'is' with literals" "Use '==' (only None uses 'is')"
+      show_detailed_finding "$fallback_pattern" 5
+    else
+      print_finding "good" "No 'is' literal comparisons"
+    fi
+    return
+  fi
+  local printed=0
+  while IFS=$'\t' read -r tag a b c; do
+    case "$tag" in
+      __COUNT__)
+        if [[ "$a" -gt 0 ]]; then
+          print_finding "warning" "$a" "Using 'is' with literals" "Use '==' (only None uses 'is')"
+        else
+          print_finding "good" "No 'is' literal comparisons"
+        fi
+        ;;
+      __SAMPLE__)
+        if [[ "$printed" -lt "$DETAIL_LIMIT" && "$printed" -lt "$MAX_DETAILED" ]]; then
+          print_code_sample "$a" "$b" "$c"
+          printed=$((printed + 1))
+        fi
+        ;;
+    esac
+  done < <(python3 - "$PROJECT_DIR" <<'PY'
+import ast
+import sys
+import warnings
+from pathlib import Path
+
+# Parsing a file that really does contain `x is "literal"` makes CPython emit
+# a SyntaxWarning of its own. Suppress it: this helper's stderr is the
+# scanner's stderr, and the finding we print is the report.
+warnings.simplefilter('ignore', SyntaxWarning)
+
+ROOT = Path(sys.argv[1]).resolve()
+BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
+SKIP_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.mypy_cache', '.pytest_cache', '.cache', 'build', 'dist'}
+
+def should_skip(path: Path) -> bool:
+    return any(part in SKIP_DIRS for part in path.parts)
+
+def iter_files(root: Path):
+    if root.is_file():
+        if root.suffix.lower() in {'.py', '.pyi'}:
+            yield root
+        return
+    for path in root.rglob('*'):
+        if path.is_file() and path.suffix.lower() in {'.py', '.pyi'} and not should_skip(path):
+            yield path
+
+def source_line(lines, line_no):
+    idx = line_no - 1
+    if 0 <= idx < len(lines):
+        return lines[idx].strip()
+    return ''
+
+def has_ignore(lines, line_no):
+    idx = line_no - 1
+    return (
+        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
+    ) or (
+        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
+    )
+
+# Literal operands that make `is` unsafe. `None` is deliberately excluded:
+# `x is None` is the idiomatic form and must never be flagged. Ellipsis and
+# NotImplemented are true singletons, so identity comparison is correct there
+# too and they are represented as ast.Constant(Ellipsis)/ast.Name.
+LITERAL_CONSTANTS = (bool, int, float, complex, str, bytes)
+LITERAL_NODES = (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.JoinedStr)
+
+def is_literal_operand(node) -> bool:
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, LITERAL_CONSTANTS)
+    if isinstance(node, LITERAL_NODES):
+        return True
+    # -1 / +1 / ~0 are literals wearing a unary operator.
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+        return is_literal_operand(node.operand)
+    return False
+
+class IsLiteralAnalyzer(ast.NodeVisitor):
+    def __init__(self, path, lines):
+        self.path = path
+        self.lines = lines
+        self.seen_lines = set()
+        self.issues = []
+
+    def remember_issue(self, line_no):
+        if has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+            return
+        self.seen_lines.add(line_no)
+        try:
+            rel = self.path.relative_to(BASE_DIR)
+        except ValueError:
+            rel = self.path.name
+        self.issues.append((str(rel), line_no, source_line(self.lines, line_no)))
+
+    def visit_Compare(self, node):
+        operands = [node.left] + list(node.comparators)
+        for index, op in enumerate(node.ops):
+            if not isinstance(op, (ast.Is, ast.IsNot)):
+                continue
+            left, right = operands[index], operands[index + 1]
+            if is_literal_operand(left) or is_literal_operand(right):
+                # Report at the operand's own line so multi-line comparisons
+                # point at the literal rather than the start of the statement.
+                target = right if is_literal_operand(right) else left
+                self.remember_issue(getattr(target, 'lineno', node.lineno))
+        self.generic_visit(node)
+
+def analyze(path, issues):
+    try:
+        text = path.read_text(encoding='utf-8', errors='ignore')
+        tree = ast.parse(text, filename=str(path))
+    except Exception:
+        return
+    lines = text.splitlines()
+    analyzer = IsLiteralAnalyzer(path, lines)
+    analyzer.visit(tree)
+    issues.extend(analyzer.issues)
+
+issues = []
+for file_path in iter_files(ROOT):
+    analyze(file_path, issues)
+print(f'__COUNT__\t{len(issues)}')
+for file_name, line_no, code in issues[:25]:
+    print(f'__SAMPLE__\t{file_name}\t{line_no}\t{code}')
+PY
+)
+}
+
 show_ast_samples_from_json() {
   local blob=$1
   [[ -n "$blob" ]] || return 0
@@ -9136,15 +9289,28 @@ rule:
     - any:
         - pattern: open($$$)
         - pattern: pathlib.Path($P).open($$$)
+    # `pattern: encoding=$ENC` parsed standalone as an *assignment statement*,
+    # so it could never match a keyword_argument node -- the rule therefore
+    # fired on every open() call, including single-line ones that pass
+    # encoding= explicitly. Anchor the pattern with a call context and select
+    # the keyword_argument, and look for it among the direct children of this
+    # call's argument_list so a formatter-wrapped multi-line argument list is
+    # seen exactly like a single-line one (#67).
     - not:
         has:
-          pattern: encoding=$ENC
+          kind: argument_list
+          has:
+            pattern:
+              context: "f(encoding=$ENC)"
+              selector: keyword_argument
+    # Binary mode takes no encoding= at all (TypeError), so an explicit
+    # binary mode -- positional ("rb"/"wb"/"ab"/"xb"/"rb+") or keyword
+    # (mode="rb") -- must never be reported (#67).
     - not:
-        any:
-          - has: { pattern: "mode='b'" }
-          - has: { pattern: "mode=\"b\"" }
-          - has: { pattern: "mode='rb'" }
-          - has: { pattern: "mode=\"rb\"" }
+        has:
+          kind: argument_list
+          has:
+            regex: "^(mode[[:space:]]*=[[:space:]]*)?[\"'][rwxa+tU]*b[rwxa+tU]*[\"']$"
 severity: info
 message: "open() without encoding=... may be non-deterministic across locales"
 YAML
@@ -10122,14 +10288,9 @@ print_header "4. COMPARISON & TYPE CHECKING TRAPS"
 print_category "Detects: 'is' with literals, type() equality, truthiness with bools" \
   "Prefer idiomatic Python comparisons and isinstance."
 
-print_subheader "'is' with literals"
-count=$("${GREP_RN[@]}" -e " is[[:space:]]*(True|False|[0-9]+|''|\"\"|'.*'|\".*\")" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$count" -gt 0 ]; then
-  print_finding "warning" "$count" "Using 'is' with literals" "Use '==' (only None uses 'is')"
-  show_detailed_finding " is[[:space:]]*(True|False|[0-9]+|''|\"\"|'.*'|\".*\")" 5
-else
-  print_finding "good" "No 'is' literal comparisons"
-fi
+# AST-backed: the old ripgrep matched the English word "is" inside string
+# literals and comments (#66).
+run_is_literal_comparison_checks
 
 print_subheader "type(x) == T instead of isinstance"
 count=$("${GREP_RN[@]}" -e "type\([^)]+\)[[:space:]]*(==|is)[[:space:]]*[A-Za-z_][A-Za-z0-9_\.]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)

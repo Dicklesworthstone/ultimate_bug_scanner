@@ -6558,6 +6558,132 @@
       }
     },
     {
+      "id": "python-is-literal-buggy",
+      "description": "Real 'is' comparisons against str/int/bool/list literals must still be reported after the AST narrowing (#66).",
+      "path": "test-suite/python/quality/is_literal_buggy.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "quality",
+        "comparison",
+        "buggy",
+        "issue-66"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Using 'is' with literals"
+        ]
+      }
+    },
+    {
+      "id": "python-is-literal-clean",
+      "description": "The English word \"is\" inside docstrings, string literals, and comments must never be read as an identity operator (#66).",
+      "path": "test-suite/python/quality/is_literal_clean.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "quality",
+        "comparison",
+        "clean",
+        "issue-66"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Using 'is' with literals"
+        ]
+      }
+    },
+    {
+      "id": "python-open-with-encoding-buggy",
+      "description": "A non-context-managed open() and a text-mode open() without encoding= must still be reported by the ast-grep rule pack (#67).",
+      "path": "test-suite/python/quality/open_with_encoding_buggy.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "quality",
+        "io",
+        "ast-grep",
+        "buggy",
+        "issue-67"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "py.open-no-with",
+          "py.open-no-encoding"
+        ]
+      }
+    },
+    {
+      "id": "python-open-with-encoding-clean",
+      "description": "Multi-line open() calls inside with statements, including binary-mode and pathlib forms, must not be flagged as unmanaged or encoding-less (#67).",
+      "path": "test-suite/python/quality/open_with_encoding_clean.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "quality",
+        "io",
+        "ast-grep",
+        "clean",
+        "issue-67"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "py.open-no-with",
+          "py.open-no-encoding"
+        ]
+      }
+    },
+    {
       "id": "go-resource-lifecycle",
       "description": "Go context/ticker/timer cleanup regression.",
       "path": "test-suite/golang/buggy/resource_lifecycle.go",

@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.3.6"
+UBS_VERSION="5.3.7"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -49,7 +49,7 @@ declare -A MODULE_CHECKSUMS=(
   [golang]='a2507466d961932e821465de17ca10571f8be010909fb29db1d032e25a604f77'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
   [js]='d410c8e412907be541fd748ea16234dcdaa1b7d70d8a0215beadc75c81a0587d'
-  [python]='396d03c96ceeb0b2fec894b4077c20d46342e7a1a62bf98ae5a2c6aa8c7173a5'
+  [python]='5c14ebdeb0aeb3e79df8e993b83a47460fccb4a7324d896cc5d2523d09dbeb97'
   [ruby]='0973251abcd905bb6892ede0448657f460aca67f821ccc97e60645be2a1c5447'
   [rust]='26249823d0ddd77ef86aed424dbe587ee53cb3e30c186810a5292d0dae325740'
   [swift]='abb8b2e29fa7aa735db056757e6daa4c4b6d618e3251448ed3e9855cf491e9c0'

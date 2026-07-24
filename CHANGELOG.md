@@ -8,6 +8,27 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.7] - 2026-07-23
+
+### Fixes
+
+- **#66 — the Python "'is' with literals" check no longer matches the English word "is" inside string literals or comments.** The check was a bare `rg` for ` is <literal>`, so any prose containing `... is "respond"` — LLM prompt templates in triple-quoted strings, docstrings, `# comments` — was reported as an identity comparison. The text lived inside a string, so a `# ubs:ignore` marker could not even be attached to suppress it, and prompt-carrying modules could never pass a `--fail-on-warning` gate. The check is now AST-backed (`ast.Compare` with an `Is`/`IsNot` operator against a `str`/`bytes`/`int`/`float`/`complex`/`bool` constant, a container display, an f-string, or a signed numeric literal), so only a real `is` operator in code can produce a finding; `x is None` remains unflagged, `ubs:ignore` still suppresses, and the old regex is retained as a fallback when `python3` is unavailable. New paired fixtures `test-suite/python/quality/is_literal_{clean,buggy}.py` pin both directions.
+- **#67 — `py.open-no-encoding` no longer fires on `open()` calls that pass `encoding=`.** The rule's exclusion clause, `has: { pattern: encoding=$ENC }`, parsed standalone as an *assignment statement* and could therefore never match a `keyword_argument` node — so the rule fired on every `open()` call in a file, single-line ones included. The exclusion is now an anchored `context`/`selector` pattern matched against the direct children of the call's `argument_list`, which sees a formatter-wrapped multi-line argument list exactly like a single-line one. Explicit binary mode (positional `"rb"`/`"wb"`/… or `mode="rb"`) is also excluded, since `encoding=` is a `TypeError` there. `py.open-no-with` (the other half of the report, fixed in #64 by matching a `with_item` ancestor) is now pinned by a regression fixture so multi-line `with open(...)` cannot regress again. New paired fixtures `test-suite/python/quality/open_with_encoding_{clean,buggy}.py`; both rules still fire on a non-context-managed `open()` and a text-mode `open()` without `encoding=`.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.7`; `MODULE_CHECKSUMS` and `SHA256SUMS` regenerated against the edited `modules/ubs-python.sh`, keeping `scripts/check-version-tag-drift.sh` satisfiable once `v5.3.7` is tagged.
+
+---
+
+## [v5.3.6] - 2026-07-19 [Release]
+
+### Housekeeping
+
+- **#65 — version bumped to `5.3.6` to clear version-tag checksum drift.** The `modules/ubs-python.sh` changes released in #64 left `MODULE_CHECKSUMS` on `main` ahead of the `v5.3.5` tag; bumping `VERSION`, `UBS_VERSION`, and the README badge restores the invariant that a runner from `main` can fetch its modules from `v$UBS_VERSION`.
+
+---
+
 ## [v5.3.5] - 2026-07-10 [Release]
 
 ### Fixes

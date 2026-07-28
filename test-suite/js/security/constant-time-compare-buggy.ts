@@ -46,3 +46,17 @@ export function legacyInequalityCheck(token: string, user: User): boolean {
 export function sessionTokenCheck(userToken: string, validToken: string): boolean {
   return userToken === validToken;
 }
+
+export function unsuppressedInlineTokenComparisonControl(
+  presentedToken: string,
+  expectedToken: string,
+): boolean {
+  return presentedToken === expectedToken;
+}
+
+export function unsuppressedPreviousLineSignatureComparisonControl(
+  presentedSignature: string,
+  expectedSignature: string,
+): boolean {
+  return presentedSignature === expectedSignature;
+}

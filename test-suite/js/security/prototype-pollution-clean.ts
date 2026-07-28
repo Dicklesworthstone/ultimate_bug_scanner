@@ -6,6 +6,11 @@ type RequestLike = {
   json(): Promise<Record<string, unknown>>;
 };
 
+declare function merge(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+): Record<string, unknown>;
+
 const bodySizeLimit = 1024 * 1024;
 
 function stripPrototypeKeys(input: Record<string, unknown>): Record<string, unknown> {
@@ -56,4 +61,13 @@ export function dynamicPropertyWrite(req: RequestLike): Record<string, unknown> 
   const target: Record<string, unknown> = Object.create(null);
   target[key] = value;
   return target;
+}
+
+export function reviewedInlineMerge(req: RequestLike): Record<string, unknown> {
+  return Object.assign({}, req.body); // ubs:ignore -- reviewed compatibility boundary
+}
+
+export function reviewedPreviousLineMerge(req: RequestLike): Record<string, unknown> {
+  // ubs:ignore -- reviewed compatibility boundary
+  return merge({}, req.query);
 }

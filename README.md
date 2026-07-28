@@ -1274,15 +1274,16 @@ eval(safe_string)  # ubs:ignore
 ```
 
 **Suppression Rules:**
-- Must appear on the **same line** as the flagged code
+- Must appear on the flagged line or the **immediately preceding source line**
 - Works across all 10 supported languages
 - Suppresses all findings on that line (use sparingly)
 - Survives formatting tools that preserve trailing comments
 
 **Anti-patterns to avoid:**
 ```javascript
-// ❌ Wrong - comment on previous line doesn't suppress:
+// ❌ Wrong - a separated comment doesn't suppress:
 // ubs:ignore
+
 eval(code);  // Still flagged!
 
 // ❌ Wrong - don't blanket-suppress large blocks:

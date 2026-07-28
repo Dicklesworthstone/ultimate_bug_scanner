@@ -3844,7 +3844,7 @@
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 1
+            "min": 9
           }
         },
         "require_substrings": [
@@ -3854,7 +3854,7 @@
     },
     {
       "id": "js-typescript-constant-time-compare-clean",
-      "description": "TypeScript code using crypto.timingSafeEqual or reviewed constant-time helpers should stay clean.",
+      "description": "TypeScript code using constant-time helpers or precise inline and preceding-line ubs:ignore annotations should stay clean.",
       "path": "test-suite/js/security/constant-time-compare-clean.ts",
       "language": "js",
       "tags": [
@@ -4405,7 +4405,7 @@
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 1
+            "min": 7
           }
         },
         "require_substrings": [
@@ -4415,7 +4415,7 @@
     },
     {
       "id": "js-typescript-prototype-pollution-clean",
-      "description": "TypeScript object merges that reject prototype keys or use safe merge helpers should stay clean.",
+      "description": "TypeScript object merges that reject prototype keys, use safe helpers, or carry precise inline and preceding-line ubs:ignore annotations should stay clean.",
       "path": "test-suite/js/security/prototype-pollution-clean.ts",
       "language": "js",
       "tags": [

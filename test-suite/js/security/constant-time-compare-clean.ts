@@ -39,3 +39,18 @@ export function tokenShapeCheck(token: string): boolean {
 export function statusCheck(status: string, expectedStatus: string): boolean {
   return status === expectedStatus;
 }
+
+export function reviewedInlineTokenComparison(
+  presentedToken: string,
+  expectedToken: string,
+): boolean {
+  return presentedToken === expectedToken; // ubs:ignore -- public compatibility marker
+}
+
+export function reviewedPreviousLineSignatureComparison(
+  presentedSignature: string,
+  expectedSignature: string,
+): boolean {
+  // ubs:ignore -- upstream verifier already authenticated this value
+  return presentedSignature === expectedSignature;
+}

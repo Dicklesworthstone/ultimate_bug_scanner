@@ -38,3 +38,11 @@ export function dynamicPropertyWrite(req: RequestLike): Record<string, unknown> 
   target[key ?? "name"] = value;
   return target;
 }
+
+export function unsuppressedInlineMergeControl(req: RequestLike): Record<string, unknown> {
+  return Object.assign({}, req.body);
+}
+
+export function unsuppressedPreviousLineMergeControl(req: RequestLike): Record<string, unknown> {
+  return merge({}, req.query);
+}

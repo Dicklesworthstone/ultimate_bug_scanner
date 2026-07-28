@@ -5425,6 +5425,14 @@ def strip_line_comments(line: str) -> str:
     return line
 
 
+def has_ignore(lines, index):
+    return (
+        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
+    ) or (
+        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
+    )
+
+
 def mask_strings(text: str) -> str:
     chars = list(text)
     quote = ''
@@ -5525,13 +5533,16 @@ for path in iter_files(root):
         continue
     tainted_vars = set()
     for idx, raw in enumerate(lines):
+        if has_ignore(lines, idx):
+            continue
         stripped = strip_line_comments(raw).strip()
         if not stripped or stripped.startswith(('*', 'import ', 'export type ', 'type ', 'interface ')):
             continue
         statement = logical_statement(lines, idx)
-        if 'ubs:ignore' in statement:
-            continue
         update_taint(statement, tainted_vars)
+        visible_line = mask_strings(stripped)
+        if not merge_sink_re.search(visible_line) and not dynamic_write_re.search(visible_line):
+            continue
         visible_statement = mask_strings(statement)
         context = context_window(lines, idx)
         if safe_re.search(statement):
@@ -8248,6 +8259,13 @@ def code_line(source_line):
         return ""
     return re.sub(r'/\*.*?\*/', '', strip_line_comments(source_line))
 
+def has_ignore(lines, index):
+    return (
+        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
+    ) or (
+        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
+    )
+
 def statement_from(lines, idx, max_lines=8):
     parts = []
     paren_balance = 0
@@ -8282,8 +8300,10 @@ def is_sensitive_text(text):
 def collect_sensitive_vars(lines):
     sensitive_vars = set()
     for idx, raw in enumerate(lines):
+        if has_ignore(lines, idx):
+            continue
         stripped = code_line(raw).strip()
-        if not stripped or 'ubs:ignore' in stripped or '=>' in stripped:
+        if not stripped or '=>' in stripped:
             continue
         statement = statement_from(lines, idx, max_lines=5)
         if not statement or safe_compare_re.search(statement):
@@ -8375,8 +8395,10 @@ for path in candidates:
     sensitive_vars = collect_sensitive_vars(lines)
     seen_lines = set()
     for idx, raw in enumerate(lines):
+        if has_ignore(lines, idx):
+            continue
         stripped = code_line(raw).strip()
-        if not stripped or 'ubs:ignore' in stripped or ('==' not in stripped and '!=' not in stripped):
+        if not stripped or ('==' not in stripped and '!=' not in stripped):
             continue
         statement = statement_from(lines, idx)
         if not statement or not unsafe_secret_compare(statement, sensitive_vars):

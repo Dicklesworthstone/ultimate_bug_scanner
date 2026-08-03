@@ -276,9 +276,19 @@ async function analyzeFileFallback(filePath) {
     const guard = line.match(/if\s*\(\s*!([A-Za-z_$][\w$]*)\b\s*\)/) || line.match(/if\s*\(\s*([A-Za-z_$][\w$]*)\b\s*===?\s*(?:null|undefined)\b\s*\)/);
     if (!guard) continue;
     const name = guard[1];
+    // GH #76: `continue`/`break` terminate the iteration or the enclosing
+    // loop/switch, so they guard the following statements exactly like
+    // `return`/`throw` do.
+    const terminator = /return\b|throw\b|continue\b|break\b/;
     let exits = false;
-    for (let j = i + 1; j < Math.min(lines.length, i + 6); j++) {
-      if (/return\b|throw\b|continue\b|break\b/.test(lines[j]) || (nextNavigationImport && noReturnCall.test(lines[j]))) {
+    // A single-line guard puts its terminator on the guard line itself
+    // (`if (!value) continue;`), after the closing parenthesis.
+    const guardTail = line.slice(guard.index + guard[0].length);
+    if (terminator.test(guardTail) || (nextNavigationImport && noReturnCall.test(guardTail))) {
+      exits = true;
+    }
+    for (let j = i + 1; !exits && j < Math.min(lines.length, i + 6); j++) {
+      if (terminator.test(lines[j]) || (nextNavigationImport && noReturnCall.test(lines[j]))) {
         exits = true;
         break;
       }

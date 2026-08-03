@@ -35,3 +35,24 @@ export function requireProfile(profile?: UserProfile): string {
 
   return profile.email ?? "anonymous@example.com";
 }
+
+// GH #76: `continue` ends the iteration, so the access below only runs when the
+// guard did not fire.
+export function collectEmails(profiles: (UserProfile | undefined)[]): string[] {
+  const out: string[] = [];
+  for (const profile of profiles) {
+    if (!profile) continue;
+    out.push(profile.email ?? "anonymous@example.com");
+  }
+  return out;
+}
+
+// GH #76: `break` leaves the loop entirely, same reasoning.
+export function firstEmail(profiles: (UserProfile | undefined)[]): string {
+  let found = "anonymous@example.com";
+  for (const profile of profiles) {
+    if (!profile) break;
+    found = profile.email ?? found;
+  }
+  return found;
+}

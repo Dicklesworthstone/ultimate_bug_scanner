@@ -7292,6 +7292,34 @@
       }
     },
     {
+      "id": "rust-findings-json-escaping",
+      "description": "Rust --emit-findings-json must escape quotes and backslashes in source samples so the artifact parses as JSON.",
+      "path": "test-suite/rust/buggy/findings_json_escaping.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "json",
+        "regression"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=1"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "findings_json_valid": true,
+        "require_substrings": [
+          "panic! macro(s) present"
+        ]
+      }
+    },
+    {
       "id": "rust-unsafe-memory-buggy",
       "description": "Rust unsafe memory APIs should be caught as code, not just text inventory.",
       "path": "test-suite/rust/buggy/unsafe_memory.rs",

@@ -264,7 +264,7 @@ json_escape() {
   local s=""
   if [[ $# -gt 0 ]]; then s="$1"; else s="$(cat 2>/dev/null || true)"; fi
   s="${s//\\/\\\\}"
-  s="${s//"/\\"}"
+  s=${s//\"/\\\"}
   s="${s//$'	'/\\t}"
   s="${s//$''/\\r}"
   s="${s//$'\n'/\\n}"

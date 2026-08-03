@@ -172,7 +172,7 @@ def expect_schema_errors(expect: Any, label: str) -> List[str]:
         if key in expect:
             errors.extend(string_list_errors(expect[key], f"{label}.expect.{key}"))
 
-    for key in ("allow_unparseable_output", "allow_zero_files"):
+    for key in ("allow_unparseable_output", "allow_zero_files", "findings_json_valid"):
         if key in expect and type(expect[key]) is not bool:
             errors.append(f"{label}.expect.{key} must be a boolean")
 
@@ -449,6 +449,33 @@ def check_expectations(
     return errors
 
 
+def findings_json_errors(path: Path) -> List[str]:
+    """Validate a module's --emit-findings-json artifact (GH #69, #71).
+
+    Source samples are copied verbatim into JSON strings, so an emitter that
+    forgets to escape a quote, backslash, or control character produces a file
+    that no JSON parser accepts. Parsing it here is the regression guard.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return [f"findings JSON not readable at {path}: {exc}"]
+    try:
+        data = JSON_DECODER.decode(raw)
+    except json.JSONDecodeError as exc:
+        return [f"findings JSON is not valid JSON ({exc})"]
+    if not isinstance(data, dict):
+        return ["findings JSON must be an object"]
+    findings = data.get("findings")
+    if not isinstance(findings, list) or not findings:
+        return ["findings JSON contains no findings array"]
+    for finding in findings:
+        samples = finding.get("samples") if isinstance(finding, dict) else None
+        if samples is not None and not isinstance(samples, list):
+            return ["findings JSON samples must be an array"]
+    return []
+
+
 def format_case_result(case_id: str, status: str, duration: float, details: Sequence[str]) -> str:
     header = f"[{case_id}] {status.upper()} ({duration:.2f}s)"
     if not details:
@@ -548,15 +575,24 @@ def main() -> None:
         case_args = case.get("args", [])
         case_ubs_bin = case.get("ubs_bin")
         case_ubs_path = resolve_path(manifest_dir, case_ubs_bin) if case_ubs_bin else ubs_path
-        cmd = [str(case_ubs_path), *default_args, *case_args, case_path_arg]
+        artifacts_dir = artifacts_root / case_id
+        ensure_dir(artifacts_dir)
+        case_expect = case.get("expect", {}) or {}
+        extra_args: List[str] = []
+        findings_json_path: Optional[Path] = None
+        if bool(case_expect.get("findings_json_valid", False)):
+            findings_json_path = artifacts_dir / "findings.json"
+            # Poison the target first: a module that never writes the artifact
+            # must not be able to pass on a stale file from an earlier run.
+            findings_json_path.write_text("not written by this run\n")
+            extra_args.append(f"--emit-findings-json={findings_json_path}")
+        cmd = [str(case_ubs_path), *default_args, *case_args, *extra_args, case_path_arg]
         env = os.environ.copy()
         env.update(default_env)
         env.update({k: str(v) for k, v in (case.get("env", {}) or {}).items()})
         if (case.get("language") or "").lower() == "python":
             env.setdefault("ENABLE_UV_TOOLS", "0")
 
-        artifacts_dir = artifacts_root / case_id
-        ensure_dir(artifacts_dir)
         shims = case.get("bin_shims") or {}
         stdout_path = artifacts_dir / "stdout.log"
         stderr_path = artifacts_dir / "stderr.log"
@@ -643,6 +679,8 @@ def main() -> None:
             proc.stderr,
             fail_on_warning,
         )
+        if findings_json_path is not None:
+            errors.extend(findings_json_errors(findings_json_path))
         status = "pass"
         if summary_error:
             errors.append(summary_error)

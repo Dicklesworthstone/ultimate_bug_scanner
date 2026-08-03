@@ -2120,7 +2120,11 @@ build_find_cmd() {
   FIND_CMD=(find "$PROJECT_DIR" \( -type d \( "${prune[@]}" \) -prune \) -o \( -type f \( "${names[@]}" \) -print0 \))
 }
 build_find_cmd
-safe_count_files(){ tr -cd '\0' | awk 'END{print (length>0?gsub(/\0/,"")+0:0)}'; }
+# Count NUL-delimited paths from find -print0. Issue #81: the previous awk
+# construct counted NUL bytes with gsub(/\0/), which busybox awk resolves to 0,
+# so the scan reported zero files. Counting the NUL-only byte stream needs no
+# awk NUL support at all.
+safe_count_files(){ tr -cd '\0' | wc -c | tr -d '[:space:]'; }
 
 if command -v rg >/dev/null 2>&1; then
   HAS_RIPGREP=1

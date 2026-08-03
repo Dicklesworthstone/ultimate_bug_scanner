@@ -37,12 +37,19 @@ export function requireProfile(profile?: UserProfile): string {
 }
 
 // GH #76: `continue` ends the iteration, so the access below only runs when the
-// guard did not fire.
+// guard did not fire. Keep the body longer than the text heuristic's lookahead
+// window so the fixture exercises the guard line itself, not a nearby `return`.
 export function collectEmails(profiles: (UserProfile | undefined)[]): string[] {
   const out: string[] = [];
+  let skipped = 0;
   for (const profile of profiles) {
     if (!profile) continue;
     out.push(profile.email ?? "anonymous@example.com");
+    console.debug("collected", out.length);
+    console.debug("skipped so far", skipped);
+    skipped += 0;
+    console.debug("still going");
+    console.debug("done with entry");
   }
   return out;
 }
@@ -50,9 +57,15 @@ export function collectEmails(profiles: (UserProfile | undefined)[]): string[] {
 // GH #76: `break` leaves the loop entirely, same reasoning.
 export function firstEmail(profiles: (UserProfile | undefined)[]): string {
   let found = "anonymous@example.com";
+  let visited = 0;
   for (const profile of profiles) {
     if (!profile) break;
     found = profile.email ?? found;
+    console.debug("visiting", visited);
+    visited += 1;
+    console.debug("current", found);
+    console.debug("still going");
+    console.debug("done with entry");
   }
   return found;
 }

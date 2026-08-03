@@ -4869,6 +4869,69 @@
       }
     },
     {
+      "id": "js-typescript-archive-entry-suppression-buggy",
+      "description": "An archive entry joined into an extraction destination stays reported when no inline suppression is present.",
+      "path": "test-suite/js/security/archive-entry-suppression-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "archive",
+        "suppression",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Archive/upload entry path traversal risk"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-archive-entry-suppression-clean",
+      "description": "A trailing ubs:ignore comment must suppress the archive entry-path finding.",
+      "path": "test-suite/js/security/archive-entry-suppression-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "archive",
+        "suppression",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Archive/upload entry path traversal risk"
+        ]
+      }
+    },
+    {
       "id": "js-typescript-jwt-verification-buggy",
       "description": "TypeScript JWT code should not trust decode-only claims or disable verification checks.",
       "path": "test-suite/js/security/jwt-verification-buggy.ts",

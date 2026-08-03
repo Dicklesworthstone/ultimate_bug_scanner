@@ -7536,15 +7536,24 @@ def code_line(source_line):
     return re.sub(r'//.*', '', without_block_comments)
 
 def statement_from(lines, idx, max_lines=12):
+    """Return the comment-stripped statement at idx and its raw source span.
+
+    Inline suppressions live in comments and code_line() removes comments, so a
+    trailing '// ubs:ignore' can only be seen in the raw span (GH #77). Pattern
+    matching keeps using the stripped text.
+    """
     parts = []
+    raw_parts = []
     paren_balance = 0
     brace_balance = 0
     saw_code = False
     for line_idx in range(idx, min(len(lines), idx + max_lines)):
-        current = code_line(lines[line_idx]).strip()
+        raw_current = lines[line_idx]
+        current = code_line(raw_current).strip()
         if not current:
             continue
         parts.append(current)
+        raw_parts.append(raw_current)
         saw_code = True
         paren_balance += current.count('(') - current.count(')')
         brace_balance += current.count('{') - current.count('}')
@@ -7552,7 +7561,9 @@ def statement_from(lines, idx, max_lines=12):
             break
         if ';' in current and paren_balance <= 0 and brace_balance <= 0:
             break
-    return ' '.join(parts) if saw_code else ""
+    if not saw_code:
+        return "", ""
+    return ' '.join(parts), '\n'.join(raw_parts)
 
 def context_from(lines, idx):
     start = max(0, idx - 8)
@@ -7595,8 +7606,8 @@ for path in candidates:
 
     archive_vars = {}
     for idx, line in enumerate(lines):
-        statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        statement, raw_statement = statement_from(lines, idx)
+        if not statement or 'ubs:ignore' in raw_statement:
             continue
         assignment = assignment_re.search(statement)
         if not assignment:
@@ -7610,12 +7621,14 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        # GH #77: test the suppression marker against the raw source, since
+        # code_line() has already removed the comment that carries it.
+        if not stripped or 'ubs:ignore' in line:
             continue
         if not path_join_re.search(stripped):
             continue
-        statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in statement:
+        statement, raw_statement = statement_from(lines, idx)
+        if not statement or 'ubs:ignore' in raw_statement:
             continue
         if not has_archive_source(statement, archive_vars):
             continue

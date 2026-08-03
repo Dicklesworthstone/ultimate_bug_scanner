@@ -356,7 +356,7 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 82,
+      "result_count": 84,
       "result_rule_ids": [
         "js.async.await-no-try",
         "js.async.dangling-promise",

@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 143,
-      "case_count": 286,
-      "clean_cases_with_forbidden_substrings": 142,
-      "strict_zero_clean_cases": 142,
+      "buggy_cases_with_required_substrings": 144,
+      "case_count": 288,
+      "clean_cases_with_forbidden_substrings": 143,
+      "strict_zero_clean_cases": 143,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 91,
-      "case_count": 182,
-      "clean_cases_with_forbidden_substrings": 91,
-      "strict_zero_clean_cases": 91,
+      "buggy_cases_with_required_substrings": 92,
+      "case_count": 184,
+      "clean_cases_with_forbidden_substrings": 92,
+      "strict_zero_clean_cases": 92,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,14 +38,14 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 174,
+      "case_count": 175,
       "default_iterations": 3,
-      "default_transformed_scan_count": 522
+      "default_transformed_scan_count": 525
     },
     "campaign": {
-      "case_count": 91,
+      "case_count": 92,
       "default_iterations": 3,
-      "default_transformed_scan_count": 273
+      "default_transformed_scan_count": 276
     },
     "smoke": {
       "case_count": 17,
@@ -55,18 +55,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 60,
-      "case_count": 120,
-      "clean_cases_with_forbidden_substrings": 60,
-      "strict_zero_clean_cases": 60,
+      "buggy_cases_with_required_substrings": 61,
+      "case_count": 122,
+      "clean_cases_with_forbidden_substrings": 61,
+      "strict_zero_clean_cases": 61,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 91,
-      "case_count": 182,
-      "clean_cases_with_forbidden_substrings": 91,
-      "strict_zero_clean_cases": 91,
+      "buggy_cases_with_required_substrings": 92,
+      "case_count": 184,
+      "clean_cases_with_forbidden_substrings": 92,
+      "strict_zero_clean_cases": 92,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -111,10 +111,10 @@
       "strict_zero_clean_cases": 14
     },
     "js": {
-      "buggy_cases_with_required_substrings": 27,
-      "clean_cases_with_forbidden_substrings": 27,
-      "security_pairs": 27,
-      "strict_zero_clean_cases": 27
+      "buggy_cases_with_required_substrings": 28,
+      "clean_cases_with_forbidden_substrings": 28,
+      "security_pairs": 28,
+      "strict_zero_clean_cases": 28
     },
     "python": {
       "buggy_cases_with_required_substrings": 35,
@@ -247,6 +247,8 @@
           "java-random-security-clean",
           "java-ssrf-buggy",
           "java-ssrf-clean",
+          "js-typescript-archive-entry-suppression-buggy",
+          "js-typescript-archive-entry-suppression-clean",
           "js-typescript-archive-extraction-buggy",
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
@@ -529,6 +531,8 @@
           "golang-taint-clean",
           "golang-tls-verification-buggy",
           "golang-tls-verification-clean",
+          "js-typescript-archive-entry-suppression-buggy",
+          "js-typescript-archive-entry-suppression-clean",
           "js-typescript-archive-extraction-buggy",
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
@@ -679,8 +683,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 348,
-      "transformed_scan_count": 530
+      "case_count": 350,
+      "transformed_scan_count": 534
     },
     "campaign": {
       "by_transform": {
@@ -719,6 +723,8 @@
           "golang-taint-clean",
           "golang-tls-verification-buggy",
           "golang-tls-verification-clean",
+          "js-typescript-archive-entry-suppression-buggy",
+          "js-typescript-archive-entry-suppression-clean",
           "js-typescript-archive-extraction-buggy",
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
@@ -903,6 +909,8 @@
           "golang-taint-clean",
           "golang-tls-verification-buggy",
           "golang-tls-verification-clean",
+          "js-typescript-archive-entry-suppression-buggy",
+          "js-typescript-archive-entry-suppression-clean",
           "js-typescript-archive-extraction-buggy",
           "js-typescript-archive-extraction-clean",
           "js-typescript-constant-time-compare-buggy",
@@ -1053,8 +1061,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 182,
-      "transformed_scan_count": 364
+      "case_count": 184,
+      "transformed_scan_count": 368
     },
     "smoke": {
       "by_transform": {
@@ -1837,6 +1845,20 @@
       "clean_path": "test-suite/java/security/SsrfClean.java",
       "language": "java",
       "slug": "ssrf"
+    },
+    {
+      "buggy_case": "js-typescript-archive-entry-suppression-buggy",
+      "buggy_min_critical": 0,
+      "buggy_min_warning": 1,
+      "buggy_path": "test-suite/js/security/archive-entry-suppression-buggy.ts",
+      "buggy_require_count": 1,
+      "clean_case": "js-typescript-archive-entry-suppression-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/js/security/archive-entry-suppression-clean.ts",
+      "language": "js",
+      "slug": "archive-entry-suppression"
     },
     {
       "buggy_case": "js-typescript-archive-extraction-buggy",
@@ -3181,6 +3203,7 @@
         "java-request-path-traversal-clean",
         "java-random-security-clean",
         "java-ssrf-clean",
+        "js-typescript-archive-entry-suppression-clean",
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-clean",
         "js-typescript-constant-time-compare-public-nonce-clean",
@@ -3408,6 +3431,8 @@
         "java-random-security-clean",
         "java-ssrf-buggy",
         "java-ssrf-clean",
+        "js-typescript-archive-entry-suppression-buggy",
+        "js-typescript-archive-entry-suppression-clean",
         "js-typescript-archive-extraction-buggy",
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-buggy",
@@ -3675,6 +3700,7 @@
         "golang-ssrf-clean",
         "golang-taint-clean",
         "golang-tls-verification-clean",
+        "js-typescript-archive-entry-suppression-clean",
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-clean",
         "js-typescript-constant-time-compare-public-nonce-clean",
@@ -3785,6 +3811,8 @@
         "golang-taint-clean",
         "golang-tls-verification-buggy",
         "golang-tls-verification-clean",
+        "js-typescript-archive-entry-suppression-buggy",
+        "js-typescript-archive-entry-suppression-clean",
         "js-typescript-archive-extraction-buggy",
         "js-typescript-archive-extraction-clean",
         "js-typescript-constant-time-compare-buggy",
@@ -4099,6 +4127,8 @@
       "java-random-security-clean",
       "java-ssrf-buggy",
       "java-ssrf-clean",
+      "js-typescript-archive-entry-suppression-buggy",
+      "js-typescript-archive-entry-suppression-clean",
       "js-typescript-archive-extraction-buggy",
       "js-typescript-archive-extraction-clean",
       "js-typescript-constant-time-compare-buggy",
@@ -4319,6 +4349,8 @@
       "golang-taint-clean",
       "golang-tls-verification-buggy",
       "golang-tls-verification-clean",
+      "js-typescript-archive-entry-suppression-buggy",
+      "js-typescript-archive-entry-suppression-clean",
       "js-typescript-archive-extraction-buggy",
       "js-typescript-archive-extraction-clean",
       "js-typescript-constant-time-compare-buggy",

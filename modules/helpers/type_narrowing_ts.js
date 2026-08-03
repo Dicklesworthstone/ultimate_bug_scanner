@@ -151,6 +151,10 @@ async function analyzeFileWithTs(filePath) {
 
   function blockHasExit(node) {
     if (ts.isReturnStatement(node) || ts.isThrowStatement(node)) return true;
+    // `continue`/`break` end the current iteration or the enclosing
+    // loop/switch, so the statements that follow in this block are only
+    // reached when the guard did not fire (GH #76).
+    if (ts.isContinueStatement(node) || ts.isBreakStatement(node)) return true;
     if (ts.isExpressionStatement(node) && isKnownNoReturnCall(node.expression)) return true;
     if (ts.isCallExpression(node) && isKnownNoReturnCall(node)) return true;
     if (ts.isBlock(node)) return node.statements.some(blockHasExit);
@@ -274,7 +278,7 @@ async function analyzeFileFallback(filePath) {
     const name = guard[1];
     let exits = false;
     for (let j = i + 1; j < Math.min(lines.length, i + 6); j++) {
-      if (/return\b|throw\b/.test(lines[j]) || (nextNavigationImport && noReturnCall.test(lines[j]))) {
+      if (/return\b|throw\b|continue\b|break\b/.test(lines[j]) || (nextNavigationImport && noReturnCall.test(lines[j]))) {
         exits = true;
         break;
       }

@@ -79,6 +79,66 @@ def check_no_supported_languages(tmpdir: Path) -> None:
     assert "NOT a pass" in res.stdout, res.stdout
 
 
+def check_version_identity(tmpdir: Path) -> None:
+    """Issue #79 regression guard: the optional git suffix on --version used to
+    come from a bare `git rev-parse --short HEAD`, so it reported whatever
+    repository the caller was standing in. UBS then attributed an unrelated
+    project's commit to itself, and the identity changed with the working
+    directory. The suffix must describe the UBS installation only."""
+    env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0"}
+
+    foreign = tmpdir / "foreign_repo"
+    foreign.mkdir(parents=True)
+    git_base = [
+        "git",
+        "-c",
+        "user.name=UBS Test",
+        "-c",
+        "user.email=ubs-test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-C",
+        str(foreign),
+    ]
+    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True)
+    (foreign / "README.md").write_text("unrelated project\n")
+    subprocess.run([*git_base, "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(
+        [*git_base, "commit", "--quiet", "-m", "unrelated commit"],
+        check=True,
+        capture_output=True,
+    )
+    foreign_sha = subprocess.run(
+        [*git_base, "rev-parse", "--short", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert foreign_sha, "could not create a foreign commit to test against"
+
+    plain = tmpdir / "not_a_repo"
+    plain.mkdir(parents=True)
+
+    outputs = {}
+    for label, cwd in (("ubs", REPO_ROOT), ("foreign", foreign), ("plain", plain)):
+        result = subprocess.run(
+            [str(UBS_BIN), "--version"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env},
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs[label] = result.stdout.strip()
+
+    assert outputs["ubs"].startswith("UBS Meta-Runner v"), outputs
+    assert foreign_sha not in outputs["foreign"], outputs
+    assert len(set(outputs.values())) == 1, (
+        f"--version must not depend on the working directory: {outputs}"
+    )
+
+
 def main() -> None:
     tmpdir = Path(tempfile.mkdtemp(prefix="ubs-meta-runner-"))
     try:
@@ -126,6 +186,9 @@ def main() -> None:
 
         # Issue #53: explicit unsupported-language result for Dart-only scans.
         check_no_supported_languages(tmpdir)
+
+        # Issue #79: --version identity must belong to UBS, not the caller's cwd.
+        check_version_identity(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

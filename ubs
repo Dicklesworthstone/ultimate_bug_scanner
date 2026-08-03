@@ -663,9 +663,23 @@ if [[ "$MODE" == "scan" && "$UPDATE_ONLY" -eq 0 ]]; then
 fi
 
 if [[ "$SHOW_VERSION" -eq 1 ]]; then
+  # Issue #79: the optional git suffix must describe the UBS installation, not
+  # whatever repository the caller happens to be standing in. Anchor git to this
+  # script's own directory and only trust the SHA when that working tree really
+  # is a UBS checkout, so an installed copy outside a repo stays stable.
   short_sha=""
-  if git rev-parse --short HEAD >/dev/null 2>&1; then
-    short_sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
+  self_path="${BASH_SOURCE[0]}"
+  if need_cmd realpath; then
+    self_path="$(realpath "$self_path" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  elif need_cmd readlink; then
+    self_path="$(readlink -f "$self_path" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+  fi
+  self_dir="$(cd -P "$(dirname "$self_path")" 2>/dev/null && pwd)" || self_dir=""
+  if [[ -n "$self_dir" ]] && need_cmd git; then
+    ubs_root="$(git -C "$self_dir" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [[ -n "$ubs_root" && -f "$ubs_root/modules/ubs-js.sh" && -f "$ubs_root/ubs" ]]; then
+      short_sha="$(git -C "$self_dir" rev-parse --short HEAD 2>/dev/null || true)"
+    fi
   fi
   say "UBS Meta-Runner v${UBS_VERSION}${short_sha:+ (git $short_sha)}"
   exit 0

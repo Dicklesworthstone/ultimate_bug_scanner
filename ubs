@@ -69,7 +69,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_kotlin.py']='6f0f4482e8c349d15ac2830956baf193eedd2461d1ef836267c78da86c78ad79'
   ['helpers/type_narrowing_rust.py']='355ad60ce6dffb9a7c63169cb83705854612c931e2e8c3a166a81b0cb810647f'
   ['helpers/type_narrowing_swift.py']='f950bafa92391964e4779c77d37dcc11b0ffeab9bc351be439b4709c0f01b41a'
-  ['helpers/type_narrowing_ts.js']='c26e30a0cc2690065bb50d1b17e5d696096dceaa6f3c87a5fcb883260ed3a32b'
+  ['helpers/type_narrowing_ts.js']='53cce8b066aa9a26c212d5c32d51b25a96e00baaf11cbecc4606077ca82eed24'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

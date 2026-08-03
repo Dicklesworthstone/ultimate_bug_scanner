@@ -48,7 +48,7 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='a231939f444a0f8dc8db97122d08898f589d8cd0dbca4e44197bb16f01b6cae9'
   [golang]='a2507466d961932e821465de17ca10571f8be010909fb29db1d032e25a604f77'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
-  [js]='d410c8e412907be541fd748ea16234dcdaa1b7d70d8a0215beadc75c81a0587d'
+  [js]='157a6023872dce2084b282366267101f385de6358a4706ac9675da30153082c7'
   [python]='5c14ebdeb0aeb3e79df8e993b83a47460fccb4a7324d896cc5d2523d09dbeb97'
   [ruby]='0973251abcd905bb6892ede0448657f460aca67f821ccc97e60645be2a1c5447'
   [rust]='5e0ffdacd0797600b7cbba16f6093ccf3aab3e8040a0b2f008728199684b40d5'
@@ -69,7 +69,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_kotlin.py']='6f0f4482e8c349d15ac2830956baf193eedd2461d1ef836267c78da86c78ad79'
   ['helpers/type_narrowing_rust.py']='355ad60ce6dffb9a7c63169cb83705854612c931e2e8c3a166a81b0cb810647f'
   ['helpers/type_narrowing_swift.py']='f950bafa92391964e4779c77d37dcc11b0ffeab9bc351be439b4709c0f01b41a'
-  ['helpers/type_narrowing_ts.js']='53cce8b066aa9a26c212d5c32d51b25a96e00baaf11cbecc4606077ca82eed24'
+  ['helpers/type_narrowing_ts.js']='a8509e1b4d6a02105f441486563aae6927e60ec14db1a8b25e50aa019b4a5305'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

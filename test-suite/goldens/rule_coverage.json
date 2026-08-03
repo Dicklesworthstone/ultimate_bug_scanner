@@ -21,9 +21,9 @@
     },
     "campaign": {
       "buggy_cases_with_required_substrings": 91,
-      "case_count": 181,
-      "clean_cases_with_forbidden_substrings": 90,
-      "strict_zero_clean_cases": 90,
+      "case_count": 182,
+      "clean_cases_with_forbidden_substrings": 91,
+      "strict_zero_clean_cases": 91,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,14 +38,14 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 173,
+      "case_count": 174,
       "default_iterations": 3,
-      "default_transformed_scan_count": 519
+      "default_transformed_scan_count": 522
     },
     "campaign": {
-      "case_count": 90,
+      "case_count": 91,
       "default_iterations": 3,
-      "default_transformed_scan_count": 270
+      "default_transformed_scan_count": 273
     },
     "smoke": {
       "case_count": 17,
@@ -64,9 +64,9 @@
     },
     "campaign": {
       "buggy_cases_with_required_substrings": 91,
-      "case_count": 181,
-      "clean_cases_with_forbidden_substrings": 90,
-      "strict_zero_clean_cases": 90,
+      "case_count": 182,
+      "clean_cases_with_forbidden_substrings": 91,
+      "strict_zero_clean_cases": 91,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -467,6 +467,7 @@
           "js-react-hooks-clean",
           "js-type-narrowing-buggy",
           "js-type-narrowing-clean",
+          "js-type-narrowing-exclusions-clean",
           "golang-async-errors-buggy",
           "golang-async-errors-clean",
           "js-resource-lifecycle",
@@ -650,6 +651,7 @@
           "js-react-hooks-clean",
           "js-type-narrowing-buggy",
           "js-type-narrowing-clean",
+          "js-type-narrowing-exclusions-clean",
           "golang-async-errors-buggy",
           "golang-async-errors-clean",
           "js-resource-lifecycle",
@@ -677,8 +679,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 347,
-      "transformed_scan_count": 528
+      "case_count": 348,
+      "transformed_scan_count": 530
     },
     "campaign": {
       "by_transform": {
@@ -839,6 +841,7 @@
           "js-react-hooks-clean",
           "js-type-narrowing-buggy",
           "js-type-narrowing-clean",
+          "js-type-narrowing-exclusions-clean",
           "golang-async-errors-buggy",
           "golang-async-errors-clean",
           "js-resource-lifecycle",
@@ -1022,6 +1025,7 @@
           "js-react-hooks-clean",
           "js-type-narrowing-buggy",
           "js-type-narrowing-clean",
+          "js-type-narrowing-exclusions-clean",
           "golang-async-errors-buggy",
           "golang-async-errors-clean",
           "js-resource-lifecycle",
@@ -1049,8 +1053,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 181,
-      "transformed_scan_count": 362
+      "case_count": 182,
+      "transformed_scan_count": 364
     },
     "smoke": {
       "by_transform": {
@@ -3287,6 +3291,7 @@
         "js-typescript-jsx-async-handler-clean",
         "js-react-hooks-clean",
         "js-type-narrowing-clean",
+        "js-type-narrowing-exclusions-clean",
         "golang-async-errors-clean",
         "js-resource-lifecycle-clean",
         "js-typescript-object-url-lifecycle-clean",
@@ -3623,6 +3628,7 @@
         "js-react-hooks-clean",
         "js-type-narrowing-buggy",
         "js-type-narrowing-clean",
+        "js-type-narrowing-exclusions-clean",
         "golang-async-errors-buggy",
         "golang-async-errors-clean",
         "js-resource-lifecycle",
@@ -3730,6 +3736,7 @@
         "js-typescript-jsx-async-handler-clean",
         "js-react-hooks-clean",
         "js-type-narrowing-clean",
+        "js-type-narrowing-exclusions-clean",
         "golang-async-errors-clean",
         "js-resource-lifecycle-clean",
         "js-typescript-object-url-lifecycle-clean",
@@ -3900,6 +3907,7 @@
         "js-react-hooks-clean",
         "js-type-narrowing-buggy",
         "js-type-narrowing-clean",
+        "js-type-narrowing-exclusions-clean",
         "golang-async-errors-buggy",
         "golang-async-errors-clean",
         "js-resource-lifecycle",
@@ -4433,6 +4441,7 @@
       "js-react-hooks-clean",
       "js-type-narrowing-buggy",
       "js-type-narrowing-clean",
+      "js-type-narrowing-exclusions-clean",
       "golang-async-errors-buggy",
       "golang-async-errors-clean",
       "js-resource-lifecycle",

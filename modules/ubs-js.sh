@@ -1263,8 +1263,19 @@ run_type_narrowing_checks() {
     print_finding "info" 0 "Node.js/Bun unavailable" "Install Node.js or Bun plus the 'typescript' package to enable type narrowing analysis"
     return
   fi
+  # Issue #75: the helper walks the tree itself, so it needs the same exclusion
+  # set the rest of the module uses (module defaults + --exclude, which is also
+  # how the meta-runner forwards .ubsignore). Without it, excluded test/e2e
+  # trees still produced type-narrowing warnings.
+  local -a helper_args=("$PROJECT_DIR")
+  local helper_excludes="" d
+  for d in "${EXCLUDE_DIRS[@]}"; do
+    [[ -z "$d" ]] && continue
+    if [[ -n "$helper_excludes" ]]; then helper_excludes+=",$d"; else helper_excludes="$d"; fi
+  done
+  [[ -n "$helper_excludes" ]] && helper_args+=("--exclude=$helper_excludes")
   local raw status
-  raw="$("$js_runner" "$helper" "$PROJECT_DIR" 2>&1)"
+  raw="$("$js_runner" "$helper" "${helper_args[@]}" 2>&1)"
   status=$?
   if [[ $status -ne 0 ]]; then
     print_finding "warning" 0 "Type narrowing analyzer failed" "$raw"

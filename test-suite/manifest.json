@@ -6357,6 +6357,38 @@
       }
     },
     {
+      "id": "js-type-narrowing-exclusions-clean",
+      "description": "Directories removed by --exclude must not reach the type-narrowing helper.",
+      "path": "test-suite/js/type_narrowing/excluded",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "type-narrowing",
+        "exclusions",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-js.sh",
+      "args": [
+        "--exclude=tests",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Potentially unsafe type narrowing"
+        ]
+      }
+    },
+    {
       "id": "golang-async-errors-buggy",
       "description": "Go goroutines ignoring error paths (fire-and-forget http.Get).",
       "path": "test-suite/golang/async_errors/buggy",

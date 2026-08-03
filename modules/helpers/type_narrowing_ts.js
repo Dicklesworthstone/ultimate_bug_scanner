@@ -8,9 +8,74 @@ try {
   ts = null;
 }
 
-const projectDir = path.resolve(process.argv[2] || process.cwd());
+// GH #75: the calling module owns the effective exclusion set (module defaults,
+// --exclude, and the .ubsignore patterns the meta-runner forwards as --exclude).
+// Accept it here as a comma-separated list so excluded trees cannot contribute
+// findings that the rest of the scan already filtered out.
+function parseArgs(argv) {
+  const excludes = [];
+  let target = null;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--exclude') {
+      if (i + 1 < argv.length) excludes.push(argv[++i]);
+      continue;
+    }
+    if (arg.startsWith('--exclude=')) {
+      excludes.push(arg.slice('--exclude='.length));
+      continue;
+    }
+    if (arg.startsWith('--')) continue;
+    if (target === null) target = arg;
+  }
+  return { target, excludes };
+}
+
+function globToRegExp(glob) {
+  let source = '';
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === '*') {
+      if (glob[i + 1] === '*') {
+        source += '.*';
+        i++;
+        if (glob[i + 1] === '/') i++;
+      } else {
+        source += '[^/]*';
+      }
+    } else if (ch === '?') {
+      source += '[^/]';
+    } else {
+      source += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+  }
+  return new RegExp(`^${source}$`);
+}
+
+const { target: cliTarget, excludes: cliExcludes } = parseArgs(process.argv.slice(2));
+const projectDir = path.resolve(cliTarget || process.cwd());
 const SKIP_DIRS = new Set(['.git', '.hg', '.svn', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.turbo', '.expo']);
+const SKIP_PATTERNS = [];
+for (const spec of cliExcludes) {
+  for (const rawEntry of spec.split(',')) {
+    const entry = rawEntry.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!entry) continue;
+    if (/[*?[\]]/.test(entry) || entry.includes('/')) {
+      SKIP_PATTERNS.push(globToRegExp(entry));
+    } else {
+      SKIP_DIRS.add(entry);
+    }
+  }
+}
 const EXTENSIONS = new Set(['.ts', '.tsx']);
+
+function isExcluded(fullPath, name) {
+  if (SKIP_DIRS.has(name)) return true;
+  if (SKIP_PATTERNS.length === 0) return false;
+  const rel = path.relative(projectDir, fullPath).split(path.sep).join('/');
+  if (!rel || rel.startsWith('..')) return false;
+  return SKIP_PATTERNS.some((re) => re.test(rel) || re.test(name));
+}
 
 async function collectFiles(target) {
   let stats;
@@ -40,8 +105,8 @@ async function collectFiles(target) {
   try {
     batches = await Promise.all(entries.map(async (entry) => {
       if (entry.isSymbolicLink()) return [];
-      if (SKIP_DIRS.has(entry.name)) return [];
       const fullPath = path.join(target, entry.name);
+      if (isExcluded(fullPath, entry.name)) return [];
       if (entry.isDirectory()) {
         if (entry.name.startsWith('.') && entry.name.length > 1) return [];
         return collectFiles(fullPath);

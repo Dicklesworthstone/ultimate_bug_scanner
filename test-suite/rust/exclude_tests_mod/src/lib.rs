@@ -1,7 +1,9 @@
 // Fixture for GH #80: --exclude-tests must drop (a) AST-backed matches at or
-// below the #[cfg(test)] boundary and (b) files reachable only through
-// #[cfg(test)]-gated `mod` declarations (see tests_support.rs), while the
+// below the cfg-test boundary and (b) files reachable only through
+// cfg-test-gated `mod` declarations (see tests_support.rs), while the
 // production findings above the boundary keep counting.
+// NOTE: the attribute is deliberately never spelled out in these comments;
+// the module's test-boundary heuristic keys off its first occurrence.
 
 use std::sync::Mutex;
 

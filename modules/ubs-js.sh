@@ -2787,6 +2787,131 @@ PY
   rm -f "$tmp_props" "$tmp_ifs"
   printf '%s' "$result"
 }
+
+# Classify division denominators so constant non-zero divisors (x / 2, x / 100,
+# x / Math.PI) and `x / (y || 1)` guards never count toward ÷0 risk (GH #73).
+analyze_division_denominators() {
+  local limit=${1:-$DETAIL_LIMIT}
+  if [[ "$HAS_AST_GREP" -ne 1 ]]; then return 1; fi
+  if ! command -v python3 >/dev/null 2>&1; then return 1; fi
+
+  local tmp_divs result
+  tmp_divs="$(mktemp -t ubs-divisions.XXXXXX 2>/dev/null || mktemp -t ubs-divisions)"
+  ( set +o pipefail; ast_grep_project --pattern '$L / $R' --json=stream 2>/dev/null || true ) >"$tmp_divs"
+
+  result=$(python3 - "$tmp_divs" "$limit" <<'PY'
+import json, re, sys
+
+matches_path, limit_raw = sys.argv[1:3]
+limit = int(limit_raw)
+
+NUMERIC_LITERAL_RE = re.compile(
+    r'^[+-]?(?:'
+    r'0[xX][0-9a-fA-F][0-9a-fA-F_]*'
+    r'|0[oO][0-7][0-7_]*'
+    r'|0[bB][01][01_]*'
+    r'|(?:\d[\d_]*)?\.\d[\d_]*(?:[eE][+-]?\d+)?'
+    r'|\d[\d_]*\.?(?:[eE][+-]?\d+)?'
+    r')n?$'
+)
+SAFE_CONSTANT_RE = re.compile(
+    r'^(?:Math\s*\.\s*(?:PI|E|LN2|LN10|LOG2E|LOG10E|SQRT2|SQRT1_2)'
+    r'|Number\s*\.\s*(?:MAX_SAFE_INTEGER|MIN_SAFE_INTEGER|MAX_VALUE|MIN_VALUE|EPSILON))$'
+)
+
+def literal_value(text):
+    t = text.replace('_', '')
+    if t.endswith(('n', 'N')):
+        t = t[:-1]
+    sign = 1
+    if t[:1] in '+-':
+        if t[0] == '-':
+            sign = -1
+        t = t[1:]
+    try:
+        if t[:2].lower() in ('0x', '0o', '0b'):
+            return sign * int(t, 0)
+        return sign * float(t)
+    except ValueError:
+        return None
+
+def strip_outer_parens(text):
+    t = text.strip()
+    while t.startswith('(') and t.endswith(')'):
+        inner = t[1:-1].strip()
+        depth = 0
+        balanced = True
+        for ch in inner:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth < 0:
+                    balanced = False
+                    break
+        if not balanced or depth != 0:
+            break
+        t = inner
+    return t
+
+def is_safe_denominator(text):
+    t = strip_outer_parens(text)
+    if NUMERIC_LITERAL_RE.match(t):
+        value = literal_value(t)
+        return value is not None and value != 0
+    if SAFE_CONSTANT_RE.match(t):
+        return True
+    # `divisor || <non-zero literal>` guards against 0 (0 is falsy). `??` does not.
+    fallback = re.match(r'^.+\|\|\s*([^|&]+)$', t)
+    if fallback:
+        candidate = strip_outer_parens(fallback.group(1))
+        if NUMERIC_LITERAL_RE.match(candidate):
+            value = literal_value(candidate)
+            return value is not None and value != 0
+        if SAFE_CONSTANT_RE.match(candidate):
+            return True
+    return False
+
+risky = 0
+safe = 0
+samples = []
+try:
+    with open(matches_path, 'r', encoding='utf-8') as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                match = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            denominator = (
+                (match.get('metaVariables') or {}).get('single', {}).get('R', {}).get('text')
+            )
+            if denominator is None:
+                continue
+            if is_safe_denominator(denominator):
+                safe += 1
+                continue
+            risky += 1
+            if len(samples) < limit:
+                rng = match.get('range') or {}
+                start = rng.get('start') or {}
+                samples.append({
+                    'file': match.get('file', '?'),
+                    'line': (start.get('line', 0) or 0) + 1,
+                    'code': (match.get('lines') or '').strip(),
+                })
+except FileNotFoundError:
+    pass
+
+print(json.dumps({'risky': risky, 'safe': safe, 'samples': samples}, ensure_ascii=False))
+PY
+  )
+
+  rm -f "$tmp_divs"
+  printf '%s' "$result"
+}
 show_ast_samples_from_json() {
   local blob=$1
   [[ -n "$blob" ]] || return 0
@@ -3641,25 +3766,44 @@ print_category "Detects: Division by zero, NaN propagation, floating-point equal
   "Mathematical bugs that produce silent errors or Infinity/NaN values"
 
 print_subheader "Division operations (potential ÷0)"
-if [ "$HAS_AST_GREP" -eq 1 ]; then
-  count=$(ast_search '$L / $R' || echo 0)
-else
-  count=$(
+# GH #73: only divisions whose denominator could plausibly be zero count toward
+# the finding. Constant non-zero divisors (x / 2, x / 100, x / Math.PI) and
+# `x / (y || 1)` guards are classified as safe and never escalate the finding.
+div_denominator_json=""
+risky_div_count=""
+safe_div_count=0
+if [[ "$HAS_AST_GREP" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+  div_denominator_json=$(analyze_division_denominators "$DETAIL_LIMIT" || true)
+  if [[ -n "$div_denominator_json" ]] && command -v jq >/dev/null 2>&1; then
+    risky_div_count=$(printf '%s' "$div_denominator_json" | jq -r '.risky // empty' 2>/dev/null || true)
+    safe_div_count=$(printf '%s' "$div_denominator_json" | jq -r '.safe // 0' 2>/dev/null || echo 0)
+  fi
+fi
+if [[ -z "${risky_div_count:-}" ]]; then
+  div_denominator_json=""
+  risky_div_count=$(
     ( "${GREP_RN[@]}" -e "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) \
       | grep -vE '^\s*//' \
       | grep -vE "[\"']" \
-      | grep -Ev "/[[:space:]]*(255|2|10|100|1000)\b" \
+      | grep -Ev "/[[:space:]]*Math\.(PI|E|LN2|LN10|LOG2E|LOG10E|SQRT2|SQRT1_2)\b" \
+      | grep -Ev "\|\|[[:space:]]*[0-9]" \
       | count_lines)
+  safe_div_count=0
 fi
-if [ "$count" -gt 25 ]; then
-  print_finding "warning" "$count" "Division by variable - verify non-zero" "Add guards: if (divisor === 0) throw; or use fallback"
-  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-    show_ast_detailed_patterns 5 '$L / $R'
+if [ "$risky_div_count" -gt 25 ]; then
+  print_finding "warning" "$risky_div_count" "Division by variable - verify non-zero" "Add guards: if (divisor === 0) throw; or use fallback"
+  if [[ -n "$div_denominator_json" ]]; then
+    show_ast_samples_from_json "$div_denominator_json"
   else
     show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
   fi
-elif [ "$count" -gt 0 ]; then
-  print_finding "info" "$count" "Division operations found"
+elif [ "$risky_div_count" -gt 0 ]; then
+  print_finding "info" "$risky_div_count" "Division operations found"
+elif [ "$safe_div_count" -gt 0 ]; then
+  print_finding "good" "Divisions use constant non-zero denominators"
+fi
+if [[ -n "$div_denominator_json" ]]; then
+  persist_metric_json "division_denominators" "$div_denominator_json"
 fi
 
 print_subheader "Incorrect NaN checks (== NaN instead of Number.isNaN)"
@@ -7510,7 +7654,37 @@ root = Path(sys.argv[1]).resolve()
 exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
 
-archive_receiver_re = re.compile(r'(?:entry|file|member|header|archive|zip|tar)', re.IGNORECASE)
+# GH #77: archive provenance must come from archive libraries/objects, not from
+# variable-name substrings. A plain `for (const entry of readdirSync(...))` is
+# not an archive entry even though the binding is called "entry".
+archive_lib_re = re.compile(
+    r'[\'"](?:adm-zip|yauzl|yazl|unzipper|unzip-stream|jszip|node-stream-zip|'
+    r'zip-lib|extract-zip|decompress|decompress-(?:zip|tar|targz|tarbz2)|'
+    r'tar|node-tar|tar-stream|tar-fs|archiver|compressing)[\'"]'
+)
+archive_api_re = re.compile(
+    r'(?:new\s+(?:AdmZip|StreamZip|JSZip|ZipFile|ZipArchive)\b|'
+    r'\byauzl\s*\.\s*(?:open|fromBuffer|fromFd)\b|'
+    r'\bunzipper\s*\.\s*(?:Open|Parse|Extract)\b|'
+    r'\btar\s*\.\s*(?:extract|list|x|t)\b|'
+    r'\bJSZip\s*\.\s*loadAsync\b|'
+    r'\.\s*getEntries\s*\(|\.\s*openReadStream\s*\()'
+)
+# TypeScript annotations whose type name signals an archive entry/header object
+# (ZipEntry, TarHeader, yauzl.Entry, ...). Dirent and other fs types must not match.
+archive_type_re = re.compile(r'(?:zip|tar|unzip|archive|yauzl|entry|header)', re.IGNORECASE)
+type_annotation_re = re.compile(
+    r'\b(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*'
+    r'(?P<type>[A-Za-z_$][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_$][A-Za-z0-9_$]*)*)'
+)
+archive_entry_event_re = re.compile(
+    r'\.\s*on\s*\(\s*[\'"]entry[\'"]\s*,\s*(?:async\s*)?'
+    r'(?:\(\s*(?P<parens>[A-Za-z_$][A-Za-z0-9_$]*)|(?P<bare>[A-Za-z_$][A-Za-z0-9_$]*)\s*=>|'
+    r'function\s*\(\s*(?P<func>[A-Za-z_$][A-Za-z0-9_$]*))'
+)
+for_of_re = re.compile(
+    r'\bfor\s*(?:await\s*)?\(\s*(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+of\s+(.+)'
+)
 source_property_re = re.compile(
     r'\b(?P<receiver>[A-Za-z_$][A-Za-z0-9_$]*)\s*\.\s*'
     r'(?P<prop>entryName|fileName|path|name)\b'
@@ -7575,11 +7749,14 @@ def context_from(lines, idx):
         if clean.strip()
     )
 
-def has_archive_source(text, archive_vars):
+def has_archive_source(text, archive_receivers, archive_path_vars):
     for match in source_property_re.finditer(text):
-        if archive_receiver_re.search(match.group('receiver')):
+        if match.group('receiver') in archive_receivers:
             return True
-    for name in archive_vars:
+        if match.group('prop') == 'entryName':
+            # entryName is an adm-zip archive-entry property; there is no fs analogue.
+            return True
+    for name in archive_path_vars:
         if re.search(rf'\b{re.escape(name)}\b', text):
             return True
     return False
@@ -7604,19 +7781,65 @@ for path in candidates:
     except Exception:
         continue
 
-    archive_vars = {}
+    # Pass 1 (GH #77): collect archive provenance. archive_receivers holds
+    # bindings that ARE archive objects/entries (typed params, archive-library
+    # results, 'entry' event handler params). archive_path_vars holds bindings
+    # DERIVED from an archive entry's path-ish properties.
+    archive_receivers = set()
+    archive_path_vars = {}
+    statements = []
     for idx, line in enumerate(lines):
         statement, raw_statement = statement_from(lines, idx)
-        if not statement or 'ubs:ignore' in raw_statement:
+        statements.append((idx, statement, raw_statement))
+        if not statement:
             continue
-        assignment = assignment_re.search(statement)
-        if not assignment:
-            continue
-        expr = assignment.group(2)
-        for match in source_property_re.finditer(expr):
-            if archive_receiver_re.search(match.group('receiver')):
-                archive_vars[assignment.group(1)] = idx
-                break
+        for annotation in type_annotation_re.finditer(statement):
+            if archive_type_re.search(annotation.group('type')):
+                archive_receivers.add(annotation.group('name'))
+        event = archive_entry_event_re.search(statement)
+        if event:
+            param = event.group('parens') or event.group('bare') or event.group('func')
+            if param:
+                archive_receivers.add(param)
+
+    # Fixpoint over assignments/for-of so chains like
+    # zip = new AdmZip(...) -> entry of zip.getEntries() -> name = entry.path
+    # resolve regardless of declaration order.
+    for _ in range(3):
+        changed = False
+        for idx, statement, raw_statement in statements:
+            if not statement or 'ubs:ignore' in raw_statement:
+                continue
+            loop = for_of_re.search(statement)
+            if loop:
+                loop_var, iterable = loop.group(1), loop.group(2)
+                if loop_var not in archive_receivers and (
+                    archive_api_re.search(iterable)
+                    or any(re.search(rf'\b{re.escape(name)}\b', iterable) for name in archive_receivers)
+                ):
+                    archive_receivers.add(loop_var)
+                    changed = True
+            assignment = assignment_re.search(statement)
+            if not assignment:
+                continue
+            target, expr = assignment.group(1), assignment.group(2)
+            if target not in archive_receivers and (
+                archive_api_re.search(expr)
+                or archive_lib_re.search(expr)
+                or any(re.search(rf'\b{re.escape(name)}\b', expr) for name in sorted(archive_receivers))
+            ):
+                if any(
+                    match.group('receiver') in archive_receivers or match.group('prop') == 'entryName'
+                    for match in source_property_re.finditer(expr)
+                ):
+                    if target not in archive_path_vars:
+                        archive_path_vars[target] = idx
+                        changed = True
+                else:
+                    archive_receivers.add(target)
+                    changed = True
+        if not changed:
+            break
 
     seen_lines = set()
     for idx, line in enumerate(lines):
@@ -7630,7 +7853,7 @@ for path in candidates:
         statement, raw_statement = statement_from(lines, idx)
         if not statement or 'ubs:ignore' in raw_statement:
             continue
-        if not has_archive_source(statement, archive_vars):
+        if not has_archive_source(statement, archive_receivers, archive_path_vars):
             continue
         if safe_re.search(context_from(lines, idx)):
             continue
@@ -9020,11 +9243,212 @@ if [ "$count" -gt 40 ]; then
 fi
 
 print_subheader "Function declarations inside blocks"
-count=$("${GREP_RN[@]}" -e "if|for|while" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A2 "function " || true) | (grep -w "function" || true) | count_lines)
-count=${count:-0}
-if [ "$count" -gt 5 ]; then
-  print_finding "warning" "$count" "Function declarations in blocks - use function expressions" "Hoisting is inconsistent"
+# GH #72: the old grep pipeline matched "if|for|while" as substrings, so
+# module-scope helpers named formatValue/classifyValue/verifyRun were flagged
+# and -A2 correlated unrelated adjacent lines. This tracks braces per file and
+# reports only function declarations whose enclosing block is a conditional/loop.
+block_function_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
+
+DECL_RE = re.compile(
+    r'^(?:export\s+)?(?:default\s+)?(?:async\s+)?function(?:\s*\*)?\s+[A-Za-z_$][\w$]*\s*\('
+)
+COND_HEAD_RE = re.compile(r'(?:^|[^\w$])(?:if|for|while|switch)\s*\(')
+REGEX_PREFIX_CHARS = set('(,=:[!&|?{};+-*%~^<>')
+
+def strip_code(text):
+    """Blank out comments and string/template literal contents, preserving
+    line structure so line numbers stay aligned with the source."""
+    out = []
+    i = 0
+    n = len(text)
+    state = 'code'
+    prev_code = ''
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ''
+        if state == 'code':
+            if ch == '/' and nxt == '/':
+                state = 'line_comment'
+                out.append('  ')
+                i += 2
+                continue
+            if ch == '/' and nxt == '*':
+                state = 'block_comment'
+                out.append('  ')
+                i += 2
+                continue
+            if ch == '/' and (prev_code == '' or prev_code in REGEX_PREFIX_CHARS):
+                state = 'regex'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == "'":
+                state = 'single'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == '"':
+                state = 'double'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == '`':
+                state = 'template'
+                out.append(' ')
+                i += 1
+                continue
+            out.append(ch)
+            if not ch.isspace():
+                prev_code = ch
+            i += 1
+            continue
+        if state == 'line_comment':
+            if ch == '\n':
+                state = 'code'
+                out.append('\n')
+            else:
+                out.append(' ')
+            i += 1
+            continue
+        if state == 'block_comment':
+            if ch == '*' and nxt == '/':
+                state = 'code'
+                out.append('  ')
+                i += 2
+            else:
+                out.append('\n' if ch == '\n' else ' ')
+                i += 1
+            continue
+        closer = {'single': "'", 'double': '"', 'template': '`', 'regex': '/'}[state]
+        if ch == '\\':
+            out.append(' ')
+            if nxt:
+                out.append('\n' if nxt == '\n' else ' ')
+            i += 2
+            continue
+        if ch == closer:
+            state = 'code'
+            out.append(' ')
+            i += 1
+            continue
+        if ch == '\n':
+            if state in ('single', 'double', 'regex'):
+                state = 'code'
+            out.append('\n')
+            i += 1
+            continue
+        out.append(' ')
+        i += 1
+    return ''.join(out)
+
+def classify(head):
+    """Classify the block opened after `head`. Returns (kind, is_declaration)."""
+    h = head.strip()
+    if DECL_RE.match(h):
+        return 'func', True
+    if re.search(r'\bfunction\b', h) or re.search(r'=>\s*$', h):
+        return 'func', False
+    if re.search(r'\bclass\b', h):
+        return 'func', False
+    if COND_HEAD_RE.search(h) and h.endswith(')'):
+        return 'cond', False
+    if re.search(r'(?:^|[^\w$])(?:else|do)\s*$', h):
+        return 'cond', False
+    return 'other', False
+
+issues = []
+if root.is_file():
+    candidates = [root]
+    sample_root = root.parent
+else:
+    candidates = []
+    sample_root = root
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            candidates.append(Path(dirpath) / fname)
+
+for path in candidates:
+    if path.suffix.lower() not in exts:
+        continue
+    try:
+        raw_text = path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        continue
+    text = strip_code(raw_text)
+    raw_lines = raw_text.splitlines()
+
+    stack = []
+    head = []
+    head_start_line = None
+    paren_depth = 0
+    line_no = 1
+    for ch in text:
+        if ch == '\n':
+            line_no += 1
+            head.append(' ')
+            continue
+        if ch == '(':
+            paren_depth += 1
+            head.append(ch)
+            continue
+        if ch == ')':
+            paren_depth = max(0, paren_depth - 1)
+            head.append(ch)
+            continue
+        if ch == ';' and paren_depth == 0:
+            head = []
+            head_start_line = None
+            continue
+        if ch == '{':
+            kind, is_declaration = classify(''.join(head))
+            if is_declaration and stack and stack[-1] == 'cond':
+                decl_line = head_start_line or line_no
+                raw_line = raw_lines[decl_line - 1].strip() if decl_line <= len(raw_lines) else ''
+                if 'ubs:ignore' not in raw_line:
+                    try:
+                        rel = path.relative_to(sample_root)
+                    except ValueError:
+                        rel = path
+                    issues.append((str(rel), decl_line, raw_line.replace('\t', ' ')))
+            stack.append(kind)
+            head = []
+            head_start_line = None
+            continue
+        if ch == '}':
+            if stack:
+                stack.pop()
+            head = []
+            head_start_line = None
+            continue
+        if head_start_line is None and not ch.isspace():
+            head_start_line = line_no
+        head.append(ch)
+
+print(len(issues))
+for entry in issues[:25]:
+    print('\t'.join(str(part) for part in entry))
+PY
+)
+block_function_count=$(printf '%s\n' "$block_function_report" | head -n1 | awk 'END{print $0+0}')
+block_function_samples=$(printf '%s\n' "$block_function_report" | tail -n +2)
+if [ "$block_function_count" -gt 0 ]; then
+  print_finding "warning" "$block_function_count" "Function declarations in blocks - use function expressions" "Hoisting is inconsistent"
+  sample_limit=3
+  while IFS=$'\t' read -r sample_path sample_line sample_text; do
+    [ -z "$sample_path" ] && continue
+    print_code_sample "$sample_path" "$sample_line" "$sample_text"
+    sample_limit=$((sample_limit - 1))
+    [ "$sample_limit" -le 0 ] && break
+  done <<<"$block_function_samples"
 fi
 
 print_subheader "Missing return in functions"
@@ -9157,11 +9581,264 @@ print_category "Detects: Missing breaks, unreachable code, confusing conditions"
 
 print_subheader "Switch cases without break/return"
 switch_count=$("${GREP_RN[@]}" -e "switch\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-case_count=$("${GREP_RN[@]}" -e "case[[:space:]]+.*:" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-break_count=$("${GREP_RN[@]}" -e "break;" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-if [ "$case_count" -gt "$break_count" ]; then
-  diff=$((case_count - break_count))
-  print_finding "warning" "$diff" "Switch cases may be missing break" "Add break or /* falls through */"
+# GH #74: analyze each switch clause individually instead of comparing global
+# `case:` and `break;` counts. Only a non-empty clause that can reach the next
+# clause without break/return/throw/continue (and without an intentional
+# fall-through comment) is reported; breaks in unrelated loops no longer skew it.
+switch_fallthrough_report=$(python3 - "$PROJECT_DIR" <<'PY' 2>/dev/null
+import os
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
+skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
+
+FALLTHROUGH_RE = re.compile(r'falls?[\s_-]*through', re.IGNORECASE)
+TERMINATOR_RE = re.compile(
+    r'(?:^|[\s;{}])(?:break|continue)\b\s*(?:[A-Za-z_$][\w$]*)?\s*;?\s*\}*\s*;?\s*$'
+    r'|(?:^|[\s;{}])(?:return|throw)\b[^;]*;?\s*\}*\s*;?\s*$'
+    r'|\bprocess\s*\.\s*exit\s*\('
+)
+REGEX_PREFIX_CHARS = set('(,=:[!&|?{};+-*%~^<>')
+
+def strip_code(text):
+    """Blank out comments and string/template literal contents, preserving
+    line structure so offsets and line numbers stay aligned with the source."""
+    out = []
+    i = 0
+    n = len(text)
+    state = 'code'
+    prev_code = ''
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ''
+        if state == 'code':
+            if ch == '/' and nxt == '/':
+                state = 'line_comment'
+                out.append('  ')
+                i += 2
+                continue
+            if ch == '/' and nxt == '*':
+                state = 'block_comment'
+                out.append('  ')
+                i += 2
+                continue
+            if ch == '/' and (prev_code == '' or prev_code in REGEX_PREFIX_CHARS):
+                state = 'regex'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == "'":
+                state = 'single'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == '"':
+                state = 'double'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == '`':
+                state = 'template'
+                out.append(' ')
+                i += 1
+                continue
+            out.append(ch)
+            if not ch.isspace():
+                prev_code = ch
+            i += 1
+            continue
+        if state == 'line_comment':
+            if ch == '\n':
+                state = 'code'
+                out.append('\n')
+            else:
+                out.append(' ')
+            i += 1
+            continue
+        if state == 'block_comment':
+            if ch == '*' and nxt == '/':
+                state = 'code'
+                out.append('  ')
+                i += 2
+            else:
+                out.append('\n' if ch == '\n' else ' ')
+                i += 1
+            continue
+        if state in ('single', 'double', 'template', 'regex'):
+            closer = {'single': "'", 'double': '"', 'template': '`', 'regex': '/'}[state]
+            if ch == '\\':
+                out.append(' ')
+                if nxt:
+                    out.append('\n' if nxt == '\n' else ' ')
+                i += 2
+                continue
+            if ch == closer:
+                state = 'code'
+                out.append(' ')
+                i += 1
+                continue
+            if ch == '\n':
+                if state in ('single', 'double', 'regex'):
+                    state = 'code'
+                out.append('\n')
+                i += 1
+                continue
+            out.append(' ')
+            i += 1
+            continue
+    return ''.join(out)
+
+def find_matching(text, start, open_ch, close_ch):
+    depth = 0
+    for pos in range(start, len(text)):
+        if text[pos] == open_ch:
+            depth += 1
+        elif text[pos] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return pos
+    return -1
+
+def label_colon(text, start, end):
+    """Find the colon terminating a case label expression starting at `start`."""
+    paren = bracket = brace = ternary = 0
+    for pos in range(start, end):
+        ch = text[pos]
+        if ch == '(':
+            paren += 1
+        elif ch == ')':
+            paren -= 1
+        elif ch == '[':
+            bracket += 1
+        elif ch == ']':
+            bracket -= 1
+        elif ch == '{':
+            brace += 1
+        elif ch == '}':
+            brace -= 1
+        elif ch == '?':
+            if pos + 1 < end and text[pos + 1] in '.?':
+                continue
+            ternary += 1
+        elif ch == ':' and paren == 0 and bracket == 0 and brace == 0:
+            if ternary > 0:
+                ternary -= 1
+            else:
+                return pos
+    return -1
+
+def clause_terminated(content):
+    lines = [l for l in content.splitlines()]
+    for raw in reversed(lines):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r'[\s;{}()\[\]]*', stripped):
+            continue
+        return bool(TERMINATOR_RE.search(stripped))
+    return None  # empty clause (grouped labels)
+
+issues = []
+if root.is_file():
+    candidates = [root]
+    sample_root = root.parent
+else:
+    candidates = []
+    sample_root = root
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            candidates.append(Path(dirpath) / fname)
+
+for path in candidates:
+    if path.suffix.lower() not in exts:
+        continue
+    try:
+        raw_text = path.read_text(encoding='utf-8', errors='ignore')
+    except Exception:
+        continue
+    text = strip_code(raw_text)
+    raw_lines = raw_text.splitlines()
+
+    for switch_match in re.finditer(r'\bswitch\s*\(', text):
+        paren_open = switch_match.end() - 1
+        paren_close = find_matching(text, paren_open, '(', ')')
+        if paren_close < 0:
+            continue
+        body_open = text.find('{', paren_close)
+        if body_open < 0 or text[paren_close + 1:body_open].strip():
+            continue
+        body_close = find_matching(text, body_open, '{', '}')
+        if body_close < 0:
+            continue
+
+        # Locate clause labels at depth 1 of the switch body.
+        labels = []
+        depth = 1
+        pos = body_open + 1
+        while pos < body_close:
+            ch = text[pos]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+            elif depth == 1 and text.startswith('case', pos) and \
+                    not (pos > 0 and (text[pos - 1].isalnum() or text[pos - 1] in '_$')) and \
+                    not (text[pos + 4].isalnum() or text[pos + 4] in '_$'):
+                colon = label_colon(text, pos + 4, body_close)
+                if colon > 0:
+                    labels.append((pos, colon))
+                    pos = colon + 1
+                    continue
+            elif depth == 1 and text.startswith('default', pos) and \
+                    not (pos > 0 and (text[pos - 1].isalnum() or text[pos - 1] in '_$')) and \
+                    not (text[pos + 7].isalnum() or text[pos + 7] in '_$'):
+                colon = text.find(':', pos + 7, body_close)
+                if colon > 0 and not text[pos + 7:colon].strip():
+                    labels.append((pos, colon))
+                    pos = colon + 1
+                    continue
+            pos += 1
+
+        for index, (label_pos, colon_pos) in enumerate(labels):
+            content_end = labels[index + 1][0] if index + 1 < len(labels) else body_close
+            if index + 1 >= len(labels):
+                continue  # final clause falls out of the switch, not into a case
+            content = text[colon_pos + 1:content_end]
+            terminated = clause_terminated(content)
+            if terminated is None or terminated:
+                continue
+            label_line = text.count('\n', 0, label_pos) + 1
+            next_label_line = text.count('\n', 0, content_end) + 1
+            raw_span = '\n'.join(raw_lines[label_line - 1:next_label_line])
+            if FALLTHROUGH_RE.search(raw_span) or 'ubs:ignore' in raw_span:
+                continue
+            try:
+                rel = path.relative_to(sample_root)
+            except ValueError:
+                rel = path
+            snippet = raw_lines[label_line - 1].strip() if label_line <= len(raw_lines) else ''
+            issues.append((str(rel), label_line, snippet.replace('\t', ' ')))
+
+print(len(issues))
+for entry in issues[:25]:
+    print('\t'.join(str(part) for part in entry))
+PY
+)
+switch_fallthrough_count=$(printf '%s\n' "$switch_fallthrough_report" | head -n1 | awk 'END{print $0+0}')
+switch_fallthrough_samples=$(printf '%s\n' "$switch_fallthrough_report" | tail -n +2)
+if [ "$switch_fallthrough_count" -gt 0 ]; then
+  print_finding "warning" "$switch_fallthrough_count" "Switch cases may be missing break" "Add break or /* falls through */"
+  sample_limit=3
+  while IFS=$'\t' read -r sample_path sample_line sample_text; do
+    [ -z "$sample_path" ] && continue
+    print_code_sample "$sample_path" "$sample_line" "$sample_text"
+    sample_limit=$((sample_limit - 1))
+    [ "$sample_limit" -le 0 ] && break
+  done <<<"$switch_fallthrough_samples"
 fi
 
 print_subheader "Switch without default case"

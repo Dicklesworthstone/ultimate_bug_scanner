@@ -59,6 +59,19 @@ def line_col(text: str, pos: int) -> tuple[int, int]:
 
 def iter_rust_files(root: Path) -> Iterable[Path]:
     base = root.resolve()
+    listing = os.environ.get("UBS_RUST_FILE_LIST", "")
+    if listing and os.path.isfile(listing):
+        # GH #70: consume the calling module's authoritative filtered file
+        # list (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(listing, encoding="utf-8") as fh:
+            for line in fh:
+                entry = line.rstrip("\n")
+                if entry.endswith(".rs"):
+                    path = Path(entry)
+                    if is_safe_path(path, base):
+                        yield path
+        return
     if root.is_file():
         if root.suffix == ".rs" and not any(part in SKIP_DIRS for part in root.parts):
             yield root

@@ -268,6 +268,16 @@ json_escape() {
   s="${s//$'	'/\\t}"
   s="${s//$''/\\r}"
   s="${s//$'\n'/\\n}"
+  # JSON requires ALL control characters U+0000-001F to be escaped, not just
+  # \t/\r/\n (GH #71: raw ESC/FF/etc. in source samples broke the artifact).
+  if [[ "$s" == *[$'\x01'-$'\x1f']* ]]; then
+    local _cc _ch _esc
+    for _cc in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+      printf -v _ch "\\$(printf '%03o' "$_cc")"
+      printf -v _esc '\\u%04x' "$_cc"
+      s="${s//"$_ch"/$_esc}"
+    done
+  fi
   printf '%s' "$s"
 }
 emit_findings_json() {
@@ -514,7 +524,11 @@ if command -v rg >/dev/null 2>&1; then
   RG_BASE=("--no-config" "--no-messages" "--line-number" "--with-filename" "--hidden" "${RG_JOBS[@]}")
   if [[ "$STRICT_GITIGNORE" -eq 0 ]]; then RG_BASE+=( "--no-ignore" "--no-ignore-vcs" "--no-ignore-parent" ); fi
   RG_EXCLUDES=()
-  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( "-g!$d/**" ); done
+  # GH #70: `-g!dir/**` is anchored to the search root, and ripgrep does not
+  # match it when PROJECT_DIR is an absolute path outside the cwd — excluded
+  # dirs silently leaked back in. `**/dir/**` matches at any depth and any
+  # root spelling, mirroring the find/grep fallback's -prune semantics.
+  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( "-g!**/$d/**" ); done
   RG_INCLUDES=()
   for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( "-g*.$(echo "$e" | xargs)" ); done
   GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
@@ -611,6 +625,111 @@ else
   GREP_RNW=(ubs_grep -n -w -E)
 fi
 
+# ---------------------------------------------------------------------------
+# Authoritative scan file list (GH #70 / GH #80)
+# ---------------------------------------------------------------------------
+# Every consumer (embedded Python helpers, helper scripts, ast-grep result
+# filtering) must honor --exclude, --strict-gitignore, and --exclude-tests
+# exactly like the primary rg/grep engine. We compute the filtered file set
+# ONCE here and export it (UBS_RUST_FILE_LIST) so helpers stop re-walking the
+# tree with their own skip lists.
+#   UBS_RUST_BASE_FILE_LIST: honors --exclude / --strict-gitignore only
+#   UBS_RUST_FILE_LIST:      additionally honors --exclude-tests (tests/,
+#                            benches/, and files reachable only via
+#                            #[cfg(test)] mod declarations)
+# _UBS_TEST_ONLY_FILES / _UBS_SCAN_ALLOWED back the same policy for matches
+# produced by ast-grep/grep streams.
+UBS_RUST_BASE_FILE_LIST=""
+UBS_RUST_FILE_LIST=""
+declare -A _UBS_TEST_ONLY_FILES=()
+declare -A _UBS_SCAN_ALLOWED=()
+_UBS_SCAN_ALLOWED_ACTIVE=0
+
+_ubs_allowed_key_add() {
+  local p="$1"
+  [[ -z "$p" ]] && return 0
+  _UBS_SCAN_ALLOWED["$p"]=1
+  _UBS_SCAN_ALLOWED["${p#./}"]=1
+}
+
+build_scan_file_list() {
+  local base_tmp final_tmp
+  base_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-files.XXXXXX)"
+  TMP_FILES+=("$base_tmp")
+  if [[ "$HAS_RG" -eq 1 ]]; then
+    ( set +o pipefail; rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}" --files "$PROJECT_DIR" 2>/dev/null || true ) >"$base_tmp"
+  else
+    build_grep_filelist || true
+    if [[ -s "${UBS_GREP_FILELIST0:-}" ]]; then tr '\0' '\n' <"$UBS_GREP_FILELIST0" >"$base_tmp"; fi
+  fi
+  UBS_RUST_BASE_FILE_LIST="$base_tmp"
+  final_tmp="$base_tmp"
+  if [[ "${EXCLUDE_TESTS:-0}" -eq 1 ]]; then
+    final_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-files-notest.XXXXXX)"
+    TMP_FILES+=("$final_tmp")
+    local f
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      case "$f" in
+        */tests/*|tests/*|*/benches/*|benches/*) continue;;
+      esac
+      printf '%s\n' "$f" >>"$final_tmp"
+    done <"$base_tmp"
+    # GH #80: exclude files reachable only via #[cfg(test)]-gated `mod` decls.
+    if [[ "$have_python3" -eq 1 && -f "$SCRIPT_DIR/helpers/cfg_test_only_modules_rust.py" ]]; then
+      local test_only_out
+      test_only_out="$(python3 "$SCRIPT_DIR/helpers/cfg_test_only_modules_rust.py" --files-from "$final_tmp" 2>/dev/null || true)"
+      if [[ -n "$test_only_out" ]]; then
+        local t rp pruned_tmp
+        declare -A _drop=()
+        while IFS= read -r t; do
+          [[ -z "$t" ]] && continue
+          _drop["$t"]=1
+          _UBS_TEST_ONLY_FILES["$t"]=1
+          _UBS_TEST_ONLY_FILES["${t#./}"]=1
+          rp="$(readlink -f -- "$t" 2>/dev/null || true)"
+          [[ -n "$rp" ]] && _UBS_TEST_ONLY_FILES["$rp"]=1
+        done <<<"$test_only_out"
+        pruned_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-files-final.XXXXXX)"
+        TMP_FILES+=("$pruned_tmp")
+        while IFS= read -r f; do
+          [[ -z "$f" || -n "${_drop[$f]:-}" ]] && continue
+          printf '%s\n' "$f" >>"$pruned_tmp"
+        done <"$final_tmp"
+        unset _drop
+        final_tmp="$pruned_tmp"
+      fi
+    fi
+  fi
+  UBS_RUST_FILE_LIST="$final_tmp"
+  export UBS_RUST_FILE_LIST
+  # Enforce the filtered set on ast-grep match streams only when a filtering
+  # flag is in effect (ast-grep re-walks the tree itself and does not know
+  # about --exclude / --strict-gitignore / --exclude-tests).
+  if [[ -n "$EXTRA_EXCLUDES" || "$STRICT_GITIGNORE" -eq 1 || "${EXCLUDE_TESTS:-0}" -eq 1 ]]; then
+    _UBS_SCAN_ALLOWED_ACTIVE=1
+    local a
+    while IFS= read -r a; do
+      [[ -z "$a" ]] && continue
+      _ubs_allowed_key_add "$a"
+    done <"$final_tmp"
+  fi
+}
+
+# Is a matched file inside the authoritative filtered set?
+_ubs_file_allowed() {
+  [[ "$_UBS_SCAN_ALLOWED_ACTIVE" -eq 1 ]] || return 0
+  local f="$1"
+  [[ -n "${_UBS_SCAN_ALLOWED[$f]:-}" || -n "${_UBS_SCAN_ALLOWED[${f#./}]:-}" ]] && return 0
+  local rp
+  rp="$(readlink -f -- "$f" 2>/dev/null || true)"
+  if [[ -n "$rp" && -n "${_UBS_SCAN_ALLOWED[$rp]:-}" ]]; then
+    _ubs_allowed_key_add "$f"
+    return 0
+  fi
+  return 1
+}
+
 count_lines() { grep -v 'ubs:ignore' | filter_test_lines | awk 'END{print (NR+0)}'; }
 
 # ---------------------------------------------------------------------------
@@ -662,6 +781,11 @@ filter_test_lines() {
     fi
     # Rule 1: files under tests/ or benches/
     if [[ "$_ftl_f" == */tests/* || "$_ftl_f" == tests/* || "$_ftl_f" == */benches/* || "$_ftl_f" == benches/* ]]; then
+      continue
+    fi
+    # Rule 1b (GH #80): files reachable only via #[cfg(test)]-gated `mod`
+    # declarations are test-only even without an internal test boundary.
+    if [[ -n "${_UBS_TEST_ONLY_FILES[$_ftl_f]:-}" || -n "${_UBS_TEST_ONLY_FILES[${_ftl_f#./}]:-}" ]]; then
       continue
     fi
     # Rule 2: at or below #[cfg(test)]
@@ -769,12 +893,19 @@ parse_ast_match_line() {
 ast_match_should_skip() {
   local file="$1" line="$2" code="${3:-}" source_line=""
   [[ "$code" == *"ubs:ignore"* ]] && return 0
+  # GH #70: ast-grep re-walks the tree itself; drop matches from files outside
+  # the authoritative filtered set (--exclude / --strict-gitignore / tests).
+  _ubs_file_allowed "$file" || return 0
   if [[ -f "$file" && "$line" =~ ^[0-9]+$ ]]; then
     source_line="$(sed -n "${line}p" "$file" 2>/dev/null || true)"
     [[ "$source_line" == *"ubs:ignore"* ]] && return 0
   fi
   if [[ "${EXCLUDE_TESTS:-0}" -eq 1 ]]; then
     if [[ "$file" == */tests/* || "$file" == tests/* || "$file" == */benches/* || "$file" == benches/* ]]; then
+      return 0
+    fi
+    # GH #80: file reachable only via #[cfg(test)]-gated `mod` declarations.
+    if [[ -n "${_UBS_TEST_ONLY_FILES[$file]:-}" || -n "${_UBS_TEST_ONLY_FILES[${file#./}]:-}" ]]; then
       return 0
     fi
     if [[ "$line" =~ ^[0-9]+$ ]]; then
@@ -1063,6 +1194,18 @@ pattern = patterns[mode]
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -1241,6 +1384,18 @@ pattern = patterns[mode]
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -1428,6 +1583,18 @@ root = Path(sys.argv[1])
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -1632,6 +1799,18 @@ call = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -1819,6 +1998,18 @@ safe_context = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -2082,6 +2273,18 @@ reject_re = re.compile(r'\b(?:return\s+Err|Err\s*\(|bail!\s*\(|ensure!\s*\(|anyh
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -2377,6 +2580,18 @@ reject_re = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -2752,6 +2967,18 @@ reject_re = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -3087,6 +3314,18 @@ reject_re = re.compile(r'\b(?:return\s+Err|Err\s*\(|bail!\s*\(|ensure!\s*\(|anyh
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -3378,6 +3617,18 @@ construction_re = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -3767,6 +4018,18 @@ safe_re = re.compile(
 PATH_LIMIT = 5
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -4051,6 +4314,18 @@ SAFE_CONTEXT_RE = re.compile(
 CONTENT_LENGTH_GUARD_RE = re.compile(r"\b(?:CONTENT_LENGTH|content_length|content-length)\b[\s\S]{0,240}\b(?:>|>=)\b")
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -4319,6 +4594,18 @@ reject_re = re.compile(r'\b(?:return|return\s+Err|Err\s*\(|bail!\s*\(|ensure!\s*
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -4575,6 +4862,18 @@ adapter_methods = {"as_str", "as_ref", "to_string", "into_string"}
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -4765,6 +5064,18 @@ safe_context = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -4992,6 +5303,18 @@ def should_skip(path: Path) -> bool:
     return any(part in skip_dirs for part in path.parts)
 
 def iter_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry).resolve()
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -5099,6 +5422,18 @@ predictable_source_re = re.compile(
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -5430,6 +5765,17 @@ keywords = {
 
 
 def rust_files(path: Path):
+    _ubs_listing = os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -5744,6 +6090,17 @@ block_comment_re = re.compile(r"/\*.*?\*/", re.DOTALL)
 
 
 def rust_files(path: Path):
+    _ubs_listing = os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -6104,6 +6461,18 @@ root = Path(sys.argv[1])
 
 
 def rust_files(path: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry.endswith(".rs"):
+                    yield Path(_ubs_entry)
+        return
     if path.is_file():
         if path.suffix == ".rs":
             yield path
@@ -6384,13 +6753,13 @@ CATS
 # ast-grep helpers
 # ────────────────────────────────────────────────────────────────────────────
 ast_search() {
+  # GH #80: route through count_ast_pattern_matches so AST-backed counts get
+  # the same ubs:ignore / --exclude-tests / filtered-file-set treatment as
+  # every other match stream (the old raw `wc -l` also overcounted multi-line
+  # matches by counting each printed line).
   local pattern=$1
   if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-    if [[ "$AST_GREP_RUN_STYLE" -eq 1 ]]; then
-      ( set +o pipefail; "${AST_GREP_CMD[@]}" run --pattern "$pattern" -l rust "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
-    else
-      ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang rust --pattern "$pattern" "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
-    fi
+    count_ast_pattern_matches "$pattern"
   else
     echo 0
   fi
@@ -7509,20 +7878,11 @@ BANNER
   say "${WHITE}Started:${RESET}  ${GRAY}$(now)${RESET}"
 fi
 
-# Count files
-EX_PRUNE=()
-for d in "${EXCLUDE_DIRS[@]}"; do EX_PRUNE+=( -name "$d" -o ); done
-EX_PRUNE=( \( -type d \( "${EX_PRUNE[@]}" -false \) -prune \) )
-NAME_EXPR=( \( )
-first=1
-for e in "${_EXT_ARR[@]}"; do
-  if [[ $first -eq 1 ]]; then NAME_EXPR+=( -name "*.${e}" ); first=0
-  else NAME_EXPR+=( -o -name "*.${e}" ); fi
-done
-NAME_EXPR+=( \) )
+# Count files (GH #70: derived from the one authoritative filtered file list
+# so the displayed count and every scanner honor the same exclusions).
+build_scan_file_list
 TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
-  | wc -l | awk '{print $1+0}'
+  ( set +o pipefail; grep -c . "$UBS_RUST_BASE_FILE_LIST" 2>/dev/null || true ) | awk 'END{print $0+0}'
 )
 say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
 
@@ -8215,6 +8575,18 @@ def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
 
 def iter_files(root: Path):
+    import os as _ubs_os
+    _ubs_listing = _ubs_os.environ.get("UBS_RUST_FILE_LIST", "")
+    if _ubs_listing and _ubs_os.path.isfile(_ubs_listing):
+        # GH #70: consume the module's authoritative filtered file list
+        # (--exclude / --strict-gitignore / --exclude-tests) instead of
+        # re-walking the tree with a local skip list.
+        with open(_ubs_listing, encoding="utf-8") as _ubs_fh:
+            for _ubs_line in _ubs_fh:
+                _ubs_entry = _ubs_line.rstrip("\n")
+                if _ubs_entry and Path(_ubs_entry).suffix.lower() in EXTS:
+                    yield Path(_ubs_entry).resolve()
+        return
     if root.is_file():
         if root.suffix.lower() in EXTS:
             yield root
@@ -8489,6 +8861,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     fi
   else
     print_finding "info" 1 "rustfmt not installed; skipping format check"
+    add_finding "info" 1 "rustfmt not installed; skipping format check" "" "${CATEGORY_NAME[12]}"
   fi
 
   # cargo clippy (normalize -D warnings)
@@ -8502,9 +8875,11 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then print_finding "good" "No clippy warnings/errors"; fi
   else
     print_finding "info" 1 "clippy not installed; skipping lint pass"
+    add_finding "info" 1 "clippy not installed; skipping lint pass" "" "${CATEGORY_NAME[12]}"
   fi
 else
   print_finding "info" 1 "cargo not available or disabled; style/lints skipped"
+  add_finding "info" 1 "cargo not available or disabled; style/lints skipped" "" "${CATEGORY_NAME[12]}"
 fi
 fi
 fi
@@ -8533,6 +8908,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; add_finding "warning" "$w" "Test build warnings" "" "${CATEGORY_NAME[13]}"; else print_finding "good" "Tests build clean"; fi
 else
   print_finding "info" 1 "cargo disabled/unavailable; build checks skipped"
+  add_finding "info" 1 "cargo disabled/unavailable; build checks skipped" "" "${CATEGORY_NAME[13]}"
 fi
 fi
 fi
@@ -8552,6 +8928,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; add_finding "critical" "$audit_vuln" "Advisories found by cargo-audit" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "No known advisories (cargo-audit)"; fi
   else
     print_finding "info" 1 "cargo-audit not installed; skipping advisory scan"
+    add_finding "info" 1 "cargo-audit not installed; skipping advisory scan" "" "${CATEGORY_NAME[14]}"
   fi
 
   if [[ "$HAS_DENY" -eq 1 ]]; then
@@ -8563,6 +8940,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$deny_err" -eq 0 && "$deny_warn" -eq 0 ]]; then print_finding "good" "cargo-deny clean"; fi
   else
     print_finding "info" 1 "cargo-deny not installed; skipping policy checks"
+    add_finding "info" 1 "cargo-deny not installed; skipping policy checks" "" "${CATEGORY_NAME[14]}"
   fi
 
   if [[ "$HAS_UDEPS" -eq 1 ]]; then
@@ -8571,6 +8949,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; add_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "No unused dependencies"; fi
   else
     print_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan"
+    add_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan" "" "${CATEGORY_NAME[14]}"
   fi
 
   if [[ "$HAS_OUTDATED" -eq 1 ]]; then
@@ -8579,9 +8958,11 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; add_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "Dependencies up-to-date"; fi
   else
     print_finding "info" 1 "cargo-outdated not installed; skipping update report"
+    add_finding "info" 1 "cargo-outdated not installed; skipping update report" "" "${CATEGORY_NAME[14]}"
   fi
 else
   print_finding "info" 1 "cargo disabled/unavailable; dependency checks skipped"
+  add_finding "info" 1 "cargo disabled/unavailable; dependency checks skipped" "" "${CATEGORY_NAME[14]}"
 fi
 fi
 
@@ -8657,6 +9038,7 @@ if [[ -f "$cargo_toml" ]]; then
   say "  ${BLUE}${INFO} Info${RESET} ${WHITE}(features sections:${RESET} ${CYAN}${feature_count}${RESET}${WHITE}, bins:${RESET} ${CYAN}${bin_count}${RESET}${WHITE}, workspace:${RESET} ${CYAN}${workspace}${RESET}${WHITE})${RESET}"
 else
   print_finding "info" 1 "No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)"
+  add_finding "info" 1 "No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)" "" "${CATEGORY_NAME[18]}"
 fi
 fi
 

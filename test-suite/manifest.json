@@ -4932,6 +4932,246 @@
       }
     },
     {
+      "id": "js-typescript-archive-provenance-buggy",
+      "description": "Archive entries with real archive-library provenance (adm-zip getEntries) joined into destinations stay reported.",
+      "path": "test-suite/js/security/archive-provenance-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "archive",
+        "provenance",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Archive/upload entry path traversal risk"
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-archive-provenance-clean",
+      "description": "fs.readdirSync Dirent walks whose bindings are merely named entry/file must not be flagged as archive extraction.",
+      "path": "test-suite/js/security/archive-provenance-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "archive",
+        "provenance",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Archive/upload entry path traversal risk"
+        ]
+      }
+    },
+    {
+      "id": "js-division-denominator-buggy",
+      "description": "Many divisions by unguarded variable denominators must still raise the division-by-variable warning.",
+      "path": "test-suite/js/math/division-denominator-buggy.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "math",
+        "division",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Division by variable - verify non-zero"
+        ]
+      }
+    },
+    {
+      "id": "js-division-denominator-clean",
+      "description": "Constant non-zero denominators (/2, /100, Math.PI) and (x || 1) guards must never raise the division warning regardless of repository size.",
+      "path": "test-suite/js/math/division-denominator-clean.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "math",
+        "division",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Division by variable - verify non-zero"
+        ]
+      }
+    },
+    {
+      "id": "js-switch-fallthrough-buggy",
+      "description": "A non-empty switch clause that can fall into the next clause without a terminator or fall-through comment is reported.",
+      "path": "test-suite/js/control_flow/switch-fallthrough-buggy.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "control-flow",
+        "switch",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Switch cases may be missing break"
+        ]
+      }
+    },
+    {
+      "id": "js-switch-fallthrough-clean",
+      "description": "Return/throw-terminated clauses, grouped case labels, documented fall-through, loop breaks, and terminal clauses must not count as missing breaks.",
+      "path": "test-suite/js/control_flow/switch-fallthrough-clean.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "control-flow",
+        "switch",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,9,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Switch cases may be missing break"
+        ]
+      }
+    },
+    {
+      "id": "js-block-function-declaration-buggy",
+      "description": "Function declarations nested directly inside if/for blocks are reported for inconsistent hoisting.",
+      "path": "test-suite/js/functions/block-function-buggy.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "functions",
+        "scope",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Function declarations in blocks - use function expressions"
+        ]
+      }
+    },
+    {
+      "id": "js-block-function-declaration-clean",
+      "description": "Module-scope helpers whose names contain for/if/while substrings (formatCurrencyShort, classifyRecord, verifyRun) must not be flagged as block declarations.",
+      "path": "test-suite/js/functions/block-function-clean.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "functions",
+        "scope",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Function declarations in blocks - use function expressions"
+        ]
+      }
+    },
+    {
       "id": "js-typescript-jwt-verification-buggy",
       "description": "TypeScript JWT code should not trust decode-only claims or disable verification checks.",
       "path": "test-suite/js/security/jwt-verification-buggy.ts",

@@ -48,16 +48,17 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='4d949858d8a9d292e2eaf9768d4536be93346d69604c9f6c3b8ddf2e70bd9ac0'
   [golang]='a2507466d961932e821465de17ca10571f8be010909fb29db1d032e25a604f77'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
-  [js]='9ab1418ab888c1fc5eb3291900a0b0645c21ef99bcd83676d4602fb9c705ed4c'
+  [js]='7974cff0f75fbb9867aa23be0ebddb43649999e8dc5b41c7c98ae17ea16d02b7'
   [python]='5c14ebdeb0aeb3e79df8e993b83a47460fccb4a7324d896cc5d2523d09dbeb97'
   [ruby]='2ab4c88bea5f28f27c74762d2618d2713f0fcbf83eb8275d4e52b691250df2e0'
-  [rust]='5e0ffdacd0797600b7cbba16f6093ccf3aab3e8040a0b2f008728199684b40d5'
+  [rust]='4131087c8538ac15912518088578e49f36d850f85fc663c77d65977a70cb71dd'
   [swift]='abb8b2e29fa7aa735db056757e6daa4c4b6d618e3251448ed3e9855cf491e9c0'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
 declare -A HELPER_CHECKSUMS=(
   ['helpers/async_task_handles_csharp.py']='a1efff32352dab3dafce18e96a39a1bd2fa4085305ba1604a799fbd3e09d3022'
+  ['helpers/cfg_test_only_modules_rust.py']='0458842326ba0707af7ad5e954fa4e0eff1ebd731739e654e84eafe1f52a61dd'
   ['helpers/resource_lifecycle_cpp.py']='efc9f28047a23246589399309acacea675d2fe2354d011e4c667fdcaebf7dfa8'
   ['helpers/resource_lifecycle_csharp.py']='6a3562049d3e616781ccf941a56a8abc1925fd6b0d95d510a66a35118ee95f28'
   ['helpers/resource_lifecycle_go.go']='10215d2c772dd7905a7e9c60a56899a9d702f1c950e1bfd30d4eb90b190e38bd'
@@ -67,7 +68,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/resource_lifecycle_swift.py']='33a78e83acdffaf0d05b05d240bff5f408d55cd9798d0ae01bd69c36f3afbd0f'
   ['helpers/type_narrowing_csharp.py']='b9b0c16f67608dfc79addcb44d0638ef7e4af96840220bdd671e98ac1f5ca12c'
   ['helpers/type_narrowing_kotlin.py']='6f0f4482e8c349d15ac2830956baf193eedd2461d1ef836267c78da86c78ad79'
-  ['helpers/type_narrowing_rust.py']='355ad60ce6dffb9a7c63169cb83705854612c931e2e8c3a166a81b0cb810647f'
+  ['helpers/type_narrowing_rust.py']='60a8384f327c8c22d3928f0b6a8e7a58bbe0a97bba9f85d50304e1fcae4bd47f'
   ['helpers/type_narrowing_swift.py']='f950bafa92391964e4779c77d37dcc11b0ffeab9bc351be439b4709c0f01b41a'
   ['helpers/type_narrowing_ts.js']='a8509e1b4d6a02105f441486563aae6927e60ec14db1a8b25e50aa019b4a5305'
 )
@@ -143,6 +144,7 @@ HELPER_ASSETS=(
   "helpers/type_narrowing_rust.py"
   "helpers/type_narrowing_kotlin.py"
   "helpers/type_narrowing_swift.py"
+  "helpers/cfg_test_only_modules_rust.py"
 )
 
 HELPERS_READY=0

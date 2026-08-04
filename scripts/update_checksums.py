@@ -67,6 +67,7 @@ def main():
 
     helper_map = {
         "helpers/async_task_handles_csharp.py": "helpers/async_task_handles_csharp.py",
+        "helpers/cfg_test_only_modules_rust.py": "helpers/cfg_test_only_modules_rust.py",
         "helpers/resource_lifecycle_cpp.py": "helpers/resource_lifecycle_cpp.py",
         "helpers/resource_lifecycle_csharp.py": "helpers/resource_lifecycle_csharp.py",
         "helpers/resource_lifecycle_py.py": "helpers/resource_lifecycle_py.py",

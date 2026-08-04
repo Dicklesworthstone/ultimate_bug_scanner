@@ -7,6 +7,21 @@ try {
 } catch (err) {
   ts = null;
 }
+// The `typescript` package can resolve to a module that is not the 5.x
+// compiler API: typescript@7 (the native-tsc wrapper) exposes only a CLI
+// shim at its main entry, so `require('typescript')` succeeds yet lacks
+// ScriptKind/createSourceFile and the analyzer would crash mid-file
+// (observed with Bun's auto-install resolving typescript@7.0.2). Validate
+// the API surface and fall back to the text heuristic instead of crashing.
+if (
+  ts &&
+  (typeof ts.createSourceFile !== 'function' ||
+    !ts.ScriptKind ||
+    !ts.SyntaxKind ||
+    typeof ts.forEachChild !== 'function')
+) {
+  ts = null;
+}
 
 // GH #75: the calling module owns the effective exclusion set (module defaults,
 // --exclude, and the .ubsignore patterns the meta-runner forwards as --exclude).

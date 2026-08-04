@@ -995,6 +995,7 @@ Environment Variables:
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
+  UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1005,6 +1006,9 @@ Exit Codes:
   1                        Critical issues found
   1                        Warnings found (only with --fail-on-warning)
   2                        Invalid arguments or environment error (e.g., missing ast-grep for JS/TS)
+  3                        Nothing was scanned: no supported languages detected, so no scanner ran.
+                           This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
+                           behaviour for callers that intentionally scan mixed/unsupported trees.
 ```
 
 **Directory size guard**

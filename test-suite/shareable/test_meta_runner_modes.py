@@ -48,35 +48,51 @@ def check_no_supported_languages(tmpdir: Path) -> None:
     languages (e.g. Dart) must emit an explicit, machine-readable
     "no-supported-languages" result instead of silently exiting 0 with empty
     stdout. The empty-stdout behavior let review automation record false
-    confidence ("UBS passed") for changes UBS never actually scanned."""
+    confidence ("UBS passed") for changes UBS never actually scanned.
+
+    Issue #68 follow-up: the exit code must be non-zero too — a distinct 3, so
+    consumers gating on $? cannot record "nothing was scanned" as a pass, and
+    cannot confuse it with 1 (findings) or 2 (environment error). Legacy exit-0
+    behaviour is opt-in via UBS_ALLOW_NO_SCAN=1."""
     env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0"}
     dart_dir = tmpdir / "dart_only"
     (dart_dir / "lib").mkdir(parents=True)
     (dart_dir / "lib" / "main.dart").write_text("void main() {}\n")
     (dart_dir / "pubspec.yaml").write_text("name: demo\n")
 
-    # JSON: structured result object, exit 0 (UBS ran fine; nothing in scope).
+    # JSON: structured result object, exit 3 (nothing was scanned ≠ pass).
     res = run_ubs([str(dart_dir), "--format=json"], env)
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 3, res.stdout + res.stderr
     assert res.stdout.strip(), "json no-langs result must not be empty stdout"
     payload = json.loads(res.stdout)
     assert payload["result"] == "no-supported-languages", payload
+    assert payload["exit_code"] == 3, payload
     assert payload["detected_languages"] == [], payload
     assert "rust" in payload["supported_languages"], payload
     assert payload["totals"]["files"] == 0, payload
 
     # SARIF: valid log whose invocation carries the no-supported-languages marker.
     res = run_ubs([str(dart_dir), "--format=sarif"], env)
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 3, res.stdout + res.stderr
     sarif = json.loads(res.stdout)
     inv = sarif["runs"][0]["invocations"][0]
     assert inv["properties"]["result"] == "no-supported-languages", sarif
+    assert inv["exitCode"] == 3, sarif
 
     # Text: explicit "this is NOT a pass" wording so humans aren't misled either.
     res = run_ubs([str(dart_dir), "--format=text"], env)
-    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.returncode == 3, res.stdout + res.stderr
     assert "no supported languages" in res.stdout, res.stdout
     assert "NOT a pass" in res.stdout, res.stdout
+
+    # Opt-out: UBS_ALLOW_NO_SCAN=1 restores the legacy exit-0 behaviour for
+    # callers that intentionally point UBS at mixed/unsupported trees.
+    legacy_env = dict(env, UBS_ALLOW_NO_SCAN="1")
+    res = run_ubs([str(dart_dir), "--format=json"], legacy_env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    payload = json.loads(res.stdout)
+    assert payload["result"] == "no-supported-languages", payload
+    assert payload["exit_code"] == 0, payload
 
 
 def check_version_identity(tmpdir: Path) -> None:

@@ -398,6 +398,8 @@ Environment Variables:
   UBS_SKIP_SIZE_CHECK=1       Skip directory size guard entirely
   UBS_REFUSE_HOME_ROOT=0|1    Whether to refuse scanning \$HOME or / (default: 1)
                               Set to 0 to allow scanning these directories
+  UBS_ALLOW_NO_SCAN=1         Exit 0 instead of 3 when no supported languages are
+                              detected and no scanner runs (legacy behaviour)
 
 Examples:
   ubs .                       # auto-detect languages and scan
@@ -3267,11 +3269,19 @@ write_jsonl_summary(){
 # machine format, so automation parsing the JSON/SARIF saw "no output + exit 0"
 # and could not distinguish "scanned clean" from "nothing was scanned". This
 # emits an explicit, machine-readable result for each format so review gates can
-# detect the no-coverage case instead of recording false confidence. Exit stays
-# 0 because UBS itself ran correctly — there was simply nothing in scope.
+# detect the no-coverage case instead of recording false confidence.
+#
+# GH #68: the exit code must also be distinguishable — "nothing was scanned" is
+# not a pass, and consumers gating on $? (CI steps, pre-commit hooks,
+# `ubs … && next-step`) were recording a pass for runs that examined zero
+# files. We exit 3 here: a NEW code so it cannot be confused with 1 (findings)
+# or 2 (environment error). Set UBS_ALLOW_NO_SCAN=1 to restore the legacy
+# exit-0 behaviour for callers that intentionally point UBS at mixed trees.
 emit_no_langs_result(){
   local proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
   local supported="${ALL_LANGS[*]}"
+  local rc=3
+  if [[ "${UBS_ALLOW_NO_SCAN:-0}" == "1" ]]; then rc=0; fi
   case "$FORMAT" in
     json|toon)
       local proj_e supported_json="" first=1 l
@@ -3281,7 +3291,7 @@ emit_no_langs_result(){
         else supported_json+=",\"$(json_escape "$l")\""; fi
       done
       local payload
-      payload=$(printf '{"result":"no-supported-languages","exit_code":0,"project":"%s","detected_languages":[],"supported_languages":[%s],"totals":{"critical":0,"warning":0,"info":0,"files":0},"scanners":[]}\n' "$proj_e" "$supported_json")
+      payload=$(printf '{"result":"no-supported-languages","exit_code":%d,"project":"%s","detected_languages":[],"supported_languages":[%s],"totals":{"critical":0,"warning":0,"info":0,"files":0},"scanners":[]}\n' "$rc" "$proj_e" "$supported_json")
       if [[ "$FORMAT" == "toon" ]] && command -v "$TOON_BIN" >/dev/null 2>&1 && looks_like_toon_rust_encoder "$TOON_BIN"; then
         printf '%s' "$payload" | "$TOON_BIN" --encode || printf '%s' "$payload"
       else
@@ -3295,15 +3305,18 @@ emit_no_langs_result(){
       ;;
     sarif)
       local proj_e; proj_e="$(json_escape "$proj")"
-      printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner","rules":[]}},"results":[],"invocations":[{"executionSuccessful":true,"exitCode":0,"properties":{"result":"no-supported-languages","project":"%s","supportedLanguages":"%s"}}]}]}\n' "$proj_e" "$(json_escape "$supported")"
+      printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner","rules":[]}},"results":[],"invocations":[{"executionSuccessful":true,"exitCode":%d,"properties":{"result":"no-supported-languages","project":"%s","supportedLanguages":"%s"}}]}]}\n' "$rc" "$proj_e" "$(json_escape "$supported")"
       ;;
     text|*)
       say "${YELLOW}${WARN}${RESET} no supported languages detected in ${proj}"
       say "${DIM}UBS did not run any scanner: nothing was checked (this is NOT a pass).${RESET}"
       say "${DIM}Supported languages: ${supported}${RESET}"
+      if [[ "$rc" -ne 0 ]]; then
+        say "${DIM}Exiting ${rc} (nothing scanned). Set UBS_ALLOW_NO_SCAN=1 to treat this as a pass.${RESET}"
+      fi
       ;;
   esac
-  exit 0
+  exit "$rc"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

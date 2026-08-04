@@ -8538,7 +8538,7 @@
     },
     {
       "id": "rust-constant-time-compare-buggy",
-      "description": "Rust bearer tokens, webhook signatures, CSRF values, reset secrets, and API keys should not be compared with == or !=.",
+      "description": "Rust auth/session/reset/JWT/CSRF/API-key/credential/signature comparisons, including alias, multiline, ignore, branch, shadow, and mixed safe/unsafe behavior.",
       "path": "test-suite/rust/buggy/constant_time_compare.rs",
       "language": "rust",
       "tags": [
@@ -8551,23 +8551,70 @@
       "args": [
         "--no-cargo",
         "--only=8",
+        "--verbose",
         "--fail-on-warning"
       ],
       "expect": {
         "exit_code": "nonzero",
         "totals": {
           "critical": {
-            "min": 7
+            "min": 30,
+            "max": 30
+          },
+          "warning": {
+            "max": 0
           }
         },
         "require_substrings": [
-          "Secret, signature, or token compared with ==/!="
+          "Secret, signature, or token compared with ==/!=",
+          "provided_signature == expected_signature",
+          "request_api_key != stored_api_key",
+          "req.csrf_token == session_csrf_token",
+          "token == user.reset_token",
+          "req.authorization == expected_token",
+          "token != user.reset_token",
+          "bare_signature == expected_bare_signature",
+          "token.len() == 64 && token == expected_reset_token",
+          "&& provided_reset_token == expected_reset_token",
+          "alias_candidate == expected_session_token",
+          "header_candidate == expected",
+          "direct_jwt_secret == expected_direct_jwt_secret",
+          "direct_credential == expected_direct_credential",
+          "conditional_candidate == expected",
+          "== expected_multiline_csrf",
+          "trailing_bearer_token ==",
+          "== expected_trimmed_value",
+          "branch_candidate == expected",
+          "shadowed_candidate == expected",
+          "let _secret_match = restored_candidate == expected;",
+          "!= expected_csrf_token",
+          "== parenthesized_credential",
+          "let is_auth_match = auth_token == expected_auth_token;",
+          "active_auth_token == active_expected_auth_token",
+          "&& provided_credential == stored_credential",
+          "|| provided_jwt_secret != expected_jwt_secret",
+          "conditional_auth_secret == conditional_auth_expected",
+          "backup_secret == expected_backup,",
+          "crypto_memcmp(left, right) & (backup_secret == expected_backup)",
+          "== expected_fluent"
+        ],
+        "forbid_substrings": [
+          "candidate == \"BR2\"",
+          "page == 1",
+          "shared == \"PAGE\"",
+          "candidate == \"1.\"",
+          "ignored_auth_token == ignored_expected_auth_token",
+          "ignored_session_token != ignored_expected_session_token",
+          "is_auth_match == expected_boolean",
+          "unsafe_conditional_result == expected_boolean",
+          "shadowed_candidate == \"BR2\"",
+          "restored_candidate == public_value"
         ]
       }
     },
     {
       "id": "rust-constant-time-compare-clean",
-      "description": "Rust code using subtle::ConstantTimeEq or reviewed constant-time helpers for secret comparisons should stay clean.",
+      "description": "Rust parser/domain comparisons, string/comment data, shadow/overwrite boundaries, and ring/crypto_memcmp safe paths should stay clean.",
       "path": "test-suite/rust/clean/constant_time_compare.rs",
       "language": "rust",
       "tags": [
@@ -8594,6 +8641,44 @@
         },
         "forbid_substrings": [
           "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "rust-constant-time-compare-python-unavailable",
+      "description": "Rust constant-time scanning must report degraded coverage instead of a false clean result when python3 cannot run.",
+      "path": "test-suite/rust/clean/constant_time_compare.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "constant-time",
+        "degraded"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "bin_shims": {
+        "python3": "#!/bin/sh\nexit 70\n"
+      },
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "min": 1,
+            "max": 1
+          }
+        },
+        "require_substrings": [
+          "Constant-time comparison scan unavailable"
+        ],
+        "forbid_substrings": [
+          "No secret comparisons using ==/!= detected"
         ]
       }
     },

@@ -5385,7 +5385,7 @@ security_terms = (
 
 assign_re = re.compile(
     r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?"
-    r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)"
+    r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=(?!=)\s*(?P<rhs>.+)"
 )
 fn_re = re.compile(
     r"^\s*(?:(?:pub|pub\s*\([^)]*\)|async|unsafe|extern\s+\"[^\"]+\")\s+)*"
@@ -5744,20 +5744,55 @@ safe_compare_re = re.compile(
     r"|\bring::constant_time::verify_slices_are_equal\s*\(",
     re.IGNORECASE,
 )
-sensitive_re = re.compile(
-    r"(?:"
-    r"\b(?:token|secret|signature|sig|hmac|mac|digest|csrf|xsrf|nonce|otp|totp|mfa|reset|"
-    r"password|passwd|pwd|auth|bearer|credential|session|jwt|webhook|invite|"
-    r"verification|recovery)\b|"
-    r"\bapi\s+key\b|"
-    r"\bauthorization\b|"
-    r"\bx-signature\b"
-    r")",
+high_standalone_terms = {
+    "secret", "password", "passwd", "pwd", "bearer", "hmac", "csrf", "xsrf",
+    "otp", "totp", "mfa",
+}
+credential_prefix_terms = {
+    "auth", "access", "refresh", "session", "reset", "recovery",
+    "verification", "invite", "jwt",
+}
+credential_suffix_terms = {"token", "secret", "key", "credential", "credentials"}
+signature_prefix_terms = {"webhook", "hmac", "auth", "csrf", "xsrf"}
+signature_suffix_terms = {"signature", "sig", "mac", "digest"}
+signature_terms = {"signature", "sig"}
+signature_metadata_terms = {
+    "field", "format", "function", "layout", "method", "parser", "schema", "type",
+}
+credential_terms = {"credential", "credentials"}
+credential_metadata_terms = {
+    "field", "format", "kind", "layout", "policy", "schema", "state", "status", "type",
+}
+authorization_terms = {"authorization"}
+authorization_metadata_terms = {"kind", "mode", "policy", "scheme", "state", "status", "type"}
+jwt_metadata_terms = {
+    "alg", "algorithm", "aud", "audience", "claim", "claims", "exp",
+    "expiration", "header", "headers", "issuer", "iss", "kid",
+}
+known_security_header_re = re.compile(
+    r'["\'](?:Authorization|X-API-Key|X-CSRF-Token|X-Hub-Signature(?:-256)?|'
+    r'X-Signature|X-Webhook-Signature)["\']',
+    re.IGNORECASE,
+)
+value_source_re = re.compile(
+    r"(?:\b(?:headers?|cookies?|env|request|req)\b[^;\n]{0,80}\."
+    r"(?:get|header|cookie)\s*\(|\b(?:env::var|header|cookie|bearer|authorization)\s*\()",
     re.IGNORECASE,
 )
 nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
 shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")
 pure_string_literal_re = re.compile(r'^\s*(?:"(?:\\.|[^"\\])*"|r#*"[^"]*"#*|b"(?:\\.|[^"\\])*")\s*$')
+string_literal_re = re.compile(r'(?:b?"(?:\\.|[^"\\])*"|r#*"[^"]*"#*)')
+binding_prefix_re = re.compile(
+    r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?"
+    r"[A-Za-z_][A-Za-z0-9_]*\s*(?::[^=;]+)?=\s*"
+)
+fn_start_re = re.compile(
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?"
+    r"(?:(?:const|async|unsafe)\s+)*"
+    r"(?:extern\s+(?:\"[^\"]+\"\s+)?)?"
+    r"fn\b"
+)
 keywords = {
     "if", "while", "match", "return", "let", "mut", "const", "static", "true",
     "false", "None", "Some", "Ok", "Err", "self", "Self", "crate", "super",
@@ -5837,21 +5872,127 @@ def strip_line_comments(line: str) -> str:
     return "".join(out)
 
 
-def statement_from(lines, line_no, max_lines=8):
+def rust_char_literal_end(text: str, start: int):
+    j = start + 1
+    if j >= len(text) or text[j] in ("\n", "\r", "'"):
+        return None
+    if text[j] == "\\":
+        j += 2
+        if j <= len(text) and text[j - 1:j] == "u" and j < len(text) and text[j] == "{":
+            closing_brace = text.find("}", j + 1)
+            if closing_brace < 0:
+                return None
+            j = closing_brace + 1
+    else:
+        j += 1
+    if j < len(text) and text[j] == "'":
+        return j
+    return None
+
+
+def sanitized_rust_lines(text: str, strip_strings: bool):
+    out = []
+    block_depth = 0
+    quote = ""
+    raw_hashes = None
+    escape = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if block_depth:
+            if ch == "/" and nxt == "*":
+                block_depth += 1
+                out.extend((" ", " "))
+                i += 2
+            elif ch == "*" and nxt == "/":
+                block_depth -= 1
+                out.extend((" ", " "))
+                i += 2
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+        if raw_hashes is not None:
+            closing = ch == '"' and text.startswith("#" * raw_hashes, i + 1)
+            if strip_strings:
+                out.append("\n" if ch == "\n" else " ")
+            else:
+                out.append(ch)
+            i += 1
+            if closing:
+                for _ in range(raw_hashes):
+                    out.append(" " if strip_strings else "#")
+                i += raw_hashes
+                raw_hashes = None
+            continue
+        if quote:
+            out.append("\n" if ch == "\n" else (" " if strip_strings else ch))
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            while i < len(text) and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            block_depth = 1
+            out.extend((" ", " "))
+            i += 2
+            continue
+        if ch == "'":
+            char_end = rust_char_literal_end(text, i)
+            if char_end is not None:
+                while i <= char_end:
+                    out.append(" " if strip_strings else text[i])
+                    i += 1
+                continue
+        raw_start = None
+        if ch == "r":
+            raw_start = i + 1
+        elif ch == "b" and nxt == "r":
+            raw_start = i + 2
+        if raw_start is not None:
+            j = raw_start
+            while j < len(text) and text[j] == "#":
+                j += 1
+            if j < len(text) and text[j] == '"':
+                raw_hashes = j - raw_start
+                while i <= j:
+                    out.append(" " if strip_strings else text[i])
+                    i += 1
+                continue
+        if ch == '"':
+            quote = ch
+            out.append(" " if strip_strings else ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out).splitlines()
+
+
+def statement_from(lines, code_lines, line_no, max_lines=64):
     idx = line_no - 1
     parts = []
     balance = 0
     for current_idx in range(idx, min(len(lines), idx + max_lines)):
-        current = strip_line_comments(lines[current_idx]).strip()
-        if not current:
-            if parts:
-                break
+        current = lines[current_idx].strip()
+        code = code_lines[current_idx].strip()
+        if not code:
             continue
         parts.append(current)
-        balance += current.count("(") + current.count("{") - current.count(")") - current.count("}")
+        balance += code.count("(") + code.count("{") - code.count(")") - code.count("}")
         if current_idx > idx and balance <= 0:
             break
-        if current_idx == idx and balance <= 0 and not current.endswith(("{", "(", ",")):
+        continues = bool(re.search(r"(?:==|!=|&&|\|\||\.|,|\(|\{|=>)\s*$", code))
+        if current_idx == idx and balance <= 0 and not continues:
             break
     return " ".join(parts)
 
@@ -5863,15 +6004,55 @@ def split_identifier_terms(text: str) -> str:
     return text
 
 
+def identifier_terms(text: str):
+    return [
+        term.lower()
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9]*", split_identifier_terms(text))
+    ]
+
+
+def has_api_key_terms(terms, compact: str) -> bool:
+    if "apikey" in compact or "api_key" in compact:
+        return True
+    return "api" in terms and "key" in terms
+
+
+def has_high_confidence_compound(terms) -> bool:
+    term_set = set(terms)
+    if term_set & high_standalone_terms:
+        return True
+    if (term_set & signature_terms) and not (term_set & signature_metadata_terms):
+        return True
+    if (term_set & credential_terms) and not (term_set & credential_metadata_terms):
+        return True
+    if (term_set & authorization_terms) and not (term_set & authorization_metadata_terms):
+        return True
+    if has_api_key_terms(terms, "_".join(terms)):
+        return True
+    if "jwt" in term_set and not (term_set & jwt_metadata_terms):
+        return True
+    if (term_set & credential_prefix_terms) and (term_set & credential_suffix_terms):
+        return True
+    if (term_set & signature_prefix_terms) and (term_set & signature_suffix_terms):
+        return True
+    return False
+
+
+def has_known_sensitive_source(text: str) -> bool:
+    return bool(known_security_header_re.search(text) and value_source_re.search(text))
+
+
 def is_sensitive_text(text: str) -> bool:
-    return bool(sensitive_re.search(split_identifier_terms(text)))
+    return has_high_confidence_compound(identifier_terms(text))
 
 
 def is_sensitive_operand_text(text: str) -> bool:
     stripped = text.strip()
     if pure_string_literal_re.match(stripped):
         return False
-    return is_sensitive_text(stripped)
+    if has_known_sensitive_source(stripped):
+        return True
+    return is_sensitive_text(string_literal_re.sub(" ", stripped))
 
 
 def operand_identifiers(operand: str):
@@ -5884,6 +6065,7 @@ def operand_identifiers(operand: str):
 
 def clean_operand_text(operand: str) -> str:
     clean = operand.strip()
+    clean = binding_prefix_re.sub("", clean, count=1)
     clean = re.sub(r"^(?:if|while|match)\s*\(?\s*", "", clean)
     clean = re.split(r"\s*(?:&&|\|\||[;{])", clean, maxsplit=1)[0].strip()
     while clean and clean[-1] in ";{}){":
@@ -5920,37 +6102,137 @@ def source_line(lines, line_no):
     return ""
 
 
-def collect_sensitive_vars(lines):
-    sensitive = set()
-    for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
-            continue
-        stripped = strip_line_comments(raw).strip()
-        if not stripped:
-            continue
-        statement = statement_from(lines, line_no, max_lines=5)
-        if not statement or safe_compare_re.search(statement):
-            continue
-        match = assign_re.match(statement)
-        if not match:
-            continue
-        name = match.group("lhs")
-        rhs = match.group("rhs")
-        if is_sensitive_text(name) or is_sensitive_operand_text(rhs) or (operand_identifiers(rhs) & sensitive):
-            sensitive.add(name)
-    return sensitive
+def sensitive_names(scopes):
+    names = set()
+    resolved = set()
+    for scope in reversed(scopes):
+        for name, is_sensitive in scope.items():
+            if name in resolved:
+                continue
+            resolved.add(name)
+            if is_sensitive:
+                names.add(name)
+    return names
 
 
-def operand_is_sensitive(operand: str, sensitive_vars) -> bool:
+def update_binding(
+    scopes,
+    name: str,
+    is_sensitive: bool,
+    declaration: bool,
+    conditional_context: bool,
+):
+    if declaration:
+        scopes[-1][name] = is_sensitive
+        return
+    for scope in reversed(scopes):
+        if name not in scope:
+            continue
+        if scope[name] and conditional_context and not is_sensitive:
+            return
+        scope[name] = is_sensitive
+        return
+    scopes[-1][name] = is_sensitive
+
+
+def conditional_boolean_result(rhs: str) -> bool:
+    if not re.match(r"^\s*(?:if|match)\b", rhs):
+        return False
+    if not re.search(r"\b(?:true|false)\b", rhs):
+        return False
+    return bool(safe_compare_re.search(rhs) or "==" in rhs or "!=" in rhs)
+
+
+def update_sensitive_vars(statement: str, scopes, conditional_context: bool):
+    assignment_statement = re.sub(r"^\s*\{+\s*", "", statement)
+    match = assign_re.match(assignment_statement)
+    if not match:
+        return
+    name = match.group("lhs")
+    rhs = match.group("rhs")
+    rhs_identifiers = operand_identifiers(string_literal_re.sub(" ", rhs))
+    rhs_is_conditional = bool(re.match(r"^\s*(?:if|match)\b", rhs))
+    rhs_is_sensitive = is_sensitive_operand_text(rhs) or bool(rhs_identifiers & sensitive_names(scopes))
+    declaration = bool(
+        re.match(r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)", assignment_statement)
+    )
+    if conditional_boolean_result(rhs):
+        rhs_is_sensitive = False
+    if ("==" in rhs or "!=" in rhs) and not rhs_is_conditional:
+        update_binding(scopes, name, False, declaration, conditional_context)
+    elif is_sensitive_text(name) or rhs_is_sensitive:
+        update_binding(scopes, name, True, declaration, conditional_context)
+    else:
+        update_binding(scopes, name, False, declaration, conditional_context)
+
+
+def comparison_statement(lines, code_lines, line_no):
+    stripped = code_lines[line_no - 1].strip()
+    if line_no > 1 and re.match(r"^(?:==|!=)(?!=)", stripped):
+        prefix = []
+        for previous_idx in range(line_no - 2, max(-1, line_no - 65), -1):
+            previous_code = code_lines[previous_idx].strip()
+            if not previous_code:
+                continue
+            if previous_code.endswith((";", "{", "}")):
+                break
+            prefix.append(lines[previous_idx].strip())
+            if not previous_code.startswith("."):
+                break
+        prefix.reverse()
+        return " ".join(prefix + [statement_from(lines, code_lines, line_no)])
+    return statement_from(lines, code_lines, line_no)
+
+
+def operand_is_sensitive(operand: str, scopes) -> bool:
     if is_sensitive_operand_text(operand):
         return True
-    return bool(operand_identifiers(operand) & sensitive_vars)
+    return bool(operand_identifiers(operand) & sensitive_names(scopes))
 
 
-def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
-    if safe_compare_re.search(statement) or "ubs:ignore" in statement:
+def mask_safe_compare_calls(text: str) -> str:
+    masked = string_literal_re.sub(lambda match: " " * len(match.group(0)), text)
+    search_from = 0
+    while True:
+        match = safe_compare_re.search(masked, search_from)
+        if not match:
+            return masked
+        open_paren = masked.find("(", match.start(), match.end() + 1)
+        if open_paren < 0:
+            search_from = match.end()
+            continue
+        start = match.start()
+        if masked[start:start + 1] == ".":
+            while start > 0 and re.match(r"[A-Za-z0-9_:.]", masked[start - 1]):
+                start -= 1
+        depth = 0
+        end = open_paren
+        while end < len(masked):
+            if masked[end] == "(":
+                depth += 1
+            elif masked[end] == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        if depth != 0:
+            search_from = match.end()
+            continue
+        while True:
+            chained = re.match(r"\s*\.[A-Za-z_][A-Za-z0-9_]*\s*\([^()]*\)", masked[end:])
+            if not chained:
+                break
+            end += chained.end()
+        masked = masked[:start] + (" " * (end - start)) + masked[end:]
+        search_from = start
+
+
+def unsafe_secret_compare(statement: str, scopes) -> bool:
+    if "ubs:ignore" in statement:
         return False
     for clause in re.split(r"\s*(?:&&|\|\|)\s*", statement):
+        clause = mask_safe_compare_calls(clause)
         match = compare_re.search(clause)
         if not match:
             continue
@@ -5958,8 +6240,22 @@ def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
         right = clean_operand_text(match.group("right"))
         if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
             continue
-        if operand_is_sensitive(left, sensitive_vars) or operand_is_sensitive(right, sensitive_vars):
+        if operand_is_sensitive(left, scopes) or operand_is_sensitive(right, scopes):
             return True
+    return False
+
+
+def comparison_is_ignored(lines, code_lines, line_no):
+    if has_ignore(lines, line_no):
+        return True
+    for previous_idx in range(line_no - 2, max(-1, line_no - 65), -1):
+        if "ubs:ignore" in lines[previous_idx]:
+            return True
+        previous_code = code_lines[previous_idx].strip()
+        if not previous_code:
+            continue
+        if previous_code.endswith((";", "{", "}")):
+            break
     return False
 
 
@@ -5972,22 +6268,51 @@ for rust_file in rust_files(root):
     if "==" not in text and "!=" not in text:
         continue
     lines = text.splitlines()
-    sensitive_vars = collect_sensitive_vars(lines)
+    analysis_lines = sanitized_rust_lines(text, strip_strings=False)
+    code_lines = sanitized_rust_lines(text, strip_strings=True)
+    scopes = [{}]
+    conditional_scopes = [False]
     seen = set()
     for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
+        structural = code_lines[line_no - 1].strip()
+        leading_closes = re.match(r"^\s*(?:}\s*)*", structural).group(0).count("}")
+        for _ in range(leading_closes):
+            if len(scopes) > 1:
+                scopes.pop()
+                conditional_scopes.pop()
+        if fn_start_re.match(structural):
+            scopes = [{}]
+            conditional_scopes = [False]
+        ignored = comparison_is_ignored(lines, code_lines, line_no)
+        if not structural:
             continue
-        stripped = strip_line_comments(raw).strip()
-        if not stripped or ("==" not in stripped and "!=" not in stripped):
-            continue
-        statement = statement_from(lines, line_no)
-        if not statement or not unsafe_secret_compare(statement, sensitive_vars):
-            continue
-        key = (str(rust_file), line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        issues.append((rust_file, line_no, source_line(lines, line_no)))
+        statement = comparison_statement(analysis_lines, code_lines, line_no)
+        if (
+            statement
+            and not ignored
+            and ("==" in structural or "!=" in structural)
+            and unsafe_secret_compare(statement, scopes)
+        ):
+            key = (str(rust_file), line_no)
+            if key not in seen:
+                seen.add(key)
+                issues.append((rust_file, line_no, source_line(lines, line_no)))
+        assignment_head = re.sub(
+            r"^\s*\{+\s*", "", analysis_lines[line_no - 1].strip()
+        )
+        if assign_re.match(assignment_head):
+            update_sensitive_vars(statement or "", scopes, any(conditional_scopes))
+        remaining_closes = structural.count("}") - leading_closes
+        conditional_opener = bool(
+            re.search(r"\b(?:if|else|match|while|for|loop)\b[^{}]*\{", structural)
+        )
+        for _ in range(structural.count("{")):
+            scopes.append({})
+            conditional_scopes.append(conditional_opener)
+        for _ in range(max(0, remaining_closes)):
+            if len(scopes) > 1:
+                scopes.pop()
+                conditional_scopes.pop()
 
 for path, line_no, code in issues:
     print(f"{path}:{line_no}:{code}")
@@ -5995,10 +6320,13 @@ PY
 }
 
 count_constant_time_compare_matches() {
-  if [[ "$have_python3" -eq 1 ]]; then
-    rust_constant_time_compare_matches | count_lines || true
+  [[ "$have_python3" -eq 1 ]] || return 127
+  local matches
+  matches=$(rust_constant_time_compare_matches) || return
+  if [[ -z "$matches" ]]; then
+    printf '0\n'
   else
-    return 1
+    printf '%s\n' "$matches" | count_lines
   fi
 }
 
@@ -8345,14 +8673,22 @@ else
 fi
 
 print_subheader "Secret/token comparisons without timing-safe equality"
-constant_time_compare_hits=$(count_constant_time_compare_matches || echo 0)
-constant_time_compare_hits=$(printf '%s\n' "${constant_time_compare_hits:-0}" | awk 'END{print $0+0}')
-if [ "$constant_time_compare_hits" -gt 0 ]; then
-  print_finding "critical" "$constant_time_compare_hits" "Secret, signature, or token compared with ==/!=" "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures"
-  show_constant_time_compare_examples 3 || true
-  add_finding "critical" "$constant_time_compare_hits" "Secret, signature, or token compared with ==/!=" "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures" "${CATEGORY_NAME[8]}" "$(collect_samples_constant_time_compare 3)"
+constant_time_sample_limit=3
+if [[ "$VERBOSE" -eq 1 ]]; then
+  constant_time_sample_limit="$MAX_DETAILED"
+fi
+if constant_time_compare_hits=$(count_constant_time_compare_matches); then
+  constant_time_compare_hits=$(printf '%s\n' "${constant_time_compare_hits:-0}" | awk 'END{print $0+0}')
+  if [ "$constant_time_compare_hits" -gt 0 ]; then
+    print_finding "critical" "$constant_time_compare_hits" "Secret, signature, or token compared with ==/!=" "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures"
+    show_constant_time_compare_examples "$constant_time_sample_limit" || true
+    add_finding "critical" "$constant_time_compare_hits" "Secret, signature, or token compared with ==/!=" "Use subtle::ConstantTimeEq, ring::constant_time::verify_slices_are_equal, crypto_memcmp, or a reviewed constant-time helper for bearer tokens, HMACs, CSRF values, reset secrets, API keys, and signatures" "${CATEGORY_NAME[8]}" "$(collect_samples_constant_time_compare "$constant_time_sample_limit")"
+  else
+    print_finding "good" "No secret comparisons using ==/!= detected"
+  fi
 else
-  print_finding "good" "No secret comparisons using ==/!= detected"
+  print_finding "warning" 1 "Constant-time comparison scan unavailable" "Install a working python3; UBS did not evaluate timing-unsafe Rust secret comparisons."
+  add_finding "warning" 1 "Constant-time comparison scan unavailable" "Install a working python3; UBS did not evaluate timing-unsafe Rust secret comparisons." "${CATEGORY_NAME[8]}"
 fi
 
 print_subheader "JWT decode, validation bypass, or missing claim binding"

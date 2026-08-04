@@ -48,7 +48,7 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='4d949858d8a9d292e2eaf9768d4536be93346d69604c9f6c3b8ddf2e70bd9ac0'
   [golang]='a2507466d961932e821465de17ca10571f8be010909fb29db1d032e25a604f77'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
-  [js]='7974cff0f75fbb9867aa23be0ebddb43649999e8dc5b41c7c98ae17ea16d02b7'
+  [js]='a5d830749187a69a8cf7147018b169c36f0173e0fc555bd13b862d09926a3898'
   [python]='5c14ebdeb0aeb3e79df8e993b83a47460fccb4a7324d896cc5d2523d09dbeb97'
   [ruby]='2ab4c88bea5f28f27c74762d2618d2713f0fcbf83eb8275d4e52b691250df2e0'
   [rust]='4131087c8538ac15912518088578e49f36d850f85fc663c77d65977a70cb71dd'
@@ -360,6 +360,8 @@ Options:
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
   --category=CSV          Focus on category packs (e.g., resource-lifecycle for AST lifecycle analyzers)
   --comparison=FILE       Baseline JSON to diff combined results against
+                          (reporting only: the diff annotates the shareable
+                          report; exit code still reflects CURRENT totals)
   --report-json=FILE      Write combined summary JSON to FILE
   --html-report=FILE      Emit shareable HTML report to FILE
   --beads-jsonl=FILE      Also write combined findings to JSONL for Beads/strung

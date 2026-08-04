@@ -5683,6 +5683,11 @@ for path in iter_files(root):
         stripped = strip_line_comments(raw).strip()
         if not stripped or stripped.startswith(('*', 'import ', 'export type ', 'type ', 'interface ')):
             continue
+        # Suppression markers live in comments, so they must be tested on the
+        # RAW line (and the line above) -- logical_statement() is built from
+        # comment-stripped text and can never contain the marker (GH #84).
+        if 'ubs:ignore' in raw or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
+            continue
         statement = logical_statement(lines, idx)
         if 'ubs:ignore' in statement:
             continue
@@ -6107,7 +6112,7 @@ for path in candidates:
         if not sink_re.search(line):
             continue
         statement = statement_from(lines, idx)
-        if 'ubs:ignore' in statement:
+        if 'ubs:ignore' in statement or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         context_start = max(0, idx - 8)
         context_lines = [
@@ -6312,7 +6317,7 @@ for path in iter_files(root):
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         if function_boundary_re.search(stripped):
             tainted_vars = {}
@@ -6708,7 +6713,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         statement = statement_from(lines, idx)
         assignment = assignment_re.search(stripped)
@@ -6929,7 +6934,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         statement = statement_from(lines, idx)
         assignment = assignment_re.search(stripped)
@@ -7185,7 +7190,7 @@ def collect_tainted_vars(lines):
     assignments = []
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         statement = statement_from(lines, idx)
         if not statement:
@@ -7254,7 +7259,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped or not candidate_re.search(stripped):
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
         if not statement or 'ubs:ignore' in statement:
@@ -7529,7 +7534,7 @@ def collect_tainted_vars(lines):
     upload_vars = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         statement = statement_from(lines, idx)
         if not statement:
@@ -7602,7 +7607,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped or not candidate_re.search(stripped):
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
         if not statement or 'ubs:ignore' in statement or not sink_re.search(statement):
@@ -8058,7 +8063,7 @@ for path in candidates:
     jwt_objects, decode_names, verify_names = collect_names(lines)
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         if not line_has_candidate_call(stripped, decode_names, verify_names):
             continue
@@ -8205,7 +8210,7 @@ for path in candidates:
     last_issue_idx = -100
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped or not candidate_re.search(stripped):
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
             continue
         context = context_from(lines, idx)
         if not context or 'ubs:ignore' in context or not credentials_true_re.search(context):
@@ -8345,7 +8350,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped:
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]):
             continue
         if not (cookie_call_re.search(stripped) or set_cookie_header_re.search(stripped)):
             continue
@@ -8526,11 +8531,23 @@ def operand_identifiers(operand):
 def is_sensitive_text(text):
     return bool(weak_families(text))
 
+def has_ignore(lines, index):
+    # Suppression markers live in comments, so they must be checked against the
+    # RAW source line (and the line above), never against comment-stripped
+    # text: code_line() removes '// ubs:ignore' before it could ever match.
+    # GH #84: a count-time miss here made suppressed findings still count in
+    # totals and the exit code even though the report line was elided.
+    return (
+        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
+    ) or (
+        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
+    )
+
 def collect_sensitive_vars(lines):
     sensitive_vars = set()
     for idx, raw in enumerate(lines):
         stripped = code_line(raw).strip()
-        if not stripped or 'ubs:ignore' in stripped or '=>' in stripped:
+        if not stripped or has_ignore(lines, idx) or '=>' in stripped:
             continue
         statement = statement_from(lines, idx, max_lines=5)
         if not statement or safe_compare_re.search(statement):
@@ -8623,7 +8640,7 @@ for path in candidates:
     seen_lines = set()
     for idx, raw in enumerate(lines):
         stripped = code_line(raw).strip()
-        if not stripped or 'ubs:ignore' in stripped or ('==' not in stripped and '!=' not in stripped):
+        if not stripped or has_ignore(lines, idx) or ('==' not in stripped and '!=' not in stripped):
             continue
         statement = statement_from(lines, idx)
         if not statement or not unsafe_secret_compare(statement, sensitive_vars):
@@ -8770,7 +8787,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped or not math_random_re.search(stripped):
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not math_random_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
         if not statement or 'ubs:ignore' in statement:
@@ -8903,7 +8920,7 @@ for path in candidates:
     seen_lines = set()
     for idx, line in enumerate(lines):
         stripped = code_line(line).strip()
-        if not stripped or 'ubs:ignore' in stripped or not candidate_re.search(stripped):
+        if not stripped or 'ubs:ignore' in line or (idx > 0 and 'ubs:ignore' in lines[idx - 1]) or not candidate_re.search(stripped):
             continue
         statement = statement_from(lines, idx)
         if not statement or 'ubs:ignore' in statement:

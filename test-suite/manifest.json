@@ -4932,6 +4932,67 @@
       }
     },
     {
+      "id": "js-typescript-secret-compare-suppression-buggy",
+      "description": "GH #84 control: an unsuppressed timing-unsafe token comparison must be reported and counted in totals and the exit code.",
+      "path": "test-suite/js/security/secret-compare-suppression-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "suppression",
+        "exit-code",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "js-typescript-secret-compare-suppression-clean",
+      "description": "GH #84 regression: a trailing ubs:ignore on a flagged secret comparison must be excluded from totals, per-severity counts, and the exit code -- not merely elided from the report.",
+      "path": "test-suite/js/security/secret-compare-suppression-clean.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "security",
+        "suppression",
+        "exit-code",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "js-typescript-archive-provenance-buggy",
       "description": "Archive entries with real archive-library provenance (adm-zip getEntries) joined into destinations stay reported.",
       "path": "test-suite/js/security/archive-provenance-buggy.ts",

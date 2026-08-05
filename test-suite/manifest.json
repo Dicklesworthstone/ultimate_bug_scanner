@@ -8598,6 +8598,34 @@
       }
     },
     {
+      "id": "rust-parser-token-compare-buggy",
+      "description": "GH #85 positive control: qualified security vocabulary (session_token, api_key, auth_token aliases) must still trigger the constant-time comparison detector after the parser-vocabulary tightening.",
+      "path": "test-suite/rust/buggy/parser_token_compare.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "constant-time",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 3
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "rust-parser-token-compare-clean",
       "description": "GH #85: parser/domain vocabulary (parser token iterators, layout markers, session_id, signature_format, credential_type, jwt_header, map keys) must not trigger the constant-time comparison detector.",
       "path": "test-suite/rust/clean/parser_token_compare.rs",

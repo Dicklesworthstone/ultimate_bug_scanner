@@ -8598,6 +8598,38 @@
       }
     },
     {
+      "id": "rust-parser-token-compare-clean",
+      "description": "GH #85: parser/domain vocabulary (parser token iterators, layout markers, session_id, signature_format, credential_type, jwt_header, map keys) must not trigger the constant-time comparison detector.",
+      "path": "test-suite/rust/clean/parser_token_compare.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "constant-time",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "rust-jwt-verification-buggy",
       "description": "Rust JWT code should not decode claims without verification, disable signature/expiration/audience validation, or accept tokens without issuer/audience binding.",
       "path": "test-suite/rust/buggy/jwt_verification.rs",

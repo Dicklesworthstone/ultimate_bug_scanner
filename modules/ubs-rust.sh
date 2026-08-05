@@ -5744,17 +5744,35 @@ safe_compare_re = re.compile(
     r"|\bring::constant_time::verify_slices_are_equal\s*\(",
     re.IGNORECASE,
 )
-sensitive_re = re.compile(
-    r"(?:"
-    r"\b(?:token|secret|signature|sig|hmac|mac|digest|csrf|xsrf|nonce|otp|totp|mfa|reset|"
-    r"password|passwd|pwd|auth|bearer|credential|session|jwt|webhook|invite|"
-    r"verification|recovery)\b|"
-    r"\bapi\s+key\b|"
-    r"\bauthorization\b|"
-    r"\bx-signature\b"
-    r")",
-    re.IGNORECASE,
-)
+# GH #85: two-tier vocabulary. Strong terms are security-sensitive on their
+# own (unless immediately followed by schema/metadata vocabulary such as
+# "signature_format" or "credential_type"). Weak terms (token, key, digest,
+# nonce, session, ...) are ordinary parser/domain vocabulary and only become
+# sensitive when combined with a security qualifier (auth_token, api_key,
+# session_token, webhook_signature, ...). This stops a bare parser `token`
+# from tainting comparisons like `candidate == "BR2"`.
+strong_terms = {
+    "secret", "password", "passwd", "pwd", "bearer", "hmac", "csrf", "xsrf",
+    "otp", "totp", "mfa", "signature", "sig", "credential", "credentials",
+    "authorization", "jwt",
+}
+weak_terms = {
+    "token", "key", "mac", "digest", "nonce", "session", "auth", "reset",
+    "webhook", "invite", "verification", "recovery",
+}
+qualifier_terms = {
+    "api", "auth", "access", "refresh", "session", "reset", "recovery",
+    "verification", "invite", "jwt", "csrf", "xsrf", "webhook", "hmac",
+    "bearer", "secret", "signing", "signature", "private", "otp", "totp",
+    "mfa", "password", "passwd", "pwd", "credential", "credentials",
+}
+metadata_terms = {
+    "field", "format", "kind", "layout", "policy", "schema", "state",
+    "status", "type", "mode", "scheme", "parser", "alg", "algorithm",
+    "aud", "audience", "claim", "claims", "exp", "expiration", "header",
+    "headers", "issuer", "iss", "kid", "name", "label", "id", "index",
+    "count", "len", "length",
+}
 nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
 shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")
 pure_string_literal_re = re.compile(r'^\s*(?:"(?:\\.|[^"\\])*"|r#*"[^"]*"#*|b"(?:\\.|[^"\\])*")\s*$')
@@ -5864,7 +5882,19 @@ def split_identifier_terms(text: str) -> str:
 
 
 def is_sensitive_text(text: str) -> bool:
-    return bool(sensitive_re.search(split_identifier_terms(text)))
+    terms = re.findall(r"[a-z0-9]+", split_identifier_terms(text).lower())
+    for idx, term in enumerate(terms):
+        if term in strong_terms:
+            follower = terms[idx + 1] if idx + 1 < len(terms) else ""
+            if follower not in metadata_terms:
+                return True
+            continue
+        if term in weak_terms and any(
+            other_idx != idx and other in qualifier_terms
+            for other_idx, other in enumerate(terms)
+        ):
+            return True
+    return False
 
 
 def is_sensitive_operand_text(text: str) -> bool:

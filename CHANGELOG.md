@@ -8,6 +8,28 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.8] - 2026-08-04 [Release]
+
+### Fixes
+
+- **#68 — "nothing was checked" is no longer a pass.** When no scanner actually ran (unsupported-language-only trees, module resolution failures), the meta-runner now exits with a distinct code `3` no-scan contract instead of a green exit `0`, so CI gates cannot silently pass on an empty scan.
+- **#69/#71 — `--emit-findings-json` emits valid JSON for samples containing double quotes and control characters** (Rust module); two golden cases (`rust-findings-json-escaping`, `rust-findings-json-control-chars`) pin the escaping.
+- **#70 — the Rust module's embedded analyzers consume the module's authoritative filtered file list** (`--exclude` / `--strict-gitignore` / `--exclude-tests`) instead of re-walking the tree, with new `exclude_dirs` / `exclude_tests_mod` fixture pairs pinning both directions.
+- **#75 — scanner exclusions are forwarded to the JS/TS type-narrowing helper**, so excluded paths can no longer resurface as narrowing findings.
+- **#76 — `continue`/`break` are treated as guard exits in TS type narrowing** (both the compiler-API path and the single-line fallback analyzer), eliminating false "possibly undefined" reports after early-continue guards.
+- **#77 — inline `ubs:ignore` is honored on archive entry-path findings** in the JS analyzer.
+- **#79 — `--version` reports the UBS install's own git suffix, not the caller's cwd**, pinned by a version-identity check in `test_meta_runner_modes.py`.
+- **#81 — Elixir/Ruby scanned-file counts no longer depend on awk NUL handling**, restoring correct per-module file totals.
+- **#84 — inline `ubs:ignore` suppressions drop from JS totals at count time**, so a fully suppressed file yields exit `0` instead of a nonzero exit with phantom counts (reported via the Homebrew tap install).
+- **#85 — parser/domain vocabulary no longer triggers the Rust constant-time comparison detector.** The detector's sensitivity vocabulary is now two-tier: strong terms (`secret`, `password`, `signature`, `csrf`, `hmac`, ...) fire standalone unless followed by schema/metadata vocabulary (`signature_format`, `credential_type`, `jwt_header`), while weak parser/domain vocabulary (`token`, `key`, `digest`, `nonce`, `session`, ...) requires a security qualifier (`auth_token`, `api_key`, `session_token`). A bare parser `token` iterator can no longer taint comparisons like `candidate == "BR2"` (the NAIC bond-holdings parser false positive reported in PR #85; implemented independently per the no-outside-contributions policy). New fixture `test-suite/rust/clean/parser_token_compare.rs` pins the family.
+- The JS type-narrowing helper now tolerates `typescript` packages that lack the compiler API, falling back to the heuristic analyzer instead of erroring.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.8`; `MODULE_CHECKSUMS`, `HELPER_CHECKSUMS`, and `SHA256SUMS` regenerated against the final `5.3.8` bytes so `scripts/check-version-tag-drift.sh` holds once `v5.3.8` is tagged.
+
+---
+
 ## [v5.3.7] - 2026-07-23
 
 ### Fixes

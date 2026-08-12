@@ -28,6 +28,9 @@ temp/
 .beads/last-touched
 .beads/.bv.lock
 .beads/.local_version
+.beads/.write.lock
+.beads/.sync.lock
+.beads/.br-*-write-*.lock
 .beads/daemon.lock
 .beads/daemon.log
 .beads/daemon-*.log

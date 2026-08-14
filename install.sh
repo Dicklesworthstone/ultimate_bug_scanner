@@ -6,8 +6,9 @@ shopt -s lastpipe 2>/dev/null || true
 # Ultimate Bug Scanner - Installation Script
 # https://github.com/Dicklesworthstone/ultimate_bug_scanner
 
-# Always present latest main version to users; actual binary will be fetched
-# from main branch (not releases). VERSION is cosmetic only.
+# VERSION selects which release's artifacts get installed. From a repo
+# checkout it comes from the VERSION file (pinned tag); when the script is
+# piped from curl it stays "main", which maps to the latest release below.
 VERSION_DEFAULT="main"
 
 # Handle case when script is piped (BASH_SOURCE[0] not set)
@@ -20,7 +21,14 @@ fi
 SCRIPT_NAME="ubs"
 INSTALL_NAME="ubs"
 REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main"
-ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
+# Release artifacts are the trust anchor for downloads (issue #87). When the
+# installer runs from a repo checkout, pin to the checkout's VERSION tag;
+# when piped from curl (VERSION="main"), use GitHub's latest-release alias.
+if [[ "$VERSION" == "main" ]]; then
+  ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/latest/download"
+else
+  ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
+fi
 ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
 MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
 
@@ -491,25 +499,10 @@ fetch_checksum_bundle() {
   local err
   err=$(mktemp_in_workdir "checksums.err.XXXXXX")
 
-  log "Fetching signed checksums from release artifacts..."
+  log "Fetching release checksums from ${ARTIFACT_BASE}..."
   if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS" "$sums" "$err"; then
     log_network_failure "Failed to download SHA256SUMS from ${ARTIFACT_BASE}" "$err"
     error "Checksum download failed. Use --insecure to bypass (not recommended)."
-    exit 1
-  fi
-  if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS.minisig" "$sig" "$err"; then
-    log_network_failure "Failed to download SHA256SUMS.minisig from ${ARTIFACT_BASE}" "$err"
-    error "Checksum signature download failed. Use --insecure to bypass (not recommended)."
-    exit 1
-  fi
-
-  if [ -z "$MINISIGN_PUBKEY" ]; then
-    error "MINISIGN public key not configured. Set UBS_MINISIGN_PUBKEY or rerun with --insecure."
-    exit 1
-  fi
-
-  if ! command -v minisign >/dev/null 2>&1; then
-    error "minisign is required for signature verification (install via your package manager)."
     exit 1
   fi
 
@@ -518,14 +511,30 @@ fetch_checksum_bundle() {
     exit 1
   fi
 
-  if minisign -Vm "$sums" -P "$MINISIGN_PUBKEY" -x "$sig" >/dev/null 2>&1; then
-    CHECKSUM_FILE="$sums"
-    CHECKSUM_SIG_FILE="$sig"
-    success "Checksum signature verified"
+  if [ -n "$MINISIGN_PUBKEY" ]; then
+    # A configured public key makes signature verification mandatory: any
+    # failure past this point aborts the install (fail closed).
+    if ! command -v minisign >/dev/null 2>&1; then
+      error "minisign is required for signature verification (install via your package manager)."
+      exit 1
+    fi
+    if ! secure_fetch "${ARTIFACT_BASE}/SHA256SUMS.minisig" "$sig" "$err"; then
+      log_network_failure "Failed to download SHA256SUMS.minisig from ${ARTIFACT_BASE}" "$err"
+      error "Checksum signature download failed. Use --insecure to bypass (not recommended)."
+      exit 1
+    fi
+    if minisign -Vm "$sums" -P "$MINISIGN_PUBKEY" -x "$sig" >/dev/null 2>&1; then
+      CHECKSUM_SIG_FILE="$sig"
+      success "Checksum signature verified"
+    else
+      error "Signature verification failed for SHA256SUMS"
+      exit 1
+    fi
   else
-    error "Signature verification failed for SHA256SUMS"
-    exit 1
+    warn "UBS_MINISIGN_PUBKEY not set — skipping signature verification (release-pinned checksums still enforced)"
   fi
+
+  CHECKSUM_FILE="$sums"
 }
 
 verify_download_checksum() {
@@ -2514,14 +2523,34 @@ install_scanner() {
       error "Failed to copy local file"
       return 1
     fi
-  else
-      log "Downloading from GitHub main..."
+  elif [ "$RUN_VERIFICATION" -eq 1 ] && [ "$INSECURE" -eq 0 ]; then
+      # Secure path (issue #87): install the release-pinned artifact and
+      # verify it against the release SHA256SUMS (minisign-verified when
+      # UBS_MINISIGN_PUBKEY is configured). Any fetch or verification
+      # failure aborts — no silent fallback to unverified sources.
+      log "Downloading release artifact from ${ARTIFACT_BASE}..."
+
+      fetch_checksum_bundle
+
+      if download_to_file "${ARTIFACT_BASE}/${SCRIPT_NAME}" "$temp_path"; then
+        log "Downloaded successfully"
+      else
+        error "Download failed from ${ARTIFACT_BASE}/${SCRIPT_NAME}. Check $download_err"
+        error "Refusing to fall back to unverified sources. Use --insecure to bypass (not recommended)."
+        rm -f "$temp_path"
+        return 1
+      fi
+
+      verify_download_checksum "$temp_path" "$SCRIPT_NAME"
+    else
+      # Explicit opt-out (--insecure / --skip-verification): legacy behavior,
+      # unpinned and unverified main.
+      warn "Checksum verification skipped (--insecure set)"
+      warn "Downloading unverified ${SCRIPT_NAME} from GitHub main..."
 
       # Append cache-buster so users never get stale CDN copies
       local cache_buster="$(date +%s)"
       local download_url="${REPO_URL}/${SCRIPT_NAME}?cache=${cache_buster}"
-      local sums_url="${REPO_URL}/SHA256SUMS?cache=${cache_buster}"
-      local sums_file="$WORKDIR/SHA256SUMS"
 
       if download_to_file "$download_url" "$temp_path"; then
         log "Downloaded successfully"
@@ -2529,42 +2558,6 @@ install_scanner() {
         error "Download failed. Check $download_err"
         rm -f "$temp_path"
         return 1
-      fi
-
-      # Always verify against main checksums unless --insecure
-      if [ "$RUN_VERIFICATION" -eq 1 ] && [ "$INSECURE" -eq 0 ]; then
-        log "Verifying checksum against main..."
-        if download_to_file "$sums_url" "$sums_file"; then
-          local expected_sum
-          expected_sum=$(grep "  ${SCRIPT_NAME}$" "$sums_file" | awk '{print $1}') || true
-          if [[ -z "$expected_sum" ]]; then
-            error "Checksum entry for ${SCRIPT_NAME} not found in SHA256SUMS"
-            rm -f "$temp_path"
-            return 1
-          fi
-
-          local actual_sum
-          if ! actual_sum="$(compute_sha256 "$temp_path")"; then
-            error "No SHA256 tool found (need sha256sum, shasum, or openssl) to verify downloads."
-            error "Rerun with --insecure to bypass checksum verification (not recommended)."
-            rm -f "$temp_path"
-            return 1
-          fi
-
-          if [[ "$expected_sum" == "$actual_sum" ]]; then
-            success "Checksum verified"
-          else
-            error "Checksum mismatch! Expected: $expected_sum, Got: $actual_sum"
-            rm -f "$temp_path"
-            return 1
-          fi
-        else
-          error "Could not download SHA256SUMS from main"
-          rm -f "$temp_path"
-          return 1
-        fi
-      else
-        warn "Checksum verification skipped (--insecure set)"
       fi
     fi
 

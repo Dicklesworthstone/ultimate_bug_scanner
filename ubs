@@ -367,7 +367,8 @@ Options:
   --beads-jsonl=FILE      Also write combined findings to JSONL for Beads/strung
   --jsonl-summary-only    JSONL output: emit only summary counts, no individual findings
   --suggest-ignore        Print large-directory ignore suggestions (without modifying files)
-  --update                Update the installed ubs binary and exit
+  --update                Update the installed ubs binary from the latest
+                          verified release and exit (nonzero on failure)
   --non-interactive       No-op (accepted for installer/cron compatibility)
   --update-modules        Force re-download of modules before run
   --jobs=N                Parallelism hint (passed to children if supported)
@@ -2267,6 +2268,32 @@ ensure_module(){
 # ─────────────────────────────────────────────────────────────────────────────
 # Self-update logic
 # ─────────────────────────────────────────────────────────────────────────────
+# Report a self-update failure. Forced updates (`ubs --update`) must surface
+# failures as a nonzero exit status (issue #87); the opt-in background check
+# must never break a scan, so it warns and reports success.
+self_update_fail(){
+  local msg="$1"
+  if [[ "${FORCE_SELF_UPDATE:-0}" -eq 1 ]]; then
+    say_err "${RED}${X}${RESET} Self-update failed: ${msg}"
+    return 1
+  fi
+  if [[ "${QUIET:-0}" -eq 0 ]]; then
+    say_err "${YELLOW}${WARN}${RESET} Self-update skipped: ${msg}"
+  fi
+  return 0
+}
+
+self_update_fetch(){
+  # $1 = url, $2 = output file
+  if need_cmd curl; then
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -o "$2" "$1" 2>/dev/null
+  elif need_cmd wget; then
+    wget --https-only -q -O "$2" "$1" 2>/dev/null
+  else
+    return 1
+  fi
+}
+
 check_and_update_self(){
   # Auto-update is opt-in (security-first). Enable by setting:
   #   UBS_ENABLE_AUTO_UPDATE=1
@@ -2275,19 +2302,28 @@ check_and_update_self(){
     [[ "${UBS_ENABLE_AUTO_UPDATE:-0}" -eq 1 ]] || return 0
     if [[ "${UBS_NO_AUTO_UPDATE:-0}" -eq 1 || "${CI_MODE:-0}" -eq 1 ]]; then return 0; fi
   fi
-  
+
   # Only update if we're running the installed binary (not a local repo script)
   # Heuristic: if the script dir contains .git, we're likely in a dev environment
-  if [[ -d "$(script_dir)/.git" ]]; then return 0; fi
+  if [[ -d "$(script_dir)/.git" ]]; then
+    if [[ "${FORCE_SELF_UPDATE:-0}" -eq 1 && "${QUIET:-0}" -eq 0 ]]; then
+      say_err "${BLUE}${INFO}${RESET} Development checkout detected; use git pull instead of --update."
+    fi
+    return 0
+  fi
 
   # Or if we are not writable
-  if [[ ! -w "$0" ]]; then return 0; fi
+  if [[ ! -w "$0" ]]; then
+    self_update_fail "installed binary is not writable: $0 (re-run with sufficient permissions)"
+    return $?
+  fi
 
   local self_path="$0"
-  # Self-update intentionally probes main (REPO_RAW_LATEST) rather than
-  # the release-pinned REPO_RAW — otherwise we'd compare against our
-  # own pinned tag and never see a newer release.
-  local remote_url="$REPO_RAW_LATEST/ubs"
+  # Self-update pulls from the latest *release* artifacts and verifies the
+  # payload against the release SHA256SUMS (plus its minisign signature when
+  # UBS_MINISIGN_PUBKEY is configured) before replacing this script.
+  # Issue #87: it previously fetched unpinned, unverified main.
+  local release_base="${UBS_RELEASE_BASE:-https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/latest/download}"
   local last_check_file="${XDG_CACHE_HOME:-$HOME/.cache}/ubs/last_update_check"
   ensure_dir "$(dirname "$last_check_file")"
 
@@ -2303,36 +2339,94 @@ check_and_update_self(){
   fi
 
   if [[ "${QUIET:-0}" -eq 0 ]]; then
-    say_err "${DIM}Checking for updates...${RESET}"
+    say_err "${DIM}Checking for updates (latest release)...${RESET}"
   fi
 
-  # Fetch remote version string or hash from the script itself
-  # We look for UBS_VERSION="X.Y.Z"
-  local remote_content
-  if need_cmd curl; then
-    remote_content=$(curl -fsSL "$remote_url") || return 0
-  elif need_cmd wget; then
-    remote_content=$(wget -qO- "$remote_url") || return 0
-  else
-    return 0
+  if ! need_cmd curl && ! need_cmd wget; then
+    self_update_fail "neither curl nor wget is available"
+    return $?
+  fi
+
+  local work_dir
+  work_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-selfupdate.XXXXXX 2>/dev/null)" || {
+    self_update_fail "cannot create temporary directory"
+    return $?
+  }
+  # shellcheck disable=SC2064
+  trap "rm -f '$work_dir/SHA256SUMS' '$work_dir/SHA256SUMS.minisig' '$work_dir/ubs'; rmdir '$work_dir' 2>/dev/null" RETURN
+
+  # 1. Fetch the release checksum manifest (fail closed — no manifest, no update).
+  local sums_file="$work_dir/SHA256SUMS"
+  if ! self_update_fetch "$release_base/SHA256SUMS" "$sums_file" || [[ ! -s "$sums_file" ]]; then
+    self_update_fail "could not download SHA256SUMS from $release_base"
+    return $?
+  fi
+
+  # 2. Verify the manifest signature when a minisign public key is configured.
+  if [[ -n "${UBS_MINISIGN_PUBKEY:-}" ]]; then
+    if ! need_cmd minisign; then
+      self_update_fail "UBS_MINISIGN_PUBKEY is set but minisign is not installed"
+      return $?
+    fi
+    local sig_file="$work_dir/SHA256SUMS.minisig"
+    if ! self_update_fetch "$release_base/SHA256SUMS.minisig" "$sig_file" || [[ ! -s "$sig_file" ]]; then
+      self_update_fail "could not download SHA256SUMS.minisig from $release_base"
+      return $?
+    fi
+    if ! minisign -Vm "$sums_file" -P "$UBS_MINISIGN_PUBKEY" -x "$sig_file" >/dev/null 2>&1; then
+      self_update_fail "minisign signature verification failed for SHA256SUMS"
+      return $?
+    fi
+  fi
+
+  local expected_sum
+  expected_sum="$(grep -E "  ubs$" "$sums_file" | head -n1 | awk '{print $1}')"
+  if [[ -z "$expected_sum" ]]; then
+    self_update_fail "no entry for 'ubs' in release SHA256SUMS"
+    return $?
+  fi
+
+  # 3. Fetch the release ubs payload and verify it against the manifest.
+  local new_self="$work_dir/ubs"
+  if ! self_update_fetch "$release_base/ubs" "$new_self" || [[ ! -s "$new_self" ]]; then
+    self_update_fail "could not download ubs from $release_base"
+    return $?
+  fi
+  local actual_sum
+  if ! actual_sum="$(compute_sha256 "$new_self")" || [[ -z "$actual_sum" ]]; then
+    self_update_fail "no sha256 tool available (need sha256sum, shasum, or openssl)"
+    return $?
+  fi
+  if [[ "$actual_sum" != "$expected_sum" ]]; then
+    self_update_fail "checksum mismatch for downloaded ubs (expected $expected_sum, got $actual_sum)"
+    return $?
   fi
 
   local remote_version
-  remote_version=$(printf '%s' "$remote_content" | grep -oE 'UBS_VERSION="[0-9.]+"' | head -n1 | cut -d'"' -f2)
-  
-  if [[ -z "$remote_version" ]]; then return 0; fi
+  remote_version=$(grep -oE 'UBS_VERSION="[0-9.]+"' "$new_self" | head -n1 | cut -d'"' -f2)
+  if [[ -z "$remote_version" ]]; then
+    self_update_fail "could not parse UBS_VERSION from downloaded release"
+    return $?
+  fi
 
   if [[ "$remote_version" != "$UBS_VERSION" ]]; then
     if [[ "${QUIET:-0}" -eq 0 ]]; then
-      say_err "${BLUE}${INFO}${RESET} Updating ubs from ${UBS_VERSION} to ${remote_version}..."
+      say_err "${BLUE}${INFO}${RESET} Updating ubs from ${UBS_VERSION} to ${remote_version} (verified release)..."
     fi
-    
-    # Write new content to temp file
+
+    # Stage next to the target so the final mv is atomic (same filesystem).
     local tmp_self
-    tmp_self="$(mktemp -t ubs-self.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-self.XXXXXX" 2>/dev/null)"
-    printf '%s' "$remote_content" > "$tmp_self"
-    chmod +x "$tmp_self"
-    
+    if ! tmp_self="$(mktemp "${self_path}.XXXXXX" 2>/dev/null)"; then
+      self_update_fail "cannot stage update next to $self_path (directory not writable?)"
+      return $?
+    fi
+    if ! cp "$new_self" "$tmp_self" 2>/dev/null; then
+      rm -f "$tmp_self"
+      self_update_fail "failed to stage verified update"
+      return $?
+    fi
+    chmod +x "$tmp_self" 2>/dev/null || true
+
     # Move over current script
     if mv "$tmp_self" "$self_path"; then
       if [[ "${QUIET:-0}" -eq 0 ]]; then
@@ -2340,13 +2434,21 @@ check_and_update_self(){
       fi
       # Update check timestamp
       date +%s > "$last_check_file"
+      # Clean up staged artifacts now: exec replaces the process, so the
+      # RETURN trap below never fires on this path.
+      rm -f "$work_dir/SHA256SUMS" "$work_dir/SHA256SUMS.minisig" "$work_dir/ubs"
+      rmdir "$work_dir" 2>/dev/null || true
       # Re-exec self to run the new version
       exec "$self_path" "$@"
     else
       rm -f "$tmp_self"
-      say_err "${YELLOW}${WARN}${RESET} Failed to update ubs binary."
+      self_update_fail "failed to replace $self_path"
+      return $?
     fi
   else
+    if [[ "${FORCE_SELF_UPDATE:-0}" -eq 1 && "${QUIET:-0}" -eq 0 ]]; then
+      say_err "${GREEN}${CHECK}${RESET} Already up to date (v${UBS_VERSION})."
+    fi
     # Update check timestamp even if no update found
     date +%s > "$last_check_file"
   fi
@@ -2360,12 +2462,23 @@ if [[ "$MODE" == "doctor" ]]; then
   exit $?
 fi
 
-# Run auto-update before main logic
-check_and_update_self "$@"
+# Run auto-update before main logic. `ubs --update` must exit nonzero when
+# the update could not be performed or verified (issue #87); the opt-in
+# background check reports success so it never breaks a scan.
+SELF_UPDATE_STATUS=0
+check_and_update_self "$@" || SELF_UPDATE_STATUS=$?
 
 if [[ "$UPDATE_ONLY" -eq 1 ]]; then
-  [[ "${QUIET:-0}" -eq 0 ]] && say_err "${GREEN}${CHECK}${RESET} Update check complete."
-  exit 0
+  if [[ "$SELF_UPDATE_STATUS" -eq 0 ]]; then
+    if [[ "${QUIET:-0}" -eq 0 ]]; then
+      say_err "${GREEN}${CHECK}${RESET} Update check complete."
+    fi
+  else
+    if [[ "${QUIET:-0}" -eq 0 ]]; then
+      say_err "${RED}${X}${RESET} Update failed (exit ${SELF_UPDATE_STATUS})."
+    fi
+  fi
+  exit "$SELF_UPDATE_STATUS"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

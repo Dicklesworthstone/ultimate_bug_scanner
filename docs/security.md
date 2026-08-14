@@ -13,6 +13,8 @@ This document captures the threat model for the UBS installer, module downloads,
 ## Controls
 
 - **Signed checksums for installers**: `SHA256SUMS` is signed with minisign. `scripts/verify.sh` verifies the signature + checksum before executing `install.sh`.
+- **Release-pinned installs**: `install.sh` downloads `ubs` from the release artifacts (never raw `main`) and verifies it against the release `SHA256SUMS` before installing. When `UBS_MINISIGN_PUBKEY` is set, the checksum manifest's minisign signature is verified as well and any failure aborts. The only opt-out is the explicit `--insecure` / `--skip-verification` flag.
+- **Verified self-update**: `ubs --update` (and the opt-in background check) pulls the latest **release** artifacts, verifies the payload against the release `SHA256SUMS` (plus minisign when `UBS_MINISIGN_PUBKEY` is set), and replaces the binary atomically. `ubs --update` exits nonzero when the update cannot be fetched or verified.
 - **Cosign keyless signing for OCI**: Images are signed by digest (not tag) and stored in the Rekor transparency log. SBOM + SLSA provenance attestations are attached to the same digest.
 - **Immutable references in workflows**: release and OCI workflows sign by digest and avoid mutable tag signing.
 - **Module integrity**: the `ubs` meta-runner embeds SHA-256 checksums for each language module and helper asset. Downloads are verified before execution; invalid checksums fail closed. `ubs doctor --fix` redownloads verified modules and helpers.

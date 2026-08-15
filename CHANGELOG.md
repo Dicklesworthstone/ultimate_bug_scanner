@@ -8,6 +8,22 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.9] - 2026-08-15 [Release]
+
+### Security
+
+- **#87 — the install path and self-update now actually verify signed release artifacts.** Three gaps closed by `bf8b92d`:
+  - `install.sh`'s live install path previously fetched `ubs` **and** its `SHA256SUMS` from the same unpinned `main` branch (self-referential, so not independent verification) while the correct verification functions sat as dead code. The installer now downloads `ubs` from the **release artifacts** (release-pinned via `VERSION`, or GitHub's `releases/latest/download` alias when piped from curl) and verifies it through `fetch_checksum_bundle` + `verify_download_checksum`; unfetchable or mismatched checksums abort with a clear error — no silent fallback to unverified sources. When `UBS_MINISIGN_PUBKEY` is set, the `SHA256SUMS` minisign signature is verified as well.
+  - `ubs --update` no longer swallows failures: fetch or verification errors propagate as a nonzero exit instead of always exiting `0`.
+  - Self-update no longer overwrites `$0` with unpinned, unverified `main` content — it is pinned to release artifacts and verified against the release `SHA256SUMS` before the binary is atomically replaced.
+- This release exists so the fix is user-visible: the hardened installer/self-updater only reaches users through release artifacts, which v5.3.9 provides.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.9`; `SHA256SUMS` regenerated against the final `5.3.9` bytes so `scripts/check-version-tag-drift.sh` holds once `v5.3.9` is tagged (modules/helpers are unchanged since v5.3.8).
+
+---
+
 ## [v5.3.8] - 2026-08-04 [Release]
 
 ### Fixes

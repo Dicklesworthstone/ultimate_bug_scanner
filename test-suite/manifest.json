@@ -290,7 +290,7 @@
           }
         },
         "require_substrings": [
-          "Preparing shadow workspace for 2 specified file(s)"
+          "Preparing shadow workspace for 2 file(s) and 0 directory target(s)"
         ]
       }
     },

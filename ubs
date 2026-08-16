@@ -317,7 +317,8 @@ REPORT_JSON_PATH=""
 HTML_REPORT_PATH=""
 SHAREABLE_MODE=0
 GIT_MODE=""  # staged, diff, or empty
-SCAN_FILES=()  # explicit file list from --files or multiple positional args
+SCAN_FILES=()  # explicit target list from --files or multiple positional args (files and/or directories)
+POSITIONAL_TARGETS=()  # raw positional path args; classified after the parse loop (issue #88)
 GIT_REMOTE_URL=""
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
@@ -343,7 +344,7 @@ fi
 usage() {
   cat <<USAGE >&2
 Usage: ubs [options] [PROJECT_DIR]
-       ubs [options] FILE1 FILE2 ...
+       ubs [options] PATH1 PATH2 ...            (files and/or directories; union scan)
        ubs --files FILE1,FILE2,... [options] [PROJECT_DIR]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
@@ -623,20 +624,23 @@ else
         shift;;
       -h|--help) usage; exit 0;;
       *)
-        if [[ "$PROJECT_DIR" == "." ]]; then
-          # First positional arg: could be a directory OR a file
-          if [[ -d "$1" ]]; then
-            PROJECT_DIR="$1"
-          else
-            SCAN_FILES+=("$1")
-          fi
-        else
-          # Additional positional args: accumulate as files
-          SCAN_FILES+=("$1")
-        fi
+        # Positional path args are classified after the loop, once we know how
+        # many there are (issue #88): deciding per-arg made `ubs src/ test/`
+        # treat test/ as an explicit FILE and die with "file not found".
+        POSITIONAL_TARGETS+=("$1")
         shift;;
     esac
   done
+  # Classify positional targets (issue #88):
+  #   - exactly one directory  -> classic whole-project scan (PROJECT_DIR)
+  #   - anything else          -> explicit target list; files AND directories
+  #     are allowed and their union is scanned from a shadow workspace rooted
+  #     at the current directory (see prepare_files_workspace).
+  if [[ ${#POSITIONAL_TARGETS[@]} -eq 1 && -d "${POSITIONAL_TARGETS[0]}" ]]; then
+    PROJECT_DIR="${POSITIONAL_TARGETS[0]}"
+  elif [[ ${#POSITIONAL_TARGETS[@]} -gt 0 ]]; then
+    SCAN_FILES+=("${POSITIONAL_TARGETS[@]}")
+  fi
   if [[ "$UPDATE_ONLY" -eq 1 ]]; then
     PROJECT_DIR="$(pwd -P)"
   else
@@ -1109,49 +1113,70 @@ for line in sys.stdin:
   fi
 }
 
-# Copy an explicit list of files (from --files or multiple positional args)
-# into a shadow workspace so the rest of the pipeline scans only those files.
+# Copy an explicit list of targets (from --files or multiple positional args)
+# into a shadow workspace so the rest of the pipeline scans only those paths.
+# Targets may be files OR directories (issue #88): files are copied verbatim
+# (explicitly named files always win, even if an ignore pattern matches them),
+# while directories are copied recursively with the global ignore patterns
+# applied — matching the semantics of a whole-project scan of that directory.
 prepare_files_workspace(){
   local scan_root="$SOURCE_PROJECT_DIR"
   if [[ -f "$scan_root" ]]; then
     scan_root="$(dirname "$scan_root")"
   fi
 
-  # Resolve each path relative to scan_root; reject missing files
-  local resolved=()
-  local f rel
+  # Resolve each path relative to scan_root; reject missing targets
+  local resolved_files=() dir_src=() dir_rel=()
+  local f rel abs
   for f in "${SCAN_FILES[@]}"; do
     [[ -z "$f" ]] && continue
     if [[ "$f" == /* ]]; then
       # Absolute path — make it relative to scan_root
-      if [[ -f "$f" ]]; then
+      if [[ -e "$f" ]]; then
         rel="${f#"$scan_root"/}"
-        resolved+=("$rel")
       else
-        say "${RED}$X file not found${RESET}: $f"
+        say "${RED}$X scan target not found${RESET}: $f"
         exit 2
       fi
-    elif [[ -f "$scan_root/$f" ]]; then
-      resolved+=("$f")
-    elif [[ -f "$f" ]]; then
+    elif [[ -e "$scan_root/$f" ]]; then
+      rel="$f"
+      f="$scan_root/$f"
+    elif [[ -e "$f" ]]; then
       # Relative to cwd, convert to relative to scan_root
-      local abs
       abs="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"
       rel="${abs#"$scan_root"/}"
-      resolved+=("$rel")
+      f="$abs"
     else
-      say "${RED}$X file not found${RESET}: $f"
+      say "${RED}$X scan target not found${RESET}: $f"
       exit 2
+    fi
+    if [[ -d "$f" ]]; then
+      # Guard directory targets with the same size ceiling as whole-project
+      # scans: the shadow-workspace copy can exhaust /tmp (issue #12).
+      if [[ "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 ]]; then
+        local dsize
+        dsize="$(dir_size_mb_filtered "$f" "$GLOBAL_EXCLUDE_PATTERNS")"
+        if [[ "$dsize" -gt "$MAX_DIR_SIZE_MB" ]]; then
+          say "${RED}${X}${RESET} ${BOLD}Directory target too large (after ignores)${RESET}: $f is ${dsize}MB, limit ${MAX_DIR_SIZE_MB}MB"
+          say "${DIM}Increase with UBS_MAX_DIR_SIZE_MB=N or disable with UBS_MAX_DIR_SIZE_MB=0.${RESET}"
+          exit 2
+        fi
+      fi
+      dir_src+=("$f")
+      rel="${rel%/}"
+      dir_rel+=("${rel#/}")
+    else
+      resolved_files+=("$rel")
     fi
   done
 
-  if [[ ${#resolved[@]} -eq 0 ]]; then
-    say "${RED}$X no valid files specified for explicit file scan${RESET}"
+  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} )) -eq 0 ]]; then
+    say "${RED}$X no valid scan targets specified${RESET}"
     exit 2
   fi
 
   if ! need_cmd rsync; then
-    say "${RED}$X rsync not found; required for explicit file scans${RESET}"
+    say "${RED}$X rsync not found; required for explicit target scans${RESET}"
     exit 1
   fi
 
@@ -1159,19 +1184,43 @@ prepare_files_workspace(){
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
 
-  say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved[@]} specified file(s)${RESET}"
+  say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved_files[@]} file(s) and ${#dir_src[@]} directory target(s)${RESET}"
 
-  local file_list="$TMPDIR_RUN/explicit_files.txt"
-  printf "%s\n" "${resolved[@]}" > "$file_list"
-
-  if rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
-    FILTERED_PROJECT_DIR="$dest"
-    PROJECT_DIR="$FILTERED_PROJECT_DIR"
-    say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
-  else
-    say "${RED}$X Failed to prepare files workspace${RESET}"
-    exit 1
+  if [[ ${#resolved_files[@]} -gt 0 ]]; then
+    local file_list="$TMPDIR_RUN/explicit_files.txt"
+    printf "%s\n" "${resolved_files[@]}" > "$file_list"
+    if ! rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
+      say "${RED}$X Failed to prepare files workspace${RESET}"
+      exit 1
+    fi
   fi
+
+  if [[ ${#dir_src[@]} -gt 0 ]]; then
+    # Directory targets honor the global ignore patterns (defaults + .ubsignore),
+    # same as a whole-project scan (see apply_ignore_filters).
+    local -a dir_excludes=()
+    local pat
+    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+      local -a _pats
+      IFS=',' read -r -a _pats <<<"$GLOBAL_EXCLUDE_PATTERNS"
+      for pat in "${_pats[@]}"; do
+        [[ -z "$pat" ]] && continue
+        dir_excludes+=( "--exclude=$pat" )
+      done
+    fi
+    local i
+    for ((i=0; i<${#dir_src[@]}; i++)); do
+      ensure_dir "$dest/${dir_rel[$i]}"
+      if ! rsync -a "${dir_excludes[@]}" "${dir_src[$i]}"/ "$dest/${dir_rel[$i]}"/ >/dev/null 2>&1; then
+        say "${RED}$X Failed to copy directory target${RESET}: ${dir_src[$i]}"
+        exit 1
+      fi
+    done
+  fi
+
+  FILTERED_PROJECT_DIR="$dest"
+  PROJECT_DIR="$FILTERED_PROJECT_DIR"
+  say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
 }
 
 checksum_tool_name(){

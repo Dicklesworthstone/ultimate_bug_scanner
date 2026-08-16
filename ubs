@@ -895,6 +895,40 @@ script_dir(){
   fi
 }
 
+script_path(){
+  # Resolve the real *file* path of this script, following symlinks — same
+  # machinery as script_dir but keeping the basename. The self-updater must
+  # replace the real installed file: `mv staged "$0"` on a Homebrew-style
+  # bin/ubs -> ../Cellar/.../ubs link would clobber the symlink with a
+  # regular file and leave the actual install (and any other links to it)
+  # stale.
+  local self="${BASH_SOURCE[0]}"
+  if command -v realpath >/dev/null 2>&1; then
+    local rp
+    rp="$(realpath "$self" 2>/dev/null)" || true
+    if [[ -n "$rp" ]]; then
+      printf '%s\n' "$rp"
+      return 0
+    fi
+  fi
+  local source="$self"
+  while [ -L "$source" ]; do
+    local link_dir
+    link_dir="$(cd -P "$(dirname "$source")" 2>/dev/null && pwd)" || link_dir=""
+    source="$(readlink "$source")" || true
+    if [[ "$source" != /* && -n "$link_dir" ]]; then
+      source="$link_dir/$source"
+    fi
+  done
+  local dir
+  dir="$(cd -P "$(dirname "$source")" 2>/dev/null && pwd)" || dir=""
+  if [[ -n "$dir" ]]; then
+    printf '%s/%s\n' "$dir" "$(basename "$source")"
+  else
+    printf '%s\n' "$source"
+  fi
+}
+
 prepare_metrics_dir(){
   local dir="$1"
   rm -rf "$dir" 2>/dev/null || true
@@ -2312,18 +2346,33 @@ check_and_update_self(){
     return 0
   fi
 
-  # Or if we are not writable
-  if [[ ! -w "$0" ]]; then
-    self_update_fail "installed binary is not writable: $0 (re-run with sufficient permissions)"
+  # Resolve $0 through symlinks so the update replaces the real installed
+  # file. Staging next to the resolved target also keeps the final mv on one
+  # filesystem (atomic) even when the symlink and its target live on
+  # different mounts.
+  local self_path
+  self_path="$(script_path)"
+  if [[ -z "$self_path" || ! -e "$self_path" ]]; then
+    self_update_fail "cannot resolve installed binary path from $0"
     return $?
   fi
 
-  local self_path="$0"
+  # Or if we are not writable
+  if [[ ! -w "$self_path" ]]; then
+    self_update_fail "installed binary is not writable: $self_path (re-run with sufficient permissions)"
+    return $?
+  fi
   # Self-update pulls from the latest *release* artifacts and verifies the
   # payload against the release SHA256SUMS (plus its minisign signature when
   # UBS_MINISIGN_PUBKEY is configured) before replacing this script.
   # Issue #87: it previously fetched unpinned, unverified main.
   local release_base="${UBS_RELEASE_BASE:-https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/latest/download}"
+  # An override supplies BOTH the payload and its SHA256SUMS, so the checksum
+  # gate alone cannot authenticate it. Never silent: warn loudly, and point at
+  # the one knob (minisign) that binds the manifest to a trusted key.
+  if [[ -n "${UBS_RELEASE_BASE:-}" ]]; then
+    say_err "${YELLOW}${WARN}${RESET} UBS_RELEASE_BASE override active: ${release_base} (checksums are fetched from the same base — set UBS_MINISIGN_PUBKEY to keep authenticity)"
+  fi
   local last_check_file="${XDG_CACHE_HOME:-$HOME/.cache}/ubs/last_update_check"
   ensure_dir "$(dirname "$last_check_file")"
 
@@ -2425,7 +2474,19 @@ check_and_update_self(){
       self_update_fail "failed to stage verified update"
       return $?
     fi
-    chmod +x "$tmp_self" 2>/dev/null || true
+    # Preserve the installed mode (default 0755) on the staged copy, and
+    # fail closed if it cannot be set: mktemp creates the file 0600, and a
+    # bare `chmod +x` under umask 022 yields 0711 — atomically mv'ing a
+    # non-readable file over the install breaks every non-owner caller
+    # (shell scripts need read permission to execute).
+    local install_mode
+    install_mode="$(stat -c '%a' "$self_path" 2>/dev/null || stat -f '%OLp' "$self_path" 2>/dev/null)" || install_mode=""
+    [[ "$install_mode" =~ ^[0-7]{3,4}$ ]] || install_mode=755
+    if ! chmod "$install_mode" "$tmp_self" 2>/dev/null; then
+      rm -f "$tmp_self"
+      self_update_fail "failed to set mode $install_mode on staged update"
+      return $?
+    fi
 
     # Move over current script
     if mv "$tmp_self" "$self_path"; then

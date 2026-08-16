@@ -8,7 +8,22 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
-## [v5.3.9] - 2026-08-15 [Release]
+## [v5.3.10] - 2026-08-16 [Release]
+
+### Fixes
+
+- **Self-update hardening (`f70f721`) — supersedes v5.3.9's published `ubs` asset, which still carries the buggy updater.** Post-release adversarial review of the v5.3.9 self-update found two HIGH bugs, both fixed:
+  - **Symlinked installs no longer break on self-update.** The updater staged and `mv`'d against `$0` verbatim, so when `ubs` was invoked through a symlink (e.g. a Homebrew-style `bin/ubs -> ../cellar/.../ubs`), the symlink itself was replaced with a regular file and the real install was left stale. `script_path()` now resolves symlinks and the update replaces the actual target.
+  - **Install permissions survive self-update.** The staged copy inherited `mktemp`'s `0600` mode, and a failure of the follow-up `chmod` was swallowed — a root-owned install could be left non-executable (or unreadable) for other users. The updater now captures the existing install's mode, applies it to the staged file, and treats a `chmod` failure as fatal before the atomic replace.
+- **MEDIUM: overriding `UBS_RELEASE_BASE` now warns loudly** that update artifacts are being fetched from a non-default base, instead of silently redirecting the supply chain.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.10`; `SHA256SUMS` regenerated against the final `5.3.10` bytes. Modules/helpers are byte-identical to v5.3.9, so `MODULE_CHECKSUMS`/`HELPER_CHECKSUMS` are unchanged and `scripts/check-version-tag-drift.sh` holds once `v5.3.10` is tagged.
+
+---
+
+## [v5.3.9] - 2026-08-15 [Release] — superseded by v5.3.10
 
 ### Security
 

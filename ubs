@@ -1117,9 +1117,17 @@ prepare_files_workspace(){
     scan_root="$(dirname "$scan_root")"
   fi
 
-  # Resolve each path relative to scan_root; reject missing files
+  # Resolve each path relative to scan_root; reject missing files. A DIRECTORY
+  # here is a usage error, not a missing file: extra positional args form an
+  # explicit FILE list, and `ubs src/ test/` used to die with a misleading
+  # "file not found: test/" even though test/ exists (GH #88).
   local resolved=()
   local f rel
+  reject_dir_target(){
+    say "${RED}$X directories cannot be extra scan targets${RESET}: $1"
+    say "${DIM}extra positional args are an explicit FILE list; pass exactly one project directory per invocation, or list individual files${RESET}"
+    exit 2
+  }
   for f in "${SCAN_FILES[@]}"; do
     [[ -z "$f" ]] && continue
     if [[ "$f" == /* ]]; then
@@ -1127,6 +1135,8 @@ prepare_files_workspace(){
       if [[ -f "$f" ]]; then
         rel="${f#"$scan_root"/}"
         resolved+=("$rel")
+      elif [[ -d "$f" ]]; then
+        reject_dir_target "$f"
       else
         say "${RED}$X file not found${RESET}: $f"
         exit 2
@@ -1139,6 +1149,8 @@ prepare_files_workspace(){
       abs="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"
       rel="${abs#"$scan_root"/}"
       resolved+=("$rel")
+    elif [[ -d "$scan_root/$f" || -d "$f" ]]; then
+      reject_dir_target "$f"
     else
       say "${RED}$X file not found${RESET}: $f"
       exit 2

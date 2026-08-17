@@ -1151,6 +1151,20 @@ prepare_files_workspace(){
       exit 2
     fi
     if [[ -d "$f" ]]; then
+      # Canonicalize to a physical path FIRST: a `..` segment surviving into
+      # the shadow-copy destination (e.g. `ubs ../lib main.c`) would place the
+      # copy OUTSIDE the workspace, and the scan would then silently omit the
+      # named target while still reporting success.
+      if ! abs="$(cd "$f" 2>/dev/null && pwd -P)"; then
+        say "${RED}$X cannot access directory target${RESET}: $f"
+        exit 2
+      fi
+      f="$abs"
+      if [[ "$f" == "$scan_root"/* ]]; then
+        rel="${f#"$scan_root"/}"
+      else
+        rel="$f"
+      fi
       # Guard directory targets with the same size ceiling as whole-project
       # scans: the shadow-workspace copy can exhaust /tmp (issue #12).
       if [[ "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 ]]; then

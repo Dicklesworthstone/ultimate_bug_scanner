@@ -8293,6 +8293,39 @@
       }
     },
     {
+      "id": "rust-loop-scope-collection-push-clean",
+      "description": "GH #96: trait impls, cold error-path closures (map_err/ok_or_else), and async blocks are not per-iteration hot paths, and Vec::push of path-named variables is not a filesystem join.",
+      "path": "test-suite/rust/clean/loop_scope_and_collection_push.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "perf",
+        "security",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=5,8,24"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "String allocation inside loop",
+          "clone() inside loops - potential perf hit",
+          "Reject absolute paths and '..' components; canonicalize and verify the result stays under the intended root"
+        ]
+      }
+    },
+    {
       "id": "rust-string-allocations-buggy",
       "description": "Rust needless string allocations should be reported as executable code.",
       "path": "test-suite/rust/buggy/string_allocations.rs",

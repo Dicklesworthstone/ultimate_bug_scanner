@@ -1497,7 +1497,56 @@ def line_number(text: str, offset: int) -> int:
     return text.count("\n", 0, offset) + 1
 
 
-loop_start = re.compile(r"\b(?:for\b[^{;]*|while\b[^{;]*|loop\s*)\{", re.MULTILINE)
+# GH #96: a `for` is only a loop when it has an `in` clause; a bare
+# `for\b[^{;]*\{` also matches `impl Trait for Type {` (and `for<'a>` HRTBs),
+# which turned every trait-impl body into a "loop" and flagged allocations in
+# loop-free methods.
+loop_start = re.compile(r"\b(?:for\b[^{;]*?\bin\b[^{;]*|while\b[^{;]*|loop\s*)\{", re.MULTILINE)
+
+# GH #96: allocations inside cold error-path closures (map_err, ok_or_else,
+# unwrap_or_else, ...) run only on the failure branch, not per iteration, and
+# allocations inside nested async blocks are deferred work, not per-iteration
+# hot-path cost. Mask those regions out of the loop-body search.
+cold_closure = re.compile(
+    r"\.\s*(?:map_err|ok_or_else|unwrap_or_else|or_else|map_or_else|expect_err)\s*\("
+)
+async_block = re.compile(r"\basync\s+(?:move\s+)?\{")
+
+
+def find_matching_paren(text: str, open_index: int) -> int:
+    depth = 0
+    for idx in range(open_index, len(text)):
+        ch = text[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return -1
+
+
+def cold_ranges(masked: str):
+    ranges = []
+    for m in cold_closure.finditer(masked):
+        open_paren = masked.find("(", m.start(), m.end() + 1)
+        if open_paren < 0:
+            continue
+        close_paren = find_matching_paren(masked, open_paren)
+        if close_paren < 0:
+            continue
+        ranges.append((open_paren, close_paren + 1))
+    for m in async_block.finditer(masked):
+        open_brace = masked.rfind("{", m.start(), m.end())
+        if open_brace < 0:
+            continue
+        close_brace = find_matching_brace(masked, open_brace)
+        if close_brace < 0:
+            continue
+        ranges.append((open_brace, close_brace + 1))
+    return ranges
+
+
 seen = set()
 
 for path in rust_files(root):
@@ -1507,6 +1556,7 @@ for path in rust_files(root):
         continue
     masked = mask_comments_and_strings(text)
     lines = text.splitlines()
+    excluded = cold_ranges(masked)
     for loop_match in loop_start.finditer(masked):
         open_brace = masked.rfind("{", loop_match.start(), loop_match.end())
         if open_brace < 0:
@@ -1517,6 +1567,8 @@ for path in rust_files(root):
         body = masked[open_brace:close_brace + 1]
         for hit in pattern.finditer(body):
             offset = open_brace + hit.start()
+            if any(start <= offset < end for start, end in excluded):
+                continue
             line = line_number(masked, offset)
             key = (str(path), line, mode, hit.group(0))
             if key in seen:
@@ -1796,6 +1848,33 @@ call = re.compile(
     r"\b(?P<recv>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
     r"\s*\.\s*(?P<method>join|push)\s*\(\s*&?\s*(?P<arg>[A-Za-z_][A-Za-z0-9_]*)"
 )
+# GH #96: `.push` on a collection (Vec<PathBuf> named `paths`, String named
+# `out`, ...) is not a filesystem join, no matter what the variable is called.
+# Track let-bindings whose declared type or initializer is a known collection
+# and exempt their `.push` calls (receiver-type awareness).
+let_binding = re.compile(
+    r"\blet\s+(?:mut\s+)?(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*"
+    r"(?::\s*(?P<ty>[^=;]+?)\s*)?=\s*(?P<init>[^;]{0,160})"
+)
+collection_type = re.compile(
+    r"^\s*&?\s*(?:mut\s+)?(?:std::(?:vec::|collections::|string::)?)?"
+    r"(?:Vec|VecDeque|HashSet|BTreeSet|BinaryHeap|SmallVec|String)\b"
+)
+collection_init = re.compile(
+    r"^\s*(?:std::(?:vec::|collections::|string::)?)?"
+    r"(?:(?:Vec|VecDeque|HashSet|BTreeSet|BinaryHeap|SmallVec|String)\s*(?:::<[^;]*?>)?\s*::\s*"
+    r"(?:new|with_capacity|from|default)\b|vec!|String::new)"
+)
+
+
+def collection_vars(masked: str):
+    found = set()
+    for m in let_binding.finditer(masked):
+        ty = m.group("ty") or ""
+        init = m.group("init") or ""
+        if (ty and collection_type.search(ty)) or collection_init.search(init):
+            found.add(m.group("var"))
+    return found
 
 
 def rust_files(path: Path):
@@ -1906,12 +1985,15 @@ for path in rust_files(root):
         continue
     masked = mask_comments_and_strings(text)
     lines = text.splitlines()
+    collections = collection_vars(masked)
     for hit in call.finditer(masked):
         recv = hit.group("recv").lower()
         arg = hit.group("arg").lower()
         if not pathish.search(recv):
             continue
         if not untrusted.search(arg):
+            continue
+        if hit.group("method") == "push" and hit.group("recv") in collections:
             continue
         line = line_number(masked, hit.start())
         code = lines[line - 1].strip() if 0 < line <= len(lines) else ""

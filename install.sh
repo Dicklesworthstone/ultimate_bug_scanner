@@ -603,6 +603,25 @@ log_network_failure() {
   fi
 }
 
+# Distinguish a destination-permission failure (EACCES writing the temp file,
+# e.g. a root-owned install dir — issue #95, curl exit 23) from a genuine
+# network failure, so the user is pointed at the actual fix instead of the
+# network.
+# Returns 0 when a destination-permission problem was diagnosed, 1 for a
+# genuine network failure (so callers can skip network-flavored advice).
+diagnose_download_failure() {
+  local url="$1" err_file="$2" dest_dir="$3" dest_tmp="$4"
+  if [ ! -w "$dest_dir" ] || grep -qiE "permission denied|errno 13|failed writing|failed to open" "$err_file" 2>/dev/null; then
+    error "Download failed writing ${dest_tmp}: install dir not writable by you — owned by root?"
+    error "  Directory: $(ls -ld "$dest_dir" 2>/dev/null || echo "$dest_dir (missing)")"
+    error "  Fix: sudo chown -R \"\$(id -un)\" \"${dest_dir}\" and re-run,"
+    error "       or pass --install-dir pointing at a directory you own."
+    return 0
+  fi
+  error "Download failed from ${url}. Check ${err_file}"
+  return 1
+}
+
 warn_path_shadow() {
   local expected="$1"
   local actual="$2"
@@ -661,7 +680,26 @@ with_backoff() {
   done
 }
 
-maybe_sudo() { local path="$1"; if [ -w "$path" ]; then echo ""; elif can_use_sudo; then echo "sudo"; else echo ""; fi }
+# Walk up to the nearest existing ancestor of a (possibly not-yet-created)
+# path so writability checks reflect what 'mkdir -p' would actually need.
+nearest_existing_dir() {
+  local path="$1"
+  while [ ! -e "$path" ] && [ "$path" != "/" ]; do
+    path="$(dirname "$path")"
+  done
+  echo "$path"
+}
+
+maybe_sudo() {
+  # Elevate only when the path — or, if it does not exist yet, its nearest
+  # existing ancestor — is genuinely unwritable (issue #95). Probing the
+  # missing path directly always failed '-w' and took the sudo branch, which
+  # left a root-owned install dir under $HOME and broke the unprivileged
+  # download that followed.
+  local path="$1" probe
+  probe="$(nearest_existing_dir "$path")"
+  if [ -w "$probe" ]; then echo ""; elif can_use_sudo; then echo "sudo"; else echo ""; fi
+}
 
 can_use_sudo() {
   # Check if sudo is available and can be used without password prompt
@@ -957,6 +995,25 @@ version_compare() {
     if ((a>b)); then return 0; elif ((a<b)); then return 1; fi
   done
   return 1
+}
+
+# When piped from curl, VERSION stays "main" even though the installer fetches
+# a tagged release asset via releases/latest — so the banner and self-report
+# said "vmain" (issue #95, cosmetic). Resolve the actual tag GitHub's
+# latest-release alias points at and report that instead. Best-effort: on any
+# failure (offline, no curl, custom artifact base) VERSION stays "main".
+resolve_release_tag() {
+  [ "$VERSION" = "main" ] || return 0
+  [ -n "${UBS_ARTIFACT_BASE:-}" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local effective tag
+  effective="$(curl -fsSL --max-time 5 -o /dev/null -w '%{url_effective}' \
+    "https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/latest" 2>/dev/null)" || return 0
+  tag="${effective##*/}"
+  if [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+    VERSION="${tag#v}"
+  fi
+  return 0
 }
 
 check_for_updates() {
@@ -2487,7 +2544,19 @@ install_scanner() {
 
   # Create directory if needed
   if [ -n "$use_sudo" ]; then
+    local pre_mkdir_base
+    pre_mkdir_base="$(nearest_existing_dir "$install_dir")"
     $use_sudo mkdir -p "$install_dir" 2>/dev/null || true
+    # If elevation created directories for a target under the invoking user's
+    # HOME, hand ownership back so the unprivileged download below can write
+    # there (issue #95: root-owned dir under $HOME broke ubs.tmp with EACCES).
+    if [ -d "$install_dir" ] && [[ "$install_dir" == "$HOME"/* ]] && [ "$pre_mkdir_base" != "$install_dir" ]; then
+      local created_root="$install_dir"
+      while [ "$(dirname "$created_root")" != "$pre_mkdir_base" ] && [ "$(dirname "$created_root")" != "$created_root" ]; do
+        created_root="$(dirname "$created_root")"
+      done
+      $use_sudo chown -R "$(id -u):$(id -g)" "$created_root" 2>/dev/null || true
+    fi
   else
     mkdir -p "$install_dir" 2>/dev/null || true
   fi
@@ -2495,6 +2564,9 @@ install_scanner() {
     error "Cannot create directory: $install_dir"
     return 1
   }
+  # Re-evaluate elevation now that the directory exists: after a chown-back
+  # (or if it was writable all along) the rest of the install runs unprivileged.
+  use_sudo="$(maybe_sudo "$install_dir")"
 
   # Download or copy script
   local script_path="$install_dir/$INSTALL_NAME"
@@ -2535,8 +2607,9 @@ install_scanner() {
       if download_to_file "${ARTIFACT_BASE}/${SCRIPT_NAME}" "$temp_path"; then
         log "Downloaded successfully"
       else
-        error "Download failed from ${ARTIFACT_BASE}/${SCRIPT_NAME}. Check $download_err"
-        error "Refusing to fall back to unverified sources. Use --insecure to bypass (not recommended)."
+        if ! diagnose_download_failure "${ARTIFACT_BASE}/${SCRIPT_NAME}" "$download_err" "$install_dir" "$temp_path"; then
+          error "Refusing to fall back to unverified sources. Use --insecure to bypass (not recommended)."
+        fi
         rm -f "$temp_path"
         return 1
       fi
@@ -2555,7 +2628,7 @@ install_scanner() {
       if download_to_file "$download_url" "$temp_path"; then
         log "Downloaded successfully"
       else
-        error "Download failed. Check $download_err"
+        diagnose_download_failure "$download_url" "$download_err" "$install_dir" "$temp_path" || true
         rm -f "$temp_path"
         return 1
       fi
@@ -3343,6 +3416,10 @@ ORIGINAL_ARGS=("$@")
 # Load configuration file (before argument parsing so CLI args can override)
 
 read_config_file
+
+# Resolve "main" to the actual release tag the artifact alias serves, so the
+# banner and session summary report the real version (issue #95, cosmetic).
+resolve_release_tag
 
 print_header
 

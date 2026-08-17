@@ -22,11 +22,13 @@ print(data)
 subprocess.run(f"ls {USER_INPUT}", shell=True)
 shell_run(f"cat {USER_INPUT}", shell=True)
 
-# SQL injection
+# SQL injection (GH #94: the interpolated value must be genuinely external —
+# a module-level constant would be provably static and correctly unflagged)
 conn = sqlite3.connect(':memory:')
 cur = conn.cursor()
+attacker_name = input('name: ')
 cur.execute(
-    f"SELECT * FROM users WHERE name = '{USER_INPUT}'"
+    f"SELECT * FROM users WHERE name = '{attacker_name}'"
 )
 
 # Insecure pickle

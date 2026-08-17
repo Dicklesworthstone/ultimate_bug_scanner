@@ -762,7 +762,6 @@ run_async_error_checks() {
     ASYNC_ERROR_SEVERITY[js.async.then-no-catch]='warning'
     ASYNC_ERROR_SEVERITY[js.async.promiseall-no-try]='warning'
   fi
-  local warn_before=$WARNING_COUNT
   if ! emit_ast_rule_group ASYNC_ERROR_RULE_IDS ASYNC_ERROR_SEVERITY ASYNC_ERROR_SUMMARY ASYNC_ERROR_REMEDIATION \
     "All async operations appear protected" "Async rule checks"; then
     if [[ "$FAIL_ON_WARNING" -eq 0 ]]; then
@@ -790,29 +789,14 @@ run_async_error_checks() {
     if [ "$promise_all_count" -gt 0 ]; then
       print_finding "warning" "$promise_all_count" "Promise.all without visible try/catch" "Wrap Promise.all in try/catch to handle aggregate failures"
     fi
-  else
-    # ast-grep can occasionally under-report in constrained CI runners; double-check with a lightweight grep heuristic
-    if [[ "$FAIL_ON_WARNING" -eq 1 && "$WARNING_COUNT" -eq "$warn_before" ]]; then
-      local then_count promise_all_count try_await_count
-      then_count=$("${GREP_RN[@]}" -e "\.then\s*\(" "$PROJECT_DIR" 2>/dev/null | \
-        (grep -v "\.catch" || true) | (grep -v "\.finally" || true) | count_lines)
-      promise_all_count=$("${GREP_RN[@]}" -e "Promise\.all\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-      if command -v rg >/dev/null 2>&1; then
-        try_await_count=$(rg --no-config --no-messages -g '*.js' -g '*.ts' -g '*.tsx' -g '*.mjs' -g '*.cjs' -g '*.jsx' \
-          -e 'try[[:space:]]*\{[^}]*await' "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-      else
-        try_await_count=0
-      fi
-      if [ "$then_count" -gt 0 ]; then
-        print_finding "warning" "$then_count" "Promise.then chain missing .catch()" "Chain .catch() (or .finally()) to surface rejections"
-      elif [ "$try_await_count" -gt 0 ]; then
-        print_finding "good" "$try_await_count" "Async awaits guarded by try/catch detected" "Try/catch provides rejection handling"
-      fi
-      if [ "$promise_all_count" -gt 0 ]; then
-        print_finding "warning" "$promise_all_count" "Promise.all without visible try/catch" "Wrap Promise.all in try/catch to handle aggregate failures"
-      fi
-    fi
   fi
+  # GH #92: the former "double-check" grep that re-ran the line-based heuristic
+  # whenever the AST rules produced ZERO warnings is gone. "ast-grep found
+  # nothing" is exactly what correct code produces, so the fallback fired on
+  # multi-line .then().catch() chains and even on `.then(` inside comments.
+  # The grep fallback above still covers the genuine-failure path (ast-grep
+  # missing or the scan itself erroring), which is the only case a fallback
+  # can distinguish from clean code.
 }
 
 run_hooks_dependency_checks() {
@@ -894,6 +878,9 @@ language: javascript
 rule:
   pattern: useMemo($CALLBACK)
 YAML
+  # GH #93: hook rules are declared `language: javascript`; re-emit them for
+  # the typescript/tsx grammars so React+TS codebases get hooks analysis too.
+  emit_rule_language_variants "$rule_dir"
   tmp_json="$(mktemp 2>/dev/null || mktemp -t js_hook_matches.XXXXXX)"
   : >"$tmp_json"
   local rf
@@ -3022,6 +3009,44 @@ annotate_metric_severity() {
   esac
 }
 
+# GH #93: ast-grep applies a rule only to the file extensions of its declared
+# `language:` — `language: javascript` never runs on .ts/.tsx, `typescript`
+# never on .js/.jsx/.tsx, `tsx` never on .js/.jsx. Every language-portable rule
+# is therefore re-emitted for the sibling grammars so a React+TS codebase gets
+# the same coverage as plain JS. Variants keep the SAME rule id (ast-grep
+# accepts duplicate ids across languages; downstream aggregation is keyed by
+# id, so counts merge naturally) and are appended to one multi-document
+# __variants-<lang>.yml per target grammar to keep the per-file scan loop
+# cheap. Extension ownership stays disjoint (.js/.jsx/.mjs/.cjs=javascript,
+# .ts=typescript, .tsx=tsx), so no file is double-counted.
+emit_rule_language_variants() {
+  local rules_dir="$1"; shift
+  local skip_name
+  local -A _variant_skip=()
+  for skip_name in "$@"; do _variant_skip["$skip_name"]=1; done
+  local src base lang targets t agg
+  for src in "$rules_dir"/*.yml; do
+    [[ -f "$src" ]] || continue
+    base="${src##*/}"
+    [[ "$base" == __variants-* ]] && continue
+    [[ -n "${_variant_skip[$base]:-}" ]] && continue
+    lang="$(awk '/^language:[[:space:]]*[A-Za-z]/{print $2; exit}' "$src" 2>/dev/null)"
+    case "$lang" in
+      javascript) targets="typescript tsx" ;;
+      typescript) targets="javascript tsx" ;;
+      tsx)        targets="javascript" ;;   # JSX parses under the javascript grammar (.jsx); the typescript grammar rejects JSX
+      *)          continue ;;
+    esac
+    # TS-only syntax (non-null assertion `!`) cannot re-parse as javascript.
+    if [[ "$base" == "ts-non-null-chain.yml" ]]; then targets="tsx"; fi
+    for t in $targets; do
+      agg="$rules_dir/__variants-$t.yml"
+      if [[ -s "$agg" ]]; then printf -- '---\n' >>"$agg"; fi
+      sed "s/^language:[[:space:]]*${lang}[[:space:]]*\$/language: $t/" "$src" >>"$agg"
+    done
+  done
+}
+
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ag_rules.XXXXXX)"
@@ -3030,8 +3055,16 @@ write_ast_rules() {
 ruleDirs:
   - "$AST_RULE_DIR"
 YAML
+  # User rules are copied verbatim and excluded from language-variant
+  # generation (GH #93): a user rule may rely on language-specific syntax and
+  # its author controls its language targeting.
+  USER_RULE_FILE_NAMES=()
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
+    local _user_rule
+    for _user_rule in "$AST_RULE_DIR"/*.yml; do
+      [[ -f "$_user_rule" ]] && USER_RULE_FILE_NAMES+=("${_user_rule##*/}")
+    done
   fi
   # Core rules
   # (Keep file names arbitrary; ruleId is authoritative)
@@ -3497,6 +3530,8 @@ rule:
 severity: warning
 message: "?? and ternary have ambiguous precedence; add parentheses: ($A ?? $B) ? ... or $A ?? ($B ? ...)"
 YAML
+
+  emit_rule_language_variants "$AST_RULE_DIR" ${USER_RULE_FILE_NAMES[@]+"${USER_RULE_FILE_NAMES[@]}"}
 
   if [[ -n "$DUMP_RULES_DIR" ]]; then
     mkdir -p "$DUMP_RULES_DIR"
@@ -8612,17 +8647,54 @@ def operand_identifiers(operand):
 def is_sensitive_text(text):
     return bool(weak_families(text))
 
+CONTINUATION_TAIL = ('=', '(', '[', ',', '&&', '||', '?', ':', '+', '=>', '.')
+CONTINUATION_HEAD = ('.', '?', ':', ')', ']', '&&', '||', '+', '===', '!==', '==', '!=')
+
+def statement_start(lines, index):
+    # Walk upward over physical lines that belong to the same statement as
+    # lines[index] (assignment/paren/operator continuations), so a suppression
+    # marker placed above a MULTI-LINE statement still attaches to a finding
+    # reported against one of its continuation lines. GH #91.
+    start = index
+    for _ in range(8):
+        if start <= 0:
+            break
+        prev = code_line(lines[start - 1]).strip()
+        cur = code_line(lines[start]).strip()
+        if not prev:
+            break
+        if prev.endswith(CONTINUATION_TAIL) or cur.startswith(CONTINUATION_HEAD):
+            start -= 1
+            continue
+        break
+    return start
+
 def has_ignore(lines, index):
     # Suppression markers live in comments, so they must be checked against the
-    # RAW source line (and the line above), never against comment-stripped
-    # text: code_line() removes '// ubs:ignore' before it could ever match.
+    # RAW source line, never against comment-stripped text: code_line() removes
+    # '// ubs:ignore' before it could ever match.
     # GH #84: a count-time miss here made suppressed findings still count in
     # totals and the exit code even though the report line was elided.
-    return (
-        0 <= index < len(lines) and 'ubs:ignore' in lines[index]
-    ) or (
-        0 <= index - 1 < len(lines) and 'ubs:ignore' in lines[index - 1]
-    )
+    # GH #91: honored placements are (a) trailing the flagged line, (b) any
+    # physical line of the enclosing multi-line statement, (c) the line
+    # immediately above the statement's FIRST line (not just above the flagged
+    # continuation line), and (d) a comment-only line directly inside a block
+    # opened by the flagged line — formatters commonly relocate a trailing
+    # marker off a block-opening `if (...) {` onto the next line, which used to
+    # silently detach the suppression.
+    if not (0 <= index < len(lines)):
+        return False
+    if 'ubs:ignore' in lines[index]:
+        return True
+    start = statement_start(lines, index)
+    for pos in range(max(0, start - 1), index):
+        if 'ubs:ignore' in lines[pos]:
+            return True
+    if code_line(lines[index]).rstrip().endswith('{') and index + 1 < len(lines):
+        relocated = lines[index + 1].strip()
+        if relocated.startswith(('//', '/*', '*')) and 'ubs:ignore' in relocated:
+            return True
+    return False
 
 def collect_sensitive_vars(lines):
     sensitive_vars = set()

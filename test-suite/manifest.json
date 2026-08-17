@@ -12778,6 +12778,86 @@
           "Warning: tru (TOON encoder) disabled by UBS_TEST_FORCE_NO_TOON=1"
         ]
       }
+    },
+    {
+      "id": "js-suppression-placement-clean",
+      "description": "GH #91: ubs:ignore suppresses when placed above a multi-line statement, when formatter-relocated inside an opened block, and when trailing the flagged line.",
+      "path": "test-suite/js/clean/suppression_placement.ts",
+      "language": "js",
+      "tags": ["js", "suppression", "regression", "clean"],
+      "args": ["--only=js"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {"critical": {"max": 0}},
+        "forbid_substrings": ["Secret, signature, or token compared with ==/!="]
+      }
+    },
+    {
+      "id": "js-async-multiline-catch-fail-on-warning",
+      "description": "GH #92: a multi-line .then().catch() chain (plus a comment mentioning .then() must stay clean under --fail-on-warning; the removed grep double-check used to flag both.",
+      "path": "test-suite/js/clean/async_then_catch_multiline.js",
+      "language": "js",
+      "tags": ["js", "async", "regression", "clean"],
+      "args": ["--only=js", "--fail-on-warning"],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": ["Promise.then chain missing .catch()"]
+      }
+    },
+    {
+      "id": "js-ts-async-rule-coverage",
+      "description": "GH #93: js.async.then-no-catch (language variant) must fire on .ts files via the AST rule, not the grep fallback.",
+      "path": "test-suite/js/buggy/ts_async_no_catch.ts",
+      "language": "js",
+      "tags": ["js", "typescript", "ast-grep", "regression", "buggy"],
+      "args": ["--only=js", "--fail-on-warning"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {"warning": {"min": 1}},
+        "require_substrings": ["Promise.then chain missing .catch()"]
+      }
+    },
+    {
+      "id": "js-tsx-async-rule-coverage",
+      "description": "GH #93: js.async.then-no-catch (language variant) must fire on .tsx files via the AST rule.",
+      "path": "test-suite/js/buggy/tsx_async_no_catch.tsx",
+      "language": "js",
+      "tags": ["js", "tsx", "ast-grep", "regression", "buggy"],
+      "args": ["--only=js", "--fail-on-warning"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {"warning": {"min": 1}},
+        "require_substrings": ["Promise.then chain missing .catch()"]
+      }
+    },
+    {
+      "id": "python-sql-static-fstring-clean",
+      "description": "GH #94: f-string over module-level string constants is provably static and must not be reported as interpolated SQL (Alembic seed-migration pattern).",
+      "path": "test-suite/python/clean/sql_static_fstring.py",
+      "language": "python",
+      "tags": ["python", "sql", "provenance", "regression", "clean"],
+      "args": ["--only=python", "--fail-on-warning", "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "Interpolated SQL reaches execution sink",
+          "Interpolated SQL with unproven-static values reaches execution sink"
+        ]
+      }
+    },
+    {
+      "id": "python-sql-unknown-provenance-warning",
+      "description": "GH #94: interpolating an imported name (provenance invisible in-file) downgrades to Warning instead of Critical.",
+      "path": "test-suite/python/buggy/sql_unknown_provenance.py",
+      "language": "python",
+      "tags": ["python", "sql", "provenance", "regression", "buggy"],
+      "args": ["--only=python", "--fail-on-warning", "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {"critical": {"max": 0}, "warning": {"min": 1}},
+        "require_substrings": ["Interpolated SQL with unproven-static values reaches execution sink"],
+        "forbid_substrings": ["Interpolated SQL reaches execution sink"]
+      }
     }
   ]
 }

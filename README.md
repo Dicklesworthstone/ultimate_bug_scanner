@@ -1278,19 +1278,25 @@ eval(safe_string)  # ubs:ignore
 ```
 
 **Suppression Rules:**
-- Must appear on the **same line** as the flagged code
+- A marker **trailing the flagged line** always suppresses (most robust placement)
+- A marker on the **line immediately above** the flagged line also suppresses:
+  ```javascript
+  // ubs:ignore -- trusted admin input
+  eval(code);  // suppressed
+  ```
+- For a **multi-line statement**, a marker on any physical line of the
+  statement — or on the line immediately above the statement's *first* line —
+  suppresses a finding reported against any of its continuation lines
+- If a formatter relocates a trailing marker off a **block-opening line**
+  (`if (...) { // ubs:ignore` becoming a comment on the first line inside the
+  block), the marker still suppresses the finding on the opening line
 - Works across all 10 supported languages
-- Suppresses all findings on that line (use sparingly)
-- Survives formatting tools that preserve trailing comments
+- Suppresses all findings on the covered lines (use sparingly)
 
 **Anti-patterns to avoid:**
 ```javascript
-// ❌ Wrong - comment on previous line doesn't suppress:
-// ubs:ignore
-eval(code);  // Still flagged!
-
 // ❌ Wrong - don't blanket-suppress large blocks:
-/* ubs:ignore */  // Doesn't work for block comments
+/* ubs:ignore */  // A standalone marker only covers the next line, not a block
 ```
 
 ### **Cross-Language Async Error Detection**

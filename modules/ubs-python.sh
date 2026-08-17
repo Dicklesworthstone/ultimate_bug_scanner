@@ -960,20 +960,36 @@ run_sql_injection_checks() {
     print_finding "info" 0 "python3 not available" "Install python3 to enable SQL injection checks"
     return
   fi
-  local printed=0
+  local printed=0 wprinted=0 crit_total=0
   while IFS=$'\t' read -r tag a b c; do
     case "$tag" in
       __COUNT__)
+        crit_total="$a"
         if [[ "$a" -gt 0 ]]; then
           print_finding "critical" "$a" "Interpolated SQL reaches execution sink" "Use parameterized queries, SQLAlchemy bind parameters, or ORM bindings instead of f-strings, format(), %, or string concatenation"
-        else
-          print_finding "good" "No interpolated SQL execution detected"
         fi
         ;;
       __SAMPLE__)
         if [[ "$printed" -lt "$DETAIL_LIMIT" && "$printed" -lt "$MAX_DETAILED" ]]; then
           print_code_sample "$a" "$b" "$c"
           printed=$((printed + 1))
+        fi
+        ;;
+      __WCOUNT__)
+        # GH #94: interpolants whose provenance is not visible in this file
+        # (plain names of unknown origin, e.g. imported constants) cannot be
+        # proven external, so they surface as Warning instead of Critical.
+        # Provably-constant interpolants produce no finding at all.
+        if [[ "$a" -gt 0 ]]; then
+          print_finding "warning" "$a" "Interpolated SQL with unproven-static values reaches execution sink" "No external data source detected for the interpolated values; still prefer parameterized queries, or add 'ubs:ignore' if the values are known constants"
+        elif [[ "${crit_total:-0}" -eq 0 ]]; then
+          print_finding "good" "No interpolated SQL execution detected"
+        fi
+        ;;
+      __WSAMPLE__)
+        if [[ "$wprinted" -lt "$DETAIL_LIMIT" && "$wprinted" -lt "$MAX_DETAILED" ]]; then
+          print_code_sample "$a" "$b" "$c"
+          wprinted=$((wprinted + 1))
         fi
         ;;
     esac
@@ -1045,13 +1061,116 @@ def all_static_strings(node):
         return all_static_strings(node.left) and all_static_strings(node.right)
     return False
 
+# GH #94 provenance tiers: 'static' = provably compile-time constant,
+# 'tainted' = can carry external data (calls, attributes, subscripts, function
+# parameters, or names bound to such values), 'unknown' = a plain name whose
+# origin is not visible in this file (e.g. an imported constant).
+RISK_ORDER = {'static': 0, 'unknown': 1, 'tainted': 2}
+
+def max_risk(a, b):
+    return a if RISK_ORDER[a] >= RISK_ORDER[b] else b
+
+def binding_target_names(target):
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = []
+        for elt in target.elts:
+            names.extend(binding_target_names(elt))
+        return names
+    if isinstance(target, ast.Starred):
+        return binding_target_names(target.value)
+    return []
+
+def build_provenance(tree):
+    """Collect function-parameter names and a per-name provenance risk map
+    from every binding in the file (GH #94)."""
+    param_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = node.args
+            for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
+                param_names.add(arg.arg)
+            if args.vararg:
+                param_names.add(args.vararg.arg)
+            if args.kwarg:
+                param_names.add(args.kwarg.arg)
+
+    bindings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            names = []
+            for target in node.targets:
+                names.extend(binding_target_names(target))
+            if names:
+                bindings.append((names, node.value))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            bindings.append(([node.target.id], node.value))
+        elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+            bindings.append(([node.target.id], node.value))
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            names = binding_target_names(node.target)
+            if names:
+                bindings.append((names, node.iter))
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    names = binding_target_names(item.optional_vars)
+                    if names:
+                        bindings.append((names, item.context_expr))
+
+    name_risk = {}
+
+    def classify(node):
+        if isinstance(node, ast.Constant):
+            return 'static'
+        if isinstance(node, ast.JoinedStr):
+            risk = 'static'
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    risk = max_risk(risk, classify(part.value))
+            return risk
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return max_risk(classify(node.left), classify(node.right))
+        if isinstance(node, ast.Name):
+            if node.id in param_names:
+                return 'tainted'
+            return name_risk.get(node.id, 'unknown')
+        if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript, ast.Await)):
+            return 'tainted'
+        risk = None
+        for child in ast.iter_child_nodes(node):
+            child_risk = classify(child)
+            risk = child_risk if risk is None else max_risk(risk, child_risk)
+        return risk if risk is not None else 'unknown'
+
+    # Fixed-point over name-to-name references (A = "x"; B = A). Each round
+    # recomputes every name from its bindings only, so a chain of constants
+    # resolves to 'static' regardless of source order; convergence is capped
+    # and unresolved names simply stay 'unknown' (surfaced as Warning, never
+    # silently dropped).
+    for _ in range(4):
+        new_risk = {}
+        for names, value in bindings:
+            risk = classify(value)
+            for name in names:
+                new_risk[name] = risk if name not in new_risk else max_risk(new_risk[name], risk)
+        if new_risk == name_risk:
+            break
+        name_risk = new_risk
+    return param_names, name_risk
+
 class SQLInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, text, lines):
+    def __init__(self, path, text, lines, param_names, name_risk):
         self.path = path
         self.text = text
         self.lines = lines
+        self.param_names = param_names
+        self.name_risk = name_risk
         self.unsafe_sql_vars = set()
+        self.weak_sql_vars = set()
         self.issues = []
+        self.warn_issues = []
 
     def relative_path(self):
         try:
@@ -1065,20 +1184,61 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def unsafe_names_in(self, node):
         return sorted(name for name in self.names_in(node) if name in self.unsafe_sql_vars)
 
-    def is_text_call(self, node):
-        if not isinstance(node, ast.Call):
-            return False
-        name = call_name(node.func)
-        return name == 'text' or name.endswith('.text')
+    def weak_names_in(self, node):
+        return sorted(name for name in self.names_in(node) if name in self.weak_sql_vars)
 
-    def is_interpolated_sql(self, node):
+    def classify_expr(self, node):
+        # GH #94: provenance of one interpolated value. Names tainted by an
+        # interpolated-SQL assignment count as tainted here too.
+        if isinstance(node, ast.Constant):
+            return 'static'
         if isinstance(node, ast.JoinedStr):
-            return looks_like_sql(node, self.text) and any(isinstance(part, ast.FormattedValue) for part in node.values)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mod, ast.Add)):
-            return looks_like_sql(node, self.text) and not all_static_strings(node)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
-            return looks_like_sql(node.func.value, self.text)
-        return False
+            risk = 'static'
+            for part in node.values:
+                if isinstance(part, ast.FormattedValue):
+                    risk = max_risk(risk, self.classify_expr(part.value))
+            return risk
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return max_risk(self.classify_expr(node.left), self.classify_expr(node.right))
+        if isinstance(node, ast.Name):
+            if node.id in self.param_names or node.id in self.unsafe_sql_vars:
+                return 'tainted'
+            return self.name_risk.get(node.id, 'unknown')
+        if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript, ast.Await)):
+            return 'tainted'
+        risk = None
+        for child in ast.iter_child_nodes(node):
+            child_risk = self.classify_expr(child)
+            risk = child_risk if risk is None else max_risk(risk, child_risk)
+        return risk if risk is not None else 'unknown'
+
+    def interpolated_sql_severity(self, node, require_sql=True):
+        # GH #94: an interpolated SQL string is Critical only when at least one
+        # interpolated value can carry external data. Provably-constant
+        # interpolants are as safe as a literal (no finding); plain names of
+        # unknown provenance surface as Warning.
+        sql_node = node
+        if isinstance(node, ast.JoinedStr):
+            parts = [part.value for part in node.values if isinstance(part, ast.FormattedValue)]
+            if not parts:
+                return None
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            parts = [node.right]
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            parts = [node.left, node.right]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
+            parts = list(node.args) + [kw.value for kw in node.keywords]
+            sql_node = node.func.value
+        else:
+            return None
+        if require_sql and not looks_like_sql(sql_node, self.text):
+            return None
+        risk = 'static'
+        for part in parts:
+            risk = max_risk(risk, self.classify_expr(part))
+        if risk == 'static':
+            return None
+        return 'critical' if risk == 'tainted' else 'warning'
 
     def contains_interpolation(self, node):
         if isinstance(node, ast.JoinedStr) and any(isinstance(part, ast.FormattedValue) for part in node.values):
@@ -1089,12 +1249,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return True
         return any(self.contains_interpolation(child) for child in ast.iter_child_nodes(node))
 
-    def contains_unsafe_sql(self, node):
-        if self.is_interpolated_sql(node) or self.unsafe_names_in(node):
-            return True
-        if self.is_text_call(node) and node.args:
-            return self.contains_unsafe_sql(node.args[0])
-        return any(self.is_interpolated_sql(child) for child in ast.walk(node))
+    def sql_risk(self, node, require_sql=True):
+        # Worst severity over the expression: None (safe), 'warning', 'critical'.
+        worst = None
+        if self.unsafe_names_in(node):
+            return 'critical'
+        if self.weak_names_in(node):
+            worst = 'warning'
+        for child in ast.walk(node):
+            severity = self.interpolated_sql_severity(child, require_sql=require_sql)
+            if severity == 'critical':
+                return 'critical'
+            if severity == 'warning':
+                worst = 'warning'
+        return worst
 
     def target_names(self, targets):
         names = []
@@ -1106,11 +1274,19 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return names
 
     def mark_assignment(self, names, value):
-        if self.contains_unsafe_sql(value):
-            self.unsafe_sql_vars.update(names)
+        risk = self.sql_risk(value)
+        if risk == 'critical':
+            for name in names:
+                self.unsafe_sql_vars.add(name)
+                self.weak_sql_vars.discard(name)
+        elif risk == 'warning':
+            for name in names:
+                self.weak_sql_vars.add(name)
+                self.unsafe_sql_vars.discard(name)
         else:
             for name in names:
                 self.unsafe_sql_vars.discard(name)
+                self.weak_sql_vars.discard(name)
 
     def visit_Assign(self, node):
         names = self.target_names(node.targets)
@@ -1125,8 +1301,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_AugAssign(self, node):
         if isinstance(node.target, ast.Name):
-            if node.target.id in self.unsafe_sql_vars or self.contains_unsafe_sql(node.value):
+            risk = self.sql_risk(node.value)
+            if node.target.id in self.unsafe_sql_vars or risk == 'critical':
                 self.unsafe_sql_vars.add(node.target.id)
+                self.weak_sql_vars.discard(node.target.id)
+            elif node.target.id in self.weak_sql_vars or risk == 'warning':
+                self.weak_sql_vars.add(node.target.id)
         self.generic_visit(node)
 
     def sql_argument(self, node):
@@ -1145,32 +1325,46 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self.generic_visit(node)
             return
         arg = self.sql_argument(node)
-        if arg is not None and self.contains_unsafe_sql(arg):
-            self.issues.append((self.relative_path(), node.lineno, source_line(self.lines, node.lineno)))
+        if arg is not None:
+            risk = self.sql_risk(arg)
+            if risk == 'critical':
+                self.issues.append((self.relative_path(), node.lineno, source_line(self.lines, node.lineno)))
+            elif risk == 'warning':
+                self.warn_issues.append((self.relative_path(), node.lineno, source_line(self.lines, node.lineno)))
         elif call_name(node.func).rsplit('.', 1)[-1] == 'extra':
             for keyword in node.keywords:
                 if keyword.arg == 'where' and self.contains_interpolation(keyword.value):
-                    self.issues.append((self.relative_path(), node.lineno, source_line(self.lines, node.lineno)))
+                    risk = self.sql_risk(keyword.value, require_sql=False)
+                    if risk == 'critical':
+                        self.issues.append((self.relative_path(), node.lineno, source_line(self.lines, node.lineno)))
+                    elif risk == 'warning':
+                        self.warn_issues.append((self.relative_path(), node.lineno, source_line(self.lines, node.lineno)))
                     break
         self.generic_visit(node)
 
-def analyze(path, issues):
+def analyze(path, issues, warn_issues):
     try:
         text = path.read_text(encoding='utf-8', errors='ignore')
         tree = ast.parse(text, filename=str(path))
     except Exception:
         return
     lines = text.splitlines()
-    analyzer = SQLInjectionAnalyzer(path, text, lines)
+    param_names, name_risk = build_provenance(tree)
+    analyzer = SQLInjectionAnalyzer(path, text, lines, param_names, name_risk)
     analyzer.visit(tree)
     issues.extend(analyzer.issues)
+    warn_issues.extend(analyzer.warn_issues)
 
 issues = []
+warn_issues = []
 for file_path in iter_files(ROOT):
-    analyze(file_path, issues)
+    analyze(file_path, issues, warn_issues)
 print(f'__COUNT__\t{len(issues)}')
 for file_name, line_no, code in issues[:25]:
     print(f'__SAMPLE__\t{file_name}\t{line_no}\t{code}')
+print(f'__WCOUNT__\t{len(warn_issues)}')
+for file_name, line_no, code in warn_issues[:25]:
+    print(f'__WSAMPLE__\t{file_name}\t{line_no}\t{code}')
 PY
 )
 }

@@ -8,6 +8,19 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.13] - 2026-08-17 [Release]
+
+### Fixes
+
+- **#95 — installer no longer sudo-creates user-path install dirs; clear EACCES diagnostics; real resolved tag in the banner (`d5fc4d4`).** Root cause (found in the v5.3.12 release e2e): with `--install-dir` pointing at a user-writable path that did not exist yet, `maybe_sudo()` probed the missing directory with `-w`, which always fails, so the installer took the sudo branch and created the bin dir root-owned; the subsequent unprivileged download then died with a misleading network-flavored error (curl exit 23 / EACCES). `maybe_sudo()` now probes the nearest *existing* ancestor of the target, chowns back any sudo-created path under `$HOME`, and re-evaluates `use_sudo` once the directory exists. Permission failures are now diagnosed as permission failures, and the completion banner reports the actually-resolved release tag instead of a guess.
+- **#96 — Rust loop-context false positives (`548540e`).** `for\b[^{;]*\{` matched `impl Trait for Type {` and `for<'a>` HRTBs, so every allocation inside a loop-free impl body was flagged as string-allocation-inside-loop; the loop regex now requires an `in` clause before the brace. Cold error-path closures (`map_err`, `ok_or_else`, `unwrap_or_else`, `or_else`, `map_or_else`, `expect_err`) and `async`/`async move` blocks are masked so failure-branch or deferred allocations are not charged as per-iteration cost. Clean fixture and manifest row added.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.13`; `SHA256SUMS` regenerated against the final `5.3.13` bytes. The rust module change in #96 already refreshed `MODULE_CHECKSUMS` in its own commit, so `scripts/check-version-tag-drift.sh` reconciles once `v5.3.13` is tagged.
+
+---
+
 ## [v5.3.12] - 2026-08-17 [Release]
 
 ### Fixes

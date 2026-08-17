@@ -100,7 +100,13 @@ declare -A ASYNC_ERROR_REMEDIATION=(
 declare -A ASYNC_ERROR_SEVERITY=(
   [js.async.then-no-catch]='warning'
   [js.async.promiseall-no-try]='warning'
-  [js.async.await-no-try]='warning'
+  # GH #93 calibration: await-no-try cannot see caller-side handling (a
+  # rejected promise is routinely caught by the caller's try/catch or a
+  # .catch() on the returned promise), so a bare await is style guidance, not
+  # evidence of an unhandled rejection — js.async.dangling-promise and
+  # js.async.then-no-catch cover the genuinely unhandled cases. Info tier
+  # keeps it visible without failing --fail-on-warning gates.
+  [js.async.await-no-try]='info'
   [js.async.dangling-promise]='warning'
 )
 
@@ -914,7 +920,15 @@ KEYWORDS = {
     'const', 'let', 'var', 'return', 'if', 'else', 'switch', 'case', 'break', 'continue',
     'for', 'while', 'do', 'class', 'function', 'async', 'await', 'default', 'new', 'typeof',
     'try', 'catch', 'finally', 'throw', 'import', 'from', 'export', 'extends', 'super',
-    'true', 'false', 'null', 'undefined', 'NaN', 'Infinity'
+    'true', 'false', 'null', 'undefined', 'NaN', 'Infinity',
+    # GH #93: operator/TS keywords — hooks rules now run on .ts/.tsx, where
+    # `void fn()`, `x as T`, and type annotations put these in callback text.
+    'void', 'delete', 'in', 'of', 'yield', 'instanceof', 'this', 'static',
+    'get', 'set', 'as', 'satisfies', 'keyof', 'readonly', 'infer', 'is',
+    'asserts', 'type', 'interface', 'enum', 'declare', 'namespace', 'abstract',
+    'implements', 'public', 'private', 'protected', 'override',
+    'string', 'number', 'boolean', 'unknown', 'any', 'never', 'object',
+    'symbol', 'bigint',
 }
 
 BUILTINS = {
@@ -924,6 +938,8 @@ BUILTINS = {
 }
 STATE_PATTERN = re.compile(r"const\s*\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]\s*=\s*useState", re.MULTILINE)
 REF_PATTERN = re.compile(r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*useRef\(", re.MULTILINE)
+MODULE_FN_PATTERN = re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)", re.MULTILINE)
+MODULE_CONST_FN_PATTERN = re.compile(r"^(?:export\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]+)?=\s*(?:async\s*)?(?:function\b|\()", re.MULTILINE)
 PROPS_FUNC_PATTERN = re.compile(r"function\s+[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\{([^}]*)\}\s*\)")
 ARROW_FUNC_PATTERN = re.compile(r"=\s*\(\s*\{([^}]*)\}\s*\)\s*=>")
 DESTRUCT_PROPS_PATTERN = re.compile(r"const\s*\{([^}]*)\}\s*=\s*props")
@@ -965,7 +981,11 @@ def get_file_symbols(path_str):
     for pattern in (PROPS_FUNC_PATTERN, ARROW_FUNC_PATTERN, DESTRUCT_PROPS_PATTERN):
         for match in pattern.finditer(text):
             props.update(parse_props(match.group(1)))
-    data = {'text': text, 'state': state_vars, 'setters': setters, 'props': props, 'refs': ref_vars}
+    # GH #93: module-level (column-0) function declarations are stable across
+    # renders and must not be suggested as hook dependencies.
+    module_fns = {m.group(1) for m in MODULE_FN_PATTERN.finditer(text)}
+    module_fns.update(m.group(1) for m in MODULE_CONST_FN_PATTERN.finditer(text))
+    data = {'text': text, 'state': state_vars, 'setters': setters, 'props': props, 'refs': ref_vars, 'module_fns': module_fns}
     file_cache[path_str] = data
     return data
 
@@ -996,6 +1016,10 @@ def extract_locals(callback_text):
         locals_set.add(match.group(1))
     for match in re.finditer(r"\(\s*([^)]+?)\s*\)\s*=>", callback_text):
         locals_set.update(parse_props(match.group(1)))
+    # GH #93: `catch (err)` bindings are callback-local, not render-scope
+    # values — never suggest them as hook dependencies.
+    for match in re.finditer(r"catch\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)", callback_text):
+        locals_set.add(match.group(1))
     return locals_set
 
 def strip_template_literals(text):
@@ -1078,6 +1102,8 @@ def classify(name, symbols):
 
 def skip_name(name, symbols):
     if name in symbols['setters']:
+        return True
+    if name in symbols.get('module_fns', set()):
         return True
     if name in BUILTINS:
         return True

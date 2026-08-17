@@ -8,6 +8,22 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.12] - 2026-08-17 [Release]
+
+### Fixes
+
+- **#90 — deep_guard recognizes membership-test guards and calibrates severity (`387e85b`).** `Object.prototype.hasOwnProperty.call(obj, key) ? obj[key] : fallback` — the exact reported false positive — is no longer flagged: membership-test ternary conditions (`hasOwnProperty.call`, `Object.hasOwn`, the binary `in` operator) now mark the whole ternary as a guarded region, `if` bodies guarded by a membership test are treated consistently, and static `Builtin.prototype.method` chains count as guarded. The persisted deep_guard metric (extras/report JSON) now carries an explicit `severity` field mirroring the printed tier — warning at worst, info otherwise, good when fully guarded — across js/python/ruby, so downstream consumers can never surface defensive-access lint as Critical.
+- **#91 — `ubs:ignore` placement is honored (`25729a1`).** The suppression marker now works when it sits on the previous line, on any physical line of a multi-line statement, or after a formatter moves a trailing marker inside a block-opening `{`. README documents the accepted placements. Fixture: `suppression_placement.ts`.
+- **#92 — multi-line `.then().catch()` no longer trips then-no-catch (`25729a1`).** The grep double-check that re-flagged multi-line `.then().catch()` chains (and comments mentioning `.then(`) was removed, so those stay clean under `--fail-on-warning`.
+- **#93 — TS/TSX rule-variant coverage (`25729a1`, calibration follow-up `2f0275e`).** `js.async.then-no-catch` language variants now fire on `.ts` and `.tsx`, not only `.js`. Follow-up calibration: `js.async.await-no-try` is info severity (bare `await` cannot see caller-side try/catch or a returned `.catch()`; dangling-promise and then-no-catch still cover genuinely unhandled cases), the hook-deps keyword set includes TS operator words seen in `.ts`/`.tsx` callbacks, module-level function names are skipped as hook deps, and `catch (err)` bindings are callback-local.
+- **#94 — Python interpolated-SQL provenance tiers (`25729a1`).** Interpolated SQL is now classified static / unknown / tainted: module-level constant f-strings (the Alembic seed-migration pattern) are silent, imported names of unknown origin report as Warning rather than Critical, and tainted interpolation keeps its Critical tier.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.12`; `SHA256SUMS` regenerated against the final `5.3.12` bytes. The js/python/ruby module changes above already refreshed `MODULE_CHECKSUMS` in their own commits, so `scripts/check-version-tag-drift.sh` reconciles once `v5.3.12` is tagged.
+
+---
+
 ## [v5.3.11] - 2026-08-16 [Release]
 
 ### Features

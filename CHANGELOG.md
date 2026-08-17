@@ -8,6 +8,22 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [v5.3.11] - 2026-08-16 [Release]
+
+### Features
+
+- **#88 — directories are now accepted as extra positional scan targets (union scan, `a91f242`).** `ubs src/ test/ scripts/` previously failed with a misleading `file not found: test/` because every extra positional arg was validated as a regular file (pre-existing since v5.0.7). Positional targets are now collected and classified after the parse loop: exactly one directory keeps the classic whole-project scan, while any other shape becomes an explicit target list that may mix files **and** directories, scanned as a union from one shadow workspace rooted at the cwd. Directory targets copy recursively with the global ignore patterns (defaults + `.ubsignore`) and respect the `UBS_MAX_DIR_SIZE_MB` size ceiling; explicitly named files still win over ignore patterns; missing targets report `scan target not found` and exit 2.
+
+### Fixes
+
+- **HIGH: `..` directory targets no longer escape the shadow workspace (`58de8a8`, #88 follow-up).** A relative directory target containing `..` (e.g. `ubs ../lib main.c` from a subdirectory) survived into the shadow-copy destination path, so the copy landed *outside* `files_scan` and the named directory was silently never scanned — while the run still exited 0 with a green summary. Directory targets are now canonicalized (`cd && pwd -P`) before deriving the in-workspace relative path: targets under the scan root keep their relative layout, targets outside it are nested under their full path with the leading slash stripped, matching the containment absolute-path directory targets already had.
+
+### Housekeeping
+
+- `VERSION`, `UBS_VERSION` (in `ubs`), and the README version badge bumped to `5.3.11`; `SHA256SUMS` regenerated against the final `5.3.11` bytes. Modules/helpers are byte-identical to v5.3.10, so `MODULE_CHECKSUMS`/`HELPER_CHECKSUMS` are unchanged and `scripts/check-version-tag-drift.sh` holds once `v5.3.11` is tagged.
+
+---
+
 ## [v5.3.10] - 2026-08-16 [Release]
 
 ### Fixes

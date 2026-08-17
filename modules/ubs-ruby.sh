@@ -373,6 +373,17 @@ persist_metric_json() {
   } >"$UBS_METRICS_DIR/$key.json"
 }
 
+# GH #90: stamp an explicit severity into a metric payload so downstream
+# consumers of extras/report JSON never have to guess a default tier (deep_guard
+# is defensive-access lint — warning at worst, never critical).
+annotate_metric_severity() {
+  local payload=$1 sev=$2
+  case "$payload" in
+    *\}) printf '%s' "${payload%\}}, \"severity\": \"$sev\"}" ;;
+    *)   printf '%s' "$payload" ;;
+  esac
+}
+
 begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; set +e; trap - ERR; }
 end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
 
@@ -2657,6 +2668,10 @@ if [[ -n "$deep_chain_json" && "$guarded_chain_count" -gt 0 ]]; then
   say "    ${DIM}Suppressed $guarded_chain_count guarded chain(s) (safe-nav or inline guard)${RESET}"
 fi
 if [[ -n "$deep_chain_json" ]]; then
+  # GH #90: mirror the printed tier (info when any unguarded chain, good otherwise)
+  deep_chain_sev="good"
+  if [ "${count:-0}" -gt 0 ]; then deep_chain_sev="info"; fi
+  deep_chain_json=$(annotate_metric_severity "$deep_chain_json" "$deep_chain_sev")
   persist_metric_json "deep_guard" "$deep_chain_json"
 fi
 

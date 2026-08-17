@@ -206,6 +206,38 @@
       }
     },
     {
+      "id": "js-deep-guard-membership-clean",
+      "description": "GH #90 regression: hasOwnProperty.call/Object.hasOwn/`in` membership guards suppress deep_guard unguarded-nested-access findings.",
+      "path": "test-suite/js/clean/deep_guard_membership.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "module",
+        "deep-guard",
+        "clean"
+      ],
+      "args": [
+        "--only=js"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "require_substrings": [
+          "Deep property chains are guarded"
+        ],
+        "forbid_substrings": [
+          "Deep property access - high crash risk"
+        ]
+      }
+    },
+    {
       "id": "js-node-buggy",
       "description": "Express/Node buggy API sample with many security issues.",
       "path": "test-suite/frameworks/node/buggy-api.js",

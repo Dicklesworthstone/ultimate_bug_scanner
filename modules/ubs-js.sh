@@ -2691,15 +2691,18 @@ analyze_deep_property_guards() {
   if [[ "$HAS_AST_GREP" -ne 1 ]]; then return 1; fi
   if ! command -v python3 >/dev/null 2>&1; then return 1; fi
 
-  local tmp_props tmp_ifs result
+  local tmp_props tmp_ifs tmp_ternaries result
   tmp_props="$(mktemp -t ubs-deep-props.XXXXXX 2>/dev/null || mktemp -t ubs-deep-props)"
   tmp_ifs="$(mktemp -t ubs-if-guards.XXXXXX 2>/dev/null || mktemp -t ubs-if-guards)"
+  tmp_ternaries="$(mktemp -t ubs-ternary-guards.XXXXXX 2>/dev/null || mktemp -t ubs-ternary-guards)"
 
   ( set +o pipefail; ast_grep_project --pattern '$OBJ.$P1.$P2.$P3' --json=stream 2>/dev/null || true ) >"$tmp_props"
   ( set +o pipefail; ast_grep_project --pattern 'if ($COND) $BODY' --json=stream 2>/dev/null || true ) >"$tmp_ifs"
+  # shellcheck disable=SC2016  # ast-grep metavariables, not shell expansion
+  ( set +o pipefail; ast_grep_project --pattern '$COND ? $THEN : $ELSE' --json=stream 2>/dev/null || true ) >"$tmp_ternaries"
 
-  result=$(python3 - "$tmp_props" "$tmp_ifs" "$limit" <<'PY'
-import json, sys
+  result=$(python3 - "$tmp_props" "$tmp_ifs" "$limit" "$tmp_ternaries" <<'PY'
+import json, re, sys
 from collections import defaultdict
 
 def load_stream(path):
@@ -2719,9 +2722,26 @@ def load_stream(path):
     return entries
 
 matches_path, guards_path, limit_raw = sys.argv[1:4]
+ternaries_path = sys.argv[4] if len(sys.argv) > 4 else None
 limit = int(limit_raw)
 matches = load_stream(matches_path)
 guards = load_stream(guards_path)
+ternaries = load_stream(ternaries_path) if ternaries_path else []
+
+# GH #90: membership-test idioms count as explicit guards, same as `a && a.b`.
+#   Object.prototype.hasOwnProperty.call(obj, key)  /  Object.hasOwn(obj, key)
+#   `key in obj` (the binary `in` operator, not for-in)
+HAS_OWN_RE = re.compile(r'\bhasOwnProperty\s*\.\s*call\s*\(|\bObject\s*\.\s*hasOwn\s*\(')
+IN_OPERATOR_RE = re.compile(r'(?<![\w$.])in(?![\w$])')
+
+def is_guard_condition(text):
+    if '&&' in text:
+        return True
+    if HAS_OWN_RE.search(text):
+        return True
+    if IN_OPERATOR_RE.search(text):
+        return True
+    return False
 
 def as_pos(data):
     line = data.get('line')
@@ -2747,10 +2767,36 @@ for guard in guards:
     if not file_path or not cond:
         continue
     cond_text = cond.get('text') or ''
-    # Only treat explicit short-circuit guards as "guarding" deep chains.
-    if '&&' not in cond_text:
+    # Explicit short-circuit guards and membership-test guards (GH #90)
+    # both count as "guarding" deep chains. Short-circuit conditions keep the
+    # historical behavior (suppress chains inside the condition itself);
+    # membership tests (hasOwnProperty.call / Object.hasOwn / `in`) extend to
+    # the whole if statement, matching the ternary-guard treatment below.
+    if HAS_OWN_RE.search(cond_text) or IN_OPERATOR_RE.search(cond_text):
+        rng = guard.get('range') or {}
+    elif '&&' in cond_text:
+        rng = cond.get('range') or {}
+    else:
         continue
-    rng = cond.get('range') or {}
+    start = rng.get('start')
+    end = rng.get('end')
+    if not start or not end:
+        continue
+    guards_by_file[file_path].append((as_pos(start), as_pos(end)))
+
+# GH #90: `guard ? guardedAccess : fallback` ternaries. When the condition is a
+# membership test (hasOwnProperty.call / Object.hasOwn / `in`) or a short-circuit
+# chain, the whole ternary expression is treated as a guarded region, so the
+# access in its branches is not reported as unguarded.
+for ternary in ternaries:
+    file_path = ternary.get('file')
+    cond = (ternary.get('metaVariables') or {}).get('single', {}).get('COND')
+    if not file_path or not cond:
+        continue
+    cond_text = cond.get('text') or ''
+    if not is_guard_condition(cond_text):
+        continue
+    rng = ternary.get('range') or {}
     start = rng.get('start')
     end = rng.get('end')
     if not start or not end:
@@ -2761,12 +2807,28 @@ unguarded = 0
 guarded = 0
 samples = []
 
+# GH #90: static built-in prototype-method borrowing is itself the guard idiom
+# (Object.prototype.hasOwnProperty.call, Array.prototype.slice.call, ...) and
+# can never be a null deref; never report it as an unguarded chain.
+SAFE_CHAIN_ROOTS = {'Object', 'Array', 'Function', 'String', 'Number', 'Reflect', 'JSON', 'Math'}
+
+def is_safe_builtin_chain(match):
+    single = (match.get('metaVariables') or {}).get('single', {})
+    obj = (single.get('OBJ') or {}).get('text', '')
+    p1 = (single.get('P1') or {}).get('text', '')
+    if obj in SAFE_CHAIN_ROOTS and p1 == 'prototype':
+        return True
+    return False
+
 for match in matches:
     file_path = match.get('file')
     rng = match.get('range') or {}
     start = rng.get('start')
     end = rng.get('end')
     if not file_path or not start or not end:
+        continue
+    if is_safe_builtin_chain(match):
+        guarded += 1
         continue
     start_pos = as_pos(start)
     end_pos = as_pos(end)
@@ -2784,7 +2846,7 @@ print(json.dumps({'unguarded': unguarded, 'guarded': guarded, 'samples': samples
 PY
   )
 
-  rm -f "$tmp_props" "$tmp_ifs"
+  rm -f "$tmp_props" "$tmp_ifs" "$tmp_ternaries"
   printf '%s' "$result"
 }
 
@@ -2947,6 +3009,17 @@ persist_metric_json() {
     printf '%s' "$payload"
     printf '}'
   } >"$UBS_METRICS_DIR/$key.json"
+}
+
+# GH #90: stamp an explicit severity into a metric payload so downstream
+# consumers of extras/report JSON never have to guess a default tier (deep_guard
+# is defensive-access lint — warning at worst, never critical).
+annotate_metric_severity() {
+  local payload=$1 sev=$2
+  case "$payload" in
+    *\}) printf '%s' "${payload%\}}, \"severity\": \"$sev\"}" ;;
+    *)   printf '%s' "$payload" ;;
+  esac
 }
 
 write_ast_rules() {
@@ -3753,6 +3826,14 @@ if [[ -n "$deep_guard_json" && "$guarded_inside" -gt 0 ]]; then
   say "    ${DIM}Suppressed $guarded_inside guarded chain(s) detected inside if conditions${RESET}"
 fi
 if [[ -n "$deep_guard_json" ]]; then
+  # GH #90: mirror the printed tier (warning >20, info >0, good otherwise)
+  deep_guard_sev="good"
+  if [ "$count" -gt 20 ]; then
+    deep_guard_sev="warning"
+  elif [ "$count" -gt 0 ]; then
+    deep_guard_sev="info"
+  fi
+  deep_guard_json=$(annotate_metric_severity "$deep_guard_json" "$deep_guard_sev")
   persist_metric_json "deep_guard" "$deep_guard_json"
 fi
 fi

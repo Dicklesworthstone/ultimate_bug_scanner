@@ -994,6 +994,31 @@ resolve_git_metadata(){
   esac
 }
 
+# Surface the real rsync diagnostic when a shadow-workspace copy fails
+# (issue #98): a discarded stderr collapsed permission errors, missing
+# paths, ENOSPC and bad file-list entries into one generic message.
+# Prints the rsync exit status plus up to 20 captured stderr lines (or an
+# explicit note that rsync produced none).
+report_rsync_failure(){
+  local rc="$1" err_file="$2"
+  say "${DIM}rsync exited with status ${rc}${RESET}"
+  if [[ -s "$err_file" ]]; then
+    local shown=0 total=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      total=$((total + 1))
+      if [[ "$shown" -lt 20 ]]; then
+        say "${DIM}  rsync: ${line}${RESET}"
+        shown=$((shown + 1))
+      fi
+    done < "$err_file"
+    if [[ "$total" -gt "$shown" ]]; then
+      say "${DIM}  ... ($((total - shown)) more rsync stderr line(s) suppressed)${RESET}"
+    fi
+  else
+    say "${DIM}  (rsync produced no stderr)${RESET}"
+  fi
+}
+
 prepare_git_workspace(){
   local mode="$1"
   if ! need_cmd git; then
@@ -1022,14 +1047,18 @@ prepare_git_workspace(){
     exit 1
   fi
 
+  # Read NUL-separated names (-z): plain --name-only C-quotes paths with
+  # backslashes or non-ASCII bytes (e.g. systemd mount-unit names like
+  # var-tmp-ai\x2dmachine.mount), and the quoted record then poisons the
+  # rsync --files-from list with a nonexistent path (issue #98).
   local raw_files=()
   if [[ "$mode" == "staged" ]]; then
-    while IFS= read -r file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
-      git -C "$repo_root" diff --name-only --cached --diff-filter=ACMR
+    while IFS= read -r -d '' file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
+      git -C "$repo_root" diff --name-only -z --cached --diff-filter=ACMR
     )
   else
-    while IFS= read -r file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
-      git -C "$repo_root" diff --name-only --diff-filter=ACMR HEAD
+    while IFS= read -r -d '' file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
+      git -C "$repo_root" diff --name-only -z --diff-filter=ACMR HEAD
     )
   fi
 
@@ -1103,12 +1132,16 @@ for line in sys.stdin:
   local file_list="$TMPDIR_RUN/files_to_scan.txt"
   printf "%s\n" "${files[@]}" > "$file_list"
   
-  if rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
+  local rsync_err="$TMPDIR_RUN/rsync_stderr_git.txt"
+  local rsync_rc=0
+  rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>"$rsync_err" || rsync_rc=$?
+  if [[ "$rsync_rc" -eq 0 ]]; then
     FILTERED_PROJECT_DIR="$dest"
     PROJECT_DIR="$FILTERED_PROJECT_DIR"
     say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
   else
     say "${RED}$X Failed to prepare shadow workspace${RESET}"
+    report_rsync_failure "$rsync_rc" "$rsync_err"
     exit 1
   fi
 }
@@ -1203,8 +1236,12 @@ prepare_files_workspace(){
   if [[ ${#resolved_files[@]} -gt 0 ]]; then
     local file_list="$TMPDIR_RUN/explicit_files.txt"
     printf "%s\n" "${resolved_files[@]}" > "$file_list"
-    if ! rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
+    local rsync_err="$TMPDIR_RUN/rsync_stderr_files.txt"
+    local rsync_rc=0
+    rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>"$rsync_err" || rsync_rc=$?
+    if [[ "$rsync_rc" -ne 0 ]]; then
       say "${RED}$X Failed to prepare files workspace${RESET}"
+      report_rsync_failure "$rsync_rc" "$rsync_err"
       exit 1
     fi
   fi
@@ -1225,8 +1262,12 @@ prepare_files_workspace(){
     local i
     for ((i=0; i<${#dir_src[@]}; i++)); do
       ensure_dir "$dest/${dir_rel[$i]}"
-      if ! rsync -a "${dir_excludes[@]}" "${dir_src[$i]}"/ "$dest/${dir_rel[$i]}"/ >/dev/null 2>&1; then
+      local dir_rsync_err="$TMPDIR_RUN/rsync_stderr_dir.txt"
+      local dir_rsync_rc=0
+      rsync -a "${dir_excludes[@]}" "${dir_src[$i]}"/ "$dest/${dir_rel[$i]}"/ >/dev/null 2>"$dir_rsync_err" || dir_rsync_rc=$?
+      if [[ "$dir_rsync_rc" -ne 0 ]]; then
         say "${RED}$X Failed to copy directory target${RESET}: ${dir_src[$i]}"
+        report_rsync_failure "$dir_rsync_rc" "$dir_rsync_err"
         exit 1
       fi
     done

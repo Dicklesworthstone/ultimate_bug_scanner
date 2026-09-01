@@ -155,6 +155,69 @@ def check_version_identity(tmpdir: Path) -> None:
     )
 
 
+def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
+    """Issue #98 regression guard: the staged/diff shadow-copy rsync used to
+    run with `>/dev/null 2>&1`, so every failure collapsed into the generic
+    "Failed to prepare shadow workspace" with no way to tell permission
+    errors, missing paths, ENOSPC or bad file-list entries apart. Worse, the
+    staged file list came from non-NUL `git diff --name-only`, which C-quotes
+    paths containing backslashes (e.g. systemd mount-unit names like
+    `var-tmp-ai\\x2dmachine.mount`), so such repos failed deterministically.
+
+    Two guards: (a) a staged backslash-named file must no longer break
+    workspace preparation at all; (b) a real rsync failure must exit non-zero
+    AND surface rsync's own exit status and stderr."""
+    env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0"}
+    repo = tmpdir / "staged_repo"
+    repo.mkdir(parents=True)
+    git_base = [
+        "git",
+        "-c",
+        "user.name=UBS Test",
+        "-c",
+        "user.email=ubs-test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-C",
+        str(repo),
+    ]
+    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True)
+    mount_unit = repo / "var-tmp-ai\\x2dmachine.mount"
+    mount_unit.write_text("[Mount]\nWhere=/var/tmp/ai-machine\n")
+    subprocess.run([*git_base, "add", "-A"], check=True, capture_output=True)
+
+    def run_staged() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(UBS_BIN), "--staged"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **env},
+            check=False,
+        )
+
+    # (a) Backslash-named staged file: the C-quoted git record used to poison
+    # the rsync --files-from list; with -z parsing the workspace must prepare.
+    res = run_staged()
+    output = res.stdout + res.stderr
+    assert "Failed to prepare shadow workspace" not in output, output
+    assert "Scanning shadow workspace" in output, output
+
+    # (b) Planted-negative: an unreadable staged file forces a genuine rsync
+    # failure. The run must fail loudly with rsync's real diagnostic instead
+    # of only the generic context line.
+    mount_unit.chmod(0)
+    try:
+        res = run_staged()
+    finally:
+        mount_unit.chmod(0o644)
+    output = res.stdout + res.stderr
+    assert res.returncode != 0, output
+    assert "Failed to prepare shadow workspace" in output, output
+    assert "rsync exited with status" in output, output
+    assert "rsync:" in output, output
+
+
 def main() -> None:
     tmpdir = Path(tempfile.mkdtemp(prefix="ubs-meta-runner-"))
     try:
@@ -205,6 +268,10 @@ def main() -> None:
 
         # Issue #79: --version identity must belong to UBS, not the caller's cwd.
         check_version_identity(tmpdir)
+
+        # Issue #98: staged rsync failures must surface rsync's stderr, and
+        # backslash-named staged files must not break workspace preparation.
+        check_staged_rsync_diagnostics(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

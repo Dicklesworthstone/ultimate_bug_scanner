@@ -2439,7 +2439,7 @@ ubs doctor --module-dir=/custom/path  # Check specific cache location
 ✓ Cache directory writable (/home/user/.local/share/ubs/modules)
 ✓ sha256sum available
 ✓ 8/8 modules verified
-✓ ast-grep v0.40.1 ready
+✓ ast-grep v0.45.3 ready
 ✓ All checks passed
 ```
 

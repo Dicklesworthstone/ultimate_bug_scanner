@@ -12,11 +12,11 @@ permissions:
   id-token: write
 
 env:
-  COSIGN_VERSION: v2.2.4
-  SYFT_VERSION: v1.4.1
-  UV_VERSION: "0.4.20"
-  JQ_VERSION: "1.7.1"
-  RG_VERSION: "13.0.0"
+  COSIGN_VERSION: v3.1.3
+  SYFT_VERSION: v1.51.1
+  UV_VERSION: "0.12.9"
+  JQ_VERSION: "1.8.2"
+  RG_VERSION: "15.2.0"
 
 jobs:
   gather:
@@ -37,12 +37,12 @@ jobs:
     needs: gather
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v27
+        uses: cachix/install-nix-action@v31
         with:
-          install_url: https://releases.nixos.org/nix/nix-2.18.1/install
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
           extra_nix_config: |
             experimental-features = nix-command flakes
 
@@ -64,7 +64,7 @@ jobs:
           fi
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -76,16 +76,16 @@ jobs:
 
           # jq (static binary)
           curl -fsSLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64"
-          echo "5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5  /usr/local/bin/jq" | sha256sum --check --status
+          echo "b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  /usr/local/bin/jq" | sha256sum --check --status
           chmod +x /usr/local/bin/jq
 
-          # ripgrep (13.0.0 deb)
-          curl -fsSLo "/tmp/ripgrep_${RG_VERSION}_amd64.deb" "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep_${RG_VERSION}_amd64.deb"
-          echo "6d78bed13722019cb4f9d0cf366715e2dcd589f4cf91897efb28216a6bb319f1  /tmp/ripgrep_${RG_VERSION}_amd64.deb" | sha256sum --check --status
-          sudo dpkg -i "/tmp/ripgrep_${RG_VERSION}_amd64.deb"
+          # ripgrep (pinned deb; upstream names the Debian package ripgrep_<ver>-1_amd64.deb since 14.x)
+          curl -fsSLo "/tmp/ripgrep_${RG_VERSION}-1_amd64.deb" "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/ripgrep_${RG_VERSION}-1_amd64.deb"
+          echo "5af93eebe4c352474632cf1d28523b0e98bcd4e2f115a249a713b8d8c7d1d01c  /tmp/ripgrep_${RG_VERSION}-1_amd64.deb" | sha256sum --check --status
+          sudo dpkg -i "/tmp/ripgrep_${RG_VERSION}-1_amd64.deb"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.13"
           enable-cache: false
@@ -116,7 +116,7 @@ jobs:
           rm dist/minisign.key
 
       - name: Install syft
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@v0.24.2
         with:
           syft-version: ${{ env.SYFT_VERSION }}
 
@@ -158,7 +158,7 @@ jobs:
           cp scripts/verify.sh dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-artifacts
           path: dist
@@ -171,16 +171,16 @@ jobs:
       VERSION: ${{ needs.gather.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Normalize image name
         run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ubs-tools" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -188,7 +188,7 @@ jobs:
 
       - name: Build and push image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true
@@ -213,7 +213,7 @@ jobs:
           echo "sha=$DIGEST_HASH" >> "$GITHUB_OUTPUT"
 
       - name: Install syft
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@v0.24.2
         with:
           syft-version: ${{ env.SYFT_VERSION }}
 
@@ -221,7 +221,7 @@ jobs:
         run: syft ${{ steps.digest.outputs.digest }} -o spdx-json > sbom.spdx.json
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.6.0
+        uses: sigstore/cosign-installer@v4.1.2
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
@@ -268,7 +268,7 @@ jobs:
         run: cosign attest --yes --predicate provenance.json --type https://slsa.dev/provenance/v1 ${{ steps.digest.outputs.digest }}
 
       - name: Upload OCI artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oci-artifacts
           path: |
@@ -283,13 +283,13 @@ jobs:
       - nix-check
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-artifacts
           path: dist
 
       - name: Download OCI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: oci-artifacts
           path: oci
@@ -304,7 +304,7 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/install.sh
@@ -339,7 +339,7 @@ jobs:
 
       - name: Trigger formula update
         if: ${{ env.TAP_TOKEN != '' }}
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ env.TAP_TOKEN }}
           repository: Dicklesworthstone/homebrew-tap

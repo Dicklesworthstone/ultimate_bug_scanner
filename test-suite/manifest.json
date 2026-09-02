@@ -8300,7 +8300,6 @@
       "tags": [
         "rust",
         "perf",
-        "security",
         "clean"
       ],
       "ubs_bin": "../modules/ubs-rust.sh",

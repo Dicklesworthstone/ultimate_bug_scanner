@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ENV UBS_NO_AUTO_UPDATE=1 \
     DEBIAN_FRONTEND=noninteractive

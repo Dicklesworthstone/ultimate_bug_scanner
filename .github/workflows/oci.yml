@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Normalize image name
         run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ubs-tools" >> "$GITHUB_ENV"
@@ -44,14 +44,14 @@ jobs:
           fi
 
       - name: Set up QEMU (for multi-platform builds)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -59,7 +59,7 @@ jobs:
 
       - name: Build and push image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -85,9 +85,9 @@ jobs:
 
       - name: Install syft
         if: github.event_name != 'pull_request'
-        uses: anchore/sbom-action/download-syft@v0
+        uses: anchore/sbom-action/download-syft@v0.24.2
         with:
-          syft-version: v1.4.1
+          syft-version: v1.51.1
 
       - name: Generate SBOM (SPDX JSON)
         if: github.event_name != 'pull_request'
@@ -97,9 +97,9 @@ jobs:
 
       - name: Install cosign
         if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v3.6.0
+        uses: sigstore/cosign-installer@v4.1.2
         with:
-          cosign-release: v2.2.4
+          cosign-release: v3.1.3
 
       - name: Sign image (keyless)
         env:
@@ -148,14 +148,14 @@ jobs:
 
       - name: Upload SBOM artifact
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-spdx
           path: sbom.spdx.json
 
       - name: Upload provenance artifact
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oci-provenance
           path: provenance.json

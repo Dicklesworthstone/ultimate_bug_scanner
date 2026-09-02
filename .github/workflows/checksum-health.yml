@@ -19,7 +19,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The version-tag drift check below resolves
           # `git show v$UBS_VERSION:modules/...`. The default fetch-depth

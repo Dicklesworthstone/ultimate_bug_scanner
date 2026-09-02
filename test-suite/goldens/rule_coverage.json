@@ -21,9 +21,9 @@
     },
     "campaign": {
       "buggy_cases_with_required_substrings": 95,
-      "case_count": 190,
-      "clean_cases_with_forbidden_substrings": 95,
-      "strict_zero_clean_cases": 95,
+      "case_count": 191,
+      "clean_cases_with_forbidden_substrings": 96,
+      "strict_zero_clean_cases": 96,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,14 +38,14 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 178,
+      "case_count": 179,
       "default_iterations": 3,
-      "default_transformed_scan_count": 534
+      "default_transformed_scan_count": 537
     },
     "campaign": {
-      "case_count": 95,
+      "case_count": 96,
       "default_iterations": 3,
-      "default_transformed_scan_count": 285
+      "default_transformed_scan_count": 288
     },
     "smoke": {
       "case_count": 17,
@@ -64,9 +64,9 @@
     },
     "campaign": {
       "buggy_cases_with_required_substrings": 95,
-      "case_count": 190,
-      "clean_cases_with_forbidden_substrings": 95,
-      "strict_zero_clean_cases": 95,
+      "case_count": 191,
+      "clean_cases_with_forbidden_substrings": 96,
+      "strict_zero_clean_cases": 96,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -494,6 +494,7 @@
           "rust-collections-mentions-clean",
           "rust-perf-hotspots-buggy",
           "rust-perf-hotspots-mentions-clean",
+          "rust-loop-scope-collection-push-clean",
           "rust-string-allocations-buggy",
           "rust-string-allocation-mentions-clean",
           "rust-async-errors-buggy",
@@ -686,6 +687,7 @@
           "rust-collections-mentions-clean",
           "rust-perf-hotspots-buggy",
           "rust-perf-hotspots-mentions-clean",
+          "rust-loop-scope-collection-push-clean",
           "rust-string-allocations-buggy",
           "rust-string-allocation-mentions-clean",
           "rust-async-errors-buggy",
@@ -695,8 +697,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 356,
-      "transformed_scan_count": 546
+      "case_count": 357,
+      "transformed_scan_count": 548
     },
     "campaign": {
       "by_transform": {
@@ -884,6 +886,7 @@
           "rust-collections-mentions-clean",
           "rust-perf-hotspots-buggy",
           "rust-perf-hotspots-mentions-clean",
+          "rust-loop-scope-collection-push-clean",
           "rust-string-allocations-buggy",
           "rust-string-allocation-mentions-clean",
           "rust-async-errors-buggy",
@@ -1076,6 +1079,7 @@
           "rust-collections-mentions-clean",
           "rust-perf-hotspots-buggy",
           "rust-perf-hotspots-mentions-clean",
+          "rust-loop-scope-collection-push-clean",
           "rust-string-allocations-buggy",
           "rust-string-allocation-mentions-clean",
           "rust-async-errors-buggy",
@@ -1085,8 +1089,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 190,
-      "transformed_scan_count": 380
+      "case_count": 191,
+      "transformed_scan_count": 382
     },
     "smoke": {
       "by_transform": {
@@ -3393,6 +3397,7 @@
         "rust-macro-mentions-clean",
         "rust-collections-mentions-clean",
         "rust-perf-hotspots-mentions-clean",
+        "rust-loop-scope-collection-push-clean",
         "rust-string-allocation-mentions-clean",
         "rust-async-errors-clean",
         "rust-type-narrowing-clean"
@@ -3747,6 +3752,7 @@
         "rust-collections-mentions-clean",
         "rust-perf-hotspots-buggy",
         "rust-perf-hotspots-mentions-clean",
+        "rust-loop-scope-collection-push-clean",
         "rust-string-allocations-buggy",
         "rust-string-allocation-mentions-clean",
         "rust-async-errors-buggy",
@@ -3850,6 +3856,7 @@
         "rust-macro-mentions-clean",
         "rust-collections-mentions-clean",
         "rust-perf-hotspots-mentions-clean",
+        "rust-loop-scope-collection-push-clean",
         "rust-string-allocation-mentions-clean",
         "rust-async-errors-clean",
         "rust-type-narrowing-clean"
@@ -4038,6 +4045,7 @@
         "rust-collections-mentions-clean",
         "rust-perf-hotspots-buggy",
         "rust-perf-hotspots-mentions-clean",
+        "rust-loop-scope-collection-push-clean",
         "rust-string-allocations-buggy",
         "rust-string-allocation-mentions-clean",
         "rust-async-errors-buggy",
@@ -4588,6 +4596,7 @@
       "rust-collections-mentions-clean",
       "rust-perf-hotspots-buggy",
       "rust-perf-hotspots-mentions-clean",
+      "rust-loop-scope-collection-push-clean",
       "rust-string-allocations-buggy",
       "rust-string-allocation-mentions-clean",
       "rust-async-errors-buggy",

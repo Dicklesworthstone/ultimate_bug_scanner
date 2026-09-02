@@ -3073,6 +3073,73 @@ emit_rule_language_variants() {
   done
 }
 
+# SARIF mode runs the whole rule pack through one `ast-grep scan -c`, and
+# ast-grep refuses to load two rule files that share an id. The per-grammar
+# variants written by emit_rule_language_variants (GH #93) deliberately reuse
+# the base rule's id so a finding stays attributable to one rule whether it
+# fired on .js, .ts, or .tsx — which made every SARIF scan of a JS/TS tree fail
+# with "Duplicate rule id". Scan the base pack and each __variants-<grammar>.yml
+# as separate rule sets, then merge the SARIF runs (results concatenated,
+# driver rules deduplicated by id when ast-grep emits them).
+run_sarif_rule_pack_scan() {
+  local out="$1" err="$2"
+  local group_root src base dir cfg part rc
+  local -a groups=() parts=()
+  group_root="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-js-sarif.XXXXXX)"
+  mkdir -p "$group_root/base"
+  for src in "$AST_RULE_DIR"/*.yml; do
+    [[ -f "$src" ]] || continue
+    base="${src##*/}"
+    if [[ "$base" == __variants-* ]]; then
+      mkdir -p "$group_root/${base%.yml}"
+      cp "$src" "$group_root/${base%.yml}/"
+    else
+      cp "$src" "$group_root/base/"
+    fi
+  done
+  groups=("$group_root/base")
+  for dir in "$group_root"/__variants-*/; do
+    [[ -d "$dir" ]] && groups+=("${dir%/}")
+  done
+  : >"$err"
+  for dir in "${groups[@]}"; do
+    cfg="$dir.sgconfig.yml"
+    printf 'ruleDirs:\n  - "%s"\n' "$dir" >"$cfg"
+    part="$dir.sarif.json"
+    rc=0
+    ast_grep_project scan -c "$cfg" --format sarif >"$part" 2>>"$err" || rc=$?
+    # `ast-grep scan` exits 1 when error-level diagnostics are found.
+    if [[ "$rc" -ne 0 && "$rc" -ne 1 ]]; then
+      rm -rf "$group_root"
+      return "$rc"
+    fi
+    [[ -s "$part" ]] && parts+=("$part")
+  done
+  if [[ ${#parts[@]} -eq 0 ]]; then
+    rm -rf "$group_root"
+    return 2
+  fi
+  if [[ ${#parts[@]} -eq 1 ]]; then
+    cat "${parts[0]}" >"$out"
+  elif ! command -v jq >/dev/null 2>&1; then
+    say "${YELLOW}${WARN} jq unavailable - SARIF output covers the base grammar only (TS/TSX rule variants skipped)${RESET}"
+    cat "${parts[0]}" >"$out"
+  elif ! jq -s '
+      .[0] as $first
+      | [.[] | .runs[0]? // empty] as $runs
+      | $first
+      | .runs[0].results = [$runs[] | .results[]?]
+      | if ([$runs[] | .tool.driver.rules? // empty] | length) > 0
+        then .runs[0].tool.driver.rules = ([$runs[] | .tool.driver.rules[]?] | unique_by(.id))
+        else . end
+    ' "${parts[@]}" >"$out" 2>>"$err"; then
+    rm -rf "$group_root"
+    return 2
+  fi
+  rm -rf "$group_root"
+  return 0
+}
+
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ag_rules.XXXXXX)"
@@ -3604,8 +3671,13 @@ run_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
   if [[ "$FORMAT" == "sarif" ]]; then
     [[ -n "$AST_RULE_CONFIG" && -f "$AST_RULE_CONFIG" ]] || return 1
-    ast_grep_project scan -c "$AST_RULE_CONFIG" --format sarif 2>/dev/null
-    return $?
+    local _sarif_out _sarif_err _sarif_rc=0
+    _sarif_out="$(mktemp 2>/dev/null || mktemp -t ubs-js.sarif.XXXXXX)"
+    _sarif_err="$(mktemp 2>/dev/null || mktemp -t ubs-js.sarif.err.XXXXXX)"
+    run_sarif_rule_pack_scan "$_sarif_out" "$_sarif_err" || _sarif_rc=$?
+    [[ "$_sarif_rc" -eq 0 ]] && cat "$_sarif_out"
+    rm -f "$_sarif_out" "$_sarif_err"
+    return "$_sarif_rc"
   fi
   if ! ensure_ast_rule_results; then
     return 1
@@ -3752,14 +3824,10 @@ if [[ "$FORMAT" == "sarif" ]]; then
   AST_SARIF_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-js.sarif.XXXXXX)"
   AST_SARIF_ERR="$(mktemp 2>/dev/null || mktemp -t ubs-js.sarif.err.XXXXXX)"
   code=0
-  if ast_grep_project scan -c "$AST_RULE_CONFIG" --format sarif >"$AST_SARIF_TMP" 2>"$AST_SARIF_ERR"; then
-    code=0
-  else
-    code=$?
-  fi
+  run_sarif_rule_pack_scan "$AST_SARIF_TMP" "$AST_SARIF_ERR" || code=$?
 
-  # `ast-grep scan` returns exit 1 when error-level diagnostics are found.
-  # Treat that as a successful scan so UBS can still parse findings.
+  # run_sarif_rule_pack_scan already treats ast-grep's exit 1 (error-level
+  # diagnostics found) as a successful scan so UBS can still parse findings.
   if [[ "$code" -ne 0 && "$code" -ne 1 ]]; then
     say "${RED}${BOLD}${CROSS} Environment error: failed to produce SARIF via ast-grep${RESET}"
     if [[ -s "$AST_SARIF_ERR" ]]; then

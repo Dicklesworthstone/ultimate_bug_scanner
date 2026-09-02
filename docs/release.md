@@ -32,7 +32,7 @@ This playbook documents how to cut and publish a signed UBS release. The release
    ```
 3. **Workflow runs automatically** on the pushed tag:
    - `nix-check`: runs `nix flake check` for determinism.
-   - `build-artifacts`: installs pinned toolchain (jq 1.7.1, ripgrep 13.0.0, uv 0.4.20), generates `SHA256SUMS`, signs it with minisign, builds `ubs.rb` Homebrew formula, and produces `dist/sbom.spdx.json` for the repo snapshot.
+   - `build-artifacts`: installs pinned toolchain (jq 1.8.2, ripgrep 15.2.0, uv 0.12.9), generates `SHA256SUMS`, signs it with minisign, builds `ubs.rb` Homebrew formula, and produces `dist/sbom.spdx.json` for the repo snapshot.
    - `oci-image`: builds and pushes `ghcr.io/<owner>/ubs-tools:{sha,tag,latest}`, signs the digest with Cosign keyless, attaches SBOM + provenance attestations, and uploads the SBOM/provenance artifacts.
    - `publish`: attaches `install.sh`, `ubs`, `SHA256SUMS`, `SHA256SUMS.minisig`, `ubs.rb`, repo SBOM, and OCI SBOM/provenance to the GitHub Release for the tag.
 4. **Validate release artifacts**

@@ -30,7 +30,9 @@ This document captures the threat model for the UBS installer, module downloads,
    ```
    This downloads `SHA256SUMS` + signature from the release, validates them, then checks `install.sh`.
 
-2. **OCI image**
+2. **OCI image** (release pipelines sign with Cosign v3, which stores the
+   Sigstore bundle as an OCI 1.1 referring artifact; verify with Cosign v3 or
+   newer)
    ```bash
    DIGEST=ghcr.io/<owner>/ubs-tools@sha256:<hash>
    cosign verify $DIGEST

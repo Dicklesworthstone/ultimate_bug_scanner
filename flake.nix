@@ -1,7 +1,7 @@
 {
   description = "Ultimate Bug Scanner - flake packaging, dev shell, and NixOS module";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
   outputs = { self, nixpkgs, ... }:
     let

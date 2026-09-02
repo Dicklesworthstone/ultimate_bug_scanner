@@ -27,7 +27,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Need write access for auto-commit on push to main
           token: ${{ secrets.GITHUB_TOKEN }}

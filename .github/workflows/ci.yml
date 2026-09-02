@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The version-tag drift check below resolves
           # `git show v$UBS_VERSION:modules/...`. The default fetch-depth
@@ -54,10 +54,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up uv with caching
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.13"
           enable-cache: true
@@ -70,7 +70,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends jq ripgrep
 
       - name: Install ast-grep
-        run: npm install -g @ast-grep/cli >/dev/null
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
 
       - name: Sync Python dependencies
         run: uv sync --locked --python 3.13
@@ -112,7 +112,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install shellcheck
         run: |

@@ -62,7 +62,7 @@ check_rule_list() {
   fi
   while IFS= read -r -d '' rule_file; do
     awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rule_file"
-  done < <(find "$dump_dir" -maxdepth 1 -type f -name '*.yml' -print0) | sort -u >"$dumped_ids"
+  done < <(find "$dump_dir" -maxdepth 1 -type f -name '*.yml' -print0) | LC_ALL=C sort -u >"$dumped_ids"
   local count
   count="$(wc -l <"$out" | awk '{print $1+0}')"
   if [[ "$count" -lt "$min_count" ]]; then

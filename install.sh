@@ -1078,7 +1078,7 @@ download_binary_release() {
 
   case "$tool" in
     ripgrep)
-      local version="14.1.0"
+      local version="15.2.0"
       local asset type="tar"
       case "$platform" in
         linux|wsl)
@@ -1134,7 +1134,7 @@ download_binary_release() {
       ;;
 
     ast-grep)
-      local version="0.40.1"
+      local version="0.45.3"
       local os target asset
       case "$platform" in
         linux|wsl) os="unknown-linux-gnu" ;;
@@ -1188,7 +1188,7 @@ PY
       ;;
 
     jq)
-      local version="1.7.1"
+      local version="1.8.2"
       local asset
       case "$platform-$arch" in
         linux-x86_64|wsl-x86_64) asset="jq-linux-amd64" ;;
@@ -1214,7 +1214,7 @@ PY
       ;;
 
     typos)
-      local version="1.28.4"
+      local version="1.50.1"
       local asset type="tar"
       case "$platform-$arch" in
         linux-x86_64|wsl-x86_64)

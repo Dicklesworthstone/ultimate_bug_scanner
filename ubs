@@ -150,18 +150,18 @@ HELPER_ASSETS=(
 HELPERS_READY=0
 
 # Pinned ast-grep release for tool-cache auto-provisioning (JS/TS accuracy).
-AST_GREP_VERSION="0.40.1"
+AST_GREP_VERSION="0.45.3"
 AST_GREP_BASE_URL="https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}"
 TOOLS_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/tools"
 TOOLS_DIR="${UBS_TOOLS_DIR:-$TOOLS_DIR_DEFAULT}"
 
 # Known-good ast-grep asset digests (sha256) for supply-chain verification.
 declare -A AST_GREP_ASSET_SHA256=(
-  [aarch64-apple-darwin]='d40d260d6a2c6c6963079e79d3c57e7988b2de08edca7cfa6c270b5fef591dd7'
-  [x86_64-apple-darwin]='1ffefbce66ceb4eabd307157ca02991d9734adfb43ac9f4b298788e935b6e04a'
-  [aarch64-unknown-linux-gnu]='24f7d0a99dfa45cf65c6e175e1bceaac24f04d2b84807d832c4205a17d2270ab'
-  [x86_64-unknown-linux-gnu]='774d6080dedbf8859a51e78d2be1cb84715454627b3995c2ff533ed755975012'
-  [x86_64-pc-windows-msvc]='4ac3d772c3d87aff8913708219ad3ca73cff2fff4846fd12f9967e87e55fc94e'
+  [aarch64-apple-darwin]='6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6'
+  [x86_64-apple-darwin]='b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c'
+  [aarch64-unknown-linux-gnu]='b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f'
+  [x86_64-unknown-linux-gnu]='f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8'
+  [x86_64-pc-windows-msvc]='3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059'
 )
 
 # Colors (respect NO_COLOR or non-tty)

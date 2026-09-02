@@ -40,3 +40,7 @@ beads.right.meta.json
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# br runtime locks and scratch files
+.br-db-openers-*.lock
+*.tmp

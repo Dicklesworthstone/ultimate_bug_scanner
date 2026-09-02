@@ -28,14 +28,20 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.3.13"
+UBS_VERSION="5.4.0-rc1"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
 # (which is what advances a stale install onto a newer tag).
 # Issue #43: pinning to "main" caused every installed copy to break
 # the moment main moved past the release the user installed.
-REPO_RAW_BASE="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner"
+# UBS_REPO_RAW_BASE lets tests serve modules/helpers from a local file:// tree;
+# it is warned about loudly at download time because it redirects the supply
+# chain (checksums are still enforced against the pinned tables).
+REPO_RAW_BASE="${UBS_REPO_RAW_BASE:-https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner}"
+if [[ -n "${UBS_REPO_RAW_BASE:-}" ]]; then
+  echo "⚠ UBS_REPO_RAW_BASE override active: modules/helpers will be fetched from ${REPO_RAW_BASE} (pinned checksums still enforced)" >&2
+fi
 REPO_RAW="${REPO_RAW_BASE}/v${UBS_VERSION}"
 REPO_RAW_LATEST="${REPO_RAW_BASE}/main"
 MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
@@ -46,10 +52,10 @@ declare -A MODULE_CHECKSUMS=(
   [cpp]='f054b77189ac66e81fa5c918d4605430272ccb67d9c875f126673182fda85805'
   [csharp]='aa49faa22bf85a0cb3da4a667e1ab2d2b8960473ec2f8694aac3dffe9f8861f6'
   [elixir]='4d949858d8a9d292e2eaf9768d4536be93346d69604c9f6c3b8ddf2e70bd9ac0'
-  [golang]='a2507466d961932e821465de17ca10571f8be010909fb29db1d032e25a604f77'
+  [golang]='0f2818ed09e28bd0f16edcce9f3821714dd15a0c1324fa2b184a3ab2b510a659'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
   [js]='ba4154373467eeceec9524f5cd5f13c4c34561ea6fb0434aaf6204e3e4b1217c'
-  [python]='71f8293da322c5718a317f9c441fac94906d0714d823c7be3e414ef8754c3d7b'
+  [python]='83316ee559bc184d174bada4a2cc899fccf53b8da8c189184e969cd27e08ec36'
   [ruby]='2d1be75bf13ac7e0bf71b5241224ec53511020300279dc462a7f99991665d358'
   [rust]='89d2b1e9bad572cb372eac0c4b6ec61583441e40b57f78981474f2b1686ec410'
   [swift]='abb8b2e29fa7aa735db056757e6daa4c4b6d618e3251448ed3e9855cf491e9c0'
@@ -164,14 +170,18 @@ declare -A AST_GREP_ASSET_SHA256=(
   [x86_64-pc-windows-msvc]='3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059'
 )
 
-# Colors (respect NO_COLOR or non-tty)
-if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then
-  RED= GREEN= YELLOW= BLUE= MAGENTA= CYAN= WHITE= GRAY= BOLD= DIM= RESET=
-else
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
-  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-fi
+# Colors (respect NO_COLOR or non-tty). Re-run after --no-color or after stdout
+# is redirected to an output file so the report is written without ANSI codes.
+init_colors(){
+  if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then
+    RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; WHITE=""; GRAY=""; BOLD=""; DIM=""; RESET=""
+  else
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+    BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+  fi
+}
+init_colors
 CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
 say(){
   if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" || "${FORMAT:-text}" == "toon" ]]; then
@@ -293,7 +303,15 @@ MODULE_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
 MODULE_DIR="$MODULE_DIR_DEFAULT"
 UPDATE_MODULES=0
 JOBS="${JOBS:-0}"
+# Seed from the documented env var so `UBS_SKIP_TYPE_NARROWING=1 ubs .` works
+# without the flag (the value is re-exported to modules later).
 SKIP_TYPE_NARROWING=0
+[[ "${UBS_SKIP_TYPE_NARROWING:-0}" == "1" ]] && SKIP_TYPE_NARROWING=1
+INCLUDE_EXT=""             # csv forwarded to modules as --include-ext=
+USER_RULES_DIR=""          # forwarded to modules as --rules= (custom ast-grep rules)
+OUTPUT_FILE=""             # tee the rendered report to this file (--output / PROJECT_DIR OUTPUT_FILE)
+LIST_CATEGORIES=0
+TEE_PID=""
 CSHARP_MODULE_ARGS=()
 MODE="scan"
 SESSION_ENTRIES=1
@@ -310,7 +328,10 @@ declare -A SKIP_BY_LANG=()
 # language modules.
 BARE_SKIP_USED=0
 UPDATE_ONLY=0
-FORCE_SELF_UPDATE=0
+# FORCE_SELF_UPDATE=1 in the environment forces an update check (documented in
+# README); --update sets it too.
+FORCE_SELF_UPDATE="${FORCE_SELF_UPDATE:-0}"
+[[ "$FORCE_SELF_UPDATE" =~ ^[0-9]+$ ]] || FORCE_SELF_UPDATE=0
 CATEGORY_FILTER=""
 COMPARISON_FILE=""
 REPORT_JSON_PATH=""
@@ -341,6 +362,17 @@ elif [[ "${1:-}" == "sessions" || "${1:-}" == "session-log" ]]; then
   shift
 fi
 
+# True when PATH has an extension one of the language modules scans; used to
+# tell `ubs . report.txt` (PROJECT_DIR OUTPUT_FILE) apart from `ubs src/ a.py`
+# (union scan of a directory and a file that does not exist yet).
+looks_like_source_path(){
+  case "${1##*/}" in
+    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyi|*.pyw|*.pyx|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.rake|*.swift|*.metal|*.cs|*.csx|*.csproj|*.sln|*.ex|*.exs|*.vue|*.svelte)
+      return 0;;
+    *) return 1;;
+  esac
+}
+
 usage() {
   cat <<USAGE >&2
 Usage: ubs [options] [PROJECT_DIR]
@@ -351,6 +383,15 @@ Usage: ubs [options] [PROJECT_DIR]
 
 Options:
   --format=FMT            text|json|jsonl|sarif|toon (default: text)
+  --output=FILE, -o FILE  Also write the report to FILE (same as the positional form
+                          `ubs PROJECT_DIR OUTPUT_FILE`); stdout still receives it
+  --no-color              Disable ANSI colors (same as NO_COLOR=1)
+  --include-ext=CSV       Extra file extensions forwarded to the language modules
+                          (e.g. --include-ext=js,ts,vue); language detection still
+                          uses each module's default extensions unless --only is given
+  --rules=DIR             Directory of custom ast-grep rules merged into every module's
+                          built-in rule pack (YAML; see README "Custom AST-Grep Rules")
+  --list-categories       Print each selected module's category numbers/names and exit
   --version               Print version and exit
   --ci                    CI mode (stable timestamps)
   --fail-on-warning       Exit non-zero if warnings or critical exist
@@ -406,6 +447,14 @@ Environment Variables:
                               Set to 0 to allow scanning these directories
   UBS_ALLOW_NO_SCAN=1         Exit 0 instead of 3 when no supported languages are
                               detected and no scanner runs (legacy behaviour)
+  NO_COLOR=1                  Disable ANSI colors
+  CI=true                     Disable the opt-in auto-update check (like --ci)
+  UBS_ENABLE_AUTO_UPDATE=1    Opt in to the 24h auto-update check
+  UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
+  FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
+  UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
+  UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
+  UBS_MODULE_TIMEOUT=SECS     Per-module timeout (default: 300)
 
 Examples:
   ubs .                       # auto-detect languages and scan
@@ -622,7 +671,45 @@ else
         fi
         unset _sk_lang_key _sk_lang_val
         shift;;
+      --format)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; FORMAT="$1"; shift;;
+      --no-color) export NO_COLOR=1; init_colors; shift;;
+      --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
+      --include-ext)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; INCLUDE_EXT="$1"; shift;;
+      --rules=*) USER_RULES_DIR="${1#*=}"; shift;;
+      --rules)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; USER_RULES_DIR="$1"; shift;;
+      --output=*) OUTPUT_FILE="${1#*=}"; shift;;
+      --output|-o)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; OUTPUT_FILE="$1"; shift;;
+      --list-categories) LIST_CATEGORIES=1; shift;;
+      --only|--exclude|--jobs|--skip|--ignore-file)
+        # Space-separated form of the =-flags above.
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        _flag="$1"; shift
+        case "$_flag" in
+          --only) ONLY_LANGS="$1";;
+          --exclude) EXCLUDE_LANGS="$1";;
+          --jobs) JOBS="$1";;
+          --skip) export UBS_SKIP_CATEGORIES="$1"; BARE_SKIP_USED=1;;
+          --ignore-file) IGNORE_FILE="$1";;
+        esac
+        unset _flag
+        shift;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do POSITIONAL_TARGETS+=("$1"); shift; done;;
       -h|--help) usage; exit 0;;
+      -?*)
+        # An unknown option used to fall through as a scan target and die with
+        # a misleading "scan target not found"; reject it explicitly.
+        say_err "${RED}$X unknown option${RESET}: $1 (see ubs --help)"
+        exit 2;;
       *)
         # Positional path args are classified after the loop, once we know how
         # many there are (issue #88): deciding per-arg made `ubs src/ test/`
@@ -631,15 +718,39 @@ else
         shift;;
     esac
   done
+  case "$FORMAT" in
+    text|json|jsonl|sarif|toon) ;;
+    *)
+      say_err "${RED}$X unknown --format value${RESET}: $FORMAT (expected text|json|jsonl|sarif|toon)"
+      exit 2;;
+  esac
   # Classify positional targets (issue #88):
+  #   - one directory + one non-existent, non-source path -> PROJECT_DIR OUTPUT_FILE
+  #     (README: `ubs . bug-report.txt` saves the report and still prints it)
   #   - exactly one directory  -> classic whole-project scan (PROJECT_DIR)
   #   - anything else          -> explicit target list; files AND directories
   #     are allowed and their union is scanned from a shadow workspace rooted
   #     at the current directory (see prepare_files_workspace).
-  if [[ ${#POSITIONAL_TARGETS[@]} -eq 1 && -d "${POSITIONAL_TARGETS[0]}" ]]; then
+  if [[ ${#POSITIONAL_TARGETS[@]} -eq 2 && -d "${POSITIONAL_TARGETS[0]}" && ! -e "${POSITIONAL_TARGETS[1]}" && -z "$OUTPUT_FILE" ]] \
+     && ! looks_like_source_path "${POSITIONAL_TARGETS[1]}"; then
+    PROJECT_DIR="${POSITIONAL_TARGETS[0]}"
+    OUTPUT_FILE="${POSITIONAL_TARGETS[1]}"
+  elif [[ ${#POSITIONAL_TARGETS[@]} -eq 1 && -d "${POSITIONAL_TARGETS[0]}" ]]; then
     PROJECT_DIR="${POSITIONAL_TARGETS[0]}"
   elif [[ ${#POSITIONAL_TARGETS[@]} -gt 0 ]]; then
     SCAN_FILES+=("${POSITIONAL_TARGETS[@]}")
+  fi
+  if [[ -n "$OUTPUT_FILE" && "$LIST_CATEGORIES" -eq 0 ]]; then
+    if ! : >"$OUTPUT_FILE" 2>/dev/null; then
+      say_err "${RED}$X cannot write output file${RESET}: $OUTPUT_FILE"
+      exit 2
+    fi
+    # Tee everything that goes to stdout (the report in text mode, the payload
+    # in machine modes; diagnostics already live on stderr) into OUTPUT_FILE.
+    # cleanup() waits for tee so the file is complete before we exit.
+    exec > >(tee "$OUTPUT_FILE")
+    TEE_PID=$!
+    init_colors  # stdout is no longer a tty: write the file without ANSI codes
   fi
   if [[ "$UPDATE_ONLY" -eq 1 ]]; then
     PROJECT_DIR="$(pwd -P)"
@@ -2335,22 +2446,48 @@ download_helper_asset(){
   return 1
 }
 
+# Returns 0 when the helper is present and verified, 2 when it was fetched but
+# does not match the pinned digest (tampering or version drift: fail closed),
+# 1 when it could not be fetched at all (offline: the caller may degrade).
 ensure_helper_asset(){
   local rel="$1"
   local path="$MODULE_DIR/$rel"
   if [ "$UPDATE_MODULES" -eq 1 ] || [ ! -f "$path" ]; then
-    download_helper_asset "$rel" "$path" || return 1
+    VERIFY_HELPER_ERR=""
+    if ! download_helper_asset "$rel" "$path"; then
+      [[ "${VERIFY_HELPER_ERR:-}" == *"checksum mismatch"* ]] && return 2
+      return 1
+    fi
   fi
   if should_verify_module_path "$path" && [ -f "$path" ]; then
-    if ! verify_helper_checksum "$rel" "$path"; then
-      local verify_code=$?
-      if [[ $verify_code -eq 2 ]]; then
-        say "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
+    # Capture the status directly: `if ! f; then rc=$?` always sees 0 after
+    # the negation, which made the "no sha256 tool" (status 2) branch dead.
+    local verify_code=0
+    verify_helper_checksum "$rel" "$path" || verify_code=$?
+    if [[ $verify_code -eq 2 ]]; then
+      say "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
+      rm -f "$path" 2>/dev/null || true
+      return 2
+    fi
+    if [[ $verify_code -ne 0 ]]; then
+      say "${YELLOW}${WARN}${RESET} cached helper $rel failed verification (${VERIFY_HELPER_ERR:-corrupt}); refreshing..."
+      VERIFY_HELPER_ERR=""
+      if ! download_helper_asset "$rel" "$path"; then
         rm -f "$path" 2>/dev/null || true
+        # download_helper_asset verifies before installing: a fetched-but-mismatching
+        # helper surfaces here as a checksum error and must fail closed.
+        [[ "${VERIFY_HELPER_ERR:-}" == *"checksum mismatch"* ]] && return 2
         return 1
       fi
-      say "${YELLOW}${WARN}${RESET} cached helper $rel failed verification (${VERIFY_HELPER_ERR:-corrupt}); refreshing..."
-      download_helper_asset "$rel" "$path" || { rm -f "$path" 2>/dev/null || true; return 1; }
+      verify_code=0
+      verify_helper_checksum "$rel" "$path" || verify_code=$?
+      if [[ $verify_code -ne 0 ]]; then
+        # Fail closed: a helper that still does not match the pinned digest
+        # after a fresh download is never executed.
+        say "${RED}$X helper $rel still fails verification after re-download (${VERIFY_HELPER_ERR:-corrupt}); refusing to run it${RESET}"
+        rm -f "$path" 2>/dev/null || true
+        return 2
+      fi
     fi
   fi
   return 0
@@ -2364,12 +2501,20 @@ ensure_cached_helpers(){
 
   local failures=0
   local rel
+  local verification_failures=0
   for rel in "${HELPER_ASSETS[@]:-}"; do
-    if ! ensure_helper_asset "$rel"; then
-      failures=$((failures+1))
-      if [[ "$mode" == "scan" ]]; then
-        say "${YELLOW}${WARN}${RESET} helper unavailable: ${DIM}$rel${RESET} (${VERIFY_HELPER_ERR:-download/verification failed}); continuing with reduced accuracy"
-      fi
+    local helper_rc=0
+    ensure_helper_asset "$rel" || helper_rc=$?
+    if [[ "$helper_rc" -eq 0 ]]; then
+      continue
+    fi
+    failures=$((failures+1))
+    if [[ "$helper_rc" -eq 2 ]]; then
+      verification_failures=$((verification_failures+1))
+    elif [[ "$mode" == "scan" ]]; then
+      # A download failure (offline, rate-limited) is not tampering: warn and
+      # let the module fall back to its regex heuristics.
+      say "${YELLOW}${WARN}${RESET} helper unavailable: ${DIM}$rel${RESET} (${VERIFY_HELPER_ERR:-download failed}); continuing with reduced accuracy"
     fi
   done
 
@@ -2380,6 +2525,17 @@ ensure_cached_helpers(){
   if [[ "$mode" == "doctor" ]]; then
     return "$failures"
   fi
+  if [[ "$verification_failures" -gt 0 ]]; then
+    if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+      say "${YELLOW}${WARN}${RESET} UBS_ALLOW_UNVERIFIED_HELPERS=1: continuing despite $verification_failures helper verification failure(s)"
+      return 0
+    fi
+    # Fail closed (docs/security.md): never execute a helper whose digest does
+    # not match. `ubs doctor --fix` re-downloads and verifies the cache.
+    say "${RED}$X $verification_failures helper(s) failed checksum verification; refusing to scan with unverified helpers.${RESET}"
+    say "${DIM}  Fix: ubs doctor --fix   (or set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override at your own risk)${RESET}"
+    return 1
+  fi
   return 0
 }
 
@@ -2389,16 +2545,25 @@ ensure_module(){
     download_module "$lang" "$path" || return 1
   fi
   if should_verify_module_path "$path" && [ -x "$path" ]; then
-    if ! verify_module_checksum "$lang" "$path"; then
-      local verify_code=$?
-      if [[ $verify_code -eq 2 ]]; then
-        say "${RED}$X ${VERIFY_MODULE_ERR}${RESET}"
-        return 1
-      fi
+    local verify_code=0
+    verify_module_checksum "$lang" "$path" || verify_code=$?
+    if [[ $verify_code -eq 2 ]]; then
+      say "${RED}$X ${VERIFY_MODULE_ERR}${RESET}"
+      return 1
+    fi
+    if [[ $verify_code -ne 0 ]]; then
       say "${YELLOW}${WARN}${RESET} cached $lang module failed verification (${VERIFY_MODULE_ERR:-corrupt}); refreshing..."
       download_module "$lang" "$path" || return 1
+      verify_code=0
+      verify_module_checksum "$lang" "$path" || verify_code=$?
+      if [[ $verify_code -ne 0 ]]; then
+        say "${RED}$X $lang module still fails verification after re-download (${VERIFY_MODULE_ERR:-corrupt}); refusing to run it. Fix: ubs doctor --fix${RESET}"
+        return 1
+      fi
     fi
-    ensure_cached_helpers "scan" || true
+    # Helper verification failures are fatal here (exit 2 at the call site);
+    # plain download failures only warn.
+    ensure_cached_helpers "scan" || return 1
   fi
   return 0
 }
@@ -2439,6 +2604,9 @@ check_and_update_self(){
   if [[ "${FORCE_SELF_UPDATE:-0}" -eq 0 ]]; then
     [[ "${UBS_ENABLE_AUTO_UPDATE:-0}" -eq 1 ]] || return 0
     if [[ "${UBS_NO_AUTO_UPDATE:-0}" -eq 1 || "${CI_MODE:-0}" -eq 1 ]]; then return 0; fi
+    # README: "when --ci is passed or CI=true is detected, auto-updates are
+    # disabled" — honour the conventional CI environment variable too.
+    case "${CI:-}" in 1|true|TRUE|True|yes|YES) return 0;; esac
   fi
 
   # Only update if we're running the installed binary (not a local repo script)
@@ -2709,6 +2877,13 @@ kill_module_pgroups(){
 
 # shellcheck disable=SC2317  # invoked via the EXIT trap and from on_interrupt
 cleanup(){
+  # Flush the OUTPUT_FILE tee (if any) before tearing anything down: close our
+  # copy of the pipe so tee sees EOF, then wait for it to finish writing.
+  if [[ -n "${TEE_PID:-}" ]]; then
+    exec 1>&2
+    wait "$TEE_PID" 2>/dev/null || true
+    TEE_PID=""
+  fi
   local dir="${TMPDIR_RUN:-}"
   [[ -n "$dir" && "$dir" != "/" ]] || return 0
   rm -rf "$dir" 2>/dev/null || true
@@ -3187,6 +3362,13 @@ run_lang(){
   [[ "$VERBOSE" -eq 1 ]] && args+=('-v')
   [[ "${QUIET:-0}" -eq 1 ]] && args+=('-q')
   [[ "$JOBS" -gt 0 ]] && args+=("--jobs=$JOBS")
+  [[ -n "$INCLUDE_EXT" ]] && args+=("--include-ext=$INCLUDE_EXT")
+  # Custom ast-grep rules: every module except elixir (no ast-grep integration
+  # yet) accepts --rules=DIR; forwarding it there would be rejected as an
+  # unknown option.
+  if [[ -n "$USER_RULES_DIR" && "$lang" != "elixir" ]]; then
+    args+=("--rules=$USER_RULES_DIR")
+  fi
   if [[ "$lang" == "csharp" && ${#CSHARP_MODULE_ARGS[@]} -gt 0 ]]; then
     args+=("${CSHARP_MODULE_ARGS[@]}")
   fi
@@ -3652,6 +3834,24 @@ langs=( $(select_langs) )
 if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
 
+# --list-categories: print each selected module's category table and exit 0.
+if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
+  list_rc=0
+  for L in "${langs[@]}"; do
+    mpath="$(resolve_module_path "$L")"
+    if ! ensure_module "$L" "$mpath"; then
+      say "${YELLOW}${WARN}${RESET} $L: module unavailable"
+      list_rc=2
+      continue
+    fi
+    say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
+    if ! "$mpath" --list-categories 2>/dev/null; then
+      say "${DIM}(the $L module does not support --list-categories yet; use --skip-$L=N with the numbers printed in its report)${RESET}"
+    fi
+  done
+  exit "$list_rc"
+fi
+
 # Issue #52: warn when bare --skip=N silences different categories per module.
 if [[ "$BARE_SKIP_USED" -eq 1 && -n "${UBS_SKIP_CATEGORIES:-}" ]]; then
   warn_ambiguous_skip "$UBS_SKIP_CATEGORIES" "${langs[@]}"
@@ -3699,7 +3899,9 @@ fi
 declare -A MODULE_PATHS
 for L in "${langs[@]}"; do
   p="$(resolve_module_path "$L")"
-  ensure_module "$L" "$p" || { say "${RED}$X failed to ensure module for $L${RESET}"; exit 1; }
+  # Environment error (exit 2): the module or its helpers could not be
+  # obtained or failed checksum verification; nothing was scanned.
+  ensure_module "$L" "$p" || { say "${RED}$X failed to ensure module for $L${RESET}"; exit 2; }
   MODULE_PATHS["$L"]="$p"
 done
 

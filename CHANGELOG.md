@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.0-rc1] - 2026-09-02 [Release]
+
 ### Fixes
 
 - **`--format=sarif` no longer fails for JavaScript/TypeScript with "Duplicate rule id".** The per-grammar rule variants introduced for #93 reuse each base rule's id on purpose, but SARIF mode loaded the whole rule directory into one `ast-grep scan -c`, which rejects duplicate ids — every SARIF scan of a JS/TS tree has exited 2 since v5.3.12 (the meta-runner then emitted a degraded summary-only SARIF run). `modules/ubs-js.sh` now scans the base pack and each `__variants-<grammar>.yml` as separate rule sets and merges the SARIF runs (`run_sarif_rule_pack_scan`). The rule-pack SARIF evidence golden was regenerated: the JS corpus now reports 201 results across 37 rules because `.ts`/`.tsx` fixtures finally contribute.

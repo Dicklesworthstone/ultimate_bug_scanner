@@ -1,5 +1,5 @@
 
-# 🔬 Ultimate Bug Scanner v5.0
+# 🔬 Ultimate Bug Scanner
 
 <div align="center">
   <img src="docs/assets/ubs_illustration.webp" alt="Ultimate Bug Scanner - The AI Coding Agent's Secret Weapon">
@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.3.13-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.4.0-rc1-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -260,6 +260,12 @@ docker run --rm -v /:/host ghcr.io/dicklesworthstone/ubs-tools bash -c "cd /host
 
 ⚠️ Use the host-mount pattern only when you understand the write-access implications.
 
+> [!NOTE]
+> The current image ships `bash`, `curl`, `jq`, and `ripgrep` only. It has no
+> `python3`, `unzip`, or ast-grep, so inside the container the AST helpers and
+> JavaScript/TypeScript scans are unavailable (regex-only languages still scan).
+> Bead `ultimate_bug_scanner-s2k5.1` adds those runtime dependencies to the image.
+
 ### Deployment & Security
 
 - Release playbook (how we cut signed releases): [docs/release.md](docs/release.md)
@@ -386,7 +392,7 @@ Ultimate Bug Scanner is like having a senior developer review every line of code
 $ ubs .
 
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🔬 ULTIMATE BUG SCANNER v4.4 - Scanning your project...             ║
+║  🔬 ULTIMATE BUG SCANNER v5.3 - Scanning your project...             ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 Project:  /Users/you/awesome-app
@@ -450,16 +456,23 @@ Summary Statistics:
 </tr>
 </table>
 
-### 💨 **2. Blazing Fast (Because Your Time Matters)**
+### 💨 **2. Fast Enough for the Edit Loop When You Scope It**
+
+Measured on 2026-09-02 (v5.3.13, single runs on a 16-core Linux box; ast-grep on PATH):
 
 ```
-Small project (5K lines):     0.8 seconds  ⚡
-Medium project (50K lines):   3.2 seconds  🚀
-Large project (200K lines):  12 seconds    💨
-Huge project (1M lines):     58 seconds    🏃
+Single file (JS or Python):                   4.6–5.8 seconds
+15-file repository (this one):                9 seconds
+29K-line fixture tree, 10 languages:          40 seconds
+124K-line Python project (597 files):         143 seconds
+407K-line TypeScript monorepo (--only=js):    hit the 300 s module timeout
 ```
 
-**That's 10,000+ lines analyzed per second.** Faster than you can say "but it worked on my machine."
+Roughly 700–900 lines per second today; the performance program that closes the
+gap to the original "10,000 lines/second" target is tracked as bead
+`ultimate_bug_scanner-q150` (profiling, a literal prefilter, an incremental cache).
+Until then, **scope scans to the files you changed** (`ubs --staged`, `ubs <file>`),
+which is the workflow the agent integrations use.
 
 ### 🤖 **3. Built FOR AI Agents, BY Developers Who Use AI**
 
@@ -590,22 +603,30 @@ Total: 6.25 hours                Total: 8 minutes
 
 ### **Pattern 1: Claude Code Integration (Real-Time Scanning)**
 
-Drop this into `.claude/hooks/on-file-write.sh`:
+The installer (`--easy-mode`, or `install.sh --setup-claude-hook` inside a project) writes
+`.claude/hooks/on-file-write.sh` **and registers it** in `.claude/settings.json` as a
+`PostToolUse` hook on `Edit|Write|MultiEdit`, alongside the `PreToolUse` safety guard:
 
-```bash
-#!/bin/bash
-# Auto-scan UBS-supported languages (JS/TS, Python, C/C++, Rust, Go, Java, Ruby, Swift, C#, Elixir) on save
-
-if [[ "$FILE_PATH" =~ \.(js|jsx|ts|tsx|mjs|cjs|py|pyw|pyi|c|cc|cpp|cxx|h|hh|hpp|hxx|rs|go|java|rb|cs|csx|ex|exs|eex|heex|leex|sface)$ ]]; then
-  echo "🔬 Quality check running..."
-
-  if ubs "${PROJECT_DIR}" --ci 2>&1 | head -30; then
-    echo "✅ No critical issues"
-  else
-    echo "⚠️  Issues detected - review above"
-  fi
-fi
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "Edit|Write|MultiEdit",
+        "hooks": [ { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh" } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Bash",
+        "hooks": [ { "type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py" } ] }
+    ]
+  }
+}
 ```
+
+The hook reads the tool call Claude Code passes on stdin, scans **only the file that was
+just written** (`ubs <file> --ci`), and exits `2` with the findings on stderr when the scan
+reports critical issues, so Claude sees them as feedback on the edit it just made. Clean
+files and non-source files exit `0` silently. Re-running the installer never duplicates the
+registration; your other settings are preserved and the previous file is backed up.
 
 **Result:** Every time Claude writes code, the scanner catches bugs **instantly**.
 
@@ -779,7 +800,7 @@ ubs .                                   # Whole project (ignores things like .ve
     💡 Suggested fix
 Exit code: 1
 ```
-Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail
+Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fail | Exit 2 → environment/usage error (fix the invocation or `ubs doctor --fix`) | Exit 3 → nothing was scanned (not a pass)
 
 **Fix Workflow:**
 1. Read finding → category + fix suggestion
@@ -972,8 +993,12 @@ File Selection:
                            JS: js,jsx,ts,tsx,mjs,cjs | Python: py,pyi,pyx
                            Go: go | Rust: rs | Java: java | C++: cpp,cc,cxx,c,h
                            Ruby: rb,rake,ru | C#: cs,csx | Custom: --include-ext=js,ts,vue
-  --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
-                           Example: --exclude=legacy (deps ignored by default)
+  --exclude=CSV            Exclude LANGUAGES from the scan (e.g. --exclude=js,ruby).
+                           To skip PATHS use .ubsignore or --ignore-file=PATH
+                           (bead ultimate_bug_scanner-cvxv.2 will make --exclude
+                           take path globs and move languages to --exclude-langs)
+  --output=FILE, -o FILE   Also write the report to FILE (same as the positional
+                           OUTPUT_FILE form); stdout still receives it
   --skip-size-check        Skip directory size guard (use with care)
 
 Performance:
@@ -1064,8 +1089,11 @@ ubs . --skip=14  # Skip TODO/FIXME markers
 ubs --jobs=0 .  # Auto-detect
 ubs --jobs=16 .  # Explicit core count
 
-# Exclude vendor code
-ubs . --exclude=node_modules,vendor,dist,build
+# Skip languages you don't want in this run
+ubs . --exclude=ruby,swift
+
+# Exclude extra paths (node_modules, vendor, dist, build are ignored by default)
+printf 'legacy/\ngenerated/\n' >> .ubsignore
 
 # Large directories (size guard)
 UBS_MAX_DIR_SIZE_MB=5000 ubs .
@@ -1145,14 +1173,14 @@ If the scanner reports false positives for your specific use case:
 # Skip entire categories
 ubs . --skip=11,14  # Skip debug code detection and TODO markers
 
-# Exclude specific files/directories
-ubs . --exclude=legacy,third-party,generated
+# Exclude specific files/directories (gitignore-style globs, one per line)
+printf 'legacy/\nthird-party/\ngenerated/\n' >> .ubsignore
 
 # For persistent config, create a wrapper script
 cat > ~/bin/ubs-custom <<'EOF'
 #!/bin/bash
 ubs "$@" \
-  --exclude=legacy,generated \
+  --ignore-file=~/.config/ubs/ignore \
   --skip=14 \
   --rules=~/.config/ubs/rules
 EOF
@@ -1290,7 +1318,10 @@ eval(safe_string)  # ubs:ignore
 - If a formatter relocates a trailing marker off a **block-opening line**
   (`if (...) { // ubs:ignore` becoming a comment on the first line inside the
   block), the marker still suppresses the finding on the opening line
-- Works across all 10 supported languages
+- The trailing-line and previous-line placements work across all 10 supported
+  languages; the multi-line-statement and formatter-relocated placements are
+  implemented in the JavaScript/TypeScript module today (bead
+  `ultimate_bug_scanner-0xjg.16` brings them to every module)
 - Suppresses all findings on the covered lines (use sparingly)
 
 **Anti-patterns to avoid:**
@@ -1410,7 +1441,7 @@ All 10 language modules normalize their findings to a consistent severity scale,
 - **Predictable `--fail-on-warning`**: Same behavior whether scanning Python, Rust, or TypeScript
 - **Cross-language metrics**: Compare code quality across polyglot projects fairly
 
-The `normalize_severity()` function in each module handles edge cases like tool-specific severity strings, numeric levels, and legacy format variations.
+Each module maps its tool-specific severity strings, numeric levels, and legacy format variations onto this scale before reporting (the Swift module does it through a dedicated `normalize_severity()`; the shared implementation for every module lives in the module-library work, bead `ultimate_bug_scanner-0xjg.1`).
 
 ### **Performance Optimizations**
 
@@ -1429,15 +1460,18 @@ The `normalize_severity()` function in each module handles edge cases like tool-
 - Ruby: .rb + Gemfile/Gemspec/Rakefile (skip vendor/bundle,tmp)
 - Custom: --include-ext=js,ts,vue
 
-# Efficient streaming (low memory usage)
-- No temp files created
-- Results streamed as found
-- Memory usage: <100MB for most projects
+# Working files and memory
+- Whole-project scans copy the tree (minus ignores) into a temporary shadow
+  workspace under $TMPDIR so ignore rules apply to every module uniformly; the
+  workspace is deleted when the scan ends (bead ultimate_bug_scanner-cvxv.4
+  replaces the copy with a per-language file list)
+- Results are merged from per-module JSON at the end of the run
+- Memory: 45–110 MB resident on typical projects; ~840 MB was measured on a
+  407K-line TypeScript tree (bead ultimate_bug_scanner-q150.6 streams that)
 
-# Incremental scanning (future feature)
-- Only scan changed files (git diff)
-- Cache previous results
-- 10x faster on large projects
+# Incremental scanning
+- Scan only changed files today: ubs --staged / ubs --diff / ubs <files>
+- Content-hash cache of previous results: bead ultimate_bug_scanner-q150.4
 ```
 
 ---
@@ -2259,14 +2293,18 @@ Any `rm -rf` targeting project directories, home folders, or ambiguous paths is 
 
 ### Enabling the Guard
 
-The installer sets this up automatically when it detects Claude Code (`.claude/` directory exists). To enable manually:
+The installer sets this up automatically when it detects Claude Code (`.claude/` directory exists): it installs the guard (from the repository checkout when you run the installer locally, otherwise from the release assets, verified against the release `SHA256SUMS`) and registers it as a `PreToolUse` hook on `Bash` in `.claude/settings.json`. To set it up on demand:
 
 ```bash
-# The installer creates this structure:
+# Inside the project you want protected:
+bash install.sh --setup-claude-hook
+
+# The installer creates and registers this structure:
 .claude/
+├── settings.json             # hooks.PreToolUse (guard) + hooks.PostToolUse (scanner)
 └── hooks/
     ├── git_safety_guard.py   # Command interceptor
-    └── on-file-write.sh      # Auto-scan on save
+    └── on-file-write.sh      # Scan the file Claude just wrote
 ```
 
 The guard produces actionable error messages explaining *why* a command was blocked and *what to do instead*, so AI agents can self-correct without human intervention.
@@ -2290,9 +2328,9 @@ Beyond the core agent integrations (Claude Code, Cursor, Codex), the installer d
 | **OpenCode** | `.opencode/` directory | Rules file |
 | **Aider** | `.aider.conf.yml` | Lint command config |
 | **Continue** | `.continue/` directory | Rules file |
-| **GitHub Copilot** | VS Code extensions | Workspace settings |
-| **TabNine** | `.tabnine/` directory | Configuration |
-| **Replit** | `replit.com` detection | Environment setup |
+| **GitHub Copilot** | VS Code extensions | `.github/copilot-instructions.md` |
+| **TabNine** | `~/.tabnine/` directory | Detected only — no configuration is written yet |
+| **Replit** | `.replit` file | Detected only — no configuration is written yet |
 
 ### Aider-Specific Integration
 

@@ -424,16 +424,24 @@ def check_robot_docs_flags_parse() -> None:
     # for acceptance only.
     doc = json.loads(run(["robot-docs", "commands"]).stdout)
     bad = []
+    # Examples such as --output=report.json write relative paths: run from a
+    # scratch directory so nothing lands in the repository root.
+    scratch = Path(tempfile.mkdtemp(prefix="ubs-flags-"))
     for flag in doc["commands"]["flags"]:
         example = flag["example"]
-        if flag["name"] in ("--update",):
-            continue  # would try to self-update; covered by env_force_self_update
+        if flag["name"] in ("--update", "--update-modules"):
+            # --update would self-update; --update-modules re-downloads the tagged
+            # modules over the checkout's own modules/ directory (it reverted the
+            # Python module once). Acceptance of both is covered elsewhere.
+            continue
         args = [example, "--only=python", "--ci", str(PY_CLEAN)]
-        if flag["name"] in ("--staged", "--diff", "--files"):
+        if flag["name"] in ("--staged", "--diff"):
             args = [example, "--only=python", "--ci"]
+        if flag["name"] == "--files":
+            args = [f"--files={PY_CLEAN}", "--only=python", "--ci", str(PY_CLEAN.parent)]
         if flag["name"] in ("--version", "--help", "--list-categories"):
             args = [example, "--only=python", str(PY_CLEAN)]
-        proc = run(args, timeout=120)
+        proc = run(args, cwd=scratch, timeout=120)
         text = proc.stdout + proc.stderr
         if "unknown option" in text or "scan target not found" in text or (proc.returncode == 2 and flag["name"] not in ("--exclude",)):
             bad.append((flag["name"], example, proc.returncode, text.strip()[-160:]))

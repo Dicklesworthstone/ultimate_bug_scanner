@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # Ultimate Bug Scanner – verification helper
-# Fetches release checksums + signature, validates them with minisign, then
-# verifies install.sh before executing it. Fails closed unless --insecure.
+# Fetches release checksums + signature, validates them with minisign (when
+# UBS_MINISIGN_PUBKEY is set) or with cosign keyless verification of the
+# Sigstore bundle the release pipeline attaches (SHA256SUMS.sigstore.json),
+# then verifies install.sh before executing it. Fails closed unless --insecure.
 
 COLOR=1
 if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then COLOR=0; fi
@@ -49,7 +51,12 @@ VERSION="$(normalize_version "${UBS_VERSION:-$(cat "$VERSION_FILE" 2>/dev/null |
 
 ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
 ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
-MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Must be set; fails closed otherwise
+MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # minisign path when set
+# cosign keyless path: the certificate must come from this repository's release
+# workflow on a v* tag, issued by GitHub's OIDC provider.
+COSIGN_IDENTITY_RE="${UBS_COSIGN_IDENTITY_RE:-^https://github.com/Dicklesworthstone/ultimate_bug_scanner/\.github/workflows/release\.yml@refs/tags/v}"
+COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+VERIFY_WITH="${UBS_VERIFY_WITH:-}"          # minisign | cosign (default: minisign when a key is set, else cosign)
 INSECURE=0
 
 usage() {
@@ -57,15 +64,18 @@ usage() {
   cat <<'USAGE'
 
 Actions:
-  - Downloads SHA256SUMS and SHA256SUMS.minisig for the chosen version.
-  - Verifies signature with minisign and the configured public key.
+  - Downloads SHA256SUMS and its signature (SHA256SUMS.minisig or SHA256SUMS.sigstore.json) for the chosen version.
+  - Verifies the SHA256SUMS signature: with minisign when UBS_MINISIGN_PUBKEY is set,
+    otherwise with cosign keyless verification of SHA256SUMS.sigstore.json
+    (UBS_VERIFY_WITH=minisign|cosign forces one path).
   - Verifies the checksum for install.sh.
   - Executes install.sh locally with any extra args you pass via --install-args.
 
 Environment:
   UBS_VERSION            Override version (defaults to ./VERSION or 5.0.7).
   UBS_ARTIFACT_BASE      Override release base URL.
-  UBS_MINISIGN_PUBKEY    Required minisign public key (base64 line from `minisign -G`).
+  UBS_MINISIGN_PUBKEY    minisign public key (base64 line from `minisign -G`); optional when cosign is installed.
+  UBS_VERIFY_WITH        minisign | cosign — force the verification path.
 USAGE
 }
 
@@ -98,12 +108,21 @@ if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
 fi
 
 if [ "$INSECURE" -eq 0 ]; then
-  command -v minisign >/dev/null 2>&1 || die "minisign is required for verification (install via your package manager)."
   command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1 \
     || die "No SHA256 tool found (need sha256sum, shasum, or openssl)."
-  if [ -z "$MINISIGN_PUBKEY" ]; then
-    die "UBS_MINISIGN_PUBKEY is not set. Export the minisign public key or rerun with --insecure."
+  if [ -z "$VERIFY_WITH" ]; then
+    if [ -n "$MINISIGN_PUBKEY" ]; then VERIFY_WITH="minisign"; else VERIFY_WITH="cosign"; fi
   fi
+  case "$VERIFY_WITH" in
+    minisign)
+      command -v minisign >/dev/null 2>&1 || die "minisign is required for UBS_VERIFY_WITH=minisign (install it, or install cosign for keyless verification)."
+      [ -n "$MINISIGN_PUBKEY" ] || die "UBS_MINISIGN_PUBKEY is not set. Export the minisign public key, install cosign for keyless verification, or rerun with --insecure."
+      ;;
+    cosign)
+      command -v cosign >/dev/null 2>&1 || die "Neither UBS_MINISIGN_PUBKEY (minisign) nor cosign is available. Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/), export the minisign key, or rerun with --insecure."
+      ;;
+    *) die "UBS_VERIFY_WITH must be minisign or cosign (got '$VERIFY_WITH')." ;;
+  esac
 fi
 
 mktemp_dir() {
@@ -132,18 +151,37 @@ download() {
 
 S_FILE="$TMPDIR/SHA256SUMS"
 SIG_FILE="$TMPDIR/SHA256SUMS.minisig"
+BUNDLE_FILE="$TMPDIR/SHA256SUMS.sigstore.json"
+COSIGN_ERR="$TMPDIR/cosign.err"
 INSTALL_FILE="$TMPDIR/install.sh"
 
 info "Version: $VERSION"
 info "Release base: $ARTIFACT_BASE"
 
 download "$ARTIFACT_BASE/SHA256SUMS" "$S_FILE"
-download "$ARTIFACT_BASE/SHA256SUMS.minisig" "$SIG_FILE"
 download "$ARTIFACT_BASE/install.sh" "$INSTALL_FILE"
 
 if [ "$INSECURE" -eq 0 ]; then
-  minisign -Vm "$S_FILE" -P "$MINISIGN_PUBKEY" -x "$SIG_FILE" >/dev/null \
-    || die "Signature verification failed for SHA256SUMS"
+  case "$VERIFY_WITH" in
+    minisign)
+      download "$ARTIFACT_BASE/SHA256SUMS.minisig" "$SIG_FILE"
+      minisign -Vm "$S_FILE" -P "$MINISIGN_PUBKEY" -x "$SIG_FILE" >/dev/null \
+        || die "Signature verification failed for SHA256SUMS (minisign)"
+      info "SHA256SUMS signature verified with minisign"
+      ;;
+    cosign)
+      download "$ARTIFACT_BASE/SHA256SUMS.sigstore.json" "$BUNDLE_FILE" \
+        || die "SHA256SUMS.sigstore.json is not published for $VERSION (releases before the cosign bundles); set UBS_MINISIGN_PUBKEY to verify with minisign"
+      if ! cosign verify-blob --bundle "$BUNDLE_FILE" \
+          --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
+          --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+          "$S_FILE" >/dev/null 2>"$COSIGN_ERR"; then
+        cat "$COSIGN_ERR" >&2
+        die "Signature verification failed for SHA256SUMS (cosign keyless bundle)"
+      fi
+      info "SHA256SUMS signature verified with cosign (keyless: ${COSIGN_IDENTITY_RE})"
+      ;;
+  esac
   expected_sum="$(awk '$2=="install.sh"{print $1}' "$S_FILE" | head -n 1)"
   [ -n "${expected_sum:-}" ] || die "install.sh entry missing in checksum file"
   actual_sum="$(compute_sha256 "$INSTALL_FILE")" || die "No SHA256 tool found (need sha256sum, shasum, or openssl)."

@@ -128,7 +128,7 @@ run_step rule-inventory-rust check_rule_list "ubs-rust.sh" "rust" 70 \
 if command -v uv >/dev/null 2>&1; then
   PY=(uv run python)
 else
-  echo "[warn] uv not found – falling back to system python3. Run 'uv sync --python 3.13' for the supported toolchain." >&2
+  echo "[warn] uv not found – falling back to system python3. Run 'uv sync --python 3.14' for the supported toolchain." >&2
   PY=(python3)
 fi
 
@@ -143,6 +143,7 @@ run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
 run_step python-resource-helper "${PY[@]}" python/tests/test_resource_helper.py
 run_step java-resource-lifecycle-helper "${PY[@]}" java/tests/test_resource_lifecycle_helper.py
 run_step csharp-helper-scanners "${PY[@]}" csharp/tests/test_helper_scanners.py
+run_step docs-claims "${PY[@]}" ../scripts/check_docs_claims.py
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "SUMMARY: ${#PASSED_STEPS[@]} passed, ${#FAILED_STEPS[@]} failed"

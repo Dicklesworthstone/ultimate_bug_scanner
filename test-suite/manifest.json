@@ -8722,6 +8722,234 @@
       }
     },
     {
+      "id": "js-sarif-meta-typescript",
+      "description": "Regression for the v5.3.12-v5.3.13 SARIF break: `ubs --format=sarif` on a TypeScript file must emit a real SARIF run with results. Per-grammar rule variants reuse base rule ids, and the JS module used to load them into one `ast-grep scan -c`, which rejects duplicate ids and made every JS/TS SARIF scan exit 2 (the meta-runner then emitted a summary-only run). Removing run_sarif_rule_pack_scan's per-grammar split makes this case fail.",
+      "path": "test-suite/js/security/path-traversal-buggy.ts",
+      "language": "js",
+      "tags": [
+        "js",
+        "typescript",
+        "sarif",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--format=sarif",
+        "--ci"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "min": 3
+          }
+        },
+        "sarif": {
+          "min_runs": 1,
+          "min_results": 5,
+          "require_rule_ids": [
+            "js.fs.writeFileSync-not-atomic",
+            "js.async.dangling-promise"
+          ],
+          "forbid_rule_ids": [
+            "summary.critical"
+          ]
+        }
+      }
+    },
+    {
+      "id": "js-sarif-meta-javascript",
+      "description": "Meta-runner SARIF on a plain JavaScript fixture: the base rule pack must reach the merged SARIF run with real rule ids (eval / innerHTML), never the summary-only fallback run the meta-runner emits when the module fails.",
+      "path": "test-suite/js/buggy/security.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "sarif",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--format=sarif",
+        "--ci"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "sarif": {
+          "min_runs": 1,
+          "min_results": 2,
+          "require_rule_ids": [
+            "js.eval-call",
+            "js.innerHTML-assign"
+          ],
+          "forbid_rule_ids": [
+            "summary.critical"
+          ]
+        }
+      }
+    },
+    {
+      "id": "polyglot-sarif-meta",
+      "description": "Meta-runner SARIF merge across languages: scanning a JS fixture and a Python fixture together must produce one SARIF run per language (merge_sarif_runs), each with real results.",
+      "path": "test-suite/js/buggy/security.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "python",
+        "sarif",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--format=sarif",
+        "--ci",
+        "test-suite/python/security/constant_time_compare_buggy.py"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          },
+          "files": {
+            "min": 2
+          }
+        },
+        "sarif": {
+          "min_runs": 2,
+          "min_results": 3,
+          "require_rule_ids": [
+            "js.eval-call",
+            "py.assert-used"
+          ]
+        }
+      }
+    },
+    {
+      "id": "python-parser-token-compare-buggy",
+      "description": "GH #85 positive control (Python): qualified security vocabulary (api_key, session_token, provided_signature, auth_token, password) must still trigger the constant-time comparison detector after the two-tier vocabulary port.",
+      "path": "test-suite/python/security/parser_token_compare_buggy.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "security",
+        "constant-time",
+        "buggy"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 4
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "python-parser-token-compare-clean",
+      "description": "GH #85 (Python): parser/domain vocabulary (parser token lists, a shell-word `token == \"rm\"`, a call-signature lookup `TARGET_SIGS.get(sig)`, session_id, signature_format, credential_type, jwt_header, map keys) must not trigger the constant-time comparison detector. The `sig`/`token` shapes are the false positives UBS raised against its own helpers.",
+      "path": "test-suite/python/security/parser_token_compare_clean.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "security",
+        "constant-time",
+        "clean"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "golang-parser-token-compare-buggy",
+      "description": "GH #85 positive control (Go): qualified security vocabulary (apiKey, sessionToken, providedSignature, authToken, password) must still trigger the constant-time comparison detector after the two-tier vocabulary port.",
+      "path": "test-suite/golang/security/parser_token_compare_buggy.go",
+      "language": "golang",
+      "tags": [
+        "golang",
+        "security",
+        "constant-time",
+        "buggy"
+      ],
+      "args": [
+        "--only=golang",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17,18,19,20,21,22"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 4
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "golang-parser-token-compare-clean",
+      "description": "GH #85 (Go): parser/domain vocabulary (parser token slices, a shell-word `token == \"rm\"`, sessionID, signatureFormat, credentialType, jwtHeader, map keys) must not trigger the constant-time comparison detector.",
+      "path": "test-suite/golang/security/parser_token_compare_clean.go",
+      "language": "golang",
+      "tags": [
+        "golang",
+        "security",
+        "constant-time",
+        "clean"
+      ],
+      "args": [
+        "--only=golang",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,7,8,10,11,12,13,14,15,16,17,18,19,20,21,22"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "rust-jwt-verification-buggy",
       "description": "Rust JWT code should not decode claims without verification, disable signature/expiration/audience validation, or accept tokens without issuer/audience binding.",
       "path": "test-suite/rust/buggy/jwt_verification.rs",

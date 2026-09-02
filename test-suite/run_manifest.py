@@ -176,6 +176,20 @@ def expect_schema_errors(expect: Any, label: str) -> List[str]:
         if key in expect and type(expect[key]) is not bool:
             errors.append(f"{label}.expect.{key} must be a boolean")
 
+    if "sarif" in expect:
+        sarif_expect = expect["sarif"]
+        if not isinstance(sarif_expect, dict) or not sarif_expect:
+            errors.append(f"{label}.expect.sarif must be a non-empty object")
+        else:
+            for key, value in sarif_expect.items():
+                if key in ("min_runs", "min_results"):
+                    if not is_nonnegative_int(value):
+                        errors.append(f"{label}.expect.sarif.{key} must be a non-negative integer")
+                elif key in ("require_rule_ids", "forbid_rule_ids"):
+                    errors.extend(string_list_errors(value, f"{label}.expect.sarif.{key}"))
+                else:
+                    errors.append(f"{label}.expect.sarif.{key} is not supported")
+
     return errors
 
 
@@ -339,6 +353,63 @@ def parse_module_text_summary(stdout: str, project_label: str) -> Optional[Dict[
     }
 
 
+SARIF_LEVEL_TO_SEVERITY = {"error": "critical", "warning": "warning", "note": "info", "none": "info"}
+
+
+def parse_sarif_summary(stdout: str, project_label: str) -> Optional[Dict[str, Any]]:
+    """Parse a SARIF 2.1.0 document (``ubs --format=sarif``) into a summary.
+
+    Totals are derived from result levels (error → critical, warning → warning,
+    note/none → info); ``files`` counts the distinct artifact URIs the results
+    point at. The extra ``sarif`` block (run count, result count, rule ids)
+    feeds the manifest's ``expect.sarif`` assertions, which is how the
+    meta-runner's merged SARIF output is regression-tested end to end.
+    """
+    stripped = stdout.lstrip()
+    if not stripped.startswith("{"):
+        return None
+    try:
+        doc, _ = JSON_DECODER.raw_decode(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(doc, dict) or "runs" not in doc or "version" not in doc:
+        return None
+    runs = doc.get("runs") or []
+    if not isinstance(runs, list):
+        return None
+    totals = {"critical": 0, "warning": 0, "info": 0, "files": 0}
+    rule_ids: set = set()
+    uris: set = set()
+    result_count = 0
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        for result in run.get("results") or []:
+            if not isinstance(result, dict):
+                continue
+            result_count += 1
+            severity = SARIF_LEVEL_TO_SEVERITY.get(str(result.get("level", "warning")).lower(), "warning")
+            totals[severity] += 1
+            rule_id = result.get("ruleId")
+            if isinstance(rule_id, str) and rule_id:
+                rule_ids.add(rule_id)
+            for location in result.get("locations") or []:
+                uri = (((location or {}).get("physicalLocation") or {}).get("artifactLocation") or {}).get("uri")
+                if isinstance(uri, str) and uri:
+                    uris.add(uri)
+    totals["files"] = len(uris)
+    return {
+        "project": project_label,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "totals": totals,
+        "sarif": {
+            "runs": len(runs),
+            "results": result_count,
+            "rule_ids": sorted(rule_ids),
+        },
+    }
+
+
 def parse_toon_summary(stdout: str, project_label: str) -> Optional[Dict[str, Any]]:
     """Parse UBS --format=toon output to extract aggregate totals.
 
@@ -446,6 +517,25 @@ def check_expectations(
     for substring in (expect or {}).get("forbid_substrings_stderr", []) or []:
         if substring in stderr:
             errors.append(f"forbidden substring '{substring}' present in stderr")
+    sarif_expect = (expect or {}).get("sarif")
+    if isinstance(sarif_expect, dict) and sarif_expect:
+        sarif = (summary or {}).get("sarif") if isinstance(summary, dict) else None
+        if not isinstance(sarif, dict):
+            errors.append("expect.sarif set but stdout was not a SARIF document")
+        else:
+            min_runs = sarif_expect.get("min_runs")
+            if min_runs is not None and int(sarif.get("runs", 0)) < int(min_runs):
+                errors.append(f"sarif runs {sarif.get('runs', 0)} < min {min_runs}")
+            min_results = sarif_expect.get("min_results")
+            if min_results is not None and int(sarif.get("results", 0)) < int(min_results):
+                errors.append(f"sarif results {sarif.get('results', 0)} < min {min_results}")
+            observed_ids = set(sarif.get("rule_ids") or [])
+            for rule_id in sarif_expect.get("require_rule_ids", []) or []:
+                if rule_id not in observed_ids:
+                    errors.append(f"missing SARIF rule id '{rule_id}'")
+            for rule_id in sarif_expect.get("forbid_rule_ids", []) or []:
+                if rule_id in observed_ids:
+                    errors.append(f"forbidden SARIF rule id '{rule_id}' present")
     return errors
 
 
@@ -657,6 +747,8 @@ def main() -> None:
                 summary = parse_module_text_summary(proc.stdout, case_path_arg)
             if summary is None:
                 summary = parse_toon_summary(proc.stdout, case_path_arg)
+            if summary is None:
+                summary = parse_sarif_summary(proc.stdout, case_path_arg)
             if summary is None:
                 allow_unparseable = bool((case.get("expect") or {}).get("allow_unparseable_output", False))
                 if not allow_unparseable:

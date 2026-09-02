@@ -6100,17 +6100,35 @@ SAFE_COMPARE_RE = re.compile(
     r'safeEqual|safeCompare|secureCompare)\s*\(',
     re.IGNORECASE,
 )
-SENSITIVE_RE = re.compile(
-    r'(?:'
-    r'\b(?:token|secret|signature|sig|hmac|mac|digest|csrf|xsrf|nonce|otp|totp|mfa|reset|'
-    r'password|passwd|pwd|auth|bearer|credential|session|jwt|webhook|invite|'
-    r'verification|recovery)\b|'
-    r'\bapi\s+key\b|'
-    r'\bauthorization\b|'
-    r'\bx-signature\b'
-    r')',
-    re.IGNORECASE,
-)
+# GH #85 two-tier vocabulary (same sets as the Rust module). Strong terms are
+# security-sensitive on their own unless the very next identifier term is
+# schema/metadata vocabulary (signatureFormat, credentialType, jwtHeader).
+# Weak terms (token, key, digest, nonce, session, mac, ...) are ordinary
+# parser/domain vocabulary and only become sensitive next to a security
+# qualifier (authToken, apiKey, sessionToken, webhookSignature), so a bare
+# parser `token == "PAGE_BREAK"` is no longer a secret comparison.
+STRONG_TERMS = {
+    'secret', 'password', 'passwd', 'pwd', 'bearer', 'hmac', 'csrf', 'xsrf',
+    'otp', 'totp', 'mfa', 'signature', 'sig', 'credential', 'credentials',
+    'authorization', 'jwt',
+}
+WEAK_TERMS = {
+    'token', 'key', 'mac', 'digest', 'nonce', 'session', 'auth', 'reset',
+    'webhook', 'invite', 'verification', 'recovery',
+}
+QUALIFIER_TERMS = {
+    'api', 'auth', 'access', 'refresh', 'session', 'reset', 'recovery',
+    'verification', 'invite', 'jwt', 'csrf', 'xsrf', 'webhook', 'hmac',
+    'bearer', 'secret', 'signing', 'signature', 'private', 'otp', 'totp',
+    'mfa', 'password', 'passwd', 'pwd', 'credential', 'credentials',
+}
+METADATA_TERMS = {
+    'field', 'format', 'kind', 'layout', 'policy', 'schema', 'state',
+    'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
+    'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
+    'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
+    'count', 'len', 'length',
+}
 NULLISH_RE = re.compile(r'^(?:nil|true|false|0|1|""|``)$')
 SHAPE_RE = re.compile(r'\b(?:len|cap)\s*\(|\.(?:Len|Size)\s*\(')
 PURE_STRING_LITERAL_RE = re.compile(r'^\s*(?:"(?:\\.|[^"\\])*"|`[^`]*`)\s*$')
@@ -6254,7 +6272,19 @@ def strip_string_contents(text: str) -> str:
     return ''.join(out)
 
 def is_sensitive_text(text: str) -> bool:
-    return bool(SENSITIVE_RE.search(split_identifier_terms(text)))
+    terms = re.findall(r'[a-z0-9]+', split_identifier_terms(text).lower())
+    for idx, term in enumerate(terms):
+        if term in STRONG_TERMS:
+            follower = terms[idx + 1] if idx + 1 < len(terms) else ''
+            if follower not in METADATA_TERMS:
+                return True
+            continue
+        if term in WEAK_TERMS and any(
+            other_idx != idx and other in QUALIFIER_TERMS
+            for other_idx, other in enumerate(terms)
+        ):
+            return True
+    return False
 
 def is_sensitive_operand_text(text: str) -> bool:
     stripped = text.strip()

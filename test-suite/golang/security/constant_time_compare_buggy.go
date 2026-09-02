@@ -48,6 +48,9 @@ func verifyLengthGuardedResetToken(token string, expectedResetToken string) bool
 // Positive control for #54: a genuine secret comparison whose sensitivity comes
 // from the OPERAND identifiers (not from string data) must STILL be detected after
 // the false-positive fix that ignores sensitive words inside string-literal contents.
-func checkToken(gotToken string, wantToken string) bool {
-	return gotToken == wantToken
+// The identifiers carry a security qualifier (auth + token) because, since the
+// GH #85 two-tier vocabulary, a bare parser-style `token` is deliberately not
+// treated as secret material on its own (see parser_token_compare_clean.go).
+func checkToken(gotAuthToken string, wantAuthToken string) bool {
+	return gotAuthToken == wantAuthToken
 }

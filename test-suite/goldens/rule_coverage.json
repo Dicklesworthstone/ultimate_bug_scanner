@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 147,
-      "case_count": 294,
-      "clean_cases_with_forbidden_substrings": 146,
-      "strict_zero_clean_cases": 146,
+      "buggy_cases_with_required_substrings": 149,
+      "case_count": 298,
+      "clean_cases_with_forbidden_substrings": 148,
+      "strict_zero_clean_cases": 148,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 95,
-      "case_count": 191,
-      "clean_cases_with_forbidden_substrings": 96,
-      "strict_zero_clean_cases": 96,
+      "buggy_cases_with_required_substrings": 96,
+      "case_count": 193,
+      "clean_cases_with_forbidden_substrings": 97,
+      "strict_zero_clean_cases": 97,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,14 +38,14 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 179,
+      "case_count": 181,
       "default_iterations": 3,
-      "default_transformed_scan_count": 537
+      "default_transformed_scan_count": 543
     },
     "campaign": {
-      "case_count": 96,
+      "case_count": 97,
       "default_iterations": 3,
-      "default_transformed_scan_count": 288
+      "default_transformed_scan_count": 291
     },
     "smoke": {
       "case_count": 17,
@@ -55,18 +55,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 64,
-      "case_count": 128,
-      "clean_cases_with_forbidden_substrings": 64,
-      "strict_zero_clean_cases": 64,
+      "buggy_cases_with_required_substrings": 65,
+      "case_count": 130,
+      "clean_cases_with_forbidden_substrings": 65,
+      "strict_zero_clean_cases": 65,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 95,
-      "case_count": 191,
-      "clean_cases_with_forbidden_substrings": 96,
-      "strict_zero_clean_cases": 96,
+      "buggy_cases_with_required_substrings": 96,
+      "case_count": 193,
+      "clean_cases_with_forbidden_substrings": 97,
+      "strict_zero_clean_cases": 97,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -99,10 +99,10 @@
       "strict_zero_clean_cases": 8
     },
     "golang": {
-      "buggy_cases_with_required_substrings": 17,
-      "clean_cases_with_forbidden_substrings": 17,
-      "security_pairs": 17,
-      "strict_zero_clean_cases": 17
+      "buggy_cases_with_required_substrings": 18,
+      "clean_cases_with_forbidden_substrings": 18,
+      "security_pairs": 18,
+      "strict_zero_clean_cases": 18
     },
     "java": {
       "buggy_cases_with_required_substrings": 14,
@@ -117,10 +117,10 @@
       "strict_zero_clean_cases": 30
     },
     "python": {
-      "buggy_cases_with_required_substrings": 35,
-      "clean_cases_with_forbidden_substrings": 34,
-      "security_pairs": 35,
-      "strict_zero_clean_cases": 34
+      "buggy_cases_with_required_substrings": 36,
+      "clean_cases_with_forbidden_substrings": 35,
+      "security_pairs": 36,
+      "strict_zero_clean_cases": 35
     },
     "ruby": {
       "buggy_cases_with_required_substrings": 7,
@@ -203,6 +203,8 @@
           "golang-jwt-verification-clean",
           "golang-open-redirect-buggy",
           "golang-open-redirect-clean",
+          "golang-parser-token-compare-buggy",
+          "golang-parser-token-compare-clean",
           "golang-request-path-traversal-buggy",
           "golang-request-path-traversal-clean",
           "golang-random-security-buggy",
@@ -349,6 +351,8 @@
           "python-nosql-injection-clean",
           "python-open-redirect-buggy",
           "python-open-redirect-clean",
+          "python-parser-token-compare-buggy",
+          "python-parser-token-compare-clean",
           "python-password-hashing-buggy",
           "python-password-hashing-clean",
           "python-path-traversal-buggy",
@@ -522,6 +526,8 @@
           "golang-jwt-verification-clean",
           "golang-open-redirect-buggy",
           "golang-open-redirect-clean",
+          "golang-parser-token-compare-buggy",
+          "golang-parser-token-compare-clean",
           "golang-request-path-traversal-buggy",
           "golang-request-path-traversal-clean",
           "golang-random-security-buggy",
@@ -697,8 +703,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 357,
-      "transformed_scan_count": 548
+      "case_count": 361,
+      "transformed_scan_count": 554
     },
     "campaign": {
       "by_transform": {
@@ -721,6 +727,8 @@
           "golang-jwt-verification-clean",
           "golang-open-redirect-buggy",
           "golang-open-redirect-clean",
+          "golang-parser-token-compare-buggy",
+          "golang-parser-token-compare-clean",
           "golang-request-path-traversal-buggy",
           "golang-request-path-traversal-clean",
           "golang-random-security-buggy",
@@ -914,6 +922,8 @@
           "golang-jwt-verification-clean",
           "golang-open-redirect-buggy",
           "golang-open-redirect-clean",
+          "golang-parser-token-compare-buggy",
+          "golang-parser-token-compare-clean",
           "golang-request-path-traversal-buggy",
           "golang-request-path-traversal-clean",
           "golang-random-security-buggy",
@@ -1089,8 +1099,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 191,
-      "transformed_scan_count": 382
+      "case_count": 193,
+      "transformed_scan_count": 386
     },
     "smoke": {
       "by_transform": {
@@ -1565,6 +1575,20 @@
       "clean_path": "test-suite/golang/security/open_redirect_clean.go",
       "language": "golang",
       "slug": "open_redirect"
+    },
+    {
+      "buggy_case": "golang-parser-token-compare-buggy",
+      "buggy_min_critical": 4,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/golang/security/parser_token_compare_buggy.go",
+      "buggy_require_count": 1,
+      "clean_case": "golang-parser-token-compare-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/golang/security/parser_token_compare_clean.go",
+      "language": "golang",
+      "slug": "parser_token_compare"
     },
     {
       "buggy_case": "golang-request-path-traversal-buggy",
@@ -2589,6 +2613,20 @@
       "slug": "open_redirect"
     },
     {
+      "buggy_case": "python-parser-token-compare-buggy",
+      "buggy_min_critical": 4,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/python/security/parser_token_compare_buggy.py",
+      "buggy_require_count": 1,
+      "clean_case": "python-parser-token-compare-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/python/security/parser_token_compare_clean.py",
+      "language": "python",
+      "slug": "parser_token_compare"
+    },
+    {
       "buggy_case": "python-password-hashing-buggy",
       "buggy_min_critical": 1,
       "buggy_min_warning": 0,
@@ -3251,6 +3289,7 @@
         "golang-host-header-poisoning-clean",
         "golang-jwt-verification-clean",
         "golang-open-redirect-clean",
+        "golang-parser-token-compare-clean",
         "golang-request-path-traversal-clean",
         "golang-random-security-clean",
         "golang-redos-regex-clean",
@@ -3324,6 +3363,7 @@
         "python-mass-assignment-clean",
         "python-nosql-injection-clean",
         "python-open-redirect-clean",
+        "python-parser-token-compare-clean",
         "python-password-hashing-clean",
         "python-path-traversal-clean",
         "python-random-security-clean",
@@ -3461,6 +3501,8 @@
         "golang-jwt-verification-clean",
         "golang-open-redirect-buggy",
         "golang-open-redirect-clean",
+        "golang-parser-token-compare-buggy",
+        "golang-parser-token-compare-clean",
         "golang-request-path-traversal-buggy",
         "golang-request-path-traversal-clean",
         "golang-random-security-buggy",
@@ -3607,6 +3649,8 @@
         "python-nosql-injection-clean",
         "python-open-redirect-buggy",
         "python-open-redirect-clean",
+        "python-parser-token-compare-buggy",
+        "python-parser-token-compare-clean",
         "python-password-hashing-buggy",
         "python-password-hashing-clean",
         "python-path-traversal-buggy",
@@ -3773,6 +3817,7 @@
         "golang-host-header-poisoning-clean",
         "golang-jwt-verification-clean",
         "golang-open-redirect-clean",
+        "golang-parser-token-compare-clean",
         "golang-request-path-traversal-clean",
         "golang-random-security-clean",
         "golang-redos-regex-clean",
@@ -3880,6 +3925,8 @@
         "golang-jwt-verification-clean",
         "golang-open-redirect-buggy",
         "golang-open-redirect-clean",
+        "golang-parser-token-compare-buggy",
+        "golang-parser-token-compare-clean",
         "golang-request-path-traversal-buggy",
         "golang-request-path-traversal-clean",
         "golang-random-security-buggy",
@@ -4175,6 +4222,8 @@
       "golang-jwt-verification-clean",
       "golang-open-redirect-buggy",
       "golang-open-redirect-clean",
+      "golang-parser-token-compare-buggy",
+      "golang-parser-token-compare-clean",
       "golang-request-path-traversal-buggy",
       "golang-request-path-traversal-clean",
       "golang-random-security-buggy",
@@ -4321,6 +4370,8 @@
       "python-nosql-injection-clean",
       "python-open-redirect-buggy",
       "python-open-redirect-clean",
+      "python-parser-token-compare-buggy",
+      "python-parser-token-compare-clean",
       "python-password-hashing-buggy",
       "python-password-hashing-clean",
       "python-path-traversal-buggy",
@@ -4431,6 +4482,8 @@
       "golang-jwt-verification-clean",
       "golang-open-redirect-buggy",
       "golang-open-redirect-clean",
+      "golang-parser-token-compare-buggy",
+      "golang-parser-token-compare-clean",
       "golang-request-path-traversal-buggy",
       "golang-request-path-traversal-clean",
       "golang-random-security-buggy",

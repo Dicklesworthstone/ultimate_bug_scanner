@@ -49,16 +49,16 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='f054b77189ac66e81fa5c918d4605430272ccb67d9c875f126673182fda85805'
-  [csharp]='aa49faa22bf85a0cb3da4a667e1ab2d2b8960473ec2f8694aac3dffe9f8861f6'
-  [elixir]='4d949858d8a9d292e2eaf9768d4536be93346d69604c9f6c3b8ddf2e70bd9ac0'
-  [golang]='0f2818ed09e28bd0f16edcce9f3821714dd15a0c1324fa2b184a3ab2b510a659'
-  [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
-  [js]='df4dadc63a00099bda7a2e1a517d1f92fcd108dd62fbf9642c887f5854602dca'
-  [python]='4b33b51943d4d7ea14227bcf284b16689dade23ef2aa7c959815d00aa980c50b'
-  [ruby]='2d1be75bf13ac7e0bf71b5241224ec53511020300279dc462a7f99991665d358'
-  [rust]='89d2b1e9bad572cb372eac0c4b6ec61583441e40b57f78981474f2b1686ec410'
-  [swift]='abb8b2e29fa7aa735db056757e6daa4c4b6d618e3251448ed3e9855cf491e9c0'
+  [cpp]='62eb2761756fd6f6e52e70150d318bad57b07b1ca46f3032ff947253d7914a9e'
+  [csharp]='0a6e5df41560b291e4bfed7a40c2216239caec4aeaddaa5a36e45c9d5624f559'
+  [elixir]='c3139d3cf9d9ebe7571cbe5a5b4ae5ce0db325857ea9e78d1e526b5101ab0f77'
+  [golang]='0a5199e1bac7636a2486420246104033b12833aa8dc00eecfd039a8420314b95'
+  [java]='40bea15174de2cd545e4ac891659f3ce30876d36284b846fea52b03ca7c1659d'
+  [js]='edc7e52df94492bc71fbe94131f9003c4411bd8efadc35b861e6fce2781ebdd5'
+  [python]='6a01c19f50986ec1b0fbd1d92b9af4b794474ddc9e3986a39081b787f95b6583'
+  [ruby]='020aeca8d1c4fc448f01cd1ad6d66e10ad43a247e0c466c0a0a5b77181ed6d34'
+  [rust]='fa7f4fcb6edf12b1147de8014e4bb0b6d26ecf40ed26911fd2088e963438d76f'
+  [swift]='0960197481c8eda9859469f227f6bdbcf5c116b813a335e2763a1188b5c6c073'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -77,6 +77,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_rust.py']='60a8384f327c8c22d3928f0b6a8e7a58bbe0a97bba9f85d50304e1fcae4bd47f'
   ['helpers/type_narrowing_swift.py']='f950bafa92391964e4779c77d37dcc11b0ffeab9bc351be439b4709c0f01b41a'
   ['helpers/type_narrowing_ts.js']='37cefad3c650ae04d1c5f7da42edfca3b5dea1f0c2263025bcec527111b930c9'
+  ['lib/ubs-common.sh']='cce2e8ce1824ce466010a2a2179c9282f6674518bd6b72785b72a1ed7c3e0016'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,6 +230,7 @@ HELPER_ASSETS=(
   "helpers/type_narrowing_kotlin.py"
   "helpers/type_narrowing_swift.py"
   "helpers/cfg_test_only_modules_rust.py"
+  "lib/ubs-common.sh"
 )
 
 HELPERS_READY=0
@@ -278,7 +280,7 @@ toon_encoder_problem(){
   elif ! command -v "$TOON_BIN" >/dev/null 2>&1; then
     printf '%s' "not found in PATH"
   elif ! looks_like_toon_rust_encoder "$TOON_BIN"; then
-    printf '%s' "does not appear to be toon_rust (expected tru)"
+    printf '%s' "does not appear to be toon_rust (expected its toon/tru binary)"
   fi
 }
 
@@ -288,7 +290,7 @@ refuse_toon_without_encoder(){
   local problem="$1"
   say_err "${RED}${X}${RESET} --format=toon needs toon_rust's encoder: $TOON_BIN $problem"
   say_err "${DIM}  Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/toon_rust/main/install.sh | bash${RESET}"
-  say_err "${DIM}  Or set TOON_TRU_BIN=/path/to/tru if it is installed elsewhere; use --format=json for the same document as JSON.${RESET}"
+  say_err "${DIM}  install.sh installs it (digest-verified toon_rust release binary); or set TOON_TRU_BIN=/path/to/toon if it lives elsewhere; use --format=json for the same document as JSON.${RESET}"
   say_err "${DIM}  Note: the Node.js 'toon' CLI and upstream toon-format's 'toon' binary are different projects and not supported.${RESET}"
   emit_error_envelope "environment" "error" "toon-encoder-missing" \
     "--format=toon needs toon_rust's tru encoder ($TOON_BIN $problem); install it or use --format=json" \
@@ -386,9 +388,16 @@ trap on_err ERR
 PROJECT_DIR="."
 # Format precedence: CLI > UBS_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > "text"
 FORMAT="${UBS_OUTPUT_FORMAT:-${TOON_DEFAULT_FORMAT:-text}}"  # text|json|jsonl|sarif|toon
-# TOON encoder binary (default: tru from toon_rust; never use the Node.js `toon` CLI)
-# Resolution order: TOON_TRU_BIN > TOON_BIN > tru
-TOON_BIN="${TOON_TRU_BIN:-${TOON_BIN:-tru}}"
+# TOON encoder binary from toon_rust: installed as `toon` since 0.2 (what
+# install.sh and `cargo install tru` produce) and `tru` before that; never the
+# Node.js `toon` CLI (looks_like_toon_rust_encoder checks the content).
+# Resolution order: TOON_TRU_BIN > TOON_BIN > tru on PATH > toon on PATH.
+TOON_BIN="${TOON_TRU_BIN:-${TOON_BIN:-}}"
+if [[ -z "$TOON_BIN" ]]; then
+  if command -v tru >/dev/null 2>&1; then TOON_BIN=tru
+  elif command -v toon >/dev/null 2>&1; then TOON_BIN=toon
+  else TOON_BIN=tru; fi
+fi
 CI_MODE=0
 FAIL_ON_WARNING=0
 VERBOSE=0
@@ -686,7 +695,7 @@ cat <<'JSON'
     "json": {"description": "One object: project, timestamp, status (ok|partial), failed_modules[], scanners[] (per-language summary with findings[] and status ok|timeout|error), totals{critical,warning,info,files}. Environment errors and refusals print an error envelope instead; no supported language prints a result object with exit_code 3.", "schema": "ubs --schema=json"},
     "jsonl": {"description": "One JSON object per line: type=finding (per finding, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
     "sarif": {"description": "SARIF 2.1.0; one run per module. Partial runs and errors set runs[].invocations[0].executionSuccessful=false with toolExecutionNotifications (descriptor ids ubs/module-timeout, ubs/module-error, ubs/<refusal-or-error-reason>).", "schema": "ubs --schema=sarif"},
-    "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable tru (TOON_TRU_BIN/TOON_BIN) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
+    "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable toon_rust encoder (toon or tru on PATH, or TOON_TRU_BIN/TOON_BIN; install.sh installs it) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
     "text": {"description": "Human report; Combined Summary at the end (Files/Critical/Warning/Info, Status: partial when applicable)."}
   },
   "env": [
@@ -2496,6 +2505,13 @@ run_doctor(){
     else
       doctor_report warn "ast-grep: missing/unusable (JS/TS scans will fail). Run: ubs doctor --fix"
     fi
+  fi
+
+  # TOON encoder (toon_rust): optional, but --format=toon exits 2 without it.
+  if command -v "$TOON_BIN" >/dev/null 2>&1 && looks_like_toon_rust_encoder "$TOON_BIN"; then
+    doctor_report ok "toon encoder: ready ${DIM}$(command -v "$TOON_BIN") $("$TOON_BIN" --version 2>/dev/null | head -n 1)${RESET}"
+  else
+    doctor_report info "toon encoder: not found (--format=toon exits 2 until toon_rust's toon/tru is on PATH; install.sh installs it, or set TOON_TRU_BIN)"
   fi
 
   local lang module_path verify_status cached_modules=0

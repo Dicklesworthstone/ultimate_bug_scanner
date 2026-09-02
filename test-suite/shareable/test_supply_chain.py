@@ -57,10 +57,14 @@ class Sandbox:
         self.bin_dir.mkdir()
         shutil.copy2(UBS, self.bin_dir / "ubs")
         (self.module_dir / "helpers").mkdir(parents=True)
+        (self.module_dir / "lib").mkdir()
         shutil.copy2(MODULES / "ubs-python.sh", self.module_dir / "ubs-python.sh")
         for helper in (MODULES / "helpers").iterdir():
             if helper.is_file():
                 shutil.copy2(helper, self.module_dir / "helpers" / helper.name)
+        # The shared module library ships through the same helper channel (bead A1).
+        for lib in (MODULES / "lib").glob("*.sh"):
+            shutil.copy2(lib, self.module_dir / "lib" / lib.name)
         tampered = self.module_dir / TAMPERED_HELPER
         if missing_helper:
             tampered.unlink()
@@ -73,6 +77,10 @@ class Sandbox:
             for helper in (MODULES / "helpers").iterdir():
                 if helper.is_file():
                     shutil.copy2(helper, dest / helper.name)
+            lib_dest = self.raw_base / ref / "modules" / "lib"
+            lib_dest.mkdir()
+            for lib in (MODULES / "lib").glob("*.sh"):
+                shutil.copy2(lib, lib_dest / lib.name)
             if serve_tampered:
                 served = dest / Path(TAMPERED_HELPER).name
                 served.write_text(served.read_text(encoding="utf-8") + "\n# tampered by test_supply_chain\n", encoding="utf-8")

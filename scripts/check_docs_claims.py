@@ -159,8 +159,10 @@ def check_languages() -> None:
 def check_helpers() -> None:
     ubs_text = (ROOT / "ubs").read_text(encoding="utf-8")
     block = re.search(r"declare -A HELPER_CHECKSUMS=\((.*?)\n\)", ubs_text, re.S)
-    pinned = set(re.findall(r"\['helpers/([^']+)'\]", block.group(1))) if block else set()
-    on_disk = {p.name for p in (ROOT / "modules" / "helpers").iterdir() if p.is_file() and not p.name.startswith(".")}
+    pinned = set(re.findall(r"\['((?:helpers|lib)/[^']+)'\]", block.group(1))) if block else set()
+    on_disk = {f"helpers/{p.name}" for p in (ROOT / "modules" / "helpers").iterdir() if p.is_file() and not p.name.startswith(".")}
+    # The shared module library ships through the same checksum channel.
+    on_disk |= {f"lib/{p.name}" for p in (ROOT / "modules" / "lib").glob("*.sh")}
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
     problems = []
     for name in sorted(on_disk - pinned):
@@ -168,7 +170,7 @@ def check_helpers() -> None:
     for name in sorted(pinned - on_disk):
         problems.append(f"HELPER_CHECKSUMS lists missing file {name}")
     for name in sorted(on_disk):
-        if name not in agents:
+        if name.split("/")[-1] not in agents:
             problems.append(f"AGENTS.md does not mention helper {name}")
     report("helpers", not problems, "; ".join(problems) if problems else f"{len(on_disk)} helpers pinned and documented")
 

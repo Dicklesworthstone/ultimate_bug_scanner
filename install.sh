@@ -41,8 +41,9 @@ fi
 
 # SHA-256 of every dependency release asset the installer can download.
 # ast-grep 0.45.3 (same table as AST_GREP_ASSET_SHA256 in ubs), jq 1.8.2 (from
-# the release's sha256sum.txt) and typos 1.50.1 (computed from the release
-# archives) are pinned here; ripgrep 15.2.0 publishes a .sha256 sidecar next
+# the release's sha256sum.txt), typos 1.50.1 (computed from the release
+# archives) and toon_rust 0.2.4 (from the release's checksums.txt) are pinned
+# here; ripgrep 15.2.0 publishes a .sha256 sidecar next
 # to each asset, which is fetched and checked instead. A download whose digest
 # is unknown or does not match is never installed.
 declare -A DEP_ASSET_SHA256=(
@@ -60,6 +61,11 @@ declare -A DEP_ASSET_SHA256=(
   [typos-v1.50.1-aarch64-unknown-linux-musl.tar.gz]='a48feb58c517977ca953e634507c72819d64df8717c33ced3e43868d174fd39e'
   [typos-v1.50.1-x86_64-apple-darwin.tar.gz]='b31ccf2f21154b2bc8d2a84f395f746106edda0feec4817fbecdb12216df53bd'
   [typos-v1.50.1-aarch64-apple-darwin.tar.gz]='2c940734b44b6e199e165278b662b7e17c68f068471a2a8a5e491ce635414ae6'
+  [toon-linux-amd64.tar.xz]='af6e21187c5afb6ec993b9e668d13d3b785f55571b67ced1c1e24bb53f0b1b62'
+  [toon-linux-arm64.tar.xz]='3ebc625a27ccf565eb649565aefef505ab40cddb63648a6bc0c8c54ae5bf9f57'
+  [toon-darwin-amd64.tar.xz]='e1af1cca9ea99df2eb85420fe5289c6d4adddad001b778a4c285e249acc57df8'
+  [toon-darwin-arm64.tar.xz]='fe163da70b7f504ad489aeea1e8887971df6b526b6bcdd0f37add9cdab7c2fce'
+  [toon-windows-amd64.zip]='3cfdb169a4f1a28e2fb14bffa6c775d1824f45793b9e602ce6a30be550872de8'
   [typos-v1.50.1-x86_64-pc-windows-msvc.zip]='8740867a0d9e44a62f0803e37a669ec3c6cd17ab63cd49d00e14a96d3e03ccc3'
 )
 MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
@@ -184,6 +190,7 @@ SKIP_AST_GREP=0
 SKIP_RIPGREP=0
 SKIP_JQ=0
 SKIP_TYPOS=0
+SKIP_TOON=0       # --skip-toon: leave toon_rust's encoder (--format=toon) alone
 LOCAL_INSTALL=0   # --local: install ./ubs from the current directory
 SKIP_BUN=0
 SKIP_TYPE_NARROWING=0
@@ -293,6 +300,7 @@ HELP
   print_help_option "--skip-ripgrep" "Skip ripgrep installation"
   print_help_option "--skip-jq" "Skip jq installation"
   print_help_option "--skip-typos" "Skip typos installation"
+  print_help_option "--skip-toon" "Skip toon_rust encoder installation (--format=toon needs it)"
   print_help_option "--skip-bun" "Skip bun installation (used for TypeScript)"
   print_help_option "--skip-type-narrowing" "Skip Node/TypeScript readiness probe"
   print_help_option "--skip-doctor" "Skip running 'ubs doctor' after install"
@@ -1015,6 +1023,23 @@ check_ripgrep() { command -v rg >/dev/null 2>&1; }
 check_jq() { command -v jq >/dev/null 2>&1; }
 check_typos() { command -v typos >/dev/null 2>&1; }
 
+# toon_rust's encoder is installed as `toon` (0.2+) or `tru` (older); it is
+# identified by content because the Node.js `toon` CLI is a different program.
+toon_encoder_path() {
+  local bin banner
+  for bin in toon tru; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    # `|| true`: head closing the pipe early must not trip pipefail.
+    banner="$("$bin" --help 2>&1 | head -n 5 || true)"
+    if [[ "$banner" == *"TOON reference implementation in Rust"* ]]; then
+      command -v "$bin"
+      return 0
+    fi
+  done
+  return 1
+}
+check_toon() { toon_encoder_path >/dev/null 2>&1; }
+
 # ==============================================================================
 # TIER 1 ENHANCEMENTS: Version Checking, Binary Fallbacks, Verification
 # ==============================================================================
@@ -1141,7 +1166,7 @@ verify_dependency_asset() {
 }
 
 download_binary_release() {
-  local tool="$1"  # ast-grep, ripgrep, jq, or typos
+  local tool="$1"  # ast-grep, ripgrep, jq, typos, or toon
   local platform="$2"
   local arch
 
@@ -1310,6 +1335,64 @@ PY
       fi
       ;;
 
+    toon)
+      # toon_rust (Dicklesworthstone/toon_rust) publishes toon-<os>-<arch>.tar.xz
+      # (a zip on Windows) holding the `toon` binary; the digests come from the
+      # release's checksums.txt and are pinned in DEP_ASSET_SHA256 above.
+      local version="0.2.4"
+      local asset type="tar" toon_arch
+      case "$arch" in
+        x86_64) toon_arch="amd64" ;;
+        aarch64) toon_arch="arm64" ;;
+        *) warn "No toon_rust binary release available for $platform-$arch (cargo install tru)"; return 1 ;;
+      esac
+      case "$platform" in
+        linux|wsl) asset="toon-linux-${toon_arch}.tar.xz" ;;
+        macos) asset="toon-darwin-${toon_arch}.tar.xz" ;;
+        windows)
+          if [ "$toon_arch" != "amd64" ]; then
+            warn "No toon_rust binary release available for windows-${toon_arch} (cargo install tru)"
+            return 1
+          fi
+          asset="toon-windows-amd64.zip"
+          type="zip"
+          ;;
+        *) warn "No toon_rust binary release available for $platform-$arch (cargo install tru)"; return 1 ;;
+      esac
+
+      local url="${DEP_BINARY_BASE}/Dicklesworthstone/toon_rust/releases/download/v${version}/${asset}"
+      local archive="$temp_dir/${asset}"
+
+      if with_backoff 3 curl -fsSL "$url" -o "$archive" 2>"$err_log"; then
+        verify_dependency_asset "$archive" "$asset" || return 1
+        case "$type" in
+          tar) tar -xf "$archive" -C "$temp_dir" >/dev/null 2>&1 || true ;;
+          zip)
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -q "$archive" -d "$temp_dir" 2>/dev/null || true
+            else
+              tar -xf "$archive" -C "$temp_dir" >/dev/null 2>&1 || true
+            fi
+            ;;
+        esac
+        local toon_bin
+        toon_bin=$(find "$temp_dir" -type f \( -name toon -o -name toon.exe \) 2>/dev/null | head -1)
+        if [ -n "$toon_bin" ] && [ -f "$toon_bin" ]; then
+          chmod +x "$toon_bin" 2>/dev/null
+          local target="$install_dir/toon"
+          [[ "$toon_bin" == *.exe ]] && target="$install_dir/toon.exe"
+          mv "$toon_bin" "$target"
+          success "toon encoder installed to $target"
+          export PATH="$install_dir:$PATH"
+          return 0
+        else
+          warn "Could not locate the toon binary in the extracted archive"
+        fi
+      else
+        warn "Download of ${asset} failed (${url})"
+      fi
+      ;;
+
     typos)
       local version="1.50.1"
       local asset type="tar"
@@ -1460,6 +1543,14 @@ verify_installation() {
     log "   typos: skipped via --skip-typos"
   else
     warn "   typos: not available (spellcheck automation disabled)"
+  fi
+
+  if check_toon; then
+    success "   toon encoder: $(toon_encoder_path)"
+  elif [ "$SKIP_TOON" -eq 1 ]; then
+    log "   toon encoder: skipped via --skip-toon"
+  else
+    warn "   toon encoder: not available (--format=toon exits 2 until toon_rust is installed)"
   fi
 
   if [ "$SKIP_TYPE_NARROWING" -eq 1 ]; then
@@ -1733,6 +1824,9 @@ read_config_file() {
       skip_typos)
         SKIP_TYPOS="$(normalize_bool "$value")"
         ;;
+      skip_toon)
+        SKIP_TOON="$(normalize_bool "$value")"
+        ;;
       skip_bun)
         SKIP_BUN="$(normalize_bool "$value")"
         ;;
@@ -1805,6 +1899,7 @@ skip_ast_grep=0
 skip_ripgrep=0
 skip_jq=0
 skip_typos=0
+skip_toon=0
 skip_type_narrowing=0
 skip_doctor=0
 
@@ -2807,6 +2902,39 @@ install_typos() {
 
   error "All typos installation methods failed"
   warn "Install manually from https://github.com/crate-ci/typos or your package manager"
+  return 1
+}
+
+install_toon() {
+  local platform log_file
+  platform="$(detect_platform)"
+
+  log "Installing toon_rust's encoder (needed for --format=toon)..."
+
+  if dry_run_enabled; then
+    log_dry_run "Would install toon_rust's encoder (platform $platform)."
+    return 0
+  fi
+
+  # The digest-pinned release binary is the fast path; cargo builds the same
+  # crate (`tru`, which installs the binary as `toon`) when no asset fits.
+  if download_binary_release "toon" "$platform"; then
+    return 0
+  fi
+
+  if command -v cargo >/dev/null 2>&1; then
+    log_file="$(mktemp_in_workdir "toon-install.log.XXXXXX")"
+    log "Attempting installation via cargo (cargo install tru)..."
+    if cargo install tru 2>&1 | tee "$log_file"; then
+      success "toon encoder installed via cargo"
+      return 0
+    else
+      warn "cargo installation failed"
+    fi
+  fi
+
+  error "All toon encoder installation methods failed"
+  warn "Install it from https://github.com/Dicklesworthstone/toon_rust (or set TOON_TRU_BIN); --format=toon exits 2 until then"
   return 1
 }
 
@@ -4038,6 +4166,10 @@ shift
 SKIP_TYPOS=1
 shift
 ;;
+--skip-toon)
+SKIP_TOON=1
+shift
+;;
 --skip-doctor)
 RUN_DOCTOR=0
 shift
@@ -4193,6 +4325,20 @@ else
   success "typos is installed"
 fi
 record_tool_status "typos" "$SKIP_TYPOS" check_typos "--skip-typos"
+echo ""
+
+# Check for toon_rust's encoder (--format=toon)
+if [ "$SKIP_TOON" -eq 1 ]; then
+  log "[skip] toon encoder installation disabled via --skip-toon"
+elif ! check_toon; then
+  warn "toon encoder not found (toon_rust; needed for --format=toon)"
+  if ask "Install the toon encoder now?"; then
+    install_toon || warn "Continuing without the toon encoder (--format=toon exits 2 until it is installed)"
+  fi
+else
+  success "toon encoder is installed"
+fi
+record_tool_status "toon" "$SKIP_TOON" check_toon "--skip-toon"
 echo ""
 
 # Check for bun (TypeScript installer)

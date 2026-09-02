@@ -80,6 +80,8 @@ def main():
         "helpers/type_narrowing_rust.py": "helpers/type_narrowing_rust.py",
         "helpers/type_narrowing_kotlin.py": "helpers/type_narrowing_kotlin.py",
         "helpers/type_narrowing_swift.py": "helpers/type_narrowing_swift.py",
+        # Shared module library (bead A1): shipped and verified like a helper.
+        "lib/ubs-common.sh": "lib/ubs-common.sh",
     }
 
     new_helper_checksums: dict[str, str] = {}

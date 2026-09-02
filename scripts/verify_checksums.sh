@@ -73,12 +73,12 @@ done
 
 echo ""
 echo "Verifying helper checksums..."
-for helper in modules/helpers/*; do
+for helper in modules/helpers/* modules/lib/*.sh; do
   if [[ ! -f "$helper" ]]; then
     continue
   fi
 
-  rel="helpers/$(basename "$helper")"
+  rel="${helper#modules/}"
 
   # Calculate actual checksum
   if command -v sha256sum >/dev/null 2>&1; then

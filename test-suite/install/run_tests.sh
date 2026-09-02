@@ -132,6 +132,15 @@ test_basic_smoke() {
       tests_failed=1
       return
     fi
+    if grep -q "toon encoder not found" "$log"; then
+      echo "[PASS] toon encoder warning emitted"
+    elif grep -q "toon encoder" "$log"; then
+      echo "[PASS] toon encoder detected"
+    else
+      echo "[FAIL] expected toon encoder status missing (log: $log)"
+      tests_failed=1
+      return
+    fi
     check_sessions_command "$home" "$session_output"
     echo "[PASS] basic_smoke"
   fi
@@ -176,6 +185,81 @@ test_skip_typos_flag() {
       echo "[PASS] skip_typos_flag"
     fi
   fi
+}
+
+test_skip_toon_flag() {
+  echo "[TEST] skip_toon_flag"
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home"
+  local log="$ctx/install.log"
+
+  if run_installer "$home" "$log" --skip-toon; then
+    if grep -q "toon encoder not found" "$log"; then
+      echo "[FAIL] toon encoder warning appeared despite --skip-toon"
+      tests_failed=1
+    elif ! grep -q "toon encoder installation disabled via --skip-toon" "$log"; then
+      echo "[FAIL] --skip-toon was not acknowledged in the log ($log)"
+      tests_failed=1
+    else
+      echo "[PASS] skip_toon_flag"
+    fi
+  fi
+}
+
+test_verified_toon_download() {
+  # The toon_rust encoder is provisioned like the other dependency binaries:
+  # a TAMPERED release archive from a local mirror must be refused and never
+  # installed (bead 3a6). --easy-mode auto-accepts the install prompt.
+  echo "[TEST] verified_toon_download"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[SKIP] verified_toon_download (python3 not available for the local mirror)"
+    return 0
+  fi
+  if [[ "$(uname -m)" != "x86_64" || "$(uname -s)" != "Linux" ]]; then
+    echo "[SKIP] verified_toon_download (needs linux x86_64 to hit the tampered asset name)"
+    return 0
+  fi
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" shim="$ctx/bin" www="$ctx/www" log="$ctx/install.log"
+  mkdir -p "$home/.local/bin" "$shim" "$www/Dicklesworthstone/toon_rust/releases/download/v0.2.4"
+  head -c 4096 /dev/urandom >"$www/Dicklesworthstone/toon_rust/releases/download/v0.2.4/toon-linux-amd64.tar.xz"
+  # cargo must not build anything for real: shim it to fail fast.
+  printf '#!/usr/bin/env bash\necho "shim: cargo disabled in tests" >&2\nexit 1\n' >"$shim/cargo"
+  chmod +x "$shim/cargo"
+  local port
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  (cd "$www" && python3 -m http.server "$port" --bind 127.0.0.1 >"$ctx/http.log" 2>&1) &
+  local http_pid=$!
+  sleep 1
+
+  local rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$ctx" && UBS_INSTALLER_BINARY_BASE="http://127.0.0.1:$port" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:/usr/bin:/bin:$home/.local/bin" SHELL=/bin/bash \
+    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+  kill "$http_pid" 2>/dev/null || true
+  if ! grep -q 'Checksum mismatch for toon-linux-amd64.tar.xz' "$log"; then
+    echo "[FAIL] tampered toon archive was not rejected by digest verification (exit $rc, log: $log)"
+    grep -n -i -E 'toon|checksum|mirror' "$log" | tail -n 20 || true
+    tests_failed=1
+    return 1
+  fi
+  if [ -e "$home/.local/bin/toon" ]; then
+    echo "[FAIL] a tampered toon binary was installed despite the checksum mismatch"
+    tests_failed=1
+    return 1
+  fi
+  if ! grep -q 'toon encoder: not available' "$log"; then
+    echo "[FAIL] summary did not report the toon encoder as unavailable after the refused download (log: $log)"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] verified_toon_download"
 }
 
 test_self_test_flag() {
@@ -743,10 +827,12 @@ test_flag_order_independence() {
 test_basic_smoke
 test_no_alias_written_when_no_path_modify
 test_skip_typos_flag
+test_skip_toon_flag
 test_fresh_home_no_path
 test_claude_hooks_registered
 test_agent_detection
 test_verified_download
+test_verified_toon_download
 test_local_requires_flag
 test_uninstall_roundtrip
 test_dry_run_touches_nothing

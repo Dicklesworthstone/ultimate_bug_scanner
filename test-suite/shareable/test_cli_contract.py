@@ -508,6 +508,50 @@ def check_schema_validates_outputs() -> None:
     report("schema_validates_outputs", not problems, "; ".join(problems)[:1500])
 
 
+def check_profile_block() -> None:
+    # UBS_PROFILE=1 adds phase timings to the json envelope; without it the key is absent.
+    proc = run(["--only=python", "--ci", "--format=json", str(PY_CLEAN)], env={"UBS_PROFILE": "1"})
+    ok = False
+    detail = f"exit={proc.returncode}"
+    try:
+        prof = json.loads(proc.stdout)["profile"]
+        ok = (
+            all(isinstance(prof[k], int) and prof[k] >= 0 for k in ("total_ms", "copy_ms", "fanout_ms", "merge_ms"))
+            and isinstance(prof["modules"].get("python"), int)
+            and prof["total_ms"] >= prof["fanout_ms"] >= prof["modules"]["python"]
+        )
+        detail += f" profile={prof}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" ({exc})"
+    report("profile_block", ok, detail, proc if not ok else None)
+    plain = run(["--only=python", "--ci", "--format=json", str(PY_CLEAN)], env={"UBS_PROFILE": None})
+    ok2 = "profile" not in json.loads(plain.stdout)
+    report("profile_absent_by_default", ok2, "", plain if not ok2 else None)
+
+
+def check_toon_missing_encoder_exit2() -> None:
+    # --format=toon without a usable tru must be an environment error with the
+    # envelope on stdout (never plain JSON labelled as TOON), decided before
+    # any scanning happens.
+    proc = run(["--only=python", "--ci", "--format=toon", str(PY_CLEAN)], env={"UBS_TEST_FORCE_NO_TOON": "1"})
+    ok = False
+    try:
+        doc = json.loads(proc.stdout)
+        ok = proc.returncode == 2 and doc["error"] == "environment" and doc["reason"] == "toon-encoder-missing" \
+            and "Scanning" not in proc.stderr and "toon_rust" in proc.stderr
+    except Exception:  # noqa: BLE001
+        pass
+    report("toon_missing_encoder_exit2", ok, f"exit={proc.returncode}", proc if not ok else None)
+    # A binary that is not toon_rust is rejected the same way.
+    proc2 = run(["--only=python", "--ci", "--format=toon", str(PY_CLEAN)], env={"TOON_TRU_BIN": "/bin/true"})
+    ok2 = False
+    try:
+        ok2 = proc2.returncode == 2 and json.loads(proc2.stdout)["reason"] == "toon-encoder-missing"
+    except Exception:  # noqa: BLE001
+        pass
+    report("toon_wrong_encoder_exit2", ok2, f"exit={proc2.returncode}", proc2 if not ok2 else None)
+
+
 def check_status_ok_on_clean_run() -> None:
     proc = run(["--only=python", "--ci", "--format=json", str(PY_CLEAN)])
     ok = False
@@ -535,6 +579,8 @@ def main() -> int:
         check_env_force_self_update,
         check_env_ci_disables_auto_update,
         check_status_ok_on_clean_run,
+        check_toon_missing_encoder_exit2,
+        check_profile_block,
         check_robot_docs,
         check_robot_docs_flags_parse,
         check_schema_validates_outputs,

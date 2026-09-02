@@ -52,7 +52,7 @@ Note: Windows users must run the installer one-liner from within Git Bash, or us
 # Scan current repo (JSON)
 ubs . --format=json
 
-# Token-optimized output (TOON)
+# Token-optimized output (TOON; needs toon_rust's tru — without it ubs exits 2 with the error envelope)
 ubs . --format=toon
 
 # Scan only staged changes
@@ -129,7 +129,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - `--comparison=<baseline.json>` diff the latest combined summary against a stored run. Deltas feed into console output, JSON, HTML, and SARIF automation metadata so CI can detect regressions.
 - `--report-json=<file>` writes an enriched summary (project, totals, git metadata, optional comparison block) that you can archive or share with teammates/CI.
 - `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
-- All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output automatically annotates `path:line` references, JSON gains `git.*` metadata, and merged SARIF runs now include `versionControlProvenance` plus `automationDetails` keyed by the comparison id.
+- All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output annotates `path:line` references, stdout JSON gains `git.*` metadata plus a `permalink` on every finding sample, and merged SARIF runs carry `properties.permalink` on each result location together with `versionControlProvenance` and `automationDetails` keyed by the comparison id. Permalinks are relative to the repository root even when you scan a subdirectory.
 
 #### Resource lifecycle heuristics in each language
 - **Python** – Category 16 now correlates every `open()` call against matching `with open(...)` usage and explicit `encoding=` parameters, while Category 19 uses the new AST helper at `modules/helpers/resource_lifecycle_py.py` to walk every file, socket, subprocess, asyncio task, and context cancellation path. The helper resolves alias imports, context managers, and awaited tasks so the diff counts (`acquire=X, release=Y, context-managed=Z`) show the exact imbalance per file.
@@ -196,7 +196,7 @@ ubs --profile=loose    # Skip TODO/debug/code-quality nits when prototyping
 # Machine-readable output
 ubs . --format=json    # Pure JSON on stdout; logs go to stderr
 ubs . --format=jsonl   # Line-delimited summary per scanner + totals
-ubs . --format=toon    # TOON format (~50% smaller than JSON, LLM-optimized)
+ubs . --format=toon    # TOON format (~50% smaller than JSON, LLM-optimized); exit 2 + envelope when tru is missing
 ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"strung"
 ```
 
@@ -468,7 +468,7 @@ Summary Statistics:
 
 ### 💨 **2. Fast Enough for the Edit Loop When You Scope It**
 
-Measured on 2026-09-02 (v5.3.13, single runs on a 16-core Linux box; ast-grep on PATH):
+Measured on 2026-09-02 (v5.3.13, single runs on a 16-core Linux box; ast-grep on PATH). Reproduce with `scripts/bench.sh` (fixture tree + a deterministic synthetic 50K-line corpus; `--large`, `--oss` for more) and watch for regressions with `scripts/bench_cusum.py`; `UBS_PROFILE=1` prints per-phase timings:
 
 ```
 Single file (JS or Python):                   4.6–5.8 seconds
@@ -1037,6 +1037,7 @@ Environment Variables:
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
+  UBS_PROFILE=1            Add phase timings (copy, fan-out, per module, merge, total ms) to json/toon output and the text summary
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
 

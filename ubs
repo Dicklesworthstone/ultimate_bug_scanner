@@ -85,6 +85,35 @@ declare -A HELPER_CHECKSUMS=(
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
 
+# Milliseconds since the epoch (bash 5 EPOCHREALTIME, else date +%s%N).
+now_ms(){
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    local s="${EPOCHREALTIME%.*}" us="${EPOCHREALTIME#*.}"
+    printf '%s\n' $(( s * 1000 + 10#${us:0:3} ))
+  else
+    local ns; ns="$(date +%s%N 2>/dev/null || echo 0)"
+    printf '%s\n' $(( ns / 1000000 ))
+  fi
+}
+UBS_START_MS="$(now_ms)"
+UBS_PROFILE="${UBS_PROFILE:-0}"
+PROFILE_COPY_MS=0
+PROFILE_FANOUT_MS=0
+PROFILE_MERGE_MS=0
+profile_json(){
+  # {"total_ms","copy_ms","fanout_ms","merge_ms","modules":{lang: wall ms}}
+  local total=$(( $(now_ms) - UBS_START_MS ))
+  local mods="" f lang ms
+  for f in "$TMPDIR_RUN"/*.ms; do
+    [[ -f "$f" ]] || continue
+    lang="$(basename "$f" .ms)"
+    ms="$(tr -cd '0-9' < "$f")"
+    mods="${mods:+$mods,}\"$(json_escape "$lang")\":${ms:-0}"
+  done
+  printf '{"total_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
+    "$total" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
+}
+
 # Machine-readable error envelope (bead B6). Environment errors and scan
 # refusals used to be text on stderr only, so `ubs --format=json | jq` saw an
 # empty stdout and could not tell "refused" from "crashed". Every machine format
@@ -309,11 +338,12 @@ print_with_permalinks(){
     cat "$file"
     return
   fi
-  python3 - "$SOURCE_PROJECT_DIR" "$GIT_BLOB_BASE" "$file" <<'PY' 2>/dev/null || cat "$file"
+  python3 - "$SOURCE_PROJECT_DIR" "$GIT_BLOB_BASE" "$file" "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" <<'PY' 2>/dev/null || cat "$file"
 import sys, pathlib, re
-root = pathlib.Path(sys.argv[1]).resolve()
+root = pathlib.Path(sys.argv[1]).resolve()          # relative locations resolve against the scanned dir
 blob = sys.argv[2].rstrip('/')
 input_path = pathlib.Path(sys.argv[3])
+top = pathlib.Path(sys.argv[4]).resolve()           # permalinks are relative to the git top level
 pattern = re.compile(r'^(\s*)((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?')
 
 def to_url(path_str, line):
@@ -327,7 +357,7 @@ def to_url(path_str, line):
     if not resolved.is_file():
         return None
     try:
-        rel = resolved.relative_to(root)
+        rel = resolved.relative_to(top)
     except Exception:
         return None
     return f"{blob}/{rel.as_posix()}#L{line}"
@@ -419,6 +449,7 @@ POSITIONAL_TARGETS=()  # raw positional path args; classified after the parse lo
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
 GIT_BLOB_BASE=""
+GIT_TOPLEVEL=""
 SARIF_AUTOMATION_ID=""
 SHOW_VERSION=0
 BEADS_JSONL_PATH=""
@@ -539,6 +570,8 @@ Environment Variables:
   UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
   UBS_MODULE_TIMEOUT=SECS     Per-module timeout (default: 300)
+  UBS_PROFILE=1               Add phase timings (copy, fan-out, per module, merge, total ms)
+                              as a "profile" block in json/toon output and a Profile line in text
   UBS_ALLOW_PARTIAL=1         Exit on findings even when a module timed out or crashed
                               (default: such partial runs exit 2; the JSON/JSONL/SARIF
                               envelope carries status and failed_modules either way)
@@ -660,6 +693,7 @@ cat <<'JSON'
     {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
     {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Per-module timeout (default 300)."},
     {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
+    {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, copy_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
     {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables)."},
     {"name": "UBS_SKIP_SIZE_CHECK", "value": "1", "description": "Skip the size guard."},
@@ -722,7 +756,7 @@ cat <<'JSON'
       },
       "sample": {
         "type": "object",
-        "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "code": {"type": "string"}},
+        "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "code": {"type": "string"}, "permalink": {"type": "string", "description": "GitHub blob URL for file#Lline; present when the project has a GitHub remote"}},
         "additionalProperties": true
       },
       "finding": {
@@ -778,8 +812,9 @@ cat <<'JSON'
           "failed_modules": {"type": "array", "items": {"$ref": "#/$defs/failed_module"}},
           "scanners": {"type": "array", "items": {"$ref": "#/$defs/scanner"}},
           "totals": {"$ref": "#/$defs/totals"},
-          "git": {"type": "object"},
-          "comparison": {"type": "object"}
+          "git": {"type": "object", "description": "present when the project has a GitHub remote", "properties": {"repository": {"type": "string"}, "commit": {"type": "string"}, "blob_base": {"type": "string"}}, "required": ["repository"]},
+          "comparison": {"type": "object"},
+          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "copy_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "copy_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
         },
         "additionalProperties": true
       },
@@ -1613,6 +1648,7 @@ resolve_git_metadata(){
   commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
   [[ -n "$remote" && -n "$commit" ]] || return
   GIT_COMMIT_SHA="$commit"
+  GIT_TOPLEVEL="$root"
   GIT_REMOTE_HTTP=""
   case "$remote" in
     git@github.com:*)
@@ -3466,7 +3502,9 @@ trap 'on_interrupt TERM' TERM
 COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 
 if [[ "$TARGETED_SCAN_MODE" -eq 0 ]]; then
+  _profile_t0="$(now_ms)"
   apply_ignore_filters
+  PROFILE_COPY_MS=$(( $(now_ms) - _profile_t0 ))
 fi
 if [[ "$SUGGEST_IGNORE" -eq 1 ]]; then
   suggest_ignore_candidates
@@ -3901,7 +3939,8 @@ run_lang(){
   local status_file="$TMPDIR_RUN/$lang.status"
   local metrics_dir="$TMPDIR_RUN/$lang.metrics"
   local module_status=0
-  local start_ts=$SECONDS
+  local start_ms
+  start_ms="$(now_ms)"
   local MODULE_TIMED_OUT=0
   local MODULE_RUN_STATUS=0
   # run_lang always executes in a backgrounded subshell (see the dispatcher), so
@@ -3968,6 +4007,7 @@ run_lang(){
       run_module "$out_json" "$err" "$module" "${args[@]}" "${report_args[@]}" --format=json || true
       module_status=$MODULE_RUN_STATUS
       restore_original_paths "$out_json"
+      [[ -s "$out_findings" ]] && restore_original_paths "$out_findings"
       # Modules that implement --format=json must emit a UBS summary *object*.
       # If they emit other JSON types (e.g., an array of findings), fall back to
       # text mode so we can still produce a stable combined summary.
@@ -4027,7 +4067,9 @@ run_lang(){
     module_status=1
   fi
 
-  local duration=$((SECONDS - start_ts))
+  local duration_ms=$(( $(now_ms) - start_ms ))
+  local duration=$(( duration_ms / 1000 ))
+  printf '%s\n' "$duration_ms" > "$TMPDIR_RUN/$lang.ms"
   if [[ "${QUIET:-0}" -eq 0 ]]; then
     say_err "${DIM}Finished $lang (${duration}s)${RESET}"
   fi
@@ -4163,13 +4205,21 @@ merge_json_scanners(){
   fi
   # First merge the summary JSONs
   local base_json
-  base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" '
+  base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" \
+      --arg repo "${GIT_REMOTE_HTTP:-}" --arg commit "${GIT_COMMIT_SHA:-}" --arg blob "${GIT_BLOB_BASE:-}" '
     def nz(x): if (x|type)=="number" then x else 0 end;
     def failed: map(select((.status // "ok") != "ok") | {language, status, module_error, message});
+    def git_block:
+      if ($repo|length) > 0 then
+        {git: ({repository:$repo}
+               + (if ($commit|length) > 0 then {commit:$commit} else {} end)
+               + (if ($blob|length) > 0 then {blob_base:$blob} else {} end))}
+      else {} end;
     {project:$project, timestamp:$ts,
      status: (if (failed|length) > 0 then "partial" else "ok" end),
-     failed_modules: failed,
-     scanners: .,
+     failed_modules: failed}
+    + git_block
+    + {scanners: .,
      totals:{
        critical: (map(nz(.critical)) | add),
        warning:  (map(nz(.warning))  | add),
@@ -4197,26 +4247,70 @@ merge_json_scanners(){
 
     # Merge findings into each scanner entry (only if we have valid findings_map)
     if [[ -n "$findings_map" && "$findings_map" != "{}" && "$findings_map" != "null" ]]; then
-      echo "$base_json" | jq --argjson fm "$findings_map" '
+      base_json=$(echo "$base_json" | jq --argjson fm "$findings_map" '
         .scanners |= map(
           if .language and $fm[.language] then
             . + {findings: $fm[.language]}
           else . end
-        )'
-    else
-      echo "$base_json"
+        )')
     fi
-  else
-    echo "$base_json"
   fi
+  add_json_permalinks "$base_json"
+}
+
+# Every finding sample that names a file and a line gets a GitHub permalink
+# (blob_base/<project-relative path>#L<line>) when the project has a GitHub
+# remote — the same links the text report prints (README "shareable output").
+add_json_permalinks(){
+  local doc="$1"
+  if [[ -z "${GIT_BLOB_BASE:-}" ]]; then
+    printf '%s\n' "$doc"
+    return 0
+  fi
+  local proj_real top_real prefix
+  proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
+  top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
+  # Scanned directory relative to the repository root ("" when they coincide).
+  prefix="${proj_real#"$top_real"}"
+  prefix="${prefix#/}"
+  printf '%s' "$doc" | jq --arg blob "$GIT_BLOB_BASE" --arg top "$top_real" --arg prefix "$prefix" '
+    def repo_rel(f):
+      if f | startswith("/") then
+        (if f | startswith($top + "/") then (f | ltrimstr($top + "/")) else null end)
+      else
+        (if ($prefix|length) > 0 then $prefix + "/" + (f | ltrimstr("./")) else (f | ltrimstr("./")) end)
+      end;
+    def link(sample):
+      if (sample|type) == "object" and (sample.file|type) == "string" and (sample.line|type) == "number" then
+        (repo_rel(sample.file)) as $rel
+        | if $rel == null then sample else sample + {permalink: ($blob + "/" + $rel + "#L" + (sample.line|tostring))} end
+      else sample end;
+    if (.scanners|type) == "array" then
+      .scanners |= map(
+        if (.findings|type) == "array" then
+          .findings |= map(if (.samples|type) == "array" then .samples |= map(link(.)) else . end)
+        else . end)
+    else . end
+  ' 2>/dev/null || printf '%s\n' "$doc"
 }
 
 generate_combined_json(){
   [[ -n "$COMBINED_JSON_FILE" ]] || return 1
   if [[ -s "$COMBINED_JSON_FILE" ]]; then return 0; fi
   if ! need_cmd jq; then return 1; fi
+  local t0; t0="$(now_ms)"
   merge_json_scanners >"$COMBINED_JSON_FILE" 2>/dev/null || return 1
+  PROFILE_MERGE_MS=$(( PROFILE_MERGE_MS + $(now_ms) - t0 ))
   return 0
+}
+
+# Print the combined JSON, with the profile block when UBS_PROFILE=1.
+emit_combined_json(){
+  if [[ "$UBS_PROFILE" == "1" ]] && need_cmd jq; then
+    jq --argjson profile "$(profile_json)" '. + {profile: $profile}' "$COMBINED_JSON_FILE"
+  else
+    cat "$COMBINED_JSON_FILE"
+  fi
 }
 
 merge_sarif_runs(){
@@ -4257,6 +4351,26 @@ merge_sarif_runs(){
          else run end)
         | (if ($auto|length) > 0 then . + {automationDetails:{id:$auto}} else . end);
       {"version":"2.1.0","runs": ((map(toRuns(.)) | add) // [] | map(attachMeta(.)))}' "${valid_sarifs[@]}" 2>"$jq_err" >"$TMPDIR_RUN/combined.sarif"; then
+    if [[ -n "${GIT_BLOB_BASE:-}" ]]; then
+      # Same permalinks as the text/JSON reports, on each result location.
+      local proj_real top_real prefix
+      proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
+      top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
+      prefix="${proj_real#"$top_real"}"
+      prefix="${prefix#/}"
+      if jq --arg blob "$GIT_BLOB_BASE" --arg top "$top_real" --arg prefix "$prefix" '
+        def rel(u): (u | ltrimstr("file://")) as $f
+          | if $f | startswith("/") then ($f | ltrimstr($top + "/"))
+            elif ($prefix|length) > 0 then $prefix + "/" + ($f | ltrimstr("./"))
+            else ($f | ltrimstr("./")) end;
+        .runs |= map(.results |= map(
+          (.locations // []) |= map(
+            if (.physicalLocation.artifactLocation.uri|type) == "string" and (.physicalLocation.region.startLine|type) == "number"
+            then . + {properties: ((.properties // {}) + {permalink: ($blob + "/" + rel(.physicalLocation.artifactLocation.uri) + "#L" + (.physicalLocation.region.startLine|tostring))})}
+            else . end)))' "$TMPDIR_RUN/combined.sarif" >"$TMPDIR_RUN/combined.sarif.tmp" 2>>"$jq_err"; then
+        mv "$TMPDIR_RUN/combined.sarif.tmp" "$TMPDIR_RUN/combined.sarif"
+      fi
+    fi
     if [[ "${RUN_STATUS:-ok}" == "partial" && -n "${FAILED_MODULES_JSON:-}" ]]; then
       # SARIF consumers must not read a partial run as a clean one: every run
       # gets invocations[].executionSuccessful=false plus one notification per
@@ -4514,6 +4628,7 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 declare -A PID_LANG=()
 pids=()
+_profile_fanout_t0="$(now_ms)"
 for L in "${langs[@]}"; do
   run_lang "$L" "${MODULE_PATHS[$L]}" "$FORMAT" &
   pid=$!
@@ -4540,6 +4655,8 @@ for pid in "${pids[@]}"; do
     status="$rc"
   fi
 done
+
+PROFILE_FANOUT_MS=$(( $(now_ms) - _profile_fanout_t0 ))
 
 # Run-level status (bead B6): "ok" when every scanner finished, "partial" when
 # one or more timed out or crashed. A partial run exits 2 (like an environment
@@ -4616,7 +4733,7 @@ case "$FORMAT" in
       status=2
     else
       if generate_combined_json; then
-        cat "$COMBINED_JSON_FILE"
+        emit_combined_json
       else
         if ! merge_json_scanners; then
           say "${RED}$X could not produce combined JSON${RESET}"
@@ -4660,7 +4777,7 @@ case "$FORMAT" in
       toon_problem="$(toon_encoder_problem)"
       if [[ -z "$toon_problem" ]]; then
         if generate_combined_json; then
-          "$TOON_BIN" --encode < "$COMBINED_JSON_FILE"
+          emit_combined_json | "$TOON_BIN" --encode
         else
           if ! merge_json_scanners | "$TOON_BIN" --encode; then
             say "${RED}$X could not produce TOON output${RESET}"
@@ -4700,6 +4817,18 @@ case "$FORMAT" in
           jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"' "$COMBINED_JSON_FILE"
           if [[ "$RUN_STATUS" == "partial" ]]; then
             say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
+          fi
+          if [[ "$UBS_PROFILE" == "1" ]]; then
+            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (copy " + (.copy_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")"')"
+          fi
+          if [[ -n "$COMPARISON_FILE" && -f "$COMPARISON_FILE" ]]; then
+            say "$(jq -r --slurpfile base "$COMPARISON_FILE" --arg path "$COMPARISON_FILE" '
+              def n(x): if (x|type)=="number" then x else 0 end;
+              def sgn(x): if x >= 0 then "+" + (x|tostring) else (x|tostring) end;
+              ($base[0].totals // {}) as $b
+              | "Δ vs baseline (" + $path + "): critical " + sgn(n(.totals.critical) - n($b.critical))
+                + ", warning " + sgn(n(.totals.warning) - n($b.warning))
+                + ", info " + sgn(n(.totals.info) - n($b.info))' "$COMBINED_JSON_FILE" 2>/dev/null || echo "Δ vs baseline: could not read $COMPARISON_FILE")"
           fi
           totals=$(jq -r '.totals' "$COMBINED_JSON_FILE")
         else
@@ -4833,12 +4962,26 @@ if out_json:
     out_path.write_text(json.dumps(shareable, indent=2), encoding="utf-8")
 
 if out_html:
-    totals_html = f"""
+    if baseline is not None:
+        def row(label, key):
+            delta = cur_totals[key] - base_totals[key]
+            return f"<tr><td>{label}</td><td>{cur_totals[key]}</td><td>{base_totals[key]}</td><td>{delta:+d}</td></tr>"
+        totals_html = f"""
     <table>
       <tr><th>Metric</th><th>Current</th><th>Baseline</th><th>Δ</th></tr>
-      <tr><td>Critical</td><td>{cur_totals['critical']}</td><td>{base_totals['critical']}</td><td>{cur_totals['critical']-base_totals['critical']}</td></tr>
-      <tr><td>Warning</td><td>{cur_totals['warning']}</td><td>{base_totals['warning']}</td><td>{cur_totals['warning']-base_totals['warning']}</td></tr>
-      <tr><td>Info</td><td>{cur_totals['info']}</td><td>{base_totals['info']}</td><td>{cur_totals['info']-base_totals['info']}</td></tr>
+      {row('Critical', 'critical')}
+      {row('Warning', 'warning')}
+      {row('Info', 'info')}
+    </table>
+    """
+    else:
+        # No baseline: a zero column would make every count look like a regression.
+        totals_html = f"""
+    <table>
+      <tr><th>Metric</th><th>Current</th></tr>
+      <tr><td>Critical</td><td>{cur_totals['critical']}</td></tr>
+      <tr><td>Warning</td><td>{cur_totals['warning']}</td></tr>
+      <tr><td>Info</td><td>{cur_totals['info']}</td></tr>
     </table>
     """
     scanners = shareable.get("scanners", [])

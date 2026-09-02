@@ -57,7 +57,7 @@ jobs:
       - name: Set up uv with caching
         uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           enable-cache: true
           cache-dependency-glob: |
             uv.lock
@@ -84,7 +84,7 @@ jobs:
           tru --version
 
       - name: Sync Python dependencies
-        run: uv sync --locked --python 3.13
+        run: uv sync --locked --python 3.14
 
       - name: Run full test suite
         env:

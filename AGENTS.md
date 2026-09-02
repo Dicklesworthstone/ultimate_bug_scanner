@@ -43,7 +43,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 UBS is a **pure Bash project** — the meta-runner (`ubs`) and all language modules (`modules/ubs-*.sh`) are Bash scripts. Helper assets use Python and Go/JS for AST-level analysis.
 
 - **Shell dialect:** Bash 5+ with `set -Eeuo pipefail`
-- **Package management:** Nix flake (`flake.nix`) for reproducible dev shells and packaging; `pyproject.toml` (uv-managed, Python 3.13) for helper tooling only
+- **Package management:** Nix flake (`flake.nix`) for reproducible dev shells and packaging; `pyproject.toml` (uv-managed, Python 3.14) for helper tooling only
 - **Core runtime dependencies:** `bash`, `jq`, `ripgrep`, `git`, `curl`, `python3`
 - **Version:** Tracked in `VERSION` (and mirrored in `UBS_VERSION` inside `ubs` and the README badge); `scripts/check-version-tag-drift.sh` fails CI when `main`'s module checksums no longer match the last `v*` tag, so every module change needs a version bump + tag before or with it
 - **Unsafe code:** N/A (shell scripts)

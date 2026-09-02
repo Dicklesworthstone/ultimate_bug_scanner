@@ -50,7 +50,7 @@
         in {
           default = pkgs.mkShell {
             packages = with pkgs;
-              [ bashInteractive shellcheck git cmake python3 jq ripgrep ]
+              [ bashInteractive shellcheck git cmake python314 jq ripgrep ]
               ++ lib.optional (uvPkg != null) uvPkg;
           };
         });

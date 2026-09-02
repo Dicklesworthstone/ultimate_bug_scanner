@@ -49,6 +49,8 @@ ubs --only=js,python src/               # Language filter (faster)
 ```bash
 ubs --ci --fail-on-warning .            # Strict mode for CI
 ubs --format=json .                     # Machine-readable
+ubs robot-docs                          # JSON: guide, flags, examples, exit codes, formats
+ubs --schema=json                       # JSON Schema for --format=json (also jsonl|sarif|toon|error)
 ubs --format=sarif .                    # GitHub code scanning
 ```
 

@@ -230,7 +230,7 @@ export UBS_MINISIGN_PUBKEY="RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBT
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/scripts/verify.sh | bash
 ```
 
-The verifier downloads `SHA256SUMS` + `SHA256SUMS.minisig` from the matching release, validates them with minisign, checks `install.sh`, and only then executes it. Use `--insecure` to bypass verification (not recommended).
+The verifier downloads `SHA256SUMS` from the matching release and validates its signature — with minisign when `UBS_MINISIGN_PUBKEY` is set, otherwise with `cosign verify-blob` against the release's keyless Sigstore bundle (`SHA256SUMS.sigstore.json`, so no key to distribute) — checks `install.sh`, and only then executes it. `UBS_VERIFY_WITH=minisign|cosign` forces a path; `--insecure` bypasses verification (not recommended).
 
 ### **Option 3: Nix**
 
@@ -2212,23 +2212,23 @@ Use it WITH your existing tools. Let ESLint handle style. Let TypeScript handle 
 
 ## 🧪 **Development & Internals**
 
-### **Python Tooling (uv + CPython 3.13)**
+### **Python Tooling (uv + CPython 3.14)**
 
-All helper scripts (manifest runner, fixtures, inline analyzers inside `ubs`) assume a single source of truth: **CPython 3.13 managed by [uv](https://github.com/astral-sh/uv)** living inside `.venv/` at the repo root.
+All helper scripts (manifest runner, fixtures, inline analyzers inside `ubs`) assume a single source of truth: **CPython 3.14 managed by [uv](https://github.com/astral-sh/uv)** living inside `.venv/` at the repo root.
 
 ```bash
 # 1) Install uv (one-time)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2) Create the managed environment defined by pyproject.toml / uv.lock
-uv sync --python 3.13
+uv sync --python 3.14
 
 # 3) Activate it whenever you work in this repo (puts .venv/bin first on PATH)
 source .venv/bin/activate
 
 # 4) Run any Python entrypoint through the env
 uv run python test-suite/run_manifest.py --case js-core-buggy
-# ...or rely on 'python'/'python3' now that they point at .venv/bin/python3.13
+# ...or rely on 'python'/'python3' now that they point at .venv/bin/python3.14
 ```
 
 > [!NOTE]
@@ -2237,7 +2237,7 @@ uv run python test-suite/run_manifest.py --case js-core-buggy
 Common uv-powered entrypoints:
 
 - `uv run python test-suite/run_manifest.py --case js-core-buggy` – run the manifest in CI or locally without manually activating the venv.
-- `source .venv/bin/activate && python -m pip list` – verify that every inline `python3` invocation maps to CPython 3.13.
+- `source .venv/bin/activate && python -m pip list` – verify that every inline `python3` invocation maps to CPython 3.14.
 - `uv run python - <<'PY' …` – mirrors how the language modules embed Python helpers, but now guaranteed to execute inside the managed interpreter.
 
 ---

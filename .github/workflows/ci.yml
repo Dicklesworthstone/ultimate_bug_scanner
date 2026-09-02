@@ -64,7 +64,7 @@ jobs:
       - name: Set up uv with caching
         uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           enable-cache: true
           cache-dependency-glob: |
             uv.lock
@@ -78,7 +78,7 @@ jobs:
         run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
 
       - name: Sync Python dependencies
-        run: uv sync --locked --python 3.13
+        run: uv sync --locked --python 3.14
 
       - name: Run manifest smoke suite
         env:
@@ -188,10 +188,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.13"
+          python-version: "3.14"
 
       - name: Sync Python dependencies
-        run: uv sync --locked --python 3.13
+        run: uv sync --locked --python 3.14
 
       - name: Version, doctor and smoke scans under Homebrew bash
         env:
@@ -247,7 +247,7 @@ jobs:
       - name: Set up uv with caching
         uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           enable-cache: true
           cache-dependency-glob: |
             uv.lock
@@ -261,7 +261,7 @@ jobs:
         run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
 
       - name: Sync Python dependencies
-        run: uv sync --locked --python 3.13
+        run: uv sync --locked --python 3.14
 
       - name: Regenerate goldens
         env:
@@ -309,6 +309,12 @@ jobs:
 
       - name: Compile-check Python files
         run: python3 -m compileall scripts modules/helpers
+
+      - name: Documentation claims match the code
+        # Flags shown in the docs must be accepted by the binaries; language and
+        # helper counts, version strings, the Python pin and the exit-code table
+        # must agree with ubs, install.sh and the workflows (scripts/check_docs_claims.py).
+        run: python3 scripts/check_docs_claims.py
 
       - name: CHANGELOG keeps an Unreleased section
         # scripts/cut-release.sh rolls "## [Unreleased]" under the new version

@@ -10,6 +10,7 @@ permissions:
   contents: write
   packages: write
   id-token: write
+  attestations: write
 
 env:
   COSIGN_VERSION: v3.1.3
@@ -87,7 +88,7 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           enable-cache: false
           version: ${{ env.UV_VERSION }}
 
@@ -117,6 +118,32 @@ jobs:
           chmod 600 dist/minisign.key
           minisign -S -s dist/minisign.key -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
           rm dist/minisign.key
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign release blobs with cosign (keyless, Sigstore bundles)
+        # One Sigstore bundle per asset, next to it as <asset>.sigstore.json.
+        # scripts/verify.sh verifies SHA256SUMS.sigstore.json when no minisign
+        # key is configured: `cosign verify-blob --bundle SHA256SUMS.sigstore.json
+        #   --certificate-identity-regexp '^https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/v'
+        #   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS`
+        run: |
+          for asset in install.sh ubs SHA256SUMS git_safety_guard.py; do
+            cosign sign-blob --yes --bundle "dist/${asset}.sigstore.json" "dist/${asset}"
+          done
+          ls -la dist/*.sigstore.json
+
+      - name: Attest build provenance for the release assets (SLSA)
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/install.sh
+            dist/ubs
+            dist/SHA256SUMS
+            dist/git_safety_guard.py
 
       - name: Install syft
         uses: anchore/sbom-action/download-syft@v0.24.2
@@ -315,6 +342,7 @@ jobs:
             dist/ubs
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
+            dist/*.sigstore.json
             dist/git_safety_guard.py
             dist/ubs.rb
             dist/sbom.spdx.json

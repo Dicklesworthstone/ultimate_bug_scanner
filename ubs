@@ -55,7 +55,7 @@ declare -A MODULE_CHECKSUMS=(
   [golang]='0f2818ed09e28bd0f16edcce9f3821714dd15a0c1324fa2b184a3ab2b510a659'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
   [js]='df4dadc63a00099bda7a2e1a517d1f92fcd108dd62fbf9642c887f5854602dca'
-  [python]='83316ee559bc184d174bada4a2cc899fccf53b8da8c189184e969cd27e08ec36'
+  [python]='4b33b51943d4d7ea14227bcf284b16689dade23ef2aa7c959815d00aa980c50b'
   [ruby]='2d1be75bf13ac7e0bf71b5241224ec53511020300279dc462a7f99991665d358'
   [rust]='89d2b1e9bad572cb372eac0c4b6ec61583441e40b57f78981474f2b1686ec410'
   [swift]='abb8b2e29fa7aa735db056757e6daa4c4b6d618e3251448ed3e9855cf491e9c0'
@@ -453,6 +453,7 @@ Options:
   --exclude-langs=CSV     Exclude languages (e.g. --exclude-langs=js,ruby)
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
   --category=CSV          Focus on category packs (e.g., resource-lifecycle for AST lifecycle analyzers)
+  --profile=NAME          Severity profile forwarded to the modules (strict|loose); strict also implies --fail-on-warning
   --comparison=FILE       Baseline JSON to diff combined results against
                           (reporting only: the diff annotates the shareable
                           report; exit code still reflects CURRENT totals)
@@ -574,7 +575,7 @@ cat <<'JSON'
       {"name": "--skip", "args": "CSV", "example": "--skip=14", "description": "Skip category numbers in every language (numbers differ per language; prefer --skip-LANG)."},
       {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|ruby|swift|csharp|elixir)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
-      {"name": "--profile", "args": "NAME", "example": "--profile=strict", "description": "Severity profile passed to the modules (strict|loose)."},
+      {"name": "--profile", "args": "NAME", "example": "--profile=strict", "description": "Severity profile passed to the modules (strict|loose); strict also implies --fail-on-warning."},
       {"name": "--files", "args": "F1,F2", "example": "--files=a.js,b.py", "description": "Scan only the listed files (comma or space separated)."},
       {"name": "--staged", "args": null, "example": "--staged", "description": "Scan only files staged in the git index."},
       {"name": "--diff", "args": null, "example": "--diff", "description": "Scan only files modified in the working tree (alias --git-diff)."},
@@ -1018,11 +1019,13 @@ PY
 # Self-description commands answer from static data (functions above) and
 # exit before any parsing, locking, network or scanning.
 if [[ "${1:-}" == "robot-docs" ]]; then
-  emit_robot_docs "${2:-all}"
-  exit $?
+  _self_doc_rc=0
+  emit_robot_docs "${2:-all}" || _self_doc_rc=$?   # `||` keeps the ERR trap quiet on exit 2
+  exit "$_self_doc_rc"
 elif [[ "${1:-}" == "--schema" || "${1:-}" == --schema=* ]]; then
-  emit_schema "${1#--schema}"
-  exit $?
+  _self_doc_rc=0
+  emit_schema "${1#--schema}" || _self_doc_rc=$?
+  exit "$_self_doc_rc"
 fi
 
 DOCTOR_FIX=0
@@ -2429,7 +2432,10 @@ run_doctor(){
           if [[ $verify_status -eq 2 ]]; then
             doctor_report err "$lang module: $VERIFY_MODULE_ERR"
           else
-            if [[ "$fix" -eq 1 ]]; then
+            if [[ "$module_path" == "$(script_dir)/modules/"* ]]; then
+              # Checkout modules are source under git: report, never download over them.
+              doctor_report err "$lang module in this checkout does not match MODULE_CHECKSUMS ($VERIFY_MODULE_ERR); run ./scripts/update_checksums.sh (doctor --fix never overwrites checkout modules)"
+            elif [[ "$fix" -eq 1 ]]; then
               say "    ${DIM}Refreshing $lang module...${RESET}"
               if download_module "$lang" "$module_path"; then
                 doctor_report ok "$lang module refreshed and verified"
@@ -3038,7 +3044,18 @@ ensure_cached_helpers(){
 
 ensure_module(){
   local lang="$1" path="$2"
-  if [ "$UPDATE_MODULES" -eq 1 ] || [ ! -x "$path" ]; then
+  # A module that lives next to this script (a repository checkout) is source
+  # under version control: never download over it. --update-modules and the
+  # "refresh on checksum mismatch" repair apply to the cache directory only;
+  # a checkout module that does not match MODULE_CHECKSUMS needs
+  # scripts/update_checksums.sh (or git), not a download.
+  local checkout_module=0
+  if [[ "$path" == "$(script_dir)/modules/"* ]]; then
+    checkout_module=1
+  fi
+  if [ "$UPDATE_MODULES" -eq 1 ] && [ "$checkout_module" -eq 1 ]; then
+    say_err "${DIM}${INFO}${RESET} $lang module comes from this checkout ($path); --update-modules never overwrites checkout modules (use git)."
+  elif [ "$UPDATE_MODULES" -eq 1 ] || [ ! -x "$path" ]; then
     download_module "$lang" "$path" || return 1
   fi
   if should_verify_module_path "$path" && [ -x "$path" ]; then
@@ -3049,6 +3066,10 @@ ensure_module(){
       return 1
     fi
     if [[ $verify_code -ne 0 ]]; then
+      if [ "$checkout_module" -eq 1 ]; then
+        say "${RED}$X $lang module in this checkout does not match MODULE_CHECKSUMS (${VERIFY_MODULE_ERR:-mismatch}); run ./scripts/update_checksums.sh after editing modules (never downloading over a checkout)${RESET}"
+        return 1
+      fi
       say "${YELLOW}${WARN}${RESET} cached $lang module failed verification (${VERIFY_MODULE_ERR:-corrupt}); refreshing..."
       download_module "$lang" "$path" || return 1
       verify_code=0

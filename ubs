@@ -388,6 +388,7 @@ OUTPUT_FILE=""             # tee the rendered report to this file (--output / PR
 LIST_CATEGORIES=0
 TEE_PID=""
 CSHARP_MODULE_ARGS=()
+RUST_MODULE_ARGS=()
 MODE="scan"
 SESSION_ENTRIES=1
 SESSION_RAW=0
@@ -505,6 +506,11 @@ Options:
   --no-format             Pass through to the C# module: skip dotnet format
   --no-deps               Pass through to the C# module: skip dotnet package checks
   --dotnet-target=PATH    Pass through to the C# module: select solution/project for dotnet commands
+  --no-cargo              Pass through to the Rust module: static analysis only, skip every cargo
+                          phase (fmt/clippy, check/test --no-run, audit/deny/udeps/outdated); the
+                          skipped categories report "Not evaluated" instead of "clean".
+                          UBS_SKIP_RUST_BUILD=1 is the env equivalent. Cargo phases also skip
+                          themselves (loudly) on targeted scans, whose shadow workspace has no Cargo.toml.
   --no-auto-update        Disable auto-update (even if UBS_ENABLE_AUTO_UPDATE=1)
   --staged                Scan only files staged for commit (git index)
   --diff, --git-diff      Scan only modified files (working tree vs HEAD)
@@ -609,6 +615,7 @@ cat <<'JSON'
       {"name": "--ignore-file", "args": "PATH", "example": "--ignore-file=.ubsignore.ci", "description": "Extra ignore globs (default: PROJECT/.ubsignore when present)."},
       {"name": "--skip-size-check", "args": null, "example": "--skip-size-check", "description": "Skip the directory size guard (default limit 1000 MB after ignores)."},
       {"name": "--skip-type-narrowing", "args": null, "example": "--skip-type-narrowing", "description": "Skip the JS/Rust/Kotlin/Swift/C# type-narrowing helpers."},
+      {"name": "--no-cargo", "args": null, "example": "--no-cargo", "description": "Rust static-only mode: skip every cargo phase (fmt/clippy, check/test --no-run, audit/deny/udeps/outdated). Skipped categories report a 'Not evaluated' finding and the Rust JSON carries meta.cargo_execution.status=skipped. Env equivalent: UBS_SKIP_RUST_BUILD=1."},
       {"name": "--module-dir", "args": "DIR", "example": "--module-dir=/tmp/ubs-modules", "description": "Where modules and helpers are cached."},
       {"name": "--update-modules", "args": null, "example": "--update-modules", "description": "Re-download modules before scanning."},
       {"name": "--comparison", "args": "FILE", "example": "--comparison=baseline.json", "description": "Baseline JSON to annotate the shareable report with deltas (exit code still reflects current totals)."},
@@ -1137,6 +1144,10 @@ else
       --skip-type-narrowing) SKIP_TYPE_NARROWING=1; shift;;
       --no-dotnet|--no-build|--no-test|--no-format|--no-deps)
         CSHARP_MODULE_ARGS+=("$1")
+        shift;;
+      --no-cargo)
+        # Rust static-only mode: forwarded to the Rust module only (issue #99).
+        RUST_MODULE_ARGS+=("$1")
         shift;;
       --dotnet-target=*)
         CSHARP_MODULE_ARGS+=("$1")
@@ -3920,6 +3931,9 @@ run_lang(){
   fi
   if [[ "$lang" == "csharp" && ${#CSHARP_MODULE_ARGS[@]} -gt 0 ]]; then
     args+=("${CSHARP_MODULE_ARGS[@]}")
+  fi
+  if [[ "$lang" == "rust" && ${#RUST_MODULE_ARGS[@]} -gt 0 ]]; then
+    args+=("${RUST_MODULE_ARGS[@]}")
   fi
   if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#SCAN_FILES[@]} -eq 0 ]]; then
     args+=("--exclude=$GLOBAL_EXCLUDE_PATTERNS")

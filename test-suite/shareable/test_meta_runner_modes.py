@@ -43,6 +43,120 @@ def assert_no_function_not_found(result: subprocess.CompletedProcess[str]) -> No
     assert "(exit 127)" not in output, output
 
 
+def check_rust_cargo_phases(tmpdir: Path) -> None:
+    """Issue #99 regression guard: the Rust module's cargo phases (categories
+    12-14) were silent no-ops from v5.0.0 to v5.3.13 -- run_cargo_subcmd
+    word-split its single "bash -lc '...'" argument, so bash executed `cd` and
+    the empty log was reported as "cargo check clean". A sentinel `cargo` on
+    PATH is the positive control that would have caught it: it must be hit
+    when cargo phases are enabled and never in static-only mode.
+
+    Also pins the surrounding contract: --no-cargo reaches the module through
+    the meta-runner, UBS_SKIP_RUST_BUILD covers category 14 too, a targeted
+    scan (shadow workspace without Cargo.toml) refuses to run cargo, every
+    skip is reported as a typed "Not evaluated" finding rather than silence or
+    "clean", and a cargo that exits non-zero without diagnostics is a failure."""
+    proj = tmpdir / "cargo_proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "Cargo.toml").write_text(
+        '[package]\nname = "sentinel_crate"\nversion = "0.0.0"\nedition = "2021"\n'
+    )
+    (proj / "src" / "lib.rs").write_text(
+        "pub fn add(a: u32, b: u32) -> u32 {\n    a.wrapping_add(b)\n}\n"
+    )
+
+    fake_bin = tmpdir / "cargo_bin"
+    fake_bin.mkdir()
+    sentinel = fake_bin / "cargo"
+    sentinel.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'cargo %s cwd=%s\\n' \"$*\" \"$PWD\" >> \"${SENTINEL_LOG:?}\"\n"
+        "exit \"${SENTINEL_EXIT:-0}\"\n"
+    )
+    sentinel.chmod(0o755)
+    # Make the module believe fmt/clippy are installed so those phases dispatch.
+    for helper in ("cargo-fmt", "cargo-clippy"):
+        stub = fake_bin / helper
+        stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+        stub.chmod(0o755)
+
+    counter = {"n": 0}
+
+    def scan(args: list[str], extra_env: dict[str, str], cwd: Path = REPO_ROOT) -> tuple[subprocess.CompletedProcess[str], str]:
+        counter["n"] += 1
+        log = tmpdir / f"sentinel-{counter['n']}.log"
+        env = {
+            "NO_COLOR": "1",
+            "UBS_ENABLE_AUTO_UPDATE": "0",
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "SENTINEL_LOG": str(log),
+        }
+        env.update(extra_env)
+        merged = os.environ.copy()
+        merged.update(env)
+        result = subprocess.run(
+            [str(UBS_BIN), "--only=rust", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=merged,
+            check=False,
+        )
+        calls = log.read_text() if log.exists() else ""
+        return result, calls
+
+    # Positive control: cargo phases enabled -> the sentinel is really executed,
+    # from the crate root, with the documented subcommands.
+    result, calls = scan([str(proj)], {})
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    for expected in ("cargo fmt -- --check", "cargo clippy", "cargo check", "cargo test --no-run"):
+        assert expected in calls, f"cargo phase '{expected}' never ran:\n{calls}\n{out}"
+    assert "Cargo.toml" not in calls  # sanity: cwd lines, not manifest errors
+    assert "cargo check clean" in out, out
+    assert "Not evaluated" not in out, out
+
+    # --no-cargo is forwarded by the meta-runner: nothing runs, every cargo
+    # category says so, and the unqualified "EXCELLENT" banner is withheld.
+    result, calls = scan(["--no-cargo", str(proj)], {})
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "scan target not found" not in out, out
+    assert calls == "", f"--no-cargo still dispatched cargo:\n{calls}"
+    assert out.count("Not evaluated:") >= 3, out
+    assert "--no-cargo" in out, out
+    assert "EXCELLENT!" not in out, out
+    assert "cargo check clean" not in out, out
+
+    # UBS_SKIP_RUST_BUILD covers dependency hygiene (category 14) as well.
+    result, calls = scan([str(proj)], {"UBS_SKIP_RUST_BUILD": "1"})
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert calls == "", f"UBS_SKIP_RUST_BUILD=1 still dispatched cargo:\n{calls}"
+    assert "dependency hygiene" in out, out
+    assert "UBS_SKIP_RUST_BUILD" in out, out
+
+    # Targeted scan: the shadow workspace has no Cargo.toml, so cargo must not
+    # run (it would resolve a manifest above the temp dir) and the report must
+    # name that reason.
+    result, calls = scan(["src/lib.rs"], {}, cwd=proj)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert calls == "", f"targeted scan dispatched cargo:\n{calls}"
+    assert "no Cargo.toml" in out, out
+    assert out.count("Not evaluated:") >= 3, out
+
+    # A cargo that fails without emitting diagnostics (wrapper refusing, broken
+    # toolchain) is a failure, never "clean".
+    result, calls = scan([str(proj)], {"SENTINEL_EXIT": "103"})
+    out = result.stdout + result.stderr
+    assert "cargo check" in calls, calls
+    assert result.returncode == 1, out
+    assert "cargo check clean" not in out, out
+    assert "Tests build clean" not in out, out
+    assert "exit 103" in out, out
+
+
 def check_no_supported_languages(tmpdir: Path) -> None:
     """Issue #53 regression guard: a project containing only unsupported
     languages (e.g. Dart) must emit an explicit, machine-readable
@@ -272,6 +386,10 @@ def main() -> None:
         # Issue #98: staged rsync failures must surface rsync's stderr, and
         # backslash-named staged files must not break workspace preparation.
         check_staged_rsync_diagnostics(tmpdir)
+
+        # Issue #99: Rust cargo phases must really run (sentinel positive
+        # control) and every static-only path must say so instead of "clean".
+        check_rust_cargo_phases(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

@@ -1021,6 +1021,10 @@ Rule Control:
   --skip=CSV               Skip categories by number (see output for numbers)
                            Example: --skip=11,14  # Skip debug code + TODOs
   --skip-type-narrowing    Disable helper-backed guard analysis (falls back to text heuristics)
+  --no-cargo               Rust: static analysis only. Skips every cargo phase (categories 12-14:
+                           fmt/clippy, check/test --no-run, audit/deny/udeps/outdated). Each skipped
+                           category reports "Not evaluated" instead of "clean"; targeted scans
+                           (files, --staged, --diff) skip cargo automatically for the same reason.
   --rules=DIR              Additional ast-grep rules directory
                            Rules are merged with built-in rules
   --no-auto-update         Disable automatic self-update
@@ -1028,6 +1032,7 @@ Rule Control:
 
 Environment Variables:
   JOBS                     Same as --jobs=N
+  UBS_SKIP_RUST_BUILD=1    Same as --no-cargo (Rust static-only mode)
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)

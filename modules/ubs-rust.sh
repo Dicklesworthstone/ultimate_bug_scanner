@@ -142,7 +142,9 @@ Options:
   --only=CSV                 Run only the specified categories (overrides --skip)
   --fail-on-warning          Exit non-zero on warnings or critical
   --rules=DIR                Additional ast-grep rules directory (merged)
-  --no-cargo                 Skip cargo-based checks (check, clippy, fmt, etc.)
+  --no-cargo                 Static analysis only: skip every cargo phase (categories 12-14
+                             fmt/clippy, check/test --no-run, audit/deny/udeps/outdated);
+                             each skipped category reports a "Not evaluated" finding
   --no-all-features          Do not pass --all-features to cargo
   --no-all-targets           Do not pass --all-targets to cargo
   --summary-json=FILE        Write a machine-readable summary (JSON)
@@ -155,6 +157,7 @@ Options:
 
 Env:
   JOBS, NO_COLOR, CI
+  UBS_SKIP_RUST_BUILD=1      Same as --no-cargo (any value other than empty or 0)
 
 Args:
   PROJECT_DIR                Directory to scan (default: ".")
@@ -206,6 +209,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
+# Static-only mode. --no-cargo (also forwarded by the meta-runner) and
+# UBS_SKIP_RUST_BUILD=1 turn off every cargo phase — categories 12, 13 AND 14 —
+# and each of those categories then reports a typed "not evaluated" finding
+# instead of vanishing or printing "clean" (#99).
+CARGO_SKIP_REASON=""
+CARGO_INVOKED=()
+CARGO_SKIPPED_CATEGORIES=()
+if [[ "$RUN_CARGO" -eq 0 ]]; then
+  CARGO_SKIP_REASON="--no-cargo (static analysis only)"
+elif [[ -n "${UBS_SKIP_RUST_BUILD:-}" && "${UBS_SKIP_RUST_BUILD}" != "0" ]]; then
+  RUN_CARGO=0
+  CARGO_SKIP_REASON="UBS_SKIP_RUST_BUILD=${UBS_SKIP_RUST_BUILD} (static analysis only)"
+fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
 # IMPORTANT: colors were initialized before arg parsing; re-init here so --no-color works.
 init_colors
@@ -284,9 +300,24 @@ emit_findings_json() {
   local out="$1"
   {
     echo '{'
-    printf '  "meta": {"version":"%s","project_dir":"%s","timestamp":"%s"},
-' \
+    printf '  "meta": {"version":"%s","project_dir":"%s","timestamp":"%s",' \
       "$(json_escape "$VERSION")" "$(json_escape "$PROJECT_DIR")" "$(json_escape "$(now)")"
+    # cargo_execution: whether the cargo phases (categories 12-14) actually ran.
+    # status "ran" lists the invoked subcommands; "skipped" carries the reason
+    # and the categories that were not evaluated (#99).
+    local cargo_status="skipped" cargo_reason="$CARGO_SKIP_REASON" i
+    if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then cargo_status="ran"; cargo_reason=""; fi
+    printf '"cargo_execution":{"status":"%s","reason":"%s","invoked":[' "$cargo_status" "$(json_escape "$cargo_reason")"
+    for ((i=0;i<${#CARGO_INVOKED[@]};i++)); do
+      [[ $i -gt 0 ]] && printf ','
+      printf '"%s"' "$(json_escape "${CARGO_INVOKED[$i]}")"
+    done
+    printf '],"skipped_categories":['
+    for ((i=0;i<${#CARGO_SKIPPED_CATEGORIES[@]};i++)); do
+      [[ $i -gt 0 ]] && printf ','
+      printf '"%s"' "$(json_escape "${CARGO_SKIPPED_CATEGORIES[$i]}")"
+    done
+    printf ']}},\n'
     echo '  "summary": {'
     printf '    "files": %s, "critical": %s, "warning": %s, "info": %s
 ' "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT"
@@ -7904,26 +7935,54 @@ check_cargo() {
     return
   fi
 
-  if command -v cargo >/dev/null 2>&1; then
-    HAS_CARGO=1
-    if command -v cargo-fmt >/dev/null 2>&1 || command -v rustfmt >/dev/null 2>&1; then HAS_FMT=1; fi
-    if command -v cargo-clippy >/dev/null 2>&1; then HAS_CLIPPY=1; fi
-    if command -v cargo-audit >/dev/null 2>&1; then HAS_AUDIT=1; fi
-    if command -v cargo-deny >/dev/null 2>&1; then HAS_DENY=1; fi
-    if command -v cargo-udeps >/dev/null 2>&1; then HAS_UDEPS=1; fi
-    if command -v cargo-outdated >/dev/null 2>&1; then HAS_OUTDATED=1; fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    CARGO_SKIP_REASON="cargo not found on PATH"
+    return
   fi
+  # Refuse to run cargo where PROJECT_DIR is not a crate/workspace root. Targeted
+  # scans (explicit files, --staged, --diff) run in a shadow workspace that holds
+  # only the selected sources; cargo would walk up from there and build whatever
+  # manifest it finds above the temp dir — the wrong crate, or none at all.
+  if [[ ! -f "$PROJECT_DIR/Cargo.toml" ]]; then
+    CARGO_SKIP_REASON="no Cargo.toml in scan root (targeted or shadow-workspace scan)"
+    return
+  fi
+
+  HAS_CARGO=1
+  if command -v cargo-fmt >/dev/null 2>&1 || command -v rustfmt >/dev/null 2>&1; then HAS_FMT=1; fi
+  if command -v cargo-clippy >/dev/null 2>&1; then HAS_CLIPPY=1; fi
+  if command -v cargo-audit >/dev/null 2>&1; then HAS_AUDIT=1; fi
+  if command -v cargo-deny >/dev/null 2>&1; then HAS_DENY=1; fi
+  if command -v cargo-udeps >/dev/null 2>&1; then HAS_UDEPS=1; fi
+  if command -v cargo-outdated >/dev/null 2>&1; then HAS_OUTDATED=1; fi
 }
 
+# run_cargo_subcmd NAME LOGFILE CMD [ARGS...]
+# Runs CMD (argv, never a shell string) inside PROJECT_DIR with stdout+stderr in
+# LOGFILE and the exit code in LOGFILE.ec. Issue #99: v5.0.0–v5.3.13 built the
+# argv with an unquoted `($@)` from a single "bash -lc '<cmd>'" string, so the
+# process that ran was `bash -lc cd` — every cargo phase was a silent no-op that
+# the empty log then reported as "clean". No login shell: the caller's PATH and
+# environment decide which cargo runs.
 run_cargo_subcmd() {
-  shift  # skip name
-  local logfile="$1"; shift
-  local -a args=($@)
+  local name="$1" logfile="$2"; shift 2
   local ec=0
   if [[ "$RUN_CARGO" -eq 0 || "$HAS_CARGO" -eq 0 ]]; then
-    echo "" >"$logfile"; echo 0 >"$logfile.ec"; return 0
+    : >"$logfile"; echo 0 >"$logfile.ec"; return 0
   fi
-  ( set +e; "${args[@]}" >"$logfile" 2>&1; ec=$?; echo "$ec" >"$logfile.ec"; exit 0 )
+  CARGO_INVOKED+=("$name")
+  set +e
+  trap - ERR
+  ( cd "$PROJECT_DIR" && CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}" "$@" ) >"$logfile" 2>&1
+  ec=$?
+  trap on_err ERR
+  set -e
+  echo "$ec" >"$logfile.ec"
+  return 0
+}
+
+cargo_phase_ec() {
+  cat "$1.ec" 2>/dev/null || echo 0
 }
 
 count_warnings_errors() {
@@ -7931,7 +7990,30 @@ count_warnings_errors() {
   local w e
   w=$(grep -E -c "^warning: |: warning:" "$file" 2>/dev/null || true)
   e=$(grep -E -c "^error: |: error:" "$file" 2>/dev/null || true)
-  echo "$w $e"
+  echo "${w:-0} ${e:-0}"
+}
+
+# report_cargo_failure SEVERITY LOGFILE CATEGORY TITLE
+# A cargo phase that exited non-zero without any diagnostic we can count (a
+# missing/failing toolchain, a wrapper refusing to run, a broken manifest) must
+# never be reported as clean: surface the exit code and the last log line.
+report_cargo_failure() {
+  local severity="$1" logfile="$2" category="$3" title="$4"
+  local ec last
+  ec="$(cargo_phase_ec "$logfile")"
+  last="$(grep -v '^[[:space:]]*$' "$logfile" 2>/dev/null | tail -n 1 | cut -c1-200)"
+  print_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}"
+  add_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}" "$category"
+}
+
+# report_cargo_skipped CATEGORY WHAT
+# Loud, typed "did not run": one info finding per category naming what was not
+# evaluated and why, so a static-only scan can never pass for a cargo pass.
+report_cargo_skipped() {
+  local category="$1" what="$2"
+  CARGO_SKIPPED_CATEGORIES+=("$category")
+  print_finding "info" 1 "Not evaluated: $what" "cargo phases skipped: $CARGO_SKIP_REASON"
+  add_finding "info" 1 "Not evaluated: $what" "cargo phases skipped: $CARGO_SKIP_REASON" "$category"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -8956,20 +9038,19 @@ print_header "12. LINTS & STYLE (fmt/clippy)"
 print_category "Runs: cargo fmt -- --check, cargo clippy" \
   "Formatter and lints help maintain consistent style and catch many issues"
 
-if [[ -n "${UBS_SKIP_RUST_BUILD:-}" ]]; then
-print_finding "info" 0 "Skipped via UBS_SKIP_RUST_BUILD"
-else
-FMT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-fmt.XXXXXX)"; CLIPPY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-clippy.XXXXXX)"; TMP_FILES+=("$FMT_LOG" "$CLIPPY_LOG")
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
+  FMT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-fmt.XXXXXX)"; CLIPPY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-clippy.XXXXXX)"; TMP_FILES+=("$FMT_LOG" "$CLIPPY_LOG")
   # cargo fmt -- --check
   if [[ "$HAS_FMT" -eq 1 ]]; then
-    run_cargo_subcmd "fmt" "$FMT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo fmt -- --check"
-    r_ec=$(cat "$FMT_LOG.ec" 2>/dev/null || echo 0)
-    if [[ "$r_ec" -ne 0 ]]; then
+    run_cargo_subcmd "fmt" "$FMT_LOG" cargo fmt -- --check
+    r_ec=$(cargo_phase_ec "$FMT_LOG")
+    if [[ "$r_ec" -eq 0 ]]; then
+      print_finding "good" "Formatting is clean"
+    elif grep -q -E '^Diff in |^[-+]' "$FMT_LOG" 2>/dev/null; then
       print_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt"
       add_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt" "${CATEGORY_NAME[12]}"
     else
-      print_finding "good" "Formatting is clean"
+      report_cargo_failure "warning" "$FMT_LOG" "${CATEGORY_NAME[12]}" "cargo fmt --check could not run"
     fi
   else
     print_finding "info" 1 "rustfmt not installed; skipping format check"
@@ -8978,21 +9059,27 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
 
   # cargo clippy (normalize -D warnings)
   if [[ "$HAS_CLIPPY" -eq 1 ]]; then
-    extra1=(); [[ "$CARGO_FEATURES_ALL" -eq 1 ]] && extra1+=(--all-features)
-    extra2=(); [[ "$CARGO_TARGETS_ALL" -eq 1 ]] && extra2+=(--all-targets)
-    run_cargo_subcmd "clippy" "$CLIPPY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo clippy ${extra1[*]} ${extra2[*]} -- -D warnings || true"
+    clippy_args=(clippy)
+    [[ "$CARGO_FEATURES_ALL" -eq 1 ]] && clippy_args+=(--all-features)
+    [[ "$CARGO_TARGETS_ALL" -eq 1 ]] && clippy_args+=(--all-targets)
+    clippy_args+=(-- -D warnings)
+    run_cargo_subcmd "clippy" "$CLIPPY_LOG" cargo "${clippy_args[@]}"
     w_e=$(count_warnings_errors "$CLIPPY_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
     if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Clippy errors"; add_finding "critical" "$e" "Clippy errors" "" "${CATEGORY_NAME[12]}"; fi
     if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Clippy warnings"; add_finding "warning" "$w" "Clippy warnings" "" "${CATEGORY_NAME[12]}"; fi
-    if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then print_finding "good" "No clippy warnings/errors"; fi
+    if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then
+      if [[ "$(cargo_phase_ec "$CLIPPY_LOG")" -eq 0 ]]; then
+        print_finding "good" "No clippy warnings/errors"
+      else
+        report_cargo_failure "warning" "$CLIPPY_LOG" "${CATEGORY_NAME[12]}" "cargo clippy could not run"
+      fi
+    fi
   else
     print_finding "info" 1 "clippy not installed; skipping lint pass"
     add_finding "info" 1 "clippy not installed; skipping lint pass" "" "${CATEGORY_NAME[12]}"
   fi
 else
-  print_finding "info" 1 "cargo not available or disabled; style/lints skipped"
-  add_finding "info" 1 "cargo not available or disabled; style/lints skipped" "" "${CATEGORY_NAME[12]}"
-fi
+  report_cargo_skipped "${CATEGORY_NAME[12]}" "formatting (cargo fmt --check) and lints (cargo clippy)"
 fi
 fi
 
@@ -9004,24 +9091,33 @@ print_header "13. BUILD HEALTH (check/test)"
 print_category "Runs: cargo check, cargo test --no-run" \
   "Ensures the project compiles and tests build"
 
-if [[ -n "${UBS_SKIP_RUST_BUILD:-}" ]]; then
-print_finding "info" 0 "Skipped via UBS_SKIP_RUST_BUILD"
-else
-CHECK_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-check.XXXXXX)"; TEST_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-test.XXXXXX)"; TMP_FILES+=("$CHECK_LOG" "$TEST_LOG")
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
-  run_cargo_subcmd "check" "$CHECK_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo check"
+  CHECK_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-check.XXXXXX)"; TEST_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-test.XXXXXX)"; TMP_FILES+=("$CHECK_LOG" "$TEST_LOG")
+  run_cargo_subcmd "check" "$CHECK_LOG" cargo check
   w_e=$(count_warnings_errors "$CHECK_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
   if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "cargo check errors"; add_finding "critical" "$e" "cargo check errors" "" "${CATEGORY_NAME[13]}"; fi
-  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "cargo check warnings"; add_finding "warning" "$w" "cargo check warnings" "" "${CATEGORY_NAME[13]}"; else print_finding "good" "cargo check clean"; fi
+  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "cargo check warnings"; add_finding "warning" "$w" "cargo check warnings" "" "${CATEGORY_NAME[13]}"; fi
+  if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then
+    if [[ "$(cargo_phase_ec "$CHECK_LOG")" -eq 0 ]]; then
+      print_finding "good" "cargo check clean"
+    else
+      report_cargo_failure "critical" "$CHECK_LOG" "${CATEGORY_NAME[13]}" "cargo check failed without diagnostics"
+    fi
+  fi
 
-  run_cargo_subcmd "test-no-run" "$TEST_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo test --no-run"
+  run_cargo_subcmd "test-no-run" "$TEST_LOG" cargo test --no-run
   w_e=$(count_warnings_errors "$TEST_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
   if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Tests failed to build (cargo test --no-run)"; add_finding "critical" "$e" "Tests failed to build (cargo test --no-run)" "" "${CATEGORY_NAME[13]}"; fi
-  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; add_finding "warning" "$w" "Test build warnings" "" "${CATEGORY_NAME[13]}"; else print_finding "good" "Tests build clean"; fi
+  if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; add_finding "warning" "$w" "Test build warnings" "" "${CATEGORY_NAME[13]}"; fi
+  if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then
+    if [[ "$(cargo_phase_ec "$TEST_LOG")" -eq 0 ]]; then
+      print_finding "good" "Tests build clean"
+    else
+      report_cargo_failure "critical" "$TEST_LOG" "${CATEGORY_NAME[13]}" "cargo test --no-run failed without diagnostics"
+    fi
+  fi
 else
-  print_finding "info" 1 "cargo disabled/unavailable; build checks skipped"
-  add_finding "info" 1 "cargo disabled/unavailable; build checks skipped" "" "${CATEGORY_NAME[13]}"
-fi
+  report_cargo_skipped "${CATEGORY_NAME[13]}" "compilation (cargo check) and test build (cargo test --no-run)"
 fi
 fi
 
@@ -9035,46 +9131,54 @@ print_category "Runs: cargo audit, cargo deny check, cargo udeps, cargo outdated
 
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$HAS_AUDIT" -eq 1 ]]; then
-    AUDIT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-audit.XXXXXX)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo audit"
+    AUDIT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-audit.XXXXXX)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" cargo audit
     audit_vuln=$(grep -c -E "Vulnerability|RUSTSEC" "$AUDIT_LOG" 2>/dev/null || true); audit_vuln=${audit_vuln:-0}
-    if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; add_finding "critical" "$audit_vuln" "Advisories found by cargo-audit" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "No known advisories (cargo-audit)"; fi
+    if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; add_finding "critical" "$audit_vuln" "Advisories found by cargo-audit" "" "${CATEGORY_NAME[14]}"
+    elif [[ "$(cargo_phase_ec "$AUDIT_LOG")" -ne 0 ]]; then report_cargo_failure "warning" "$AUDIT_LOG" "${CATEGORY_NAME[14]}" "cargo audit could not run"
+    else print_finding "good" "No known advisories (cargo-audit)"; fi
   else
     print_finding "info" 1 "cargo-audit not installed; skipping advisory scan"
     add_finding "info" 1 "cargo-audit not installed; skipping advisory scan" "" "${CATEGORY_NAME[14]}"
   fi
 
   if [[ "$HAS_DENY" -eq 1 ]]; then
-    DENY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-deny.XXXXXX)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo deny check advisories bans licenses sources"
+    DENY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-deny.XXXXXX)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" cargo deny check advisories bans licenses sources
     deny_err=$(grep -c -E "error\[[^)]+\]|[[:space:]]error:" "$DENY_LOG" 2>/dev/null || true); deny_err=${deny_err:-0}
     deny_warn=$(grep -c -E "[[:space:]]warning:" "$DENY_LOG" 2>/dev/null || true); deny_warn=${deny_warn:-0}
     if [[ "$deny_err" -gt 0 ]]; then print_finding "critical" "$deny_err" "cargo-deny errors"; add_finding "critical" "$deny_err" "cargo-deny errors" "" "${CATEGORY_NAME[14]}"; fi
     if [[ "$deny_warn" -gt 0 ]]; then print_finding "warning" "$deny_warn" "cargo-deny warnings"; add_finding "warning" "$deny_warn" "cargo-deny warnings" "" "${CATEGORY_NAME[14]}"; fi
-    if [[ "$deny_err" -eq 0 && "$deny_warn" -eq 0 ]]; then print_finding "good" "cargo-deny clean"; fi
+    if [[ "$deny_err" -eq 0 && "$deny_warn" -eq 0 ]]; then
+      if [[ "$(cargo_phase_ec "$DENY_LOG")" -eq 0 ]]; then print_finding "good" "cargo-deny clean"
+      else report_cargo_failure "warning" "$DENY_LOG" "${CATEGORY_NAME[14]}" "cargo deny could not run"; fi
+    fi
   else
     print_finding "info" 1 "cargo-deny not installed; skipping policy checks"
     add_finding "info" 1 "cargo-deny not installed; skipping policy checks" "" "${CATEGORY_NAME[14]}"
   fi
 
   if [[ "$HAS_UDEPS" -eq 1 ]]; then
-    UDEPS_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-udeps.XXXXXX)"; TMP_FILES+=("$UDEPS_LOG"); run_cargo_subcmd "udeps" "$UDEPS_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo udeps --all-targets"
+    UDEPS_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-udeps.XXXXXX)"; TMP_FILES+=("$UDEPS_LOG"); run_cargo_subcmd "udeps" "$UDEPS_LOG" cargo udeps --all-targets
     udeps_count=$(grep -c -E "(unused dependency|possibly unused|not used)" "$UDEPS_LOG" 2>/dev/null || true); udeps_count=${udeps_count:-0}
-    if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; add_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "No unused dependencies"; fi
+    if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; add_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)" "" "${CATEGORY_NAME[14]}"
+    elif [[ "$(cargo_phase_ec "$UDEPS_LOG")" -ne 0 ]]; then report_cargo_failure "info" "$UDEPS_LOG" "${CATEGORY_NAME[14]}" "cargo udeps could not run (needs nightly)"
+    else print_finding "good" "No unused dependencies"; fi
   else
     print_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan"
     add_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan" "" "${CATEGORY_NAME[14]}"
   fi
 
   if [[ "$HAS_OUTDATED" -eq 1 ]]; then
-    OUT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-outdated.XXXXXX)"; TMP_FILES+=("$OUT_LOG"); run_cargo_subcmd "outdated" "$OUT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo outdated -R"
-    outdated_count=$(grep -E -c "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null || true)
-    if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; add_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)" "" "${CATEGORY_NAME[14]}"; else print_finding "good" "Dependencies up-to-date"; fi
+    OUT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-outdated.XXXXXX)"; TMP_FILES+=("$OUT_LOG"); run_cargo_subcmd "outdated" "$OUT_LOG" cargo outdated -R
+    outdated_count=$(grep -E -c "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null || true); outdated_count=${outdated_count:-0}
+    if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; add_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)" "" "${CATEGORY_NAME[14]}"
+    elif [[ "$(cargo_phase_ec "$OUT_LOG")" -ne 0 ]]; then report_cargo_failure "info" "$OUT_LOG" "${CATEGORY_NAME[14]}" "cargo outdated could not run"
+    else print_finding "good" "Dependencies up-to-date"; fi
   else
     print_finding "info" 1 "cargo-outdated not installed; skipping update report"
     add_finding "info" 1 "cargo-outdated not installed; skipping update report" "" "${CATEGORY_NAME[14]}"
   fi
 else
-  print_finding "info" 1 "cargo disabled/unavailable; dependency checks skipped"
-  add_finding "info" 1 "cargo disabled/unavailable; dependency checks skipped" "" "${CATEGORY_NAME[14]}"
+  report_cargo_skipped "${CATEGORY_NAME[14]}" "dependency hygiene (cargo audit / deny / udeps / outdated)"
 fi
 fi
 
@@ -9466,7 +9570,12 @@ if [ "$INFO_COUNT" -gt 0 ]; then
 fi
 
 if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
-  say "\n  ${GREEN}${BOLD}${SPARKLE} EXCELLENT! No critical or warning issues found ${SPARKLE}${RESET}"
+  if [ "${#CARGO_SKIPPED_CATEGORIES[@]}" -gt 0 ]; then
+    say "\n  ${GREEN}${BOLD}${SPARKLE} No critical or warning issues found by static analysis ${SPARKLE}${RESET}"
+    say "  ${YELLOW}${WARN} Not evaluated (cargo phases skipped: ${CARGO_SKIP_REASON}): $(IFS='; '; echo "${CARGO_SKIPPED_CATEGORIES[*]}")${RESET}"
+  else
+    say "\n  ${GREEN}${BOLD}${SPARKLE} EXCELLENT! No critical or warning issues found ${SPARKLE}${RESET}"
+  fi
 fi
 
 echo ""

@@ -33,6 +33,16 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 set -Eeuo pipefail
+
+# Shared primitives (bead A1): locale export, json_escape, format contract,
+# NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+  echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
+  exit 2
+fi
+# shellcheck source=lib/ubs-common.sh
+source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 shopt -s lastpipe
 shopt -s extglob
 set -o errtrace
@@ -189,7 +199,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
-    --format=*)   FORMAT="${1#*=}"; shift;;
+    --format=*)   FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-emoji)   NO_EMOJI=1; shift;;
     --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
@@ -332,7 +342,7 @@ declare -A RESOURCE_LIFECYCLE_REGEX_REMEDIATION=(
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep)
 # ────────────────────────────────────────────────────────────────────────────
-LC_ALL=C
+ubs_export_locale
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=()
 for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done

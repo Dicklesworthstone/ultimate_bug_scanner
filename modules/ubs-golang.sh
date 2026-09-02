@@ -36,6 +36,16 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 set -Eeuo pipefail
+
+# Shared primitives (bead A1): locale export, json_escape, format contract,
+# NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+  echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
+  exit 2
+fi
+# shellcheck source=lib/ubs-common.sh
+source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 shopt -s lastpipe
 shopt -s extglob
@@ -213,7 +223,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
-    --format=*)   FORMAT="${1#*=}"; shift;;
+    --format=*)   FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
     --sarif-plain) SARIF_RICH=0; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
@@ -311,7 +321,7 @@ AST_CONFIG_FILE=""   # sgconfig.yml for scanning the generated rule pack
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep) + include/exclude
 # ────────────────────────────────────────────────────────────────────────────
-LC_ALL=C
+ubs_export_locale
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 IFS=',' read -r -a _NAME_ARR <<<"$INCLUDE_NAMES"
 
@@ -368,15 +378,6 @@ maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 && "$QUIET" -eq 0 ]]; then clear 
 
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 
-json_escape() {
-  local s="${1-}"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "$s"
-}
 
 emit_json_summary() {
   local ts

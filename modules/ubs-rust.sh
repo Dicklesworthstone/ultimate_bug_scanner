@@ -36,6 +36,16 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 set -Eeuo pipefail
+
+# Shared primitives (bead A1): locale export, json_escape, format contract,
+# NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+  echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
+  exit 2
+fi
+# shellcheck source=lib/ubs-common.sh
+source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 shopt -s lastpipe
 shopt -s extglob
 
@@ -172,7 +182,7 @@ while [[ $# -gt 0 ]]; do
     --list-categories) LIST_CATEGORIES=1; shift;;
     --list-rules) LIST_RULES=1; shift;;
     --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
-    --format=*)   FORMAT="${1#*=}"; shift;;
+    --format=*)   FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
@@ -275,26 +285,6 @@ add_finding() {
   FIND_DESC+=("$desc")
   FIND_CAT+=("$category")
   FIND_SAMPLES+=("$samples")
-}
-json_escape() {
-  local s=""
-  if [[ $# -gt 0 ]]; then s="$1"; else s="$(cat 2>/dev/null || true)"; fi
-  s="${s//\\/\\\\}"
-  s=${s//\"/\\\"}
-  s="${s//$'	'/\\t}"
-  s="${s//$''/\\r}"
-  s="${s//$'\n'/\\n}"
-  # JSON requires ALL control characters U+0000-001F to be escaped, not just
-  # \t/\r/\n (GH #71: raw ESC/FF/etc. in source samples broke the artifact).
-  if [[ "$s" == *[$'\x01'-$'\x1f']* ]]; then
-    local _cc _ch _esc
-    for _cc in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
-      printf -v _ch "\\$(printf '%03o' "$_cc")"
-      printf -v _esc '\\u%04x' "$_cc"
-      s="${s//"$_ch"/$_esc}"
-    done
-  fi
-  printf '%s' "$s"
 }
 emit_findings_json() {
   local out="$1"
@@ -536,7 +526,7 @@ category_enabled() {
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep)
 # ────────────────────────────────────────────────────────────────────────────
-LC_ALL=C
+ubs_export_locale
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=()
 for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done

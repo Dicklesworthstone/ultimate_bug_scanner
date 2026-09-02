@@ -32,6 +32,16 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 set -Eeuo pipefail
+
+# Shared primitives (bead A1): locale export, json_escape, format contract,
+# NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+  echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
+  exit 2
+fi
+# shellcheck source=lib/ubs-common.sh
+source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 umask 022
 shopt -s lastpipe
 shopt -s extglob
@@ -150,7 +160,7 @@ while [[ $# -gt 0 ]]; do
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
     --very-verbose) VERBOSE=2; DETAIL_LIMIT=25; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
-    --format=*)   FORMAT="${1#*=}"; shift;;
+    --format=*)   FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
     --json-out=*) JSON_OUT="${1#*=}"; shift;;
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
@@ -272,15 +282,6 @@ declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
 maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]] && ! is_machine_format; then clear || true; fi; }
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 
-json_escape() {
-  local s="${1-}"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "$s"
-}
 
 emit_json_summary() {
   local ts json
@@ -402,7 +403,7 @@ PY
 }
 count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR>0?NR:0)}'; }
 
-LC_ALL=C
+ubs_export_locale
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=(); for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
 EXCLUDE_DIRS=(.git .hg .svn .bzr .bundle vendor/bundle vendor/cache log tmp .yardoc coverage .tox .nox .cache .idea .vscode .history node_modules dist build pkg doc public/assets storage .sass-cache .rubocop-cache .reek .bundle-audit .solargraph .gem spec/fixtures test/fixtures .next .turbo .webpacker public/packs)

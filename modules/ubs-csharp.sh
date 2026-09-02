@@ -24,6 +24,16 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 set -Eeuo pipefail
+
+# Shared primitives (bead A1): locale export, json_escape, format contract,
+# NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+  echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
+  exit 2
+fi
+# shellcheck source=lib/ubs-common.sh
+source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 shopt -s lastpipe 2>/dev/null || true
 
 VERSION="3.0.2"
@@ -103,15 +113,6 @@ ok()   { [[ "$QUIET" -eq 1 ]] && return 0; echo "${GREEN}${ICON_OK} $*${RESET}";
 count_lines() { awk '!/ubs:ignore/ { c++ } END { print c+0 }'; }
 
 # JSON escape (safe for simple strings)
-json_escape() {
-  local s="$1"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  echo -n "$s"
-}
 
 # ---------- findings model ----------
 declare -a FINDINGS=()
@@ -1103,7 +1104,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) usage; exit 0;;
-      --format=*) FORMAT="${1#*=}"; shift;;
+      --format=*) FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
       --ci) CI_MODE=1; shift;;
       --quiet|-q) QUIET=1; shift;;
       --verbose|-v) VERBOSE=1; DETAIL_LIMIT=15; shift;;

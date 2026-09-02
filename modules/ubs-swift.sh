@@ -56,6 +56,16 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
 fi
 
 set -Eeuo pipefail
+
+# Shared primitives (bead A1): locale export, json_escape, format contract,
+# NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+  echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
+  exit 2
+fi
+# shellcheck source=lib/ubs-common.sh
+source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 shopt -s lastpipe || true
 shopt -s extglob || true
 shopt -s compat31 || true
@@ -102,15 +112,6 @@ normalize_severity(){
  esac
 }
 
-json_escape(){
- local s="$1"
- s="${s//\\/\\\\}"
- s="${s//\"/\\\"}"
- s="${s//$'\n'/\\n}"
- s="${s//$'\r'/\\r}"
- s="${s//$'\t'/\\t}"
- printf '%s' "$s"
-}
 
 USE_COLOR=0; FORCE_COLOR=0; NO_COLOR_FLAG=0; COLOR_MODE="auto"
 RED=''; GREEN=''; YELLOW=''; BLUE=''; ORANGE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
@@ -345,7 +346,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
   -q|--quiet) VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
-  --format=*) FORMAT="${1#*=}"; shift;;
+  --format=*) FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
   --ci) CI_MODE=1; shift;;
   --no-color) NO_COLOR_FLAG=1; shift;;
     --force-color) FORCE_COLOR=1; COLOR_MODE="always"; shift;;

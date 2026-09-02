@@ -8,6 +8,20 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **`--format=sarif` no longer fails for JavaScript/TypeScript with "Duplicate rule id".** The per-grammar rule variants introduced for #93 reuse each base rule's id on purpose, but SARIF mode loaded the whole rule directory into one `ast-grep scan -c`, which rejects duplicate ids — every SARIF scan of a JS/TS tree has exited 2 since v5.3.12 (the meta-runner then emitted a degraded summary-only SARIF run). `modules/ubs-js.sh` now scans the base pack and each `__variants-<grammar>.yml` as separate rule sets and merges the SARIF runs (`run_sarif_rule_pack_scan`). The rule-pack SARIF evidence golden was regenerated: the JS corpus now reports 201 results across 37 rules because `.ts`/`.tsx` fixtures finally contribute.
+- **Test gates are green again on non-C locales and on `main`.** `test-suite/run_all.sh` sorts dumped rule ids under `LC_ALL=C` so the Go inventory check no longer depends on the developer's collation, and `rust-loop-scope-collection-push-clean` (a #96 perf-heuristic regression fixture) dropped a stray `security` tag that made the quality harness demand a non-existent buggy twin — the reason the "UBS Test Suite" workflow had been red since 2026-08-17. `test-suite/goldens/rule_coverage.json` regenerated accordingly.
+
+### Housekeeping
+
+- **Dependency refresh.** ast-grep pin 0.40.1 → 0.45.3 (new `AST_GREP_ASSET_SHA256` digests for all five targets; CI installs the same version via `@ast-grep/cli@0.45.3`); installer binary fallbacks ripgrep 14.1.0 → 15.2.0, jq 1.7.1 → 1.8.2, typos 1.28.4 → 1.50.1; release toolchain jq 1.8.2 / ripgrep 15.2.0 (`ripgrep_<ver>-1_amd64.deb` naming) / uv 0.12.9 / syft v1.51.1 / cosign v3.1.3 via cosign-installer v4.1.2 (Cosign v3 bundles need Cosign ≥ 3 to verify — noted in `docs/security.md`); GitHub Actions bumped to their current majors (checkout v7, upload-artifact v7, download-artifact v8, setup-uv v10, install-nix-action v31 with Nix 2.35.2, docker/* v4 and build-push-action v7, action-gh-release v3, repository-dispatch v4, sbom-action pinned to v0.24.2); toon_rust v0.2.4; `flake.nix` on nixpkgs `nixos-26.05`; Docker base `debian:trixie-slim`.
+- `MODULE_CHECKSUMS` (js) and `SHA256SUMS` regenerated; `scripts/check-version-tag-drift.sh` will flag `ubs-js.sh` against `v5.3.13` until the next tag is cut.
+
+---
+
 ## [v5.3.13] - 2026-08-17 [Release]
 
 ### Fixes

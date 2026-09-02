@@ -241,6 +241,31 @@ say(){
 }
 say_err(){ echo -e "$*" >&2; }
 
+# Why --format=toon cannot be produced right now: prints a short reason (empty
+# when the encoder is usable). UBS_TEST_FORCE_NO_TOON=1 is the test seam.
+toon_encoder_problem(){
+  if [[ "${UBS_TEST_FORCE_NO_TOON:-0}" == "1" ]]; then
+    printf '%s' "disabled by UBS_TEST_FORCE_NO_TOON=1"
+  elif ! command -v "$TOON_BIN" >/dev/null 2>&1; then
+    printf '%s' "not found in PATH"
+  elif ! looks_like_toon_rust_encoder "$TOON_BIN"; then
+    printf '%s' "does not appear to be toon_rust (expected tru)"
+  fi
+}
+
+# --format=toon without a usable encoder is an environment error (bead K5):
+# exit 2 with the B6 envelope, never plain JSON labelled as TOON.
+refuse_toon_without_encoder(){
+  local problem="$1"
+  say_err "${RED}${X}${RESET} --format=toon needs toon_rust's encoder: $TOON_BIN $problem"
+  say_err "${DIM}  Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/toon_rust/main/install.sh | bash${RESET}"
+  say_err "${DIM}  Or set TOON_TRU_BIN=/path/to/tru if it is installed elsewhere; use --format=json for the same document as JSON.${RESET}"
+  say_err "${DIM}  Note: the Node.js 'toon' CLI and upstream toon-format's 'toon' binary are different projects and not supported.${RESET}"
+  emit_error_envelope "environment" "error" "toon-encoder-missing" \
+    "--format=toon needs toon_rust's tru encoder ($TOON_BIN $problem); install it or use --format=json" \
+    '"failed_modules":[]'
+}
+
 looks_like_toon_rust_encoder(){
   local bin="${1:-}"
   [[ -z "$bin" ]] && return 1
@@ -621,7 +646,7 @@ cat <<'JSON'
     "json": {"description": "One object: project, timestamp, status (ok|partial), failed_modules[], scanners[] (per-language summary with findings[] and status ok|timeout|error), totals{critical,warning,info,files}. Environment errors and refusals print an error envelope instead; no supported language prints a result object with exit_code 3.", "schema": "ubs --schema=json"},
     "jsonl": {"description": "One JSON object per line: type=finding (per finding, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
     "sarif": {"description": "SARIF 2.1.0; one run per module. Partial runs and errors set runs[].invocations[0].executionSuccessful=false with toolExecutionNotifications (descriptor ids ubs/module-timeout, ubs/module-error, ubs/<refusal-or-error-reason>).", "schema": "ubs --schema=sarif"},
-    "toon": {"description": "The json document encoded with toon_rust's tru (falls back to JSON when tru is absent).", "schema": "ubs --schema=toon"},
+    "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable tru (TOON_TRU_BIN/TOON_BIN) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
     "text": {"description": "Human report; Combined Summary at the end (Files/Critical/Warning/Info, Status: partial when applicable)."}
   },
   "env": [
@@ -1205,6 +1230,13 @@ else
       say_err "${RED}$X unknown --format value${RESET}: $FORMAT (expected text|json|jsonl|sarif|toon)"
       exit 2;;
   esac
+  if [[ "$FORMAT" == "toon" ]]; then
+    _toon_problem="$(toon_encoder_problem)"
+    if [[ -n "$_toon_problem" ]]; then
+      refuse_toon_without_encoder "$_toon_problem"
+      exit 2
+    fi
+  fi
   # Classify positional targets (issue #88):
   #   - one directory + one non-existent, non-source path -> PROJECT_DIR OUTPUT_FILE
   #     (README: `ubs . bug-report.txt` saves the report and still prints it)
@@ -4608,18 +4640,11 @@ case "$FORMAT" in
       emit_env_error_json
       status=2
     else
-      # Check if TOON encoder is available (UBS_TEST_FORCE_NO_TOON=1 forces fallback for testing)
-      # TOON_BIN can be set to toon_rust's tru binary for better performance
-      toon_skip_reason=""
-      if [[ "${UBS_TEST_FORCE_NO_TOON:-0}" == "1" ]]; then
-        toon_skip_reason="disabled by UBS_TEST_FORCE_NO_TOON=1"
-      elif ! command -v "$TOON_BIN" >/dev/null 2>&1; then
-        toon_skip_reason="not found in PATH"
-      elif ! looks_like_toon_rust_encoder "$TOON_BIN"; then
-        toon_skip_reason="does not appear to be toon_rust (expected tru)"
-      fi
-
-      if [[ -z "$toon_skip_reason" ]]; then
+      # The encoder was checked before scanning; re-check so an encoder that
+      # vanished mid-run still yields the envelope (exit 2), never JSON
+      # labelled as TOON.
+      toon_problem="$(toon_encoder_problem)"
+      if [[ -z "$toon_problem" ]]; then
         if generate_combined_json; then
           "$TOON_BIN" --encode < "$COMBINED_JSON_FILE"
         else
@@ -4629,19 +4654,8 @@ case "$FORMAT" in
           fi
         fi
       else
-        say_err "${YELLOW}Warning: $TOON_BIN (TOON encoder) $toon_skip_reason; falling back to --format=json${RESET}"
-        say_err "${DIM}  --format=toon requires 'tru' from https://github.com/Dicklesworthstone/toon_rust${RESET}"
-        say_err "${DIM}  Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/toon_rust/main/install.sh | bash${RESET}"
-        say_err "${DIM}  Or set TOON_TRU_BIN=/path/to/tru if it's installed elsewhere.${RESET}"
-        say_err "${DIM}  Note: the Node.js 'toon' CLI and upstream toon-format/toon-rust's 'toon' binary are different projects and not supported here.${RESET}"
-        if generate_combined_json; then
-          cat "$COMBINED_JSON_FILE"
-        else
-          if ! merge_json_scanners; then
-            say "${RED}$X could not produce combined JSON${RESET}"
-            [[ "$status" -lt 1 ]] && status=1
-          fi
-        fi
+        refuse_toon_without_encoder "$toon_problem"
+        status=2
       fi
     fi
     ;;

@@ -60,7 +60,16 @@ ubs --staged --format=json
 
 # CI-strict (fail on warnings)
 ubs . --profile=strict --fail-on-warning --format=json
+
+# Machine-readable docs and schemas for agent loops
+ubs robot-docs                # guide, commands/flags, examples, exit codes, formats, env — one JSON document
+ubs robot-docs exit-codes     # a single topic
+ubs --schema=json             # JSON Schema (draft 2020-12) for --format=json; also jsonl|sarif|toon|error|all
 ```
+
+Every machine format prints exactly one document (or one JSONL stream) on stdout and validates against
+`ubs --schema`; `status` is `ok` or `partial`, and environment errors/refusals are an error envelope
+with exit 2 (see "Machine-readable failures" below).
 
 ## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
 
@@ -207,13 +216,6 @@ This method provides:
 - Automatic updates via `brew upgrade`
 - Dependency management
 - Easy uninstall via `brew uninstall`
-
-### **Windows: Scoop**
-
-```powershell
-scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
-scoop install dicklesworthstone/ubs
-```
 
 ### **Alternative: Automated Install**
 
@@ -368,7 +370,15 @@ bash install.sh --dry-run --no-path-modify --skip-hooks --non-interactive
 
 # CI-friendly install that self-tests the smoke harness
 bash install.sh --easy-mode --self-test --skip-hooks
+
+# Install the ubs in the current directory (a checkout's install.sh does this by itself;
+# without --local a stray ./ubs is ignored and the verified release is installed)
+bash install.sh --local --skip-hooks
 ```
+
+Dependency binaries the installer downloads (ast-grep, jq, typos, ripgrep) are verified against
+pinned SHA-256 digests or the upstream `.sha256` sidecar before they are installed; a mismatch
+aborts that install, and `--skip-verification` prints exactly which check it skipped.
 
 ### 🔄 **Auto-Update**
 
@@ -993,10 +1003,12 @@ File Selection:
                            JS: js,jsx,ts,tsx,mjs,cjs | Python: py,pyi,pyx
                            Go: go | Rust: rs | Java: java | C++: cpp,cc,cxx,c,h
                            Ruby: rb,rake,ru | C#: cs,csx | Custom: --include-ext=js,ts,vue
-  --exclude=CSV            Exclude LANGUAGES from the scan (e.g. --exclude=js,ruby).
-                           To skip PATHS use .ubsignore or --ignore-file=PATH
-                           (bead ultimate_bug_scanner-cvxv.2 will make --exclude
-                           take path globs and move languages to --exclude-langs)
+  --exclude=GLOB[,..]      Skip PATHS: globs/dirs with .ubsignore semantics (e.g.
+                           --exclude=legacy,generated,*.min.js), merged with .ubsignore
+                           and the default ignores and forwarded to every module.
+                           A value that names a language (js, python, …) with no such
+                           path is rejected with exit 2 — use --exclude-langs for that.
+  --exclude-langs=CSV      Exclude LANGUAGES from the scan (e.g. --exclude-langs=js,ruby)
   --output=FILE, -o FILE   Also write the report to FILE (same as the positional
                            OUTPUT_FILE form); stdout still receives it
   --skip-size-check        Skip directory size guard (use with care)
@@ -1019,6 +1031,7 @@ Environment Variables:
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
+  UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
 
@@ -1030,11 +1043,22 @@ Exit Codes:
   0                        No critical issues (or no issues at all)
   1                        Critical issues found
   1                        Warnings found (only with --fail-on-warning)
-  2                        Invalid arguments or environment error (e.g., missing ast-grep for JS/TS)
+  2                        Invalid arguments, environment error (e.g., missing ast-grep for JS/TS),
+                           a refused scan (directory too large, $HOME or /), or a PARTIAL run in
+                           which a scanner module timed out or crashed. Set UBS_ALLOW_PARTIAL=1 to
+                           exit on findings alone for partial runs.
   3                        Nothing was scanned: no supported languages detected, so no scanner ran.
                            This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
                            behaviour for callers that intentionally scan mixed/unsupported trees.
 ```
+
+**Machine-readable failures**
+
+In `--format=json|jsonl|sarif|toon` mode every failure is an object on stdout, never
+just text on stderr, so `ubs … --format=json | jq` always has something to parse:
+
+- Environment errors and refused scans: `{"error":"environment"|"refused","status":"error"|"refused","reason":"ast-grep-missing"|"module-failed"|"directory-too-large"|"home-directory"|"root-directory","exit_code":2,"message":…}` (JSONL adds `"type":"error"`; SARIF emits one run with `invocations[0].executionSuccessful=false` and a `toolExecutionNotifications` entry).
+- Partial runs: the normal envelope with `"status":"partial"` and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `timeout`, `error`). SARIF runs get `invocations[].executionSuccessful=false` with one notification per failed module.
 
 **Directory size guard**
 
@@ -1061,7 +1085,7 @@ brew install ast-grep            # or: cargo install ast-grep, npm i -g @ast-gre
 If you’re intentionally scanning non-JS languages only, exclude JS:
 
 ```bash
-ubs --exclude=js .
+ubs --exclude-langs=js .
 ```
 
 ### **Examples**
@@ -1090,7 +1114,10 @@ ubs --jobs=0 .  # Auto-detect
 ubs --jobs=16 .  # Explicit core count
 
 # Skip languages you don't want in this run
-ubs . --exclude=ruby,swift
+ubs . --exclude-langs=ruby,swift
+
+# Skip paths for this run only (same semantics as .ubsignore lines)
+ubs . --exclude=legacy,generated
 
 # Exclude extra paths (node_modules, vendor, dist, build are ignored by default)
 printf 'legacy/\ngenerated/\n' >> .ubsignore

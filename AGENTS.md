@@ -303,6 +303,8 @@ ubs --ci --fail-on-warning .            # CI mode (UTC timestamps, strict)
 ubs .                                   # Whole project (respects .ubsignore)
 ubs -v .                                # Verbose mode (more examples)
 ubs doctor --fix                        # Verify/repair cached modules
+ubs robot-docs [topic]                  # JSON: guide, commands, examples, exit-codes, formats, env
+ubs --schema[=json|jsonl|sarif|toon|error|all]  # JSON Schema for each output format
 ```
 
 ### Severity Levels

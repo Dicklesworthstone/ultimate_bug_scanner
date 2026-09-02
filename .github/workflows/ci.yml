@@ -109,6 +109,18 @@ jobs:
           NO_COLOR: "1"
         run: bash test-suite/install/run_tests.sh
 
+      - name: Self-scan (UBS must pass on its own sources)
+        # The repository is its own fixture: every warning or critical that UBS
+        # reports on ubs, install.sh, scripts/ and modules/helpers/ is either a
+        # real bug or a false positive we owe a fix for. .ubsignore only skips
+        # the intentionally buggy test fixtures.
+        env:
+          NO_COLOR: "1"
+        run: |
+          ./ubs . --ci --fail-on-warning --format=json > self-scan.json
+          jq -e '.totals.critical == 0 and .totals.warning == 0' self-scan.json
+          jq -c '.totals' self-scan.json
+
       - name: Run helper test suites
         env:
           NO_COLOR: "1"
@@ -142,6 +154,138 @@ jobs:
           jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' docker-smoke.json
           jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' docker-smoke.json
 
+  macos-smoke:
+    # macOS ships bash 3.2 as /bin/bash and BSD userland (du, sed, stat), the
+    # two things most likely to break a Bash meta-runner developed on Linux.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install a modern bash and the scan tools
+        run: |
+          brew update >/dev/null
+          brew install bash jq ripgrep >/dev/null
+          npm install -g @ast-grep/cli@0.45.3 >/dev/null
+          "$(brew --prefix)/bin/bash" --version | head -n 1
+
+      - name: Stock /bin/bash 3.2 must fail with the documented message (exit 2)
+        run: |
+          set +e
+          /bin/bash ./ubs --version > guard.out 2>&1
+          rc=$?
+          set -e
+          cat guard.out
+          [ "$rc" -eq 2 ] || { echo "expected exit 2 from the bash-version guard, got $rc" >&2; exit 1; }
+          grep -q 'brew install bash' guard.out
+          set +e
+          /bin/bash ./install.sh --help > guard-install.out 2>&1
+          rc=$?
+          set -e
+          [ "$rc" -eq 2 ] || { echo "expected exit 2 from the installer bash-version guard, got $rc" >&2; cat guard-install.out; exit 1; }
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.13"
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.13
+
+      - name: Version, doctor and smoke scans under Homebrew bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          export PATH="$(brew --prefix)/bin:$PATH"
+          bash --version | head -n 1
+          ./ubs --version
+          ./ubs doctor
+          ./ubs test-suite/js/buggy test-suite/python/security --ci --format=json > macos-smoke.json || true
+          jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' macos-smoke.json
+          jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' macos-smoke.json
+          cd test-suite && uv run python run_manifest.py --fail-fast \
+            --case js-core-buggy --case js-core-clean \
+            --case golang-buggy --case golang-clean \
+            --case rust-buggy --case rust-clean
+
+      - name: Installer smoke tests under Homebrew bash
+        env:
+          NO_COLOR: "1"
+        run: |
+          export PATH="$(brew --prefix)/bin:$PATH"
+          bash test-suite/install/run_tests.sh
+
+      - name: Homebrew tap install (released channel, informational)
+        # Exercises `brew install dicklesworthstone/tap/ubs` from the README.
+        # It installs the last RELEASE, not this commit, so it cannot block a
+        # change here; a failure means the tap formula is broken for users.
+        continue-on-error: true
+        run: |
+          brew install dicklesworthstone/tap/ubs
+          "$(brew --prefix)/bin/ubs" --version
+
+  goldens-bot:
+    # The rule-coverage and SARIF-evidence goldens are derived from the fixture
+    # corpus; when a rule or fixture changes on main they go stale and the test
+    # job stays red until someone regenerates them by hand. This job regenerates
+    # both on every push to main and opens (or updates) one PR with the diff, so
+    # the reviewer decides whether the drift is intentional. A PR from the
+    # default GITHUB_TOKEN does not trigger CI on itself: push an empty commit
+    # or close/reopen it to get a run before merging.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv with caching
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep
+
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.13
+
+      - name: Regenerate goldens
+        env:
+          NO_COLOR: "1"
+        run: |
+          cd test-suite && uv run python quality/rule_quality_harness.py --update-goldens
+          git status --short goldens/
+
+      - name: Open or update the goldens PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          add-paths: test-suite/goldens/*.json
+          branch: bot/goldens-refresh
+          delete-branch: true
+          commit-message: "chore(goldens): refresh rule coverage and SARIF evidence goldens"
+          title: "chore(goldens): refresh rule coverage and SARIF evidence goldens"
+          body: |
+            `test-suite/quality/rule_quality_harness.py --update-goldens` produced a
+            different `rule_coverage.json` / `ast_grep_rule_pack_sarif.json` on `main`.
+
+            Review the diff before merging: added rules or higher counts mean the golden
+            was merely stale; removed rules or lower counts mean coverage regressed and
+            the fix belongs in the module or fixture, not in this PR.
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -155,8 +299,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
 
       - name: Run shellcheck
+        # The meta-runner, installer, scripts, test harnesses and hooks are
+        # held at -S warning (clean as of bead H5); the language modules still
+        # carry ~130 unused-variable warnings and stay at -S error until the
+        # shared-library work (A1) retires that boilerplate.
         run: |
-          shellcheck -S error install.sh ubs modules/*.sh scripts/*.sh
+          shellcheck -S warning install.sh ubs scripts/*.sh test-suite/*.sh test-suite/install/run_tests.sh .githooks/* .claude/hooks/*.sh
+          shellcheck -S error modules/*.sh
 
       - name: Compile-check Python files
         run: python3 -m compileall scripts modules/helpers
+
+      - name: CHANGELOG keeps an Unreleased section
+        # scripts/cut-release.sh rolls "## [Unreleased]" under the new version
+        # header and re-creates an empty one; every change lands there first.
+        run: |
+          grep -q '^## \[Unreleased\]' CHANGELOG.md || {
+            echo "CHANGELOG.md has no '## [Unreleased]' section (see docs/release.md)" >&2
+            exit 1
+          }

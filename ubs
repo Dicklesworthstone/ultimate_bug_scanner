@@ -21,7 +21,7 @@ if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
   echo "" >&2
   echo "Then re-run this script with:  /opt/homebrew/bin/bash $0 \"\$@\"" >&2
   echo "Or add /opt/homebrew/bin/bash to /etc/shells and chsh." >&2
-  exit 1
+  exit 2
 fi
 
 set -Eeuo pipefail
@@ -54,7 +54,7 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='4d949858d8a9d292e2eaf9768d4536be93346d69604c9f6c3b8ddf2e70bd9ac0'
   [golang]='0f2818ed09e28bd0f16edcce9f3821714dd15a0c1324fa2b184a3ab2b510a659'
   [java]='9d6df2d271d7c20caa97248a82ba71d4c14970dd31fc30b0b82c7902269af4a2'
-  [js]='ba4154373467eeceec9524f5cd5f13c4c34561ea6fb0434aaf6204e3e4b1217c'
+  [js]='df4dadc63a00099bda7a2e1a517d1f92fcd108dd62fbf9642c887f5854602dca'
   [python]='83316ee559bc184d174bada4a2cc899fccf53b8da8c189184e969cd27e08ec36'
   [ruby]='2d1be75bf13ac7e0bf71b5241224ec53511020300279dc462a7f99991665d358'
   [rust]='89d2b1e9bad572cb372eac0c4b6ec61583441e40b57f78981474f2b1686ec410'
@@ -76,7 +76,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_kotlin.py']='6f0f4482e8c349d15ac2830956baf193eedd2461d1ef836267c78da86c78ad79'
   ['helpers/type_narrowing_rust.py']='60a8384f327c8c22d3928f0b6a8e7a58bbe0a97bba9f85d50304e1fcae4bd47f'
   ['helpers/type_narrowing_swift.py']='f950bafa92391964e4779c77d37dcc11b0ffeab9bc351be439b4709c0f01b41a'
-  ['helpers/type_narrowing_ts.js']='be39dd81f9779c065c377295795a2cd6ef2f7e895e1058d925e82801d8a6b079'
+  ['helpers/type_narrowing_ts.js']='37cefad3c650ae04d1c5f7da42edfca3b5dea1f0c2263025bcec527111b930c9'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +84,43 @@ declare -A HELPER_CHECKSUMS=(
 # ─────────────────────────────────────────────────────────────────────────────
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
+
+# Machine-readable error envelope (bead B6). Environment errors and scan
+# refusals used to be text on stderr only, so `ubs --format=json | jq` saw an
+# empty stdout and could not tell "refused" from "crashed". Every machine format
+# now gets one object on stdout that names the failure:
+#   json/toon : {"error":KIND,"status":STATUS,"reason":REASON,"exit_code":2,...}
+#   jsonl     : the same object with "type":"error"
+#   sarif     : a run with invocations[0].executionSuccessful=false and a
+#               toolExecutionNotification carrying the reason
+# $1 kind (environment|refused)  $2 status (error|refused)  $3 reason slug
+# $4 human message  $5 optional extra JSON fields (already encoded, no braces)
+emit_error_envelope(){
+  local kind="$1" status="$2" reason="$3" message="$4" extra="${5:-}"
+  local proj; proj="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
+  local msg; msg="$(json_escape "$message")"
+  local body="\"error\":\"$kind\",\"status\":\"$status\",\"reason\":\"$reason\",\"exit_code\":2,\"project\":\"$proj\",\"message\":\"$msg\"${extra:+,$extra}"
+  case "${FORMAT:-text}" in
+    json|toon) printf '{%s}\n' "$body" ;;
+    jsonl) printf '{"type":"error",%s}\n' "$body" ;;
+    sarif) printf '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner","rules":[]}},"results":[],"invocations":[{"executionSuccessful":false,"exitCode":2,"toolExecutionNotifications":[{"level":"error","descriptor":{"id":"ubs/%s"},"message":{"text":"%s"}}],"properties":{%s}}]}]}\n' "$reason" "$msg" "$body" ;;
+    *) ;;
+  esac
+}
+
+# Refuse a scan with a clear human message and, for machine formats, the
+# envelope above on stdout (the human text then goes to stderr so stdout stays
+# parseable). $1 reason slug, $2 headline, $3 extra JSON fields, $4.. hint lines.
+refuse_scan(){
+  local reason="$1" headline="$2" extra="$3"; shift 3
+  local out=say
+  case "${FORMAT:-text}" in json|jsonl|sarif|toon) out=say_err ;; esac
+  "$out" "${RED}${X}${RESET} ${BOLD}${headline}${RESET}"
+  local line
+  for line in "$@"; do "$out" "${DIM}${line}${RESET}"; done
+  emit_error_envelope "refused" "refused" "$reason" "$headline" "$extra"
+  exit 2
+}
 json_escape(){
   local s="${1:-}"
   s=${s//\\/\\\\}
@@ -134,6 +171,18 @@ PY
     local human="${csv//,/ }"
     say "${DIM}${INFO}${RESET} Ignoring paths from ${file} → ${human}"
   fi
+}
+
+# --exclude=GLOB[,GLOB..] (bead B2): path globs, same semantics as .ubsignore
+# lines. They join GLOBAL_EXCLUDE_PATTERNS, so the shadow-workspace copy, the
+# size guard, explicit file lists and every module's --exclude all honour them.
+add_exclude_patterns(){
+  local csv="$1"
+  csv="${csv//$'\n'/}"
+  csv="${csv%,}"
+  [[ -n "$csv" ]] || return 0
+  USER_EXCLUDE_PATTERNS="${USER_EXCLUDE_PATTERNS:+$USER_EXCLUDE_PATTERNS,}$csv"
+  GLOBAL_EXCLUDE_PATTERNS="${GLOBAL_EXCLUDE_PATTERNS:+$GLOBAL_EXCLUDE_PATTERNS,}$csv"
 }
 
 HELPER_ASSETS=(
@@ -290,7 +339,8 @@ FAIL_ON_WARNING=0
 VERBOSE=0
 QUIET=0
 ONLY_LANGS=""              # csv: js,python,cpp,rust
-EXCLUDE_LANGS=""           # csv
+EXCLUDE_LANGS=""           # csv (--exclude-langs)
+USER_EXCLUDE_PATTERNS=""   # csv of --exclude path globs, for the language-name guard
 IGNORE_FILE=""
 DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels"
 # Safety guards: maximum directory size (MB) and whether to refuse home/root dirs
@@ -340,7 +390,6 @@ SHAREABLE_MODE=0
 GIT_MODE=""  # staged, diff, or empty
 SCAN_FILES=()  # explicit target list from --files or multiple positional args (files and/or directories)
 POSITIONAL_TARGETS=()  # raw positional path args; classified after the parse loop (issue #88)
-GIT_REMOTE_URL=""
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
 GIT_BLOB_BASE=""
@@ -380,11 +429,13 @@ Usage: ubs [options] [PROJECT_DIR]
        ubs --files FILE1,FILE2,... [options] [PROJECT_DIR]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
+       ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]   (JSON for agents)
+       ubs --schema[=json|jsonl|sarif|toon|error|all]                       (JSON Schema per format)
 
 Options:
   --format=FMT            text|json|jsonl|sarif|toon (default: text)
   --output=FILE, -o FILE  Also write the report to FILE (same as the positional form
-                          `ubs PROJECT_DIR OUTPUT_FILE`); stdout still receives it
+                          ubs PROJECT_DIR OUTPUT_FILE); stdout still receives it
   --no-color              Disable ANSI colors (same as NO_COLOR=1)
   --include-ext=CSV       Extra file extensions forwarded to the language modules
                           (e.g. --include-ext=js,ts,vue); language detection still
@@ -398,7 +449,8 @@ Options:
   -v, --verbose           Pass -v to child scanners (if supported)
   -q, --quiet             Reduce console output (also passes -q to scanners)
   --only=CSV              Restrict to languages: js,python,c,cpp,rust,golang,java,ruby,swift,csharp,cs,elixir,ex
-  --exclude=CSV           Exclude languages
+  --exclude=GLOB[,..]     Skip paths (globs/dirs, like .ubsignore lines); forwarded to modules
+  --exclude-langs=CSV     Exclude languages (e.g. --exclude-langs=js,ruby)
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
   --category=CSV          Focus on category packs (e.g., resource-lifecycle for AST lifecycle analyzers)
   --comparison=FILE       Baseline JSON to diff combined results against
@@ -455,6 +507,9 @@ Environment Variables:
   UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
   UBS_MODULE_TIMEOUT=SECS     Per-module timeout (default: 300)
+  UBS_ALLOW_PARTIAL=1         Exit on findings even when a module timed out or crashed
+                              (default: such partial runs exit 2; the JSON/JSONL/SARIF
+                              envelope carries status and failed_modules either way)
 
 Examples:
   ubs .                       # auto-detect languages and scan
@@ -470,6 +525,417 @@ Examples:
   UBS_OUTPUT_FORMAT=toon ubs .  # set default format via env var
   UBS_MAX_DIR_SIZE_MB=0 ubs . # disable size check for large directories
 USAGE
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Machine-readable self-description (bead K1)
+#   ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]
+#   ubs --schema[=json|jsonl|sarif|toon|error|all]
+# Both print ONE JSON document on stdout (stderr for diagnostics) and exit 0;
+# an unknown topic/format exits 2. schema_version changes when a field is
+# removed or its meaning changes; additions keep the version.
+# ─────────────────────────────────────────────────────────────────────────────
+UBS_SCHEMA_VERSION="1"
+UBS_SCHEMA_ID_BASE="https://github.com/Dicklesworthstone/ultimate_bug_scanner/schema/v${UBS_SCHEMA_VERSION}"
+
+robot_docs_document(){
+cat <<'JSON'
+{
+  "guide": {
+    "summary": "UBS scans JavaScript/TypeScript, Python, C/C++, Rust, Go, Java/Kotlin, Ruby, Swift, C# and Elixir for likely bugs and security issues. Run it on the files you just changed, read the machine-readable envelope, fix criticals, re-run until exit 0.",
+    "golden_rule": "ubs <changed-files> --format=json before every commit; exit 0 = safe, 1 = findings, 2 = environment/partial/refused, 3 = nothing scanned.",
+    "stdout_contract": "In --format=json|jsonl|sarif|toon mode stdout is exactly one machine-readable document (or one JSONL stream); every diagnostic goes to stderr.",
+    "workflow": [
+      "Scope the scan to changed files: ubs a.ts b.py --format=json (sub-second) rather than the whole tree.",
+      "Read totals.critical / totals.warning and status; status=partial means a module timed out or crashed and exit is 2 unless UBS_ALLOW_PARTIAL=1.",
+      "Findings live under scanners[].findings[] with severity, count, title, description and samples[{file,line,code}].",
+      "Suppress a confirmed false positive with a trailing `ubs:ignore` comment (or the line above); never delete the check.",
+      "Re-run the same command until exit 0, then commit."
+    ]
+  },
+  "commands": {
+    "subcommands": [
+      {"name": "scan", "usage": "ubs [options] [PATH ...]", "description": "Default. Scans the project directory or the listed files/directories (union scan)."},
+      {"name": "doctor", "usage": "ubs doctor [--fix] [--module-dir=DIR]", "description": "Verify cached modules/helpers and the ast-grep toolchain; --fix re-downloads corrupted copies."},
+      {"name": "sessions", "usage": "ubs sessions [--entries N] [--raw]", "description": "Show recent installer session summaries."},
+      {"name": "robot-docs", "usage": "ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]", "description": "This document (JSON on stdout)."},
+      {"name": "--schema", "usage": "ubs --schema[=json|jsonl|sarif|toon|error|all]", "description": "JSON Schema (draft 2020-12) for each output format."}
+    ],
+    "flags": [
+      {"name": "--format", "args": "FMT", "example": "--format=json", "description": "Output format: text (default), json, jsonl, sarif, toon."},
+      {"name": "--output", "args": "FILE", "example": "--output=report.json", "description": "Also write the report to FILE (alias: -o FILE, or a trailing positional file that does not exist yet); stdout still receives it."},
+      {"name": "--ci", "args": null, "example": "--ci", "description": "CI mode: stable UTC timestamps; also disables the auto-update check."},
+      {"name": "--fail-on-warning", "args": null, "example": "--fail-on-warning", "description": "Exit 1 when warnings exist, not only criticals."},
+      {"name": "--only", "args": "CSV", "example": "--only=js,python", "description": "Restrict to these languages (js, python, c/cpp, rust, golang, java, ruby, swift, csharp/cs, elixir/ex)."},
+      {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
+      {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
+      {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
+      {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack."},
+      {"name": "--skip", "args": "CSV", "example": "--skip=14", "description": "Skip category numbers in every language (numbers differ per language; prefer --skip-LANG)."},
+      {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|ruby|swift|csharp|elixir)."},
+      {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
+      {"name": "--profile", "args": "NAME", "example": "--profile=strict", "description": "Severity profile passed to the modules (strict|loose)."},
+      {"name": "--files", "args": "F1,F2", "example": "--files=a.js,b.py", "description": "Scan only the listed files (comma or space separated)."},
+      {"name": "--staged", "args": null, "example": "--staged", "description": "Scan only files staged in the git index."},
+      {"name": "--diff", "args": null, "example": "--diff", "description": "Scan only files modified in the working tree (alias --git-diff)."},
+      {"name": "--list-categories", "args": null, "example": "--list-categories", "description": "Print each selected module's category numbers/names and exit 0."},
+      {"name": "--jobs", "args": "N", "example": "--jobs=4", "description": "Parallelism hint passed to modules that support it."},
+      {"name": "--ignore-file", "args": "PATH", "example": "--ignore-file=.ubsignore.ci", "description": "Extra ignore globs (default: PROJECT/.ubsignore when present)."},
+      {"name": "--skip-size-check", "args": null, "example": "--skip-size-check", "description": "Skip the directory size guard (default limit 1000 MB after ignores)."},
+      {"name": "--skip-type-narrowing", "args": null, "example": "--skip-type-narrowing", "description": "Skip the JS/Rust/Kotlin/Swift/C# type-narrowing helpers."},
+      {"name": "--module-dir", "args": "DIR", "example": "--module-dir=/tmp/ubs-modules", "description": "Where modules and helpers are cached."},
+      {"name": "--update-modules", "args": null, "example": "--update-modules", "description": "Re-download modules before scanning."},
+      {"name": "--comparison", "args": "FILE", "example": "--comparison=baseline.json", "description": "Baseline JSON to annotate the shareable report with deltas (exit code still reflects current totals)."},
+      {"name": "--report-json", "args": "FILE", "example": "--report-json=summary.json", "description": "Write the combined summary JSON to FILE."},
+      {"name": "--html-report", "args": "FILE", "example": "--html-report=report.html", "description": "Write a shareable HTML report."},
+      {"name": "--beads-jsonl", "args": "FILE", "example": "--beads-jsonl=findings.jsonl", "description": "Write findings as JSONL for Beads/strung."},
+      {"name": "--jsonl-summary-only", "args": null, "example": "--jsonl-summary-only", "description": "JSONL: emit only scanner/totals lines, no per-finding lines."},
+      {"name": "--suggest-ignore", "args": null, "example": "--suggest-ignore", "description": "Print large-directory ignore suggestions without modifying files."},
+      {"name": "--no-color", "args": null, "example": "--no-color", "description": "Disable ANSI colors (same as NO_COLOR=1)."},
+      {"name": "--verbose", "args": null, "example": "-v", "description": "More code samples per finding (alias -v)."},
+      {"name": "--quiet", "args": null, "example": "-q", "description": "Less console output (alias -q)."},
+      {"name": "--no-auto-update", "args": null, "example": "--no-auto-update", "description": "Disable the opt-in auto-update check."},
+      {"name": "--update", "args": null, "example": "--update", "description": "Update the installed ubs from the latest verified release and exit."},
+      {"name": "--version", "args": null, "example": "--version", "description": "Print the version and exit 0."},
+      {"name": "--help", "args": null, "example": "--help", "description": "Human help text (alias -h)."}
+    ]
+  },
+  "examples": [
+    {"goal": "Scan two changed files, machine-readable", "command": "ubs src/a.ts src/b.py --ci --format=json"},
+    {"goal": "Pre-commit: scan staged files", "command": "ubs --staged --ci --format=json"},
+    {"goal": "CI gate on warnings", "command": "ubs . --ci --fail-on-warning --format=json"},
+    {"goal": "SARIF for code scanning", "command": "ubs . --ci --format=sarif > ubs.sarif"},
+    {"goal": "Skip a directory for this run", "command": "ubs . --exclude=legacy,generated --format=json"},
+    {"goal": "Only Python and Go", "command": "ubs . --only=python,golang --format=json"},
+    {"goal": "Accept a partial run (a module timed out)", "command": "UBS_ALLOW_PARTIAL=1 ubs . --format=json"},
+    {"goal": "Validate an output against its schema", "command": "ubs --schema=json > ubs.schema.json"}
+  ],
+  "exit_codes": [
+    {"code": 0, "meaning": "No critical findings (no warnings either with --fail-on-warning); every requested language was scanned."},
+    {"code": 1, "meaning": "Critical findings, or warnings with --fail-on-warning."},
+    {"code": 2, "meaning": "Invalid arguments, environment error (e.g. ast-grep missing, module failed verification), refused scan (directory too large, $HOME, /), or a partial run (module timeout/crash) unless UBS_ALLOW_PARTIAL=1. Machine formats still print an envelope on stdout."},
+    {"code": 3, "meaning": "Nothing was scanned: no supported language detected. Not a pass; UBS_ALLOW_NO_SCAN=1 restores exit 0."}
+  ],
+  "formats": {
+    "json": {"description": "One object: project, timestamp, status (ok|partial), failed_modules[], scanners[] (per-language summary with findings[] and status ok|timeout|error), totals{critical,warning,info,files}. Environment errors and refusals print an error envelope instead; no supported language prints a result object with exit_code 3.", "schema": "ubs --schema=json"},
+    "jsonl": {"description": "One JSON object per line: type=finding (per finding, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
+    "sarif": {"description": "SARIF 2.1.0; one run per module. Partial runs and errors set runs[].invocations[0].executionSuccessful=false with toolExecutionNotifications (descriptor ids ubs/module-timeout, ubs/module-error, ubs/<refusal-or-error-reason>).", "schema": "ubs --schema=sarif"},
+    "toon": {"description": "The json document encoded with toon_rust's tru (falls back to JSON when tru is absent).", "schema": "ubs --schema=toon"},
+    "text": {"description": "Human report; Combined Summary at the end (Files/Critical/Warning/Info, Status: partial when applicable)."}
+  },
+  "env": [
+    {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
+    {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Per-module timeout (default 300)."},
+    {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
+    {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
+    {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables)."},
+    {"name": "UBS_SKIP_SIZE_CHECK", "value": "1", "description": "Skip the size guard."},
+    {"name": "UBS_REFUSE_HOME_ROOT", "value": "0|1", "description": "Refuse scanning $HOME or / (default 1)."},
+    {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
+    {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
+    {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
+    {"name": "CI", "value": "true", "description": "Disables the auto-update check like --ci."},
+    {"name": "NO_COLOR", "value": "1", "description": "Disable ANSI colors."},
+    {"name": "TOON_TRU_BIN", "value": "PATH", "description": "toon_rust encoder binary for --format=toon."}
+  ]
+}
+JSON
+}
+
+emit_robot_docs(){
+  local topic="${1:-all}"
+  case "$topic" in
+    guide|commands|examples|exit-codes|formats|env|all) ;;
+    -h|--help)
+      say_err "Usage: ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]"
+      return 0 ;;
+    *)
+      say_err "${RED}${X}${RESET} unknown robot-docs topic: $topic (guide|commands|examples|exit-codes|formats|env|all)"
+      return 2 ;;
+  esac
+  if ! need_cmd jq; then
+    say_err "${RED}${X}${RESET} jq is required for ubs robot-docs"
+    return 2
+  fi
+  local key="${topic//-/_}"
+  robot_docs_document | jq --arg v "$UBS_VERSION" --arg sv "$UBS_SCHEMA_VERSION" --arg topic "$topic" --arg key "$key" '
+    {schema_version: $sv, ubs_version: $v, topic: $topic}
+    + (if $topic == "all" then . else {($key): .[$key]} end)'
+}
+
+schema_document(){
+cat <<'JSON'
+{
+  "json": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ubs --format=json (and the document encoded by --format=toon)",
+    "description": "Everything ubs prints on stdout in json/toon mode validates against this: a combined scan report, a no-supported-languages result (exit 3), or an error envelope (exit 2).",
+    "oneOf": [
+      {"$ref": "#/$defs/report"},
+      {"$ref": "#/$defs/no_scan_result"},
+      {"$ref": "#/$defs/error_envelope"}
+    ],
+    "$defs": {
+      "count": {"type": "integer", "minimum": 0},
+      "totals": {
+        "type": "object",
+        "required": ["critical", "warning", "info", "files"],
+        "properties": {
+          "critical": {"$ref": "#/$defs/count"},
+          "warning": {"$ref": "#/$defs/count"},
+          "info": {"$ref": "#/$defs/count"},
+          "files": {"$ref": "#/$defs/count"}
+        }
+      },
+      "sample": {
+        "type": "object",
+        "properties": {"file": {"type": "string"}, "line": {"type": "integer"}, "code": {"type": "string"}},
+        "additionalProperties": true
+      },
+      "finding": {
+        "type": "object",
+        "required": ["severity", "title", "count"],
+        "properties": {
+          "severity": {"enum": ["critical", "warning", "info", "good"]},
+          "count": {"$ref": "#/$defs/count"},
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "samples": {"type": "array", "items": {"$ref": "#/$defs/sample"}}
+        },
+        "additionalProperties": true
+      },
+      "scanner": {
+        "type": "object",
+        "required": ["language", "files", "critical", "warning", "info"],
+        "properties": {
+          "language": {"type": "string"},
+          "status": {"enum": ["ok", "timeout", "error"]},
+          "files": {"$ref": "#/$defs/count"},
+          "critical": {"$ref": "#/$defs/count"},
+          "warning": {"$ref": "#/$defs/count"},
+          "info": {"$ref": "#/$defs/count"},
+          "timestamp": {"type": "string"},
+          "project": {"type": "string"},
+          "version": {"type": "string"},
+          "findings": {"type": "array", "items": {"$ref": "#/$defs/finding"}},
+          "extras": {"type": "object"},
+          "module_error": {"type": "string"},
+          "module_timeout_secs": {"type": "integer"},
+          "message": {"type": "string"}
+        },
+        "additionalProperties": true
+      },
+      "failed_module": {
+        "type": "object",
+        "required": ["language", "status"],
+        "properties": {
+          "language": {"type": "string"},
+          "status": {"enum": ["timeout", "error"]},
+          "module_error": {"type": ["string", "null"]},
+          "message": {"type": ["string", "null"]}
+        }
+      },
+      "report": {
+        "type": "object",
+        "required": ["project", "timestamp", "status", "failed_modules", "scanners", "totals"],
+        "properties": {
+          "project": {"type": "string"},
+          "timestamp": {"type": "string"},
+          "status": {"enum": ["ok", "partial"]},
+          "failed_modules": {"type": "array", "items": {"$ref": "#/$defs/failed_module"}},
+          "scanners": {"type": "array", "items": {"$ref": "#/$defs/scanner"}},
+          "totals": {"$ref": "#/$defs/totals"},
+          "git": {"type": "object"},
+          "comparison": {"type": "object"}
+        },
+        "additionalProperties": true
+      },
+      "no_scan_result": {
+        "type": "object",
+        "required": ["result", "exit_code", "project", "totals", "scanners"],
+        "properties": {
+          "result": {"const": "no-supported-languages"},
+          "exit_code": {"enum": [0, 3]},
+          "project": {"type": "string"},
+          "detected_languages": {"type": "array", "items": {"type": "string"}},
+          "supported_languages": {"type": "array", "items": {"type": "string"}},
+          "totals": {"$ref": "#/$defs/totals"},
+          "scanners": {"type": "array", "maxItems": 0}
+        }
+      },
+      "error_envelope": {
+        "type": "object",
+        "required": ["error", "status", "reason", "exit_code", "project", "message"],
+        "properties": {
+          "error": {"enum": ["environment", "refused"]},
+          "status": {"enum": ["error", "refused"]},
+          "reason": {"type": "string", "description": "ast-grep-missing | module-failed | directory-too-large | home-directory | root-directory"},
+          "exit_code": {"const": 2},
+          "project": {"type": "string"},
+          "message": {"type": "string"},
+          "failed_modules": {"type": "array", "items": {"type": "string"}},
+          "size_mb": {"type": "integer"},
+          "limit_mb": {"type": "integer"},
+          "target": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "jsonl": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ubs --format=jsonl (one object per line)",
+    "description": "Each line is one of: a finding, a per-language scanner summary, the totals line (always last on success), or an error envelope.",
+    "oneOf": [
+      {"$ref": "#/$defs/finding_line"},
+      {"$ref": "#/$defs/scanner_line"},
+      {"$ref": "#/$defs/totals_line"},
+      {"$ref": "#/$defs/error_line"}
+    ],
+    "$defs": {
+      "count": {"type": "integer", "minimum": 0},
+      "finding_line": {
+        "type": "object",
+        "required": ["type", "project", "language", "severity", "title", "count"],
+        "properties": {
+          "type": {"const": "finding"},
+          "project": {"type": "string"},
+          "language": {"type": "string"},
+          "severity": {"enum": ["critical", "warning", "info", "good"]},
+          "count": {"$ref": "#/$defs/count"},
+          "title": {"type": "string"},
+          "description": {"type": "string"},
+          "samples": {"type": "array"}
+        },
+        "additionalProperties": true
+      },
+      "scanner_line": {
+        "type": "object",
+        "required": ["type", "project", "language", "status", "files", "critical", "warning", "info"],
+        "properties": {
+          "type": {"const": "scanner"},
+          "project": {"type": "string"},
+          "language": {"type": "string"},
+          "status": {"enum": ["ok", "timeout", "error"]},
+          "files": {"$ref": "#/$defs/count"},
+          "critical": {"$ref": "#/$defs/count"},
+          "warning": {"$ref": "#/$defs/count"},
+          "info": {"$ref": "#/$defs/count"},
+          "timestamp": {"type": "string"}
+        }
+      },
+      "totals_line": {
+        "type": "object",
+        "required": ["type", "project", "status", "failed_modules", "files", "critical", "warning", "info"],
+        "properties": {
+          "type": {"const": "totals"},
+          "project": {"type": "string"},
+          "status": {"enum": ["ok", "partial"]},
+          "failed_modules": {"type": "array"},
+          "files": {"$ref": "#/$defs/count"},
+          "critical": {"$ref": "#/$defs/count"},
+          "warning": {"$ref": "#/$defs/count"},
+          "info": {"$ref": "#/$defs/count"},
+          "timestamp": {"type": "string"}
+        }
+      },
+      "error_line": {
+        "type": "object",
+        "required": ["type", "error", "status", "reason", "exit_code", "project", "message"],
+        "properties": {
+          "type": {"const": "error"},
+          "error": {"enum": ["environment", "refused"]},
+          "status": {"enum": ["error", "refused"]},
+          "reason": {"type": "string"},
+          "exit_code": {"const": 2},
+          "project": {"type": "string"},
+          "message": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "sarif": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ubs --format=sarif",
+    "description": "SARIF 2.1.0 (official schema: https://json.schemastore.org/sarif-2.1.0.json). This local schema pins the envelope and the UBS-specific invocation semantics: on a partial run or an error every run carries invocations[0].executionSuccessful=false and toolExecutionNotifications whose descriptor.id is ubs/module-timeout, ubs/module-error or ubs/<reason>.",
+    "type": "object",
+    "required": ["version", "runs"],
+    "properties": {
+      "version": {"const": "2.1.0"},
+      "$schema": {"type": "string"},
+      "runs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["tool", "results"],
+          "properties": {
+            "tool": {"type": "object", "required": ["driver"], "properties": {"driver": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}, "rules": {"type": "array"}}}}},
+            "results": {"type": "array", "items": {"type": "object", "properties": {"ruleId": {"type": "string"}, "level": {"enum": ["error", "warning", "note", "none"]}, "message": {"type": "object"}}}},
+            "invocations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["executionSuccessful"],
+                "properties": {
+                  "executionSuccessful": {"type": "boolean"},
+                  "exitCode": {"type": "integer"},
+                  "toolExecutionNotifications": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["level", "message"],
+                      "properties": {
+                        "level": {"enum": ["error", "warning", "note", "none"]},
+                        "descriptor": {"type": "object", "properties": {"id": {"type": "string", "pattern": "^ubs/"}}},
+                        "message": {"type": "object", "required": ["text"]}
+                      }
+                    }
+                  },
+                  "properties": {"type": "object"}
+                }
+              }
+            },
+            "versionControlProvenance": {"type": "array"},
+            "automationDetails": {"type": "object"}
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "additionalProperties": true
+  }
+}
+JSON
+}
+
+emit_schema(){
+  local fmt="${1#=}"
+  fmt="${fmt:-all}"
+  if ! need_cmd jq; then
+    say_err "${RED}${X}${RESET} jq is required for ubs --schema"
+    return 2
+  fi
+  case "$fmt" in
+    json|jsonl|sarif) ;;
+    toon) fmt="json" ;;
+    error)
+      schema_document | jq --arg id "$UBS_SCHEMA_ID_BASE/error.schema.json" --arg sv "$UBS_SCHEMA_VERSION" '
+        {"$schema": "https://json-schema.org/draft/2020-12/schema", "$id": $id, schema_version: $sv,
+         title: "ubs error envelope (exit 2, machine formats)"} + .json["$defs"].error_envelope'
+      return 0 ;;
+    all)
+      schema_document | jq --arg base "$UBS_SCHEMA_ID_BASE" --arg sv "$UBS_SCHEMA_VERSION" --arg v "$UBS_VERSION" '
+        {schema_version: $sv, ubs_version: $v}
+        + (to_entries | map({key: .key, value: (.value + {"$id": ($base + "/" + .key + ".schema.json"), schema_version: $sv})}) | from_entries)
+        + {toon: {"$ref": ($base + "/json.schema.json"), description: "TOON is tru-encoded json; validate the decoded document against the json schema."}}'
+      return 0 ;;
+    *)
+      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|all)"
+      return 2 ;;
+  esac
+  schema_document | jq --arg key "$fmt" --arg base "$UBS_SCHEMA_ID_BASE" --arg sv "$UBS_SCHEMA_VERSION" '
+    .[$key] + {"$id": ($base + "/" + $key + ".schema.json"), schema_version: $sv}'
 }
 
 doctor_usage(){
@@ -549,6 +1015,16 @@ for idx, block in enumerate(subset):
 PY
 }
 
+# Self-description commands answer from static data (functions above) and
+# exit before any parsing, locking, network or scanning.
+if [[ "${1:-}" == "robot-docs" ]]; then
+  emit_robot_docs "${2:-all}"
+  exit $?
+elif [[ "${1:-}" == "--schema" || "${1:-}" == --schema=* ]]; then
+  emit_schema "${1#--schema}"
+  exit $?
+fi
+
 DOCTOR_FIX=0
 if [[ "$MODE" == "doctor" ]]; then
   while [[ $# -gt 0 ]]; do
@@ -598,7 +1074,8 @@ else
       --update) UPDATE_ONLY=1; FORCE_SELF_UPDATE=1; shift;;
       --non-interactive) shift;;
       --only=*) ONLY_LANGS="${1#*=}"; shift;;
-      --exclude=*) EXCLUDE_LANGS="${1#*=}"; shift;;
+      --exclude=*) add_exclude_patterns "${1#*=}"; shift;;
+      --exclude-langs=*) EXCLUDE_LANGS="${1#*=}"; shift;;
       --category=*) CATEGORY_FILTER="${1#*=}"; shift;;
       --category)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -688,13 +1165,14 @@ else
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; OUTPUT_FILE="$1"; shift;;
       --list-categories) LIST_CATEGORIES=1; shift;;
-      --only|--exclude|--jobs|--skip|--ignore-file)
+      --only|--exclude|--exclude-langs|--jobs|--skip|--ignore-file)
         # Space-separated form of the =-flags above.
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         _flag="$1"; shift
         case "$_flag" in
           --only) ONLY_LANGS="$1";;
-          --exclude) EXCLUDE_LANGS="$1";;
+          --exclude) add_exclude_patterns "$1";;
+          --exclude-langs) EXCLUDE_LANGS="$1";;
           --jobs) JOBS="$1";;
           --skip) export UBS_SKIP_CATEGORIES="$1"; BARE_SKIP_USED=1;;
           --ignore-file) IGNORE_FILE="$1";;
@@ -822,20 +1300,35 @@ fi
 # Fixes GitHub issue #12: UBS copies entire scan directory to /tmp
 # ─────────────────────────────────────────────────────────────────────────────
 
+# --exclude used to take language names. A stale invocation such as
+# `--exclude=js` would now silently skip a path named "js" (usually none), so
+# a value that names a language and matches no path is rejected with the fix.
+if [[ -n "$USER_EXCLUDE_PATTERNS" ]]; then
+  IFS=',' read -r -a _user_excludes <<<"$USER_EXCLUDE_PATTERNS"
+  for _pat in "${_user_excludes[@]}"; do
+    case "${_pat,,}" in
+      js|ts|javascript|typescript|python|py|cpp|c|c++|rust|rs|golang|go|java|kotlin|kt|ruby|rb|swift|csharp|cs|c#|dotnet|elixir|ex)
+        if [[ ! -e "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}/$_pat" && ! -e "$_pat" ]]; then
+          say_err "${RED}${X}${RESET} --exclude now takes path globs; '$_pat' names a language and no path '$_pat' exists under ${SOURCE_PROJECT_DIR:-$PROJECT_DIR}. Use --exclude-langs=$_pat to skip the language."
+          exit 2
+        fi
+        ;;
+    esac
+  done
+fi
+
 # Check 1: Refuse to scan home directory or root (unless explicitly allowed)
 if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && "$REFUSE_HOME_ROOT" -eq 1 && -d "$SOURCE_PROJECT_DIR" ]]; then
   resolved_dir="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)"
   if [[ "$resolved_dir" == "$HOME" ]]; then
-    say "${RED}${X}${RESET} ${BOLD}Refusing to scan home directory${RESET}"
-    say "${DIM}UBS copies the scan target to /tmp, which can exhaust disk space on large directories.${RESET}"
-    say "${DIM}If you really want to scan \$HOME, set${RESET} UBS_REFUSE_HOME_ROOT=0"
-    exit 2
+    refuse_scan "home-directory" "Refusing to scan home directory" "" \
+      "UBS copies the scan target to /tmp, which can exhaust disk space on large directories." \
+      "If you really want to scan \$HOME, set UBS_REFUSE_HOME_ROOT=0"
   fi
   if [[ "$resolved_dir" == "/" ]]; then
-    say "${RED}${X}${RESET} ${BOLD}Refusing to scan root directory${RESET}"
-    say "${DIM}UBS copies the scan target to /tmp, which can exhaust disk space.${RESET}"
-    say "${DIM}If you really want to scan /, set${RESET} UBS_REFUSE_HOME_ROOT=0"
-    exit 2
+    refuse_scan "root-directory" "Refusing to scan root directory" "" \
+      "UBS copies the scan target to /tmp, which can exhaust disk space." \
+      "If you really want to scan /, set UBS_REFUSE_HOME_ROOT=0"
   fi
 fi
 
@@ -935,15 +1428,11 @@ if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && "$SKIP_SIZE_CHE
     say "${DIM}${INFO}${RESET} Scan size after ignores: ${dir_size_mb}MB (limit ${MAX_DIR_SIZE_MB}MB)"
   fi
   if [[ "$dir_size_mb" -gt "$MAX_DIR_SIZE_MB" ]]; then
-    say "${RED}${X}${RESET} ${BOLD}Directory too large (after ignores)${RESET}: ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB"
-    say "${DIM}UBS copies the scan target to /tmp before analysis, which can exhaust disk space.${RESET}"
-    say "${DIM}This safety check prevents accidental scans of large directories like \$HOME.${RESET}"
-    say ""
-    say "${DIM}Options:${RESET}"
-    say "${DIM}  • Scan a smaller subdirectory instead${RESET}"
-    say "${DIM}  • Increase the limit:${RESET} UBS_MAX_DIR_SIZE_MB=5000 ubs ..."
-    say "${DIM}  • Disable the check:${RESET} UBS_MAX_DIR_SIZE_MB=0 ubs ..."
-    exit 2
+    refuse_scan "directory-too-large" "Directory too large (after ignores): ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB" \
+      "\"size_mb\":${dir_size_mb},\"limit_mb\":${MAX_DIR_SIZE_MB}" \
+      "UBS copies the scan target to /tmp before analysis, which can exhaust disk space." \
+      "This safety check prevents accidental scans of large directories like \$HOME." \
+      "Options: scan a smaller subdirectory; raise the limit with UBS_MAX_DIR_SIZE_MB=5000; disable it with UBS_MAX_DIR_SIZE_MB=0."
   fi
 fi
 
@@ -1077,7 +1566,6 @@ resolve_git_metadata(){
   remote=$(git -C "$root" config --get remote.origin.url 2>/dev/null || true)
   commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
   [[ -n "$remote" && -n "$commit" ]] || return
-  GIT_REMOTE_URL="$remote"
   GIT_COMMIT_SHA="$commit"
   GIT_REMOTE_HTTP=""
   case "$remote" in
@@ -1315,9 +1803,9 @@ prepare_files_workspace(){
         local dsize
         dsize="$(dir_size_mb_filtered "$f" "$GLOBAL_EXCLUDE_PATTERNS")"
         if [[ "$dsize" -gt "$MAX_DIR_SIZE_MB" ]]; then
-          say "${RED}${X}${RESET} ${BOLD}Directory target too large (after ignores)${RESET}: $f is ${dsize}MB, limit ${MAX_DIR_SIZE_MB}MB"
-          say "${DIM}Increase with UBS_MAX_DIR_SIZE_MB=N or disable with UBS_MAX_DIR_SIZE_MB=0.${RESET}"
-          exit 2
+          refuse_scan "directory-too-large" "Directory target too large (after ignores): $f is ${dsize}MB, limit ${MAX_DIR_SIZE_MB}MB" \
+            "\"size_mb\":${dsize},\"limit_mb\":${MAX_DIR_SIZE_MB},\"target\":\"$(json_escape "$f")\"" \
+            "Increase with UBS_MAX_DIR_SIZE_MB=N or disable with UBS_MAX_DIR_SIZE_MB=0."
         fi
       fi
       dir_src+=("$f")
@@ -1561,6 +2049,13 @@ ensure_ast_grep_tool_cache(){
 
 ensure_ast_grep(){
   local found
+  # Test seam (mirrors UBS_TEST_FORCE_NO_TOON): pretend ast-grep is absent so
+  # the environment-error envelope can be exercised without breaking the host.
+  # Distinct from the JS module's UBS_TEST_FORCE_NO_AST_GREP, which forces the
+  # module's heuristic path while the runner still provisions ast-grep.
+  if [[ "${UBS_TEST_RUNNER_NO_AST_GREP:-0}" == "1" ]]; then
+    return 1
+  fi
   if found="$(find_ast_grep_in_path)"; then
     AST_GREP_BIN="$found"
     AST_GREP_SOURCE="path"
@@ -2101,11 +2596,13 @@ suggest_ignore_candidates(){
   IFS=',' read -r -a defaults <<<"$DEFAULT_IGNORES"
   say "${BLUE}${INFO}${RESET} Ignore suggestions (directories with >${threshold} files not already default-ignored):"
   find "$PROJECT_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | while read -r d; do
-    local base=$(basename "$d")
+    local base
+    base=$(basename "$d")
     local skip=0
     for df in "${defaults[@]}"; do [[ "$base" == "$df" ]] && skip=1; done
     [[ "$skip" -eq 1 ]] && continue
-    local count=$(find "$d" -type f 2>/dev/null | wc -l | awk '{print $1+0}')
+    local count
+    count=$(find "$d" -type f 2>/dev/null | wc -l | awk '{print $1+0}')
     if [[ "$count" -gt $threshold ]]; then
       say "  ${GRAY}$base${RESET} (${count} files) → consider adding to .ubsignore"
     fi
@@ -3311,21 +3808,20 @@ emit_module_timeout_result(){
   local lang="$1" fmt="$2" json="$3" txt="$4" sarif="$5"
   local secs="$UBS_MODULE_TIMEOUT"
   local proj; proj="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
-  local msg="Scanner module '${lang}' timed out after ${secs}s (UBS_MODULE_TIMEOUT) and was terminated; the scan continued with a bounded partial result. A common cause is a build tool such as cargo blocking on a locked target/ directory or on network access. Raise UBS_MODULE_TIMEOUT or investigate the wedge."
+  local msg="Scanner module '${lang}' timed out after ${secs}s (UBS_MODULE_TIMEOUT) and was terminated; the result is PARTIAL (this language was not scanned). A common cause is a build tool such as cargo blocking on a locked target/ directory or on network access. Raise UBS_MODULE_TIMEOUT or investigate the wedge."
   local msg_json; msg_json="$(json_escape "$msg")"
   cat >"$json" <<JSON
-{"language":"$lang","project":"$proj","files":0,"critical":1,"warning":0,"info":0,"timestamp":"$(date_iso)","module_error":"MODULE_TIMEOUT","module_timeout_secs":$secs,"message":"$msg_json"}
+{"language":"$lang","project":"$proj","files":0,"critical":0,"warning":0,"info":0,"timestamp":"$(date_iso)","status":"timeout","module_error":"MODULE_TIMEOUT","module_timeout_secs":$secs,"message":"$msg_json"}
 JSON
   {
     printf 'MODULE_TIMEOUT: %s\n' "$lang"
     printf '  %s\n' "$msg"
-    printf 'Critical issues: 1\n'
   } >"$txt"
   if [[ "$fmt" == "sarif" ]]; then
     minimal_sarif_from_text "$lang" "$txt" >"$sarif" 2>/dev/null || true
   fi
   if [[ "${QUIET:-0}" -eq 0 ]]; then
-    say_err "${RED}${X}${RESET} Module '${lang}' timed out after ${secs}s (MODULE_TIMEOUT); partial result recorded."
+    say_err "${RED}${X}${RESET} Module '${lang}' timed out after ${secs}s (MODULE_TIMEOUT); the result is partial."
   fi
 }
 
@@ -3469,6 +3965,25 @@ run_lang(){
     say_err "${DIM}Finished $lang (${duration}s)${RESET}"
   fi
 
+  # Machine-readable per-scanner status (bead B6): "ok" (exit 0/1 = findings
+  # or none), "timeout", or "error" (any other exit code: crash, missing tool,
+  # helper failure). The top-level envelope derives status/failed_modules from
+  # these and the exit code becomes 2 for a partial run unless
+  # UBS_ALLOW_PARTIAL=1.
+  local scanner_status="ok"
+  if [[ "${MODULE_TIMED_OUT:-0}" -eq 1 ]]; then
+    scanner_status="timeout"
+  elif [[ "$module_status" -ne 0 && "$module_status" -ne 1 ]]; then
+    scanner_status="error"
+  fi
+  if need_cmd jq && [[ -s "$out_json" ]] && jq -e 'type=="object"' "$out_json" >/dev/null 2>&1; then
+    jq --arg s "$scanner_status" --argjson rc "$module_status" '
+      . + {status:$s}
+      + (if $s == "error" and (.module_error|not) then
+           {module_error:("MODULE_EXIT_" + ($rc|tostring)),
+            message:("Scanner module exited with status " + ($rc|tostring) + " before producing a result; see stderr")}
+         else {} end)' "$out_json" > "$out_json.tmp" 2>/dev/null && mv "$out_json.tmp" "$out_json"
+  fi
   echo "$module_status" >"$status_file"
   return "$module_status"
 }
@@ -3476,25 +3991,25 @@ run_lang(){
 # Parse legacy text logs → JSON summary (robust to colors)
 parse_text_to_json(){
   local lang="$1" txt="$2" json="$3"
-  local critical=0 warning=0 info=0 files=0
+  local critical=0 warning=0 info=0 file_count=0
   # Strip ANSI, normalize
   local cleaned; cleaned="$(sed -E 's/\x1B\[[0-9;]*[mK]//g' "$txt" | tr -d '\r\0')"
   critical=$(printf '%s\n' "$cleaned" | grep -E 'Critical issues:|CRITICAL' | grep -Eo '[0-9]+' | tail -n1 || true)
   warning=$(printf '%s\n' "$cleaned" | grep -E 'Warning issues:|Warning' | grep -Eo '[0-9]+' | tail -n1 || true)
   info=$(printf '%s\n' "$cleaned" | grep -E 'Info items:|Info' | grep -Eo '[0-9]+' | tail -n1 || true)
-  files=$(printf '%s\n' "$cleaned" | grep -E 'Files scanned:' | grep -Eo '[0-9]+' | tail -n1 || true)
-  if [[ -z "$files" ]]; then
-    files=$(printf '%s\n' "$cleaned" \
+  file_count=$(printf '%s\n' "$cleaned" | grep -E 'Files scanned:' | grep -Eo '[0-9]+' | tail -n1 || true)
+  if [[ -z "$file_count" ]]; then
+    file_count=$(printf '%s\n' "$cleaned" \
       | grep -E 'Files:[[:space:]]*[0-9]+' \
       | head -n1 \
       | grep -Eo '[0-9]+' \
       | head -n1 || true)
   fi
-  critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
+  critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; file_count=${file_count:-0}
   local proj_display
   proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
   cat >"$json" <<JSON
-{"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
+{"language":"$lang","project":"$proj_display","files":$file_count,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
 JSON
 }
 
@@ -3583,7 +4098,11 @@ merge_json_scanners(){
   local base_json
   base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" '
     def nz(x): if (x|type)=="number" then x else 0 end;
-    {project:$project, timestamp:$ts, scanners: .,
+    def failed: map(select((.status // "ok") != "ok") | {language, status, module_error, message});
+    {project:$project, timestamp:$ts,
+     status: (if (failed|length) > 0 then "partial" else "ok" end),
+     failed_modules: failed,
+     scanners: .,
      totals:{
        critical: (map(nz(.critical)) | add),
        warning:  (map(nz(.warning))  | add),
@@ -3670,7 +4189,23 @@ merge_sarif_runs(){
         (if ($repo|length) > 0 then run + {versionControlProvenance:[{repositoryUri:$repo, revisionId:$rev}]}
          else run end)
         | (if ($auto|length) > 0 then . + {automationDetails:{id:$auto}} else . end);
-      {"version":"2.1.0","runs": ((map(toRuns(.)) | add) // [] | map(attachMeta(.)))}' "${valid_sarifs[@]}" 2>"$jq_err"; then
+      {"version":"2.1.0","runs": ((map(toRuns(.)) | add) // [] | map(attachMeta(.)))}' "${valid_sarifs[@]}" 2>"$jq_err" >"$TMPDIR_RUN/combined.sarif"; then
+    if [[ "${RUN_STATUS:-ok}" == "partial" && -n "${FAILED_MODULES_JSON:-}" ]]; then
+      # SARIF consumers must not read a partial run as a clean one: every run
+      # gets invocations[].executionSuccessful=false plus one notification per
+      # failed module (SARIF 2.1.0 §3.20.21 toolExecutionNotifications).
+      jq --argjson failed "$FAILED_MODULES_JSON" '
+        .runs |= map(. + {invocations: [{
+          executionSuccessful: false,
+          toolExecutionNotifications: ($failed | map({
+            level: "error",
+            descriptor: {id: ("ubs/module-" + .status)},
+            message: {text: (.language + ": " + .status + " — " + (.message // .module_error // "module did not complete"))}
+          }))
+        }]})' "$TMPDIR_RUN/combined.sarif" 2>>"$jq_err" || cat "$TMPDIR_RUN/combined.sarif"
+    else
+      cat "$TMPDIR_RUN/combined.sarif"
+    fi
     return 0
   fi
 
@@ -3689,7 +4224,8 @@ write_jsonl_summary(){
   local dest="$1"
   if ! generate_combined_json; then return 1; fi
   local tmp="$TMPDIR_RUN/combined.jsonl"
-  local ts="$(date_iso)"
+  local ts
+  ts="$(date_iso)"
   if ! need_cmd jq; then return 1; fi
 
   if [[ "${JSONL_DETAIL:-1}" -eq 1 ]]; then
@@ -3702,7 +4238,7 @@ write_jsonl_summary(){
 
     # Also emit scanner summaries
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-      .scanners[] | {type:"scanner", project:$project, language, files, critical, warning, info, timestamp:(.timestamp // $ts)}
+      .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:(.timestamp // $ts)}
     ' "$COMBINED_JSON_FILE" >>"$tmp"
   else
     # Summary-only mode (legacy behavior)
@@ -3713,7 +4249,8 @@ write_jsonl_summary(){
 
   # Always emit totals
   jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-    {type:"totals", project:$project, files:(.totals.files//0), critical:(.totals.critical//0),
+    {type:"totals", project:$project, status:(.status // "ok"), failed_modules:(.failed_modules // []),
+     files:(.totals.files//0), critical:(.totals.critical//0),
      warning:(.totals.warning//0), info:(.totals.info//0), timestamp:(.timestamp // $ts)}
   ' "$COMBINED_JSON_FILE" >>"$tmp"
 
@@ -3830,7 +4367,7 @@ say "${CYAN}${BOLD}UBS Meta-Runner v${UBS_VERSION}${RESET}  ${DIM}$(date_iso)${R
 say "${WHITE}Project:${RESET} ${CYAN}$SOURCE_PROJECT_DIR${RESET}"
 say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"
 
-langs=( $(select_langs) )
+read -r -a langs <<<"$(select_langs)"
 if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
 
@@ -3888,9 +4425,9 @@ if [[ " ${langs[*]} " == *" js "* ]]; then
   else
     say_err "${RED}${X}${RESET} Environment error: ast-grep is required for accurate JS/TS scanning."
     say_err "${DIM}Fix: install ast-grep (https://ast-grep.github.io/) or run the UBS installer.${RESET}"
-    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "toon" ]]; then
-      printf '{"error":"environment","exit_code":2,"failed_modules":["js"]}\n'
-    fi
+    emit_error_envelope "environment" "error" "ast-grep-missing" \
+      "ast-grep is required for JS/TS scanning; install it (https://ast-grep.github.io/) or run the UBS installer" \
+      '"failed_modules":["js"]'
     exit 2
   fi
 fi
@@ -3937,6 +4474,24 @@ for pid in "${pids[@]}"; do
   fi
 done
 
+# Run-level status (bead B6): "ok" when every scanner finished, "partial" when
+# one or more timed out or crashed. A partial run exits 2 (like an environment
+# error) so a green exit always means every requested language was scanned;
+# UBS_ALLOW_PARTIAL=1 restores the findings-based exit for callers that prefer
+# whatever completed. The envelope carries status/failed_modules either way.
+RUN_STATUS="ok"
+FAILED_MODULES_JSON="[]"
+if need_cmd jq; then
+  scanner_jsons=()
+  for L in "${langs[@]}"; do
+    [[ -s "$TMPDIR_RUN/$L.json" ]] && scanner_jsons+=("$TMPDIR_RUN/$L.json")
+  done
+  if [[ ${#scanner_jsons[@]} -gt 0 ]]; then
+    FAILED_MODULES_JSON="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") != "ok") | {language, status, module_error, message}]' "${scanner_jsons[@]}" 2>/dev/null || echo '[]')"
+    [[ "$FAILED_MODULES_JSON" != "[]" ]] && RUN_STATUS="partial"
+  fi
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment error handling (exit code 2)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3978,7 +4533,9 @@ emit_env_error_json(){
       modules_json+=",\"$lang_json\""
     fi
   done
-  printf '{"error":"environment","exit_code":2,"project":"%s","failed_modules":[%s]}\n' "$proj" "$modules_json"
+  emit_error_envelope "environment" "error" "module-failed" \
+    "One or more scanner modules could not run (tooling/dependency problem, not a code-quality failure): ${ENV_ERROR_LANGS[*]}" \
+    "\"failed_modules\":[$modules_json]"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4018,6 +4575,7 @@ case "$FORMAT" in
   sarif)
     if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
       emit_env_error_report
+      emit_env_error_json
       status=2
     else
       merge_sarif_runs
@@ -4091,6 +4649,9 @@ case "$FORMAT" in
         say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
         if generate_combined_json; then
           jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"' "$COMBINED_JSON_FILE"
+          if [[ "$RUN_STATUS" == "partial" ]]; then
+            say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
+          fi
           totals=$(jq -r '.totals' "$COMBINED_JSON_FILE")
         else
           merge_json_scanners | jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
@@ -4119,6 +4680,15 @@ case "$FORMAT" in
 	    if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit + warn)) -gt 0 ]]; then desired=1; fi
 	    if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
 	    if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
+	  fi
+	fi
+
+	if [[ "$HAS_ENV_ERROR" -eq 0 && "$RUN_STATUS" == "partial" ]]; then
+	  if [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
+	    say_err "${YELLOW}${WARN}${RESET} Partial run accepted because UBS_ALLOW_PARTIAL=1 ($(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')); exit code reflects the modules that completed."
+	  else
+	    say_err "${RED}${X}${RESET} Partial run: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")'). Exit 2 — not every requested language was scanned. Set UBS_ALLOW_PARTIAL=1 to accept partial results."
+	    status=2
 	  fi
 	fi
 

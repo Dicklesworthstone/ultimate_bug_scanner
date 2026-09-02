@@ -25,3 +25,19 @@ jobs:
 
       - name: Run nix flake check
         run: nix flake check
+
+      - name: Run the packaged ubs
+        run: |
+          nix run . -- --version
+          nix run . -- --help >/dev/null
+
+      - name: Dev shell provides the documented tools
+        run: |
+          nix develop --command bash -c '
+            set -euo pipefail
+            for tool in bash shellcheck git jq rg uv python3 cmake; do
+              printf "%-10s %s\n" "$tool" "$(command -v "$tool")"
+            done
+            [ "${BASH_VERSINFO[0]}" -ge 4 ] || { echo "dev shell bash is ${BASH_VERSION}, need >= 4" >&2; exit 1; }
+            shellcheck --version | head -n 2
+          '

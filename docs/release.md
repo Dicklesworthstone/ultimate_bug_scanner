@@ -52,6 +52,19 @@ This playbook documents how to cut and publish a signed UBS release. The release
      cosign verify-attestation --type https://slsa.dev/provenance/v1 $IMAGE_DIGEST
      ```
 
+5. **Watch the first release after a toolchain bump.** The pipeline is not exercised
+   locally, so the first tag after a change to `release.yml` (e.g. the Cosign v3
+   bump: its bundles verify only with Cosign >= 3, see `docs/security.md`) must be
+   checked end to end — signatures, attestations and `scripts/verify.sh` — before
+   the release is announced. If it fails, fix forward and cut the next patch tag;
+   never move or re-tag a published version.
+
+## Changelog discipline
+
+Every change lands under `## [Unreleased]` in `CHANGELOG.md` in the same PR.
+`scripts/cut-release.sh` rolls that section under the new version header and
+re-creates an empty one; CI (`lint` job) fails when the section is missing.
+
 ## Key management
 
 - **Rotation**: generate a new minisign keypair, update the GitHub secret, and publish the new public key. Keep the old public key listed in `docs/security.md` until all releases signed with it are retired.

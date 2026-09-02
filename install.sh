@@ -30,6 +30,38 @@ else
   ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
 fi
 ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
+
+# Dependency binaries (ast-grep, ripgrep, jq, typos) are fetched from GitHub
+# releases. UBS_INSTALLER_BINARY_BASE redirects those fetches (tests serve a
+# local mirror); the digests below are checked regardless of the base.
+DEP_BINARY_BASE="${UBS_INSTALLER_BINARY_BASE:-https://github.com}"
+if [ -n "${UBS_INSTALLER_BINARY_BASE:-}" ]; then
+  echo "WARNING: UBS_INSTALLER_BINARY_BASE=${UBS_INSTALLER_BINARY_BASE} overrides where dependency binaries are downloaded from" >&2
+fi
+
+# SHA-256 of every dependency release asset the installer can download.
+# ast-grep 0.45.3 (same table as AST_GREP_ASSET_SHA256 in ubs), jq 1.8.2 (from
+# the release's sha256sum.txt) and typos 1.50.1 (computed from the release
+# archives) are pinned here; ripgrep 15.2.0 publishes a .sha256 sidecar next
+# to each asset, which is fetched and checked instead. A download whose digest
+# is unknown or does not match is never installed.
+declare -A DEP_ASSET_SHA256=(
+  [app-aarch64-apple-darwin.zip]='6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6'
+  [app-x86_64-apple-darwin.zip]='b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c'
+  [app-aarch64-unknown-linux-gnu.zip]='b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f'
+  [app-x86_64-unknown-linux-gnu.zip]='f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8'
+  [app-x86_64-pc-windows-msvc.zip]='3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059'
+  [jq-linux-amd64]='b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f'
+  [jq-linux-arm64]='8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309'
+  [jq-macos-amd64]='e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0'
+  [jq-macos-arm64]='2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e'
+  [jq-win64.exe]='a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627'
+  [typos-v1.50.1-x86_64-unknown-linux-musl.tar.gz]='edf0545109aee6a22751d04ddecb97c45be47d3aa0409564fb895eeeace91b1e'
+  [typos-v1.50.1-aarch64-unknown-linux-musl.tar.gz]='a48feb58c517977ca953e634507c72819d64df8717c33ced3e43868d174fd39e'
+  [typos-v1.50.1-x86_64-apple-darwin.tar.gz]='b31ccf2f21154b2bc8d2a84f395f746106edda0feec4817fbecdb12216df53bd'
+  [typos-v1.50.1-aarch64-apple-darwin.tar.gz]='2c940734b44b6e199e165278b662b7e17c68f068471a2a8a5e491ce635414ae6'
+  [typos-v1.50.1-x86_64-pc-windows-msvc.zip]='8740867a0d9e44a62f0803e37a669ec3c6cd17ab63cd49d00e14a96d3e03ccc3'
+)
 MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
 
 # Global copy of original args (needed in update re-exec; must not be local)
@@ -113,9 +145,10 @@ if ((BASH_VERSINFO[0] < 4)); then
     fi
   fi
 
-  echo "Error: This installer requires Bash 4.0 or later (you have $BASH_VERSION)" >&2
-  echo "Please upgrade bash or install manually." >&2
-  exit 1
+  echo "Error: This installer requires Bash 4.0 or later (you have $BASH_VERSION)." >&2
+  echo "macOS: brew install bash, then re-run with: \$(brew --prefix)/bin/bash install.sh" >&2
+  echo "Linux: install the bash package for your distribution." >&2
+  exit 2
 fi
 
 # TTY-aware color initialization
@@ -151,14 +184,13 @@ SKIP_AST_GREP=0
 SKIP_RIPGREP=0
 SKIP_JQ=0
 SKIP_TYPOS=0
+LOCAL_INSTALL=0   # --local: install ./ubs from the current directory
 SKIP_BUN=0
 SKIP_TYPE_NARROWING=0
-TYPE_NARROWING_READY=0
 SKIP_HOOKS=0
 AUTO_UPDATE=0
 INSTALL_DIR=""
 FORCE_REINSTALL=0
-FORCE_UNINSTALL=0
 SKIP_VERSION_CHECK=0
 RUN_VERIFICATION=1
 DRY_RUN=0
@@ -166,7 +198,6 @@ RUN_SELF_TEST=0
 RUN_DOCTOR=1
 INSECURE=0
 CHECKSUM_FILE=""
-CHECKSUM_SIG_FILE=""
 SESSION_AGENT_SUMMARY=""
 SESSION_SUMMARY_FILE=""
 declare -a SESSION_FACT_KEYS=()
@@ -180,8 +211,6 @@ WORKDIR_CAN_DELETE=1
 LOCK_FILE="/tmp/ubs-install.lock"
 # Track if we own the lock (only remove it if we created it)
 LOCK_OWNED=0
-LOCK_METHOD="dir"
-LOCK_FD=""
 
 dry_run_enabled() { [ "$DRY_RUN" -eq 1 ]; }
 
@@ -245,6 +274,7 @@ HELP
   print_help_option "--non-interactive" "Skip all prompts (use defaults)"
   print_help_option "--update" "Force reinstall to latest version"
   print_help_option "--install-dir DIR" "Custom installation directory"
+  print_help_option "--local" "Install ./ubs from the current directory instead of the verified release (a repo checkout installs its own ubs automatically)"
   print_help_option "--system" "Install to /usr/local/bin (uses sudo if needed)"
   print_help_option "--no-path-modify" "Skip shell RC edits and alias creation"
   echo ""
@@ -281,8 +311,7 @@ HELP
 }
 
 report_type_narrowing_status() {
-  TYPE_NARROWING_READY=0
-  if [ "$SKIP_TYPE_NARROWING" -eq 1 ]; then
+    if [ "$SKIP_TYPE_NARROWING" -eq 1 ]; then
     log "[skip] Type narrowing readiness check disabled via --skip-type-narrowing"
     return 0
   fi
@@ -296,7 +325,6 @@ report_type_narrowing_status() {
   fi
   if check_typescript_pkg; then
     success "   TypeScript compiler detected (type narrowing ready)"
-    TYPE_NARROWING_READY=1
   else
     warn "   TypeScript package not found – run 'npm install -g typescript' or add it to your project devDependencies"
   fi
@@ -398,23 +426,49 @@ cleanup_on_exit() {
 
 release_lock() {
   if [ "$LOCK_OWNED" -eq 1 ]; then
+    rm -f "$LOCK_FILE/pid" 2>/dev/null || true
     rmdir "$LOCK_FILE" 2>/dev/null || true
     LOCK_OWNED=0
   fi
 }
 
+# A lock is stale when the PID recorded in it is gone, or (no PID recorded,
+# e.g. an older installer) when the directory is older than LOCK_STALE_SECS.
+LOCK_STALE_SECS=3600
+lock_is_stale() {
+  local pid_file="$LOCK_FILE/pid" pid=""
+  [ -f "$pid_file" ] && pid="$(tr -cd '0-9' < "$pid_file" 2>/dev/null)"
+  if [ -n "$pid" ]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    return 0
+  fi
+  local now mtime
+  now="$(date +%s)"
+  mtime="$(stat -c %Y "$LOCK_FILE" 2>/dev/null || stat -f %m "$LOCK_FILE" 2>/dev/null || echo "$now")"
+  [ $((now - mtime)) -gt "$LOCK_STALE_SECS" ]
+}
+
 acquire_lock() {
   # Use a directory lock for safety. File-based locks in /tmp can follow symlinks
   # and truncate arbitrary files if the installer is run with elevated privileges.
-  LOCK_METHOD="dir"
-  if mkdir "$LOCK_FILE" 2>/dev/null; then
-    LOCK_OWNED=1
-    return 0
-  else
-    error "Another installation is already in progress."
-    error "If this is incorrect, delete $LOCK_FILE and retry."
+  local attempt
+  for attempt in 1 2; do
+    if mkdir "$LOCK_FILE" 2>/dev/null; then
+      LOCK_OWNED=1
+      printf '%s\n' "$$" > "$LOCK_FILE/pid" 2>/dev/null || true
+      return 0
+    fi
+    if [ "$attempt" -eq 1 ] && lock_is_stale; then
+      warn "Removing stale installer lock $LOCK_FILE (its owner is no longer running)"
+      rm -rf "$LOCK_FILE" 2>/dev/null || true
+      continue
+    fi
+    error "Another installation is already in progress (lock: $LOCK_FILE, pid: $(cat "$LOCK_FILE/pid" 2>/dev/null || echo unknown))."
+    error "If no installer is running, delete $LOCK_FILE and retry."
     exit 1
-  fi
+  done
 }
 
 
@@ -524,7 +578,6 @@ fetch_checksum_bundle() {
       exit 1
     fi
     if minisign -Vm "$sums" -P "$MINISIGN_PUBKEY" -x "$sig" >/dev/null 2>&1; then
-      CHECKSUM_SIG_FILE="$sig"
       success "Checksum signature verified"
     else
       error "Signature verification failed for SHA256SUMS"
@@ -1050,8 +1103,45 @@ check_for_updates() {
   fi
 }
 
+# Verify a downloaded dependency asset. $1 file, $2 asset name (key into
+# DEP_ASSET_SHA256), $3 optional URL of a published .sha256 sidecar used when
+# no digest is pinned. --skip-verification / --insecure skip it LOUDLY.
+verify_dependency_asset() {
+  local file="$1" asset="$2" sidecar_url="${3:-}"
+  if [ "$RUN_VERIFICATION" -eq 0 ] || [ "$INSECURE" -eq 1 ]; then
+    warn "Skipping checksum verification for ${asset} (--skip-verification/--insecure): installing an unverified binary"
+    return 0
+  fi
+  local expected="${DEP_ASSET_SHA256[$asset]:-}"
+  if [ -z "$expected" ] && [ -n "$sidecar_url" ]; then
+    local sidecar
+    sidecar="$(mktemp_in_workdir "${asset}.sha256.XXXXXX")"
+    if with_backoff 3 curl -fsSL "$sidecar_url" -o "$sidecar" 2>/dev/null; then
+      expected="$(awk '{print $1}' "$sidecar" | head -n 1 | tr -d '\r')"
+    else
+      warn "Could not fetch the published checksum for ${asset} (${sidecar_url})"
+    fi
+  fi
+  if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    error "No SHA-256 known for ${asset}; refusing to install an unverified binary (use --skip-verification to override)"
+    return 1
+  fi
+  local actual
+  if ! actual="$(compute_sha256 "$file")"; then
+    error "No SHA256 tool found (need sha256sum, shasum, or openssl) to verify ${asset}"
+    return 1
+  fi
+  if [[ "${expected,,}" != "${actual,,}" ]]; then
+    error "Checksum mismatch for ${asset}; refusing to install it"
+    error "Expected: ${expected}"
+    error "Got:      ${actual}"
+    return 1
+  fi
+  success "Checksum verified for ${asset}"
+}
+
 download_binary_release() {
-  local tool="$1"  # ast-grep, ripgrep, or jq
+  local tool="$1"  # ast-grep, ripgrep, jq, or typos
   local platform="$2"
   local arch
 
@@ -1088,7 +1178,8 @@ download_binary_release() {
           asset="ripgrep-${version}-${arch}-apple-darwin.tar.gz"
           ;;
         freebsd)
-          asset="ripgrep-${version}-${arch}-unknown-freebsd.tar.gz"
+          warn "ripgrep publishes no FreeBSD binary release; install it with: pkg install ripgrep"
+          return 1
           ;;
         windows)
           case "$arch" in
@@ -1100,10 +1191,11 @@ download_binary_release() {
         *) warn "No binary release for $platform"; return 1 ;;
       esac
 
-      local url="https://github.com/BurntSushi/ripgrep/releases/download/${version}/${asset}"
+      local url="${DEP_BINARY_BASE}/BurntSushi/ripgrep/releases/download/${version}/${asset}"
       local archive_path="$temp_dir/${asset}"
 
       if with_backoff 3 curl -fsSL "$url" -o "$archive_path" 2>"$err_log"; then
+        verify_dependency_asset "$archive_path" "$asset" "${url}.sha256" || return 1
         case "$type" in
           tar)
             tar -xzf "$archive_path" -C "$temp_dir" >/dev/null 2>&1 || true
@@ -1151,12 +1243,13 @@ download_binary_release() {
       target="${arch}-${os}"
       asset="app-${target}.zip"
 
-      local url="https://github.com/ast-grep/ast-grep/releases/download/${version}/${asset}"
+      local url="${DEP_BINARY_BASE}/ast-grep/ast-grep/releases/download/${version}/${asset}"
       local zip_path="$temp_dir/${asset}"
       local extract_dir="$temp_dir/ast-grep"
       mkdir -p "$extract_dir" 2>/dev/null || true
 
       if with_backoff 3 curl -fsSL "$url" -o "$zip_path" 2>"$err_log"; then
+        verify_dependency_asset "$zip_path" "$asset" || return 1
         if command -v unzip >/dev/null 2>&1; then
           unzip -q "$zip_path" -d "$extract_dir" 2>/dev/null || true
         elif command -v python3 >/dev/null 2>&1; then
@@ -1200,12 +1293,16 @@ PY
         *) warn "No binary release for $platform-$arch"; return 1 ;;
       esac
 
-      local url="https://github.com/jqlang/jq/releases/download/jq-${version}/${asset}"
+      local url="${DEP_BINARY_BASE}/jqlang/jq/releases/download/jq-${version}/${asset}"
 
       local target="$install_dir/jq"
       [[ "$asset" == *.exe ]] && target="$install_dir/jq.exe"
 
       if with_backoff 3 curl -fsSL "$url" -o "$target" 2>"$err_log"; then
+        if ! verify_dependency_asset "$target" "$asset"; then
+          rm -f "$target"
+          return 1
+        fi
         chmod +x "$target"
         success "jq binary installed to $target"
         export PATH="$install_dir:$PATH"
@@ -1234,8 +1331,9 @@ PY
           type="zip"
           ;;
         windows-aarch64)
-          asset="typos-v${version}-aarch64-pc-windows-msvc.zip"
-          type="zip"
+          # typos v1.50.1 publishes no aarch64 Windows archive.
+          warn "No typos binary release available for windows-aarch64 (cargo install typos-cli)"
+          return 1
           ;;
         *)
           warn "No typos binary release available for $platform-$arch"
@@ -1243,10 +1341,11 @@ PY
           ;;
       esac
 
-      local url="https://github.com/crate-ci/typos/releases/download/v${version}/${asset}"
+      local url="${DEP_BINARY_BASE}/crate-ci/typos/releases/download/v${version}/${asset}"
       local archive="$temp_dir/${asset}"
 
       if with_backoff 3 curl -fsSL "$url" -o "$archive" 2>"$err_log"; then
+        verify_dependency_asset "$archive" "$asset" || return 1
         case "$type" in
           tar)
             if tar -xzf "$archive" -C "$temp_dir" >/dev/null 2>&1; then
@@ -1497,6 +1596,10 @@ write_session_summary() {
   local install_dir="$3"
   local note="$4"
   local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ubs"
+  if dry_run_enabled; then
+    log_dry_run "Would write the session summary to $config_dir/session.md."
+    return 0
+  fi
   mkdir -p "$config_dir" 2>/dev/null || true
   local summary="$config_dir/session.md"
   SESSION_SUMMARY_FILE="$summary"
@@ -1629,6 +1732,9 @@ read_config_file() {
         ;;
       skip_typos)
         SKIP_TYPOS="$(normalize_bool "$value")"
+        ;;
+      skip_bun)
+        SKIP_BUN="$(normalize_bool "$value")"
         ;;
       skip_doctor)
         RUN_DOCTOR=$((1 - $(normalize_bool "$value")))
@@ -1923,7 +2029,7 @@ uninstall_ubs() {
   log_section "Uninstall Ultimate Bug Scanner"
 
   warn "This will remove Ultimate Bug Scanner and all integrations"
-  if [ "$NON_INTERACTIVE" -eq 1 ] || [ "$FORCE_UNINSTALL" -eq 1 ]; then
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
     log "Auto-confirming uninstall"
   else
     if ! ask "Continue with uninstall?"; then
@@ -1935,72 +2041,118 @@ uninstall_ubs() {
   log "Uninstalling Ultimate Bug Scanner..."
   echo ""
 
-  # Remove binary
-  local install_dir
-  install_dir="$(determine_install_dir)"
-  local script_path="$install_dir/$INSTALL_NAME"
+  # 1. The binary, from every directory this installer could have used.
+  local removed_binary=0 candidate seen=""
+  for candidate in "$(determine_install_dir)" "$HOME/.local/bin" "/usr/local/bin"; do
+    case ",$seen," in *",$candidate,"*) continue ;; esac
+    seen="${seen:+$seen,}$candidate"
+    local bin="$candidate/$INSTALL_NAME"
+    [ -f "$bin" ] || continue
+    if ! grep -q -E "UBS Meta-Runner|Ultimate Bug Scanner" "$bin" 2>/dev/null; then
+      warn "Leaving $bin alone: it does not look like a UBS binary"
+      continue
+    fi
+    local sudo_cmd
+    sudo_cmd="$(maybe_sudo "$candidate")"
+    if $sudo_cmd rm -f "$bin" 2>/dev/null; then
+      success "Removed binary: $bin"
+      removed_binary=1
+    else
+      warn "Could not remove $bin"
+    fi
+  done
+  [ "$removed_binary" -eq 1 ] || log "No ubs binary found in ${seen//,/ }"
 
-  if [ -f "$script_path" ]; then
-    rm -f "$script_path"
-    success "Removed binary: $script_path"
-  else
-    log "Binary not found at: $script_path"
-  fi
-
-  # Remove from PATH (restore RC file)
+  # 2. Shell rc file: the PATH block (comment + export) and the alias
+  #    (bash/zsh: comment + alias; fish: comment + 3-line function).
   local rc_file
   rc_file="$(get_rc_file)"
-  if [ -f "$rc_file" ]; then
-    if grep -q "Ultimate Bug Scanner" "$rc_file" 2>/dev/null; then
-      cp "$rc_file" "${rc_file}.pre-uninstall-backup"
-      log "Backed up $rc_file to ${rc_file}.pre-uninstall-backup"
-
-      # Remove PATH and alias/function entries
-      if sed -i.bak '/# Ultimate Bug Scanner.*added/,+1d' "$rc_file" 2>/dev/null; then
-        rm -f "${rc_file}.bak" 2>/dev/null || true
-      fi
-      if sed -i.bak '/# Ultimate Bug Scanner alias/,+1d' "$rc_file" 2>/dev/null; then
-        rm -f "${rc_file}.bak" 2>/dev/null || true
-      fi
-      # Remove blank lines
-      if sed -i.bak '/^$/N;/^\n$/d' "$rc_file" 2>/dev/null; then
-        rm -f "${rc_file}.bak" 2>/dev/null || true
-      fi
-      success "Removed from $rc_file"
+  if [ -f "$rc_file" ] && grep -q "Ultimate Bug Scanner" "$rc_file" 2>/dev/null; then
+    cp "$rc_file" "${rc_file}.pre-uninstall-backup"
+    log "Backed up $rc_file to ${rc_file}.pre-uninstall-backup"
+    if sed -i.bak '/# Ultimate Bug Scanner.*added/,+1d' "$rc_file" 2>/dev/null; then
+      rm -f "${rc_file}.bak" 2>/dev/null || true
     fi
+    if grep -q '^function ubs' "$rc_file" 2>/dev/null; then
+      sed -i.bak '/# Ultimate Bug Scanner alias/,+3d' "$rc_file" 2>/dev/null && rm -f "${rc_file}.bak"
+    else
+      sed -i.bak '/# Ultimate Bug Scanner alias/,+1d' "$rc_file" 2>/dev/null && rm -f "${rc_file}.bak"
+    fi
+    strip_trailing_blank_lines "$rc_file"
+    success "Removed from $rc_file"
   fi
 
-  # Remove hooks
+  # 3. Git pre-commit hook, wherever git actually runs hooks from.
   echo ""
   if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove git hooks?"; then
-    if [ -f ".git/hooks/pre-commit" ] && grep -q "Ultimate Bug Scanner" ".git/hooks/pre-commit" 2>/dev/null; then
-      if [ -f ".git/hooks/pre-commit.backup" ]; then
-        mv ".git/hooks/pre-commit.backup" ".git/hooks/pre-commit"
+    local hooks_dir=""
+    if command -v git >/dev/null 2>&1; then
+      hooks_dir="$(git rev-parse --git-path hooks 2>/dev/null)" || hooks_dir=""
+    fi
+    [ -n "$hooks_dir" ] || hooks_dir=".git/hooks"
+    local hook_file="$hooks_dir/pre-commit"
+    if [ -f "$hook_file" ] && grep -q "Ultimate Bug Scanner" "$hook_file" 2>/dev/null; then
+      if [ -f "${hook_file}.backup" ]; then
+        mv "${hook_file}.backup" "$hook_file"
         success "Restored backup git hook"
       else
-        rm -f ".git/hooks/pre-commit"
-        success "Removed git hook"
+        rm -f "$hook_file"
+        success "Removed git hook: $hook_file"
       fi
     fi
   fi
 
+  # 4. Claude Code: hook scripts and their settings.json registrations.
   if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove Claude Code hook?"; then
-    if [ -f ".claude/hooks/on-file-write.sh" ]; then
-      rm -f ".claude/hooks/on-file-write.sh"
-      success "Removed Claude hook"
-    fi
-  fi
-
-  if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove AI agent guardrails (.cursor/rules, etc.)?"; then
-    for dir in .cursor .codex .gemini .windsurf .cline .opencode; do
-      if [ -f "$dir/rules" ] && grep -q "Ultimate Bug Scanner" "$dir/rules" 2>/dev/null; then
-        sed -i.bak '/# >>> Ultimate Bug Scanner/,/# <<< End Ultimate Bug Scanner/d' "$dir/rules" 2>/dev/null
-        rm -f "$dir/rules.bak"
-        success "Removed guardrails from $dir/rules"
+    local claude_file
+    for claude_file in .claude/hooks/on-file-write.sh .claude/hooks/git_safety_guard.py; do
+      if [ -f "$claude_file" ]; then
+        rm -f "$claude_file"
+        success "Removed $claude_file"
       fi
     done
+    unregister_claude_settings_hooks
+    rmdir .claude/hooks .claude 2>/dev/null || true
   fi
 
+  # 5. Agent guardrail blocks and integration files.
+  if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove AI agent guardrails (.cursor/rules, etc.)?"; then
+    local dir
+    for dir in .cursor .gemini .windsurf .cline .opencode; do
+      remove_quick_reference_block "$dir/rules" && rmdir "$dir" 2>/dev/null || true
+    done
+    if [ -d ".codex/rules" ]; then
+      remove_quick_reference_block ".codex/rules/ubs.md" && rmdir ".codex/rules" ".codex" 2>/dev/null || true
+    elif [ -f ".codex/rules" ]; then
+      remove_quick_reference_block ".codex/rules" && rmdir ".codex" 2>/dev/null || true
+    fi
+    remove_quick_reference_block "AGENTS.md" || true
+    if [ -f ".github/copilot-instructions.md" ] && grep -q "Run Ultimate Bug Scanner" ".github/copilot-instructions.md" 2>/dev/null; then
+      rm -f ".github/copilot-instructions.md"
+      success "Removed .github/copilot-instructions.md"
+      rmdir ".github" 2>/dev/null || true
+    fi
+    remove_continue_commands ".continue/config.json"
+    remove_aider_integration "${HOME}/.aider.conf.yml"
+  fi
+
+  # 6. Cron job from setup_auto_update.
+  if check_cron; then
+    local current_crontab
+    current_crontab="$(crontab -l 2>/dev/null || true)"
+    if printf '%s\n' "$current_crontab" | grep -q "Ultimate Bug Scanner Auto-Update"; then
+      local remaining
+      remaining="$(printf '%s\n' "$current_crontab" | grep -v "Ultimate Bug Scanner Auto-Update" | sed '/^[[:space:]]*$/d')"
+      if [ -n "$remaining" ]; then
+        printf '%s\n' "$remaining" | crontab - 2>/dev/null || warn "Could not rewrite the crontab"
+      else
+        crontab -r 2>/dev/null || printf '' | crontab - 2>/dev/null || true
+      fi
+      success "Removed the daily auto-update cron job"
+    fi
+  fi
+
+  # 7. Module cache, config and session log.
   echo ""
   if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove cached modules?"; then
     local module_dir="${XDG_DATA_HOME:-$HOME/.local/share}/ubs"
@@ -2013,13 +2165,17 @@ uninstall_ubs() {
       fi
     fi
   fi
-  
+
   if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove configuration file?"; then
-    local config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ubs/install.conf"
-    if [ -f "$config_file" ]; then
-      rm -f "$config_file"
-      success "Removed config file: $config_file"
-    fi
+    local config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ubs"
+    local cfg
+    for cfg in "$config_dir/install.conf" "$config_dir/session.md"; do
+      if [ -f "$cfg" ]; then
+        rm -f "$cfg"
+        success "Removed $cfg"
+      fi
+    done
+    rmdir "$config_dir" 2>/dev/null || true
   fi
 
   echo ""
@@ -2030,6 +2186,168 @@ uninstall_ubs() {
   success "Ultimate Bug Scanner has been uninstalled"
   log "To reinstall: curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash"
   echo ""
+}
+
+# Drop blank lines at the end of a file (the installer appends a blank line
+# before every block it writes).
+strip_trailing_blank_lines() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="surrogateescape").read()
+stripped = text.rstrip("\n")
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(stripped + "\n" if stripped else "")
+PY
+  else
+    sed -i.bak -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$file" 2>/dev/null && rm -f "${file}.bak"
+  fi
+}
+
+# Remove the UBS quick-reference block from a rules/AGENTS file. Handles the
+# marked form (<!-- >>> ... --> / <!-- <<< End ... -->) and the legacy form
+# (the ````markdown fence directly followed by the "## UBS Quick Reference"
+# heading, up to the closing ```` fence). Deletes the file when nothing else
+# is left. Returns 0 when the file was removed entirely, 1 otherwise.
+remove_quick_reference_block() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  grep -q "UBS Quick Reference for AI Agents" "$file" 2>/dev/null || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$file" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="surrogateescape").read()
+marked = re.compile(r"\n?<!-- >>> Ultimate Bug Scanner quick reference.*?<!-- <<< End Ultimate Bug Scanner quick reference -->\n?", re.S)
+legacy = re.compile(r"\n?````markdown\n## UBS Quick Reference for AI Agents\n.*?\n````\n?", re.S)
+new = marked.sub("\n", text)
+new = legacy.sub("\n", new)
+new = new.rstrip("\n") + ("\n" if new.strip() else "")
+open(path, "w", encoding="utf-8", errors="surrogateescape").write(new)
+PY
+  else
+    sed -i.bak '/<!-- >>> Ultimate Bug Scanner quick reference/,/<!-- <<< End Ultimate Bug Scanner quick reference -->/d' "$file" 2>/dev/null && rm -f "${file}.bak"
+  fi
+  if [ ! -s "$file" ] || ! grep -q '[^[:space:]]' "$file" 2>/dev/null; then
+    rm -f "$file"
+    success "Removed $file (only contained the UBS quick reference)"
+    return 0
+  fi
+  success "Removed UBS quick reference from $file"
+  return 1
+}
+
+# Remove the UBS commands from a Continue config.json; delete the file when the
+# installer created it and nothing else is in it.
+remove_continue_commands() {
+  local config="$1"
+  [ -f "$config" ] || return 0
+  grep -q "ubs" "$config" 2>/dev/null || return 0
+  command -v python3 >/dev/null 2>&1 || { warn "python3 not available; remove the UBS commands from $config manually"; return 0; }
+  local result
+  result="$(python3 - "$config" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception:
+    print("invalid"); sys.exit(0)
+if not isinstance(data, dict):
+    print("invalid"); sys.exit(0)
+def keep(entry):
+    text = json.dumps(entry)
+    return not (isinstance(entry, dict) and "ubs" in text and entry.get("name") in ("scan-bugs", "quality"))
+for key in ("customCommands", "slashCommands"):
+    if isinstance(data.get(key), list):
+        data[key] = [e for e in data[key] if keep(e)]
+        if not data[key]:
+            del data[key]
+if data:
+    json.dump(data, open(path, "w", encoding="utf-8"), indent=2)
+    open(path, "a", encoding="utf-8").write("\n")
+    print("stripped")
+else:
+    os.remove(path)
+    print("removed")
+PY
+)"
+  case "$result" in
+    removed) success "Removed $config (only contained the UBS commands)"; rmdir "$(dirname "$config")" 2>/dev/null || true ;;
+    stripped) success "Removed UBS commands from $config" ;;
+    *) warn "Could not parse $config; remove the UBS commands manually" ;;
+  esac
+}
+
+# Remove the lint-cmd/auto-lint lines the installer added to an Aider config;
+# delete the file when the installer created it.
+remove_aider_integration() {
+  local conf="$1"
+  [ -f "$conf" ] || return 0
+  if head -n 1 "$conf" | grep -q "^# Aider configuration with UBS integration"; then
+    rm -f "$conf"
+    success "Removed $conf (created by the installer)"
+    return 0
+  fi
+  if grep -q "# Ultimate Bug Scanner integration" "$conf" 2>/dev/null; then
+    sed -i.bak '/# Ultimate Bug Scanner integration/,+2d' "$conf" 2>/dev/null && rm -f "${conf}.bak"
+    strip_trailing_blank_lines "$conf"
+    success "Removed UBS integration from $conf"
+  fi
+}
+
+# Remove the hook registrations register_claude_settings_hooks added; delete
+# settings.json when nothing else is left in it.
+unregister_claude_settings_hooks() {
+  local settings=".claude/settings.json"
+  [ -f "$settings" ] || return 0
+  grep -q -E "on-file-write.sh|git_safety_guard.py" "$settings" 2>/dev/null || return 0
+  command -v python3 >/dev/null 2>&1 || { warn "python3 not available; remove the UBS hooks from $settings manually"; return 0; }
+  local result
+  result="$(python3 - "$settings" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, encoding="utf-8"))
+except Exception:
+    print("invalid"); sys.exit(0)
+hooks = data.get("hooks") if isinstance(data, dict) else None
+if not isinstance(hooks, dict):
+    print("unchanged"); sys.exit(0)
+ours = ("on-file-write.sh", "git_safety_guard.py")
+for event in list(hooks):
+    entries = hooks[event]
+    if not isinstance(entries, list):
+        continue
+    kept = []
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
+            entry["hooks"] = [h for h in entry["hooks"] if not any(o in str(h.get("command", "")) for o in ours)]
+            if not entry["hooks"]:
+                continue
+        kept.append(entry)
+    if kept:
+        hooks[event] = kept
+    else:
+        del hooks[event]
+if not hooks:
+    del data["hooks"]
+if data:
+    json.dump(data, open(path, "w", encoding="utf-8"), indent=2)
+    open(path, "a", encoding="utf-8").write("\n")
+    print("stripped")
+else:
+    os.remove(path)
+    print("removed")
+PY
+)"
+  case "$result" in
+    removed) success "Removed $settings (only contained the UBS hooks)" ;;
+    stripped) success "Removed UBS hook registrations from $settings" ;;
+    unchanged) ;;
+    *) warn "Could not parse $settings; remove the UBS hooks manually" ;;
+  esac
 }
 
 install_jq() {
@@ -2529,6 +2847,10 @@ determine_install_dir() {
     echo "/usr/local/bin"; return
   fi
 
+  if dry_run_enabled; then
+    echo "$HOME/.local/bin"; return
+  fi
+
   if [ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
     echo "$HOME/.local/bin"
   elif [ -w "/usr/local/bin" ]; then
@@ -2543,7 +2865,6 @@ install_scanner() {
   install_dir="$(determine_install_dir)"
   local use_sudo=""
   use_sudo="$(maybe_sudo "$install_dir")"
-  local downloaded_from_release=0
 
   log "Installing Ultimate Bug Scanner to $install_dir..."
 
@@ -2578,10 +2899,11 @@ install_scanner() {
   # (or if it was writable all along) the rest of the install runs unprivileged.
   use_sudo="$(maybe_sudo "$install_dir")"
 
-  # Download or copy script
+  # Download or copy the runner into WORKDIR first (cleaned up on every exit
+  # path, and never subject to the install dir's permissions), then move it.
   local script_path="$install_dir/$INSTALL_NAME"
-  local temp_path="${script_path}.tmp"
-  register_temp_path "$temp_path"
+  local temp_path
+  temp_path="$(mktemp_in_workdir "${INSTALL_NAME}.download.XXXXXX")"
 
   local download_err
   download_err="$(mktemp_in_workdir "download-error.log.XXXXXX")"
@@ -2591,9 +2913,34 @@ install_scanner() {
     secure_fetch "$url" "$out" "$download_err"
   }
 
-  if [ -f "./$SCRIPT_NAME" ]; then
-    log "Installing from local file..."
-    if cp "./$SCRIPT_NAME" "$temp_path" 2>/dev/null; then
+  # Local install sources (bead E4). A ./ubs in the CURRENT directory is never
+  # installed implicitly: `curl | bash` run from a directory that happens to
+  # contain a stale or planted ubs must still install the verified release.
+  # Two deliberate cases install a local file: --local (./ubs, else the copy
+  # next to this script), and running install.sh from a repository checkout
+  # (ubs and VERSION next to the installer).
+  local local_source="" installer_dir=""
+  if [ -f "${BASH_SOURCE[0]:-}" ]; then
+    installer_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  fi
+  if [ "$LOCAL_INSTALL" -eq 1 ]; then
+    if [ -f "./$SCRIPT_NAME" ]; then
+      local_source="./$SCRIPT_NAME"
+    elif [ -n "$installer_dir" ] && [ -f "$installer_dir/$SCRIPT_NAME" ]; then
+      local_source="$installer_dir/$SCRIPT_NAME"
+    else
+      error "--local given but no $SCRIPT_NAME in $(pwd) or next to the installer"
+      return 1
+    fi
+  elif [ -n "$installer_dir" ] && [ -f "$installer_dir/$SCRIPT_NAME" ] && [ -f "$installer_dir/VERSION" ]; then
+    local_source="$installer_dir/$SCRIPT_NAME"
+  elif [ -f "./$SCRIPT_NAME" ]; then
+    warn "Ignoring ./$SCRIPT_NAME in $(pwd): local files are only installed with --local; installing the verified release instead"
+  fi
+
+  if [ -n "$local_source" ]; then
+    log "Installing from local file $local_source (no release verification: you chose this file)..."
+    if cp "$local_source" "$temp_path" 2>/dev/null; then
       if head -n 1 "$temp_path" | grep -q '^#!/.*bash'; then
         :
       else
@@ -2632,7 +2979,8 @@ install_scanner() {
       warn "Downloading unverified ${SCRIPT_NAME} from GitHub main..."
 
       # Append cache-buster so users never get stale CDN copies
-      local cache_buster="$(date +%s)"
+      local cache_buster
+      cache_buster="$(date +%s)"
       local download_url="${REPO_URL}/${SCRIPT_NAME}?cache=${cache_buster}"
 
       if download_to_file "$download_url" "$temp_path"; then
@@ -3071,7 +3419,8 @@ setup_codex_rules() {
   # If rules exists as a file (legacy format), migrate it
   if [ -f "$rules_path" ]; then
     log "Migrating Codex rules from file to directory format..."
-    local backup="${rules_path}.backup.$(date +%s)"
+    local backup
+    backup="${rules_path}.backup.$(date +%s)"
     mv "$rules_path" "$backup"
     mkdir -p "$rules_path"
     mv "$backup" "${rules_path}/legacy-rules.md"
@@ -3358,6 +3707,7 @@ detect_coding_agents() {
 
 quick_reference_block() {
 cat <<'QUICK_REF'
+<!-- >>> Ultimate Bug Scanner quick reference (written by install.sh; removed by install.sh --uninstall) -->
 ````markdown
 ## UBS Quick Reference for AI Agents
 
@@ -3407,6 +3757,7 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - ❌ Full scan per edit → ✅ Scope to file
 - ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
 ````
+<!-- <<< End Ultimate Bug Scanner quick reference -->
 QUICK_REF
 }
 
@@ -3607,20 +3958,6 @@ for _arg in "$@"; do
   esac
 done
 
-# Concurrent execution lock to prevent race conditions
-
-acquire_lock
-
-# Load configuration file (before argument parsing so CLI args can override)
-
-read_config_file
-
-# Resolve "main" to the actual release tag the artifact alias serves, so the
-# banner and session summary report the real version (issue #95, cosmetic).
-resolve_release_tag
-
-print_header
-
 # Pre-parse the flags that change how the steps *before* the main parse loop
 # behave (the update prompt, dry-run, colors): argument order must not matter.
 
@@ -3631,6 +3968,23 @@ if [[ " ${ORIGINAL_ARGS[*]} " =~ " --no-color " ]]; then COLOR_ENABLED=0; init_c
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --easy-mode " ]]; then EASY_MODE=1; NON_INTERACTIVE=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --non-interactive " ]]; then NON_INTERACTIVE=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --dry-run " ]]; then DRY_RUN=1; fi
+
+# Concurrent execution lock to prevent race conditions. A dry run reads and
+# reports only, so it takes no lock and cannot be blocked by (or leave) one.
+
+if ! dry_run_enabled; then
+  acquire_lock
+fi
+
+# Load configuration file (before argument parsing so CLI args can override)
+
+read_config_file
+
+# Resolve "main" to the actual release tag the artifact alias serves, so the
+# banner and session summary report the real version (issue #95, cosmetic).
+resolve_release_tag
+
+print_header
 
 # Check for updates (unless skipped or updating)
 
@@ -3698,6 +4052,10 @@ shift
 ;;
 --skip-verification)
 RUN_VERIFICATION=0
+shift
+;;
+--local)
+LOCAL_INSTALL=1
 shift
 ;;
 --insecure)

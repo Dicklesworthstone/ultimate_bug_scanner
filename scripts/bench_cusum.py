@@ -60,14 +60,26 @@ def baseline_sigma(item: dict, default: float) -> float:
     return default
 
 
+def read_json(path: Path, what: str) -> dict:
+    """Load a benchmark document; a corrupt file is a clear error, not a traceback."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"[bench-cusum] cannot read {what} {path}: {exc}") from exc
+
+
 def load_history(path: Path, latest: Path | None) -> list[dict]:
     docs: list[dict] = []
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
                 docs.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise SystemExit(f"[bench-cusum] {path}:{lineno} is not JSON: {exc}") from exc
     if latest and latest.exists():
-        doc = json.loads(latest.read_text(encoding="utf-8"))
+        doc = read_json(latest, "latest results")
         if not docs or docs[-1].get("generated_at") != doc.get("generated_at"):
             docs.append(doc)
     return docs
@@ -87,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.baseline.exists():
         print(f"[bench-cusum] no baseline at {args.baseline}: nothing to compare (copy benchmarks/latest.json there to start)")
         return 0
-    baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
+    baseline = read_json(args.baseline, "baseline")
     history = load_history(args.history, args.latest)
     if not history:
         print("[bench-cusum] no history to compare")

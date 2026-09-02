@@ -2,6 +2,7 @@
 name = "ubs_rust_buggy"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [[bin]]
 name = "buggy_unwrap"

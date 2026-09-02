@@ -247,6 +247,24 @@ jobs:
           export PATH="$(brew --prefix)/bin:$PATH"
           bash test-suite/install/run_tests.sh
 
+      - name: toon_rust encoder installs from its release and drives --format=toon
+        # The digest-pinned darwin asset (bead 3a6.6, macOS half): a throwaway
+        # HOME, the installer's easy mode accepting the toon prompt, then ubs
+        # finds the installed `toon` on PATH without configuration.
+        env:
+          NO_COLOR: "1"
+        run: |
+          export PATH="$(brew --prefix)/bin:$PATH"
+          home="$(mktemp -d)"
+          mkdir -p "$home/.local/bin"
+          HOME="$home" bash ./install.sh --local --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos \
+            --skip-doctor --skip-hooks --skip-version-check --no-path-modify --install-dir "$home/.local/bin" | tee toon-install.log
+          grep -q 'Checksum verified for toon-darwin-' toon-install.log
+          "$home/.local/bin/toon" --version
+          PATH="$home/.local/bin:$PATH" ./ubs --ci --only=python --format=toon test-suite/python/clean > toon-scan.out
+          head -n 3 toon-scan.out
+          grep -q '^status: ok' toon-scan.out
+
       - name: Homebrew tap install (released channel, informational)
         # Exercises `brew install dicklesworthstone/tap/ubs` from the README.
         # It installs the last RELEASE, not this commit, so it cannot block a
@@ -335,7 +353,7 @@ jobs:
         # carry ~130 unused-variable warnings and stay at -S error until the
         # shared-library work (A1) retires that boilerplate.
         run: |
-          shellcheck -S warning install.sh ubs scripts/*.sh test-suite/*.sh test-suite/install/run_tests.sh .githooks/* .claude/hooks/*.sh
+          shellcheck -S warning install.sh ubs modules/lib/*.sh scripts/*.sh test-suite/*.sh test-suite/install/run_tests.sh .githooks/* .claude/hooks/*.sh
           shellcheck -S error modules/*.sh
 
       - name: Compile-check Python files

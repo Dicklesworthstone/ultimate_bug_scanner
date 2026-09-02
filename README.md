@@ -52,7 +52,7 @@ Note: Windows users must run the installer one-liner from within Git Bash, or us
 # Scan current repo (JSON)
 ubs . --format=json
 
-# Token-optimized output (TOON; needs toon_rust's tru — without it ubs exits 2 with the error envelope)
+# Token-optimized output (TOON; needs toon_rust's encoder, which install.sh installs — without it ubs exits 2 with the error envelope)
 ubs . --format=toon
 
 # Scan only staged changes
@@ -196,7 +196,7 @@ ubs --profile=loose    # Skip TODO/debug/code-quality nits when prototyping
 # Machine-readable output
 ubs . --format=json    # Pure JSON on stdout; logs go to stderr
 ubs . --format=jsonl   # Line-delimited summary per scanner + totals
-ubs . --format=toon    # TOON format (~50% smaller than JSON, LLM-optimized); exit 2 + envelope when tru is missing
+ubs . --format=toon    # TOON format (~50% smaller than JSON, LLM-optimized); exit 2 + envelope when the toon_rust encoder is missing
 ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"strung"
 ```
 
@@ -279,9 +279,10 @@ The installer will:
 - ✅ Optionally install `ripgrep` (for 10x faster scanning)
 - ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
 - ✅ Optionally install `typos` (smart spellchecker for docs and identifiers)
+- ✅ Optionally install toon_rust's `toon` encoder for `--format=toon` (digest-pinned release binary; `cargo install tru` as the fallback)
 - ✅ Optionally install `Node.js + typescript` (enables deep TypeScript type narrowing analysis)
 - ✅ Auto-run `ubs doctor` post-install and append a session summary to `~/.config/ubs/session.md`
-- ✅ Capture readiness facts (ripgrep/jq/typos/type narrowing) and store them for `ubs sessions --entries 1`
+- ✅ Capture readiness facts (ripgrep/jq/typos/toon/type narrowing) and store them for `ubs sessions --entries 1`
 - ✅ Set up git hooks (block commits with critical bugs)
 - ✅ Set up Claude Code hooks (scan on file save)
 - ✅ Add documentation to your AGENTS.md
@@ -345,6 +346,7 @@ This command deletes the UBS binary, shell RC snippets/aliases, config under `~/
 | `--dry-run` | Prints every install action (downloads, PATH edits, hook writes, cleanup) without touching disk. Dry runs still resolve config, detect agents, and show you exactly what *would* change. | Audit the installer, demo it to teammates, or validate CI steps without modifying a workstation. |
 | `--self-test` | Immediately runs `test-suite/install/run_tests.sh` after installation and exits non-zero if the smoke suite fails. | CI/CD jobs and verified setups can prove the installer still works end-to-end before trusting a release. |
 | `--skip-type-narrowing` | Skip the Node.js + TypeScript readiness probe **and** the cross-language guard analyzers (JS/Rust/Kotlin/Swift/C#). | Useful for air-gapped hosts or environments that want to stay in heuristic-only mode. |
+| `--skip-toon` | Skip installing toon_rust's `toon` encoder, the digest-verified release binary that `--format=toon` needs. | For hosts that already ship `toon`/`tru`, or when you never use TOON output. |
 | `--skip-typos` | Skip the Typos spellchecker installation + diagnostics. | Handy when corp images already provide Typos or when you deliberately disable spellcheck automation. |
 | `--skip-doctor` | Skip the automatic `ubs doctor` run + session summary after install. | Use when CI already runs doctor separately or when you're iterating locally and want a faster finish. |
 
@@ -376,7 +378,7 @@ bash install.sh --easy-mode --self-test --skip-hooks
 bash install.sh --local --skip-hooks
 ```
 
-Dependency binaries the installer downloads (ast-grep, jq, typos, ripgrep) are verified against
+Dependency binaries the installer downloads (ast-grep, jq, typos, ripgrep, toon) are verified against
 pinned SHA-256 digests or the upstream `.sha256` sidecar before they are installed; a mismatch
 aborts that install, and `--skip-verification` prints exactly which check it skipped.
 

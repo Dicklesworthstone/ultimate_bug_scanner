@@ -173,7 +173,7 @@ ubs doctor                # Check environment
 ubs doctor --fix          # Auto-fix missing dependencies
 ```
 
-Checks: curl/wget, ast-grep, ripgrep, jq, typos, Node.js + TypeScript.
+Checks: checksum tool, curl/wget, writable module cache, ast-grep, the toon encoder (`--format=toon`), and module + helper checksums (refreshed with `--fix`).
 
 ## Agent Integration
 

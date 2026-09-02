@@ -256,6 +256,8 @@ ultimate_bug_scanner/
 │       ├── type_narrowing_rust.py     # Rust type narrowing
 │       ├── type_narrowing_swift.py    # Swift type narrowing
 │       └── type_narrowing_ts.js       # TypeScript type narrowing
+│   └── lib/
+│       └── ubs-common.sh              # Shared module primitives (locale, json_escape, format contract, NUL-safe file listing); verified like a helper
 ├── scripts/
 │   ├── check-version-tag-drift.sh     # CI guard: main's module checksums vs the last tag
 │   ├── setup_dev.sh                   # Dev environment setup

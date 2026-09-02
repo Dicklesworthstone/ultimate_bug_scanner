@@ -21,13 +21,18 @@ This playbook documents how to cut and publish a signed UBS release. The release
 
 ## Release steps
 
-1. **Bump version**
-   - Update `VERSION` to the new semantic version (for example `5.1.0`).
-   - Update docs/readme snippets if they mention the version.
-2. **Commit and tag**
+1. **Cut the release with the script** (the only supported path — doing the steps by
+   hand is what produced the recurring version-tag checksum drift issues):
    ```bash
-   git commit -am "chore: bump version to 5.1.0"
-   git tag v5.1.0
+   scripts/cut-release.sh 5.4.0 --yes      # add --dry-run to preview, --no-commit to inspect first;
+                                           # without --yes it asks before committing and refuses when non-interactive
+   ```
+   It bumps `VERSION`, `UBS_VERSION` in `ubs` and the README badge; regenerates
+   `MODULE_CHECKSUMS`/`HELPER_CHECKSUMS` and `SHA256SUMS`; rolls the `## [Unreleased]`
+   section of `CHANGELOG.md` under `## [v5.4.0] - <date> [Release]`; verifies
+   everything; then commits and creates the annotated tag `v5.4.0`. It never pushes.
+2. **Push**
+   ```bash
    git push origin main --tags
    ```
 3. **Workflow runs automatically** on the pushed tag:

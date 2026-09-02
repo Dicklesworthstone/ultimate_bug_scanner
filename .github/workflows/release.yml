@@ -105,6 +105,9 @@ jobs:
       - name: Generate checksums
         run: |
           sha256sum install.sh ubs scripts/verify.sh > dist/SHA256SUMS
+          # The Claude Code safety guard is installed by install.sh from the
+          # release assets and verified against this manifest (flat name).
+          (cd .claude/hooks && sha256sum git_safety_guard.py) >> dist/SHA256SUMS
 
       - name: Sign checksums with minisign
         env:
@@ -156,6 +159,7 @@ jobs:
           cp install.sh dist/
           cp ubs dist/
           cp scripts/verify.sh dist/
+          cp .claude/hooks/git_safety_guard.py dist/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -311,6 +315,7 @@ jobs:
             dist/ubs
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
+            dist/git_safety_guard.py
             dist/ubs.rb
             dist/sbom.spdx.json
             oci/oci-sbom.spdx.json

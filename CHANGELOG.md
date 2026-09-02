@@ -10,21 +10,27 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Added
 
----
-
-## [v5.4.0-rc1] - 2026-09-02 [Release]
+- **`scripts/cut-release.sh` is the one supported release path.** It bumps `VERSION`, `UBS_VERSION` and the README badge atomically, regenerates `MODULE_CHECKSUMS`/`HELPER_CHECKSUMS`/`SHA256SUMS`, rolls this changelog's `[Unreleased]` section under the new tag, verifies everything, then commits and creates the annotated tag. It never pushes, and it refuses to commit or tag unless `--yes` is passed or a terminal confirms (`--dry-run` previews, `--no-commit` only stages). CI runs the dry-run on every push. `docs/release.md` now documents this flow instead of the hand-run steps that produced #83/#86/#97.
+- **Fail-closed helper verification.** A cached helper asset that fails checksum verification is now refused for scanning (exit 2 with a clear message) instead of being used anyway; `UBS_ALLOW_UNVERIFIED_HELPERS=1` is the explicit escape hatch and `UBS_REPO_RAW_BASE` lets tests serve assets from a local `file://` mirror. Covered by `test-suite/shareable/test_supply_chain.py` (tampered module, tampered helper, offline cache, mirror override).
+- **CLI contract hardening.** `--format sarif` (space form), `--no-color`, `--output FILE`/`-o`, `--include-ext=`, `--rules=`, `--list-categories` and `--` are accepted; unknown options and invalid formats exit 2 instead of being silently treated as paths; `CI=true` also disables auto-update. `test-suite/shareable/test_cli_contract.py` pins the contract (12 checks) and runs in CI.
+- **Manifest SARIF expectations.** `test-suite/run_manifest.py` parses SARIF output natively and manifest cases can assert `min_runs`, `min_results`, `require_rule_ids` and `forbid_rule_ids` per scan; JS/TS/polyglot SARIF cases were added.
+- **Constant-time comparison detector (Python, Go) uses the two-tier vocabulary from #85.** Only qualified identifiers (`auth_token`, `api_key`, `password`) or strong terms count as secrets; bare `token`/`key`/`id` and metadata like `token_count` no longer trip the rule. New positive/negative fixtures under `test-suite/{python,golang}/security/parser_token_compare_*`.
+- **Installer.** Claude Code integration writes a hook that reads the tool call JSON on stdin (the `$FILE_PATH` contract never existed), registers PostToolUse/PreToolUse hooks in `.claude/settings.json` idempotently, and installs `git_safety_guard.py` (verified against `SHA256SUMS`, shipped with each release). `--help`/`--info` work before the lock or any network access, action flags are order-independent, and a missing PATH entry is a warning rather than a failed install. `test-suite/install/run_tests.sh` gained three scenarios and runs in CI.
+- **Docker image** ships the modules, installs `rsync`/`python3`/`unzip`, and pre-provisions the digest-verified ast-grep into `/opt/ubs/tools` at build time, so `docker run --network=none` scans work offline; a `docker-smoke` CI job proves it.
 
 ### Fixes
 
+- **Scan-mode mismatches are fatal.** When a module fails checksum verification or cannot be provisioned, the meta-runner now exits 2 instead of reporting a partial "clean" result, and the negated `$?` test that hid this is gone.
 - **`--format=sarif` no longer fails for JavaScript/TypeScript with "Duplicate rule id".** The per-grammar rule variants introduced for #93 reuse each base rule's id on purpose, but SARIF mode loaded the whole rule directory into one `ast-grep scan -c`, which rejects duplicate ids — every SARIF scan of a JS/TS tree has exited 2 since v5.3.12 (the meta-runner then emitted a degraded summary-only SARIF run). `modules/ubs-js.sh` now scans the base pack and each `__variants-<grammar>.yml` as separate rule sets and merges the SARIF runs (`run_sarif_rule_pack_scan`). The rule-pack SARIF evidence golden was regenerated: the JS corpus now reports 201 results across 37 rules because `.ts`/`.tsx` fixtures finally contribute.
 - **Test gates are green again on non-C locales and on `main`.** `test-suite/run_all.sh` sorts dumped rule ids under `LC_ALL=C` so the Go inventory check no longer depends on the developer's collation, and `rust-loop-scope-collection-push-clean` (a #96 perf-heuristic regression fixture) dropped a stray `security` tag that made the quality harness demand a non-existent buggy twin — the reason the "UBS Test Suite" workflow had been red since 2026-08-17. `test-suite/goldens/rule_coverage.json` regenerated accordingly.
 
 ### Housekeeping
 
 - **Dependency refresh.** ast-grep pin 0.40.1 → 0.45.3 (new `AST_GREP_ASSET_SHA256` digests for all five targets; CI installs the same version via `@ast-grep/cli@0.45.3`); installer binary fallbacks ripgrep 14.1.0 → 15.2.0, jq 1.7.1 → 1.8.2, typos 1.28.4 → 1.50.1; release toolchain jq 1.8.2 / ripgrep 15.2.0 (`ripgrep_<ver>-1_amd64.deb` naming) / uv 0.12.9 / syft v1.51.1 / cosign v3.1.3 via cosign-installer v4.1.2 (Cosign v3 bundles need Cosign ≥ 3 to verify — noted in `docs/security.md`); GitHub Actions bumped to their current majors (checkout v7, upload-artifact v7, download-artifact v8, setup-uv v10, install-nix-action v31 with Nix 2.35.2, docker/* v4 and build-push-action v7, action-gh-release v3, repository-dispatch v4, sbom-action pinned to v0.24.2); toon_rust v0.2.4; `flake.nix` on nixpkgs `nixos-26.05`; Docker base `debian:trixie-slim`.
-- `MODULE_CHECKSUMS` (js) and `SHA256SUMS` regenerated; `scripts/check-version-tag-drift.sh` will flag `ubs-js.sh` against `v5.3.13` until the next tag is cut.
+- `MODULE_CHECKSUMS` (js, python, golang) and `SHA256SUMS` regenerated; `scripts/check-version-tag-drift.sh` will flag those modules against `v5.3.13` until the next tag is cut with `scripts/cut-release.sh`.
+- **Docs corrected to match the code:** AGENTS.md, SKILL.md, `modules/README.md` and the README now state 10 languages, the real flag set, exit codes 2/3, the stdin hook contract, the measured performance table, and the suppression comment placements that actually work.
 
 ---
 

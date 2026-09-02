@@ -1,11 +1,11 @@
 ---
 name: ubs
-description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 18 detection categories, 8 languages, 4-layer analysis engine. The AI agent's quality gate."
+description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 14-24 detection categories per language, 10 languages, regex + ast-grep + AST-helper analysis. The AI agent's quality gate."
 ---
 
 # UBS - Ultimate Bug Scanner
 
-Static analysis tool built for AI coding workflows. Catches bugs that AI agents commonly introduce: null safety, async/await issues, security holes, memory leaks. Scans JS/TS, Python, Go, Rust, Java, C++, Ruby, Swift in 3-5 seconds.
+Static analysis tool built for AI coding workflows. Catches bugs that AI agents commonly introduce: null safety, async/await issues, security holes, memory leaks. Scans JS/TS, Python, Go, Rust, Java/Kotlin, C/C++, Ruby, Swift, C#, and Elixir. Single-file scans take a few seconds; scope scans to changed files (see Speed Tips).
 
 ## Why This Exists
 
@@ -63,7 +63,7 @@ Exit code: 1
 
 Parse: `file:line:col` → location | `💡` → how to fix | Exit 0/1 → pass/fail
 
-## The 18 Detection Categories
+## Detection Categories (14 to 24 per language; numbers differ per module, so prefer `--skip-<lang>=N`)
 
 ### Critical (Always Fix)
 
@@ -146,12 +146,12 @@ Useful for CI to detect regressions vs. main branch.
 
 ## Inline Suppression
 
-When a finding is intentional:
+When a finding is intentional, put `ubs:ignore` in a comment on the flagged line or on the line directly above it (there is no `ubs:ignore-next-line` marker):
 
 ```javascript
 eval(trustedCode);  // ubs:ignore
 
-// ubs:ignore-next-line
+// ubs:ignore -- reviewed: trusted admin input
 dangerousOperation();
 ```
 
@@ -161,7 +161,8 @@ dangerousOperation();
 |------|---------|
 | `0` | No critical issues (safe to commit) |
 | `1` | Critical issues or warnings (with `--fail-on-warning`) |
-| `2` | Environment error (missing ast-grep, etc.) |
+| `2` | Environment or usage error (unknown flag, missing ast-grep, unverified module/helper, timeout) |
+| `3` | Nothing was scanned (no supported language) — not a pass |
 
 ## Doctor Command
 
@@ -187,17 +188,20 @@ UBS auto-configures hooks for coding agents during install:
 
 ### Claude Code Hook Pattern
 
+The installer registers `.claude/hooks/on-file-write.sh` as a `PostToolUse` hook on
+`Edit|Write|MultiEdit` (and `git_safety_guard.py` as a `PreToolUse` hook on `Bash`) in
+`.claude/settings.json`. The hook reads the tool call from stdin and scans only the file
+that was written; critical findings come back to Claude as feedback (exit 2):
+
 ```bash
-#!/bin/bash
-# .claude/hooks/on-file-write.sh
-if [[ "$FILE_PATH" =~ \.(js|jsx|ts|tsx|py|go|rs|java|rb)$ ]]; then
-  echo "🔬 Quality check running..."
-  if ubs "${PROJECT_DIR}" --ci 2>&1 | head -30; then
-    echo "✅ No critical issues"
-  else
-    echo "⚠️  Issues detected - review above"
-  fi
-fi
+#!/usr/bin/env bash
+# .claude/hooks/on-file-write.sh (abridged; the installer writes the full version)
+file="$(jq -r '.tool_input.file_path // empty')"          # Claude Code passes JSON on stdin
+[[ -f "$file" ]] || exit 0
+case "$file" in *.js|*.ts|*.tsx|*.py|*.go|*.rs|*.java|*.rb|*.swift|*.cs|*.ex) ;; *) exit 0 ;; esac
+if report="$(ubs "$file" --ci 2>&1)"; then exit 0; fi
+printf 'UBS found critical issues in %s:\n%s\n' "$file" "$report" >&2
+exit 2
 ```
 
 ### Git Pre-Commit Hook

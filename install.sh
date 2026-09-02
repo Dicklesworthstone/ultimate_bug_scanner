@@ -762,7 +762,7 @@ safe_timeout() {
       return 124  # Standard timeout exit code
     fi
     sleep 1
-    ((count++))
+    count=$((count + 1))
   done
 
   # Get actual exit status
@@ -1302,24 +1302,34 @@ verify_installation() {
   log_section "POST-INSTALL VERIFICATION"
   log "Running post-install verification..."
   local errors=0
-  local had_ubs=0
+  local ubs_cmd=""
+  local installed_bin
+  installed_bin="$(determine_install_dir)/$INSTALL_NAME"
 
-  # Test 1: Command available
+  # Test 1: Command available. Not being on PATH yet is the normal state of a
+  # clean first install (the completion banner tells the user to reload their
+  # shell), so it is a warning, not a failure; only a missing binary is fatal.
   if command -v ubs >/dev/null 2>&1; then
     success "ubs command available in PATH"
     log "   Location: $(command -v ubs)"
-    had_ubs=1
+    ubs_cmd="ubs"
+  elif [ -x "$installed_bin" ]; then
+    warn "ubs command not found in PATH yet (installed at $installed_bin; reload your shell or add its directory to PATH)"
+    ubs_cmd="$installed_bin"
   else
-    error "ubs command not found in PATH"
-    ((errors++))
+    error "ubs command not found in PATH and no binary at $installed_bin"
+    # Not `((errors++))`: with errors=0 that evaluates to 0, returns status 1,
+    # and under `set -e` aborted the whole installer before the doctor run,
+    # session log, and PATH advice ever happened.
+    errors=$((errors + 1))
   fi
 
-  # Test 2: Can execute --help
-  if ubs --help >/dev/null 2>&1 || ubs -h >/dev/null 2>&1; then
+  # Test 2: Can execute --help (against whichever binary Test 1 found)
+  if [ -n "$ubs_cmd" ] && { "$ubs_cmd" --help >/dev/null 2>&1 || "$ubs_cmd" -h >/dev/null 2>&1; }; then
     success "ubs executes successfully"
   else
     error "ubs command fails to run"
-    ((errors++))
+    errors=$((errors + 1))
   fi
 
   # Test 3: Dependencies
@@ -1378,8 +1388,8 @@ if (value === NaN) {
 }
 SMOKE
 
-  if [ "$had_ubs" -eq 1 ]; then
-    if safe_timeout 10 ubs --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1; then
+  if [ -n "$ubs_cmd" ]; then
+    if safe_timeout 10 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1; then
       warn "Smoke test FAILED - scanner did not flag known bugs (exit 0)"
     else
       success "Smoke test PASSED - scanner detects bugs (non-zero exit)"
@@ -2838,37 +2848,200 @@ create_alias() {
 
 setup_claude_code_hook() {
   if dry_run_enabled; then
-    log_dry_run "Would configure Claude Code hook at .claude/hooks/on-file-write.sh."
+    log_dry_run "Would write .claude/hooks/on-file-write.sh, install .claude/hooks/git_safety_guard.py, and register both in .claude/settings.json."
     return 0
   fi
   if [ ! -d ".claude" ]; then
     mkdir -p ".claude"
     log "Created .claude directory for Claude Code integration."
   fi
-  log "Setting up Claude Code hook..."
+  log "Setting up Claude Code hooks..."
 
   local hook_dir=".claude/hooks"
   local hook_file="$hook_dir/on-file-write.sh"
 
   mkdir -p "$hook_dir"
 
+  # Keep this in sync with .claude/hooks/on-file-write.sh in the repository.
   cat > "$hook_file" << 'HOOK_EOF'
-#!/bin/bash
-# Ultimate Bug Scanner - Claude Code Hook
-# Runs on every file save for UBS-supported languages (JS/TS, Python, C/C++, Rust, Go, Java, Ruby, Swift, C#)
+#!/usr/bin/env bash
+# Ultimate Bug Scanner - Claude Code PostToolUse hook for Edit|Write|MultiEdit.
+#
+# Claude Code passes the tool call as JSON on stdin ({"tool_name": ..., "tool_input":
+# {"file_path": ...}}). The hook scans just the file that was written and, when UBS
+# reports critical findings, exits 2 so the scanner output is shown to Claude as
+# feedback on the edit it just made. Clean files exit 0 silently.
+set -u
 
-if [[ "$FILE_PATH" =~ \.(js|jsx|ts|tsx|mjs|cjs|py|pyw|pyi|c|cc|cpp|cxx|h|hh|hpp|hxx|rs|go|java|rb|cs|csx)$ ]]; then
-  echo "🔬 Running bug scanner..."
-  if ! command -v ubs >/dev/null 2>&1; then
-    echo "⚠️  'ubs' not found in PATH; install it before using this hook." >&2
-    exit 0
+payload="$(cat 2>/dev/null || true)"
+file=""
+if [[ -n "$payload" ]]; then
+  if command -v jq >/dev/null 2>&1; then
+    file="$(printf '%s' "$payload" | jq -r '.tool_input.file_path // .tool_input.path // empty' 2>/dev/null || true)"
+  elif command -v python3 >/dev/null 2>&1; then
+    file="$(printf '%s' "$payload" | python3 -c '
+import json, sys
+try:
+    tool_input = json.load(sys.stdin).get("tool_input") or {}
+    print(tool_input.get("file_path") or tool_input.get("path") or "")
+except Exception:
+    print("")
+' 2>/dev/null || true)"
   fi
-  ubs "${PROJECT_DIR}" --ci 2>&1 | head -50
 fi
+# Legacy contract: earlier versions of this hook read $FILE_PATH from the environment.
+[[ -z "$file" ]] && file="${FILE_PATH:-}"
+[[ -z "$file" || ! -f "$file" ]] && exit 0
+
+case "$file" in
+  *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyw|*.pyi|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.swift|*.cs|*.csx|*.ex|*.exs) ;;
+  *) exit 0 ;;
+esac
+
+if ! command -v ubs >/dev/null 2>&1; then
+  echo "ubs not found in PATH; install it (https://github.com/Dicklesworthstone/ultimate_bug_scanner) to scan edits." >&2
+  exit 0
+fi
+
+if report="$(ubs "$file" --ci 2>&1)"; then
+  exit 0
+fi
+{
+  echo "UBS found critical issues in $file — fix them before moving on:"
+  printf '%s\n' "$report" | tail -n 60
+} >&2
+exit 2
 HOOK_EOF
 
   chmod +x "$hook_file"
   success "Claude Code hook created: $hook_file"
+
+  install_claude_safety_guard
+  register_claude_settings_hooks
+}
+
+# Install the git/filesystem safety guard (PreToolUse hook for Bash) that README
+# documents: prefer the copy shipped next to this script (repository checkout),
+# otherwise download it from the release assets and verify it against the
+# release SHA256SUMS when that manifest lists it.
+install_claude_safety_guard() {
+  local hook_dir=".claude/hooks"
+  local target="$hook_dir/git_safety_guard.py"
+  local script_dir=""
+  if [ -f "$target" ]; then
+    chmod +x "$target" 2>/dev/null || true
+    log "Claude Code safety guard already present: $target"
+    return 0
+  fi
+  if script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]:-${0}}")" 2>/dev/null && pwd)" \
+     && [ -f "$script_dir/.claude/hooks/git_safety_guard.py" ] \
+     && [ "$script_dir/.claude/hooks/git_safety_guard.py" != "$(pwd)/$target" ]; then
+    cp "$script_dir/.claude/hooks/git_safety_guard.py" "$target"
+    chmod +x "$target"
+    success "Claude Code safety guard installed from local checkout: $target"
+    return 0
+  fi
+  local tmp err
+  tmp="$(mktemp_in_workdir "git_safety_guard.XXXXXX")"
+  err="$(mktemp_in_workdir "git_safety_guard.err.XXXXXX")"
+  if ! secure_fetch "${ARTIFACT_BASE}/git_safety_guard.py" "$tmp" "$err"; then
+    log_network_failure "Failed to download git_safety_guard.py from ${ARTIFACT_BASE}" "$err"
+    warn "Claude Code safety guard not installed; copy .claude/hooks/git_safety_guard.py from the repository into $hook_dir manually."
+    return 0
+  fi
+  if [ -n "$CHECKSUM_FILE" ] && [ -f "$CHECKSUM_FILE" ] && grep -q '  git_safety_guard.py$' "$CHECKSUM_FILE"; then
+    verify_download_checksum "$tmp" "git_safety_guard.py"
+  else
+    warn "Release manifest has no entry for git_safety_guard.py (older release); installing it without checksum verification."
+  fi
+  if ! head -n 1 "$tmp" | grep -q 'python'; then
+    warn "Downloaded safety guard is not a Python script; not installing it."
+    return 0
+  fi
+  mv "$tmp" "$target"
+  chmod +x "$target"
+  success "Claude Code safety guard installed: $target"
+}
+
+# Register the hooks in .claude/settings.json (PostToolUse on Edit|Write|MultiEdit
+# for the scanner, PreToolUse on Bash for the safety guard). Idempotent: an entry
+# whose command is already present is left alone; other settings are preserved;
+# the previous file is backed up before it is rewritten.
+register_claude_settings_hooks() {
+  local settings=".claude/settings.json"
+  local has_guard=0
+  [ -f ".claude/hooks/git_safety_guard.py" ] && has_guard=1
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 not available; add these hooks to $settings manually:"
+    cat << 'SNIPPET'
+  "hooks": {
+    "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh"}]}],
+    "PreToolUse":  [{"matcher": "Bash", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"}]}]
+  }
+SNIPPET
+    return 0
+  fi
+  local result
+  if result="$(python3 - "$settings" "$has_guard" << 'PY'
+import json, os, shutil, sys, time
+
+path, has_guard = sys.argv[1], sys.argv[2] == "1"
+data = {}
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read().strip()
+    if text:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            print(f"invalid:{exc}")
+            sys.exit(0)
+if not isinstance(data, dict):
+    print("invalid:top-level value is not an object")
+    sys.exit(0)
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    print("invalid:'hooks' is not an object")
+    sys.exit(0)
+wanted = [("PostToolUse", "Edit|Write|MultiEdit", "$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh")]
+if has_guard:
+    wanted.append(("PreToolUse", "Bash", "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"))
+added = []
+for event, matcher, command in wanted:
+    entries = hooks.setdefault(event, [])
+    if not isinstance(entries, list):
+        print(f"invalid:'hooks.{event}' is not a list")
+        sys.exit(0)
+    present = any(
+        isinstance(entry, dict)
+        and any(isinstance(h, dict) and h.get("command") == command for h in (entry.get("hooks") or []))
+        for entry in entries
+    )
+    if present:
+        continue
+    entries.append({"matcher": matcher, "hooks": [{"type": "command", "command": command}]})
+    added.append(f"{event}:{matcher}")
+if not added:
+    print("unchanged")
+    sys.exit(0)
+if os.path.exists(path):
+    shutil.copyfile(path, f"{path}.bak-ubs-{time.strftime('%Y%m%dT%H%M%S')}")
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+print("added:" + ",".join(added))
+PY
+)"; then
+    case "$result" in
+      invalid:*) warn "Could not update $settings (${result#invalid:}); add the hooks manually." ;;
+      unchanged) log "Claude Code hooks already registered in $settings" ;;
+      added:*) success "Registered Claude Code hooks in $settings (${result#added:})" ;;
+      *) log "Claude Code settings: $result" ;;
+    esac
+  else
+    warn "Failed to update $settings; add the hooks manually."
+  fi
 }
 
 append_agent_rule_block() {
@@ -3405,13 +3578,38 @@ fi
 
 main() {
 
-# Concurrent execution lock to prevent race conditions
-
-acquire_lock
-
 # Save original arguments for potential re-exec during update
 
 ORIGINAL_ARGS=("$@")
+
+# --help / --info answer from local state only: no lock, no config, no network.
+local _arg
+for _arg in "$@"; do
+  case "$_arg" in
+    --help|-h)
+      show_help
+      echo "Notes:"
+      echo "  --dry-run resolves config and detects agents so you can audit changes safely."
+      echo "  --self-test is ideal for CI but must run from a working tree that contains test-suite/install/run_tests.sh."
+      exit 0
+      ;;
+    --info)
+      echo "UBS installer info"
+      echo "  Version: ${VERSION}"
+      echo "  Artifact base: ${ARTIFACT_BASE}"
+      if [ -n "$MINISIGN_PUBKEY" ]; then
+        echo "  Minisign pubkey: ${MINISIGN_PUBKEY}"
+      else
+        echo "  Minisign pubkey: (not configured; set UBS_MINISIGN_PUBKEY)"
+      fi
+      exit 0
+      ;;
+  esac
+done
+
+# Concurrent execution lock to prevent race conditions
+
+acquire_lock
 
 # Load configuration file (before argument parsing so CLI args can override)
 
@@ -3423,12 +3621,16 @@ resolve_release_tag
 
 print_header
 
-# Pre-parse some flags so update logic behaves as expected
+# Pre-parse the flags that change how the steps *before* the main parse loop
+# behave (the update prompt, dry-run, colors): argument order must not matter.
 
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --skip-version-check " ]]; then SKIP_VERSION_CHECK=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --update " ]]; then FORCE_REINSTALL=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --quiet " ]]; then QUIET=1; fi
 if [[ " ${ORIGINAL_ARGS[*]} " =~ " --no-color " ]]; then COLOR_ENABLED=0; init_colors; fi
+if [[ " ${ORIGINAL_ARGS[*]} " =~ " --easy-mode " ]]; then EASY_MODE=1; NON_INTERACTIVE=1; fi
+if [[ " ${ORIGINAL_ARGS[*]} " =~ " --non-interactive " ]]; then NON_INTERACTIVE=1; fi
+if [[ " ${ORIGINAL_ARGS[*]} " =~ " --dry-run " ]]; then DRY_RUN=1; fi
 
 # Check for updates (unless skipped or updating)
 
@@ -3519,43 +3721,16 @@ shift
 INSTALL_DIR="$2"
 shift 2
 ;;
---setup-git-hook)
-setup_git_hook
-exit 0
+--setup-git-hook|--setup-claude-hook|--generate-config|--diagnose|--uninstall)
+# Action flags run after the whole command line has been parsed, so
+# `--uninstall --non-interactive` and `--setup-claude-hook --dry-run` work
+# regardless of order (they used to execute at parse position).
+INSTALLER_ACTION="$1"
+shift
 ;;
---setup-claude-hook)
-setup_claude_code_hook
-exit 0
-;;
---generate-config)
-generate_config
-exit 0
-;;
---info)
-  echo "UBS installer info"
-  echo "  Version: ${VERSION}"
-  echo "  Artifact base: ${ARTIFACT_BASE}"
-  if [ -n "$MINISIGN_PUBKEY" ]; then
-    echo "  Minisign pubkey: ${MINISIGN_PUBKEY}"
-  else
-    echo "  Minisign pubkey: (not configured; set UBS_MINISIGN_PUBKEY)"
-  fi
-  exit 0
-  ;;
---diagnose)
-diagnostic_check
-exit 0
-;;
---uninstall)
-uninstall_ubs
-exit 0
-;;
---help)
-show_help
-echo "Notes:"
-echo "  --dry-run resolves config and detects agents so you can audit changes safely."
-echo "  --self-test is ideal for CI but must run from a working tree that contains test-suite/install/run_tests.sh."
-exit 0
+--info|--help|-h)
+# Handled before the lock/network steps at the top of main().
+shift
 ;;
 *)
 error "Unknown option: $1"
@@ -3563,6 +3738,14 @@ exit 1
 ;;
 esac
 done
+
+case "${INSTALLER_ACTION:-}" in
+  --setup-git-hook) setup_git_hook; exit 0 ;;
+  --setup-claude-hook) setup_claude_code_hook; exit 0 ;;
+  --generate-config) generate_config; exit 0 ;;
+  --diagnose) diagnostic_check; exit 0 ;;
+  --uninstall) uninstall_ubs; exit 0 ;;
+esac
 
 log "Detected platform: $(detect_platform)"
 log "Detected shell: $(detect_shell)"

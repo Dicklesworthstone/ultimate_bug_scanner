@@ -92,4 +92,13 @@ verify_sha256sums_entry() {
 verify_sha256sums_entry install.sh
 verify_sha256sums_entry ubs
 
+# Beads hygiene: when .beads/ is part of the commit, surface tracker problems
+# (dangling dependencies, DB/JSONL drift) without blocking the commit. The
+# tracker is advisory; a broken br install must never stop a code commit.
+if git diff --cached --name-only | grep -q '^\.beads/' && command -v br >/dev/null 2>&1; then
+  if ! br doctor >/dev/null 2>&1; then
+    echo "⚠️  br doctor reports problems with .beads/ (commit continues; run 'br doctor' to see them)"
+  fi
+fi
+
 echo "✓ Pre-commit checks passed"

@@ -30,18 +30,11 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## Git Branch: ONLY Use `main`, NEVER `master`
 
-**The default branch is `main`. The `master` branch exists only for legacy URL compatibility.**
+**The default branch is `main`.** A `master` branch exists on the remote purely as a legacy-URL mirror; nothing in the code, docs, workflows, or install URLs may reference it (the one sanctioned mention is this section).
 
 - **All work happens on `main`** — commits, PRs, feature branches all merge to `main`
-- **Never reference `master` in code or docs** — if you see `master` anywhere, it's a bug that needs fixing
-- **The `master` branch must stay synchronized with `main`** — after pushing to `main`, also push to `master`:
-  ```bash
-  git push origin main:master
-  ```
-
-**If you see `master` referenced anywhere:**
-1. Update it to `main`
-2. Ensure `master` is synchronized: `git push origin main:master`
+- **Never reference `master` in code or docs** — if you see `master` anywhere else, it's a bug that needs fixing (update it to `main`)
+- **Mirror maintenance is the maintainer's job, not an agent's:** the maintainer keeps the legacy mirror in sync after pushing to `main` (`git push origin main:master`); agents do not push to it
 
 ---
 
@@ -52,7 +45,7 @@ UBS is a **pure Bash project** — the meta-runner (`ubs`) and all language modu
 - **Shell dialect:** Bash 5+ with `set -Eeuo pipefail`
 - **Package management:** Nix flake (`flake.nix`) for reproducible dev shells and packaging; `pyproject.toml` (uv-managed, Python 3.13) for helper tooling only
 - **Core runtime dependencies:** `bash`, `jq`, `ripgrep`, `git`, `curl`, `python3`
-- **Version:** Tracked in `VERSION` file (currently 5.0.7)
+- **Version:** Tracked in `VERSION` (and mirrored in `UBS_VERSION` inside `ubs` and the README badge); `scripts/check-version-tag-drift.sh` fails CI when `main`'s module checksums no longer match the last `v*` tag, so every module change needs a version bump + tag before or with it
 - **Unsafe code:** N/A (shell scripts)
 
 ### Key Dependencies
@@ -195,7 +188,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## ultimate_bug_scanner — This Project
 
-**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, or SARIF format. It covers 9 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Ruby, Swift, and C#.
+**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 10 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java (plus Kotlin via the Java module), Ruby, Swift, C#, and Elixir. UBS cannot yet scan Bash, the language it is written in (bead `ultimate_bug_scanner-7mga.1`).
 
 ### What It Does
 
@@ -212,7 +205,8 @@ Invocation → Parse CLI args → Detect languages → ┬─ ubs-js.sh      (JS
                                                   ├─ ubs-java.sh    (Java)
                                                   ├─ ubs-ruby.sh    (Ruby)
                                                   ├─ ubs-swift.sh   (Swift)
-                                                  └─ ubs-csharp.sh  (C#)
+                                                  ├─ ubs-csharp.sh  (C#)
+                                                  └─ ubs-elixir.sh  (Elixir)
                                                            │
                                                   (concurrent execution)
                                                            │
@@ -245,19 +239,25 @@ ultimate_bug_scanner/
 │   ├── ubs-ruby.sh                    # Ruby scanner
 │   ├── ubs-swift.sh                   # Swift scanner
 │   ├── ubs-csharp.sh                  # C# scanner
+│   ├── ubs-elixir.sh                  # Elixir scanner
 │   ├── README.md                      # Module interface contract
-│   └── helpers/                       # AST correlation & type narrowing helpers
+│   └── helpers/                       # AST correlation & type narrowing helpers (all listed in HELPER_CHECKSUMS)
 │       ├── async_task_handles_csharp.py # C# async task-handle analysis
+│       ├── cfg_test_only_modules_rust.py # Rust #[cfg(test)]-only module resolution (GH #80)
+│       ├── resource_lifecycle_cpp.py  # C/C++ resource lifecycle analysis
 │       ├── resource_lifecycle_csharp.py # C# resource lifecycle analysis
 │       ├── resource_lifecycle_go.go   # Go resource lifecycle analysis
 │       ├── resource_lifecycle_java.py # Java resource lifecycle analysis
 │       ├── resource_lifecycle_py.py   # Python resource lifecycle analysis
+│       ├── resource_lifecycle_ruby.py # Ruby resource lifecycle analysis
+│       ├── resource_lifecycle_swift.py # Swift resource lifecycle analysis
 │       ├── type_narrowing_csharp.py   # C# type narrowing
 │       ├── type_narrowing_kotlin.py   # Kotlin type narrowing
 │       ├── type_narrowing_rust.py     # Rust type narrowing
 │       ├── type_narrowing_swift.py    # Swift type narrowing
 │       └── type_narrowing_ts.js       # TypeScript type narrowing
 ├── scripts/
+│   ├── check-version-tag-drift.sh     # CI guard: main's module checksums vs the last tag
 │   ├── setup_dev.sh                   # Dev environment setup
 │   ├── update_checksums.sh            # Regenerate module checksums in ubs
 │   ├── update_checksums.py            # Python helper for checksum generation
@@ -318,7 +318,9 @@ ubs doctor --fix                        # Verify/repair cached modules
 | Code | Meaning |
 |------|---------|
 | `0` | No critical issues (safe to proceed) |
-| `1` | Critical issues found (MUST fix before committing) |
+| `1` | Critical issues found (MUST fix before committing); also warnings with `--fail-on-warning` |
+| `2` | Environment or usage error: unknown flag/format, missing ast-grep for JS/TS, module or helper failed checksum verification, timeout |
+| `3` | Nothing was scanned (no supported language detected). Not a pass; `UBS_ALLOW_NO_SCAN=1` restores the legacy exit 0 |
 
 ### Supply Chain Security
 

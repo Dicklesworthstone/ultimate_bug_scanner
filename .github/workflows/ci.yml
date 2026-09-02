@@ -49,6 +49,11 @@ jobs:
         # See https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/45
         run: ./scripts/check-version-tag-drift.sh
 
+      - name: Release script dry run
+        # scripts/cut-release.sh is the only supported release path; make sure
+        # its plan stage keeps working (no files are changed in --dry-run).
+        run: ./scripts/cut-release.sh 999.0.0 --dry-run --allow-dirty
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -96,16 +101,46 @@ jobs:
             --case ruby-buggy \
             --case ruby-clean
 
+      - name: Installer smoke tests
+        # Runs install.sh end to end from a clean $HOME (no network needed: the
+        # local ./ubs is installed), including the Claude hook registration,
+        # flag-order independence and the fresh-HOME regression scenarios.
+        env:
+          NO_COLOR: "1"
+        run: bash test-suite/install/run_tests.sh
+
       - name: Run helper test suites
         env:
           NO_COLOR: "1"
           UBS_LOG_JSON: "1"
         run: |
           uv run python test-suite/shareable/test_shareable_reports.py
+          uv run python test-suite/shareable/test_cli_contract.py
+          uv run python test-suite/shareable/test_supply_chain.py
           uv run python test-suite/python/tests/test_resource_helper.py
           uv run python test-suite/python/tests/test_git_safety_guard.py
           uv run python test-suite/java/tests/test_resource_lifecycle_helper.py
           uv run python test-suite/csharp/tests/test_helper_scanners.py
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Build image for the host platform
+        run: docker build -t ubs-smoke:ci .
+
+      - name: Scan the fixture tree inside the image (JS + Python must produce findings)
+        # The image bundles modules, helpers, python3, unzip and a pre-provisioned
+        # ast-grep, so this runs with --network=none: no downloads at scan time.
+        run: |
+          docker run --rm --network=none -v "$PWD/test-suite:/scan:ro" \
+            -e UBS_NO_AUTO_UPDATE=1 -e UBS_SKIP_SIZE_CHECK=1 \
+            ubs-smoke:ci /scan/js/buggy /scan/python/security --ci --format=json > docker-smoke.json || true
+          jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' docker-smoke.json
+          jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' docker-smoke.json
 
   lint:
     runs-on: ubuntu-latest

@@ -13013,7 +13013,7 @@
     },
     {
       "id": "toon-format-fallback",
-      "description": "TOON format falls back to JSON when tru binary is not available.",
+      "description": "--format=toon without a usable tru encoder is an environment error: exit 2 with the error envelope (reason toon-encoder-missing) on stdout, never JSON labelled as TOON.",
       "path": "test-suite/buggy",
       "language": "js",
       "tags": [
@@ -13029,13 +13029,17 @@
         "UBS_TEST_FORCE_NO_TOON": "1"
       },
       "expect": {
-        "exit_code": "nonzero",
+        "exit_code": 2,
+        "allow_zero_files": true,
         "require_substrings": [
-          "\"project\":",
+          "\"error\":\"environment\"",
+          "\"reason\":\"toon-encoder-missing\""
+        ],
+        "forbid_substrings": [
           "\"scanners\":"
         ],
         "require_substrings_stderr": [
-          "Warning: tru (TOON encoder) disabled by UBS_TEST_FORCE_NO_TOON=1"
+          "needs toon_rust's encoder: tru disabled by UBS_TEST_FORCE_NO_TOON=1"
         ]
       }
     },

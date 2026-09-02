@@ -54,6 +54,27 @@ def empty_manifest_error(cases: Sequence[Dict[str, Any]]) -> str | None:
     return None
 
 
+def parse_shard(spec: Optional[str]) -> Optional[tuple[int, int]]:
+    """--shard I/N: run the I-th of N deterministic slices (1-based)."""
+    if not spec:
+        return None
+    try:
+        index_text, total_text = spec.split("/", 1)
+        index, total = int(index_text), int(total_text)
+    except ValueError as exc:
+        raise SystemExit(f"--shard expects I/N (e.g. 2/4), got {spec!r}") from exc
+    if total < 1 or index < 1 or index > total:
+        raise SystemExit(f"--shard {spec}: need 1 <= I <= N")
+    return index, total
+
+
+def shard_case_ids(case_ids: List[str], index: int, total: int) -> set[str]:
+    """Deterministic, order-preserving split: case k (0-based, in manifest
+    order) belongs to shard (k % N) + 1. Every case lands in exactly one shard
+    and the shards differ in size by at most one."""
+    return {case_id for k, case_id in enumerate(case_ids) if k % total == index - 1}
+
+
 def missing_selected_case_ids(
     cases: Sequence[Dict[str, Any]],
     selected_ids: set[str],
@@ -273,9 +294,19 @@ def has_summary_counts(obj: Dict[str, Any]) -> bool:
     return all(is_nonnegative_int(obj.get(key)) for key in SUMMARY_COUNT_KEYS)
 
 
+def is_error_envelope(obj: Dict[str, Any]) -> bool:
+    """The machine-format error envelope (environment error or refused scan):
+    {"error": ..., "status": ..., "reason": ..., "exit_code": 2, ...}. It carries
+    no totals because nothing was scanned; cases assert on exit code and
+    substrings (see `ubs --schema=error`)."""
+    return isinstance(obj.get("error"), str) and isinstance(obj.get("exit_code"), int) and "reason" in obj
+
+
 def is_ubs_summary_object(obj: Dict[str, Any]) -> bool:
     totals = obj.get("totals")
     if isinstance(totals, dict) and has_summary_counts(totals):
+        return True
+    if is_error_envelope(obj):
         return True
     return has_summary_counts(obj)
 
@@ -299,6 +330,8 @@ def extract_json_from_stdout(stdout: str) -> Optional[Dict[str, Any]]:
                 obj, _ = decoder.raw_decode(candidate)
                 if isinstance(obj, dict):
                     if is_ubs_summary_object(obj):
+                        if is_error_envelope(obj) and not isinstance(obj.get("totals"), dict):
+                            obj = {**obj, "totals": {"critical": 0, "warning": 0, "info": 0, "files": 0}}
                         return obj
                     if "ruleId" in obj or ("severity" in obj and "message" in obj):
                         continue
@@ -580,6 +613,7 @@ def main() -> None:
     parser.add_argument("--case", dest="cases", action="append", help="Run only matching case id (can repeat)")
     parser.add_argument("--list", action="store_true", help="List available case ids and exit")
     parser.add_argument("--fail-fast", action="store_true", help="Stop after first failure")
+    parser.add_argument("--shard", help="Run only slice I of N (I/N, 1-based) of the enabled cases, split deterministically in manifest order")
     parser.add_argument(
         "--case-timeout",
         type=int,
@@ -633,6 +667,13 @@ def main() -> None:
         for case_id in disabled_ids:
             print(f"[{case_id}] FAIL\n  - manifest case is disabled/skipped", file=sys.stderr)
         sys.exit(1)
+
+    shard = parse_shard(args.shard)
+    if shard is not None:
+        runnable_ids = [c["id"] for c in cases if c.get("id") and c.get("enabled", True) and (not selected_ids or c["id"] in selected_ids)]
+        shard_ids = shard_case_ids(runnable_ids, *shard)
+        print(f"[manifest] shard {shard[0]}/{shard[1]}: {len(shard_ids)} of {len(runnable_ids)} enabled case(s)", flush=True)
+        selected_ids = shard_ids or {"__no_case_in_this_shard__"}
 
     manifest_dir = args.manifest.parent
     artifacts_root = resolve_path(manifest_dir, defaults.get("artifacts_dir", "artifacts"))

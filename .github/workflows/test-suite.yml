@@ -1,9 +1,13 @@
 name: UBS Test Suite
 
+# Full run_all.sh (every gate, 447 manifest cases in one process). PRs get the
+# faster gate in ci.yml (sharded manifest, harness, installer, self-scan);
+# this runs on main pushes, nightly, and on demand.
 on:
   push:
     branches: ["main"]
-  pull_request:
+  schedule:
+    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,6 +19,61 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bench:
+    # Nightly/main benchmark (bead C1): scripts/bench.sh on the fixture tree and
+    # the synthetic 50K-line corpus, three runs each; scripts/bench_cusum.py
+    # compares against benchmarks/baseline.json (a maintainer copies a
+    # latest.json recorded on THIS runner class there to start; a baseline from
+    # another machine is meaningless). The results land in a bot PR so the
+    # history accumulates in git.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      NO_COLOR: "1"
+      UBS_NO_AUTO_UPDATE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep time
+
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
+
+      - name: Run the benchmark corpus
+        run: scripts/bench.sh --runs=3
+
+      - name: Compare against the baseline (CUSUM)
+        run: python3 scripts/bench_cusum.py --baseline benchmarks/baseline.json --history benchmarks/history.ndjson --latest benchmarks/latest.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks
+          path: benchmarks/
+
+      - name: Open or update the benchmark PR
+        if: github.event_name != 'pull_request'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          add-paths: |
+            benchmarks/latest.json
+            benchmarks/history.ndjson
+          branch: bot/bench-refresh
+          delete-branch: true
+          commit-message: "chore(bench): record benchmark results"
+          title: "chore(bench): record benchmark results"
+          body: |
+            `scripts/bench.sh --runs=3` on the CI runner. Merge to keep the history;
+            copy `benchmarks/latest.json` to `benchmarks/baseline.json` to (re)set the
+            CUSUM baseline for this runner class.
+
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 30

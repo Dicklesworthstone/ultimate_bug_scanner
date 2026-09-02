@@ -80,27 +80,6 @@ jobs:
       - name: Sync Python dependencies
         run: uv sync --locked --python 3.14
 
-      - name: Run manifest smoke suite
-        env:
-          NO_COLOR: "1"
-          UBS_LOG_JSON: "1"
-        run: |
-          cd test-suite && uv run python run_manifest.py --fail-fast \
-            --case js-core-buggy \
-            --case js-core-clean \
-            --case js-node-buggy \
-            --case js-node-clean \
-            --case golang-buggy \
-            --case golang-clean \
-            --case cpp-buggy \
-            --case cpp-clean \
-            --case rust-buggy \
-            --case rust-clean \
-            --case java-buggy \
-            --case java-clean \
-            --case ruby-buggy \
-            --case ruby-clean
-
       - name: Installer smoke tests
         # Runs install.sh end to end from a clean $HOME (no network needed: the
         # local ./ubs is installed), including the Claude hook registration,
@@ -133,6 +112,58 @@ jobs:
           uv run python test-suite/python/tests/test_git_safety_guard.py
           uv run python test-suite/java/tests/test_resource_lifecycle_helper.py
           uv run python test-suite/csharp/tests/test_helper_scanners.py
+
+  manifest:
+    # The full manifest (447 cases) takes ~30 min serially; four deterministic
+    # slices (run_manifest.py --shard I/N) bring the PR gate under ten minutes.
+    # The nightly/main full run (test-suite.yml) still executes everything in
+    # one process through run_all.sh.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      NO_COLOR: "1"
+      UBS_LOG_JSON: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv with caching
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep
+
+      - name: Install ast-grep
+        run: npm install -g @ast-grep/cli@0.45.3 >/dev/null
+
+      - name: Install toon_rust encoder (tru)
+        # toon-format-* cases need the real encoder; pinned release + sha256 sidecar.
+        run: |
+          TOON_RUST_TAG="v0.2.4"
+          curl -fsSLO "https://github.com/Dicklesworthstone/toon_rust/releases/download/${TOON_RUST_TAG}/toon-linux-amd64.tar.xz"
+          curl -fsSLO "https://github.com/Dicklesworthstone/toon_rust/releases/download/${TOON_RUST_TAG}/toon-linux-amd64.tar.xz.sha256"
+          sha256sum -c <(awk '{print $1"  toon-linux-amd64.tar.xz"}' toon-linux-amd64.tar.xz.sha256)
+          tar -xf toon-linux-amd64.tar.xz
+          sudo install -m 0755 toon /usr/local/bin/tru
+          rm -f toon toon-linux-amd64.tar.xz toon-linux-amd64.tar.xz.sha256
+          tru --version
+
+      - name: Sync Python dependencies
+        run: uv sync --locked --python 3.14
+
+      - name: Run manifest shard ${{ matrix.shard }}/4
+        run: cd test-suite && uv run python run_manifest.py --shard ${{ matrix.shard }}/4
 
   docker-smoke:
     runs-on: ubuntu-latest

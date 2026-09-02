@@ -264,7 +264,7 @@ async function analyzeFileWithTs(filePath) {
         return null;
       }
       let found = null;
-      function search(node) {
+      const search = (node) => {
         if (found) return;
         if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
           found = node.expression;
@@ -279,7 +279,7 @@ async function analyzeFileWithTs(filePath) {
           return;
         }
         ts.forEachChild(node, search);
-      }
+      };
       search(stmt);
       if (found) return found;
     }

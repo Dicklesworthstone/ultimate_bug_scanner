@@ -19,9 +19,12 @@ export function nonceReplayCheck(sessionNonce: string, expectedNonce: string): b
 }
 
 // SAME-concept comparison in the token family (mirrors the clean fixture's
-// doneToken, but compared against another token rather than a nonce).
-export function doneTokenCheck(doneToken: string, expectedToken: string): boolean {
-  if (doneToken !== expectedToken) {
+// doneToken, but compared against another token rather than a nonce). The
+// names are QUALIFIED (auth + token): under the two-tier vocabulary shared by
+// every module (GH #85) a bare `token` is parser/DB vocabulary and does not
+// count as a secret by name alone; `authToken`, `apiKey`, `sessionSecret` do.
+export function doneTokenCheck(doneAuthToken: string, expectedAuthToken: string): boolean {
+  if (doneAuthToken !== expectedAuthToken) {
     return false;
   }
   return true;

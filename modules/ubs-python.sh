@@ -4312,42 +4312,10 @@ from pathlib import Path
 ROOT = Path(sys.argv[1]).resolve()
 BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
 SKIP_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.mypy_cache', '.pytest_cache', '.cache', 'build', 'dist'}
-# GH #85 two-tier vocabulary (same sets as the Rust module). Strong terms are
-# security-sensitive on their own unless the very next identifier term is
-# schema/metadata vocabulary (signature_format, credential_type, jwt_header).
-# Weak terms (token, key, digest, nonce, session, mac, ...) are ordinary
-# parser/domain vocabulary and only become sensitive next to a security
-# qualifier in the same identifier (auth_token, api_key, session_token,
-# webhook_signature). Identifiers are split into terms first, so `TARGET_SIGS`
-# no longer matches `sig` by substring and a bare parser `token == "rm"` is
-# not reported as a secret comparison.
-STRONG_TERMS = {
-    'secret', 'password', 'passwd', 'pwd', 'bearer', 'hmac', 'csrf', 'xsrf',
-    'otp', 'totp', 'mfa', 'signature', 'sig', 'credential', 'credentials',
-    'authorization', 'jwt',
-}
-WEAK_TERMS = {
-    'token', 'key', 'mac', 'digest', 'nonce', 'session', 'auth', 'reset',
-    'webhook', 'invite', 'verification', 'recovery',
-}
-QUALIFIER_TERMS = {
-    'api', 'auth', 'access', 'refresh', 'session', 'reset', 'recovery',
-    'verification', 'invite', 'jwt', 'csrf', 'xsrf', 'webhook', 'hmac',
-    'bearer', 'secret', 'signing', 'signature', 'private', 'otp', 'totp',
-    'mfa', 'password', 'passwd', 'pwd', 'credential', 'credentials',
-}
-METADATA_TERMS = {
-    'field', 'format', 'kind', 'layout', 'policy', 'schema', 'state',
-    'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
-    'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
-    'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
-    'count', 'len', 'length',
-}
-
-def identifier_terms(text):
-    text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)
-    text = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', text)
-    return re.findall(r'[a-z0-9]+', text.lower())
+SENSITIVE_RE = re.compile(
+    r'(hmac|mac|signature|sig|token|secret|api_?key|csrf|xsrf|nonce|digest|password|passwd|reset|auth|bearer|webhook)',
+    re.IGNORECASE,
+)
 
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
@@ -4401,21 +4369,7 @@ def target_names(target):
     return []
 
 def name_is_sensitive(name):
-    if not name:
-        return False
-    terms = identifier_terms(name)
-    for idx, term in enumerate(terms):
-        if term in STRONG_TERMS:
-            follower = terms[idx + 1] if idx + 1 < len(terms) else ''
-            if follower not in METADATA_TERMS:
-                return True
-            continue
-        if term in WEAK_TERMS and any(
-            other_idx != idx and other in QUALIFIER_TERMS
-            for other_idx, other in enumerate(terms)
-        ):
-            return True
-    return False
+    return bool(name and SENSITIVE_RE.search(name))
 
 class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def __init__(self, path, lines):
@@ -10005,11 +9959,7 @@ text = path.read_text(encoding="utf-8", errors="replace")
 parts = [p.strip() for p in text.split("__UBS_SARIF_SPLIT__") if p.strip()]
 
 version = None
-# One rule file per ast-grep invocation means one SARIF run per rule; fold them
-# into a single run (results concatenated, driver rules deduplicated by id) so a
-# Python scan contributes one run to the meta-runner's merged SARIF instead of
-# ~45 mostly-empty ones.
-merged = None
+runs = []
 for part in parts:
     try:
         obj = json.loads(part)
@@ -10019,24 +9969,11 @@ for part in parts:
         v = obj.get("version")
         if isinstance(v, str) and v:
             version = v
-    for run in obj.get("runs") or []:
-        if not isinstance(run, dict):
-            continue
-        if merged is None:
-            merged = {k: v for k, v in run.items() if k != "results"}
-            merged["results"] = []
-        merged["results"].extend(run.get("results") or [])
-        rules = ((run.get("tool") or {}).get("driver") or {}).get("rules")
-        if isinstance(rules, list) and rules:
-            driver = merged.setdefault("tool", {}).setdefault("driver", {})
-            existing = driver.setdefault("rules", [])
-            seen = {rule.get("id") for rule in existing if isinstance(rule, dict)}
-            for rule in rules:
-                if isinstance(rule, dict) and rule.get("id") not in seen:
-                    existing.append(rule)
-                    seen.add(rule.get("id"))
+    r = obj.get("runs")
+    if isinstance(r, list):
+        runs.extend(r)
 
-out = {"runs": [merged] if merged else [], "version": version or "0.0.0"}
+out = {"runs": runs, "version": version or "0.0.0"}
 sys.stdout.write(json.dumps(out))
 sys.stdout.write("\n")
 PY

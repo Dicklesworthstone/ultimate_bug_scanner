@@ -621,6 +621,70 @@ def expectation_strength_scopes_from_runtime(
     return strength_scopes
 
 
+REGENERATE_GOLDENS_CMD = "uv run python test-suite/quality/rule_quality_harness.py --update-goldens"
+
+
+def _golden_leaf_diff(expected: Any, current: Any, path: str, out: list[tuple[str, str]]) -> None:
+    """Collect leaf-level differences as (kind, description) where kind is
+    'removed' / 'decreased' (coverage went DOWN) or 'added' / 'increased' /
+    'changed' (coverage moved or grew). Lists are compared as sets of their
+    JSON renderings so reordering does not count as drift."""
+    if isinstance(expected, dict) and isinstance(current, dict):
+        for key in sorted(set(expected) | set(current)):
+            sub = f"{path}.{key}" if path else str(key)
+            if key not in current:
+                out.append(("removed", f"{sub} (was {json.dumps(expected[key])[:80]})"))
+            elif key not in expected:
+                out.append(("added", f"{sub} (now {json.dumps(current[key])[:80]})"))
+            else:
+                _golden_leaf_diff(expected[key], current[key], sub, out)
+        return
+    if isinstance(expected, list) and isinstance(current, list):
+        exp_items = {json.dumps(x, sort_keys=True) for x in expected}
+        cur_items = {json.dumps(x, sort_keys=True) for x in current}
+        for item in sorted(exp_items - cur_items):
+            out.append(("removed", f"{path}[] -= {item[:80]}"))
+        for item in sorted(cur_items - exp_items):
+            out.append(("added", f"{path}[] += {item[:80]}"))
+        return
+    if expected == current:
+        return
+    if isinstance(expected, (int, float)) and isinstance(current, (int, float)) and not isinstance(expected, bool):
+        kind = "decreased" if current < expected else "increased"
+        out.append((kind, f"{path}: {expected} -> {current}"))
+        return
+    out.append(("changed", f"{path}: {json.dumps(expected)[:60]} -> {json.dumps(current)[:60]}"))
+
+
+def describe_golden_drift(label: str, golden_path: Path, expected: dict[str, Any], current: dict[str, Any]) -> str:
+    """Explain a golden mismatch so the log alone says what to do: a golden
+    that only gained rules/results/counts is STALE (regenerate it); one that
+    lost rules or counts means COVERAGE REGRESSED (fix the module or fixture,
+    never regenerate to force green)."""
+    diffs: list[tuple[str, str]] = []
+    _golden_leaf_diff(expected, current, "", diffs)
+    regressions = [d for k, d in diffs if k in ("removed", "decreased")]
+    growth = [d for k, d in diffs if k in ("added", "increased")]
+    changes = [d for k, d in diffs if k == "changed"]
+    if regressions:
+        verdict = "COVERAGE REGRESSED — rules/results/counts went down; fix the detector or fixture"
+    elif growth and not changes:
+        verdict = "GOLDEN STALE — only additions/increases; regenerate after a glance at the diff"
+    else:
+        verdict = "GOLDEN CHANGED — values moved; review the diff before regenerating"
+    lines = [f"[{label}] {golden_path.relative_to(REPO_ROOT)} differs from current results: {verdict}"]
+    shown = 0
+    for title, items in (("regression", regressions), ("change", changes), ("addition", growth)):
+        for item in items[:12]:
+            lines.append(f"  {title}: {item}")
+            shown += 1
+    if len(diffs) > shown:
+        lines.append(f"  ... {len(diffs) - shown} more difference(s)")
+    lines.append(f"  regenerate (from the repo root, only if intentional): {REGENERATE_GOLDENS_CMD}")
+    lines.append("  on main the goldens-bot CI job opens a PR with the regenerated files")
+    return "\n".join(lines)
+
+
 def update_or_check_golden(current: dict[str, Any], update: bool) -> None:
     rendered = json.dumps(current, indent=2, sort_keys=True) + "\n"
     if update:
@@ -639,8 +703,7 @@ def update_or_check_golden(current: dict[str, Any], update: bool) -> None:
         raise AssertionError(f"{GOLDEN_PATH.relative_to(REPO_ROOT)} must contain a JSON object")
     if expected != current:
         raise AssertionError(
-            "rule coverage golden changed; review coverage drift and rerun with "
-            "UPDATE_GOLDENS=1 if the new coverage is intentional"
+            describe_golden_drift("coverage-golden", GOLDEN_PATH, expected, current)
         )
     log_progress("[coverage-golden] PASS")
 
@@ -675,8 +738,7 @@ def update_or_check_ast_grep_sarif_golden(current: dict[str, Any], update: bool)
         )
     if expected != current:
         raise AssertionError(
-            "ast-grep SARIF evidence golden changed; review rule-pack result drift and rerun "
-            "with UPDATE_GOLDENS=1 if the new evidence is intentional"
+            describe_golden_drift("ast-grep-sarif-golden", AST_GREP_SARIF_GOLDEN_PATH, expected, current)
         )
     log_progress("[ast-grep-sarif-golden] PASS")
 

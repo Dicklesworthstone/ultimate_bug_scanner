@@ -7,6 +7,10 @@ license = { file = "LICENSE" }
 requires-python = ">=3.13,<3.14"
 dependencies = []
 
+[dependency-groups]
+# Test-only: validates real ubs outputs against `ubs --schema` in test_cli_contract.py.
+dev = ["jsonschema>=4.23"]
+
 [tool.uv]
 managed = true
 python-preference = "only-managed"

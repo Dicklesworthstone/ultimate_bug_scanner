@@ -8622,15 +8622,46 @@ safe_compare_re = re.compile(
 # bearer-auth credentials) still counts as "same concept on both sides", while
 # `doneToken !== sessionNonce` (a bearer token vs an unrelated correlation
 # nonce) does not.  See issue #61.
+# Two-tier identifier vocabulary (GH #85; identical to the Python and Go
+# modules).  A STRONG term names a secret on its own (password, hmac, csrf...)
+# unless the very next term is METADATA (tokenType, secretName, keyId).  A WEAK
+# term (token, key, session, nonce...) only counts when the SAME identifier also
+# carries a QUALIFIER (authToken, api_key, sessionSecret): bare `token`, `key`,
+# `id` or `nonce` are everyday parser/DB/cache vocabulary and must not taint.
+STRONG_TERMS = {
+    'secret', 'password', 'passwd', 'pwd', 'bearer', 'hmac', 'csrf', 'xsrf',
+    'otp', 'totp', 'mfa', 'signature', 'sig', 'credential', 'credentials',
+    'authorization', 'jwt',
+}
+WEAK_TERMS = {
+    'token', 'key', 'mac', 'digest', 'nonce', 'session', 'auth', 'reset',
+    'webhook', 'invite', 'verification', 'recovery',
+}
+QUALIFIER_TERMS = {
+    'api', 'auth', 'access', 'refresh', 'session', 'reset', 'recovery',
+    'verification', 'invite', 'jwt', 'csrf', 'xsrf', 'webhook', 'hmac',
+    'bearer', 'secret', 'signing', 'signature', 'private', 'otp', 'totp',
+    'mfa', 'password', 'passwd', 'pwd', 'credential', 'credentials',
+}
+METADATA_TERMS = {
+    'field', 'format', 'kind', 'layout', 'policy', 'schema', 'state',
+    'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
+    'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
+    'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
+    'count', 'len', 'length',
+}
+# Concept family of each vocabulary term, used to decide whether two
+# name-sensitive operands compare the SAME secret (issue #61).
 TERM_FAMILY = {
     'token': 'token', 'bearer': 'token', 'jwt': 'token',
     'authorization': 'token', 'auth': 'token',
     'secret': 'secret', 'password': 'secret', 'passwd': 'secret',
-    'pwd': 'secret', 'credential': 'secret',
+    'pwd': 'secret', 'credential': 'secret', 'credentials': 'secret',
+    'key': 'key',
     'signature': 'signature', 'sig': 'signature', 'hmac': 'signature',
-    'digest': 'signature',
+    'digest': 'signature', 'mac': 'signature',
     'csrf': 'csrf', 'xsrf': 'csrf',
-    'otp': 'otp', 'mfa': 'otp',
+    'otp': 'otp', 'totp': 'otp', 'mfa': 'otp',
     'session': 'session',
     'nonce': 'nonce',
     'reset': 'reset', 'recovery': 'reset',
@@ -8661,20 +8692,51 @@ def strip_string_literals(text):
     # false positive described in #61.
     return string_literal_re.sub(lambda m: m.group(1) * 2, text)
 
-def weak_families(text):
-    # Concept families implied by an operand's *code text* (identifiers), with
-    # string-literal contents stripped first.  Empty result => not sensitive.
-    norm = split_identifier_terms(strip_string_literals(text)).lower()
+def identifier_terms(identifier):
+    return term_word_re.findall(split_identifier_terms(identifier).lower())
+
+def identifier_is_sensitive(terms):
+    for idx, term in enumerate(terms):
+        if term in STRONG_TERMS:
+            follower = terms[idx + 1] if idx + 1 < len(terms) else ''
+            if follower not in METADATA_TERMS:
+                return True
+            continue
+        if term in WEAK_TERMS and any(
+            other_idx != idx and other in QUALIFIER_TERMS
+            for other_idx, other in enumerate(terms)
+        ):
+            return True
+    return False
+
+def sensitive_families(text):
+    # Concept families implied by the *qualified* identifiers in an operand's
+    # code text, string-literal contents stripped first.  Empty => not
+    # sensitive.  Each identifier is judged on its own terms, so
+    # `req.headers.authorization` is sensitive (STRONG) while `parser.token`
+    # and `cache.key` are not (WEAK without a qualifier).
+    code = strip_string_literals(text)
     fams = set()
-    if re.search(r'\bapi\s+key\b', norm):
-        fams.add('apikey')
-    if re.search(r'\bx\s+signature\b', norm):
+    if re.search(r'\bx\s+signature\b', split_identifier_terms(code).lower()):
         fams.add('signature')
-    for word in term_word_re.findall(norm):
-        fam = TERM_FAMILY.get(word)
-        if fam:
-            fams.add(fam)
+    for ident in identifier_re.findall(code):
+        terms = identifier_terms(ident)
+        if not identifier_is_sensitive(terms):
+            continue
+        for word in terms:
+            fam = TERM_FAMILY.get(word)
+            if fam:
+                fams.add(fam)
     return fams
+
+def term_families(text):
+    # Every concept family named ANYWHERE in the operand, qualified or not.
+    # Not a sensitivity signal on its own; used only to tell whether two
+    # name-sensitive operands talk about the SAME secret concept (issue #61):
+    # `doneToken !== sessionNonce` is token-vs-nonce, a public correlation
+    # check, even though sessionNonce alone is a qualified (sensitive) name.
+    norm = split_identifier_terms(strip_string_literals(text)).lower()
+    return {TERM_FAMILY[w] for w in term_word_re.findall(norm) if w in TERM_FAMILY}
 
 def strip_line_comments(line: str) -> str:
     out = []
@@ -8739,7 +8801,7 @@ def operand_identifiers(operand):
     }
 
 def is_sensitive_text(text):
-    return bool(weak_families(text))
+    return bool(sensitive_families(text))
 
 CONTINUATION_TAIL = ('=', '(', '[', ',', '&&', '||', '?', ':', '+', '=>', '.')
 CONTINUATION_HEAD = ('.', '?', ':', ')', ']', '&&', '||', '+', '===', '!==', '==', '!=')
@@ -8808,7 +8870,7 @@ def collect_sensitive_vars(lines):
         # expression's *code* (string-literal contents stripped), names a
         # secret.  A sensitive word appearing only inside a string literal on
         # the RHS no longer taints the name (issue #61 / #54 parity).
-        if weak_families(name) or weak_families(expr):
+        if sensitive_families(name) or sensitive_families(expr):
             sensitive_vars.add(name)
     return sensitive_vars
 
@@ -8841,8 +8903,8 @@ def unsafe_secret_compare(statement, sensitive_vars):
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
         return False
 
-    left_fams = weak_families(left)
-    right_fams = weak_families(right)
+    left_fams = sensitive_families(left)
+    right_fams = sensitive_families(right)
     left_taint = bool(operand_identifiers(left) & sensitive_vars)
     right_taint = bool(operand_identifiers(right) & sensitive_vars)
     left_sensitive = bool(left_fams) or left_taint
@@ -8851,7 +8913,7 @@ def unsafe_secret_compare(statement, sensitive_vars):
     if not (left_sensitive or right_sensitive):
         return False
 
-    # When BOTH operands look sensitive purely by their identifier *names*
+    # When BOTH operands carry secret vocabulary in their identifier *names*
     # (no data-flow taint from an assigned secret), require that they name the
     # SAME secret concept.  A genuine timing-attack self-comparison uses one
     # concept on both sides (userToken === validToken; authorization ===
@@ -8859,8 +8921,10 @@ def unsafe_secret_compare(statement, sensitive_vars):
     # sessionNonce) is almost always an unrelated/public value such as a
     # correlation nonce, not a real secret check -- so it is not flagged.
     # See issue #61.
-    if left_fams and right_fams and not (left_taint or right_taint):
-        return bool(left_fams & right_fams)
+    left_all = term_families(left)
+    right_all = term_families(right)
+    if left_all and right_all and not (left_taint or right_taint):
+        return bool(left_all & right_all)
 
     return True
 

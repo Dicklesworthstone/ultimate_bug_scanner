@@ -37,6 +37,9 @@ fi
 
 if ! command -v sha256sum >/dev/null 2>&1; then
   if command -v shasum >/dev/null 2>&1; then
+    # Compatibility shim for the external command: callers pass file
+    # arguments or pipe stdin, exactly as with GNU sha256sum.
+    # shellcheck disable=SC2120
     sha256sum() { shasum -a 256 "$@"; }
   else
     echo "ERROR: sha256sum or shasum required" >&2

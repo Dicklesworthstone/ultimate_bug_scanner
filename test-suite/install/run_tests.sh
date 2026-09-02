@@ -321,6 +321,372 @@ PY
   echo "[PASS] claude_hooks_registered"
 }
 
+test_agent_detection() {
+  # README's integration table promises: TabNine and Replit are DETECTED ONLY
+  # (nothing is written), GitHub Copilot gets .github/copilot-instructions.md.
+  # Fake all three, run a full easy-mode install from a throwaway project dir,
+  # and shim `crontab` so the auto-update step can never touch the host.
+  echo "[TEST] agent_detection"
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" proj="$ctx/proj" shim="$ctx/bin" log="$ctx/install.log"
+  mkdir -p "$home/.tabnine" "$home/.vscode/extensions/github.copilot-1.0.0" "$home/.local/bin" "$proj" "$shim"
+  printf 'run = "npm start"\n' >"$proj/.replit"
+  local replit_before
+  replit_before="$(cksum "$proj/.replit")"
+  cat >"$shim/crontab" <<'SHIM'
+#!/usr/bin/env bash
+# Test shim: records what the installer would have scheduled instead of
+# editing the real user crontab.
+case "${1:-}" in
+  -l) [ -f "$CRONTAB_SHIM_FILE" ] && cat "$CRONTAB_SHIM_FILE"; exit 0 ;;
+  -)  cat >"$CRONTAB_SHIM_FILE"; exit 0 ;;
+  *)  exit 1 ;;
+esac
+SHIM
+  chmod +x "$shim/crontab"
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+
+  local rc=0
+  (cd "$proj" && CRONTAB_SHIM_FILE="$ctx/crontab.txt" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:$home/.local/bin:$PATH" SHELL=/bin/bash \
+    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-doctor \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[FAIL] easy-mode install exited $rc (log: $log)"
+    tail -n 40 "$log" || true
+    tests_failed=1
+    return 1
+  fi
+  if ! grep -q 'copilot=1 tabnine=1 replit=1' "$log"; then
+    echo "[FAIL] agent detection did not report copilot/tabnine/replit (log: $log)"
+    grep -n 'Additional:' "$log" || true
+    tests_failed=1
+    return 1
+  fi
+  if [ ! -f "$proj/.github/copilot-instructions.md" ] || ! grep -q 'ubs' "$proj/.github/copilot-instructions.md"; then
+    echo "[FAIL] Copilot instructions were not written to $proj/.github/copilot-instructions.md"
+    tests_failed=1
+    return 1
+  fi
+  if [ -n "$(ls -A "$home/.tabnine")" ] || [ "$(cksum "$proj/.replit")" != "$replit_before" ]; then
+    echo "[FAIL] TabNine/Replit are documented as detect-only, but files were written"
+    ls -la "$home/.tabnine" || true
+    tests_failed=1
+    return 1
+  fi
+  if [ ! -f "$ctx/crontab.txt" ] || ! grep -q -- '--update' "$ctx/crontab.txt"; then
+    echo "[FAIL] easy mode did not route the auto-update cron job through the crontab shim"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] agent_detection"
+}
+
+test_verified_download() {
+  # Dependency binaries must be digest-verified (bead E4). Serve a TAMPERED
+  # ast-grep release archive from a local HTTP mirror; the installer must
+  # refuse it, and --skip-verification must say exactly what it skipped.
+  echo "[TEST] verified_download"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[SKIP] verified_download (python3 not available for the local mirror)"
+    return 0
+  fi
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" shim="$ctx/bin" www="$ctx/www" log="$ctx/install.log"
+  mkdir -p "$home/.local/bin" "$shim" "$www/ast-grep/ast-grep/releases/download/0.45.3"
+  head -c 4096 /dev/urandom >"$www/ast-grep/ast-grep/releases/download/0.45.3/app-x86_64-unknown-linux-gnu.zip"
+  # Package managers must not be tried (they would install for real): shim them to fail fast.
+  printf '#!/usr/bin/env bash\necho "shim: package manager disabled in tests" >&2\nexit 1\n' >"$shim/cargo"
+  cp "$shim/cargo" "$shim/npm"
+  chmod +x "$shim/cargo" "$shim/npm"
+  local port
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  (cd "$www" && python3 -m http.server "$port" --bind 127.0.0.1 >"$ctx/http.log" 2>&1) &
+  local http_pid=$!
+  sleep 1
+  local arch
+  arch="$(uname -m)"
+  if [[ "$arch" != "x86_64" || "$(uname -s)" != "Linux" ]]; then
+    kill "$http_pid" 2>/dev/null || true
+    echo "[SKIP] verified_download (needs linux x86_64 to hit the tampered asset name)"
+    return 0
+  fi
+
+  local rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$ctx" && UBS_INSTALLER_BINARY_BASE="http://127.0.0.1:$port" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:/usr/bin:/bin:$home/.local/bin" SHELL=/bin/bash \
+    "$INSTALLER" --non-interactive --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+  if ! grep -q 'Checksum mismatch for app-x86_64-unknown-linux-gnu.zip' "$log"; then
+    kill "$http_pid" 2>/dev/null || true
+    echo "[FAIL] tampered ast-grep archive was not rejected by digest verification (exit $rc, log: $log)"
+    grep -n -i -E 'ast-grep|checksum|mirror' "$log" | tail -n 20 || true
+    tests_failed=1
+    return 1
+  fi
+  if [ -e "$home/.local/bin/ast-grep" ]; then
+    kill "$http_pid" 2>/dev/null || true
+    echo "[FAIL] a tampered ast-grep binary was installed despite the checksum mismatch"
+    tests_failed=1
+    return 1
+  fi
+
+  # --skip-verification: allowed, but the skip is named explicitly in the log.
+  rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$ctx" && UBS_INSTALLER_BINARY_BASE="http://127.0.0.1:$port" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:/usr/bin:/bin:$home/.local/bin" SHELL=/bin/bash \
+    "$INSTALLER" --non-interactive --skip-verification --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$ctx/install-skip.log" 2>&1 || rc=$?
+  kill "$http_pid" 2>/dev/null || true
+  if ! grep -q 'Skipping checksum verification for app-x86_64-unknown-linux-gnu.zip' "$ctx/install-skip.log"; then
+    echo "[FAIL] --skip-verification did not name the skipped verification (log: $ctx/install-skip.log)"
+    grep -n -i 'verif' "$ctx/install-skip.log" | tail -n 10 || true
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] verified_download"
+}
+
+test_local_requires_flag() {
+  # A ./ubs in the current directory is never installed implicitly (bead E4):
+  # without --local the installer ignores it and goes for the release (which
+  # fails here because the artifact base points at a dead port); with --local
+  # it installs exactly that file.
+  echo "[TEST] local_requires_flag"
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" proj="$ctx/proj" inst="$ctx/inst" log="$ctx/install.log"
+  mkdir -p "$home/.local/bin" "$proj" "$inst"
+  # Installer copied away from the checkout so the "repo checkout" rule does not apply.
+  cp "$INSTALLER" "$inst/install.sh"
+  printf '#!/usr/bin/env bash\n# Ultimate Bug Scanner (fake local runner for the installer test)\ncase "${1:-}" in --version) echo "UBS Meta-Runner v0.0.0-local-test";; *) echo "fake ubs: $*";; esac\nexit 0\n' >"$proj/ubs"
+  chmod +x "$proj/ubs"
+
+  local rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$proj" && UBS_ARTIFACT_BASE="http://127.0.0.1:9/dead" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
+    bash "$inst/install.sh" --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] || ! grep -q 'Ignoring ./ubs' "$log" || [ -e "$home/.local/bin/ubs" ]; then
+    echo "[FAIL] ./ubs from the current directory was installed (or not ignored) without --local (exit $rc, log: $log)"
+    grep -n -i -E 'ignoring|local file|installing' "$log" | tail -n 10 || true
+    tests_failed=1
+    return 1
+  fi
+
+  rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$proj" && UBS_ARTIFACT_BASE="http://127.0.0.1:9/dead" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
+    bash "$inst/install.sh" --local --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$ctx/install-local.log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ] || ! cmp -s "$proj/ubs" "$home/.local/bin/ubs"; then
+    echo "[FAIL] --local did not install ./ubs from the current directory (exit $rc, log: $ctx/install-local.log)"
+    tail -n 30 "$ctx/install-local.log" || true
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] local_requires_flag"
+}
+
+test_uninstall_roundtrip() {
+  # --uninstall must remove everything the installer wrote (bead F5): with
+  # every agent faked, an easy-mode install followed by an uninstall leaves the
+  # filesystem identical to the pre-install snapshot, except the rc backup the
+  # uninstaller deliberately keeps.
+  echo "[TEST] uninstall_roundtrip"
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" proj="$ctx/proj" shim="$ctx/bin"
+  mkdir -p "$home/.local/bin" "$home/.claude" "$home/.tabnine" "$home/.vscode/extensions/github.copilot-1.0.0" "$shim" \
+    "$proj/.cursor" "$proj/.codex" "$proj/.gemini" "$proj/.windsurf" "$proj/.cline" "$proj/.opencode" "$proj/.continue"
+  printf 'export PRE_EXISTING=1\n' >"$home/.bashrc"
+  printf 'model: gpt-4o\n' >"$home/.aider.conf.yml"
+  printf 'run = "npm start"\n' >"$proj/.replit"
+  printf '# Cursor house rules\n\nBe terse.\n' >"$proj/.cursor/rules"
+  (cd "$proj" && git init -q && git config user.email t@example.invalid && git config user.name t)
+  cat >"$shim/crontab" <<'SHIM'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -l) [ -f "$CRONTAB_SHIM_FILE" ] && cat "$CRONTAB_SHIM_FILE"; exit 0 ;;
+  -)  cat >"$CRONTAB_SHIM_FILE"; exit 0 ;;
+  -r) rm -f "$CRONTAB_SHIM_FILE"; exit 0 ;;
+  *)  exit 1 ;;
+esac
+SHIM
+  chmod +x "$shim/crontab"
+
+  snapshot() {
+    (cd "$ctx" && find home proj -type f | LC_ALL=C sort | while IFS= read -r f; do cksum "$f"; done)
+  }
+  local before after
+  before="$(snapshot)"
+
+  local rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  # The install dir is deliberately NOT on PATH so the installer also writes
+  # its PATH block and alias into ~/.bashrc, which the uninstall must strip.
+  (cd "$proj" && CRONTAB_SHIM_FILE="$ctx/crontab.txt" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:$PATH" SHELL=/bin/bash \
+    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor \
+      --skip-version-check --install-dir "$home/.local/bin") >"$ctx/install.log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[FAIL] easy-mode install exited $rc (log: $ctx/install.log)"
+    tail -n 40 "$ctx/install.log" || true
+    tests_failed=1
+    return 1
+  fi
+  # The install must actually have written the integrations we are about to remove.
+  local written=0 f
+  for f in "$home/.local/bin/ubs" "$proj/.claude/hooks/on-file-write.sh" "$proj/.claude/settings.json" \
+    "$proj/.codex/rules/ubs.md" "$proj/.gemini/rules" "$proj/.continue/config.json" "$proj/.github/copilot-instructions.md" \
+    "$proj/.git/hooks/pre-commit" "$ctx/crontab.txt" "$home/.config/ubs/session.md"; do
+    [ -f "$f" ] && written=$((written + 1))
+  done
+  if [ "$written" -lt 10 ] || ! grep -q 'UBS Quick Reference' "$proj/.cursor/rules" || ! grep -q 'Ultimate Bug Scanner' "$home/.aider.conf.yml" || ! grep -q 'Ultimate Bug Scanner' "$home/.bashrc"; then
+    echo "[FAIL] install did not write the expected integrations ($written/10 files; log: $ctx/install.log)"
+    tests_failed=1
+    return 1
+  fi
+
+  rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$proj" && CRONTAB_SHIM_FILE="$ctx/crontab.txt" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:$home/.local/bin:$PATH" SHELL=/bin/bash \
+    "$INSTALLER" --uninstall --non-interactive --skip-version-check --install-dir "$home/.local/bin") >"$ctx/uninstall.log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[FAIL] --uninstall exited $rc (log: $ctx/uninstall.log)"
+    tail -n 40 "$ctx/uninstall.log" || true
+    tests_failed=1
+    return 1
+  fi
+  after="$(snapshot)"
+  local diff_out
+  diff_out="$(diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -E '^[<>]' | grep -v 'home/.bashrc.pre-uninstall-backup' || true)"
+  if [ -n "$diff_out" ]; then
+    echo "[FAIL] filesystem differs from the pre-install snapshot after --uninstall:"
+    printf '%s\n' "$diff_out"
+    echo "--- uninstall log tail ---"
+    tail -n 30 "$ctx/uninstall.log" || true
+    tests_failed=1
+    return 1
+  fi
+  if [ -f "$ctx/crontab.txt" ] && grep -q 'Ultimate Bug Scanner' "$ctx/crontab.txt"; then
+    echo "[FAIL] cron job survived --uninstall"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] uninstall_roundtrip"
+}
+
+test_dry_run_touches_nothing() {
+  # README promises --dry-run audits without touching disk (bead F6): no lock
+  # directory, no ~/.local/bin, no session.md, no hook or rule files.
+  echo "[TEST] dry_run_touches_nothing"
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" proj="$ctx/proj" log="$ctx/dry-run.log"
+  mkdir -p "$home/.claude" "$proj/.cursor"
+  printf 'export PRE_EXISTING=1\n' >"$home/.bashrc"
+  snapshot() {
+    (cd "$ctx" && find home proj | LC_ALL=C sort; find home proj -type f | LC_ALL=C sort | while IFS= read -r f; do cksum "$f"; done)
+  }
+  local before after
+  before="$(snapshot)"
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  local rc=0
+  (cd "$proj" && UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" PATH="/usr/bin:/bin" SHELL=/bin/bash \
+    "$INSTALLER" --dry-run --non-interactive --skip-version-check) >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "[FAIL] --dry-run exited $rc (log: $log)"
+    tail -n 30 "$log" || true
+    tests_failed=1
+    return 1
+  fi
+  after="$(snapshot)"
+  if [ "$before" != "$after" ]; then
+    echo "[FAIL] --dry-run changed the filesystem:"
+    diff <(printf '%s\n' "$before") <(printf '%s\n' "$after") | grep -E '^[<>]' || true
+    tests_failed=1
+    return 1
+  fi
+  if [ -e /tmp/ubs-install.lock ]; then
+    echo "[FAIL] --dry-run left /tmp/ubs-install.lock behind"
+    rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+    tests_failed=1
+    return 1
+  fi
+  if ! grep -q 'Would' "$log"; then
+    echo "[FAIL] --dry-run log shows no planned actions (log: $log)"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] dry_run_touches_nothing"
+}
+
+test_stale_lock_recovered() {
+  # A lock left by a killed installer (recorded PID no longer running) must
+  # not block the next install (bead F6).
+  echo "[TEST] stale_lock_recovered"
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" log="$ctx/install.log"
+  mkdir -p "$home"
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  mkdir -p /tmp/ubs-install.lock
+  # A PID that cannot be running: the max pid + 1 style value is not portable,
+  # so use a child that has already exited.
+  local dead_pid
+  dead_pid="$(bash -c 'echo $$')"
+  printf '%s\n' "$dead_pid" >/tmp/ubs-install.lock/pid
+  # Invoked directly: run_installer clears the lock itself before every run.
+  mkdir -p "$home/.local/bin"
+  local rc=0
+  (UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
+    "$INSTALLER" --non-interactive --skip-version-check --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ] || [ ! -x "$home/.local/bin/ubs" ]; then
+    echo "[FAIL] install with a stale lock present failed (exit $rc, log: $log)"
+    tail -n 20 "$log" || true
+    tests_failed=1
+    return 1
+  fi
+  if ! grep -q 'Removing stale installer lock' "$log"; then
+    echo "[FAIL] installer did not report recovering the stale lock (log: $log)"
+    tests_failed=1
+    return 1
+  fi
+  if [ -e /tmp/ubs-install.lock ]; then
+    echo "[FAIL] lock directory left behind after the run"
+    rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+    tests_failed=1
+    return 1
+  fi
+  # A live lock (this shell's PID) must still block.
+  mkdir -p /tmp/ubs-install.lock
+  printf '%s\n' "$$" >/tmp/ubs-install.lock/pid
+  rc=0
+  (UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" SHELL=/bin/bash \
+    "$INSTALLER" --non-interactive --skip-version-check --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks --no-path-modify --install-dir "$home/.local/bin") >"$ctx/blocked.log" 2>&1 || rc=$?
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  if [ "$rc" -eq 0 ] || ! grep -q 'already in progress' "$ctx/blocked.log"; then
+    echo "[FAIL] a live lock did not block the installer (exit $rc, log: $ctx/blocked.log)"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] stale_lock_recovered"
+}
+
 test_flag_order_independence() {
   echo "[TEST] flag_order_independence"
   local ctx
@@ -379,6 +745,12 @@ test_no_alias_written_when_no_path_modify
 test_skip_typos_flag
 test_fresh_home_no_path
 test_claude_hooks_registered
+test_agent_detection
+test_verified_download
+test_local_requires_flag
+test_uninstall_roundtrip
+test_dry_run_touches_nothing
+test_stale_lock_recovered
 test_flag_order_independence
 if [ "$SELF_TEST_MODE" -ne 1 ]; then
   test_self_test_flag

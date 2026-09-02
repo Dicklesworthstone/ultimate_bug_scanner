@@ -356,7 +356,7 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 84,
+      "result_count": 201,
       "result_rule_ids": [
         "js.async.await-no-try",
         "js.async.dangling-promise",
@@ -519,7 +519,7 @@
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 340,
+      "result_count": 439,
       "result_rule_ids": [
         "rust.arc-mutex",
         "rust.assert-macros",
@@ -1103,8 +1103,26 @@
       "fixture": "test-suite/js/buggy/security.js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "rule_count": 37,
+      "rule_count": 40,
       "rules": [
+        {
+          "file": "__variants-javascript.yml",
+          "id": "security.cookie-insecure",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "__variants-tsx.yml",
+          "id": "js.async.await-no-try",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "__variants-typescript.yml",
+          "id": "js.async.await-no-try",
+          "language": "typescript",
+          "match_count": 0
+        },
         {
           "file": "async-await-no-try.yml",
           "id": "js.async.await-no-try",

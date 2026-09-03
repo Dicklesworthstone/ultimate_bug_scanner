@@ -274,6 +274,75 @@ jobs:
           brew install dicklesworthstone/tap/ubs
           "$(brew --prefix)/bin/ubs" --version
 
+  windows-smoke:
+    # README advertises Windows through Git Bash (or WSL). Git for Windows ships
+    # bash 5 and coreutils but no rsync, and `python3` is whatever the runner
+    # provides, so this job covers what a Windows user actually gets: version,
+    # doctor, a JS and a Python smoke scan, a directory with spaces, a CRLF
+    # fixture and a single-file scan (bead G4). The installer harness is not run
+    # here: it assumes /tmp semantics. Written without a Windows box to observe
+    # it on; the first run on main is the observation.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep fixture line endings as committed
+        run: git config --global core.autocrlf false
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+
+      - name: Install scan tools
+        run: |
+          choco install -y --no-progress ripgrep >/dev/null
+          command -v jq >/dev/null || choco install -y --no-progress jq >/dev/null
+          npm install -g @ast-grep/cli@0.45.3 >/dev/null
+          bash --version | head -n 1
+          rg --version | head -n 1
+          jq --version
+          ast-grep --version
+          echo "python3: $(command -v python3 || echo missing); python: $(command -v python || echo missing)"
+
+      - name: Version and doctor
+        env:
+          NO_COLOR: "1"
+          UBS_NO_AUTO_UPDATE: "1"
+        run: |
+          ./ubs --version
+          ./ubs doctor
+
+      - name: JS and Python smoke scans
+        env:
+          NO_COLOR: "1"
+          UBS_NO_AUTO_UPDATE: "1"
+        run: |
+          ./ubs test-suite/js/buggy --only=js --ci --format=json > js.json || true
+          jq -e '.scanners | map(select(.language=="js" and .critical > 0)) | length > 0' js.json
+          ./ubs test-suite/python/buggy --only=python --ci --format=json > py.json || true
+          jq -e '.scanners | map(select(.language=="python" and .critical > 0)) | length > 0' py.json
+
+      - name: Directory with spaces, CRLF fixture, single-file scan
+        env:
+          NO_COLOR: "1"
+          UBS_NO_AUTO_UPDATE: "1"
+        run: |
+          base="$(cygpath -u "$RUNNER_TEMP")/dir with spaces"
+          mkdir -p "$base/src"
+          cp test-suite/python/security/parser_token_compare_buggy.py "$base/src/app.py"
+          sed -i 's/$/\r/' "$base/src/app.py"
+          file "$base/src/app.py" || true
+          ./ubs "$base" --only=python --ci --format=json > spaces.json || true
+          jq -e '.scanners | map(select(.language=="python" and .files >= 1 and .critical > 0)) | length > 0' spaces.json
+          ./ubs "$base/src/app.py" --ci --format=json > single.json || true
+          jq -e '.scanners[0].language == "python" and .scanners[0].files == 1 and .scanners[0].critical > 0' single.json
+
   goldens-bot:
     # The rule-coverage and SARIF-evidence goldens are derived from the fixture
     # corpus; when a rule or fixture changes on main they go stale and the test

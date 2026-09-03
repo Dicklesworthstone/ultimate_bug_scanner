@@ -1081,6 +1081,8 @@ counted nor copied into the scan workspace, so a data directory next to the code
 small project "too large". It prints `Scan size after ignores: XMB (limit YMB)` before enforcing
 the limit. Override via `UBS_MAX_DIR_SIZE_MB` or `UBS_SKIP_SIZE_CHECK=1`, or pass `--skip-size-check`.
 
+**Cargo could not run (Rust).** When cargo is present but a phase exits without compiler diagnostics (a build wrapper refusing, a missing toolchain component), the Rust module reports each phase as a warning plus "Not evaluated", surfaces the wrapper's message, and marks itself partial: the run's `status` becomes `partial` and the exit code 2 unless `UBS_ALLOW_PARTIAL=1`. A clean crate is never reported critical for a broken build environment.
+
 ### Environment errors (exit 2)
 
 If UBS prints an **Environment error** and exits `2`, a required dependency is missing or unusable.
@@ -2267,6 +2269,7 @@ Common uv-powered entrypoints:
 Need repo-wide scans to ignore generated code or intentionally buggy fixtures (like this project’s `test-suite/`)? Drop a `.ubsignore` at the root.
 
 - Format mirrors `.gitignore`: one glob per line, `#` for comments.
+- Three directory names are decided by content instead of by name: `obj/` is skipped when it holds C# build output (`project.assets.json`, `*.AssemblyInfo.cs`, Debug/Release), `env/` when it is a virtualenv (`pyvenv.cfg`, `bin/activate`), `bin/` when no file under it has a source extension. A Go program under `bin/` or a package named `env` is scanned. Package-manager stores `.pnpm` and `.bun` are always skipped, as is `node_modules`.
 - UBS loads `PROJECT/.ubsignore` automatically; override with `--ignore-file=/path/to/file`.
 - Built-in ignores already cover `node_modules`, virtualenvs, dist/build/target/vendor, editor caches, and more, so you rarely need to add them yourself.
 - Use `--suggest-ignore` to print large top-level directories that might deserve an entry (no files are modified automatically).

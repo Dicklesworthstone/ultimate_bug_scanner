@@ -258,6 +258,7 @@ ultimate_bug_scanner/
 │       ├── type_narrowing_rust.py     # Rust type narrowing
 │       ├── type_narrowing_swift.py    # Swift type narrowing
 │       └── type_narrowing_ts.js       # TypeScript type narrowing
+│   ├── contract.json                  # Machine-readable module contract (flags, formats, exit codes, env, per-module extensions/manifests); source of modules/README.md's Options block
 │   └── lib/
 │       └── ubs-common.sh              # Shared module primitives (locale, json_escape, format contract, NUL-safe file listing); verified like a helper
 ├── scripts/
@@ -275,6 +276,10 @@ ultimate_bug_scanner/
 │   └── security.md                    # Threat model and integrity controls
 └── notes/                             # Design notes
 ```
+
+### Adding a language module
+
+`scripts/new-module.sh <lang> --extensions a,b [--display Name]` scaffolds a contract-v2 module (`modules/ubs-<lang>.sh` on `modules/lib/ubs-common.sh`, the shared flag core, NUL-safe discovery, text/json/sarif renderers, two example checks), a buggy/clean fixture pair under `test-suite/<lang>/` and two manifest cases. It never overwrites and prints the steps it leaves to you: `ALL_LANGS` + `detect_lang` in `ubs`, the `modules/contract.json` entry (then `scripts/gen_module_readme.py`), and `./scripts/update_checksums.sh && ./scripts/update_sha256sums.sh`. `test-suite/quality/test_new_module.py` proves the scaffold output.
 
 ### Key Files
 

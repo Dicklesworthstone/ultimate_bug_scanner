@@ -4708,12 +4708,12 @@ def is_summary(doc) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project"):
+    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress"):
         ap.add_argument("--" + name.replace("_", "-"), default="")
     a = ap.parse_args()
     if a.mode == "text":
         raw = Path(a.raw).read_text(encoding="utf-8", errors="replace") if os.path.isfile(a.raw) else ""
-        text = restore_text(suppress(raw), a)
+        text = restore_text(raw if a.no_suppress == "1" else suppress(raw), a)
         Path(a.txt).write_text(text, encoding="utf-8")
         doc = summary_from_text(text, a)
         apply_partial(doc, text)
@@ -4744,10 +4744,17 @@ PY
 # Returns the script's exit code (3 = json output is not a summary object).
 postprocess_module(){
   local mode="$1" lang="$2" raw="$3" txt="$4" json="$5" sarif="$6" findings="$7" metrics="$8"
-  local proj; proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  local proj no_suppress=0; proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  # Single-file fast path: the only source the findings can point at is the
+  # target itself; without a marker there is nothing to suppress (bead C3).
+  if [[ -n "${SINGLE_FILE_TARGET:-}" && -f "$SINGLE_FILE_TARGET" ]] \
+     && ! grep -q -i -E 'ubs:ignore|ubs: disable|nolint|noqa' "$SINGLE_FILE_TARGET" 2>/dev/null; then
+    no_suppress=1
+  fi
   python3 "$TMPDIR_RUN/postprocess.py" --mode "$mode" --lang "$lang" --raw "$raw" --txt "$txt" --json "$json" \
     --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "${FILTERED_PROJECT_DIR:-}" \
-    --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj"
+    --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
+    --no-suppress "$no_suppress"
 }
 
 # Text-mode partial marker (bead D10). A module that could not evaluate part of

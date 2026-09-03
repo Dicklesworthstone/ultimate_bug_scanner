@@ -6,6 +6,13 @@ import re
 import sys
 from pathlib import Path
 
+HELPERS_DIR = Path(__file__).resolve().parent
+if str(HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPERS_DIR))
+
+from ubs_core.io import format_location, line_col  # noqa: E402
+from ubs_core.lexer import strip_comments_and_strings as core_strip  # noqa: E402
+
 SKIP_DIRS = {
     ".git",
     ".hg",
@@ -78,89 +85,7 @@ def iter_cpp_files(root: Path):
 
 
 def strip_comments_and_strings(text: str) -> str:
-    result: list[str] = []
-    i = 0
-    n = len(text)
-    in_line = False
-    in_block = False
-    in_string = False
-    escaped = False
-    quote = ""
-
-    def mask_char(ch: str) -> str:
-        return "\n" if ch == "\n" else " "
-
-    while i < n:
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-
-        if in_line:
-            result.append(mask_char(ch))
-            if ch == "\n":
-                in_line = False
-            i += 1
-            continue
-
-        if in_block:
-            result.append(mask_char(ch))
-            if ch == "*" and nxt == "/":
-                result.append(" ")
-                in_block = False
-                i += 2
-            else:
-                i += 1
-            continue
-
-        if in_string:
-            result.append(mask_char(ch))
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == quote:
-                in_string = False
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_line = True
-            result.extend("  ")
-            i += 2
-            continue
-
-        if ch == "/" and nxt == "*":
-            in_block = True
-            result.extend("  ")
-            i += 2
-            continue
-
-        if ch in {'"', "'"}:
-            in_string = True
-            quote = ch
-            result.append(mask_char(ch))
-            i += 1
-            continue
-
-        result.append(ch)
-        i += 1
-
-    return "".join(result)
-
-
-def line_col(text: str, pos: int) -> tuple[int, int]:
-    line = text.count("\n", 0, pos) + 1
-    last_newline = text.rfind("\n", 0, pos)
-    col = pos + 1 if last_newline == -1 else pos - last_newline
-    return line, col
-
-
-def format_location(base: Path, path: Path, pos: int, text: str) -> str:
-    line, col = line_col(text, pos)
-    try:
-        rel = path.relative_to(base)
-    except ValueError:
-        rel = path
-    return f"{rel}:{line}:{col}"
+    return core_strip(text, lang="cpp")
 
 
 def line_text(text: str, pos: int) -> str:

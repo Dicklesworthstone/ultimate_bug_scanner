@@ -7,6 +7,12 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+HELPERS_DIR = Path(__file__).resolve().parent
+if str(HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPERS_DIR))
+
+from ubs_core.lexer import strip_comments_and_strings as core_strip  # noqa: E402
+
 SKIP_DIRS = {".git", "node_modules", "dist", "build", "bin", "out", ".venv", "vendor"}
 STATEMENT_RE = re.compile(r"\b(?:PreparedStatement|CallableStatement|Statement)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*?;", re.DOTALL)
 RESULTSET_RE = re.compile(r"\bResultSet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*?;", re.DOTALL)
@@ -14,95 +20,7 @@ TRY_RE = re.compile(r"\btry\s*\(")
 
 
 def strip_comments(text: str) -> str:
-    result: list[str] = []
-    i = 0
-    n = len(text)
-    in_line = False
-    in_block = False
-    in_string = False
-    in_text_block = False
-    string_quote = ""
-    escaped = False
-
-    def mask_char(ch: str) -> str:
-        return "\n" if ch == "\n" else " "
-
-    while i < n:
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < n else ""
-        nxt2 = text[i + 2] if i + 2 < n else ""
-
-        if in_line:
-            result.append(mask_char(ch))
-            if ch == "\n":
-                in_line = False
-            i += 1
-            continue
-
-        if in_block:
-            result.append(mask_char(ch))
-            if ch == "*" and nxt == "/":
-                result.append(" ")
-                in_block = False
-                i += 2
-            else:
-                i += 1
-            continue
-
-        if in_text_block:
-            if ch == '"' and nxt == '"' and nxt2 == '"':
-                result.extend('"""')
-                in_text_block = False
-                i += 3
-            else:
-                result.append(mask_char(ch))
-                i += 1
-            continue
-
-        if in_string:
-            if escaped:
-                result.append(mask_char(ch))
-                escaped = False
-            elif ch == "\\":
-                result.append(" ")
-                escaped = True
-            elif ch == string_quote:
-                result.append(ch)
-                in_string = False
-            else:
-                result.append(mask_char(ch))
-            i += 1
-            continue
-
-        if ch == '"' and nxt == '"' and nxt2 == '"':
-            in_text_block = True
-            result.extend('"""')
-            i += 3
-            continue
-
-        if ch in ('"', "'"):
-            in_string = True
-            string_quote = ch
-            result.append(ch)
-            i += 1
-            continue
-
-        if ch == "/" and nxt == "/":
-            in_line = True
-            result.extend("  ")
-            i += 2
-            continue
-
-        if ch == "/" and nxt == "*":
-            in_block = True
-            result.extend("  ")
-            i += 2
-            continue
-
-        result.append(ch)
-        i += 1
-
-    return "".join(result)
+    return core_strip(text, lang="java")
 
 
 def iter_java_files(root: Path) -> Iterable[Path]:

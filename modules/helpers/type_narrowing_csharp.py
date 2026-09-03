@@ -6,6 +6,12 @@ import re
 import sys
 from pathlib import Path
 
+HELPERS_DIR = Path(__file__).resolve().parent
+if str(HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPERS_DIR))
+
+from ubs_core.io import extract_statement_region, find_block_end, line_col, skip_ws  # noqa: E402
+
 SKIP_DIRS = {
     ".git",
     ".hg",
@@ -55,45 +61,6 @@ def iter_csharp_files(root: Path):
                 yield path
 
 
-def find_block_end(text: str, brace_start: int) -> int:
-    depth = 0
-    for idx in range(brace_start, len(text)):
-        ch = text[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return idx
-    return len(text) - 1
-
-
-def skip_ws(text: str, idx: int) -> int:
-    while idx < len(text) and text[idx].isspace():
-        idx += 1
-    return idx
-
-
-def extract_statement_region(text: str, start_idx: int) -> tuple[str, int]:
-    idx = skip_ws(text, start_idx)
-    if idx >= len(text):
-        return "", len(text)
-    if text[idx] == "{":
-        block_end = find_block_end(text, idx)
-        return text[idx : block_end + 1], block_end + 1
-    semi = text.find(";", idx)
-    newline = text.find("\n", idx)
-    if semi == -1 and newline == -1:
-        return text[idx:], len(text)
-    if semi == -1:
-        end = newline
-    elif newline == -1:
-        end = semi + 1
-    else:
-        end = min(semi + 1, newline)
-    return text[idx:end], end
-
-
 def skip_optional_else(text: str, idx: int) -> int:
     idx = skip_ws(text, idx)
     match = ELSE_PATTERN.match(text, idx)
@@ -105,16 +72,6 @@ def skip_optional_else(text: str, idx: int) -> int:
 
 def contains_exit(block_text: str) -> bool:
     return bool(EXIT_PATTERN.search(block_text))
-
-
-def line_col(text: str, pos: int) -> tuple[int, int]:
-    line = text.count("\n", 0, pos) + 1
-    last_newline = text.rfind("\n", 0, pos)
-    if last_newline == -1:
-        col = pos + 1
-    else:
-        col = pos - last_newline
-    return line, col
 
 
 def find_unsafe_use(text: str, name: str, start_idx: int) -> tuple[int, int] | None:

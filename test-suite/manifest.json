@@ -13071,7 +13071,8 @@
           "\"scanners\":"
         ],
         "require_substrings_stderr": [
-          "needs toon_rust's encoder: tru disabled by UBS_TEST_FORCE_NO_TOON=1"
+          "needs toon_rust's encoder:",
+          "disabled by UBS_TEST_FORCE_NO_TOON=1"
         ]
       }
     },

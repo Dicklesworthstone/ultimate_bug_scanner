@@ -147,11 +147,15 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert out.count("Not evaluated:") >= 3, out
 
     # A cargo that fails without emitting diagnostics (wrapper refusing, broken
-    # toolchain) is a failure, never "clean".
+    # toolchain) makes the scan partial, never "clean". The meta-runner must
+    # preserve that environment failure as exit 2 instead of downgrading it to
+    # an ordinary findings-only exit 1.
     result, calls = scan([str(proj)], {"SENTINEL_EXIT": "103"})
     out = result.stdout + result.stderr
     assert "cargo check" in calls, calls
-    assert result.returncode == 1, out
+    assert result.returncode == 2, out
+    assert "CARGO_UNAVAILABLE" in out, out
+    assert "Partial run" in out, out
     assert "cargo check clean" not in out, out
     assert "Tests build clean" not in out, out
     assert "exit 103" in out, out

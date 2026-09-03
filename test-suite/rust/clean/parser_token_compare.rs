@@ -32,3 +32,18 @@ pub fn jwt_header_is_jose(jwt_header: &str) -> bool {
 pub fn map_key_present(key: &str, keys: &[String]) -> bool {
     keys.iter().any(|entry| entry == key)
 }
+
+// A security-sensitive assignment in one function must not taint a reused
+// local name in an unrelated function.
+pub fn load_recovery_issue(title: &str) -> String {
+    let issue = format!("secret: {title}");
+    issue
+}
+
+pub struct PublicIssue {
+    pub title: String,
+}
+
+pub fn public_issue_title_matches(issue: &PublicIssue) -> bool {
+    issue.title == "Modified"
+}

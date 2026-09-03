@@ -519,7 +519,7 @@
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 439,
+      "result_count": 443,
       "result_rule_ids": [
         "rust.arc-mutex",
         "rust.assert-macros",

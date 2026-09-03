@@ -5843,6 +5843,10 @@ assign_re = re.compile(
     r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?"
     r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)"
 )
+fn_re = re.compile(
+    r"^\s*(?:(?:pub(?:\s*\([^)]*\))?|async|unsafe|const|extern)\s+)*"
+    r"fn\s+[A-Za-z_][A-Za-z0-9_]*"
+)
 identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 safe_compare_re = re.compile(
     r"\b(?:subtle::)?ConstantTimeEq\b"
@@ -5963,6 +5967,51 @@ def strip_line_comments(line: str) -> str:
     return "".join(out)
 
 
+def without_string_literals(expr: str) -> str:
+    chars = list(expr)
+    i = 0
+    quote = ""
+    raw_hashes = None
+    escape = False
+    while i < len(chars):
+        ch = chars[i]
+        if raw_hashes is not None:
+            chars[i] = " "
+            if ch == '"' and expr.startswith("#" * raw_hashes, i + 1):
+                for pos in range(i + 1, min(i + 1 + raw_hashes, len(chars))):
+                    chars[pos] = " "
+                i += raw_hashes + 1
+                raw_hashes = None
+                continue
+            i += 1
+            continue
+        if quote:
+            chars[i] = " "
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "r":
+            j = i + 1
+            while j < len(chars) and chars[j] == "#":
+                j += 1
+            if j < len(chars) and chars[j] == '"':
+                for pos in range(i, j + 1):
+                    chars[pos] = " "
+                raw_hashes = j - i - 1
+                i = j + 1
+                continue
+        if ch == '"':
+            chars[i] = " "
+            quote = ch
+        i += 1
+    return "".join(chars)
+
+
 def statement_from(lines, line_no, max_lines=8):
     idx = line_no - 1
     parts = []
@@ -6058,25 +6107,20 @@ def source_line(lines, line_no):
     return ""
 
 
-def collect_sensitive_vars(lines):
-    sensitive = set()
-    for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
-            continue
-        stripped = strip_line_comments(raw).strip()
-        if not stripped:
-            continue
-        statement = statement_from(lines, line_no, max_lines=5)
-        if not statement or safe_compare_re.search(statement):
-            continue
-        match = assign_re.match(statement)
-        if not match:
-            continue
-        name = match.group("lhs")
-        rhs = match.group("rhs")
-        if is_sensitive_text(name) or is_sensitive_operand_text(rhs) or (operand_identifiers(rhs) & sensitive):
-            sensitive.add(name)
-    return sensitive
+def update_sensitive_vars(statement: str, sensitive_vars) -> None:
+    match = assign_re.match(statement)
+    if not match:
+        return
+    name = match.group("lhs")
+    rhs = match.group("rhs")
+    if (
+        is_sensitive_text(name)
+        or is_sensitive_operand_text(rhs)
+        or (operand_identifiers(rhs) & sensitive_vars)
+    ):
+        sensitive_vars.add(name)
+    elif statement.lstrip().startswith("let "):
+        sensitive_vars.discard(name)
 
 
 def operand_is_sensitive(operand: str, sensitive_vars) -> bool:
@@ -6110,22 +6154,51 @@ for rust_file in rust_files(root):
     if "==" not in text and "!=" not in text:
         continue
     lines = text.splitlines()
-    sensitive_vars = collect_sensitive_vars(lines)
+    global_sensitive_vars = set()
+    function_sensitive_vars = None
+    function_depth = None
+    pending_function = False
+    brace_depth = 0
     seen = set()
     for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
-            continue
         stripped = strip_line_comments(raw).strip()
-        if not stripped or ("==" not in stripped and "!=" not in stripped):
-            continue
-        statement = statement_from(lines, line_no)
-        if not statement or not unsafe_secret_compare(statement, sensitive_vars):
-            continue
-        key = (str(rust_file), line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        issues.append((rust_file, line_no, source_line(lines, line_no)))
+        structural = without_string_literals(stripped)
+
+        if function_depth is not None and brace_depth < function_depth:
+            function_sensitive_vars = None
+            function_depth = None
+
+        opens = structural.count("{")
+        closes = structural.count("}")
+        if fn_re.match(structural):
+            pending_function = True
+        if pending_function and opens:
+            function_sensitive_vars = set(global_sensitive_vars)
+            function_depth = brace_depth + 1
+            pending_function = False
+        elif pending_function and ";" in structural:
+            pending_function = False
+
+        sensitive_vars = (
+            function_sensitive_vars
+            if function_sensitive_vars is not None
+            else global_sensitive_vars
+        )
+        if stripped and not has_ignore(lines, line_no):
+            statement = statement_from(lines, line_no)
+            if statement and not safe_compare_re.search(statement):
+                update_sensitive_vars(statement, sensitive_vars)
+            if (
+                statement
+                and ("==" in stripped or "!=" in stripped)
+                and unsafe_secret_compare(statement, sensitive_vars)
+            ):
+                key = (str(rust_file), line_no)
+                if key not in seen:
+                    seen.add(key)
+                    issues.append((rust_file, line_no, source_line(lines, line_no)))
+
+        brace_depth += opens - closes
 
 for path, line_no, code in issues:
     print(f"{path}:{line_no}:{code}")

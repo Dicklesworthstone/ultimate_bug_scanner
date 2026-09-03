@@ -384,8 +384,16 @@ def check_module_contract() -> None:
     report("module-contract", not problems, "; ".join(problems) if problems else f"{len(listed)} contract flags and {len(parsers)} modules verified; README block current")
 
 
+def check_coverage_matrix() -> None:
+    """detectors.yml agrees with docs/coverage-matrix.md and README.md."""
+    import subprocess
+    gen = ROOT / "scripts" / "generate_coverage_matrix.py"
+    proc = subprocess.run([sys.executable, str(gen), "--check"], capture_output=True, text=True)  # ubs:ignore
+    report("coverage-matrix", proc.returncode == 0, (proc.stderr or proc.stdout).strip() if proc.returncode != 0 else "detectors.yml, docs/coverage-matrix.md, and README in sync")
+
+
 def main() -> int:
-    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme, check_toon_digests_in_sync, check_help_heredoc_static, check_module_contract):
+    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme, check_toon_digests_in_sync, check_help_heredoc_static, check_module_contract, check_coverage_matrix):
         try:
             check()
         except Exception as exc:  # noqa: BLE001

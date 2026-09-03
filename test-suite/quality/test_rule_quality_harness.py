@@ -1121,5 +1121,28 @@ class ExpectationStrengthScopeTest(unittest.TestCase):
         )
 
 
+class DetectorsRegistryAuditTest(unittest.TestCase):
+    def test_audit_detectors_registry_on_real_files(self) -> None:
+        manifest = rule_quality_harness.load_manifest()
+        # Must not raise
+        rule_quality_harness.audit_detectors_registry(manifest)
+
+    def test_audit_detectors_registry_detects_na_violation(self) -> None:
+        manifest = rule_quality_harness.load_manifest()
+        manifest_copy = {"cases": list(manifest["cases"])}
+        manifest_copy["cases"].append(
+            {
+                "id": "cpp-cors-buggy",
+                "language": "cpp",
+                "path": "test-suite/cpp/clean",
+                "tags": ["cpp", "cors", "buggy"],
+            }
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            rule_quality_harness.audit_detectors_registry(manifest_copy)
+        self.assertIn("marks cors/cpp as n-a", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
+

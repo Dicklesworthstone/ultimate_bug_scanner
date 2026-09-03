@@ -124,7 +124,7 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert "scan target not found" not in out, out
     assert calls == "", f"--no-cargo still dispatched cargo:\n{calls}"
     assert out.count("Not evaluated:") >= 3, out
-    assert "--no-cargo" in out, out
+    assert "Skipping cargo-based checks: --no-cargo" in out, out
     assert "EXCELLENT!" not in out, out
     assert "cargo check clean" not in out, out
 
@@ -134,7 +134,9 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert result.returncode == 0, out
     assert calls == "", f"UBS_SKIP_RUST_BUILD=1 still dispatched cargo:\n{calls}"
     assert "dependency hygiene" in out, out
-    assert "UBS_SKIP_RUST_BUILD" in out, out
+    # The banner must name the lever that actually suppressed the phases, not a
+    # hardcoded "--no-cargo".
+    assert "Skipping cargo-based checks: UBS_SKIP_RUST_BUILD=1" in out, out
 
     # Targeted scan: the shadow workspace has no Cargo.toml, so cargo must not
     # run (it would resolve a manifest above the temp dir) and the report must
@@ -143,7 +145,7 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert calls == "", f"targeted scan dispatched cargo:\n{calls}"
-    assert "no Cargo.toml" in out, out
+    assert "Skipping cargo-based checks: no Cargo.toml" in out, out
     assert out.count("Not evaluated:") >= 3, out
 
     # A cargo that fails without emitting diagnostics (wrapper refusing, broken

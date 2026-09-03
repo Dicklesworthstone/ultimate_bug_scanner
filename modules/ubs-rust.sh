@@ -8184,10 +8184,13 @@ if [[ "$RUN_CARGO" -eq 1 ]]; then
     [[ "$HAS_UDEPS"  -eq 1 ]] && say "  ${GREEN}${CHECK}${RESET} cargo-udeps available" || say "  ${YELLOW}${WARN}${RESET} cargo-udeps not installed"
     [[ "$HAS_OUTDATED" -eq 1 ]] && say "  ${GREEN}${CHECK}${RESET} cargo-outdated available" || say "  ${YELLOW}${WARN}${RESET} cargo-outdated not installed"
   else
-    say "${YELLOW}${WARN} cargo not found. Skipping cargo-based checks.${RESET}"
+    say "${YELLOW}${WARN} Skipping cargo-based checks: ${CARGO_SKIP_REASON:-cargo not found on PATH}${RESET}"
   fi
 else
-  say "${YELLOW}${WARN} --no-cargo set: skipping cargo-based checks.${RESET}"
+  # Report the actual trigger (--no-cargo, UBS_SKIP_RUST_BUILD, targeted scan),
+  # never a hardcoded one: which lever suppressed the phases is the evidence
+  # a reader needs (#99).
+  say "${YELLOW}${WARN} Skipping cargo-based checks: ${CARGO_SKIP_REASON:-static analysis only}${RESET}"
 fi
 
 # If user only wants to see categories

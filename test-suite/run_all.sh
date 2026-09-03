@@ -189,6 +189,10 @@ run_step meta-runner-modes "${PY[@]}" shareable/test_meta_runner_modes.py
 run_step cli-contract "${PY[@]}" shareable/test_cli_contract.py
 run_step supply-chain "${PY[@]}" shareable/test_supply_chain.py
 run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
+# SARIF parity (bead K5): asserted for the modules whose SARIF carries their
+# heuristic findings; the other languages are reported (json has no per-finding
+# records for them yet, bead K2).
+run_step sarif-parity "${PY[@]}" shareable/test_sarif_parity.py --assert=python,rust,ruby,elixir,cpp
 run_step python-resource-helper "${PY[@]}" python/tests/test_resource_helper.py
 run_step java-resource-lifecycle-helper "${PY[@]}" java/tests/test_resource_lifecycle_helper.py
 run_step csharp-helper-scanners "${PY[@]}" csharp/tests/test_helper_scanners.py

@@ -1251,24 +1251,34 @@ def sarif_summary_from_process(
     except AssertionError:
         write_runtime_artifact(label, proc, payload if isinstance(payload, dict) else None)
         raise
+    # This check measures the generated ast-grep rule pack: since bead K5 a
+    # module's SARIF also carries a `ubs-<lang>-heuristics` run (rule ids
+    # <lang>.heuristic.<slug>, by construction not generated rules), which is
+    # left out of the counts, the rule-id cross-check and the golden.
+    def is_rule_pack_run(run: Any) -> bool:
+        if not isinstance(run, dict):
+            return False
+        name = str(((run.get("tool") or {}).get("driver") or {}).get("name") or "")
+        return not name.endswith("-heuristics")
+
     result_count = sum(
         1
         for run in payload["runs"]
-        if isinstance(run, dict)
+        if is_rule_pack_run(run)
         for result in run.get("results", []) or []
         if isinstance(result, dict)
     )
     result_rule_ids = {
         result.get("ruleId")
         for run in payload["runs"]
-        if isinstance(run, dict)
+        if is_rule_pack_run(run)
         for result in run.get("results", []) or []
         if isinstance(result, dict) and isinstance(result.get("ruleId"), str)
     }
     driver_rule_ids = {
         rule_id
         for run in payload["runs"]
-        if isinstance(run, dict)
+        if is_rule_pack_run(run)
         for rule in ((run.get("tool", {}) or {}).get("driver", {}) or {}).get("rules", []) or []
         if isinstance(rule, dict)
         for rule_id in (rule.get("id"), rule.get("name"), rule.get("ruleId"))
@@ -1280,7 +1290,7 @@ def sarif_summary_from_process(
             label,
             proc,
             {
-                "sarif_runs": len(payload["runs"]),
+                "sarif_runs": sum(1 for run in payload["runs"] if is_rule_pack_run(run)),
                 "result_rule_ids": sorted(result_rule_ids),
             },
         )
@@ -1296,7 +1306,7 @@ def sarif_summary_from_process(
         "module": spec["module"],
         "result_count": result_count,
         "result_rule_ids": sorted(result_rule_ids),
-        "sarif_runs": len(payload["runs"]),
+        "sarif_runs": sum(1 for run in payload["runs"] if is_rule_pack_run(run)),
     }
     write_runtime_artifact(label, proc, summary)
     return summary

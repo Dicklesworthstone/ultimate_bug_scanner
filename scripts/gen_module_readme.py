@@ -22,6 +22,10 @@ BEGIN, END = "<!-- contract:options -->", "<!-- /contract:options -->"
 COL = 19
 
 
+def note(text: str, err: bool = False) -> None:
+    (sys.stderr if err else sys.stdout).write(text + "\n")
+
+
 def render_block(contract: dict) -> str:
     lines = []
     for entry in contract["flags"]:
@@ -46,23 +50,27 @@ def splice(text: str, block: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    try:
+        contract = json.loads(CONTRACT.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        note(f"[gen-module-readme] cannot read {CONTRACT}: {exc}", err=True)
+        return 2
     text = README.read_text(encoding="utf-8")
     if BEGIN not in text or END not in text:
-        print(f"[gen-module-readme] markers {BEGIN} / {END} missing in {README}", file=sys.stderr)
+        note(f"[gen-module-readme] markers {BEGIN} / {END} missing in {README}", err=True)
         return 2
     new = splice(text, render_block(contract))
     if "--check" in argv:
         if new != text:
-            print("[gen-module-readme] modules/README.md Options block is stale; run scripts/gen_module_readme.py", file=sys.stderr)
+            note("[gen-module-readme] modules/README.md Options block is stale; run scripts/gen_module_readme.py", err=True)
             return 1
-        print("[gen-module-readme] modules/README.md Options block matches contract.json")
+        note("[gen-module-readme] modules/README.md Options block matches contract.json")
         return 0
     if new != text:
         README.write_text(new, encoding="utf-8")
-        print("[gen-module-readme] rewrote the Options block")
+        note("[gen-module-readme] rewrote the Options block")
     else:
-        print("[gen-module-readme] already up to date")
+        note("[gen-module-readme] already up to date")
     return 0
 
 

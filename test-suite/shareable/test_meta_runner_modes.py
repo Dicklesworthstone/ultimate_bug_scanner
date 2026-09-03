@@ -147,14 +147,19 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
     assert out.count("Not evaluated:") >= 3, out
 
     # A cargo that fails without emitting diagnostics (wrapper refusing, broken
-    # toolchain) is a failure, never "clean".
+    # toolchain) is never "clean": since bead D10 it is an environment
+    # condition — warnings plus "Not evaluated" per phase, the module reports
+    # itself partial, and the run exits 2 (partial) rather than 1 (critical).
     result, calls = scan([str(proj)], {"SENTINEL_EXIT": "103"})
     out = result.stdout + result.stderr
     assert "cargo check" in calls, calls
-    assert result.returncode == 1, out
+    assert result.returncode == 2, out
     assert "cargo check clean" not in out, out
     assert "Tests build clean" not in out, out
     assert "exit 103" in out, out
+    assert "cargo check could not run" in out, out
+    assert "Partial: [CARGO_UNAVAILABLE]" in out, out
+    assert "CRITICAL" not in out.split("cargo check could not run", 1)[1].split("\n", 3)[0], out
 
 
 def check_no_supported_languages(tmpdir: Path) -> None:

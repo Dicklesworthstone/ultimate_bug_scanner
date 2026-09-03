@@ -348,6 +348,34 @@ def check_file_list_workspace() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_single_file_fast_path() -> None:
+    # One explicit source file is scanned in place (bead C3): only its language
+    # runs, no workspace is announced, and sample paths are the real path.
+    target = REPO_ROOT / "test-suite" / "python" / "security" / "parser_token_compare_buggy.py"
+    proc = run([str(target), "--ci", "--format=json"], env={"UBS_PROFILE": "1"})
+    ok = False
+    detail = f"exit={proc.returncode}"
+    try:
+        doc = json.loads(proc.stdout)
+        langs = [s["language"] for s in doc["scanners"]]
+        samples = [s for sc in doc["scanners"] for f in sc.get("findings", []) for s in f.get("samples", []) if s.get("file")]
+        rel = "test-suite/python/security/parser_token_compare_buggy.py"
+        ok = langs == ["python"] and doc["scanners"][0]["files"] == 1 and bool(samples) \
+            and all(s["file"] == rel for s in samples) \
+            and all(s.get("permalink", "").endswith(f"{rel}#L{s['line']}") for s in samples if isinstance(s.get("line"), int)) \
+            and "Scanning one file directly (no workspace)" in proc.stderr \
+            and "Preparing shadow workspace" not in proc.stderr \
+            and doc["profile"]["copy_ms"] == 0
+        detail += f" langs={langs} samples={len(samples)}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" {exc}"
+    report("single_file_fast_path", ok, detail, proc if not ok else None)
+    # Two files, or a file with an extension no module owns, keep the workspace path.
+    proc2 = run([str(target), str(PY_CLEAN), "--ci", "--only=python", "--format=json"])
+    ok2 = proc2.returncode in (0, 1) and "Preparing shadow workspace for 2 file(s)" in proc2.stderr
+    report("multi_file_keeps_workspace", ok2, f"exit={proc2.returncode}", proc2 if not ok2 else None)
+
+
 def _exclude_project() -> Path:
     # legacy/ holds a buggy file, src/ a clean one, plus a JS file so two
     # languages are detected for the --exclude-langs check.
@@ -623,6 +651,7 @@ def main() -> int:
         check_env_error_envelope,
         check_size_refusal_envelope,
         check_file_list_workspace,
+        check_single_file_fast_path,
     ):
         try:
             check()

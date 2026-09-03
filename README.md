@@ -1506,6 +1506,9 @@ Each module maps its tool-specific severity strings, numeric levels, and legacy 
   module uniformly; the workspace is deleted when the scan ends
 - One explicit source file (the agent-hook case, `ubs FILE --ci`) is handed to
   its language module in place: no workspace, no per-language detection walk
+- rsync is optional everywhere: every workspace copy (whole project, explicit
+  targets, directory targets, --staged/--diff) falls back to tar, then to a
+  Python copy, so Git for Windows (no rsync) works
 - Results are merged from per-module JSON at the end of the run
 - Memory: 45–110 MB resident on typical projects; ~840 MB was measured on a
   407K-line TypeScript tree (bead ultimate_bug_scanner-q150.6 streams that)

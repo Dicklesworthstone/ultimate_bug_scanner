@@ -9132,7 +9132,18 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   fi
 
   if [[ "$HAS_DENY" -eq 1 ]]; then
-    DENY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-deny.XXXXXX)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" cargo deny check advisories bans licenses sources
+    # cargo-deny's built-in policy allows NO license until a deny.toml lists
+    # them ("license is not explicitly allowed"), so without one the licenses
+    # check turns every crate into a critical. Run it only when the project
+    # configured it; advisories/bans/sources work with the defaults.
+    DENY_CHECKS=(advisories bans sources)
+    if [[ -f "$PROJECT_DIR/deny.toml" || -f "$PROJECT_DIR/.cargo/deny.toml" || -f "$PROJECT_DIR/.deny.toml" ]]; then
+      DENY_CHECKS+=(licenses)
+    else
+      print_finding "info" 1 "cargo-deny licenses check skipped: no deny.toml (cargo-deny allows no license until one is listed there)"
+      add_finding "info" 1 "cargo-deny licenses check skipped: no deny.toml" "" "${CATEGORY_NAME[14]}"
+    fi
+    DENY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-deny.XXXXXX)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" cargo deny check "${DENY_CHECKS[@]}"
     deny_err=$(grep -c -E "error\[[^)]+\]|[[:space:]]error:" "$DENY_LOG" 2>/dev/null || true); deny_err=${deny_err:-0}
     deny_warn=$(grep -c -E "[[:space:]]warning:" "$DENY_LOG" 2>/dev/null || true); deny_warn=${deny_warn:-0}
     if [[ "$deny_err" -gt 0 ]]; then print_finding "critical" "$deny_err" "cargo-deny errors"; add_finding "critical" "$deny_err" "cargo-deny errors" "" "${CATEGORY_NAME[14]}"; fi

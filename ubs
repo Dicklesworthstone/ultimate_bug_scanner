@@ -57,7 +57,7 @@ declare -A MODULE_CHECKSUMS=(
   [js]='edc7e52df94492bc71fbe94131f9003c4411bd8efadc35b861e6fce2781ebdd5'
   [python]='6a01c19f50986ec1b0fbd1d92b9af4b794474ddc9e3986a39081b787f95b6583'
   [ruby]='020aeca8d1c4fc448f01cd1ad6d66e10ad43a247e0c466c0a0a5b77181ed6d34'
-  [rust]='fa7f4fcb6edf12b1147de8014e4bb0b6d26ecf40ed26911fd2088e963438d76f'
+  [rust]='9190c446eee7d2ce5709e42006c7de692557b9b63f9e5ed0321195d74623d4c6'
   [swift]='0960197481c8eda9859469f227f6bdbcf5c116b813a335e2763a1188b5c6c073'
 )
 
@@ -459,6 +459,7 @@ HTML_REPORT_PATH=""
 SHAREABLE_MODE=0
 GIT_MODE=""  # staged, diff, or empty
 SCAN_FILES=()  # explicit target list from --files or multiple positional args (files and/or directories)
+SINGLE_FILE_TARGET=""  # set by prepare_single_file_target: one source file scanned in place (bead C3)
 POSITIONAL_TARGETS=()  # raw positional path args; classified after the parse loop (issue #88)
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
@@ -489,6 +490,25 @@ looks_like_source_path(){
   case "${1##*/}" in
     *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyi|*.pyw|*.pyx|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.rake|*.swift|*.metal|*.cs|*.csx|*.csproj|*.sln|*.ex|*.exs|*.vue|*.svelte)
       return 0;;
+    *) return 1;;
+  esac
+}
+
+# Language module for ONE explicit source file (bead C3 fast path). Prints the
+# module name; fails when the extension is not owned by exactly one module, in
+# which case the caller keeps the shadow-workspace path and rg-based detection.
+lang_for_source_file(){
+  case "${1##*/}" in
+    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx) echo js;;
+    *.py|*.pyi|*.pyw) echo python;;
+    *.go) echo golang;;
+    *.rs) echo rust;;
+    *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx) echo cpp;;
+    *.java|*.kt|*.kts) echo java;;
+    *.rb|*.rake) echo ruby;;
+    *.swift) echo swift;;
+    *.cs) echo csharp;;
+    *.ex|*.exs|*.heex|*.eex) echo elixir;;
     *) return 1;;
   esac
 }
@@ -1792,6 +1812,37 @@ resolve_git_metadata(){
   esac
 }
 
+# Single-file fast path (bead C3): the hook-driven `ubs FILE --ci` case. The
+# module gets the real file, so no workspace is copied, no path restoration
+# runs and no per-language rg probes are needed (select_langs uses the
+# extension). Returns 1 — and leaves everything untouched — when the target is
+# not one existing regular file with an extension owned by exactly one module,
+# so prepare_files_workspace handles it exactly as before (including its
+# "scan target not found" diagnostics).
+prepare_single_file_target(){
+  [[ ${#SCAN_FILES[@]} -eq 1 ]] || return 1
+  local f="${SCAN_FILES[0]}" scan_root="$SOURCE_PROJECT_DIR" abs
+  [[ -f "$scan_root" ]] && scan_root="$(dirname "$scan_root")"
+  if [[ "$f" == /* ]]; then
+    abs="$f"
+  elif [[ -f "$scan_root/$f" ]]; then
+    abs="$scan_root/$f"
+  elif [[ -f "$f" ]]; then
+    abs="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)/$(basename "$f")"
+  else
+    return 1
+  fi
+  [[ -f "$abs" && ! -L "$abs" ]] || return 1
+  lang_for_source_file "$abs" >/dev/null 2>&1 || return 1
+  SINGLE_FILE_TARGET="$abs"
+  PROJECT_DIR="$abs"
+  FILTERED_PROJECT_DIR=""
+  if [[ "${QUIET:-0}" -eq 0 ]]; then
+    say "${DIM}${INFO}${RESET} Scanning one file directly (no workspace): ${abs}"
+  fi
+  return 0
+}
+
 # Surface the real rsync diagnostic when a shadow-workspace copy fails
 # (issue #98): a discarded stderr collapsed permission errors, missing
 # paths, ENOSPC and bad file-list entries into one generic message.
@@ -2328,6 +2379,14 @@ verify_ast_grep_bin(){
 
 apply_inline_suppressions(){
   if ! need_cmd python3; then cat; return 0; fi
+  # Single-file fast path (bead C3): the only source the findings can point at
+  # is the target itself, so when it carries no suppression marker the python
+  # pass (a temp script plus interpreter start-up) has nothing to do.
+  if [[ -n "${SINGLE_FILE_TARGET:-}" && -f "$SINGLE_FILE_TARGET" ]] \
+     && ! grep -q -i -E 'ubs:ignore|ubs: disable|nolint|noqa' "$SINGLE_FILE_TARGET" 2>/dev/null; then
+    cat
+    return 0
+  fi
   local py_script
   py_script="$(mktemp -t ubs_suppress.XXXXXX 2>/dev/null || mktemp -t ubs_suppress)"
   cat >"$py_script" <<'PY'
@@ -2872,9 +2931,54 @@ suggest_ignore_candidates(){
   done
 }
 
+# Single-file fast path (bead C3): the module saw one file as its scan root and
+# names it by bare basename; rewrite that to the path relative to the directory
+# the scan was invoked from (the form the shadow workspace produced), or to the
+# absolute path when the file lives outside it. JSON/SARIF are rewritten on
+# their `file`/`uri` keys only; text on `<name>:<line>` references.
+single_file_paths(){
+  local file="$1" base rel
+  base="${SINGLE_FILE_TARGET##*/}"
+  rel="${SINGLE_FILE_TARGET#"$SOURCE_PROJECT_DIR"/}"
+  [[ "$rel" != "$base" && -s "$file" ]] || return 0
+  case "$file" in
+    *.json|*.sarif)
+      need_cmd jq || return 0
+      if jq --arg base "$base" --arg rel "$rel" 'walk(if type == "object" then
+            (if (.file|type) == "string" and .file == $base then .file = $rel else . end)
+            | (if (.uri|type) == "string" and .uri == $base then .uri = $rel else . end)
+          else . end)' "$file" > "$file.tmp" 2>/dev/null; then
+        mv "$file.tmp" "$file"
+      else
+        rm -f "$file.tmp" 2>/dev/null
+      fi
+      ;;
+    *)
+      need_cmd python3 || return 0
+      python3 - "$file" "$base" "$rel" <<'PY' 2>/dev/null || true
+import pathlib
+import re
+import sys
+
+path, base, rel = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+try:
+    data = path.read_text(errors="replace")
+except OSError:
+    sys.exit(0)
+path.write_text(re.sub(r"(?<![\w/.\-])" + re.escape(base) + r"(?=:\d)", rel, data))
+PY
+      ;;
+  esac
+}
+
 restore_original_paths(){
   local file="$1"
-  [[ -n "$FILTERED_PROJECT_DIR" && -f "$file" ]] || return 0
+  [[ -f "$file" ]] || return 0
+  if [[ -n "$SINGLE_FILE_TARGET" ]]; then
+    single_file_paths "$file"
+    return 0
+  fi
+  [[ -n "$FILTERED_PROJECT_DIR" ]] || return 0
   if ! need_cmd python3; then return 0; fi
   python3 - "$FILTERED_PROJECT_DIR" "$SOURCE_PROJECT_DIR" "$file" <<'PY' 2>/dev/null || true
 import sys, pathlib
@@ -3691,6 +3795,8 @@ fi
 
 if [[ -n "$GIT_MODE" ]]; then
   prepare_git_workspace "$GIT_MODE"
+elif [[ ${#SCAN_FILES[@]} -eq 1 ]] && prepare_single_file_target; then
+  :  # one source file scanned in place (bead C3)
 elif [[ ${#SCAN_FILES[@]} -gt 0 ]]; then
   prepare_files_workspace
 fi
@@ -3996,9 +4102,15 @@ warn_ambiguous_skip(){
 # Build selected language set
 select_langs(){
   local detected=()
-  for L in "${ALL_LANGS[@]}"; do
-    detect_lang "$L" && detected+=("$L")
-  done
+  if [[ -n "$SINGLE_FILE_TARGET" ]]; then
+    # rg applies no glob filter to an explicit file argument, so the per-language
+    # probes would claim every language for it; the extension decides instead.
+    detected=("$(lang_for_source_file "$SINGLE_FILE_TARGET")")
+  else
+    for L in "${ALL_LANGS[@]}"; do
+      detect_lang "$L" && detected+=("$L")
+    done
+  fi
   # apply --only / --exclude
   local filtered=() i
   if [[ -n "$ONLY_LANGS" ]]; then

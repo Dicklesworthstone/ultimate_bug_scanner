@@ -69,6 +69,7 @@ run_installer() {
         --skip-ast-grep \
         --skip-ripgrep \
         --skip-jq \
+        --skip-toon \
         --skip-doctor \
         --skip-hooks \
         --skip-version-check \
@@ -132,7 +133,9 @@ test_basic_smoke() {
       tests_failed=1
       return
     fi
-    if grep -q "toon encoder not found" "$log"; then
+    if grep -q "toon encoder installation disabled via --skip-toon" "$log"; then
+      echo "[PASS] toon encoder skipped (harness default)"
+    elif grep -q "toon encoder not found" "$log"; then
       echo "[PASS] toon encoder warning emitted"
     elif grep -q "toon encoder" "$log"; then
       echo "[PASS] toon encoder detected"
@@ -262,6 +265,54 @@ test_verified_toon_download() {
   echo "[PASS] verified_toon_download"
 }
 
+test_non_interactive_installs_toon() {
+  # Non-interactive installs provision the encoder by default (bead F8): the
+  # download must be attempted without a prompt, and a tampered asset from the
+  # local mirror must still be refused. Same mirror layout as
+  # test_verified_toon_download, but --non-interactive instead of --easy-mode.
+  echo "[TEST] non_interactive_installs_toon"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[SKIP] non_interactive_installs_toon (python3 not available for the local mirror)"
+    return 0
+  fi
+  if [[ "$(uname -m)" != "x86_64" || "$(uname -s)" != "Linux" ]]; then
+    echo "[SKIP] non_interactive_installs_toon (needs linux x86_64 to hit the asset name)"
+    return 0
+  fi
+  local ctx
+  ctx="$(mktemp_dir)"
+  tmpdirs+=("$ctx")
+  local home="$ctx/home" shim="$ctx/bin" www="$ctx/www" log="$ctx/install.log"
+  mkdir -p "$home/.local/bin" "$shim" "$www/Dicklesworthstone/toon_rust/releases/download/v0.2.4"
+  head -c 4096 /dev/urandom >"$www/Dicklesworthstone/toon_rust/releases/download/v0.2.4/toon-linux-amd64.tar.xz"
+  printf '#!/usr/bin/env bash\necho "shim: cargo disabled in tests" >&2\nexit 1\n' >"$shim/cargo"
+  chmod +x "$shim/cargo"
+  local port
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  (cd "$www" && python3 -m http.server "$port" --bind 127.0.0.1 >"$ctx/http.log" 2>&1) &
+  local http_pid=$!
+  sleep 1
+  local rc=0
+  rm -rf /tmp/ubs-install.lock 2>/dev/null || true
+  (cd "$ctx" && UBS_INSTALLER_BINARY_BASE="http://127.0.0.1:$port" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
+    HOME="$home" PATH="$shim:/usr/bin:/bin:$home/.local/bin" SHELL=/bin/bash \
+    "$INSTALLER" --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+      --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+  kill "$http_pid" 2>/dev/null || true
+  if ! grep -q 'Installing the toon encoder (non-interactive default' "$log"; then
+    echo "[FAIL] non-interactive install did not attempt the toon encoder (exit $rc, log: $log)"
+    grep -n -i 'toon' "$log" | tail -n 10 || true
+    tests_failed=1
+    return 1
+  fi
+  if ! grep -q 'Checksum mismatch for toon-linux-amd64.tar.xz' "$log" || [ -e "$home/.local/bin/toon" ]; then
+    echo "[FAIL] tampered toon archive was not refused in non-interactive mode (log: $log)"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] non_interactive_installs_toon"
+}
+
 test_self_test_flag() {
   echo "[TEST] self_test_flag"
   local ctx
@@ -303,6 +354,7 @@ test_fresh_home_no_path() {
       --skip-hooks \
       --skip-version-check \
       --skip-typos \
+      --skip-toon \
       --no-path-modify \
       --install-dir "$bin_dir" >"$log" 2>&1 || status=$?
 
@@ -435,7 +487,7 @@ SHIM
   local rc=0
   (cd "$proj" && CRONTAB_SHIM_FILE="$ctx/crontab.txt" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
     HOME="$home" PATH="$shim:$home/.local/bin:$PATH" SHELL=/bin/bash \
-    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-doctor \
+    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-toon --skip-doctor \
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[FAIL] easy-mode install exited $rc (log: $log)"
@@ -504,7 +556,7 @@ test_verified_download() {
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   (cd "$ctx" && UBS_INSTALLER_BINARY_BASE="http://127.0.0.1:$port" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
     HOME="$home" PATH="$shim:/usr/bin:/bin:$home/.local/bin" SHELL=/bin/bash \
-    "$INSTALLER" --non-interactive --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+    "$INSTALLER" --non-interactive --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor --skip-hooks \
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
   if ! grep -q 'Checksum mismatch for app-x86_64-unknown-linux-gnu.zip' "$log"; then
     kill "$http_pid" 2>/dev/null || true
@@ -525,7 +577,7 @@ test_verified_download() {
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   (cd "$ctx" && UBS_INSTALLER_BINARY_BASE="http://127.0.0.1:$port" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
     HOME="$home" PATH="$shim:/usr/bin:/bin:$home/.local/bin" SHELL=/bin/bash \
-    "$INSTALLER" --non-interactive --skip-verification --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+    "$INSTALLER" --non-interactive --skip-verification --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor --skip-hooks \
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$ctx/install-skip.log" 2>&1 || rc=$?
   kill "$http_pid" 2>/dev/null || true
   if ! grep -q 'Skipping checksum verification for app-x86_64-unknown-linux-gnu.zip' "$ctx/install-skip.log"; then
@@ -557,7 +609,7 @@ test_local_requires_flag() {
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   (cd "$proj" && UBS_ARTIFACT_BASE="http://127.0.0.1:9/dead" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
     HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
-    bash "$inst/install.sh" --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks \
+    bash "$inst/install.sh" --non-interactive --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor --skip-hooks \
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
   if [ "$rc" -eq 0 ] || ! grep -q 'Ignoring ./ubs' "$log" || [ -e "$home/.local/bin/ubs" ]; then
     echo "[FAIL] ./ubs from the current directory was installed (or not ignored) without --local (exit $rc, log: $log)"
@@ -621,7 +673,7 @@ SHIM
   # its PATH block and alias into ~/.bashrc, which the uninstall must strip.
   (cd "$proj" && CRONTAB_SHIM_FILE="$ctx/crontab.txt" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
     HOME="$home" PATH="$shim:$PATH" SHELL=/bin/bash \
-    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor \
+    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor \
       --skip-version-check --install-dir "$home/.local/bin") >"$ctx/install.log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[FAIL] easy-mode install exited $rc (log: $ctx/install.log)"
@@ -738,7 +790,7 @@ test_stale_lock_recovered() {
   mkdir -p "$home/.local/bin"
   local rc=0
   (UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" PATH="$home/.local/bin:$PATH" SHELL=/bin/bash \
-    "$INSTALLER" --non-interactive --skip-version-check --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
+    "$INSTALLER" --non-interactive --skip-version-check --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor --skip-hooks --no-path-modify --install-dir "$home/.local/bin") >"$log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ] || [ ! -x "$home/.local/bin/ubs" ]; then
     echo "[FAIL] install with a stale lock present failed (exit $rc, log: $log)"
     tail -n 20 "$log" || true
@@ -761,7 +813,7 @@ test_stale_lock_recovered() {
   printf '%s\n' "$$" >/tmp/ubs-install.lock/pid
   rc=0
   (UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" SHELL=/bin/bash \
-    "$INSTALLER" --non-interactive --skip-version-check --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-doctor --skip-hooks --no-path-modify --install-dir "$home/.local/bin") >"$ctx/blocked.log" 2>&1 || rc=$?
+    "$INSTALLER" --non-interactive --skip-version-check --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor --skip-hooks --no-path-modify --install-dir "$home/.local/bin") >"$ctx/blocked.log" 2>&1 || rc=$?
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   if [ "$rc" -eq 0 ] || ! grep -q 'already in progress' "$ctx/blocked.log"; then
     echo "[FAIL] a live lock did not block the installer (exit $rc, log: $ctx/blocked.log)"
@@ -833,6 +885,7 @@ test_claude_hooks_registered
 test_agent_detection
 test_verified_download
 test_verified_toon_download
+test_non_interactive_installs_toon
 test_local_requires_flag
 test_uninstall_roundtrip
 test_dry_run_touches_nothing

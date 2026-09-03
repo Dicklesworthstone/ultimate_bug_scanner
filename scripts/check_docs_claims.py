@@ -305,8 +305,40 @@ def check_module_readme() -> None:
     report("module-readme", not problems, "; ".join(problems) if problems else f"{checked} documented flags verified against {len(parsers)} module parsers")
 
 
+def check_toon_digests_in_sync() -> None:
+    """The toon_rust asset digests pinned in `ubs` (TOON_ASSET_SHA256, used by
+    doctor --fix) and in install.sh (DEP_ASSET_SHA256) must be identical."""
+    ubs_text = (ROOT / "ubs").read_text(encoding="utf-8")
+    inst_text = (ROOT / "install.sh").read_text(encoding="utf-8")
+    block = re.search(r"declare -A TOON_ASSET_SHA256=\((.*?)\)", ubs_text, re.S)
+    in_ubs = dict(re.findall(r"\[(toon-[^\]]+)\]='([0-9a-f]{64})'", block.group(1))) if block else {}
+    in_inst = dict(re.findall(r"\[(toon-[^\]]+)\]='([0-9a-f]{64})'", inst_text))
+    problems: list[str] = []
+    if not in_ubs:
+        problems.append("no TOON_ASSET_SHA256 table in ubs")
+    for name in sorted(set(in_ubs) | set(in_inst)):
+        if in_ubs.get(name) != in_inst.get(name):
+            problems.append(f"{name}: ubs={in_ubs.get(name, 'missing')[:12]} install.sh={in_inst.get(name, 'missing')[:12]}")
+    report("toon-digests", not problems, "; ".join(problems) if problems else f"{len(in_ubs)} toon_rust asset digests identical in ubs and install.sh")
+
+
+def check_help_heredoc_static() -> None:
+    """The usage() help text in `ubs` is an unquoted heredoc: a backtick or $( )
+    in it is executed at `ubs --help` time (twice in 2026 it ran `python`
+    interactively and hung the installer's self-check). Nothing in that block
+    may look like a command substitution."""
+    text = (ROOT / "ubs").read_text(encoding="utf-8")
+    start = text.find("usage() {")
+    end = text.find("\nUSAGE\n", start)
+    if start < 0 or end < 0:
+        report("help-heredoc", False, "usage() heredoc not found in ubs")
+        return
+    offenders = [ln.strip()[:80] for ln in text[start:end].splitlines() if "`" in ln or "$(" in ln]
+    report("help-heredoc", not offenders, "; ".join(offenders) if offenders else "no command substitution in the usage() heredoc")
+
+
 def main() -> int:
-    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme):
+    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme, check_toon_digests_in_sync, check_help_heredoc_static):
         try:
             check()
         except Exception as exc:  # noqa: BLE001

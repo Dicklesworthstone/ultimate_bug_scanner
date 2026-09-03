@@ -4332,7 +4332,13 @@ if [ "$SKIP_TOON" -eq 1 ]; then
   log "[skip] toon encoder installation disabled via --skip-toon"
 elif ! check_toon; then
   warn "toon encoder not found (toon_rust; needed for --format=toon)"
-  if ask "Install the toon encoder now?"; then
+  # Non-interactive installs (curl | bash -s -- --non-interactive, Docker, CI)
+  # provision the encoder without a prompt: the pinned release asset is small
+  # and digest-verified, and --skip-toon (or skip_toon in install.conf) opts out.
+  if [ "$NON_INTERACTIVE" -eq 1 ]; then
+    log "Installing the toon encoder (non-interactive default; --skip-toon opts out)"
+    install_toon || warn "Continuing without the toon encoder (--format=toon exits 2 until it is installed)"
+  elif ask "Install the toon encoder now?"; then
     install_toon || warn "Continuing without the toon encoder (--format=toon exits 2 until it is installed)"
   fi
 else

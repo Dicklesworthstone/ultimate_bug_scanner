@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 149,
-      "case_count": 298,
-      "clean_cases_with_forbidden_substrings": 148,
-      "strict_zero_clean_cases": 148,
+      "buggy_cases_with_required_substrings": 150,
+      "case_count": 300,
+      "clean_cases_with_forbidden_substrings": 149,
+      "strict_zero_clean_cases": 149,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -20,10 +20,10 @@
       ]
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 96,
-      "case_count": 193,
-      "clean_cases_with_forbidden_substrings": 97,
-      "strict_zero_clean_cases": 97,
+      "buggy_cases_with_required_substrings": 97,
+      "case_count": 195,
+      "clean_cases_with_forbidden_substrings": 98,
+      "strict_zero_clean_cases": 98,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -38,14 +38,14 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 181,
+      "case_count": 182,
       "default_iterations": 3,
-      "default_transformed_scan_count": 543
+      "default_transformed_scan_count": 546
     },
     "campaign": {
-      "case_count": 97,
+      "case_count": 98,
       "default_iterations": 3,
-      "default_transformed_scan_count": 291
+      "default_transformed_scan_count": 294
     },
     "smoke": {
       "case_count": 17,
@@ -55,18 +55,18 @@
   },
   "expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 65,
-      "case_count": 130,
-      "clean_cases_with_forbidden_substrings": 65,
-      "strict_zero_clean_cases": 65,
+      "buggy_cases_with_required_substrings": 66,
+      "case_count": 132,
+      "clean_cases_with_forbidden_substrings": 66,
+      "strict_zero_clean_cases": 66,
       "weak_case_count": 0,
       "weak_cases": []
     },
     "campaign": {
-      "buggy_cases_with_required_substrings": 96,
-      "case_count": 193,
-      "clean_cases_with_forbidden_substrings": 97,
-      "strict_zero_clean_cases": 97,
+      "buggy_cases_with_required_substrings": 97,
+      "case_count": 195,
+      "clean_cases_with_forbidden_substrings": 98,
+      "strict_zero_clean_cases": 98,
       "weak_case_count": 0,
       "weak_cases": []
     },
@@ -129,10 +129,10 @@
       "strict_zero_clean_cases": 7
     },
     "rust": {
-      "buggy_cases_with_required_substrings": 17,
-      "clean_cases_with_forbidden_substrings": 17,
-      "security_pairs": 17,
-      "strict_zero_clean_cases": 17
+      "buggy_cases_with_required_substrings": 18,
+      "clean_cases_with_forbidden_substrings": 18,
+      "security_pairs": 18,
+      "strict_zero_clean_cases": 18
     },
     "swift": {
       "buggy_cases_with_required_substrings": 7,
@@ -417,6 +417,8 @@
           "rust-redos-regex-clean",
           "rust-request-body-limit-buggy",
           "rust-request-body-limit-clean",
+          "rust-secret-compare-function-scope-buggy",
+          "rust-secret-compare-function-scope-clean",
           "rust-security-randomness-buggy",
           "rust-security-randomness-clean",
           "rust-security-shell-command-buggy",
@@ -626,6 +628,8 @@
           "rust-redos-regex-clean",
           "rust-request-body-limit-buggy",
           "rust-request-body-limit-clean",
+          "rust-secret-compare-function-scope-buggy",
+          "rust-secret-compare-function-scope-clean",
           "rust-security-randomness-buggy",
           "rust-security-randomness-clean",
           "rust-security-shell-command-buggy",
@@ -703,8 +707,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 361,
-      "transformed_scan_count": 554
+      "case_count": 363,
+      "transformed_scan_count": 558
     },
     "campaign": {
       "by_transform": {
@@ -827,6 +831,8 @@
           "rust-redos-regex-clean",
           "rust-request-body-limit-buggy",
           "rust-request-body-limit-clean",
+          "rust-secret-compare-function-scope-buggy",
+          "rust-secret-compare-function-scope-clean",
           "rust-security-randomness-buggy",
           "rust-security-randomness-clean",
           "rust-security-shell-command-buggy",
@@ -1022,6 +1028,8 @@
           "rust-redos-regex-clean",
           "rust-request-body-limit-buggy",
           "rust-request-body-limit-clean",
+          "rust-secret-compare-function-scope-buggy",
+          "rust-secret-compare-function-scope-clean",
           "rust-security-randomness-buggy",
           "rust-security-randomness-clean",
           "rust-security-shell-command-buggy",
@@ -1099,8 +1107,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 193,
-      "transformed_scan_count": 386
+      "case_count": 195,
+      "transformed_scan_count": 390
     },
     "smoke": {
       "by_transform": {
@@ -3075,6 +3083,20 @@
       "slug": "request-body-limit"
     },
     {
+      "buggy_case": "rust-secret-compare-function-scope-buggy",
+      "buggy_min_critical": 4,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/rust/buggy/secret_compare_function_scope.rs",
+      "buggy_require_count": 1,
+      "clean_case": "rust-secret-compare-function-scope-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/rust/clean/secret_compare_function_scope.rs",
+      "language": "rust",
+      "slug": "secret-compare-function-scope"
+    },
+    {
       "buggy_case": "rust-security-randomness-buggy",
       "buggy_min_critical": 1,
       "buggy_min_warning": 0,
@@ -3396,6 +3418,7 @@
         "rust-parser-token-compare-clean",
         "rust-redos-regex-clean",
         "rust-request-body-limit-clean",
+        "rust-secret-compare-function-scope-clean",
         "rust-security-randomness-clean",
         "rust-security-shell-command-clean",
         "rust-sql-injection-clean",
@@ -3715,6 +3738,8 @@
         "rust-redos-regex-clean",
         "rust-request-body-limit-buggy",
         "rust-request-body-limit-clean",
+        "rust-secret-compare-function-scope-buggy",
+        "rust-secret-compare-function-scope-clean",
         "rust-security-randomness-buggy",
         "rust-security-randomness-clean",
         "rust-security-shell-command-buggy",
@@ -3867,6 +3892,7 @@
         "rust-parser-token-compare-clean",
         "rust-redos-regex-clean",
         "rust-request-body-limit-clean",
+        "rust-secret-compare-function-scope-clean",
         "rust-security-randomness-clean",
         "rust-security-shell-command-clean",
         "rust-sql-injection-clean",
@@ -4025,6 +4051,8 @@
         "rust-redos-regex-clean",
         "rust-request-body-limit-buggy",
         "rust-request-body-limit-clean",
+        "rust-secret-compare-function-scope-buggy",
+        "rust-secret-compare-function-scope-clean",
         "rust-security-randomness-buggy",
         "rust-security-randomness-clean",
         "rust-security-shell-command-buggy",
@@ -4436,6 +4464,8 @@
       "rust-redos-regex-clean",
       "rust-request-body-limit-buggy",
       "rust-request-body-limit-clean",
+      "rust-secret-compare-function-scope-buggy",
+      "rust-secret-compare-function-scope-clean",
       "rust-security-randomness-buggy",
       "rust-security-randomness-clean",
       "rust-security-shell-command-buggy",
@@ -4582,6 +4612,8 @@
       "rust-redos-regex-clean",
       "rust-request-body-limit-buggy",
       "rust-request-body-limit-clean",
+      "rust-secret-compare-function-scope-buggy",
+      "rust-secret-compare-function-scope-clean",
       "rust-security-randomness-buggy",
       "rust-security-randomness-clean",
       "rust-security-shell-command-buggy",

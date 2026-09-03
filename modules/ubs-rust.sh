@@ -5913,6 +5913,9 @@ assign_re = re.compile(
     r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)"
 )
 identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A `fn` ITEM declaration (`pub async fn verify`), not a function-pointer type
+# (`fn(u32) -> u32`) and not the `Fn`/`FnMut` traits.
+fn_decl_re = re.compile(r"(?:^|[^A-Za-z0-9_:])fn\s+[A-Za-z_][A-Za-z0-9_]*")
 safe_compare_re = re.compile(
     r"\b(?:subtle::)?ConstantTimeEq\b"
     r"|\.(?:ct_eq|constant_time_eq|timing_safe_eq|timing_safe_compare|safe_eq|safe_compare|secure_compare)\s*\("
@@ -6127,24 +6130,147 @@ def source_line(lines, line_no):
     return ""
 
 
-def collect_sensitive_vars(lines):
-    sensitive = set()
+def blank_string_literals(text: str) -> str:
+    """Comment-stripped text with string/char literal CONTENT blanked out.
+
+    Used only for structural brace counting and `fn` detection, so the result
+    keeps the original length and every non-literal character in place: a `{`
+    inside `"{}"` or `'{'` must not open a scope.
+    """
+    chars = list(text)
+    i = 0
+    n = len(chars)
+    while i < n:
+        ch = chars[i]
+        if ch == "r":
+            j = i + 1
+            while j < n and chars[j] == "#":
+                j += 1
+            if j < n and chars[j] == '"':
+                hashes = j - i - 1
+                closer = '"' + "#" * hashes
+                end = text.find(closer, j + 1)
+                stop = n if end == -1 else end + len(closer)
+                for pos in range(i, stop):
+                    chars[pos] = " "
+                i = stop
+                continue
+        if ch == '"':
+            chars[i] = " "
+            i += 1
+            escape = False
+            while i < n:
+                cur = chars[i]
+                chars[i] = " "
+                i += 1
+                if escape:
+                    escape = False
+                elif cur == "\\":
+                    escape = True
+                elif cur == '"':
+                    break
+            continue
+        if ch == "'":
+            # `'x'` / `'\n'` are char literals; anything else beginning with a
+            # quote is a lifetime (`'a`, `'static`) and is left untouched.
+            if i + 2 < n and chars[i + 1] == "\\":
+                end = i + 2
+                while end < n and chars[end] != "'":
+                    end += 1
+                if end < n:
+                    for pos in range(i, end + 1):
+                        chars[pos] = " "
+                    i = end + 1
+                    continue
+            elif i + 2 < n and chars[i + 2] == "'":
+                for pos in range(i, i + 3):
+                    chars[pos] = " "
+                i += 3
+                continue
+        i += 1
+    return "".join(chars)
+
+
+def structural_line(line: str) -> str:
+    return blank_string_literals(strip_line_comments(line))
+
+
+def function_owner_by_line(lines):
+    """Map every 1-based line number to the innermost enclosing `fn` body id.
+
+    Id 0 is module scope: everything outside a function body (`static`/`const`
+    items, `impl` headers, struct fields). A body that opens and closes on one
+    line still gets its own id, so a one-line function is its own taint scope.
+    """
+    owner = [0] * (len(lines) + 1)
+    depth = 0
+    stack = []  # (fn_id, body_depth)
+    next_id = 1
+    pending_fn = False
     for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
-            continue
-        stripped = strip_line_comments(raw).strip()
-        if not stripped:
-            continue
-        statement = statement_from(lines, line_no, max_lines=5)
-        if not statement or safe_compare_re.search(statement):
-            continue
-        match = assign_re.match(statement)
-        if not match:
-            continue
-        name = match.group("lhs")
-        rhs = match.group("rhs")
-        if is_sensitive_text(name) or is_sensitive_operand_text(rhs) or (operand_identifiers(rhs) & sensitive):
-            sensitive.add(name)
+        structural = structural_line(raw)
+        if fn_decl_re.search(structural):
+            pending_fn = True
+        # The innermost scope active at ANY point on the line owns it, so the
+        # body-opening line, the body's closing brace, and a one-line function
+        # all resolve to that function rather than to its parent.
+        chosen = stack[-1] if stack else None
+        for ch in structural:
+            if ch == "{":
+                depth += 1
+                if pending_fn:
+                    stack.append((next_id, depth))
+                    next_id += 1
+                    pending_fn = False
+                    chosen = stack[-1]
+            elif ch == "}":
+                if stack and stack[-1][1] == depth:
+                    stack.pop()
+                depth = max(0, depth - 1)
+        if pending_fn and ";" in structural and "{" not in structural:
+            # A signature-only declaration (trait method, `extern` block).
+            pending_fn = False
+        owner[line_no] = chosen[0] if chosen else 0
+    return owner
+
+
+def collect_sensitive_vars(lines, line_numbers, seeded=()):
+    """Taint set for ONE scope, seeded from the enclosing (module) scope.
+
+    Iterated to a fixpoint so alias chains stay order-independent inside the
+    scope, exactly as the previous whole-file pass was. The only change is the
+    scope: one function body instead of the entire file. A sensitive
+    `let auth_token` in one function must not taint an unrelated
+    `token == "BR2"` in another.
+    """
+    sensitive = set(seeded)
+    for _ in range(4):
+        changed = False
+        for line_no in line_numbers:
+            if has_ignore(lines, line_no):
+                continue
+            stripped = strip_line_comments(lines[line_no - 1]).strip()
+            if not stripped:
+                continue
+            statement = statement_from(lines, line_no, max_lines=5)
+            if not statement or safe_compare_re.search(statement):
+                continue
+            match = assign_re.match(statement)
+            if not match:
+                continue
+            name = match.group("lhs")
+            if name in sensitive:
+                continue
+            rhs = match.group("rhs")
+            if (
+                is_sensitive_text(name)
+                or is_sensitive_operand_text(rhs)
+                or (operand_identifiers(rhs) & sensitive)
+            ):
+                sensitive.add(name)
+                changed = True
+        if not changed:
+            break
     return sensitive
 
 
@@ -6179,22 +6305,40 @@ for rust_file in rust_files(root):
     if "==" not in text and "!=" not in text:
         continue
     lines = text.splitlines()
-    sensitive_vars = collect_sensitive_vars(lines)
+    owner = function_owner_by_line(lines)
+    scopes = {}
+    for line_no in range(1, len(lines) + 1):
+        scopes.setdefault(owner[line_no], []).append(line_no)
+    # Module-scope taint (a `static API_SECRET`, a `const HMAC_KEY`) seeds every
+    # function; a function's own locals stay inside it.
+    module_sensitive = collect_sensitive_vars(lines, scopes.get(0, ()))
+    found = []
     seen = set()
-    for line_no, raw in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
-            continue
-        stripped = strip_line_comments(raw).strip()
-        if not stripped or ("==" not in stripped and "!=" not in stripped):
-            continue
-        statement = statement_from(lines, line_no)
-        if not statement or not unsafe_secret_compare(statement, sensitive_vars):
-            continue
-        key = (str(rust_file), line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        issues.append((rust_file, line_no, source_line(lines, line_no)))
+    for scope_id, scope_lines in scopes.items():
+        sensitive_vars = (
+            module_sensitive
+            if scope_id == 0
+            else collect_sensitive_vars(lines, scope_lines, module_sensitive)
+        )
+        for line_no in scope_lines:
+            if has_ignore(lines, line_no):
+                continue
+            stripped = strip_line_comments(lines[line_no - 1]).strip()
+            if not stripped or ("==" not in stripped and "!=" not in stripped):
+                continue
+            statement = statement_from(lines, line_no)
+            if not statement or not unsafe_secret_compare(statement, sensitive_vars):
+                continue
+            key = (str(rust_file), line_no)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((rust_file, line_no, source_line(lines, line_no)))
+    # Scopes are visited in first-appearance order, but a nested function is
+    # discovered after its parent's opening lines; sort so findings stay in
+    # source order for stable output and goldens.
+    found.sort(key=lambda item: item[1])
+    issues.extend(found)
 
 for path, line_no, code in issues:
     print(f"{path}:{line_no}:{code}")

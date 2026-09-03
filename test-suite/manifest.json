@@ -8754,6 +8754,66 @@
       }
     },
     {
+      "id": "rust-secret-compare-function-scope-buggy",
+      "description": "PR #100 positive control: scoping the Rust secret-comparison taint to each function must keep same-function alias propagation, module-scope secrets (a `static API_SECRET`) and direct secret comparisons critical.",
+      "path": "test-suite/rust/buggy/secret_compare_function_scope.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "constant-time",
+        "buggy"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 4
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "rust-secret-compare-function-scope-clean",
+      "description": "PR #100: Rust secret-comparison taint is function-scoped. A sensitive assignment to a generic local name (`issue`, `value`) in one function must not mark unrelated comparisons that reuse that name in other functions, methods or one-line bodies.",
+      "path": "test-suite/rust/clean/secret_compare_function_scope.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "security",
+        "constant-time",
+        "clean"
+      ],
+      "ubs_bin": "../modules/ubs-rust.sh",
+      "args": [
+        "--no-cargo",
+        "--only=8",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
       "id": "js-sarif-meta-typescript",
       "description": "Regression for the v5.3.12-v5.3.13 SARIF break: `ubs --format=sarif` on a TypeScript file must emit a real SARIF run with results. Per-grammar rule variants reuse base rule ids, and the JS module used to load them into one `ast-grep scan -c`, which rejects duplicate ids and made every JS/TS SARIF scan exit 2 (the meta-runner then emitted a summary-only run). Removing run_sarif_rule_pack_scan's per-grammar split makes this case fail.",
       "path": "test-suite/js/security/path-traversal-buggy.ts",

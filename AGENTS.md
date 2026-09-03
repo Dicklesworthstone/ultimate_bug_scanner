@@ -132,6 +132,8 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 The test suite lives in `test-suite/` and is organized by language. Each language has `buggy/` (known-bad) and `clean/` (known-good) fixtures to validate detection accuracy and false-positive rates.
 
+Tests must not write into the checkout: the only places a test may create files are `test-suite/artifacts/` (and `test-suite/goldens/` when regenerating). `test-suite/run_all.sh` compares the untracked-file set before and after every step and names the step that left files behind; in CI (or with `UBS_TEST_HYGIENE=strict`) that fails the run, locally it warns because other agents create files in the checkout concurrently. Use a scratch cwd (tempfile) for any check that runs `ubs` with report flags.
+
 ### Running Tests
 
 ```bash

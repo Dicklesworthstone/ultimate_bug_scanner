@@ -1038,6 +1038,7 @@ Environment Variables:
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
+  UBS_MAX_FILE_MB          Leave files above N MB out of whole-project scans (default: 8; 0 disables)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
   UBS_PROFILE=1            Add phase timings (copy, fan-out, per module, merge, total ms) to json/toon output and the text summary
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
@@ -1070,9 +1071,12 @@ just text on stderr, so `ubs … --format=json | jq` always has something to par
 
 **Directory size guard**
 
-UBS computes scan size **after ignore filters** (defaults + `.ubsignore`) and prints:
-`Scan size after ignores: XMB (limit YMB)` before enforcing the limit. Override via
-`UBS_MAX_DIR_SIZE_MB` or `UBS_SKIP_SIZE_CHECK=1`, or pass `--skip-size-check`.
+UBS computes scan size **after ignore filters** (defaults + `.ubsignore`) over the files it
+will actually scan: binary, media, archive and data files (images, fonts, archives, databases,
+parquet/npy/pickle, csv/tsv/jsonl, …) and files above `UBS_MAX_FILE_MB` (default 8) are neither
+counted nor copied into the scan workspace, so a data directory next to the code does not make a
+small project "too large". It prints `Scan size after ignores: XMB (limit YMB)` before enforcing
+the limit. Override via `UBS_MAX_DIR_SIZE_MB` or `UBS_SKIP_SIZE_CHECK=1`, or pass `--skip-size-check`.
 
 ### Environment errors (exit 2)
 
@@ -1496,10 +1500,10 @@ Each module maps its tool-specific severity strings, numeric levels, and legacy 
 - Custom: --include-ext=js,ts,vue
 
 # Working files and memory
-- Whole-project scans copy the tree (minus ignores) into a temporary shadow
-  workspace under $TMPDIR so ignore rules apply to every module uniformly; the
-  workspace is deleted when the scan ends (bead ultimate_bug_scanner-cvxv.4
-  replaces the copy with a per-language file list)
+- Whole-project scans list the files to scan (ignores applied; binary/data
+  files and files above UBS_MAX_FILE_MB left out) and copy only those into a
+  temporary shadow workspace under $TMPDIR so ignore rules apply to every
+  module uniformly; the workspace is deleted when the scan ends
 - Results are merged from per-module JSON at the end of the run
 - Memory: 45–110 MB resident on typical projects; ~840 MB was measured on a
   407K-line TypeScript tree (bead ultimate_bug_scanner-q150.6 streams that)

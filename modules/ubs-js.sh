@@ -450,19 +450,9 @@ print_finding() {
     description="${arg4:-}"
   fi
 
-  if [[ -n "$REPORT_JSON" ]]; then
-    python3 - "$JSON_FINDINGS_TMP" "$MAX_JSON_SAMPLES" "$severity" "$count" "$title" "$description" <<'PY' 2>/dev/null || true
-import json, sys
-tmp = sys.argv[1]
-severity = sys.argv[3]
-count = int(sys.argv[4])
-title = sys.argv[5]
-description = sys.argv[6] if len(sys.argv) > 6 else ""
-open(tmp, 'a', encoding='utf-8').write(
-    json.dumps({"severity": severity, "count": count, "title": title, "description": description}, ensure_ascii=False)
-    + '\n'
-)
-PY
+  if [[ -n "$REPORT_JSON" && -n "$JSON_FINDINGS_TMP" ]]; then
+    # TSV record (bead C3c): a bash append instead of a python process per finding.
+    printf 'F\t%s\t%s\t%s\t%s\n' "$severity" "$count" "$(printf '%s' "$title" | tr '\t\n' '  ')" "$(printf '%s' "$description" | tr '\t\n' '  ')" >>"$JSON_FINDINGS_TMP"
   fi
 
   case "$severity" in
@@ -10823,8 +10813,12 @@ src, out, files, crit, warn, info, ver = sys.argv[1:8]
 findings = []
 try:
   with open(src,'r',encoding='utf-8') as fh:
-    for line in fh:
-      if line.strip(): findings.append(json.loads(line))
+    for raw in fh:
+      parts = raw.rstrip('\n').split('\t')
+      if parts[0] != 'F' or len(parts) < 4: continue
+      try: count = int(parts[2])
+      except ValueError: count = 0
+      findings.append({"severity": parts[1], "count": count, "title": parts[3], "description": parts[4] if len(parts) > 4 else ""})
 except FileNotFoundError: pass
 payload = {"version": ver, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
            "files": int(files), "critical": int(crit), "warning": int(warn), "info": int(info), "findings": findings}

@@ -236,7 +236,100 @@ emit_json_summary() {
   fi
 }
 
+
+# SARIF parity (bead K5): in sarif mode every finding and code sample is also
+# recorded (TSV scratch log) so the SARIF document carries the heuristic
+# findings, not only the ast-grep run. Cheap: no spawn per record.
+SARIF_FINDINGS_TMP=""
+sarif_log_ready(){
+  [[ "${FORMAT:-text}" == "sarif" ]] || return 1
+  if [[ -z "$SARIF_FINDINGS_TMP" ]]; then
+    SARIF_FINDINGS_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-sarif-findings.XXXXXX)" || return 1
+    : >"$SARIF_FINDINGS_TMP"
+  fi
+  return 0
+}
+record_sarif_finding(){ sarif_log_ready || return 0; printf 'F\t%s\t%s\t%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\t\n' '  ')" >>"$SARIF_FINDINGS_TMP"; }
+record_sarif_sample(){ sarif_log_ready || return 0; printf 'S\t%s\t%s\t%s\n' "$(printf '%s' "$1" | tr '\t\n' '  ')" "$2" "$(printf '%s' "$3" | tr '\t\n' '  ')" >>"$SARIF_FINDINGS_TMP"; }
+
+# --format=sarif (bead K5): the ast-grep run (when the rule pack ran) plus a
+# 'ubs-elixir-heuristics' run rendered from the recorded findings — one result
+# per sample with its location, plus one location-less result per finding whose
+# count exceeds its samples — so SARIF never carries fewer findings than the
+# text/json report.
 emit_sarif() {
+  local ast_tmp
+  ast_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-elixir-sarif.XXXXXX)"
+  : >"$ast_tmp"
+  : # no ast-grep rule pack for Elixir yet (bead D5)
+  if command -v python3 >/dev/null 2>&1 && python3 - "$ast_tmp" "${SARIF_FINDINGS_TMP:-}" "elixir" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+ast_path, log_path, lang = sys.argv[1:4]
+runs, sarif_version = [], "2.1.0"
+if Path(ast_path).stat().st_size:
+    try:
+        doc = json.loads(Path(ast_path).read_text(encoding="utf-8", errors="replace"))
+        runs.extend(r for r in doc.get("runs", []) if isinstance(r, dict))
+        if isinstance(doc.get("version"), str) and doc["version"]:
+            sarif_version = doc["version"]
+    except Exception:
+        pass
+findings = []
+if log_path and Path(log_path).is_file():
+    for raw in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = raw.split("\t")
+        if parts[0] == "F" and len(parts) >= 4:
+            findings.append({"severity": parts[1], "count": parts[2], "title": parts[3], "samples": []})
+        elif parts[0] == "S" and len(parts) >= 4 and findings:
+            findings[-1]["samples"].append({"file": parts[1], "line": parts[2], "code": parts[3]})
+LEVELS = {"critical": "error", "warning": "warning", "info": "note"}
+
+
+def slug(title):
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "finding"
+
+
+def count_of(f):
+    try:
+        return int(f.get("count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+results, rules, seen = [], [], set()
+for f in findings:
+    sev = f["severity"]
+    if sev not in LEVELS:
+        continue
+    title = f["title"].strip()
+    rule_id = f"{lang}.heuristic.{slug(title)}"
+    if rule_id not in seen:
+        seen.add(rule_id)
+        rules.append({"id": rule_id, "shortDescription": {"text": title}, "defaultConfiguration": {"level": LEVELS[sev]}})
+    for smp in f["samples"]:
+        try:
+            line = max(1, int(smp["line"] or 1))
+        except ValueError:
+            line = 1
+        results.append({"ruleId": rule_id, "level": LEVELS[sev], "message": {"text": title},
+                        "locations": [{"physicalLocation": {"artifactLocation": {"uri": smp["file"]}, "region": {"startLine": line}}}],
+                        "properties": {"occurrences": count_of(f), "recorded_samples": len(f["samples"])}})
+    # Occurrences beyond the recorded samples are carried as properties.occurrences on
+    # the located results: every SARIF result must have a physical location (harness contract).
+if results or not runs:
+    runs.append({"tool": {"driver": {"name": f"ubs-{lang}-heuristics", "rules": rules}}, "results": results})
+sys.stdout.write(json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": sarif_version, "runs": runs}) + "\n")
+PY
+  then
+    rm -f "$ast_tmp" 2>/dev/null
+    return 0
+  fi
+  if [[ -s "$ast_tmp" ]]; then cat "$ast_tmp"; rm -f "$ast_tmp" 2>/dev/null; return 0; fi
+  rm -f "$ast_tmp" 2>/dev/null
   printf '%s\n' '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs-elixir"}},"results":[]}]}'
 }
 print_header() { say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; say "${WHITE}${BOLD}$1${RESET}"; say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; }
@@ -249,6 +342,7 @@ print_finding() {
     *)
       local raw_count=$2; local title=$3; local description="${4:-}"
       local count; count=$(printf '%s\n' "$raw_count" | awk 'END{print $0+0}')
+      record_sarif_finding "$severity" "$count" "$title"
       case $severity in
         critical) CRITICAL_COUNT=$((CRITICAL_COUNT + count)); say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"; say "    ${RED}${BOLD}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
         warning)  WARNING_COUNT=$((WARNING_COUNT + count)); say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"; say "    ${YELLOW}$title${RESET}"; [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true ;;
@@ -257,7 +351,7 @@ print_finding() {
       ;;
   esac
 }
-print_code_sample() { local file=$1; local line=$2; local code=$3; say "${GRAY}      $file:$line${RESET}"; say "${WHITE}      $code${RESET}"; }
+print_code_sample() { local file=$1; local line=$2; local code=$3; record_sarif_sample "$file" "$line" "$code"; say "${GRAY}      $file:$line${RESET}"; say "${WHITE}      $code${RESET}"; }
 
 # Parse grep/rg output line handling Windows drive letters (C:/path...)
 # Sets: PARSED_FILE, PARSED_LINE, PARSED_CODE

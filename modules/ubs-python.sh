@@ -307,9 +307,17 @@ init_colors
 
 # Scratch findings log for --report-json (#64): print_finding/print_code_sample
 # append JSONL records here; the final report is assembled at the end of the run.
-if [[ -n "$REPORT_JSON" ]]; then
+# SARIF parity (bead K5): the same scratch log feeds the heuristics run of the
+# SARIF document, so it is kept in sarif mode as well; the ast-grep SARIF is
+# buffered in AST_SARIF_BUFFER and merged at the end of the run.
+AST_SARIF_BUFFER=""
+if [[ -n "$REPORT_JSON" || "$FORMAT" == "sarif" ]]; then
   JSON_FINDINGS_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-findings.XXXXXX)"
   : > "$JSON_FINDINGS_TMP"
+fi
+if [[ "$FORMAT" == "sarif" ]]; then
+  AST_SARIF_BUFFER="$(mktemp 2>/dev/null || mktemp -t ubs-ag-sarif.XXXXXX)"
+  : > "$AST_SARIF_BUFFER"
 fi
 
 # OUTPUT_FILE handling:
@@ -480,38 +488,19 @@ bump_category_count() {
 }
 
 # Append a finding record to the JSONL scratch log for --report-json (#64).
+# TSV scratch records (bead C3c): F<tab>severity<tab>count<tab>title<tab>description
+# and S<tab>file<tab>line<tab>code; tabs/newlines inside fields become spaces.
+# A bash append instead of a python process per record: --report-json and
+# --format=sarif used to cost ~0.8 s per run in interpreter start-ups alone.
 record_json_finding() {
-  [[ -n "$REPORT_JSON" && -n "$JSON_FINDINGS_TMP" ]] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$JSON_FINDINGS_TMP" "$1" "$2" "$3" "${4:-}" <<'PY' 2>/dev/null || true
-import json, sys
-tmp, severity, count, title = sys.argv[1:5]
-description = sys.argv[5] if len(sys.argv) > 5 else ""
-try:
-    count_val = int(count)
-except ValueError:
-    count_val = 0
-with open(tmp, 'a', encoding='utf-8') as fh:
-    fh.write(json.dumps({"type": "finding", "severity": severity, "count": count_val,
-                         "title": title, "description": description}, ensure_ascii=False) + '\n')
-PY
+  [[ -n "$JSON_FINDINGS_TMP" ]] || return 0
+  printf 'F\t%s\t%s\t%s\t%s\n' "$1" "$2" "$(printf '%s' "$3" | tr '\t\n' '  ')" "$(printf '%s' "${4:-}" | tr '\t\n' '  ')" >>"$JSON_FINDINGS_TMP"
 }
 
 # Append a code-sample record (attached to the most recent finding) (#64).
 record_json_sample() {
-  [[ -n "$REPORT_JSON" && -n "$JSON_FINDINGS_TMP" ]] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  python3 - "$JSON_FINDINGS_TMP" "$1" "$2" "$3" <<'PY' 2>/dev/null || true
-import json, sys
-tmp, file_path, line_no, code = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-try:
-    line_val = int(line_no)
-except ValueError:
-    line_val = 0
-with open(tmp, 'a', encoding='utf-8') as fh:
-    fh.write(json.dumps({"type": "sample", "file": file_path, "line": line_val,
-                         "code": code}, ensure_ascii=False) + '\n')
-PY
+  [[ -n "$JSON_FINDINGS_TMP" ]] || return 0
+  printf 'S\t%s\t%s\t%s\n' "$(printf '%s' "$1" | tr '\t\n' '  ')" "$2" "$(printf '%s' "$3" | tr '\t\n' '  ')" >>"$JSON_FINDINGS_TMP"
 }
 
 print_finding() {
@@ -10025,7 +10014,7 @@ run_ast_rules() {
       ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --format sarif 2>/dev/null || true ) >>"$sarif_tmp"
       printf '\n__UBS_SARIF_SPLIT__\n' >>"$sarif_tmp"
     done
-    python3 - "$sarif_tmp" <<'PY' >&"$MACHINE_FD" || { rm -f "$sarif_tmp"; return 1; }
+    python3 - "$sarif_tmp" <<'PY' >"$AST_SARIF_BUFFER" || { rm -f "$sarif_tmp"; return 1; }
 import json, sys
 from pathlib import Path
 
@@ -11740,6 +11729,82 @@ if [[ -n "$SUMMARY_JSON" ]]; then
   say "${DIM}Summary JSON written to: ${SUMMARY_JSON}${RESET}"
 fi
 
+# --format=sarif (bead K5): one document — the ast-grep run (buffered above)
+# plus a 'ubs-python-heuristics' run built from the recorded findings: one
+# result per recorded sample (with its location), plus one location-less
+# result per finding whose count exceeds its recorded samples, so the SARIF
+# never carries fewer findings than the text/json report.
+emit_merged_sarif() {
+  python3 - "${AST_SARIF_BUFFER:-}" "${JSON_FINDINGS_TMP:-}" "$UBS_PY_VERSION" "$PROJECT_DIR" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+ast_path, log_path, version, project = sys.argv[1:5]
+runs = []
+sarif_version = "2.1.0"
+if ast_path and Path(ast_path).is_file() and Path(ast_path).stat().st_size:
+    try:
+        doc = json.loads(Path(ast_path).read_text(encoding="utf-8", errors="replace"))
+        runs.extend(r for r in doc.get("runs", []) if isinstance(r, dict))
+        if isinstance(doc.get("version"), str) and doc["version"]:
+            sarif_version = doc["version"]
+    except Exception:
+        pass
+
+findings = []
+if log_path and Path(log_path).is_file():
+    for raw in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = raw.split("\t")
+        if parts[0] == "F" and len(parts) >= 4:
+            findings.append({"severity": parts[1], "count": parts[2], "title": parts[3], "samples": []})
+        elif parts[0] == "S" and len(parts) >= 4 and findings:
+            findings[-1]["samples"].append({"file": parts[1], "line": parts[2], "code": parts[3]})
+
+LEVELS = {"critical": "error", "warning": "warning", "info": "note"}
+
+
+def slug(title: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:60] or "finding"
+
+
+def count_of(f):
+    try:
+        return int(f.get("count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+results, rules, seen = [], [], set()
+for f in findings:
+    sev = f.get("severity", "")
+    if sev not in LEVELS:
+        continue
+    title = str(f.get("title", "")).strip()
+    rule_id = f"python.heuristic.{slug(title)}"
+    if rule_id not in seen:
+        seen.add(rule_id)
+        rules.append({"id": rule_id, "shortDescription": {"text": title}, "defaultConfiguration": {"level": LEVELS[sev]}})
+    samples = f.get("samples", [])
+    for smp in samples:
+        loc = {"physicalLocation": {"artifactLocation": {"uri": str(smp.get("file", ""))},
+                                    "region": {"startLine": max(1, int(smp.get("line", 1) or 1))}}}
+        results.append({"ruleId": rule_id, "level": LEVELS[sev], "message": {"text": title}, "locations": [loc], "properties": {"occurrences": count_of(f), "recorded_samples": len(samples)}})
+    # Occurrences beyond the recorded samples are carried as properties.occurrences on
+    # the located results: every SARIF result must have a physical location (harness contract).
+
+if results or not runs:
+    runs.append({"tool": {"driver": {"name": "ubs-python-heuristics", "version": version, "rules": rules}}, "results": results})
+sys.stdout.write(json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": sarif_version, "runs": runs}))
+sys.stdout.write("\n")
+PY
+}
+if [[ "$FORMAT" == "sarif" ]]; then
+  emit_merged_sarif >&"$MACHINE_FD" || true
+  [[ -n "$AST_SARIF_BUFFER" ]] && rm -f "$AST_SARIF_BUFFER" 2>/dev/null || true
+fi
+
 # Optional machine-friendly findings report (#64): mirrors the JS module's
 # --report-json so the meta-runner can attach per-finding detail (with code
 # samples) to the combined --format=json output.
@@ -11754,24 +11819,25 @@ except ValueError:
 findings = []
 try:
     with open(src, 'r', encoding='utf-8') as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if obj.get('type') == 'sample':
+        for raw in fh:
+            parts = raw.rstrip('\n').split('\t')
+            if parts[0] == 'S' and len(parts) >= 4:
                 if findings:
                     samples = findings[-1].setdefault('samples', [])
                     if len(samples) < sample_cap:
-                        samples.append({'file': obj.get('file', ''),
-                                        'line': obj.get('line', 0),
-                                        'code': obj.get('code', '')})
+                        try:
+                            line_val = int(parts[2])
+                        except ValueError:
+                            line_val = 0
+                        samples.append({'file': parts[1], 'line': line_val, 'code': parts[3]})
                 continue
-            obj.pop('type', None)
-            findings.append(obj)
+            if parts[0] == 'F' and len(parts) >= 4:
+                try:
+                    count_val = int(parts[2])
+                except ValueError:
+                    count_val = 0
+                findings.append({'severity': parts[1], 'count': count_val, 'title': parts[3],
+                                 'description': parts[4] if len(parts) > 4 else ''})
 except FileNotFoundError:
     pass
 payload = {"version": ver,

@@ -341,23 +341,92 @@ emit_json_summary() {
     "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$(json_escape "$(now)")" "$status_json"
 }
 
+# --format=sarif (bead K5): the ast-grep run plus a 'ubs-rust-heuristics' run
+# rendered from the recorded findings (one result per sample with its location,
+# plus one location-less result per finding whose count exceeds its samples),
+# so SARIF never carries fewer findings than the text/json report.
 emit_sarif() {
+  local sarif_tmp err_tmp findings_tmp ec=0
+  sarif_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-sarif.XXXXXX)"
+  err_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-sarif-err.XXXXXX)"
+  findings_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-findings.XXXXXX)"
+  TMP_FILES+=("$sarif_tmp" "$err_tmp" "$findings_tmp")
+  : >"$sarif_tmp"
   if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_CONFIG_FILE" && -f "$AST_CONFIG_FILE" ]]; then
-    local sarif_tmp err_tmp ec=0
-    sarif_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-sarif.XXXXXX)"
-    err_tmp="$(mktemp 2>/dev/null || mktemp -t ubs-rust-sarif-err.XXXXXX)"
-    TMP_FILES+=("$sarif_tmp" "$err_tmp")
     set +e
     trap - ERR
     "${AST_GREP_CMD[@]}" scan -c "$AST_CONFIG_FILE" "$PROJECT_DIR" --format sarif >"$sarif_tmp" 2>"$err_tmp"
     ec=$?
     trap on_err ERR
     set -e
-    if [[ ( $ec -eq 0 || $ec -eq 1 ) && -s "$sarif_tmp" ]]; then
-      cat "$sarif_tmp"
-      return 0
-    fi
+    if [[ $ec -ne 0 && $ec -ne 1 ]]; then : >"$sarif_tmp"; fi
   fi
+  emit_findings_json "$findings_tmp"
+  if command -v python3 >/dev/null 2>&1 && python3 - "$sarif_tmp" "$findings_tmp" "$VERSION" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+ast_path, findings_path, version = sys.argv[1:4]
+runs, sarif_version = [], "2.1.0"
+if Path(ast_path).stat().st_size:
+    try:
+        doc = json.loads(Path(ast_path).read_text(encoding="utf-8", errors="replace"))
+        runs.extend(r for r in doc.get("runs", []) if isinstance(r, dict))
+        if isinstance(doc.get("version"), str) and doc["version"]:
+            sarif_version = doc["version"]
+    except Exception:
+        pass
+try:
+    findings = json.loads(Path(findings_path).read_text(encoding="utf-8", errors="replace")).get("findings", [])
+except Exception:
+    findings = []
+LEVELS = {"critical": "error", "warning": "warning", "info": "note"}
+
+
+def slug(title):
+    return re.sub(r"[^a-z0-9]+", "-", str(title).lower()).strip("-")[:60] or "finding"
+
+
+def count_of(f):
+    try:
+        return int(f.get("count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+results, rules, seen = [], [], set()
+for f in findings:
+    sev = f.get("severity")
+    if sev not in LEVELS:
+        continue
+    title = str(f.get("title", "")).strip()
+    rule_id = "rust.heuristic." + slug(title)
+    if rule_id not in seen:
+        seen.add(rule_id)
+        rules.append({"id": rule_id, "shortDescription": {"text": title}, "defaultConfiguration": {"level": LEVELS[sev]}})
+    samples = f.get("samples") if isinstance(f.get("samples"), list) else []
+    for smp in samples:
+        if not isinstance(smp, dict) or not smp.get("file"):
+            continue
+        try:
+            line = max(1, int(smp.get("line", 1) or 1))
+        except (TypeError, ValueError):
+            line = 1
+        results.append({"ruleId": rule_id, "level": LEVELS[sev], "message": {"text": title},
+                        "locations": [{"physicalLocation": {"artifactLocation": {"uri": str(smp["file"])}, "region": {"startLine": line}}}],
+                        "properties": {"occurrences": count_of(f), "recorded_samples": len(samples)}})
+    # Occurrences beyond the recorded samples are carried as properties.occurrences on
+    # the located results: every SARIF result must have a physical location (harness contract).
+if results or not runs:
+    runs.append({"tool": {"driver": {"name": "ubs-rust-heuristics", "version": version, "rules": rules}}, "results": results})
+sys.stdout.write(json.dumps({"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": sarif_version, "runs": runs}) + "\n")
+PY
+  then
+    return 0
+  fi
+  if [[ -s "$sarif_tmp" ]]; then cat "$sarif_tmp"; return 0; fi
   printf '%s\n' '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs-rust"}},"results":[]}]}'
 }
 

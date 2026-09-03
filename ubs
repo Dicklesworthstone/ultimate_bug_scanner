@@ -49,15 +49,15 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='e1d73c428ce69a930bea4a8fe9217062943b836e6f2eb29a017ab0442bdbfcb0'
+  [cpp]='eb71d850e74f736cd5b50b6893e8051e4409321fe94ade75cac30ed1740d4e9e'
   [csharp]='0a6e5df41560b291e4bfed7a40c2216239caec4aeaddaa5a36e45c9d5624f559'
-  [elixir]='c3139d3cf9d9ebe7571cbe5a5b4ae5ce0db325857ea9e78d1e526b5101ab0f77'
+  [elixir]='27f9bc72107b5dc0fcb2bdf20333aa4ce01411b5cf0e8f01a9ce0a80e4d5e21c'
   [golang]='06f389a0b71e6a196cc50fad45256a9d9d0009d78c6fd46e2baa6f817e428c5e'
   [java]='40bea15174de2cd545e4ac891659f3ce30876d36284b846fea52b03ca7c1659d'
-  [js]='edc7e52df94492bc71fbe94131f9003c4411bd8efadc35b861e6fce2781ebdd5'
-  [python]='2ab7c3bee5b22120a490a3fba65106799018d7e2b9ffc7b3e82fa1c5aa255cb0'
-  [ruby]='020aeca8d1c4fc448f01cd1ad6d66e10ad43a247e0c466c0a0a5b77181ed6d34'
-  [rust]='f456f008cd06b41704b47338fe5c7085771913230dddc4475cceb29c9202c5b4'
+  [js]='de0e9cf86144a1cd7ef33e5c10e1c0d4f07732cd70c57807a42681fce8c66485'
+  [python]='022caa877b5c7f5c4459bd45196dfb45ec3f712eb75aa8f0b727d7861784aa9f'
+  [ruby]='e676f8ce6eea0c2b6bea51b244ef28e6189edd9dcf78258dad2bb2ebf068c3fa'
+  [rust]='782b35e0bfc5ee2ba31e5cd404468d9db5e5d45a8618bf33dcaa19887028f0dd'
   [swift]='0960197481c8eda9859469f227f6bdbcf5c116b813a335e2763a1188b5c6c073'
 )
 
@@ -5277,10 +5277,10 @@ merge_sarif_runs(){
             elif ($prefix|length) > 0 then $prefix + "/" + ($f | ltrimstr("./"))
             else ($f | ltrimstr("./")) end;
         .runs |= map(.results |= map(
-          (.locations // []) |= map(
+          if .locations == null then . else .locations |= map(
             if (.physicalLocation.artifactLocation.uri|type) == "string" and (.physicalLocation.region.startLine|type) == "number"
             then . + {properties: ((.properties // {}) + {permalink: ($blob + "/" + rel(.physicalLocation.artifactLocation.uri) + "#L" + (.physicalLocation.region.startLine|tostring))})}
-            else . end)))' "$TMPDIR_RUN/combined.sarif" >"$TMPDIR_RUN/combined.sarif.tmp" 2>>"$jq_err"; then
+            else . end) end))' "$TMPDIR_RUN/combined.sarif" >"$TMPDIR_RUN/combined.sarif.tmp" 2>>"$jq_err"; then
         mv "$TMPDIR_RUN/combined.sarif.tmp" "$TMPDIR_RUN/combined.sarif"
       fi
     fi

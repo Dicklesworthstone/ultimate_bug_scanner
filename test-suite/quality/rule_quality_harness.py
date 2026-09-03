@@ -245,6 +245,79 @@ def case_side_and_slug(case: dict[str, Any]) -> tuple[str | None, str | None]:
     return side, stem
 
 
+def is_case_buggy(case: dict[str, Any]) -> bool:
+    path_parts = normalize_case_path(case.get("path", "")).split("/")
+    return "buggy" in path_parts or "buggy" in case.get("id", "") or "buggy" in case.get("tags", [])
+
+
+def is_case_clean(case: dict[str, Any]) -> bool:
+    path_parts = normalize_case_path(case.get("path", "")).split("/")
+    return "clean" in path_parts or "clean" in case.get("id", "") or "clean" in case.get("tags", [])
+
+
+def load_detectors_yaml(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8").strip()
+    if text.startswith("{") and text.endswith("}"):
+        return json.loads(text)
+    try:
+        import yaml
+        with path.open("r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except ImportError:
+        return json.loads(text)
+
+
+def audit_detectors_registry(manifest: dict[str, Any]) -> None:
+    """Verify detectors.yml registry (bead D1):
+    1. Every 'implemented' cell must have valid manifest cases (both buggy and clean)
+       whose target paths exist on disk.
+    2. No manifest case references a family/language the registry marks 'n-a'.
+    """
+    detectors_path = REPO_ROOT / "detectors.yml"
+    if not detectors_path.exists():
+        raise AssertionError(f"Missing detectors registry at {detectors_path}")
+
+    try:
+        registry = load_detectors_yaml(detectors_path)
+    except Exception as exc:
+        raise AssertionError(f"Failed to parse {detectors_path}: {exc}") from exc
+
+    cases_by_id = {case["id"]: case for case in manifest.get("cases", [])}
+    families = registry.get("families", {})
+
+    for fam_id, fam_info in families.items():
+        dets = fam_info.get("detectors", {})
+        for lang, cell in dets.items():
+            status = cell.get("status")
+            manifest_cases = cell.get("manifest_cases", [])
+
+            if status == "implemented":
+                if not manifest_cases:
+                    raise AssertionError(f"detectors.yml: {fam_id}/{lang} is marked implemented but has no manifest_cases")
+                has_buggy = any(is_case_buggy(cases_by_id[cid]) for cid in manifest_cases if cid in cases_by_id)
+                has_clean = any(is_case_clean(cases_by_id[cid]) for cid in manifest_cases if cid in cases_by_id)
+                if not (has_buggy and has_clean):
+                    raise AssertionError(f"detectors.yml: {fam_id}/{lang} implemented cell must have both buggy and clean manifest cases, got: {manifest_cases}")
+                for cid in manifest_cases:
+                    if cid not in cases_by_id:
+                        raise AssertionError(f"detectors.yml: {fam_id}/{lang} references unknown manifest case {cid!r}")
+                    path_str = cases_by_id[cid].get("path", "")
+                    if not (REPO_ROOT / path_str).exists():
+                        raise AssertionError(f"detectors.yml: {fam_id}/{lang} case {cid} path does not exist: {path_str}")
+
+            elif status == "n-a":
+                fam_token = fam_id.replace("_", "-")
+                for cid, case in cases_by_id.items():
+                    if case.get("language") == lang:
+                        tags = set(case.get("tags", []))
+                        if fam_id in tags or fam_token in tags or fam_id in cid or fam_token in cid:
+                            raise AssertionError(
+                                f"detectors.yml marks {fam_id}/{lang} as n-a, but manifest case {cid} references it"
+                            )
+
+    log_progress("[detectors-registry] PASS")
+
+
 def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
     cases = manifest["cases"]
     ids = [case["id"] for case in cases]
@@ -1955,6 +2028,7 @@ def main(argv: list[str]) -> int:
     schema_errors = manifest_schema_errors(manifest)
     if schema_errors:
         raise AssertionError(f"manifest schema errors: {schema_errors}")
+    audit_detectors_registry(manifest)
     coverage = build_rule_coverage(manifest)
     update_or_check_golden(coverage, update_golden)
     log_progress("[manifest-audit] PASS")

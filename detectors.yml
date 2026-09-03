@@ -1,0 +1,2205 @@
+{
+  "version": 1,
+  "languages": [
+    {
+      "id": "js",
+      "display": "JavaScript / TypeScript"
+    },
+    {
+      "id": "python",
+      "display": "Python"
+    },
+    {
+      "id": "golang",
+      "display": "Go"
+    },
+    {
+      "id": "rust",
+      "display": "Rust"
+    },
+    {
+      "id": "java",
+      "display": "Java / Kotlin"
+    },
+    {
+      "id": "cpp",
+      "display": "C / C++"
+    },
+    {
+      "id": "ruby",
+      "display": "Ruby"
+    },
+    {
+      "id": "swift",
+      "display": "Swift"
+    },
+    {
+      "id": "csharp",
+      "display": "C# / .NET"
+    },
+    {
+      "id": "elixir",
+      "display": "Elixir"
+    }
+  ],
+  "families": {
+    "archive_extraction": {
+      "display": "Archive Extraction (Zip Slip)",
+      "description": "Path traversal during archive decompression / tar / zip extraction",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.archive-extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive-extraction"
+          ],
+          "manifest_cases": [
+            "js-typescript-archive-extraction-buggy",
+            "js-typescript-archive-extraction-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.archive-extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction"
+          ],
+          "manifest_cases": [
+            "python-archive-extraction-buggy",
+            "python-archive-extraction-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive-extraction"
+          ],
+          "manifest_cases": [
+            "golang-archive-extraction-buggy",
+            "golang-archive-extraction-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive-extraction"
+          ],
+          "manifest_cases": [
+            "rust-archive-extraction-buggy",
+            "rust-archive-extraction-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.security.archive_extraction",
+            "kotlin.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction",
+            "kotlin_archive_extraction"
+          ],
+          "manifest_cases": [
+            "java-archive-extraction-buggy",
+            "java-archive-extraction-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction"
+          ],
+          "manifest_cases": [
+            "cpp-archive-extraction-buggy",
+            "cpp-archive-extraction-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction"
+          ],
+          "manifest_cases": [
+            "ruby-archive-extraction-buggy",
+            "ruby-archive-extraction-clean"
+          ]
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction"
+          ],
+          "manifest_cases": [
+            "swift-archive-extraction-buggy",
+            "swift-archive-extraction-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction"
+          ],
+          "manifest_cases": [
+            "csharp-archive-extraction-buggy",
+            "csharp-archive-extraction-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.archive_extraction"
+          ],
+          "fixture_pair_ids": [
+            "archive_extraction"
+          ],
+          "manifest_cases": [
+            "elixir-archive-extraction-buggy",
+            "elixir-archive-extraction-clean"
+          ]
+        }
+      }
+    },
+    "open_redirect": {
+      "display": "Open Redirect",
+      "description": "Unvalidated redirect targets derived from user request input",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.open-redirect"
+          ],
+          "fixture_pair_ids": [
+            "open-redirect"
+          ],
+          "manifest_cases": [
+            "js-typescript-open-redirect-buggy",
+            "js-typescript-open-redirect-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.open-redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect"
+          ],
+          "manifest_cases": [
+            "python-open-redirect-buggy",
+            "python-open-redirect-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open-redirect"
+          ],
+          "manifest_cases": [
+            "golang-open-redirect-buggy",
+            "golang-open-redirect-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open-redirect"
+          ],
+          "manifest_cases": [
+            "rust-open-redirect-buggy",
+            "rust-open-redirect-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.security.open_redirect",
+            "kotlin.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect",
+            "kotlin_open_redirect"
+          ],
+          "manifest_cases": [
+            "java-open-redirect-buggy",
+            "java-open-redirect-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect"
+          ],
+          "manifest_cases": [
+            "cpp-open-redirect-buggy",
+            "cpp-open-redirect-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect"
+          ],
+          "manifest_cases": [
+            "ruby-open-redirect-buggy",
+            "ruby-open-redirect-clean"
+          ]
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect"
+          ],
+          "manifest_cases": [
+            "swift-open-redirect-buggy",
+            "swift-open-redirect-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect"
+          ],
+          "manifest_cases": [
+            "csharp-open-redirect-buggy",
+            "csharp-open-redirect-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.open_redirect"
+          ],
+          "fixture_pair_ids": [
+            "open_redirect"
+          ],
+          "manifest_cases": [
+            "elixir-open-redirect-buggy",
+            "elixir-open-redirect-clean"
+          ]
+        }
+      }
+    },
+    "ssrf": {
+      "display": "Server-Side Request Forgery (SSRF)",
+      "description": "Outbound HTTP requests constructed with untrusted user input",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf-fetch"
+          ],
+          "manifest_cases": [
+            "js-typescript-ssrf-fetch-buggy",
+            "js-typescript-ssrf-fetch-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "python-ssrf-buggy",
+            "python-ssrf-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "golang-ssrf-buggy",
+            "golang-ssrf-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "rust-ssrf-buggy",
+            "rust-ssrf-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.security.ssrf",
+            "kotlin.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf",
+            "kotlin_ssrf"
+          ],
+          "manifest_cases": [
+            "java-ssrf-buggy",
+            "java-ssrf-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "cpp-ssrf-buggy",
+            "cpp-ssrf-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "ruby-ssrf-buggy",
+            "ruby-ssrf-clean"
+          ]
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "swift-ssrf-buggy",
+            "swift-ssrf-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "csharp-ssrf-buggy",
+            "csharp-ssrf-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.ssrf"
+          ],
+          "fixture_pair_ids": [
+            "ssrf"
+          ],
+          "manifest_cases": [
+            "elixir-ssrf-buggy",
+            "elixir-ssrf-clean"
+          ]
+        }
+      }
+    },
+    "header_injection": {
+      "display": "HTTP Response Header Injection",
+      "description": "CRLF injection / response header splitting from unvalidated input",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.header-injection"
+          ],
+          "fixture_pair_ids": [
+            "header-injection"
+          ],
+          "manifest_cases": [
+            "js-typescript-header-injection-buggy",
+            "js-typescript-header-injection-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.header-injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection"
+          ],
+          "manifest_cases": [
+            "python-header-injection-buggy",
+            "python-header-injection-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header-injection"
+          ],
+          "manifest_cases": [
+            "golang-header-injection-buggy",
+            "golang-header-injection-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header-injection"
+          ],
+          "manifest_cases": [
+            "rust-header-injection-buggy",
+            "rust-header-injection-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.security.header_injection",
+            "kotlin.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection",
+            "kotlin_header_injection"
+          ],
+          "manifest_cases": [
+            "java-header-injection-buggy",
+            "java-header-injection-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection"
+          ],
+          "manifest_cases": [
+            "cpp-header-injection-buggy",
+            "cpp-header-injection-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection"
+          ],
+          "manifest_cases": [
+            "ruby-header-injection-buggy",
+            "ruby-header-injection-clean"
+          ]
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection"
+          ],
+          "manifest_cases": [
+            "swift-header-injection-buggy",
+            "swift-header-injection-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection"
+          ],
+          "manifest_cases": [
+            "csharp-header-injection-buggy",
+            "csharp-header-injection-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.header_injection"
+          ],
+          "fixture_pair_ids": [
+            "header_injection"
+          ],
+          "manifest_cases": [
+            "elixir-header-injection-buggy",
+            "elixir-header-injection-clean"
+          ]
+        }
+      }
+    },
+    "path_traversal": {
+      "display": "Path Traversal",
+      "description": "Arbitrary file read or write via unvalidated directory path parameters",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.path-traversal"
+          ],
+          "fixture_pair_ids": [
+            "path-traversal"
+          ],
+          "manifest_cases": [
+            "js-typescript-path-traversal-buggy",
+            "js-typescript-path-traversal-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.path-traversal"
+          ],
+          "fixture_pair_ids": [
+            "path_traversal"
+          ],
+          "manifest_cases": [
+            "python-path-traversal-buggy",
+            "python-path-traversal-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "request-path-traversal"
+          ],
+          "manifest_cases": [
+            "golang-request-path-traversal-buggy",
+            "golang-request-path-traversal-clean"
+          ]
+        },
+        "rust": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.security.path_traversal",
+            "kotlin.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "request_path_traversal",
+            "kotlin_path_traversal"
+          ],
+          "manifest_cases": [
+            "java-request-path-traversal-buggy",
+            "java-request-path-traversal-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "cpp-request-path-traversal-buggy",
+            "cpp-request-path-traversal-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "path_traversal"
+          ],
+          "manifest_cases": [
+            "ruby-path-traversal-buggy",
+            "ruby-path-traversal-clean"
+          ]
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "path_traversal"
+          ],
+          "manifest_cases": [
+            "swift-request-path-traversal-buggy",
+            "swift-request-path-traversal-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "csharp-request-path-traversal-buggy",
+            "csharp-request-path-traversal-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.path_traversal"
+          ],
+          "fixture_pair_ids": [
+            "request_path_traversal"
+          ],
+          "manifest_cases": [
+            "elixir-request-path-traversal-buggy",
+            "elixir-request-path-traversal-clean"
+          ]
+        }
+      }
+    },
+    "security_randomness": {
+      "display": "Insecure Security Randomness",
+      "description": "Non-cryptographic PRNG used for security tokens, salts, or passwords",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "random-security"
+          ],
+          "manifest_cases": [
+            "js-typescript-random-security-buggy",
+            "js-typescript-random-security-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "random_security"
+          ],
+          "manifest_cases": [
+            "python-random-security-buggy",
+            "python-random-security-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "random-security"
+          ],
+          "manifest_cases": [
+            "golang-random-security-buggy",
+            "golang-random-security-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "security-randomness"
+          ],
+          "manifest_cases": [
+            "rust-security-randomness-buggy",
+            "rust-security-randomness-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.security.randomness",
+            "kotlin.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "random_security",
+            "kotlin_security_randomness"
+          ],
+          "manifest_cases": [
+            "java-random-security-buggy",
+            "java-random-security-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "security_randomness"
+          ],
+          "manifest_cases": [
+            "cpp-security-randomness-buggy",
+            "cpp-security-randomness-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "security_randomness"
+          ],
+          "manifest_cases": [
+            "ruby-security-randomness-buggy",
+            "ruby-security-randomness-clean"
+          ]
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "security_randomness"
+          ],
+          "manifest_cases": [
+            "swift-security-randomness-buggy",
+            "swift-security-randomness-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "random_security"
+          ],
+          "manifest_cases": [
+            "csharp-random-security-buggy",
+            "csharp-random-security-clean"
+          ]
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.randomness"
+          ],
+          "fixture_pair_ids": [
+            "security_randomness"
+          ],
+          "manifest_cases": [
+            "elixir-security-randomness-buggy",
+            "elixir-security-randomness-clean"
+          ]
+        }
+      }
+    },
+    "ct_compare": {
+      "display": "Constant-Time Secret Comparison",
+      "description": "Timing-attack vulnerable equality checks on HMAC, tokens, or hashes",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.constant-time-compare"
+          ],
+          "fixture_pair_ids": [
+            "constant-time-compare"
+          ],
+          "manifest_cases": [
+            "js-typescript-constant-time-compare-buggy",
+            "js-typescript-constant-time-compare-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.constant-time-compare"
+          ],
+          "fixture_pair_ids": [
+            "constant_time_compare"
+          ],
+          "manifest_cases": [
+            "python-constant-time-compare-buggy",
+            "python-constant-time-compare-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.constant_time_compare"
+          ],
+          "fixture_pair_ids": [
+            "constant-time-compare"
+          ],
+          "manifest_cases": [
+            "golang-constant-time-compare-buggy",
+            "golang-constant-time-compare-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.constant_time_compare"
+          ],
+          "fixture_pair_ids": [
+            "constant-time-compare"
+          ],
+          "manifest_cases": [
+            "rust-constant-time-compare-buggy",
+            "rust-constant-time-compare-clean"
+          ]
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "jwt": {
+      "display": "JWT Verification Bypass",
+      "description": "Unverified or algorithm-none signature checks on JSON Web Tokens",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.jwt"
+          ],
+          "fixture_pair_ids": [
+            "jwt-verification"
+          ],
+          "manifest_cases": [
+            "js-typescript-jwt-verification-buggy",
+            "js-typescript-jwt-verification-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.jwt"
+          ],
+          "fixture_pair_ids": [
+            "jwt_verification"
+          ],
+          "manifest_cases": [
+            "python-jwt-verification-buggy",
+            "python-jwt-verification-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.jwt"
+          ],
+          "fixture_pair_ids": [
+            "jwt-verification"
+          ],
+          "manifest_cases": [
+            "golang-jwt-verification-buggy",
+            "golang-jwt-verification-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.jwt"
+          ],
+          "fixture_pair_ids": [
+            "jwt-verification"
+          ],
+          "manifest_cases": [
+            "rust-jwt-verification-buggy",
+            "rust-jwt-verification-clean"
+          ]
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "cors": {
+      "display": "Credentialed Wildcard CORS",
+      "description": "Insecure Access-Control-Allow-Origin: * combined with credentials: true",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.cors"
+          ],
+          "fixture_pair_ids": [
+            "cors-credentials"
+          ],
+          "manifest_cases": [
+            "js-typescript-cors-credentials-buggy",
+            "js-typescript-cors-credentials-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.cors"
+          ],
+          "fixture_pair_ids": [
+            "cors_misconfig"
+          ],
+          "manifest_cases": [
+            "python-cors-misconfig-buggy",
+            "python-cors-misconfig-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.cors"
+          ],
+          "fixture_pair_ids": [
+            "cors-credentials"
+          ],
+          "manifest_cases": [
+            "golang-cors-credentials-buggy",
+            "golang-cors-credentials-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.cors"
+          ],
+          "fixture_pair_ids": [
+            "cors-credentials"
+          ],
+          "manifest_cases": [
+            "rust-cors-credentials-buggy",
+            "rust-cors-credentials-clean"
+          ]
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "cookies": {
+      "display": "Insecure Cookie Flags",
+      "description": "Missing HttpOnly, Secure, or SameSite protection flags on session cookies",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.cookie"
+          ],
+          "fixture_pair_ids": [
+            "cookie-security"
+          ],
+          "manifest_cases": [
+            "js-typescript-cookie-security-buggy",
+            "js-typescript-cookie-security-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.cookie"
+          ],
+          "fixture_pair_ids": [
+            "cookie_security"
+          ],
+          "manifest_cases": [
+            "python-cookie-security-buggy",
+            "python-cookie-security-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.cookie"
+          ],
+          "fixture_pair_ids": [
+            "cookie-security"
+          ],
+          "manifest_cases": [
+            "golang-cookie-security-buggy",
+            "golang-cookie-security-clean"
+          ]
+        },
+        "rust": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "n-a",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "secrets": {
+      "display": "Hardcoded Secrets & Default Fallbacks",
+      "description": "Committed API keys, JWT secrets, or insecure hardcoded fallback credentials",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.hardcoded-secrets"
+          ],
+          "fixture_pair_ids": [
+            "hardcoded-secrets"
+          ],
+          "manifest_cases": [
+            "js-typescript-hardcoded-secrets-buggy",
+            "js-typescript-hardcoded-secrets-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.hardcoded-secrets"
+          ],
+          "fixture_pair_ids": [
+            "hardcoded_secrets"
+          ],
+          "manifest_cases": [
+            "python-hardcoded-secrets-buggy",
+            "python-hardcoded-secrets-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.hardcoded_secrets"
+          ],
+          "fixture_pair_ids": [
+            "hardcoded-secrets"
+          ],
+          "manifest_cases": [
+            "golang-hardcoded-secrets-buggy",
+            "golang-hardcoded-secrets-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.hardcoded_secrets"
+          ],
+          "fixture_pair_ids": [
+            "hardcoded-secrets"
+          ],
+          "manifest_cases": [
+            "rust-hardcoded-secrets-buggy",
+            "rust-hardcoded-secrets-clean"
+          ]
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "implemented",
+          "rule_ids": [
+            "elixir.security.hardcoded_secrets"
+          ],
+          "fixture_pair_ids": [
+            "hardcoded_secrets"
+          ],
+          "manifest_cases": [
+            "elixir-hardcoded-secrets-buggy",
+            "elixir-hardcoded-secrets-clean"
+          ]
+        }
+      }
+    },
+    "async_errors": {
+      "display": "Async & Concurrency Hazards",
+      "description": "Unhandled rejections, missing await, deadlocks, or async loop pitfalls",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async-errors"
+          ],
+          "manifest_cases": [
+            "js-async-errors-buggy",
+            "js-async-errors-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async_errors"
+          ],
+          "manifest_cases": [
+            "python-async-errors-buggy",
+            "python-async-errors-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async-errors"
+          ],
+          "manifest_cases": [
+            "golang-async-errors-buggy",
+            "golang-async-errors-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async-errors"
+          ],
+          "manifest_cases": [
+            "rust-async-errors-buggy",
+            "rust-async-errors-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async_errors"
+          ],
+          "manifest_cases": [
+            "java-async-errors-buggy",
+            "java-async-errors-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async_errors"
+          ],
+          "manifest_cases": [
+            "cpp-async-errors-buggy",
+            "cpp-async-errors-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.async.pitfalls"
+          ],
+          "fixture_pair_ids": [
+            "async_errors"
+          ],
+          "manifest_cases": [
+            "ruby-async-errors-buggy",
+            "ruby-async-errors-clean"
+          ]
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.async.task_handles"
+          ],
+          "fixture_pair_ids": [
+            "async_task_handles"
+          ],
+          "manifest_cases": [
+            "csharp-async-task-handles-buggy",
+            "csharp-async-task-handles-clean"
+          ]
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "sql_injection": {
+      "display": "SQL Injection",
+      "description": "Dynamic string concatenation in SQL database queries",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.sql"
+          ],
+          "fixture_pair_ids": [
+            "sql_injection"
+          ],
+          "manifest_cases": [
+            "js-typescript-sql-injection-buggy",
+            "js-typescript-sql-injection-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.sql"
+          ],
+          "fixture_pair_ids": [
+            "sql_injection"
+          ],
+          "manifest_cases": [
+            "python-sql-injection-buggy",
+            "python-sql-injection-clean"
+          ]
+        },
+        "golang": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.sql"
+          ],
+          "fixture_pair_ids": [
+            "sql-injection"
+          ],
+          "manifest_cases": [
+            "rust-sql-injection-buggy",
+            "rust-sql-injection-clean"
+          ]
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "command_injection": {
+      "display": "Command Injection",
+      "description": "Shell or OS command execution using untrusted string arguments",
+      "detectors": {
+        "js": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.command_injection"
+          ],
+          "fixture_pair_ids": [
+            "command_injection"
+          ],
+          "manifest_cases": [
+            "python-command-injection-buggy",
+            "python-command-injection-clean"
+          ]
+        },
+        "golang": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.shell_command"
+          ],
+          "fixture_pair_ids": [
+            "security-shell-command"
+          ],
+          "manifest_cases": [
+            "rust-security-shell-command-buggy",
+            "rust-security-shell-command-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.security.command"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_security"
+          ],
+          "manifest_cases": [
+            "kotlin-security-command-buggy",
+            "kotlin-security-command-clean"
+          ]
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.security.process"
+          ],
+          "fixture_pair_ids": [
+            "security-process"
+          ],
+          "manifest_cases": [
+            "swift-security-process-buggy",
+            "swift-security-process-clean"
+          ]
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "deserialization": {
+      "display": "Unsafe Deserialization",
+      "description": "Deserialization of arbitrary code (pickle, YAML, marshal, etc.)",
+      "detectors": {
+        "js": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.deserialization"
+          ],
+          "fixture_pair_ids": [
+            "unsafe_deserialization"
+          ],
+          "manifest_cases": [
+            "python-unsafe-deserialization-buggy",
+            "python-unsafe-deserialization-clean"
+          ]
+        },
+        "golang": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "rust": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.serialization"
+          ],
+          "fixture_pair_ids": [
+            "serialization"
+          ],
+          "manifest_cases": [
+            "ruby-serialization-buggy",
+            "ruby-serialization-clean"
+          ]
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "tls_verification": {
+      "display": "Disabled TLS Verification",
+      "description": "TLS certificate verification disabled in HTTP clients / SSL contexts",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.tls-verification"
+          ],
+          "fixture_pair_ids": [
+            "tls-verification"
+          ],
+          "manifest_cases": [
+            "js-typescript-tls-verification-buggy",
+            "js-typescript-tls-verification-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.tls-verification"
+          ],
+          "fixture_pair_ids": [
+            "tls_verification"
+          ],
+          "manifest_cases": [
+            "python-tls-verification-buggy",
+            "python-tls-verification-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.tls_verification"
+          ],
+          "fixture_pair_ids": [
+            "tls-verification"
+          ],
+          "manifest_cases": [
+            "golang-tls-verification-buggy",
+            "golang-tls-verification-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.security.tls_verification"
+          ],
+          "fixture_pair_ids": [
+            "tls-verification"
+          ],
+          "manifest_cases": [
+            "rust-tls-verification-buggy",
+            "rust-tls-verification-clean"
+          ]
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "type_narrowing": {
+      "display": "Type Narrowing & Safe Casting",
+      "description": "Optional and nullability type narrowing analysis",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.typeof-invalid-string"
+          ],
+          "fixture_pair_ids": [
+            "type_narrowing"
+          ],
+          "manifest_cases": [
+            "js-typeof-invalid-string-literals-detected",
+            "js-module-clean"
+          ]
+        },
+        "python": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "golang": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.type_narrowing"
+          ],
+          "fixture_pair_ids": [
+            "type_narrowing"
+          ],
+          "manifest_cases": [
+            "rust-type-narrowing-buggy",
+            "rust-type-narrowing-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "kotlin.type_narrowing"
+          ],
+          "fixture_pair_ids": [
+            "kotlin_type_narrowing"
+          ],
+          "manifest_cases": [
+            "kotlin-type-narrowing-buggy",
+            "kotlin-type-narrowing-clean"
+          ]
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "implemented",
+          "rule_ids": [
+            "swift.type_narrowing"
+          ],
+          "fixture_pair_ids": [
+            "type_narrowing"
+          ],
+          "manifest_cases": [
+            "swift-type-narrowing-buggy",
+            "swift-type-narrowing-clean"
+          ]
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.type_narrowing"
+          ],
+          "fixture_pair_ids": [
+            "type_narrowing"
+          ],
+          "manifest_cases": [
+            "csharp-type-narrowing-buggy",
+            "csharp-type-narrowing-clean"
+          ]
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "deep_guard": {
+      "display": "Deep Guard Correlation",
+      "description": "Multi-signal guard and null-check correlation before access",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.deep-guard"
+          ],
+          "fixture_pair_ids": [
+            "deep-guard"
+          ],
+          "manifest_cases": [
+            "js-core-buggy",
+            "js-deep-guard-membership-clean"
+          ]
+        },
+        "python": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "golang": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "rust": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "resource_lifecycle": {
+      "display": "Resource Lifecycle & Cleanup",
+      "description": "Leak detection for unclosed handles, connections, timers, and streams",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "js-typescript-async-timer-buggy",
+            "js-typescript-async-timer-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "python-resource-lifecycle",
+            "python-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "go-resource-lifecycle",
+            "golang-clean"
+          ]
+        },
+        "rust": {
+          "status": "implemented",
+          "rule_ids": [
+            "rust.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "rust-resource-lifecycle",
+            "rust-clean"
+          ]
+        },
+        "java": {
+          "status": "implemented",
+          "rule_ids": [
+            "java.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "java-resource-lifecycle",
+            "java-clean"
+          ]
+        },
+        "cpp": {
+          "status": "implemented",
+          "rule_ids": [
+            "cpp.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "cpp-resource-lifecycle",
+            "cpp-clean"
+          ]
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "ruby-resource-lifecycle",
+            "ruby-clean"
+          ]
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "implemented",
+          "rule_ids": [
+            "csharp.resource.lifecycle"
+          ],
+          "fixture_pair_ids": [
+            "resource_lifecycle"
+          ],
+          "manifest_cases": [
+            "csharp-resource-lifecycle-buggy",
+            "csharp-resource-lifecycle-clean"
+          ]
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    },
+    "taint": {
+      "display": "Taint & Dataflow Engine",
+      "description": "Source-to-sink dataflow propagation from user input to dangerous sinks",
+      "detectors": {
+        "js": {
+          "status": "implemented",
+          "rule_ids": [
+            "js.security.taint"
+          ],
+          "fixture_pair_ids": [
+            "taint"
+          ],
+          "manifest_cases": [
+            "js-taint-buggy",
+            "js-taint-clean"
+          ]
+        },
+        "python": {
+          "status": "implemented",
+          "rule_ids": [
+            "py.security.taint"
+          ],
+          "fixture_pair_ids": [
+            "taint"
+          ],
+          "manifest_cases": [
+            "python-taint-buggy",
+            "python-taint-clean"
+          ]
+        },
+        "golang": {
+          "status": "implemented",
+          "rule_ids": [
+            "golang.security.taint"
+          ],
+          "fixture_pair_ids": [
+            "taint"
+          ],
+          "manifest_cases": [
+            "golang-taint-buggy",
+            "golang-taint-clean"
+          ]
+        },
+        "rust": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "java": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "cpp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "ruby": {
+          "status": "implemented",
+          "rule_ids": [
+            "ruby.security.taint"
+          ],
+          "fixture_pair_ids": [
+            "taint"
+          ],
+          "manifest_cases": [
+            "ruby-taint-buggy",
+            "ruby-taint-clean"
+          ]
+        },
+        "swift": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "csharp": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        },
+        "elixir": {
+          "status": "planned",
+          "rule_ids": [],
+          "fixture_pair_ids": [],
+          "manifest_cases": []
+        }
+      }
+    }
+  }
+}

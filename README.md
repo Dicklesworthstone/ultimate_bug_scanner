@@ -175,8 +175,8 @@ ubs . --fail-on-warning
 # Quiet mode (summary only)
 ubs -q .
 
-# Skip specific categories (e.g., skip TODO markers)
-ubs . --skip=11,14
+# Skip specific categories (by stable id or category number)
+ubs . --skip=js.debug,python.todo
 
 # Custom file extensions
 ubs . --include-ext=js,ts,vue,svelte
@@ -1022,8 +1022,8 @@ Performance:
                            Set to 1 for deterministic output
 
 Rule Control:
-  --skip=CSV               Skip categories by number (see output for numbers)
-                           Example: --skip=11,14  # Skip debug code + TODOs
+  --skip=CSV               Skip categories by id or number (see --list-categories)
+                           Example: --skip=js.debug,python.todo  # Skip debug code + TODOs
   --skip-type-narrowing    Disable helper-backed guard analysis (falls back to text heuristics)
   --no-cargo               Rust: static analysis only. Skips every cargo phase (categories 12-14:
                            fmt/clippy, check/test --no-run, audit/deny/udeps/outdated). Each skipped
@@ -1214,8 +1214,8 @@ message: "Never mutate state directly - use setState()"
 If the scanner reports false positives for your specific use case:
 
 ```bash
-# Skip entire categories
-ubs . --skip=11,14  # Skip debug code detection and TODO markers
+# Skip entire categories by stable id or number
+ubs . --skip=js.debug,python.todo  # Skip debug code detection and TODO markers
 
 # Exclude specific files/directories (gitignore-style globs, one per line)
 printf 'legacy/\nthird-party/\ngenerated/\n' >> .ubsignore
@@ -2290,27 +2290,32 @@ coverage/
 
 ## 🧭 **Language Coverage Comparison**
 
-UBS ships ten language-focused analyzers. The comparison below focuses on the longest-standing modules; Swift and Elixir are called out separately where relevant. Each category below is scored using the following scale:
+<!-- coverage:matrix -->
+| Detector Family | JS / TS | Python | Go | Rust | Java | C / C++ | Ruby | Swift | C# | Elixir |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Archive Extraction (Zip Slip) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Async & Concurrency Hazards | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| Command Injection | ○ | ✓ | ○ | ✓ | ✓ | ○ | ○ | ✓ | ○ | ○ |
+| Constant-Time Secret Comparison | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Credentialed Wildcard CORS | ✓ | ✓ | ✓ | ✓ | ○ | — | ○ | ○ | ○ | ○ |
+| Deep Guard Correlation | ✓ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Disabled TLS Verification | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
+| HTTP Response Header Injection | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Hardcoded Secrets & Default Fallbacks | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ✓ |
+| Insecure Cookie Flags | ✓ | ✓ | ✓ | ○ | ○ | — | ○ | ○ | ○ | ○ |
+| Insecure Security Randomness | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| JWT Verification Bypass | ✓ | ✓ | ✓ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Open Redirect | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Path Traversal | ✓ | ✓ | ✓ | ○ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Resource Lifecycle & Cleanup | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ○ | ✓ | ○ |
+| SQL Injection | ✓ | ✓ | ○ | ✓ | ○ | ○ | ○ | ○ | ○ | ○ |
+| Server-Side Request Forgery (SSRF) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Taint & Dataflow Engine | ✓ | ✓ | ✓ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
+| Type Narrowing & Safe Casting | ✓ | ○ | ○ | ✓ | ✓ | ○ | ○ | ✓ | ✓ | ○ |
+| Unsafe Deserialization | ○ | ✓ | ○ | ○ | ○ | ○ | ✓ | ○ | ○ | ○ |
 
-- **0 – Not covered**
-- **1 – Simple heuristics/regex only**
-- **2 – Multi-signal/static heuristics (context-aware passes)**
-- **3 – Deep analysis (AST-grep rule packs, taint/dataflow engines, or toolchain integrations such as `cargo clippy`)**
-
-| Issue Category | JS / TS | Python | Go | C / C++ | Rust | Java | Ruby | C# |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Null / Nil Safety | **2** – DOM guard & optional-chaining heuristics (cat.1) | **2** – `None` guard + dataclass fallbacks | **1** – Basic nil/pointer guards | **2** – Raw pointer/nullptr/RAII checks | **3** – Borrow/Option misuse via clippy + rules | **2** – Optional/null equality audits | **1** – Nil guard reminders | **2** – Nullability pragmas, `!` operator, exception/null heuristics |
-| Numeric & Type Coercion | **2** – NaN/loose equality/float equality (cat.2/4) | **2** – Division-by-zero & float precision | **1** – Limited arithmetic heuristics | **2** – UB risk & narrowing warnings | **2** – Float/overflow watchers (cat.4) | **1** – Basic comparisons only | **1** – Simple arithmetic foot-guns | **2** – FP equality, truncation casts, parse/validation heuristics |
-| Collections & Memory | **2** – Array mutation/leak detectors | **2** – Dict/list iteration pitfalls | **1** – Slice/map heuristics | **3** – malloc/free, iterator invalidation, UB (cat.1/5/7) | **2** – Vec/String/iterator audits | **2** – Collections & generics misuse | **1** – Enumerator/default mutability hints | **2** – LINQ `.First()` / `.Count()>0` / allocation smells |
-| Async / Concurrency | **3** – AST-grep + fallback for missing `await`, React hooks dep analyzer, async `useEffect` guard, async `forEach`/`flatMap`/`reduce`/predicate/sort-comparator guards, EventEmitter and JSX async-listener guards, ignored or directly awaited `map(async ...)` promises, `Promise.all(map(...))` return guard, `Promise.all(forEach(...))` guard | **2** – Async/Await pitfall scans | **3** – Goroutine/channel/context/defer hygiene | **2** – `std::thread` join + `std::async` wait tracking | **2** – Async macros, Send/Sync checks | **2** – ExecutorService shutdown, `synchronized` monitors | **1** – Basic thread/promise hints | **2** – `Task.Wait`, `.Result`, `async void`, lock/await hazards |
-| Error Handling & Logging | **2** – Promise rejection / try–catch auditing | **2** – Exception swallow/logging checks | **2** – Error wrapping, panic usage | **2** – Throw-in-dtor, catch-by-value | **2** – Result/expect/panic usage | **2** – Logging best practices, try-with-resources | **1** – Rescue/raise heuristics | **2** – `throw ex`, empty catch, broad catch patterns |
-| Security & Taint | **3** – Lightweight taint engine + XSS/prototype/window.open/postMessage/message-origin/open-redirect/SSRF/server-side proxy SSRF/response-header-injection/request-path-traversal/credentialed-CORS/cookie-security/constant-time-secret-compare/hardcoded-secret-env-fallback/security-randomness/disabled-TLS-verification/fetch-cancellation/JWT verification/SQL-injection/archive-extraction/JSX target blank/dangerous HTML security heuristics (cat.7) | **3** – Eval/exec/SQL/pickle/YAML heuristics, taint sinks, interpolated SQL execution sinks, archive extraction, Flask/Django/Starlette open redirects, SSRF-prone outbound fetches, outbound HTTP timeout gaps, request-path traversal and upload filename saves, JWT verification bypasses, credentialed wildcard CORS, insecure session cookie flags, explicit CSRF disables, disabled template autoescape, request-data mass assignment, unsafe Python deserialization loaders, weak password-hashing configs, hardcoded-secret/env-fallback checks, debug/host misconfigurations, unsafe XML parsing, insecure security randomness, disabled TLS verification | **3** – HTTP/crypto/command checks, lightweight taint, JWT verification bypasses, security-sensitive non-crypto randomness, constant-time-secret-compare, hardcoded-secret/env-default checks, credentialed wildcard/reflected CORS, insecure auth/session cookies, request path traversal, response header injection, request-derived open redirects, request-derived outbound URL/SSRF, request-derived reverse proxy SSRF, archive extraction | **3** – Unsafe C APIs, shell execution, security-sensitive non-crypto randomness, request path traversal, response header injection, request-derived open redirects, request-derived outbound URL/SSRF, archive extraction | **3** – Security category (cat.8) with command injection, JWT verification bypass checks, constant-time-secret-compare, hardcoded-secret/env-fallback checks, response header injection, request-derived open redirects, request-derived outbound URL/SSRF, request-derived SQL injection, credentialed wildcard/reflected CORS, path traversal, archive extraction, and predictable temp-file write checks | **3** – SQL concat, `Runtime.exec`, SSL/crypto, Java/Kotlin security-sensitive non-crypto randomness, Java/Kotlin request path traversal, Java/Kotlin response header injection, Java/Kotlin request-derived open redirects, Java/Kotlin request-derived outbound URL/SSRF, Java/Kotlin archive extraction checks | **3** – Rails mass-assignment, shell/eval warnings, security-sensitive non-crypto randomness, request path traversal, response header injection, request-derived open redirects, request-derived outbound URL/SSRF, archive extraction | **3** – weak crypto, TLS bypass, hardcoded secrets, C# security-sensitive non-crypto randomness, ASP.NET request path traversal, response header injection, request-derived open redirects, request-derived outbound URL/SSRF, archive extraction; Elixir request-derived response header injection, open redirects, outbound URL/SSRF, hardcoded Phoenix/Guardian/Joken secrets, and security-sensitive non-crypto randomness are covered in the dedicated Elixir module |
-| Resource Lifecycle & I/O | **3** – AST event-listener/timer/observer tracking + Blob/Object URL revocation heuristics | **2** – Context-manager & file lifecycle hints | **2** – `defer`/file close + HTTP resource hygiene | **2** – Thread join/malloc/free & resource correlation | **2** – Drop/RAII heuristics + correlation | **3** – Executor/file stream cleanup detections | **2** – File open/close + block usage hints | **2** – HttpClient/IDisposable/timer/CTS lifecycle heuristics |
-| Build / Tooling Hygiene | **0** – Not covered yet | **2** – `uv` extras, packaging, notebook hygiene | **2** – Go toolchain sanity (`go vet`, module drift) | **1** – CMake/CXX standard reminders | **3** – `cargo fmt/clippy/test/check` integrations | **2** – Maven/Gradle best-effort builds | **2** – Bundler/Rake/AST rule packs | **2** – optional `dotnet format/build/test/list package` checks |
-| Code Quality Markers | **1** – TODO/HACK detectors | **1** | **1** | **1** | **1** | **1** | **1** | **1** |
-| Domain-Specific Extras | **3** – React hooks, Node I/O, taint flows | **2** – Typing strictness, notebook linting | **2** – Context propagation, HTTP server/client reviews | **2** – Modernization, macro/STL idioms | **3** – Unsafe/FFI audits, cargo inventory | **3** – SQL/Executor/annotation/path handling | **2** – Rails practicals, bundle hygiene | **2** – ASP.NET middleware/CORS hazards, parsing and lock heuristics |
-
-Use this matrix to decide which language module’s findings you want to prioritize or extend. For example, if you need deeper Go resource-lifecycle audits, you can extend category 5 (defer/cleanup) or contribute new AST-grep rules; for JavaScript security you can build on the taint engine already running in category 7.
+*(Legend: **✓** Implemented with dual-sided regression test pairs; **○** Planned; **—** N/A. Full details in [`docs/coverage-matrix.md`](docs/coverage-matrix.md).)*
+<!-- /coverage:matrix -->
 
 ---
 

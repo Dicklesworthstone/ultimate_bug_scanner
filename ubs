@@ -548,10 +548,6 @@ ALL_LANGS=(js python cpp rust golang java ruby swift csharp elixir)
 # Per-language category skip lists, populated by --skip-LANG=N flags.
 # Bare --skip=N continues to apply globally via UBS_SKIP_CATEGORIES (issue #52).
 declare -A SKIP_BY_LANG=()
-# Track whether the user passed a bare --skip=N (separate from --skip-LANG=N)
-# so we can warn when it might silence different categories in different
-# language modules.
-BARE_SKIP_USED=0
 UPDATE_ONLY=0
 # FORCE_SELF_UPDATE=1 in the environment forces an update check (documented in
 # README); --update sets it too.
@@ -666,6 +662,7 @@ Options:
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
   --skip-size-check       Skip directory size guard (use with care)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift/C# type narrowing checks (falls back to basic heuristics)
+  --skip=CSV              Skip categories by id (e.g. --skip=js.debug,python.todo) or number
   --skip-LANG=CSV         Skip categories in ONE language only (LANG is js/python/cpp/rust/golang/java/ruby/swift/csharp/elixir;
                           aliases c/cs/ex accepted). Example: --skip-js=8 --skip-rust=3
                           Use this instead of bare --skip=N in polyglot repos: category numbers are NOT stable across
@@ -779,7 +776,7 @@ cat <<'JSON'
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
       {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack."},
-      {"name": "--skip", "args": "CSV", "example": "--skip=14", "description": "Skip category numbers in every language (numbers differ per language; prefer --skip-LANG)."},
+      {"name": "--skip", "args": "CSV", "example": "--skip=python.todo", "description": "Skip categories by stable id (e.g. python.todo) or category number."},
       {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|ruby|swift|csharp|elixir)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
       {"name": "--profile", "args": "NAME", "example": "--profile=strict", "description": "Severity profile passed to the modules (strict|loose); strict also implies --fail-on-warning."},
@@ -1349,7 +1346,6 @@ else
         shift;;
       --skip=*)
         export UBS_SKIP_CATEGORIES="${1#*=}"
-        BARE_SKIP_USED=1
         shift;;
       --skip-*=*)
         # --skip-LANG=N[,M,...] applies only to the matching language module
@@ -1393,7 +1389,7 @@ else
           --exclude) add_exclude_patterns "$1";;
           --exclude-langs) EXCLUDE_LANGS="$1";;
           --jobs) JOBS="$1";;
-          --skip) export UBS_SKIP_CATEGORIES="$1"; BARE_SKIP_USED=1;;
+          --skip) export UBS_SKIP_CATEGORIES="$1";;
           --ignore-file) IGNORE_FILE="$1";;
         esac
         unset _flag
@@ -4127,6 +4123,11 @@ normalize_lang(){
     c) echo "cpp" ;;
     cs|csharp|csharp-dotnet|dotnet|c#) echo "csharp" ;;
     ex|elixir|phoenix) echo "elixir" ;;
+    go) echo "golang" ;;
+    py) echo "python" ;;
+    rb) echo "ruby" ;;
+    rs) echo "rust" ;;
+    ts) echo "js" ;;
     *) echo "$1" ;;
   esac
 }
@@ -4167,29 +4168,29 @@ category_name_for(){
       esac;;
     python)
       case "$cat" in
-        1) echo "NONE / DEFENSIVE PROGRAMMING";;
-        2) echo "NUMERIC / ARITHMETIC PITFALLS";;
-        3) echo "COLLECTION SAFETY";;
-        4) echo "COMPARISON & TYPE CHECKING TRAPS";;
-        5) echo "ASYNC/AWAIT PITFALLS";;
-        6) echo "ERROR HANDLING ANTI-PATTERNS";;
-        7) echo "SECURITY VULNERABILITIES";;
-        8) echo "FUNCTION & SCOPE ISSUES (incl. CRITICAL Mutable default args)";;
-        9) echo "PARSING & TYPE CONVERSION BUGS";;
-        10) echo "CONTROL FLOW GOTCHAS";;
-        11) echo "DEBUGGING & PRODUCTION CODE";;
-        12) echo "PERFORMANCE & MEMORY";;
-        13) echo "VARIABLE & SCOPE";;
-        14) echo "CODE QUALITY MARKERS";;
-        15) echo "REGEX & STRING SAFETY";;
-        16) echo "I/O & RESOURCE SAFETY";;
-        17) echo "TYPING STRICTNESS";;
-        18) echo "PYTHON I/O & MODULE USAGE";;
-        19) echo "RESOURCE LIFECYCLE CORRELATION";;
-        20) echo "UV-POWERED EXTRA ANALYZERS";;
-        21) echo "DEPRECATIONS & PY3.13 MIGRATIONS";;
-        22) echo "PACKAGING & CONFIG HYGIENE";;
-        23) echo "NOTEBOOK HYGIENE";;
+        1) echo "None / Defensive Programming";;
+        2) echo "Numeric / Arithmetic Pitfalls";;
+        3) echo "Collection Safety";;
+        4) echo "Comparison & Type Checking Traps";;
+        5) echo "Async/Await Pitfalls";;
+        6) echo "Error Handling Anti-patterns";;
+        7) echo "Security Vulnerabilities";;
+        8) echo "Function & Scope Issues (incl. CRITICAL Mutable default args)";;
+        9) echo "Parsing & Type Conversion Bugs";;
+        10) echo "Control Flow Gotchas";;
+        11) echo "Debugging & Production Code";;
+        12) echo "Performance & Memory";;
+        13) echo "Variable & Scope";;
+        14) echo "Code Quality Markers";;
+        15) echo "Regex & String Safety";;
+        16) echo "I/O & Resource Safety";;
+        17) echo "Typing Strictness";;
+        18) echo "Python I/O & Module Usage";;
+        19) echo "Resource Lifecycle Correlation";;
+        20) echo "UV-Powered Extra Analyzers";;
+        21) echo "Deprecations & Py3.13 Migrations";;
+        22) echo "Packaging & Config Hygiene";;
+        23) echo "Notebook Hygiene";;
         *) echo "(no category $cat)";;
       esac;;
     rust)
@@ -4417,6 +4418,367 @@ warn_ambiguous_skip(){
   say_err "${YELLOW}${WARN}${RESET} To silence in only one language, use --skip-LANG=${skip_csv} (e.g. --skip-js=${skip_csv} or --skip-rust=${skip_csv})."
   say_err ""
   unset _wac
+}
+
+# Category slug lookup for stable category ids (bead A5)
+category_slug_for(){
+  local lang="$1" cat="$2"
+  case "$lang" in
+    js)
+      case "$cat" in
+        1) echo "null-undefined";;
+        2) echo "equality";;
+        3) echo "proto-object";;
+        4) echo "type-coercion";;
+        5) echo "async";;
+        6) echo "error-handling";;
+        7) echo "security";;
+        8) echo "function-scope";;
+        9) echo "parsing";;
+        10) echo "control-flow";;
+        11) echo "debug";;
+        12) echo "perf";;
+        13) echo "vars";;
+        14) echo "code-quality";;
+        15) echo "regex";;
+        16) echo "dom";;
+        17) echo "typescript";;
+        18) echo "node";;
+        19) echo "resource-lifecycle";;
+        *) echo "";;
+      esac;;
+    python)
+      case "$cat" in
+        1) echo "none";;
+        2) echo "numeric";;
+        3) echo "collections";;
+        4) echo "comparison";;
+        5) echo "async";;
+        6) echo "error-handling";;
+        7) echo "security";;
+        8) echo "functions";;
+        9) echo "parsing";;
+        10) echo "control-flow";;
+        11) echo "debug";;
+        12) echo "perf";;
+        13) echo "variables";;
+        14) echo "code-quality";;
+        15) echo "regex";;
+        16) echo "io";;
+        17) echo "typing";;
+        18) echo "modules";;
+        19) echo "resource-lifecycle";;
+        20) echo "uv-tools";;
+        21) echo "deprecations";;
+        22) echo "packaging";;
+        23) echo "notebooks";;
+        *) echo "";;
+      esac;;
+    rust)
+      case "$cat" in
+        1) echo "ownership";;
+        2) echo "unsafe-memory";;
+        3) echo "async";;
+        4) echo "numeric";;
+        5) echo "collections";;
+        6) echo "allocation";;
+        7) echo "filesystem";;
+        8) echo "security";;
+        9) echo "code-quality";;
+        10) echo "modules";;
+        11) echo "tests";;
+        12) echo "lints";;
+        13) echo "build";;
+        14) echo "dependencies";;
+        15) echo "api-misuse";;
+        16) echo "domain";;
+        17) echo "ast-grep";;
+        18) echo "inventory";;
+        19) echo "resource-lifecycle";;
+        20) echo "async-locking";;
+        21) echo "panic";;
+        22) echo "casts";;
+        23) echo "parsing";;
+        24) echo "perf";;
+        *) echo "";;
+      esac;;
+    golang)
+      case "$cat" in
+        1) echo "concurrency";;
+        2) echo "channels";;
+        3) echo "context";;
+        4) echo "http";;
+        5) echo "resource-lifecycle";;
+        6) echo "error-handling";;
+        7) echo "json-encoding";;
+        8) echo "filesystem";;
+        9) echo "security";;
+        10) echo "reflection-unsafe";;
+        11) echo "imports";;
+        12) echo "build";;
+        13) echo "testing";;
+        14) echo "logging";;
+        15) echo "style";;
+        16) echo "panic-time";;
+        17) echo "lifecycle-correlation";;
+        18) echo "tooling";;
+        19) echo "dependencies";;
+        20) echo "defer-nil";;
+        21) echo "database";;
+        22) echo "shutdown";;
+        *) echo "";;
+      esac;;
+    java)
+      case "$cat" in
+        1) echo "null-optional";;
+        2) echo "equality";;
+        3) echo "concurrency";;
+        4) echo "security";;
+        5) echo "io";;
+        6) echo "logging";;
+        7) echo "regex";;
+        8) echo "collections";;
+        9) echo "control-flow";;
+        10) echo "streams-perf";;
+        11) echo "serialization";;
+        12) echo "java21";;
+        13) echo "sql";;
+        14) echo "annotations";;
+        15) echo "ast-grep";;
+        16) echo "build";;
+        17) echo "inventory";;
+        18) echo "api-misuse";;
+        19) echo "resource-lifecycle";;
+        20) echo "filesystem";;
+        21) echo "secrets";;
+        22) echo "logging-practices";;
+        *) echo "";;
+      esac;;
+    cpp)
+      case "$cat" in
+        1) echo "memory-raii";;
+        2) echo "exceptions";;
+        3) echo "concurrency";;
+        4) echo "modernization";;
+        5) echo "pointer-lifetime";;
+        6) echo "numeric";;
+        7) echo "undefined-behavior";;
+        8) echo "headers";;
+        9) echo "stl";;
+        10) echo "string-io";;
+        11) echo "macros";;
+        12) echo "cmake";;
+        13) echo "code-quality";;
+        14) echo "perf";;
+        15) echo "debug";;
+        16) echo "resource-lifecycle";;
+        *) echo "";;
+      esac;;
+    ruby)
+      case "$cat" in
+        1) echo "nil";;
+        2) echo "numeric";;
+        3) echo "collections";;
+        4) echo "comparison";;
+        5) echo "exceptions";;
+        6) echo "security";;
+        7) echo "shell";;
+        8) echo "io";;
+        9) echo "parsing";;
+        10) echo "control-flow";;
+        11) echo "debug";;
+        12) echo "perf";;
+        13) echo "variables";;
+        14) echo "code-quality";;
+        15) echo "regex";;
+        16) echo "concurrency";;
+        17) echo "rails";;
+        19) echo "bundler";;
+        *) echo "";;
+      esac;;
+    swift)
+      case "$cat" in
+        1) echo "optionals";;
+        2) echo "concurrency";;
+        3) echo "closures";;
+        4) echo "networking";;
+        5) echo "error-handling";;
+        6) echo "security";;
+        7) echo "crypto";;
+        8) echo "filesystem";;
+        9) echo "threading";;
+        10) echo "perf";;
+        11) echo "debug";;
+        12) echo "regex";;
+        13) echo "swiftui";;
+        14) echo "memory";;
+        15) echo "code-quality";;
+        16) echo "resource-lifecycle";;
+        17) echo "info-plist";;
+        18) echo "deprecations";;
+        19) echo "build";;
+        20) echo "packaging";;
+        21) echo "ui-safety";;
+        22) echo "tests";;
+        23) echo "l10n";;
+        *) echo "";;
+      esac;;
+    csharp)
+      case "$cat" in
+        1) echo "exceptions-null";;
+        2) echo "resources";;
+        3) echo "concurrency";;
+        4) echo "numeric";;
+        5) echo "collections";;
+        6) echo "strings";;
+        7) echo "filesystem";;
+        8) echo "security";;
+        9) echo "code-quality";;
+        10) echo "api-misuse";;
+        11) echo "debug";;
+        12) echo "formatting";;
+        13) echo "build";;
+        14) echo "dependencies";;
+        15) echo "exceptions";;
+        16) echo "aspnet";;
+        17) echo "ast-grep";;
+        18) echo "inventory";;
+        19) echo "resource-lifecycle";;
+        20) echo "async-locks";;
+        21) echo "rethrow";;
+        22) echo "casts";;
+        23) echo "parsing";;
+        24) echo "perf";;
+        *) echo "";;
+      esac;;
+    elixir)
+      case "$cat" in
+        1) echo "pattern-matching";;
+        2) echo "error-handling";;
+        3) echo "process-otp";;
+        4) echo "security";;
+        5) echo "phoenix";;
+        6) echo "ecto";;
+        7) echo "concurrency";;
+        8) echo "io";;
+        9) echo "debug";;
+        10) echo "perf";;
+        11) echo "code-quality";;
+        12) echo "config";;
+        13) echo "testing";;
+        14) echo "mix";;
+        15) echo "binary-safety";;
+        16) echo "analyzers";;
+        *) echo "";;
+      esac;;
+    *) echo "";;
+  esac
+}
+
+# Resolve category slug to numeric category within a language
+category_slug_to_num(){
+  local lang="$1" slug="$2"
+  case "$slug" in
+    todo) slug="code-quality";;
+    quality) slug="code-quality";;
+    lifecycle) slug="resource-lifecycle";;
+  esac
+  local cat=1
+  while [[ $cat -le 35 ]]; do
+    local s; s="$(category_slug_for "$lang" "$cat")"
+    if [[ "$s" == "$slug" ]]; then
+      echo "$cat"
+      return 0
+    fi
+    cat=$((cat + 1))
+  done
+  return 1
+}
+
+# Normalize and validate --skip values (bead A5):
+# Supports:
+#   - Language-prefixed IDs: e.g. --skip=js.debug,python.todo
+#   - Bare category numbers: e.g. --skip=11,14 (applies per language; warns if >1 language active)
+#   - Invalid or unselected IDs exit 2 with diagnostic error.
+resolve_skip_categories(){
+  [[ -z "${UBS_SKIP_CATEGORIES:-}" ]] && return 0
+  local -a tokens
+  IFS=',' read -r -a tokens <<<"$UBS_SKIP_CATEGORIES"
+  local -a bare_nums=()
+  local tok
+  for tok in "${tokens[@]}"; do
+    tok="${tok//[[:space:]]/}"
+    [[ -z "$tok" ]] && continue
+    if [[ "$tok" =~ ^[0-9]+$ ]]; then
+      bare_nums+=("$tok")
+    elif [[ "$tok" =~ ^([a-zA-Z0-9_-]+)\.([a-zA-Z0-9_-]+)$ ]]; then
+      local t_lang="${BASH_REMATCH[1]}"
+      local t_slug="${BASH_REMATCH[2]}"
+      local norm_lang; norm_lang="$(normalize_lang "$t_lang")"
+      local lang_active=0 l
+      for l in "${langs[@]}"; do
+        if [[ "$l" == "$norm_lang" ]]; then lang_active=1; break; fi
+      done
+      if [[ "$lang_active" -eq 0 ]]; then
+        say_err "${RED}Error:${RESET} Category id '${tok}' does not exist in any selected language (${langs[*]})."
+        exit 2
+      fi
+      local c_num
+      if ! c_num="$(category_slug_to_num "$norm_lang" "$t_slug")" || [[ -z "$c_num" ]]; then
+        say_err "${RED}Error:${RESET} Unknown category slug '${t_slug}' for language '${norm_lang}' (id: ${tok})."
+        exit 2
+      fi
+      if [[ -n "${SKIP_BY_LANG[$norm_lang]:-}" ]]; then
+        SKIP_BY_LANG["$norm_lang"]="${SKIP_BY_LANG[$norm_lang]},$c_num"
+      else
+        SKIP_BY_LANG["$norm_lang"]="$c_num"
+      fi
+    else
+      say_err "${RED}Error:${RESET} Invalid --skip parameter '${tok}'. Expected numeric category or <lang>.<slug> id."
+      exit 2
+    fi
+  done
+
+  if [[ "${#bare_nums[@]}" -gt 0 ]]; then
+    local bare_csv
+    bare_csv="$(IFS=','; echo "${bare_nums[*]}")"
+    UBS_SKIP_CATEGORIES="$bare_csv"
+    if [[ "${#langs[@]}" -ge 2 ]]; then
+      warn_ambiguous_skip "$bare_csv" "${langs[@]}"
+    fi
+  else
+    UBS_SKIP_CATEGORIES=""
+  fi
+}
+
+list_categories_for_langs(){
+  local list_rc=0 L
+  for L in "${langs[@]}"; do
+    local mpath
+    mpath="$(resolve_module_path "$L")"
+    if ! ensure_module "$L" "$mpath"; then
+      say "${YELLOW}${WARN}${RESET} $L: module unavailable"
+      list_rc=2
+      continue
+    fi
+    say "\n${MAGENTA}${BOLD}──────── $L (category ids for --skip) ────────${RESET}"
+    local cat=1 printed=0
+    while [[ $cat -le 35 ]]; do
+      local slug; slug="$(category_slug_for "$L" "$cat")"
+      [[ -z "$slug" ]] && { cat=$((cat + 1)); continue; }
+      local cname; cname="$(category_name_for "$L" "$cat")"
+      [[ "$cname" == "(no category "* ]] && { cat=$((cat + 1)); continue; }
+      printf "  ${WHITE}%2d${RESET}  ${CYAN}%-26s${RESET} %s\n" "$cat" "${L}.${slug}" "$cname"
+      printed=1
+      cat=$((cat + 1))
+    done
+    if [[ "$printed" -eq 0 ]]; then
+      if ! "$mpath" --list-categories 2>/dev/null; then
+        say "${DIM}(the $L module does not support --list-categories yet; use --skip-$L=N with the numbers printed in its report)${RESET}"
+      fi
+    fi
+  done
+  exit "$list_rc"
 }
 
 # Build selected language set
@@ -5469,25 +5831,7 @@ say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
 
 # --list-categories: print each selected module's category table and exit 0.
 if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
-  list_rc=0
-  for L in "${langs[@]}"; do
-    mpath="$(resolve_module_path "$L")"
-    if ! ensure_module "$L" "$mpath"; then
-      say "${YELLOW}${WARN}${RESET} $L: module unavailable"
-      list_rc=2
-      continue
-    fi
-    say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
-    if ! "$mpath" --list-categories 2>/dev/null; then
-      say "${DIM}(the $L module does not support --list-categories yet; use --skip-$L=N with the numbers printed in its report)${RESET}"
-    fi
-  done
-  exit "$list_rc"
-fi
-
-# Issue #52: warn when bare --skip=N silences different categories per module.
-if [[ "$BARE_SKIP_USED" -eq 1 && -n "${UBS_SKIP_CATEGORIES:-}" ]]; then
-  warn_ambiguous_skip "$UBS_SKIP_CATEGORIES" "${langs[@]}"
+  list_categories_for_langs
 fi
 
 # Issue #52: normalize per-language skip keys (e.g. --skip-c → --skip-cpp)
@@ -5510,6 +5854,9 @@ if [[ "${#SKIP_BY_LANG[@]}" -gt 0 ]]; then
   done
   unset _SKIP_NORMALIZED _slk _sln
 fi
+
+# Bead A5: resolve language-prefixed category ids and per-language --skip mapping
+resolve_skip_categories
 
 # Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
 if [[ " ${langs[*]} " == *" js "* ]]; then

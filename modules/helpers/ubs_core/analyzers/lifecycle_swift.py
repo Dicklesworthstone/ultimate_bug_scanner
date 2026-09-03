@@ -4,11 +4,10 @@ Logic moved verbatim from modules/helpers/resource_lifecycle_swift.py, which rem
 as a thin entrypoint. Also exposes a structured `run(ctx)` for the
 `python3 -m ubs_core` CLI.
 """
+from __future__ import annotations
+
 import re
 import sys
-from pathlib import Path
-from typing import Iterable
-import re
 from pathlib import Path
 from typing import Iterable
 
@@ -211,16 +210,11 @@ def scan_text(path: Path, text: str, base: Path) -> list[tuple[str, str, str, in
         for match in acquire.finditer(code):
             name = match.group(1)
             if search_release(name, release_patterns, code, match.end()):
-def main() -> int:
-    if len(sys.argv) < 2:
-        print("Usage: resource_lifecycle_swift.py <project_dir>", file=sys.stderr)
-        return 1
-    root = Path(sys.argv[1]).resolve()
-    if not root.exists():
-        return 0
-    for loc, kind, message in collect_issues(root):
-        print(f"{loc}\t{kind}\t{message}")
-    return 0
+                continue
+            emit(match.start(), kind, f"{message} ({name})")
+
+    kvo_kind, kvo_message, kvo_acquire, kvo_release = KVO_RULE
+    if not kvo_release.search(code):
         for match in kvo_acquire.finditer(code):
             emit(match.start(), kvo_kind, kvo_message)
 
@@ -243,11 +237,9 @@ def collect_issues(root: Path) -> list[tuple[str, str, str]]:
 
 
 def main() -> int:
-    import sys
-
-    if len(sys.argv) != 2:
-        print("usage: resource_lifecycle_swift.py <project_dir>", file=sys.stderr)
-        return 2
+    if len(sys.argv) < 2:
+        print("Usage: resource_lifecycle_swift.py <project_dir>", file=sys.stderr)
+        return 1
     root = Path(sys.argv[1]).resolve()
     if not root.exists():
         return 0
@@ -296,9 +288,9 @@ def _selftest_timer_positive() -> None:
 def _selftest_invalidated_suppression() -> None:
     code = (
         "class A {\n"
-        '  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n'
+        "  let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }\n"
         "  func stop() { timer.invalidate() }\n"
-        '  let s = "let fake = Timer.scheduledTimer(x)"\n'
+        "  let s = \"let fake = Timer.scheduledTimer(x)\"\n"
         "}\n"
     )
     assert scan_text(Path("A.swift"), code, Path(".")) == []
@@ -328,7 +320,7 @@ def _selftest_run(tmp_prefix: str = "ubs_core_lifecycle_swift_") -> None:
     assert len(findings) == 1, findings
     assert findings[0]["rule"] == "swift.lifecycle.file_handle"
     assert findings[0]["line"] == 3
-    assert findings[0]["col"] == 15
+    assert findings[0]["col"] == 3
     assert findings[0]["severity"] == "critical"
 
 

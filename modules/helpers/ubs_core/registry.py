@@ -31,6 +31,7 @@ LANGS: tuple[str, ...] = (
     "swift",
     "csharp",
     "kotlin",
+    "elixir",
 )
 
 Lang = str

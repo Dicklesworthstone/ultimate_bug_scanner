@@ -332,8 +332,13 @@ emit_findings_json() {
 }
 
 emit_json_summary() {
-  printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json"}\n' \
-    "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$(json_escape "$(now)")"
+  local status_json='"status":"ok"'
+  if [[ "$CARGO_UNAVAILABLE" -eq 1 ]]; then
+    status_json="$(printf '"status":"partial","module_error":"CARGO_UNAVAILABLE","message":"%s"' \
+      "$(json_escape "cargo could not run, so compilation, tests and lints were not evaluated: ${CARGO_UNAVAILABLE_MSG}")")"
+  fi
+  printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
+    "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$(json_escape "$(now)")" "$status_json"
 }
 
 emit_sarif() {
@@ -7987,11 +7992,31 @@ count_warnings_errors() {
 # A cargo phase that exited non-zero without any diagnostic we can count (a
 # missing/failing toolchain, a wrapper refusing to run, a broken manifest) must
 # never be reported as clean: surface the exit code and the last log line.
+# A cargo phase that exits non-zero WITHOUT producing compiler diagnostics
+# (bead D10): the build wrapper refused (rch exit 103, "remote build admission
+# is paused"), a toolchain component is missing, the network was needed — an
+# environment condition, not a defect in the code. Severity is never above
+# warning, the phase is reported as "Not evaluated", and the module marks
+# itself partial (status/module_error in the JSON summary) so the meta-runner
+# reports status: partial (exit 2 unless UBS_ALLOW_PARTIAL=1) instead of a
+# clean or a critical result. Info-level callers (udeps/outdated, optional
+# tools) keep their severity and do not make the run partial.
+CARGO_UNAVAILABLE=0
+CARGO_UNAVAILABLE_MSG=""
 report_cargo_failure() {
   local severity="$1" logfile="$2" category="$3" title="$4"
   local ec last
   ec="$(cargo_phase_ec "$logfile")"
   last="$(grep -v '^[[:space:]]*$' "$logfile" 2>/dev/null | tail -n 1 | cut -c1-200)"
+  if [[ "$severity" == "critical" || "$severity" == "warning" ]]; then
+    severity="warning"
+    if [[ "$CARGO_UNAVAILABLE" -eq 0 ]]; then
+      CARGO_UNAVAILABLE=1
+      CARGO_UNAVAILABLE_MSG="${title} (exit ${ec}): ${last:-no output captured}"
+    fi
+    print_finding "info" 1 "Not evaluated: ${title%% could not run*}${title%% failed without diagnostics*}" "cargo returned exit $ec without diagnostics; the result is partial"
+    add_finding "info" 1 "Not evaluated: ${title%% could not run*}${title%% failed without diagnostics*}" "cargo returned exit $ec without diagnostics; the result is partial" "$category"
+  fi
   print_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}"
   add_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}" "$category"
 }
@@ -9091,7 +9116,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$(cargo_phase_ec "$CHECK_LOG")" -eq 0 ]]; then
       print_finding "good" "cargo check clean"
     else
-      report_cargo_failure "critical" "$CHECK_LOG" "${CATEGORY_NAME[13]}" "cargo check failed without diagnostics"
+      report_cargo_failure "critical" "$CHECK_LOG" "${CATEGORY_NAME[13]}" "cargo check could not run"
     fi
   fi
 
@@ -9103,7 +9128,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
     if [[ "$(cargo_phase_ec "$TEST_LOG")" -eq 0 ]]; then
       print_finding "good" "Tests build clean"
     else
-      report_cargo_failure "critical" "$TEST_LOG" "${CATEGORY_NAME[13]}" "cargo test --no-run failed without diagnostics"
+      report_cargo_failure "critical" "$TEST_LOG" "${CATEGORY_NAME[13]}" "cargo test --no-run could not run"
     fi
   fi
 else
@@ -9554,6 +9579,10 @@ say "  ${WHITE}Files scanned:${RESET}    ${CYAN}$TOTAL_FILES${RESET}"
 say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$CRITICAL_COUNT${RESET}"
 say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}"
 say "  ${BLUE}Info items:${RESET}       ${BLUE}$INFO_COUNT${RESET}"
+if [[ "$CARGO_UNAVAILABLE" -eq 1 ]]; then
+  say "  ${YELLOW}${BOLD}Partial:${RESET} [CARGO_UNAVAILABLE] ${YELLOW}cargo could not run — compilation, tests and lints were not evaluated${RESET}"
+  say "  ${DIM}${CARGO_UNAVAILABLE_MSG}${RESET}"
+fi
 echo ""
 
 say "${BOLD}${WHITE}Priority Actions:${RESET}"

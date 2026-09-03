@@ -87,6 +87,8 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
     )
     findings = run_scan(ctx) if layer == "scan" else run_layer(layer, ctx)
     return _write_ndjson(findings, args.out)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Populate the registry before dispatch; analyzer modules self-register on import.
     from ubs_core import analyzers  # noqa: F401  (side-effect import)

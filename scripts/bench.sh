@@ -177,16 +177,75 @@ if [[ "$OSS" -eq 1 ]]; then
   done
 fi
 
+# Single-file overhead (beads C3/C3d): the agent-hook case `ubs FILE --ci`
+# against the module alone on the same file, alternating, first pair discarded
+# as warm-up. overhead = meta - module per pair; p50 and p95 by nearest rank.
+# Text mode, because that is what the hooks run (json mode adds the module's
+# own report-json pass). Timed with $EPOCHREALTIME (bash 5): no extra process.
+SINGLE_FILE_TARGET_REL="test-suite/python/clean/clean_async_security.py"
+now_ms(){ local t="${EPOCHREALTIME/./}"; echo $(( t / 1000 )); }
+bench_single_file(){
+  local target="$ROOT_DIR/$SINGLE_FILE_TARGET_REL" samples="$WORK/single-file.samples"
+  local i t0 t1 t2 meta module
+  : >"$samples"
+  echo "▶ single-file: $SINGLE_FILE_TARGET_REL, $RUNS pair(s) + 1 warm-up" >&2
+  for ((i = 0; i <= RUNS; i++)); do
+    t0="$(now_ms)"
+    env NO_COLOR=1 UBS_NO_AUTO_UPDATE=1 "$ROOT_DIR/ubs" "$target" --ci >/dev/null 2>&1 || true
+    t1="$(now_ms)"
+    env NO_COLOR=1 "$ROOT_DIR/modules/ubs-python.sh" --ci "$target" >/dev/null 2>&1 || true
+    t2="$(now_ms)"
+    meta=$(( t1 - t0 )); module=$(( t2 - t1 ))
+    if [[ "$i" -eq 0 ]]; then echo "  warm-up: meta ${meta}ms module ${module}ms" >&2; continue; fi
+    printf '%s %s\n' "$meta" "$module" >>"$samples"
+    echo "  pair $i: meta ${meta}ms module ${module}ms overhead $((meta - module))ms" >&2
+  done
+  python3 - "$SINGLE_FILE_TARGET_REL" "$samples" <<'PY'
+import json
+import statistics
+import sys
+
+rel, path = sys.argv[1], sys.argv[2]
+rows = [tuple(int(x) for x in line.split()) for line in open(path) if line.strip()]
+meta = [m for m, _ in rows]
+module = [mod for _, mod in rows]
+over = [m - mod for m, mod in rows]
+
+
+def nearest_rank(values, q):
+    if not values:
+        return 0
+    ordered = sorted(values)
+    k = max(1, int(round(q * len(ordered))))
+    return ordered[k - 1]
+
+
+print(json.dumps({
+    "name": "single-file", "file": rel, "runs": len(rows), "mode": "text",
+    "meta_ms": meta, "module_ms": module,
+    "meta_ms_p50": int(statistics.median(meta)) if meta else 0,
+    "module_ms_p50": int(statistics.median(module)) if module else 0,
+    "overhead_ms_p50": int(statistics.median(over)) if over else 0,
+    "overhead_ms_p95": nearest_rank(over, 0.95),
+    "target_overhead_ms_p95": 150,
+}))
+PY
+}
+single_file_json="$WORK/single-file.json"
+bench_single_file >"$single_file_json"
+
 ubs_sha="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 ubs_version="$(grep -m1 '^UBS_VERSION=' "$ROOT_DIR/ubs" | cut -d'"' -f2)"
 ast_grep_version="$( (command -v ast-grep >/dev/null 2>&1 && ast-grep --version 2>/dev/null | head -n 1) || echo unknown)"
 cores="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 0)"
 jq -s --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sha "$ubs_sha" --arg ver "$ubs_version" \
-   --arg ag "$ast_grep_version" --argjson cores "$cores" --arg os "$(uname -s)" --argjson runs "$RUNS" '
+   --arg ag "$ast_grep_version" --argjson cores "$cores" --arg os "$(uname -s)" --argjson runs "$RUNS" \
+   --slurpfile sf "$single_file_json" '
   {generated_at: $ts, runs_per_item: $runs,
    engine: {ubs_sha: $sha, ubs_version: $ver, ast_grep: $ag},
    host: {cores: $cores, os: $os},
-   corpus: .}' "$items" >"$OUT_DIR/latest.json"
+   corpus: ., single_file: $sf[0]}' "$items" >"$OUT_DIR/latest.json"
 jq -c '.' "$OUT_DIR/latest.json" >>"$OUT_DIR/history.ndjson"
 echo "wrote $OUT_DIR/latest.json (+ history.ndjson)" >&2
 jq -r '.corpus[] | "  \(.name): \(.files) files, \(.lines) lines → wall \(.wall_s)s (min \(.wall_s_min), max \(.wall_s_max)), cpu \(.cpu_s)s, rss \(.rss_mb)MB, timeouts \(.timeouts)"' "$OUT_DIR/latest.json" >&2
+jq -r '.single_file | "  single-file (\(.file)): meta p50 \(.meta_ms_p50)ms, module p50 \(.module_ms_p50)ms → overhead p50 \(.overhead_ms_p50)ms, p95 \(.overhead_ms_p95)ms (target \(.target_overhead_ms_p95)ms; the hard gate lands with bead C3b)"' "$OUT_DIR/latest.json" >&2

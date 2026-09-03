@@ -50,6 +50,25 @@ def standardise(walls: list[float], baseline_wall: float, sigma_rel: float) -> l
     return [(math.log(w) - base) / sigma_rel for w in walls]
 
 
+def overhead_sigma(baseline_ms: float) -> float:
+    """Noise for the single-file overhead series, in milliseconds.
+
+    The overhead is a difference of two wall times that can sit near zero, so
+    the log transform used for corpus wall times is wrong here; the series is
+    tracked in raw ms with sigma = max(20 ms, 15% of the baseline), which is the
+    run-to-run spread measured on the fixture file (bead C3d)."""
+    return max(20.0, 0.15 * baseline_ms)
+
+
+def overhead_samples(history: list[dict]) -> list[float]:
+    out: list[float] = []
+    for doc in history:
+        sf = doc.get("single_file")
+        if isinstance(sf, dict) and isinstance(sf.get("overhead_ms_p95"), (int, float)):
+            out.append(float(sf["overhead_ms_p95"]))
+    return out
+
+
 def baseline_sigma(item: dict, default: float) -> float:
     """Relative noise of the baseline: half its min..max log-range over its
     runs when it recorded several, else the default."""
@@ -128,6 +147,25 @@ def main(argv: list[str] | None = None) -> int:
             verdict = f"ALARM faster (CUSUM {lo[-1]:.1f}σ > {args.h}σ; refresh the baseline)"
             alarms += 1
         print(f"[bench-cusum:{name}] {verdict} — baseline {base_wall}s, latest {walls[-1]}s ({latest_ratio:+.1%} vs baseline), σ={sigma:.3f}, {len(z)} sample(s)".replace("+-", "-"))
+    sf_base = baseline.get("single_file") if isinstance(baseline.get("single_file"), dict) else {}
+    base_over = float(sf_base.get("overhead_ms_p95", 0) or 0)
+    if base_over > 0:
+        overs = overhead_samples(history)[-args.window:]
+        if not overs:
+            print("[bench-cusum:single-file] no samples")
+        else:
+            sigma_ms = overhead_sigma(base_over)
+            z = [(x - base_over) / sigma_ms for x in overs]
+            hi, lo, first_hi, first_lo = cusum(z, args.k, args.h)
+            verdict = "PASS"
+            if first_hi is not None:
+                verdict = f"ALARM slower (CUSUM {hi[-1]:.1f}σ > {args.h}σ, tripped at sample {first_hi + 1}/{len(z)})"
+                alarms += 1
+            elif first_lo is not None:
+                verdict = f"ALARM faster (CUSUM {lo[-1]:.1f}σ > {args.h}σ; refresh the baseline)"
+                alarms += 1
+            target = sf_base.get("target_overhead_ms_p95", 150)
+            print(f"[bench-cusum:single-file] {verdict} — overhead p95 baseline {base_over:.0f} ms, latest {overs[-1]:.0f} ms, σ={sigma_ms:.0f} ms, {len(z)} sample(s); target {target} ms is informational until bead C3b lands")
     return 1 if alarms else 0
 
 

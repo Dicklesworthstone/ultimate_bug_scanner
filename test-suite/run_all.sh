@@ -53,6 +53,54 @@ echo ""
 # still runs. The summary at the end lists every failed step by name.
 FAILED_STEPS=()
 PASSED_STEPS=()
+
+# hygiene-guard-begin
+# Repository hygiene guard (bead H9). A test that writes into the checkout
+# (2026-09-02: a contract check left findings.jsonl, report.html, report.json
+# and summary.json at the repo root) must be named by the step that did it.
+# After every step the untracked-file set is compared with the snapshot taken
+# before it; new paths outside the allowed prefixes are reported. In CI (or
+# with UBS_TEST_HYGIENE=strict) that fails the run; locally it only warns,
+# because other agents create files in this checkout while the suite runs and
+# a red gate for their files would blame the wrong actor. Nothing is deleted.
+HYGIENE_ALLOWED_PREFIXES=("test-suite/artifacts/" "test-suite/goldens/" ".beads/")
+HYGIENE_MODE="${UBS_TEST_HYGIENE:-}"
+if [[ -z "$HYGIENE_MODE" ]]; then
+  if [[ -n "${CI:-}" ]]; then HYGIENE_MODE=strict; else HYGIENE_MODE=warn; fi
+fi
+HYGIENE_ISSUES=()
+HYGIENE_SNAPSHOT=""
+hygiene_untracked(){
+  # Untracked paths relative to the repository root, outside the allowed prefixes.
+  local root prefix path allowed
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+  git -C "$root" status --porcelain --untracked-files=all 2>/dev/null | awk '/^\?\? /{print substr($0, 4)}' | while IFS= read -r path; do
+    allowed=0
+    for prefix in "${HYGIENE_ALLOWED_PREFIXES[@]}"; do
+      [[ "$path" == "$prefix"* ]] && allowed=1
+    done
+    [[ "$allowed" -eq 0 ]] && printf '%s\n' "$path"
+  done | LC_ALL=C sort
+}
+hygiene_snapshot(){ HYGIENE_SNAPSHOT="$(hygiene_untracked)"; }
+hygiene_check(){
+  local step="$1" now new list
+  now="$(hygiene_untracked)"
+  new="$(LC_ALL=C comm -13 <(printf '%s\n' "$HYGIENE_SNAPSHOT") <(printf '%s\n' "$now") | sed '/^$/d')"
+  HYGIENE_SNAPSHOT="$now"
+  [[ -z "$new" ]] && return 0
+  list="$(printf '%s' "$new" | tr '\n' ' ')"
+  if [[ "$HYGIENE_MODE" == "strict" ]]; then
+    echo "❌ [$step] left untracked files in the checkout (UBS_TEST_HYGIENE=strict): $list"
+    HYGIENE_ISSUES+=("$step left untracked files: $list")
+  else
+    echo "⚠️  [$step] new untracked files appeared during this step (not deleted; UBS_TEST_HYGIENE=strict makes this fatal): $list"
+    HYGIENE_ISSUES+=("$step (warning) new untracked files: $list")
+  fi
+  return 0
+}
+hygiene_snapshot
+# hygiene-guard-end
 run_step() {
   local name="$1"; shift
   local started=$SECONDS
@@ -65,6 +113,7 @@ run_step() {
     FAILED_STEPS+=("$name (exit $rc)")
     echo "❌ [$name] FAIL (exit $rc, $((SECONDS - started))s)"
   fi
+  hygiene_check "$name"
   echo ""
 }
 
@@ -148,6 +197,15 @@ run_step docs-claims "${PY[@]}" ../scripts/check_docs_claims.py
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "SUMMARY: ${#PASSED_STEPS[@]} passed, ${#FAILED_STEPS[@]} failed"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [[ ${#HYGIENE_ISSUES[@]} -gt 0 ]]; then
+  echo "Repository hygiene (${HYGIENE_MODE}):"
+  for issue in "${HYGIENE_ISSUES[@]}"; do
+    echo "  • $issue"
+  done
+  if [[ "$HYGIENE_MODE" == "strict" ]]; then
+    FAILED_STEPS+=("hygiene (${#HYGIENE_ISSUES[@]} step(s) wrote into the checkout)")
+  fi
+fi
 if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
   for step in "${FAILED_STEPS[@]}"; do
     echo "❌ $step"

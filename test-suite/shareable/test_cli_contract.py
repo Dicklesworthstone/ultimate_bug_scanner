@@ -791,8 +791,310 @@ def check_status_ok_on_clean_run() -> None:
     report("status_ok_on_clean_run", ok, f"exit={proc.returncode}", proc if not ok else None)
 
 
+def write_case_artifacts(case_id: str, proc: subprocess.CompletedProcess, result: dict | None = None) -> None:
+    for cid in (case_id, case_id.replace("_", "-")):
+        art_dir = REPO_ROOT / "test-suite" / "artifacts" / cid
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / "stdout.log").write_text(proc.stdout or "", encoding="utf-8")
+        (art_dir / "stderr.log").write_text(proc.stderr or "", encoding="utf-8")
+        if result is not None:
+            (art_dir / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        elif proc.stdout and proc.stdout.strip().startswith("{"):
+            try:
+                (art_dir / "result.json").write_text(json.dumps(json.loads(proc.stdout), indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+
+def test_ubsignore_precedence() -> None:
+    # Precedence: default ignores, .ubsignore, --exclude, --include-ext,
+    # and explicitly named files which must always win over ignores (bead B8).
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-prec-"))
+    try:
+        (tmp / "clean.py").write_text("print('clean')\n", encoding="utf-8")
+        (tmp / "node_modules").mkdir()
+        (tmp / "node_modules" / "mod.py").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "custom_ignored").mkdir()
+        (tmp / "custom_ignored" / "cust.py").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "cli_excluded").mkdir()
+        (tmp / "cli_excluded" / "excl.py").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "custom_ext").mkdir()
+        (tmp / "custom_ext" / "file.pyw").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "custom_ext" / "file.other_ext").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / ".ubsignore").write_text("custom_ignored\n", encoding="utf-8")
+
+        # 1. Directory scan: default ignore, .ubsignore, and --exclude must be skipped
+        proc1 = run(["--only=python", "--ci", "--format=json", "--exclude=cli_excluded", str(tmp)])
+        doc1 = json.loads(proc1.stdout)
+        files1 = doc1.get("totals", {}).get("files", 0)
+        crit1 = doc1.get("totals", {}).get("critical", 0)
+
+        # 2. Explicitly named file in .ubsignore must WIN
+        proc2 = run(["--only=python", "--ci", "--format=json", str(tmp / "custom_ignored" / "cust.py")])
+        doc2 = json.loads(proc2.stdout)
+        files2 = doc2.get("totals", {}).get("files", 0)
+        crit2 = doc2.get("totals", {}).get("critical", 0)
+
+        # 3. Explicitly named file in default ignore must WIN
+        proc3 = run(["--only=python", "--ci", "--format=json", str(tmp / "node_modules" / "mod.py")])
+        doc3 = json.loads(proc3.stdout)
+        files3 = doc3.get("totals", {}).get("files", 0)
+        crit3 = doc3.get("totals", {}).get("critical", 0)
+
+        # 4. Explicitly named file matching --exclude must WIN
+        proc4 = run(["--only=python", "--ci", "--format=json", "--exclude=cli_excluded", str(tmp / "cli_excluded" / "excl.py")])
+        doc4 = json.loads(proc4.stdout)
+        files4 = doc4.get("totals", {}).get("files", 0)
+        crit4 = doc4.get("totals", {}).get("critical", 0)
+
+        # 5. --include-ext includes extra extensions matching the scanner (pyw is not in default INCLUDE_EXT)
+        proc5 = run(["--only=python", "--ci", "--format=json", "--include-ext=py,pyw", "--exclude=cli_excluded", str(tmp)])
+        doc5 = json.loads(proc5.stdout)
+        files5 = doc5.get("totals", {}).get("files", 0)
+
+        ok = (
+            files1 == 1 and crit1 == 0
+            and files2 == 1 and crit2 >= 1
+            and files3 == 1 and crit3 >= 1
+            and files4 == 1 and crit4 >= 1
+            and files5 == 2
+        )
+        detail = (
+            f"dir_files={files1}(crit={crit1}) explicit_ubsignore={files2}(crit={crit2}) "
+            f"explicit_default={files3}(crit={crit3}) explicit_exclude={files4}(crit={crit4}) include_ext={files5}"
+        )
+        write_case_artifacts("test_ubsignore_precedence", proc1, {
+            "dir_scan": doc1,
+            "explicit_ubsignore": doc2,
+            "explicit_default": doc3,
+            "explicit_exclude": doc4,
+            "include_ext": doc5,
+            "ok": ok,
+        })
+        report("test_ubsignore_precedence", ok, detail, proc1 if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_suggest_ignore_lists_large_dirs() -> None:
+    # --suggest-ignore suggests directories > 200 files not already default-ignored (bead B8).
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-suggest-"))
+    try:
+        big_dir = tmp / "large_unignored_dir"
+        big_dir.mkdir()
+        for i in range(205):
+            (big_dir / f"dummy_{i:03d}.txt").write_text("x\n", encoding="utf-8")
+
+        small_dir = tmp / "small_dir"
+        small_dir.mkdir()
+        for i in range(5):
+            (small_dir / f"dummy_{i:03d}.txt").write_text("x\n", encoding="utf-8")
+
+        node_dir = tmp / "node_modules"
+        node_dir.mkdir()
+        for i in range(205):
+            (node_dir / f"dummy_{i:03d}.txt").write_text("x\n", encoding="utf-8")
+
+        proc = run(["--suggest-ignore", str(tmp)])
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode in (0, 1, 3)
+            and "large_unignored_dir" in combined
+            and "(205 files) → consider adding to .ubsignore" in combined
+            and "small_dir" not in combined
+            and "node_modules" not in combined
+        )
+        detail = (
+            f"exit={proc.returncode} has_large={'large_unignored_dir' in combined} "
+            f"has_small={'small_dir' in combined} has_node={'node_modules' in combined}"
+        )
+        write_case_artifacts("test_suggest_ignore_lists_large_dirs", proc, {
+            "exit": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "ok": ok,
+        })
+        report("test_suggest_ignore_lists_large_dirs", ok, detail, proc if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_staged_scans_index_only() -> None:
+    # --staged scans only files in the git index, ignoring unstaged edits and untracked files (bead B8).
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-staged-"))
+    try:
+        subprocess.run(["git", "init"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "UBS Test"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "ubs-test@example.com"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp, capture_output=True, check=True)
+
+        base_file = tmp / "base.py"
+        base_file.write_text("print('committed base')\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.py"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp, capture_output=True, check=True)
+
+        # Staged buggy file
+        staged_file = tmp / "staged_buggy.py"
+        staged_file.write_text("eval(input())\n", encoding="utf-8")
+        subprocess.run(["git", "add", "staged_buggy.py"], cwd=tmp, capture_output=True, check=True)
+
+        # Unstaged modification to base.py
+        base_file.write_text("eval(input())\n", encoding="utf-8")
+
+        # Untracked buggy file
+        untracked_file = tmp / "untracked_buggy.py"
+        untracked_file.write_text("eval(input())\n", encoding="utf-8")
+
+        proc = run(["--staged", "--only=python", "--ci", "--format=json"], cwd=tmp)
+        ok = False
+        detail = f"exit={proc.returncode}"
+        try:
+            doc = json.loads(proc.stdout)
+            files = doc.get("totals", {}).get("files", 0)
+            crit = doc.get("totals", {}).get("critical", 0)
+            scanned_samples = [
+                s.get("file")
+                for sc in doc.get("scanners", [])
+                for f in sc.get("findings", [])
+                for s in f.get("samples", [])
+                if s.get("file")
+            ]
+            ok = (
+                files == 1
+                and crit >= 1
+                and any("staged_buggy.py" in p for p in scanned_samples)
+                and not any("base.py" in p for p in scanned_samples)
+                and not any("untracked_buggy.py" in p for p in scanned_samples)
+            )
+            detail += f" files={files} crit={crit} samples={scanned_samples}"
+        except Exception as exc:  # noqa: BLE001
+            detail += f" ({exc})"
+
+        write_case_artifacts("test_staged_scans_index_only", proc, {
+            "exit": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "ok": ok,
+        })
+        report("test_staged_scans_index_only", ok, detail, proc if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_diff_scans_modified_only() -> None:
+    # --diff scans only working-tree files modified vs HEAD, excluding untouched and untracked (bead B8).
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-diff-"))
+    try:
+        subprocess.run(["git", "init"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.name", "UBS Test"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "config", "user.email", "ubs-test@example.com"], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp, capture_output=True, check=True)
+
+        unchanged = tmp / "unchanged.py"
+        unchanged.write_text("print('clean')\n", encoding="utf-8")
+        to_modify = tmp / "mod_buggy.py"
+        to_modify.write_text("print('clean')\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=tmp, capture_output=True, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp, capture_output=True, check=True)
+
+        # Working tree modified vs HEAD
+        to_modify.write_text("eval(input())\n", encoding="utf-8")
+
+        # Untracked file
+        untracked = tmp / "untracked_buggy.py"
+        untracked.write_text("eval(input())\n", encoding="utf-8")
+
+        proc = run(["--diff", "--only=python", "--ci", "--format=json"], cwd=tmp)
+        ok = False
+        detail = f"exit={proc.returncode}"
+        try:
+            doc = json.loads(proc.stdout)
+            files = doc.get("totals", {}).get("files", 0)
+            crit = doc.get("totals", {}).get("critical", 0)
+            scanned_samples = [
+                s.get("file")
+                for sc in doc.get("scanners", [])
+                for f in sc.get("findings", [])
+                for s in f.get("samples", [])
+                if s.get("file")
+            ]
+            ok = (
+                files == 1
+                and crit >= 1
+                and any("mod_buggy.py" in p for p in scanned_samples)
+                and not any("unchanged.py" in p for p in scanned_samples)
+                and not any("untracked_buggy.py" in p for p in scanned_samples)
+            )
+            detail += f" files={files} crit={crit} samples={scanned_samples}"
+        except Exception as exc:  # noqa: BLE001
+            detail += f" ({exc})"
+
+        write_case_artifacts("test_diff_scans_modified_only", proc, {
+            "exit": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "ok": ok,
+        })
+        report("test_diff_scans_modified_only", ok, detail, proc if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+check_ubsignore_precedence = test_ubsignore_precedence
+check_suggest_ignore_lists_large_dirs = test_suggest_ignore_lists_large_dirs
+check_staged_scans_index_only = test_staged_scans_index_only
+check_diff_scans_modified_only = test_diff_scans_modified_only
+
+
+def test_skip_polyglot_mapping() -> None:
+    # Bead A5: Language-prefixed category ids and per-language --skip mapping.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-skipmap-"))
+    try:
+        (tmp / "test.js").write_text("console.log('debug');\n", encoding="utf-8")
+        (tmp / "test.py").write_text("def f(x=[]):\n    # TODO: fix\n    return x\n", encoding="utf-8")
+
+        # 1. Valid stable ids: --skip=js.debug,python.todo
+        proc1 = run(["--skip=js.debug,python.todo", "--format=json", str(tmp)])
+        out1 = proc1.stdout + proc1.stderr
+        ok1 = proc1.returncode in (0, 1) and "WARNING: bare --skip=" not in out1
+
+        # 2. Unselected category id (e.g. rust.perf on js/python project) -> exit 2
+        proc2 = run(["--skip=rust.perf", str(tmp)])
+        ok2 = proc2.returncode == 2 and "does not exist in any selected language" in proc2.stderr
+
+        # 3. Unknown category slug -> exit 2
+        proc3 = run(["--skip=js.unknown_slug", str(tmp)])
+        ok3 = proc3.returncode == 2 and "Unknown category slug" in proc3.stderr
+
+        # 4. Bare numeric skip in polyglot mode -> warns but exits 0/1 (not 2)
+        proc4 = run(["--skip=11", str(tmp)])
+        ok4 = proc4.returncode in (0, 1) and "WARNING: bare --skip=11" in proc4.stderr
+
+        # 5. --list-categories output contains <lang>.<slug>
+        proc5 = run(["--only=python", "--list-categories", str(tmp)])
+        ok5 = proc5.returncode == 0 and "python.security" in proc5.stdout
+
+        ok = ok1 and ok2 and ok3 and ok4 and ok5
+        detail = f"valid={ok1} unselected_exit2={ok2} unknown_slug_exit2={ok3} polyglot_warn={ok4} list_cat_ids={ok5}"
+        write_case_artifacts("test_skip_polyglot_mapping", proc1, {
+            "valid_ids": {"exit": proc1.returncode, "stdout": proc1.stdout, "stderr": proc1.stderr},
+            "unselected_exit2": {"exit": proc2.returncode, "stderr": proc2.stderr},
+            "unknown_slug_exit2": {"exit": proc3.returncode, "stderr": proc3.stderr},
+            "polyglot_warn": {"exit": proc4.returncode, "stderr": proc4.stderr},
+            "list_categories": {"exit": proc5.returncode, "stdout": proc5.stdout},
+            "ok": ok,
+        })
+        report("test_skip_polyglot_mapping", ok, detail, proc1 if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+check_skip_polyglot_mapping = test_skip_polyglot_mapping
+
+
 def main() -> int:
-    for check in (
+    filter_names = set(sys.argv[1:])
+    checks = (
         check_unknown_flag_exit2,
         check_bad_format_exit2,
         check_documented_flags_parse,
@@ -823,11 +1125,20 @@ def main() -> int:
         check_python_shim_when_only_python_exists,
         check_doctor_fix_refuses_tampered_toon,
         check_language_scoped_ignores,
-    ):
+        test_ubsignore_precedence,
+        test_suggest_ignore_lists_large_dirs,
+        test_staged_scans_index_only,
+        test_diff_scans_modified_only,
+        test_skip_polyglot_mapping,
+    )
+    for check in checks:
+        name = check.__name__
+        if filter_names and name not in filter_names and name.replace("test_", "check_") not in filter_names and name.replace("check_", "test_") not in filter_names:
+            continue
         try:
             check()
         except Exception as exc:  # noqa: BLE001
-            report(check.__name__, False, f"raised {exc!r}")
+            report(name, False, f"raised {exc!r}")
     if FAILURES:
         print(f"\n[cli-contract] {len(FAILURES)} check(s) failed: {', '.join(FAILURES)}")
         return 1
@@ -837,3 +1148,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

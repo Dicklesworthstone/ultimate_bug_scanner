@@ -43,7 +43,7 @@
     "uv_tools"
   ],
   "findings_schema": "ubs --schema=json (scanners[].findings[] with title/severity/count/samples[file,line,code]); per-finding records via --report-json (js, python) or --emit-findings-json (csharp) until bead K2",
-  "rule_id_grammar": "<lang>.<family>.<name> (e.g. js.async.dangling-promise, py.json.loads-no-try); category numbers are per module until bead A5 prefixes them per language",
+  "rule_id_grammar": "<lang>.<family>.<name> (e.g. js.async.dangling-promise, py.json.loads-no-try); category ids are <lang>.<slug> (e.g. js.debug, python.security)",
   "flags": [
     {
       "flag": "--format",

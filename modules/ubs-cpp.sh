@@ -274,7 +274,9 @@ ubs_export_locale
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=()
 for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
-EXCLUDE_DIRS=(.git .svn .hg build cmake-build-* out dist bin lib obj target .vscode .vs .cache .idea _deps third_party vendor bazel-*)
+# `bin` is deliberately absent (bead B4b): sources can live under bin/; only
+# C/C++ extensions are read, so build outputs there cost nothing.
+EXCLUDE_DIRS=(.git .svn .hg build cmake-build-* out dist lib obj target .vscode .vs .cache .idea _deps third_party vendor bazel-*)
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
 EXCLUDE_FLAGS=()
 for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done

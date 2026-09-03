@@ -1,0 +1,569 @@
+{
+  "contract_version": 1,
+  "about": "Machine-readable contract of the language modules (bead A3b, 2026-09-03). Hand-maintained; scripts/check_docs_claims.py verifies every flag here against each module's argument parser, renders modules/README.md's Options block from it (scripts/gen_module_readme.py) and fails when a parser flag shared by 7+ modules is missing here. Per-module `contract` becomes 2 once the A4 port (modules/lib/ubs-common.sh + ubs_core, --files-from) lands.",
+  "invocation": "modules/ubs-<lang>.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]",
+  "formats": {
+    "module": [
+      "text",
+      "json",
+      "sarif"
+    ],
+    "meta_runner_only": [
+      "jsonl",
+      "toon"
+    ],
+    "note": "A module asked for --format=jsonl or --format=toon exits 2 (ubs_validate_format in modules/lib/ubs-common.sh); the meta-runner derives those from the module's json."
+  },
+  "exit_codes": {
+    "0": "no critical findings (and no warnings when --fail-on-warning is set)",
+    "1": "critical findings, or warnings with --fail-on-warning",
+    "2": "usage or environment error: unknown flag, unsupported --format, missing modules/lib/ubs-common.sh, missing required tool"
+  },
+  "environment": {
+    "UBS_LANG": "set by the meta-runner to the module's language name",
+    "UBS_METRICS_DIR": "directory where helpers drop metrics JSON the meta-runner attaches to the summary",
+    "UBS_SKIP_TYPE_NARROWING": "1 skips the type-narrowing helpers (also --skip-type-narrowing on ubs)",
+    "UBS_AST_GREP_BIN": "explicit ast-grep binary (the meta-runner exports the verified one)",
+    "UBS_MODULE_LIB_DIR": "set by the module itself: directory holding lib/ubs-common.sh next to the module",
+    "NO_COLOR": "disable ANSI colour (same as --no-color)"
+  },
+  "summary_json_keys": [
+    "language",
+    "project",
+    "files",
+    "critical",
+    "warning",
+    "info",
+    "timestamp",
+    "status",
+    "findings",
+    "categories",
+    "ast_grep_rules",
+    "extras",
+    "uv_tools"
+  ],
+  "findings_schema": "ubs --schema=json (scanners[].findings[] with title/severity/count/samples[file,line,code]); per-finding records via --report-json (js, python) or --emit-findings-json (csharp) until bead K2",
+  "rule_id_grammar": "<lang>.<family>.<name> (e.g. js.async.dangling-promise, py.json.loads-no-try); category numbers are per module until bead A5 prefixes them per language",
+  "flags": [
+    {
+      "flag": "--format",
+      "value": "FMT",
+      "modules": "all",
+      "documented": true,
+      "doc": "text|json|sarif (default: text). jsonl and toon are produced by the\nmeta-runner from the module's json output, not by the module itself"
+    },
+    {
+      "flag": "--ci",
+      "modules": "all",
+      "documented": true,
+      "doc": "stable timestamps (UTC ISO8601)"
+    },
+    {
+      "flag": "--fail-on-warning",
+      "modules": "all",
+      "documented": true,
+      "doc": "exit non-zero if any warnings or critical"
+    },
+    {
+      "flag": "--verbose",
+      "short": "-v",
+      "modules": "all",
+      "documented": true,
+      "doc": "print more samples in text mode"
+    },
+    {
+      "flag": "--quiet",
+      "short": "-q",
+      "modules": "all",
+      "documented": false,
+      "doc": "print only the summary"
+    },
+    {
+      "flag": "--no-color",
+      "modules": "all",
+      "documented": false,
+      "doc": "disable ANSI colour"
+    },
+    {
+      "flag": "--jobs",
+      "value": "N",
+      "modules": "all",
+      "documented": true,
+      "doc": "parallel hint (propagated to ripgrep/child tools)"
+    },
+    {
+      "flag": "--exclude",
+      "value": "GLOBS",
+      "modules": "all",
+      "documented": true,
+      "doc": "additional path globs to skip (forwarded by the meta-runner)"
+    },
+    {
+      "flag": "--include-ext",
+      "value": "CSV",
+      "modules": "all",
+      "documented": true,
+      "doc": "extra file extensions to scan"
+    },
+    {
+      "flag": "--skip",
+      "value": "CSV",
+      "modules": "all",
+      "documented": true,
+      "doc": "skip category numbers (numbers differ per module)"
+    },
+    {
+      "flag": "--only",
+      "value": "CSV",
+      "modules": [
+        "cpp",
+        "csharp",
+        "elixir",
+        "java",
+        "ruby",
+        "rust",
+        "swift"
+      ],
+      "documented": false,
+      "doc": "run only these category numbers"
+    },
+    {
+      "flag": "--rules",
+      "value": "DIR",
+      "modules": [
+        "cpp",
+        "csharp",
+        "golang",
+        "java",
+        "js",
+        "python",
+        "ruby",
+        "rust",
+        "swift"
+      ],
+      "documented": true,
+      "doc": "merge custom ast-grep rules into the built-in pack (all modules except elixir)"
+    },
+    {
+      "flag": "--list-rules",
+      "modules": [
+        "csharp",
+        "golang",
+        "java",
+        "js",
+        "ruby",
+        "rust",
+        "swift"
+      ],
+      "documented": true,
+      "doc": "print generated ast-grep rule ids and exit (js, golang, rust, java, ruby, swift, csharp)"
+    },
+    {
+      "flag": "--dump-rules",
+      "value": "DIR",
+      "modules": [
+        "csharp",
+        "golang",
+        "java",
+        "js",
+        "ruby",
+        "rust",
+        "swift"
+      ],
+      "documented": true,
+      "doc": "write the generated ast-grep rules to DIR (same modules as --list-rules)"
+    },
+    {
+      "flag": "--list-categories",
+      "modules": [
+        "cpp",
+        "csharp",
+        "python",
+        "rust",
+        "swift"
+      ],
+      "documented": true,
+      "doc": "print the category table and exit (python, rust, cpp, swift, csharp)"
+    },
+    {
+      "flag": "--help",
+      "short": "-h",
+      "modules": "all",
+      "documented": true,
+      "doc": "this help"
+    }
+  ],
+  "modules": {
+    "js": {
+      "file": "ubs-js.sh",
+      "display": "JavaScript / TypeScript",
+      "extensions": [
+        "js",
+        "jsx",
+        "ts",
+        "tsx",
+        "mjs",
+        "cjs"
+      ],
+      "manifest_files": [
+        "package.json",
+        "tsconfig.json",
+        "tsconfig.*.json",
+        "jsconfig.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+        "bun.lock",
+        "deno.json",
+        "deno.jsonc",
+        ".eslintrc",
+        ".eslintrc.*",
+        "eslint.config.*",
+        ".babelrc",
+        "babel.config.*",
+        ".env",
+        ".env.*"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--dump-rules",
+        "--list-rules",
+        "--max-samples",
+        "--report-json",
+        "--rules"
+      ]
+    },
+    "python": {
+      "file": "ubs-python.sh",
+      "display": "Python",
+      "extensions": [
+        "py",
+        "pyi",
+        "pyx",
+        "pxd",
+        "pxi",
+        "ipynb"
+      ],
+      "manifest_files": [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "requirements*.txt",
+        "Pipfile",
+        "poetry.lock",
+        "uv.lock",
+        ".env",
+        ".env.*"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--baseline",
+        "--force-color",
+        "--list-categories",
+        "--max-detailed",
+        "--max-file-size",
+        "--max-samples",
+        "--no-uv",
+        "--report-json",
+        "--rules",
+        "--summary-json",
+        "--timeout-seconds",
+        "--uv-tools"
+      ]
+    },
+    "cpp": {
+      "file": "ubs-cpp.sh",
+      "display": "C / C++",
+      "extensions": [
+        "cpp",
+        "cc",
+        "cxx",
+        "cppm",
+        "mpp",
+        "ixx",
+        "h",
+        "hpp",
+        "hxx",
+        "hh",
+        "ipp",
+        "tpp"
+      ],
+      "manifest_files": [
+        "CMakeLists.txt",
+        "Makefile",
+        "meson.build",
+        "compile_commands.json",
+        ".clang-tidy",
+        ".clang-format"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--binary-files",
+        "--counts",
+        "--exclude-dir",
+        "--hidden",
+        "--include",
+        "--list-categories",
+        "--max-filesize",
+        "--only",
+        "--paths-from",
+        "--respect-gitignore",
+        "--rules"
+      ]
+    },
+    "rust": {
+      "file": "ubs-rust.sh",
+      "display": "Rust",
+      "extensions": [
+        "rs"
+      ],
+      "manifest_files": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "deny.toml",
+        ".cargo/deny.toml",
+        "rust-toolchain",
+        "rust-toolchain.toml",
+        "clippy.toml",
+        "rustfmt.toml"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--binary-files",
+        "--dump-rules",
+        "--emit-findings-json",
+        "--exclude-dir",
+        "--exclude-tests",
+        "--fail-critical",
+        "--fail-warning",
+        "--include",
+        "--list-categories",
+        "--list-rules",
+        "--no-all-features",
+        "--no-all-targets",
+        "--no-cargo",
+        "--only",
+        "--rules",
+        "--strict-gitignore",
+        "--summary-json"
+      ]
+    },
+    "golang": {
+      "file": "ubs-golang.sh",
+      "display": "Go",
+      "extensions": [
+        "go",
+        "tmpl",
+        "gotmpl",
+        "tpl"
+      ],
+      "manifest_files": [
+        "go.mod",
+        "go.sum",
+        "go.work",
+        "go.work.sum",
+        ".golangci.yml",
+        ".golangci.yaml"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--allow-npx",
+        "--baseline",
+        "--dump-rules",
+        "--go-tools",
+        "--include-names",
+        "--list-rules",
+        "--no-banner",
+        "--only-changed",
+        "--rules",
+        "--sarif-plain",
+        "--strict",
+        "--test-pkgs"
+      ]
+    },
+    "java": {
+      "file": "ubs-java.sh",
+      "display": "Java / Kotlin",
+      "extensions": [
+        "java",
+        "kt",
+        "kts"
+      ],
+      "manifest_files": [
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+        ".mvn"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--detail",
+        "--dump-rules",
+        "--json-out",
+        "--list-rules",
+        "--min-severity",
+        "--no-build",
+        "--no-emoji",
+        "--only",
+        "--rules",
+        "--sarif-out"
+      ]
+    },
+    "ruby": {
+      "file": "ubs-ruby.sh",
+      "display": "Ruby",
+      "extensions": [
+        "rb",
+        "rake",
+        "ru",
+        "gemspec",
+        "erb",
+        "haml",
+        "slim",
+        "rbi",
+        "rbs",
+        "jbuilder"
+      ],
+      "manifest_files": [
+        "Gemfile",
+        "Gemfile.lock",
+        "Rakefile",
+        "*.gemspec",
+        ".rubocop.yml"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--ag-fixable-only",
+        "--ag-preview-fix",
+        "--ag-threads",
+        "--disable-rules",
+        "--dump-rules",
+        "--json-out",
+        "--list-rules",
+        "--no-bundler",
+        "--only",
+        "--only-rules",
+        "--rb-tools",
+        "--rules",
+        "--sarif-out",
+        "--summary-json",
+        "--very-verbose"
+      ]
+    },
+    "swift": {
+      "file": "ubs-swift.sh",
+      "display": "Swift",
+      "extensions": [
+        "swift",
+        "mm",
+        "m",
+        "metal",
+        "plist",
+        "xib",
+        "storyboard",
+        "xcconfig"
+      ],
+      "manifest_files": [
+        "Package.swift",
+        "Podfile",
+        "*.xcodeproj",
+        "*.xcworkspace",
+        "Info.plist",
+        ".swiftlint.yml"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--baseline",
+        "--color",
+        "--dump-rules",
+        "--emit-csv",
+        "--emit-html",
+        "--explain-rule",
+        "--force-color",
+        "--keep-temp",
+        "--list-categories",
+        "--list-rules",
+        "--max-detailed",
+        "--max-file-size",
+        "--no-ignore",
+        "--only",
+        "--progress",
+        "--report-md",
+        "--respect-ignore",
+        "--rules",
+        "--sdk",
+        "--summary-json",
+        "--timeout-seconds",
+        "--version"
+      ]
+    },
+    "csharp": {
+      "file": "ubs-csharp.sh",
+      "display": "C#",
+      "extensions": [
+        "cs",
+        "csx"
+      ],
+      "manifest_files": [
+        "*.csproj",
+        "*.sln",
+        "*.fsproj",
+        "Directory.Build.props",
+        "global.json",
+        "nuget.config"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--dotnet-target",
+        "--dump-rules",
+        "--emit-findings-json",
+        "--exclude-dirs",
+        "--extra-exclude-dirs",
+        "--fail-critical",
+        "--fail-warning",
+        "--list-categories",
+        "--list-rules",
+        "--no-build",
+        "--no-deps",
+        "--no-dotnet",
+        "--no-format",
+        "--no-test",
+        "--only",
+        "--rules",
+        "--strict-gitignore",
+        "--summary-json"
+      ]
+    },
+    "elixir": {
+      "file": "ubs-elixir.sh",
+      "display": "Elixir",
+      "extensions": [
+        "ex",
+        "exs",
+        "eex",
+        "heex",
+        "leex",
+        "sface"
+      ],
+      "manifest_files": [
+        "mix.exs",
+        "mix.lock"
+      ],
+      "contract": 1,
+      "extra_flags": [
+        "--ex-tools",
+        "--json-out",
+        "--no-mix",
+        "--only",
+        "--sarif-out",
+        "--summary-json",
+        "--very-verbose"
+      ]
+    }
+  }
+}

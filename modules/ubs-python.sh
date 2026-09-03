@@ -408,6 +408,23 @@ for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)
 
 EXCLUDE_DIRS=(.git .hg .svn .bzr .tox .nox .venv venv env .mypy_cache .pytest_cache __pycache__ .ruff_cache .cache .coverage dist build site-packages .eggs .pdm-build .poetry .idea .vscode .history .ipynb_checkpoints .pytype .hypothesis .maturin .hatch .pants .ninja)
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
+# `env` is a virtualenv name, not a reserved one (bead B4b): keep the blanket
+# exclusion only when some env/ under the project (depth <= 3) actually is a
+# virtualenv (pyvenv.cfg, bin/activate, Scripts/activate); otherwise a package
+# named env is scanned. Via the meta-runner the workspace never contains
+# virtualenvs, so there the package case always wins.
+if [[ -d "$PROJECT_DIR" ]]; then
+  _ENV_IS_VENV=0
+  while IFS= read -r -d '' _envdir; do
+    if [[ -f "$_envdir/pyvenv.cfg" || -f "$_envdir/bin/activate" || -f "$_envdir/Scripts/activate" ]]; then _ENV_IS_VENV=1; break; fi
+  done < <(find "$PROJECT_DIR" -maxdepth 3 -type d -name env -print0 2>/dev/null)
+  if [[ "$_ENV_IS_VENV" -eq 0 ]]; then
+    _KEEP=()
+    for _d in "${EXCLUDE_DIRS[@]}"; do [[ "$_d" == "env" ]] || _KEEP+=("$_d"); done
+    EXCLUDE_DIRS=("${_KEEP[@]}")
+  fi
+  unset _ENV_IS_VENV _envdir _KEEP _d
+fi
 EXCLUDE_FLAGS=()
 for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
 

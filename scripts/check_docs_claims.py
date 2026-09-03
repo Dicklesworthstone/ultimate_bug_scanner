@@ -337,8 +337,55 @@ def check_help_heredoc_static() -> None:
     report("help-heredoc", not offenders, "; ".join(offenders) if offenders else "no command substitution in the usage() heredoc")
 
 
+def check_module_contract() -> None:
+    """modules/contract.json agrees with the module parsers: every listed flag
+    exists in every module it is claimed for, every module on disk is described
+    with its extensions, and every parser flag shared by 7+ modules is in the
+    contract; the README Options block matches the rendered contract."""
+    import subprocess
+    contract_path = ROOT / "modules" / "contract.json"
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        report("module-contract", False, f"cannot read modules/contract.json: {exc}")
+        return
+    parsers = module_parser_flags()
+    problems: list[str] = []
+    for lang in sorted(parsers):
+        if lang not in contract.get("modules", {}):
+            problems.append(f"module {lang} missing from contract.json")
+    for lang, spec in contract.get("modules", {}).items():
+        if lang not in parsers:
+            problems.append(f"contract names unknown module {lang}")
+            continue
+        if not spec.get("extensions"):
+            problems.append(f"{lang}: no extensions listed")
+        for flag in spec.get("extra_flags", []):
+            if flag not in parsers[lang]:
+                problems.append(f"{lang}: extra flag {flag} has no parser arm")
+    for entry in contract.get("flags", []):
+        flag = entry["flag"]
+        targets = sorted(parsers) if entry.get("modules") == "all" else entry.get("modules", [])
+        for lang in targets:
+            if lang in parsers and flag not in parsers[lang]:
+                problems.append(f"{flag}: claimed for {lang} but modules/ubs-{lang}.sh has no parser arm")
+    listed = {e["flag"] for e in contract.get("flags", [])}
+    counts: dict[str, int] = {}
+    for arms in parsers.values():
+        for flag in arms:
+            counts[flag] = counts.get(flag, 0) + 1
+    for flag, n in sorted(counts.items()):
+        if n >= 7 and flag not in listed:
+            problems.append(f"{flag} is accepted by {n} modules but not in contract.json flags")
+    gen = ROOT / "scripts" / "gen_module_readme.py"
+    proc = subprocess.run([sys.executable, str(gen), "--check"], capture_output=True, text=True)  # ubs:ignore
+    if proc.returncode != 0:
+        problems.append((proc.stderr or proc.stdout).strip()[:160])
+    report("module-contract", not problems, "; ".join(problems) if problems else f"{len(listed)} contract flags and {len(parsers)} modules verified; README block current")
+
+
 def main() -> int:
-    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme, check_toon_digests_in_sync, check_help_heredoc_static):
+    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme, check_toon_digests_in_sync, check_help_heredoc_static, check_module_contract):
         try:
             check()
         except Exception as exc:  # noqa: BLE001

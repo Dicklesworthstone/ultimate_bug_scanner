@@ -6,6 +6,7 @@ Each `ubs-<lang>.sh` provides a consistent CLI (current modules: `js`, `python`,
 ubs-<lang>.sh [PROJECT_DIR] [options] [OUTPUT_FILE]
 
 Options:
+<!-- contract:options -->
 --format=FMT       text|json|sarif (default: text). jsonl and toon are produced by the
                    meta-runner from the module's json output, not by the module itself
 --ci               stable timestamps (UTC ISO8601)
@@ -20,9 +21,12 @@ Options:
 --dump-rules=DIR   write the generated ast-grep rules to DIR (same modules as --list-rules)
 --list-categories  print the category table and exit (python, rust, cpp, swift, csharp)
 -h, --help         this help
+<!-- /contract:options -->
 ```
 
-Contract v2 (one flag set, one findings schema, shared library) is tracked as bead `ultimate_bug_scanner-0xjg.3`; until it lands, run `ubs-<lang>.sh --help` for the exact flags a module accepts.
+The block above is rendered from `modules/contract.json` by `scripts/gen_module_readme.py` (the machine-readable contract: flags with their module lists, formats, exit codes, environment, summary keys, and per-module extensions and manifest files). `scripts/check_docs_claims.py` verifies the contract against every module's argument parser and fails when the block or the contract drifts. Flags a single module adds beyond the shared set are listed per module in the contract (`extra_flags`); `ubs-<lang>.sh --help` prints them. Contract v2 (shared library, `--files-from`, one findings schema) lands module by module with the A4 ports and is recorded per module as `contract: 2`.
+
+New module: `scripts/new-module.sh <lang> --extensions a,b` scaffolds a contract-v2 module with fixtures and manifest cases (see AGENTS.md, "Adding a language module").
 
 Responsibilities:
 - Detect files for the given language

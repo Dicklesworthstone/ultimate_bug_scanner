@@ -334,7 +334,9 @@ INCLUDE_GLOBS_RG=()
 for n in "${_NAME_ARR[@]}"; do n="$(echo "$n" | xargs)"; [[ -n "$n" ]] && INCLUDE_GLOBS_RG+=( -g "$n" ); done
 for e in "${_EXT_ARR[@]}";  do e="$(echo "$e" | xargs)"; [[ -n "$e" ]] && INCLUDE_GLOBS_RG+=( -g "*.$e" ); done
 
-EXCLUDE_DIRS=(.git .svn .hg vendor third_party Godeps node_modules .cache build dist bin out tmp .idea .vscode .vs bazel-* _bazel go.work.d)
+# `bin` is deliberately absent (bead B4b): a Go program can live under bin/
+# (only *.go files are read, so compiled binaries there cost nothing).
+EXCLUDE_DIRS=(.git .svn .hg vendor third_party Godeps node_modules .cache build dist out tmp .idea .vscode .vs bazel-* _bazel go.work.d)
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
 
 EXCLUDE_FLAGS_GREP=()

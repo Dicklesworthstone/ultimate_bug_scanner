@@ -348,6 +348,48 @@ def check_file_list_workspace() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_language_scoped_ignores() -> None:
+    # bin/obj/env are decided by content (bead B4b): a Go program under bin/
+    # and a plain package named env are scanned; a virtualenv named env, a C#
+    # obj/ build directory and .pnpm/.bun stores are not.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-scoped-"))
+    (tmp / "bin").mkdir()
+    (tmp / "bin" / "main.go").write_text("package main\n\nimport \"os/exec\"\n\nfunc main() { exec.Command(\"sh\", \"-c\", os.Args[1]).Run() }\n")
+    (tmp / "env").mkdir()
+    (tmp / "env" / "config.py").write_text("import os\nos.system(input())\n")
+    (tmp / "venvlike").mkdir()
+    (tmp / "venvlike" / "env").mkdir()
+    (tmp / "venvlike" / "env" / "pyvenv.cfg").write_text("home = /usr\n")
+    (tmp / "venvlike" / "env" / "site.py").write_text("import os\nos.system(input())\n")
+    (tmp / "obj").mkdir()
+    (tmp / "obj" / "project.assets.json").write_text("{}\n")
+    (tmp / "obj" / "Generated.cs").write_text("class G { static void M() { System.Diagnostics.Process.Start(\"cmd\", \"/c \" + System.Console.ReadLine()); } }\n")
+    for store in (".pnpm", ".bun"):
+        (tmp / store / "pkg").mkdir(parents=True)
+        (tmp / store / "pkg" / "index.js").write_text("eval(location.hash);\n")
+    (tmp / "src").mkdir()
+    (tmp / "src" / "app.js").write_text("export const ok = 1;\n")
+    env = {"UBS_PROFILE": "1"}
+    proc = run(["--ci", "--format=json", str(tmp)], env=env)
+    ok = False
+    detail = f"exit={proc.returncode}"
+    try:
+        doc = json.loads(proc.stdout)
+        files = {s["language"]: s.get("files", 0) for s in doc["scanners"]}
+        listed = [s for sc in doc["scanners"] for f in sc.get("findings", []) for s in f.get("samples", []) if s.get("file")]
+        paths = {s["file"] for s in listed}
+        # golang files == 1 proves bin/main.go was listed and scanned (the only Go
+        # file); the Go module reports no sample for it, so paths only cover python.
+        ok = files.get("golang", 0) == 1 and files.get("python", 0) == 1 and files.get("js", 0) == 1 and "csharp" not in files \
+            and not any("venvlike" in p or "obj/" in p or ".pnpm" in p or ".bun" in p for p in paths) \
+            and any(p.endswith("env/config.py") for p in paths)
+        detail += f" files={files} paths={sorted(paths)[:6]}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" {exc}"
+    report("language_scoped_ignores", ok, detail, proc if not ok else None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def check_doctor_fix_refuses_tampered_toon() -> None:
     # `ubs doctor --fix` provisions the toon encoder from the digest-pinned
     # release (bead F8). A tampered asset served from a local file:// mirror must
@@ -780,6 +822,7 @@ def main() -> int:
         check_workspaces_without_rsync,
         check_python_shim_when_only_python_exists,
         check_doctor_fix_refuses_tampered_toon,
+        check_language_scoped_ignores,
     ):
         try:
             check()

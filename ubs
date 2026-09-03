@@ -49,15 +49,15 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='62eb2761756fd6f6e52e70150d318bad57b07b1ca46f3032ff947253d7914a9e'
+  [cpp]='e1d73c428ce69a930bea4a8fe9217062943b836e6f2eb29a017ab0442bdbfcb0'
   [csharp]='0a6e5df41560b291e4bfed7a40c2216239caec4aeaddaa5a36e45c9d5624f559'
   [elixir]='c3139d3cf9d9ebe7571cbe5a5b4ae5ce0db325857ea9e78d1e526b5101ab0f77'
-  [golang]='0a5199e1bac7636a2486420246104033b12833aa8dc00eecfd039a8420314b95'
+  [golang]='06f389a0b71e6a196cc50fad45256a9d9d0009d78c6fd46e2baa6f817e428c5e'
   [java]='40bea15174de2cd545e4ac891659f3ce30876d36284b846fea52b03ca7c1659d'
   [js]='edc7e52df94492bc71fbe94131f9003c4411bd8efadc35b861e6fce2781ebdd5'
-  [python]='6a01c19f50986ec1b0fbd1d92b9af4b794474ddc9e3986a39081b787f95b6583'
+  [python]='2ab7c3bee5b22120a490a3fba65106799018d7e2b9ffc7b3e82fa1c5aa255cb0'
   [ruby]='020aeca8d1c4fc448f01cd1ad6d66e10ad43a247e0c466c0a0a5b77181ed6d34'
-  [rust]='9190c446eee7d2ce5709e42006c7de692557b9b63f9e5ed0321195d74623d4c6'
+  [rust]='f456f008cd06b41704b47338fe5c7085771913230dddc4475cceb29c9202c5b4'
   [swift]='0960197481c8eda9859469f227f6bdbcf5c116b813a335e2763a1188b5c6c073'
 )
 
@@ -226,34 +226,21 @@ json_escape(){
 }
 
 load_ignore_patterns(){
-  local file="$1"
+  # Plain bash (bead C3b): one comment-stripped, deduplicated pattern per line;
+  # a trailing slash and a leading ./ are dropped, like .gitignore lines.
+  local file="$1" line csv="" seen=","
   [[ -f "$file" ]] || return 0
-  if ! need_cmd python3; then
-    say "${YELLOW}${WARN}${RESET} python3 is required to parse ignore file $file (skipping)"
-    return 0
-  fi
-  local csv
-  csv=$(python3 - "$file" <<'PY' 2>/dev/null
-import sys, pathlib
-path = pathlib.Path(sys.argv[1])
-if not path.exists():
-    sys.exit(0)
-patterns = []
-seen = set()
-for raw in path.read_text().splitlines():
-    stripped = raw.strip()
-    if not stripped or stripped.startswith('#'):
-        continue
-    stripped = stripped.rstrip('/')
-    if stripped.startswith('./'):
-        stripped = stripped[2:]
-    if not stripped or stripped in seen:
-        continue
-    seen.add(stripped)
-    patterns.append(stripped)
-print(",".join(patterns))
-PY
-)
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    line="${line%/}"
+    line="${line#./}"
+    [[ -z "$line" ]] && continue
+    [[ "$seen" == *",$line,"* ]] && continue
+    seen="$seen$line,"
+    csv="${csv:+$csv,}$line"
+  done < "$file"
   csv="${csv//$'\n'/}"
   csv="${csv%,}"
   if [[ -n "$csv" ]]; then
@@ -515,7 +502,16 @@ ONLY_LANGS=""              # csv: js,python,cpp,rust
 EXCLUDE_LANGS=""           # csv (--exclude-langs)
 USER_EXCLUDE_PATTERNS=""   # csv of --exclude path globs, for the language-name guard
 IGNORE_FILE=""
-DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels,.next,.turbo,.nuxt,.svelte-kit,.output,storybook-static,.cache,.parcel-cache"
+# Always-ignored names (any depth). `bin`, `obj` and `env` are NOT here any
+# more (bead B4b): they are decided per directory by content in
+# list_scan_files — obj is skipped when it is C# build output, env when it is a
+# virtualenv, bin when it holds no source file — so a Go program under
+# bin/, a package named env or a C# repo's obj/ are treated correctly.
+# .pnpm/.bun are package-manager stores that can sit outside node_modules.
+DEFAULT_IGNORES="node_modules,venv,.venv,.env,site-packages,dist,build,vendor,target,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels,.next,.turbo,.nuxt,.svelte-kit,.output,storybook-static,.cache,.parcel-cache,.pnpm,.bun"
+# Content-scoped directory names and the source extensions that keep a bin/ alive.
+SCOPED_IGNORE_DIRS="bin,obj,env"
+SOURCE_EXTENSIONS="js,jsx,mjs,cjs,ts,tsx,py,pyi,pyw,pyx,pxd,pxi,ipynb,go,tmpl,gotmpl,tpl,rs,c,cc,cpp,cxx,cppm,mpp,ixx,h,hh,hpp,hxx,ipp,tpp,java,kt,kts,rb,rake,ru,gemspec,erb,haml,slim,rbi,rbs,jbuilder,swift,mm,m,metal,cs,csx,ex,exs,heex,eex,leex,sface"  # union of the modules' INCLUDE_EXT defaults
 # Safety guards: maximum directory size (MB) and whether to refuse home/root dirs
 MAX_DIR_SIZE_MB="${UBS_MAX_DIR_SIZE_MB:-1000}"  # 1GB default; set 0 to disable
 SKIP_SIZE_CHECK="${UBS_SKIP_SIZE_CHECK:-0}"
@@ -758,7 +754,7 @@ cat <<'JSON'
     "stdout_contract": "In --format=json|jsonl|sarif|toon mode stdout is exactly one machine-readable document (or one JSONL stream); every diagnostic goes to stderr.",
     "workflow": [
       "Scope the scan to changed files: ubs a.ts b.py --format=json (sub-second) rather than the whole tree.",
-      "Read totals.critical / totals.warning and status; status=partial means a module timed out or crashed and exit is 2 unless UBS_ALLOW_PARTIAL=1.",
+      "Read totals.critical / totals.warning and status; status=partial means a module timed out, crashed, or reported itself partial (the Rust module when cargo could not run) and exit is 2 unless UBS_ALLOW_PARTIAL=1.",
       "Findings live under scanners[].findings[] with severity, count, title, description and samples[{file,line,code}].",
       "Suppress a confirmed false positive with a trailing `ubs:ignore` comment (or the line above); never delete the check.",
       "Re-run the same command until exit 0, then commit."
@@ -945,7 +941,7 @@ cat <<'JSON'
         "required": ["language", "status"],
         "properties": {
           "language": {"type": "string"},
-          "status": {"enum": ["timeout", "error"]},
+          "status": {"enum": ["timeout", "error", "partial"]},
           "module_error": {"type": ["string", "null"]},
           "message": {"type": ["string", "null"]}
         }
@@ -1700,7 +1696,7 @@ list_scan_files(){
     : > "$raw"
   fi
   local stats
-  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" <<'PY'
+  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" <<'PY'
 import fnmatch
 import os
 import sys
@@ -1709,7 +1705,42 @@ root = os.fsencode(sys.argv[1])
 raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
 data_exts = set(sys.argv[5].split(","))
 mode, patterns = sys.argv[6], [p for p in sys.argv[7].split(",") if p]
+scoped = set(sys.argv[8].split(",")) if len(sys.argv) > 8 and sys.argv[8] else set()
+source_exts = set(sys.argv[9].split(",")) if len(sys.argv) > 9 else set()
 cap = max_mb * 1024 * 1024 if max_mb > 0 else 0
+
+
+def ext_of(name: bytes) -> str:
+    return name.rsplit(b".", 1)[-1].lower().decode("utf-8", "replace") if b"." in name[1:] else ""
+
+
+# Content-scoped directories (bead B4b). A directory named obj/env/bin is
+# skipped only when its content says it is build output: obj when it holds
+# C# build artefacts (project.assets.json, *.AssemblyInfo.cs, *.nuget.*), env
+# when it is a virtualenv (pyvenv.cfg, bin/activate, Scripts/activate), bin
+# when no file under it has a source extension. Decisions are cached per
+# directory; the whole listing is needed for bin, so it is a second pass.
+scoped_cache: dict[bytes, bool] = {}
+
+
+def scoped_skip(dirpath: bytes, name: bytes, files_under: set[bytes]) -> bool:
+    if dirpath in scoped_cache:
+        return scoped_cache[dirpath]
+    full = os.path.join(root, dirpath)
+    verdict = False
+    if name == b"env":
+        verdict = any(os.path.exists(os.path.join(full, m)) for m in (b"pyvenv.cfg", b"bin/activate", b"Scripts/activate", b"Scripts/activate.bat"))
+    elif name == b"obj":
+        try:
+            entries = os.listdir(full)
+        except OSError:
+            entries = []
+        verdict = any(e == b"project.assets.json" or b".nuget." in e or e.endswith(b".AssemblyInfo.cs") for e in entries) or any(
+            os.path.isdir(os.path.join(full, e)) and e.lower() in (b"debug", b"release") for e in entries)
+    elif name == b"bin":
+        verdict = not any(ext_of(f.rsplit(b"/", 1)[-1]) in source_exts for f in files_under)
+    scoped_cache[dirpath] = verdict
+    return verdict
 
 
 def excluded(rel, name):
@@ -1739,17 +1770,37 @@ if mode == "walk":
 else:
     with open(raw, "rb") as fh:
         entries = fh.read().split(b"\0")
+entries = [e[2:] if e.startswith(b"./") else e for e in entries if e]
+# Files grouped under every scoped directory (any depth) for the bin/ rule.
+under: dict[bytes, set[bytes]] = {}
+if scoped:
+    scoped_b = {s.encode() for s in scoped}
+    for rel in entries:
+        parts = rel.split(b"/")
+        for i, part in enumerate(parts[:-1]):
+            if part in scoped_b:
+                under.setdefault(b"/".join(parts[: i + 1]), set()).add(rel)
 kept, total, big, data = [], 0, 0, 0
+scoped_skipped = 0
 for rel in entries:
     if not rel:
         continue
-    if rel.startswith(b"./"):
-        rel = rel[2:]
     name = rel.rsplit(b"/", 1)[-1]
-    ext = name.rsplit(b".", 1)[-1].lower().decode("utf-8", "replace") if b"." in name[1:] else ""
+    ext = ext_of(name)
     if ext in data_exts:
         data += 1
         continue
+    if under:
+        parts = rel.split(b"/")
+        skip = False
+        for i, part in enumerate(parts[:-1]):
+            dirpath = b"/".join(parts[: i + 1])
+            if dirpath in under and scoped_skip(dirpath, part, under[dirpath]):
+                skip = True
+                break
+        if skip:
+            scoped_skipped += 1
+            continue
     try:
         st = os.lstat(os.path.join(root, rel))
     except OSError:
@@ -3316,10 +3367,10 @@ detect_lang(){
       ;;
     golang)
       if need_cmd rg; then
-        rg -q --hidden -g '!vendor/**' -g '!bin/**' -g '!dist/**' -g '!build/**' \
+        rg -q --hidden -g '!vendor/**' -g '!dist/**' -g '!build/**' \
            -g '*.go' -g 'go.mod' -g 'go.sum' -g 'go.work' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
-        find "$PROJECT_DIR" \( -name vendor -o -name bin -o -name dist -o -name build -o -name .git \) -prune -o \
+        find "$PROJECT_DIR" \( -name vendor -o -name dist -o -name build -o -name .git \) -prune -o \
           -type f \( -name '*.go' -o -name 'go.mod' -o -name 'go.sum' -o -name 'go.work' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
@@ -3965,6 +4016,7 @@ fi
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
+if need_cmd python3; then write_postprocess_script; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-module time bound + process-group teardown (issue #60)
@@ -4486,6 +4538,261 @@ JSON
   fi
 }
 
+# One post-processing pass per module run (bead C3b). Everything that used to be
+# a separate python/jq/sed spawn on the module's output — inline suppressions,
+# workspace/single-file path restoration, text → summary JSON, the partial
+# marker, the metrics merge — runs in one python process. The script is written
+# once per run; postprocess_module invokes it per module. Exit 3 from json mode
+# means "not a summary object" and the caller falls back to the text path.
+write_postprocess_script(){
+  cat > "$TMPDIR_RUN/postprocess.py" <<'PY'
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+FINDING = re.compile(r"^\s*((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?")
+MARKERS = ("ubs:ignore", "ubs: disable", "nolint", "noqa")
+PARTIAL = re.compile(r"^\s*Partial:\s*(?:\[([A-Z_]+)\]\s*)?(.*)$")
+
+
+def suppress(raw: str) -> str:
+    """Drop finding lines whose source line (or the one above) carries a marker."""
+    out, cache = [], {}
+    for line in raw.splitlines(keepends=True):
+        m = FINDING.match(ANSI.sub("", line))
+        if not m:
+            out.append(line)
+            continue
+        path = (m.group(1) or "").strip()
+        try:
+            lineno = int(m.group(2))
+        except ValueError:
+            out.append(line)
+            continue
+        if path not in cache:
+            try:
+                p = Path(path)
+                cache[path] = p.read_text(encoding="utf-8", errors="replace").splitlines() if p.is_file() else None
+            except Exception:
+                cache[path] = None
+        content = cache[path]
+        hit = False
+        if content:
+            idx = lineno - 1
+            for i in (idx, idx - 1):
+                if 0 <= i < len(content) and any(mk in content[i].lower() for mk in MARKERS):
+                    hit = True
+                    break
+        if not hit:
+            out.append(line)
+    return "".join(out)
+
+
+def restore_text(text: str, a) -> str:
+    if a.single_file:
+        base = os.path.basename(a.single_file)
+        rel = a.single_file[len(a.source) + 1:] if a.single_file.startswith(a.source + "/") else a.single_file
+        if rel != base:
+            text = re.sub(r"(?<![\w/.\-])" + re.escape(base) + r"(?=:\d)", rel, text)
+        return text
+    if a.workspace:
+        text = text.replace(a.workspace, a.source)
+    return text
+
+
+def restore_json_doc(doc, a):
+    if a.single_file:
+        base = os.path.basename(a.single_file)
+        rel = a.single_file[len(a.source) + 1:] if a.single_file.startswith(a.source + "/") else a.single_file
+        if rel == base:
+            return doc
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key in ("file", "uri"):
+                    if node.get(key) == base:
+                        node[key] = rel
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(doc)
+        return doc
+    return doc
+
+
+def restore_json_file(path: str, a):
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    if a.single_file:
+        try:
+            doc = json.loads(text)
+        except json.JSONDecodeError:
+            Path(path).write_text(restore_text(text, a), encoding="utf-8")
+            return None
+        doc = restore_json_doc(doc, a)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        return doc
+    if a.workspace and a.workspace in text:
+        text = text.replace(a.workspace, a.source)
+        Path(path).write_text(text, encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def last_number(lines, pattern):
+    found = None
+    rx = re.compile(pattern)
+    for ln in lines:
+        if rx.search(ln):
+            nums = re.findall(r"[0-9]+", ln)
+            if nums:
+                found = nums[-1]
+    return int(found) if found is not None else 0
+
+
+def summary_from_text(text: str, a) -> dict:
+    cleaned = ANSI.sub("", text).replace("\r", "").replace("\0", "")
+    lines = cleaned.splitlines()
+    critical = last_number(lines, r"Critical issues:|CRITICAL")
+    warning = last_number(lines, r"Warning issues:|Warning")
+    info = last_number(lines, r"Info items:|Info")
+    files = last_number(lines, r"Files scanned:")
+    if not files:
+        for ln in lines:
+            m = re.search(r"Files:\s*([0-9]+)", ln)
+            if m:
+                files = int(m.group(1))
+                break
+    return {"language": a.lang, "project": a.project, "files": files, "critical": critical,
+            "warning": warning, "info": info, "timestamp": a.timestamp}
+
+
+def apply_partial(doc: dict, text: str) -> None:
+    for ln in ANSI.sub("", text).splitlines():
+        m = PARTIAL.match(ln)
+        if m:
+            doc["status"] = "partial"
+            doc["module_error"] = m.group(1) or "MODULE_PARTIAL"
+            doc["message"] = m.group(2).strip()
+            return
+
+
+def attach_metrics(doc: dict, metrics_dir: str) -> None:
+    if not metrics_dir or not os.path.isdir(metrics_dir):
+        return
+    extras = doc.get("extras", {}) if isinstance(doc.get("extras"), dict) else {}
+    for name in sorted(os.listdir(metrics_dir)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            payload = json.loads(Path(metrics_dir, name).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            extras.update(payload)
+    if extras:
+        doc["extras"] = extras
+
+
+def is_summary(doc) -> bool:
+    return isinstance(doc, dict) and all(isinstance(doc.get(k), (int, float)) and not isinstance(doc.get(k), bool) for k in ("files", "critical", "warning", "info"))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project"):
+        ap.add_argument("--" + name.replace("_", "-"), default="")
+    a = ap.parse_args()
+    if a.mode == "text":
+        raw = Path(a.raw).read_text(encoding="utf-8", errors="replace") if os.path.isfile(a.raw) else ""
+        text = restore_text(suppress(raw), a)
+        Path(a.txt).write_text(text, encoding="utf-8")
+        doc = summary_from_text(text, a)
+        apply_partial(doc, text)
+        attach_metrics(doc, a.metrics_dir)
+        Path(a.json).write_text(json.dumps(doc), encoding="utf-8")
+        return 0
+    if a.mode == "json":
+        doc = restore_json_file(a.json, a)
+        restore_json_file(a.findings, a)
+        if not is_summary(doc):
+            return 3
+        doc["language"] = a.lang
+        attach_metrics(doc, a.metrics_dir)
+        Path(a.json).write_text(json.dumps(doc), encoding="utf-8")
+        return 0
+    if a.mode == "sarif":
+        restore_json_file(a.sarif, a)
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+}
+
+# postprocess_module MODE LANG RAW TXT JSON SARIF FINDINGS METRICS_DIR
+# Returns the script's exit code (3 = json output is not a summary object).
+postprocess_module(){
+  local mode="$1" lang="$2" raw="$3" txt="$4" json="$5" sarif="$6" findings="$7" metrics="$8"
+  local proj; proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  python3 "$TMPDIR_RUN/postprocess.py" --mode "$mode" --lang "$lang" --raw "$raw" --txt "$txt" --json "$json" \
+    --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "${FILTERED_PROJECT_DIR:-}" \
+    --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj"
+}
+
+# Text-mode partial marker (bead D10). A module that could not evaluate part of
+# its checks prints one line `Partial: [CODE] reason` in its text report (the
+# Rust module: [CARGO_UNAVAILABLE] when cargo could not run). In text mode the
+# runner never sees the module's JSON, so the marker is what carries the
+# status: the scanner's JSON gets status partial with that code and reason,
+# and the envelope reports the run as partial exactly as in json mode.
+partial_status_from_text(){
+  local txt="$1" json="$2" line code msg
+  [[ -s "$txt" && -s "$json" ]] || return 0
+  line="$(grep -m1 -E '^[[:space:]]*Partial:' "$txt" 2>/dev/null | sed -E 's/\x1B\[[0-9;]*[mK]//g')" || true
+  [[ -n "$line" ]] || return 0
+  code="$(printf '%s' "$line" | sed -n -E 's/^[[:space:]]*Partial:[[:space:]]*\[([A-Z_]+)\].*$/\1/p')"
+  msg="$(printf '%s' "$line" | sed -E 's/^[[:space:]]*Partial:[[:space:]]*(\[[A-Z_]+\][[:space:]]*)?//')"
+  need_cmd jq || return 0
+  jq --arg code "${code:-MODULE_PARTIAL}" --arg msg "$msg" '. + {status:"partial", module_error:$code, message:$msg}' "$json" > "$json.tmp" 2>/dev/null && mv "$json.tmp" "$json"
+  return 0
+}
+
+# No-python fallback for postprocess_module: the pre-C3b chain of separate
+# steps (suppressions, path restore, text → json, partial marker, metrics).
+# Bead B10 decides whether this path survives.
+legacy_postprocess(){
+  local mode="$1" lang="$2" raw="$3" txt="$4" json="$5" findings="$6" metrics="$7"; shift 7
+  if [[ "$mode" == "json" ]]; then
+    restore_original_paths "$json"
+    [[ -s "$findings" ]] && restore_original_paths "$findings"
+    if need_cmd jq && jq -e 'type=="object" and (.files|type)=="number" and (.critical|type)=="number" and (.warning|type)=="number" and (.info|type)=="number"' "$json" >/dev/null 2>&1; then
+      jq --arg language "$lang" '. + {language: $language}' "$json" > "$json.tmp" && mv "$json.tmp" "$json"
+      attach_metrics_to_json "$json" "$metrics"
+      return 0
+    fi
+    prepare_metrics_dir "$metrics"
+    run_module "$raw" "$err" "$module" "$@" || true
+    module_status=$MODULE_RUN_STATUS
+  fi
+  apply_inline_suppressions <"$raw" >"$txt" 2>>"$err"
+  restore_original_paths "$txt"
+  parse_text_to_json "$lang" "$txt" "$json"
+  partial_status_from_text "$txt" "$json"
+  attach_metrics_to_json "$json" "$metrics"
+}
+
 # Run a module job
 run_lang(){
   local lang="$1" module="$2" fmt="$3"
@@ -4565,31 +4872,33 @@ run_lang(){
 
       run_module "$out_json" "$err" "$module" "${args[@]}" "${report_args[@]}" --format=json || true
       module_status=$MODULE_RUN_STATUS
-      restore_original_paths "$out_json"
-      [[ -s "$out_findings" ]] && restore_original_paths "$out_findings"
       # Modules that implement --format=json must emit a UBS summary *object*.
       # If they emit other JSON types (e.g., an array of findings), fall back to
       # text mode so we can still produce a stable combined summary.
+      local pp_rc=0
       if [[ "$MODULE_TIMED_OUT" -eq 1 ]]; then
         : # synthetic MODULE_TIMEOUT result is written after the case block
-      elif need_cmd jq && jq -e 'type=="object" and (.files|type)=="number" and (.critical|type)=="number" and (.warning|type)=="number" and (.info|type)=="number"' "$out_json" >/dev/null 2>&1; then
-        jq --arg language "$lang" '. + {language: $language}' "$out_json" > "$out_json.tmp" && mv "$out_json.tmp" "$out_json"
-        attach_metrics_to_json "$out_json" "$metrics_dir"
+      elif [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
+        postprocess_module json "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || pp_rc=$?
+        if [[ "$pp_rc" -ne 0 ]]; then
+          prepare_metrics_dir "$metrics_dir"
+          run_module "$out_raw" "$err" "$module" "${args[@]}" "${report_args[@]}" || true
+          module_status=$MODULE_RUN_STATUS
+          postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
+        fi
       else
-        prepare_metrics_dir "$metrics_dir"
-        run_module "$out_raw" "$err" "$module" "${args[@]}" "${report_args[@]}" || true
-        module_status=$MODULE_RUN_STATUS
-        apply_inline_suppressions <"$out_raw" >"$out_txt" 2>>"$err"
-        restore_original_paths "$out_txt"
-        parse_text_to_json "$lang" "$out_txt" "$out_json"
-        attach_metrics_to_json "$out_json" "$metrics_dir"
+        legacy_postprocess json "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir" "${args[@]}" "${report_args[@]}"
       fi
       ;;
     sarif)
       prepare_metrics_dir "$metrics_dir"
       run_module "$out_sarif" "$err" "$module" "${args[@]}" --format=sarif || true
       module_status=$MODULE_RUN_STATUS
-      restore_original_paths "$out_sarif"
+      if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
+        postprocess_module sarif "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
+      else
+        restore_original_paths "$out_sarif"
+      fi
       if [[ "$MODULE_TIMED_OUT" -eq 1 ]]; then
         : # synthetic MODULE_TIMEOUT result is written after the case block
       elif need_cmd jq && jq -e . "$out_sarif" >/dev/null 2>&1; then
@@ -4599,21 +4908,23 @@ run_lang(){
         prepare_metrics_dir "$metrics_dir"
         run_module "$out_raw" "$err" "$module" "${args[@]}" || true
         module_status=$MODULE_RUN_STATUS
-        apply_inline_suppressions <"$out_raw" >"$out_txt" 2>>"$err"
-        restore_original_paths "$out_txt"
+        if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
+          postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
+        else
+          legacy_postprocess text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir"
+        fi
         minimal_sarif_from_text "$lang" "$out_txt" >"$out_sarif"
-        parse_text_to_json "$lang" "$out_txt" "$out_json"
-        attach_metrics_to_json "$out_json" "$metrics_dir"
       fi
       ;;
     text|*)
       prepare_metrics_dir "$metrics_dir"
       run_module "$out_raw" "$err" "$module" "${args[@]}" || true
       module_status=$MODULE_RUN_STATUS
-      apply_inline_suppressions <"$out_raw" >"$out_txt" 2>>"$err"
-      restore_original_paths "$out_txt"
-      parse_text_to_json "$lang" "$out_txt" "$out_json"
-      attach_metrics_to_json "$out_json" "$metrics_dir"
+      if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
+        postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
+      else
+        legacy_postprocess text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir"
+      fi
       ;;
   esac
 
@@ -4645,8 +4956,11 @@ run_lang(){
     scanner_status="error"
   fi
   if need_cmd jq && [[ -s "$out_json" ]] && jq -e 'type=="object"' "$out_json" >/dev/null 2>&1; then
+    # A module may report itself partial (e.g. the Rust module when cargo could
+    # not run, bead D10): keep that status and its module_error/message when
+    # the process itself exited normally.
     jq --arg s "$scanner_status" --argjson rc "$module_status" '
-      . + {status:$s}
+      (if $s == "ok" and .status == "partial" then . else . + {status:$s} end)
       + (if $s == "error" and (.module_error|not) then
            {module_error:("MODULE_EXIT_" + ($rc|tostring)),
             message:("Scanner module exited with status " + ($rc|tostring) + " before producing a result; see stderr")}

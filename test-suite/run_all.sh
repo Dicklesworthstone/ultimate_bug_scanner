@@ -183,6 +183,7 @@ fi
 
 run_step rule-quality-harness "${PY[@]}" quality/rule_quality_harness.py
 run_step quality-unittests "${PY[@]}" -m unittest discover -s quality -p 'test_*.py'
+run_step contract-conformance "${PY[@]}" quality/contract_conformance.py
 run_step manifest "${PY[@]}" ./run_manifest.py "$@"
 run_step shareable-reports "${PY[@]}" shareable/test_shareable_reports.py
 run_step meta-runner-modes "${PY[@]}" shareable/test_meta_runner_modes.py

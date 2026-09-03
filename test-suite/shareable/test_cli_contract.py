@@ -348,6 +348,77 @@ def check_file_list_workspace() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_doctor_fix_refuses_tampered_toon() -> None:
+    # `ubs doctor --fix` provisions the toon encoder from the digest-pinned
+    # release (bead F8). A tampered asset served from a local file:// mirror must
+    # be refused with the checksum diagnostic and nothing installed.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-toonfix-"))
+    www = tmp / "www"
+    www.mkdir()
+    (www / "toon-linux-amd64.tar.xz").write_bytes(os.urandom(4096))
+    tools = tmp / "tools"
+    env = {"UBS_TOON_BASE_URL": f"file://{www}", "UBS_TOOLS_DIR": str(tools), "TOON_BIN": "/nonexistent/tru"}
+    proc = run(["doctor", "--fix"], env=env)
+    out = proc.stdout + proc.stderr
+    installed = [q for q in tools.rglob("toon*") if q.is_file()] if tools.exists() else []
+    if os.uname().sysname != "Linux" or os.uname().machine not in ("x86_64", "amd64"):
+        report("doctor_fix_refuses_tampered_toon", True, "skipped: mirror holds only the linux-amd64 asset name")
+    else:
+        ok = "toon encoder checksum mismatch for toon-linux-amd64.tar.xz" in out and not installed \
+            and "toon encoder: could not be provisioned" in out
+        report("doctor_fix_refuses_tampered_toon", ok, f"exit={proc.returncode} installed={installed}", proc if not ok else None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_python_shim_when_only_python_exists() -> None:
+    # Git for Windows has `python` but no `python3` (bead G7): ubs must expose a
+    # python3 for itself, the modules and the helpers. Build a PATH where every
+    # directory that holds a python3 is replaced by a symlink farm without it,
+    # add `python` -> the real interpreter, and require helper-backed findings.
+    real = shutil.which("python3")
+    if not real:
+        report("python_shim_when_only_python_exists", True, "skipped: no python3 on this box")
+        return
+    farm_root = Path(tempfile.mkdtemp(prefix="ubs-pyshim-"))
+    new_path: list[str] = []
+    for n, d in enumerate(os.environ.get("PATH", "").split(os.pathsep)):
+        if not d or not os.path.isdir(d):
+            continue
+        if not any(name.startswith("python3") for name in os.listdir(d)):
+            new_path.append(d)
+            continue
+        farm = farm_root / f"farm{n}"
+        farm.mkdir()
+        for name in os.listdir(d):
+            if name.startswith("python3"):
+                continue
+            try:
+                os.symlink(os.path.join(d, name), farm / name)
+            except OSError:
+                pass
+        new_path.append(str(farm))
+    first = Path(new_path[0]) if new_path else farm_root
+    if not (first / "python").exists():
+        os.symlink(real, first / "python")
+    env = {"PATH": os.pathsep.join(new_path)}
+    target = REPO_ROOT / "test-suite" / "python" / "buggy"
+    proc = run(["--ci", "--only=python", "--category=resource-lifecycle", "--format=json", str(target)], env=env)
+    ok = False
+    detail = f"exit={proc.returncode}"
+    try:
+        doc = json.loads(proc.stdout)
+        py = next(s for s in doc["scanners"] if s["language"] == "python")
+        ok = proc.returncode in (0, 1) and py["critical"] + py["warning"] > 0 and "python3 is required" not in proc.stderr
+        detail += f" python critical={py['critical']} warning={py['warning']}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" {exc}"
+    report("python_shim_when_only_python_exists", ok, detail, proc if not ok else None)
+    doc_proc = run(["doctor"], env=env)
+    ok2 = "python: ready" in doc_proc.stdout + doc_proc.stderr and "per-run python3 shim" in doc_proc.stdout + doc_proc.stderr
+    report("doctor_reports_python_shim", ok2, "", doc_proc if not ok2 else None)
+    shutil.rmtree(farm_root, ignore_errors=True)
+
+
 def check_workspaces_without_rsync() -> None:
     # Git for Windows ships no rsync (bead B11): explicit multi-file targets,
     # directory targets and --staged must still scan, through tar or python,
@@ -380,6 +451,26 @@ def check_workspaces_without_rsync() -> None:
     except Exception as exc:  # noqa: BLE001
         detail += f" {exc}"
     report("directory_target_without_rsync", ok, detail, without if not ok else None)
+
+    # Planted negative: an unreadable target must fail the tar tier loudly with
+    # tar's diagnostic — never a silently partial workspace (issue #98 semantics).
+    if os.geteuid() == 0:
+        report("unreadable_target_without_rsync_fails_loudly", True, "skipped: root can read everything")
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-norsync-"))
+    good = tmp / "good.py"
+    bad = tmp / "bad.py"
+    shutil.copy(PY_CLEAN, good)
+    bad.write_text("x = 1\n")
+    bad.chmod(0)
+    try:
+        proc = run([str(good), str(bad), "--ci", "--only=python", "--format=json"], env={"UBS_TEST_NO_RSYNC": "1"})
+    finally:
+        bad.chmod(0o644)
+        shutil.rmtree(tmp, ignore_errors=True)
+    out = proc.stdout + proc.stderr
+    ok = proc.returncode != 0 and "tar exited with status" in out and "Failed to prepare files workspace" in out
+    report("unreadable_target_without_rsync_fails_loudly", ok, f"exit={proc.returncode}", proc if not ok else None)
 
 
 def check_single_file_fast_path() -> None:
@@ -687,6 +778,8 @@ def main() -> int:
         check_file_list_workspace,
         check_single_file_fast_path,
         check_workspaces_without_rsync,
+        check_python_shim_when_only_python_exists,
+        check_doctor_fix_refuses_tampered_toon,
     ):
         try:
             check()

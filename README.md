@@ -52,7 +52,7 @@ Note: Windows users must run the installer one-liner from within Git Bash, or us
 # Scan current repo (JSON)
 ubs . --format=json
 
-# Token-optimized output (TOON; needs toon_rust's encoder, which install.sh installs — without it ubs exits 2 with the error envelope)
+# Token-optimized output (TOON; needs toon_rust's encoder — install.sh or `ubs doctor --fix` fetches it; without it ubs exits 2 with the error envelope)
 ubs . --format=toon
 
 # Scan only staged changes
@@ -346,7 +346,7 @@ This command deletes the UBS binary, shell RC snippets/aliases, config under `~/
 | `--dry-run` | Prints every install action (downloads, PATH edits, hook writes, cleanup) without touching disk. Dry runs still resolve config, detect agents, and show you exactly what *would* change. | Audit the installer, demo it to teammates, or validate CI steps without modifying a workstation. |
 | `--self-test` | Immediately runs `test-suite/install/run_tests.sh` after installation and exits non-zero if the smoke suite fails. | CI/CD jobs and verified setups can prove the installer still works end-to-end before trusting a release. |
 | `--skip-type-narrowing` | Skip the Node.js + TypeScript readiness probe **and** the cross-language guard analyzers (JS/Rust/Kotlin/Swift/C#). | Useful for air-gapped hosts or environments that want to stay in heuristic-only mode. |
-| `--skip-toon` | Skip installing toon_rust's `toon` encoder, the digest-verified release binary that `--format=toon` needs. | For hosts that already ship `toon`/`tru`, or when you never use TOON output. |
+| `--skip-toon` | Skip installing toon_rust's `toon` encoder, the digest-verified release binary that `--format=toon` needs. Non-interactive installs fetch it by default; interactive ones ask. | For hosts that already ship `toon`/`tru`, or when you never use TOON output. `ubs doctor --fix` can fetch it later. |
 | `--skip-typos` | Skip the Typos spellchecker installation + diagnostics. | Handy when corp images already provide Typos or when you deliberately disable spellcheck automation. |
 | `--skip-doctor` | Skip the automatic `ubs doctor` run + session summary after install. | Use when CI already runs doctor separately or when you're iterating locally and want a faster finish. |
 
@@ -469,6 +469,8 @@ Summary Statistics:
 </table>
 
 ### 💨 **2. Fast Enough for the Edit Loop When You Scope It**
+
+`scripts/bench.sh` also records the agent-hook case as `single_file`: the meta-runner on one file (`--ci`, text mode) against the Python module alone on the same file, overhead p50/p95 in ms (target p95 ≤ 150 ms, tracked by `scripts/bench_cusum.py`).
 
 Measured on 2026-09-02 (v5.3.13, single runs on a 16-core Linux box; ast-grep on PATH). Reproduce with `scripts/bench.sh` (fixture tree + a deterministic synthetic 50K-line corpus; `--large`, `--oss` for more) and watch for regressions with `scripts/bench_cusum.py`; `UBS_PROFILE=1` prints per-phase timings:
 
@@ -1039,6 +1041,7 @@ Environment Variables:
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
   UBS_MAX_FILE_MB          Leave files above N MB out of whole-project scans (default: 8; 0 disables)
+  UBS_PYTHON               Python >= 3.9 interpreter to use as python3 (Git Bash/Windows: `python` or `py -3` are tried automatically)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
   UBS_PROFILE=1            Add phase timings (copy, fan-out, per module, merge, total ms) to json/toon output and the text summary
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)

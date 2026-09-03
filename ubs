@@ -89,6 +89,64 @@ need_cmd(){
   if [[ "${1:-}" == "rsync" && "${UBS_TEST_NO_RSYNC:-0}" == "1" ]]; then return 1; fi
   command -v "$1" >/dev/null 2>&1
 }
+
+# Temp paths created before TMPDIR_RUN exists (the python3 shim, the scan file
+# list). early_cleanup runs from the EXIT trap until cleanup() takes over and
+# calls it too, so a refusal or early exit leaves nothing behind.
+EARLY_TMP_PATHS=()
+early_cleanup(){
+  local p
+  for p in "${EARLY_TMP_PATHS[@]}"; do
+    [[ -n "$p" && -e "$p" && "$p" != "/" ]] && rm -rf "$p" 2>/dev/null
+  done
+  return 0
+}
+trap early_cleanup EXIT
+
+# python3 resolution (bead G7). Git for Windows and some Windows installs only
+# have `python` (or the `py` launcher); the modules and the 14 helpers call
+# `python3` by name. When python3 is missing but `python`/`py -3` is Python
+# >= 3.9, a shim directory holding a `python3` wrapper is prepended to PATH for
+# the whole run, so nothing else changes. UBS_PYTHON=/path/to/interpreter
+# overrides detection (a shim is made even when a python3 is on PATH). doctor
+# reports what was used.
+PYTHON_RESOLVED=""   # interpreter python3 resolves to (for doctor); empty = none
+PYTHON_SOURCE=""     # path | UBS_PYTHON | python | py
+PYTHON_SHIM_DIR=""
+python_is_3(){ "$@" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; }
+resolve_python3(){
+  local -a cand=()
+  if [[ -n "${UBS_PYTHON:-}" ]]; then
+    if python_is_3 "$UBS_PYTHON"; then
+      cand=("$UBS_PYTHON"); PYTHON_SOURCE="UBS_PYTHON"
+    else
+      echo "⚠ UBS_PYTHON=$UBS_PYTHON is not a usable Python >= 3.9; ignoring it" >&2
+    fi
+  fi
+  if [[ ${#cand[@]} -eq 0 ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      PYTHON_RESOLVED="$(command -v python3)"; PYTHON_SOURCE="path"
+      return 0
+    fi
+    if command -v python >/dev/null 2>&1 && python_is_3 python; then
+      cand=("$(command -v python)"); PYTHON_SOURCE="python"
+    elif command -v py >/dev/null 2>&1 && python_is_3 py -3; then
+      cand=(py -3); PYTHON_SOURCE="py"
+    fi
+  fi
+  [[ ${#cand[@]} -gt 0 ]] || return 1
+  PYTHON_SHIM_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ubspy.XXXXXX)" || return 1
+  EARLY_TMP_PATHS+=("$PYTHON_SHIM_DIR")
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec'; printf ' %q' "${cand[@]}"; printf ' "$@"\n'
+  } > "$PYTHON_SHIM_DIR/python3"
+  chmod +x "$PYTHON_SHIM_DIR/python3"
+  export PATH="$PYTHON_SHIM_DIR:$PATH"
+  PYTHON_RESOLVED="${cand[*]} (via a per-run python3 shim)"
+  return 0
+}
+resolve_python3 || true
 date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
 
 # Milliseconds since the epoch (bash 5 EPOCHREALTIME, else date +%s%N).
@@ -247,6 +305,49 @@ AST_GREP_BASE_URL="https://github.com/ast-grep/ast-grep/releases/download/${AST_
 TOOLS_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/tools"
 TOOLS_DIR="${UBS_TOOLS_DIR:-$TOOLS_DIR_DEFAULT}"
 
+# toon_rust encoder for --format=toon (bead F8): `ubs doctor --fix` provisions
+# it into the tool cache from the digest-pinned release, the way ast-grep is
+# provisioned. The digests are the release's checksums.txt (v0.2.4); install.sh
+# pins the same table under DEP_ASSET_SHA256 and scripts/check_docs_claims.py
+# fails when the two drift. UBS_TOON_BASE_URL is the test seam for a local
+# mirror (never documented for users).
+TOON_VERSION="0.2.4"
+TOON_BASE_URL="${UBS_TOON_BASE_URL:-https://github.com/Dicklesworthstone/toon_rust/releases/download/v${TOON_VERSION}}"
+declare -A TOON_ASSET_SHA256=(
+  [toon-linux-amd64.tar.xz]='af6e21187c5afb6ec993b9e668d13d3b785f55571b67ced1c1e24bb53f0b1b62'
+  [toon-linux-arm64.tar.xz]='3ebc625a27ccf565eb649565aefef505ab40cddb63648a6bc0c8c54ae5bf9f57'
+  [toon-darwin-amd64.tar.xz]='e1af1cca9ea99df2eb85420fe5289c6d4adddad001b778a4c285e249acc57df8'
+  [toon-darwin-arm64.tar.xz]='fe163da70b7f504ad489aeea1e8887971df6b526b6bcdd0f37add9cdab7c2fce'
+  [toon-windows-amd64.zip]='3cfdb169a4f1a28e2fb14bffa6c775d1824f45793b9e602ce6a30be550872de8'
+)
+# Release asset for this platform (toon-<os>-<arch>.tar.xz, a zip on Windows).
+toon_asset_name(){
+  local os arch
+  case "$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')" in
+    linux) os=linux ;;
+    darwin) os=darwin ;;
+    msys*|mingw*|cygwin*) os=windows ;;
+    *) return 1 ;;
+  esac
+  case "$(uname -m 2>/dev/null)" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) return 1 ;;
+  esac
+  if [[ "$os" == windows ]]; then
+    [[ "$arch" == amd64 ]] || return 1
+    echo "toon-windows-amd64.zip"
+  else
+    echo "toon-${os}-${arch}.tar.xz"
+  fi
+}
+toon_cached_bin_path(){
+  local asset bin="toon"
+  asset="$(toon_asset_name)" || return 1
+  [[ "$asset" == *.zip ]] && bin="toon.exe"
+  echo "$TOOLS_DIR/toon/${TOON_VERSION}/${asset%%.*}/${bin}"
+}
+
 # Known-good ast-grep asset digests (sha256) for supply-chain verification.
 declare -A AST_GREP_ASSET_SHA256=(
   [aarch64-apple-darwin]='6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6'
@@ -296,7 +397,7 @@ refuse_toon_without_encoder(){
   local problem="$1"
   say_err "${RED}${X}${RESET} --format=toon needs toon_rust's encoder: $TOON_BIN $problem"
   say_err "${DIM}  Install: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/toon_rust/main/install.sh | bash${RESET}"
-  say_err "${DIM}  install.sh installs it (digest-verified toon_rust release binary); or set TOON_TRU_BIN=/path/to/toon if it lives elsewhere; use --format=json for the same document as JSON.${RESET}"
+  say_err "${DIM}  Run 'ubs doctor --fix' (or install.sh) to fetch the digest-verified toon_rust release binary; or set TOON_TRU_BIN=/path/to/toon if it lives elsewhere; use --format=json for the same document as JSON.${RESET}"
   say_err "${DIM}  Note: the Node.js 'toon' CLI and upstream toon-format's 'toon' binary are different projects and not supported.${RESET}"
   emit_error_envelope "environment" "error" "toon-encoder-missing" \
     "--format=toon needs toon_rust's tru encoder ($TOON_BIN $problem); install it or use --format=json" \
@@ -402,7 +503,9 @@ TOON_BIN="${TOON_TRU_BIN:-${TOON_BIN:-}}"
 if [[ -z "$TOON_BIN" ]]; then
   if command -v tru >/dev/null 2>&1; then TOON_BIN=tru
   elif command -v toon >/dev/null 2>&1; then TOON_BIN=toon
+  elif _toon_cached="$(toon_cached_bin_path 2>/dev/null)" && [[ -x "$_toon_cached" ]]; then TOON_BIN="$_toon_cached"
   else TOON_BIN=tru; fi
+  unset _toon_cached
 fi
 CI_MODE=0
 FAIL_ON_WARNING=0
@@ -598,6 +701,8 @@ Environment Variables:
                               Set to 0 to disable this safety check
   UBS_MAX_FILE_MB=N           Leave files above N MB out of whole-project scans (default: 8; 0 disables);
                               binary/media/archive/data files are always left out
+  UBS_PYTHON=PATH             Python >= 3.9 interpreter to use as python3 (Git Bash/Windows ship only
+                              python; python and the py -3 launcher are tried automatically when python3 is missing)
   UBS_SKIP_SIZE_CHECK=1       Skip directory size guard entirely
   UBS_REFUSE_HOME_ROOT=0|1    Whether to refuse scanning \$HOME or / (default: 1)
                               Set to 0 to allow scanning these directories
@@ -727,7 +832,7 @@ cat <<'JSON'
     "json": {"description": "One object: project, timestamp, status (ok|partial), failed_modules[], scanners[] (per-language summary with findings[] and status ok|timeout|error), totals{critical,warning,info,files}. Environment errors and refusals print an error envelope instead; no supported language prints a result object with exit_code 3.", "schema": "ubs --schema=json"},
     "jsonl": {"description": "One JSON object per line: type=finding (per finding, with language), type=scanner (per language summary), type=totals (last line, carries status/failed_modules), or type=error (envelope).", "schema": "ubs --schema=jsonl"},
     "sarif": {"description": "SARIF 2.1.0; one run per module. Partial runs and errors set runs[].invocations[0].executionSuccessful=false with toolExecutionNotifications (descriptor ids ubs/module-timeout, ubs/module-error, ubs/<refusal-or-error-reason>).", "schema": "ubs --schema=sarif"},
-    "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable toon_rust encoder (toon or tru on PATH, or TOON_TRU_BIN/TOON_BIN; install.sh installs it) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
+    "toon": {"description": "The json document encoded with toon_rust's tru. Without a usable toon_rust encoder (toon or tru on PATH, TOON_TRU_BIN/TOON_BIN, or the tool cache filled by 'ubs doctor --fix'/install.sh) the run exits 2 with the error envelope (reason toon-encoder-missing) instead of printing JSON labelled as TOON.", "schema": "ubs --schema=toon"},
     "text": {"description": "Human report; Combined Summary at the end (Files/Critical/Warning/Info, Status: partial when applicable)."}
   },
   "env": [
@@ -738,6 +843,7 @@ cat <<'JSON'
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
     {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables). Measured over the listed files: binary/media/archive/data files and files above UBS_MAX_FILE_MB are not counted or copied."},
     {"name": "UBS_MAX_FILE_MB", "value": "N", "description": "Leave files above N MB out of whole-project scans (default 8; 0 disables)."},
+    {"name": "UBS_PYTHON", "value": "PATH", "description": "Python >= 3.9 interpreter to expose as python3 for the run (a python/py -3 on PATH is used automatically when python3 is missing)."},
     {"name": "UBS_SKIP_SIZE_CHECK", "value": "1", "description": "Skip the size guard."},
     {"name": "UBS_REFUSE_HOME_ROOT", "value": "0|1", "description": "Refuse scanning $HOME or / (default 1)."},
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
@@ -1668,34 +1774,47 @@ PY
 }
 
 # Copy the files named in LIST (NUL-separated, relative to SRC) into DEST,
-# preserving the hierarchy: rsync when present, else tar, else Python. Prints
-# the tier used when it is not rsync. Returns 1 when every tier failed or DEST
-# ended up without files.
+# preserving the hierarchy. The tier is chosen by availability only — rsync,
+# else tar, else Python — and every tier fails loudly with the tool's own
+# diagnostic: a copy that silently dropped an unreadable file would hand the
+# modules a partial workspace and report success (issue #98). Returns 1 on
+# any failure; prints the tier when it is not rsync.
 copy_file_list(){
   local src="$1" list="$2" dest="$3" label="${4:-scan workspace}"
   [[ -s "$list" ]] || return 1
   ensure_dir "$dest"
-  has_files(){ [[ -n "$(find "$dest" -type f 2>/dev/null | head -n 1)" ]]; }
+  local err="$TMPDIR_RUN/copy_stderr.txt" rc=0 tar_rc=0
   if need_cmd rsync; then
-    local rsync_err="$TMPDIR_RUN/rsync_stderr_copy.txt" rsync_rc=0
-    rsync -a --from0 --files-from="$list" "$src"/ "$dest"/ >/dev/null 2>"$rsync_err" || rsync_rc=$?
-    if [[ "$rsync_rc" -eq 0 ]] && has_files; then return 0; fi
-    report_rsync_failure "$rsync_rc" "$rsync_err"
-    rm -rf "$dest" 2>/dev/null || true
-    ensure_dir "$dest"
+    rsync -a --from0 --files-from="$list" "$src"/ "$dest"/ >/dev/null 2>"$err" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+      report_rsync_failure "$rc" "$err"
+      return 1
+    fi
+    return 0
   fi
-  if need_cmd tar && (cd "$src" && tar -cf - --null -T "$list" 2>/dev/null) | (cd "$dest" && tar -xf - 2>/dev/null) && has_files; then
+  if need_cmd tar; then
+    # GNU tar exits 2 (bsdtar 1) when a listed file cannot be read; the archive
+    # it still produced is discarded so the workspace is never partial.
+    (cd "$src" && tar -cf - --null -T "$list" 2>"$err") | (cd "$dest" && tar -xf - 2>>"$err")
+    local -a tar_status=("${PIPESTATUS[@]}")
+    tar_rc="${tar_status[0]:-1}"; rc="${tar_status[1]:-1}"
+    if [[ "$tar_rc" -ne 0 || "$rc" -ne 0 || -s "$err" ]]; then
+      report_copy_failure tar "$tar_rc" "$err"
+      rm -rf "$dest" 2>/dev/null || true
+      ensure_dir "$dest"
+      return 1
+    fi
     say "${DIM}${INFO}${RESET} ${label}: copied with tar (rsync unavailable)"
     return 0
   fi
-  rm -rf "$dest" 2>/dev/null || true
-  ensure_dir "$dest"
-  if need_cmd python3 && python3 - "$src" "$dest" "$list" <<'PY' 2>/dev/null
+  if need_cmd python3; then
+    python3 - "$src" "$dest" "$list" <<'PY' 2>"$err" || rc=$?
 import os
 import shutil
 import sys
 
 src, dst = os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2])
+failed = 0
 with open(sys.argv[3], "rb") as fh:
     for rel in fh.read().split(b"\0"):
         if not rel:
@@ -1704,16 +1823,40 @@ with open(sys.argv[3], "rb") as fh:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         try:
             shutil.copy2(os.path.join(src, rel), target, follow_symlinks=False)
-        except (OSError, shutil.Error):
-            pass
+        except (OSError, shutil.Error) as exc:
+            failed += 1
+            print(f"{os.fsdecode(rel)}: {exc}", file=sys.stderr)
+sys.exit(1 if failed else 0)
 PY
-  then
-    if has_files; then
-      say "${DIM}${INFO}${RESET} ${label}: copied with python (rsync and tar unavailable)"
-      return 0
+    if [[ "$rc" -ne 0 ]]; then
+      report_copy_failure python "$rc" "$err"
+      rm -rf "$dest" 2>/dev/null || true
+      ensure_dir "$dest"
+      return 1
     fi
+    say "${DIM}${INFO}${RESET} ${label}: copied with python (rsync and tar unavailable)"
+    return 0
   fi
+  say "${RED}$X none of rsync, tar or python3 is available to build the ${label}${RESET}"
   return 1
+}
+
+# tar/python counterpart of report_rsync_failure: status plus up to 20 stderr lines.
+report_copy_failure(){
+  local tool="$1" rc="$2" err_file="$3" line shown=0 total=0
+  say "${DIM}${tool} exited with status ${rc}${RESET}"
+  if [[ -s "$err_file" ]]; then
+    total="$(wc -l <"$err_file" | awk '{print $1+0}')"
+    while IFS= read -r line && [[ "$shown" -lt 20 ]]; do
+      say "${DIM}  ${tool}: ${line}${RESET}"
+      shown=$((shown + 1))
+    done <"$err_file"
+    if [[ "$total" -gt "$shown" ]]; then
+      say "${DIM}  ... ($((total - shown)) more ${tool} stderr line(s) suppressed)${RESET}"
+    fi
+  else
+    say "${DIM}  (${tool} produced no stderr)${RESET}"
+  fi
 }
 
 build_scan_file_list(){
@@ -1733,9 +1876,7 @@ build_scan_file_list(){
     return 1
   fi
   SCAN_FILE_LIST="$list"
-  # The run's cleanup trap is installed later; until then this keeps a refusal
-  # or early exit from leaving the list behind in $TMPDIR.
-  trap 'rm -f "${SCAN_FILE_LIST:-}" 2>/dev/null' EXIT
+  EARLY_TMP_PATHS+=("$list")  # removed by early_cleanup / cleanup
   PROFILE_LIST_MS=$(( $(now_ms) - t0 ))
   return 0
 }
@@ -2383,6 +2524,69 @@ ensure_ast_grep_tool_cache(){
   echo "$bin_path"
 }
 
+# Provision the toon encoder into the tool cache (bead F8): download the
+# platform asset from TOON_BASE_URL, verify it against TOON_ASSET_SHA256, extract
+# the `toon` binary and confirm it identifies itself as toon_rust. Prints the
+# binary path. Nothing is installed when the digest does not match.
+ensure_toon_tool_cache(){
+  local asset expected url bin_path tool_root archive tmp sha
+  asset="$(toon_asset_name)" || {
+    say_err "${RED}${X}${RESET} Environment error: no toon_rust release asset for this platform ($(uname -s) $(uname -m))"
+    return 1
+  }
+  expected="${TOON_ASSET_SHA256[$asset]:-}"
+  [[ -n "$expected" ]] || return 1
+  bin_path="$(toon_cached_bin_path)" || return 1
+  tool_root="$(dirname "$bin_path")"
+  archive="$tool_root/$asset"
+  url="${TOON_BASE_URL}/${asset}"
+  if [[ -x "$bin_path" ]] && looks_like_toon_rust_encoder "$bin_path"; then
+    echo "$bin_path"
+    return 0
+  fi
+  if ! ( need_cmd curl || need_cmd wget ); then
+    say_err "${RED}${X}${RESET} Environment error: need curl or wget to provision the toon encoder"
+    return 1
+  fi
+  if ! checksum_tool_name >/dev/null 2>&1; then
+    say_err "${RED}${X}${RESET} Environment error: need sha256sum, shasum, or openssl to verify the toon encoder download"
+    return 1
+  fi
+  ensure_dir "$tool_root"
+  [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading toon_rust ${TOON_VERSION} (${asset})..."
+  tmp="$(mktemp -t ubs-toon.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-toon.XXXXXX" 2>/dev/null)" || return 1
+  if ! download_url_to_file "$url" "$tmp"; then
+    say_err "${RED}${X}${RESET} failed to download the toon encoder: $url"
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  if ! sha="$(compute_sha256 "$tmp")"; then
+    rm -f "$tmp" 2>/dev/null
+    return 2
+  fi
+  if [[ "$sha" != "$expected" ]]; then
+    say_err "${RED}${X}${RESET} toon encoder checksum mismatch for ${asset}; nothing installed"
+    say_err "${DIM}Expected: ${expected}${RESET}"
+    say_err "${DIM}Got:      ${sha}${RESET}"
+    rm -f "$tmp" 2>/dev/null
+    return 1
+  fi
+  mv "$tmp" "$archive"
+  rm -f "$bin_path" 2>/dev/null
+  if [[ "$asset" == *.zip ]]; then
+    extract_zip_member "$archive" "toon.exe" "$bin_path" || { say_err "${RED}${X}${RESET} failed to extract toon.exe from ${archive}"; return 1; }
+  else
+    ( cd "$tool_root" && tar -xf "$archive" toon 2>/dev/null ) || { say_err "${RED}${X}${RESET} failed to extract toon from ${archive}"; return 1; }
+  fi
+  chmod +x "$bin_path" 2>/dev/null || true
+  if ! looks_like_toon_rust_encoder "$bin_path"; then
+    say_err "${RED}${X}${RESET} extracted toon encoder did not identify itself as toon_rust: $bin_path"
+    rm -f "$bin_path" 2>/dev/null
+    return 1
+  fi
+  echo "$bin_path"
+}
+
 ensure_ast_grep(){
   local found
   # Test seam (mirrors UBS_TEST_FORCE_NO_TOON): pretend ast-grep is absent so
@@ -2760,11 +2964,29 @@ run_doctor(){
     fi
   fi
 
+  # python3: helpers, permalinks, suppressions and the size guard's fallbacks need it.
+  if [[ -n "$PYTHON_RESOLVED" ]]; then
+    doctor_report ok "python: ready ${DIM}${PYTHON_RESOLVED} $(python3 --version 2>&1 | head -n 1)${RESET}"
+    [[ "$PYTHON_SOURCE" != "path" ]] && doctor_report info "python3 comes from ${PYTHON_SOURCE} (UBS_PYTHON overrides detection)"
+  else
+    doctor_report warn "python: no python3, python or py launcher with Python >= 3.9 found (helpers, permalinks, suppressions and fallbacks degrade); set UBS_PYTHON=/path/to/python"
+  fi
+
   # TOON encoder (toon_rust): optional, but --format=toon exits 2 without it.
   if command -v "$TOON_BIN" >/dev/null 2>&1 && looks_like_toon_rust_encoder "$TOON_BIN"; then
     doctor_report ok "toon encoder: ready ${DIM}$(command -v "$TOON_BIN") $("$TOON_BIN" --version 2>/dev/null | head -n 1)${RESET}"
   else
-    doctor_report info "toon encoder: not found (--format=toon exits 2 until toon_rust's toon/tru is on PATH; install.sh installs it, or set TOON_TRU_BIN)"
+    if [[ "$fix" -eq 1 ]]; then
+      local toon_bin
+      if toon_bin="$(ensure_toon_tool_cache)"; then
+        TOON_BIN="$toon_bin"
+        doctor_report ok "toon encoder: installed ${DIM}${toon_bin} $("$toon_bin" --version 2>/dev/null | head -n 1)${RESET}"
+      else
+        doctor_report warn "toon encoder: could not be provisioned (see above); --format=toon exits 2 until toon_rust's toon/tru is on PATH or TOON_TRU_BIN points at it"
+      fi
+    else
+      doctor_report info "toon encoder: not found (--format=toon exits 2 until it is installed; run 'ubs doctor --fix' to fetch the digest-pinned toon_rust release, or set TOON_TRU_BIN)"
+    fi
   fi
 
   local lang module_path verify_status cached_modules=0
@@ -3809,7 +4031,7 @@ cleanup(){
     wait "$TEE_PID" 2>/dev/null || true
     TEE_PID=""
   fi
-  [[ -n "${SCAN_FILE_LIST:-}" && -f "$SCAN_FILE_LIST" ]] && rm -f "$SCAN_FILE_LIST" 2>/dev/null
+  early_cleanup
   local dir="${TMPDIR_RUN:-}"
   [[ -n "$dir" && "$dir" != "/" ]] || return 0
   rm -rf "$dir" 2>/dev/null || true

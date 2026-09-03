@@ -316,6 +316,38 @@ def check_size_refusal_envelope() -> None:
     report("size_refusal_text", ok3, f"exit={proc3.returncode}", proc3 if not ok3 else None)
 
 
+def check_file_list_workspace() -> None:
+    # Whole-project scans are driven by a file list (bead B4): binary/data files
+    # and files above UBS_MAX_FILE_MB neither count toward the size guard nor
+    # reach the scan workspace, so a small JS app next to a large data directory
+    # scans under a 1 MB limit and reports only its source files.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-filelist-"))
+    src = tmp / "src"
+    data = tmp / "data"
+    src.mkdir()
+    data.mkdir()
+    for i in range(20):
+        (src / f"m{i}.js").write_text(f"export const v{i} = {i};\n")
+    (data / "events.parquet").write_bytes(b"\0" * 3_000_000)
+    (data / "rows.csv").write_text("a,b\n" * 700_000)
+    (tmp / "generated.js").write_text("// generated\n" + "x" * 9_000_000)  # above the 8 MB per-file cap
+    env = {"UBS_SKIP_SIZE_CHECK": None, "UBS_MAX_DIR_SIZE_MB": "1", "UBS_PROFILE": "1"}
+    proc = run(["--ci", "--only=js", "--format=json", str(tmp)], env=env)
+    ok = False
+    detail = f"exit={proc.returncode}"
+    try:
+        doc = json.loads(proc.stdout)
+        js = next(s for s in doc["scanners"] if s["language"] == "js")
+        prof = doc.get("profile", {})
+        ok = proc.returncode in (0, 1) and js["files"] == 20 and isinstance(prof.get("list_ms"), int) \
+            and "Scan size after ignores: 0MB" in proc.stderr and "left out: 2 binary/data files, 1 above 8MB" in proc.stderr
+        detail += f" js_files={js.get('files')} list_ms={prof.get('list_ms')}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" {exc}"
+    report("file_list_size_guard_and_copy", ok, detail, proc if not ok else None)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _exclude_project() -> Path:
     # legacy/ holds a buggy file, src/ a clean one, plus a JS file so two
     # languages are detected for the --exclude-langs check.
@@ -590,6 +622,7 @@ def main() -> int:
         check_timeout_envelope,
         check_env_error_envelope,
         check_size_refusal_envelope,
+        check_file_list_workspace,
     ):
         try:
             check()

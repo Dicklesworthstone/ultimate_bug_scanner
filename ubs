@@ -99,10 +99,11 @@ now_ms(){
 UBS_START_MS="$(now_ms)"
 UBS_PROFILE="${UBS_PROFILE:-0}"
 PROFILE_COPY_MS=0
+PROFILE_LIST_MS=0
 PROFILE_FANOUT_MS=0
 PROFILE_MERGE_MS=0
 profile_json(){
-  # {"total_ms","copy_ms","fanout_ms","merge_ms","modules":{lang: wall ms}}
+  # {"total_ms","list_ms","copy_ms","fanout_ms","merge_ms","modules":{lang: wall ms}}
   local total=$(( $(now_ms) - UBS_START_MS ))
   local mods="" f lang ms
   for f in "$TMPDIR_RUN"/*.ms; do
@@ -111,8 +112,8 @@ profile_json(){
     ms="$(tr -cd '0-9' < "$f")"
     mods="${mods:+$mods,}\"$(json_escape "$lang")\":${ms:-0}"
   done
-  printf '{"total_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
-    "$total" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
+  printf '{"total_ms":%d,"list_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
+    "$total" "$PROFILE_LIST_MS" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
 }
 
 # Machine-readable error envelope (bead B6). Environment errors and scan
@@ -406,10 +407,14 @@ ONLY_LANGS=""              # csv: js,python,cpp,rust
 EXCLUDE_LANGS=""           # csv (--exclude-langs)
 USER_EXCLUDE_PATTERNS=""   # csv of --exclude path globs, for the language-name guard
 IGNORE_FILE=""
-DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels"
+DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels,.next,.turbo,.nuxt,.svelte-kit,.output,storybook-static,.cache,.parcel-cache"
 # Safety guards: maximum directory size (MB) and whether to refuse home/root dirs
 MAX_DIR_SIZE_MB="${UBS_MAX_DIR_SIZE_MB:-1000}"  # 1GB default; set 0 to disable
 SKIP_SIZE_CHECK="${UBS_SKIP_SIZE_CHECK:-0}"
+MAX_FILE_SIZE_MB="${UBS_MAX_FILE_MB:-8}"        # files above this leave the scan workspace (0 disables)
+[[ "$MAX_FILE_SIZE_MB" =~ ^[0-9]+$ ]] || MAX_FILE_SIZE_MB=8
+SCAN_FILE_LIST=""                                  # NUL-separated list built by build_scan_file_list
+SCAN_LIST_COUNT=0; SCAN_LIST_BYTES=0; SCAN_LIST_SKIPPED_BIG=0; SCAN_LIST_SKIPPED_DATA=0
 REFUSE_HOME_ROOT="${UBS_REFUSE_HOME_ROOT:-1}"  # 1 = refuse, 0 = allow
 GLOBAL_EXCLUDE_PATTERNS="$DEFAULT_IGNORES"
 FILTERED_PROJECT_DIR=""
@@ -566,6 +571,8 @@ Environment Variables:
                               Set to a specific toon_rust encoder path if needed (do not use Node.js toon)
   UBS_MAX_DIR_SIZE_MB=N       Max directory size in MB before refusing to scan (default: 1000)
                               Set to 0 to disable this safety check
+  UBS_MAX_FILE_MB=N           Leave files above N MB out of whole-project scans (default: 8; 0 disables);
+                              binary/media/archive/data files are always left out
   UBS_SKIP_SIZE_CHECK=1       Skip directory size guard entirely
   UBS_REFUSE_HOME_ROOT=0|1    Whether to refuse scanning \$HOME or / (default: 1)
                               Set to 0 to allow scanning these directories
@@ -702,9 +709,10 @@ cat <<'JSON'
     {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
     {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Per-module timeout (default 300)."},
     {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
-    {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, copy_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
+    {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, list_ms, copy_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
-    {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables)."},
+    {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables). Measured over the listed files: binary/media/archive/data files and files above UBS_MAX_FILE_MB are not counted or copied."},
+    {"name": "UBS_MAX_FILE_MB", "value": "N", "description": "Leave files above N MB out of whole-project scans (default 8; 0 disables)."},
     {"name": "UBS_SKIP_SIZE_CHECK", "value": "1", "description": "Skip the size guard."},
     {"name": "UBS_REFUSE_HOME_ROOT", "value": "0|1", "description": "Refuse scanning $HOME or / (default 1)."},
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
@@ -823,7 +831,7 @@ cat <<'JSON'
           "totals": {"$ref": "#/$defs/totals"},
           "git": {"type": "object", "description": "present when the project has a GitHub remote", "properties": {"repository": {"type": "string"}, "commit": {"type": "string"}, "blob_base": {"type": "string"}}, "required": ["repository"]},
           "comparison": {"type": "object"},
-          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "copy_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "copy_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
+          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "copy_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "copy_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
         },
         "additionalProperties": true
       },
@@ -1511,11 +1519,111 @@ PY
   echo "0"
 }
 
+# Whole-project scans are driven by a file list (bead B4). `rg --files` walks the
+# tree with the same ignore patterns the copy used to get, a Python pass drops
+# binary/media/archive/data files by extension and files above UBS_MAX_FILE_MB
+# and sums what is left, and that list feeds both the size guard and the shadow
+# workspace copy. Data directories next to the code therefore neither count
+# against the limit nor get copied. Needs rg + python3; without them the
+# du-based guard and the whole-tree copy stay in charge. Modules still scan the
+# workspace exactly as before: nothing about the module contract changes here.
+SCAN_DATA_EXTENSIONS="png,jpg,jpeg,gif,bmp,ico,webp,tif,tiff,psd,svg,heic,mp3,wav,flac,ogg,m4a,aac,mp4,mov,avi,mkv,webm,ttf,otf,woff,woff2,eot,zip,tar,gz,tgz,bz2,xz,zst,7z,rar,jar,war,ear,whl,egg,o,obj,a,lib,so,dll,dylib,exe,bin,class,pyc,pyo,wasm,pdb,db,sqlite,sqlite3,parquet,arrow,feather,npy,npz,pkl,pickle,h5,hdf5,pt,pth,ckpt,safetensors,onnx,pb,tflite,gguf,csv,tsv,jsonl,ndjson,avro,orc,pdf,doc,docx,xls,xlsx,ppt,pptx,map,log,iso,img,dmg,pkg,deb,rpm,apk,ipa"
+
+build_scan_file_list(){
+  [[ "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" ]] || return 1
+  need_cmd rg && need_cmd python3 || return 1
+  local t0 pat list stats
+  t0="$(now_ms)"
+  local -a rg_args=(--files -0 --hidden --no-ignore --no-messages) pats
+  IFS=',' read -r -a pats <<<"$GLOBAL_EXCLUDE_PATTERNS"
+  for pat in "${pats[@]}"; do
+    [[ -z "$pat" ]] && continue
+    # .ubsignore/rsync semantics: a bare name matches at any depth; a pattern
+    # with a slash matches anywhere unless anchored with a leading slash.
+    case "$pat" in
+      /*) rg_args+=( -g "!${pat#/}" ) ;;
+      \*\*/*) rg_args+=( -g "!$pat" ) ;;
+      */*) rg_args+=( -g "!**/$pat" ) ;;
+      *) rg_args+=( -g "!$pat" ) ;;
+    esac
+  done
+  list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
+  local raw="$list.raw" rg_rc=0
+  # rg exits 1 when nothing matched (an empty tree is a valid answer), 2 on error.
+  (cd "$SOURCE_PROJECT_DIR" && rg "${rg_args[@]}" > "$raw" 2>/dev/null) || rg_rc=$?
+  if [[ "$rg_rc" -gt 1 ]]; then
+    rm -f "$list" "$raw" 2>/dev/null
+    return 1
+  fi
+  if ! stats="$(python3 - "$SOURCE_PROJECT_DIR" "$raw" "$list" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" <<'PY'
+import os
+import sys
+
+root = os.fsencode(sys.argv[1])
+raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
+data_exts = set(sys.argv[5].split(","))
+cap = max_mb * 1024 * 1024 if max_mb > 0 else 0
+kept, total, big, data = [], 0, 0, 0
+with open(raw, "rb") as fh:
+    entries = fh.read().split(b"\0")
+for rel in entries:
+    if not rel:
+        continue
+    if rel.startswith(b"./"):
+        rel = rel[2:]
+    name = rel.rsplit(b"/", 1)[-1]
+    ext = name.rsplit(b".", 1)[-1].lower().decode("utf-8", "replace") if b"." in name[1:] else ""
+    if ext in data_exts:
+        data += 1
+        continue
+    try:
+        size = os.stat(os.path.join(root, rel), follow_symlinks=False).st_size
+    except OSError:
+        continue
+    if cap and size > cap:
+        big += 1
+        continue
+    kept.append(rel)
+    total += size
+with open(out, "wb") as fh:
+    fh.write(b"\0".join(kept) + (b"\0" if kept else b""))
+print(len(kept), total, big, data)
+PY
+)"; then
+    rm -f "$list" "$raw" 2>/dev/null
+    return 1
+  fi
+  rm -f "$raw" 2>/dev/null
+  read -r SCAN_LIST_COUNT SCAN_LIST_BYTES SCAN_LIST_SKIPPED_BIG SCAN_LIST_SKIPPED_DATA <<<"$stats"
+  if [[ ! "$SCAN_LIST_COUNT" =~ ^[0-9]+$ || ! "$SCAN_LIST_BYTES" =~ ^[0-9]+$ ]]; then
+    rm -f "$list" 2>/dev/null
+    SCAN_LIST_COUNT=0; SCAN_LIST_BYTES=0; SCAN_LIST_SKIPPED_BIG=0; SCAN_LIST_SKIPPED_DATA=0
+    return 1
+  fi
+  SCAN_FILE_LIST="$list"
+  # The run's cleanup trap is installed later; until then this keeps a refusal
+  # or early exit from leaving the list behind in $TMPDIR.
+  trap 'rm -f "${SCAN_FILE_LIST:-}" 2>/dev/null' EXIT
+  PROFILE_LIST_MS=$(( $(now_ms) - t0 ))
+  return 0
+}
+
+if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" && -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+  build_scan_file_list || true
+fi
+
 # Check 2: Refuse directories larger than MAX_DIR_SIZE_MB (unless set to 0)
 if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
-  dir_size_mb="$(dir_size_mb_filtered "$SOURCE_PROJECT_DIR" "$GLOBAL_EXCLUDE_PATTERNS")"
+  if [[ -n "$SCAN_FILE_LIST" ]]; then
+    dir_size_mb=$(( SCAN_LIST_BYTES / 1024 / 1024 ))
+  else
+    dir_size_mb="$(dir_size_mb_filtered "$SOURCE_PROJECT_DIR" "$GLOBAL_EXCLUDE_PATTERNS")"
+  fi
   if [[ "${QUIET:-0}" -eq 0 ]]; then
     say "${DIM}${INFO}${RESET} Scan size after ignores: ${dir_size_mb}MB (limit ${MAX_DIR_SIZE_MB}MB)"
+    if [[ -n "$SCAN_FILE_LIST" && ( "$SCAN_LIST_SKIPPED_DATA" -gt 0 || "$SCAN_LIST_SKIPPED_BIG" -gt 0 ) ]]; then
+      say "${DIM}${INFO}${RESET} ${SCAN_LIST_COUNT} files listed for scanning; left out: ${SCAN_LIST_SKIPPED_DATA} binary/data files, ${SCAN_LIST_SKIPPED_BIG} above ${MAX_FILE_SIZE_MB}MB (UBS_MAX_FILE_MB)"
+    fi
   fi
   if [[ "$dir_size_mb" -gt "$MAX_DIR_SIZE_MB" ]]; then
     refuse_scan "directory-too-large" "Directory too large (after ignores): ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB" \
@@ -2594,6 +2702,60 @@ apply_ignore_filters(){
     [[ -n "$(find "$dest" -type f 2>/dev/null | head -n 1)" ]]
   }
 
+  # File-list workspace (bead B4): copy exactly the files build_scan_file_list
+  # kept, so data directories and oversized files never reach the workspace.
+  if [[ -n "$SCAN_FILE_LIST" && -s "$SCAN_FILE_LIST" ]]; then
+    if need_cmd rsync; then
+      local rsync_err="$TMPDIR_RUN/rsync_stderr_scan.txt" rsync_rc=0
+      rsync -a --from0 --files-from="$SCAN_FILE_LIST" "$SOURCE_PROJECT_DIR"/ "$dest"/ >/dev/null 2>"$rsync_err" || rsync_rc=$?
+      if [[ "$rsync_rc" -eq 0 ]] && dest_has_files; then
+        FILTERED_PROJECT_DIR="$dest"
+        PROJECT_DIR="$FILTERED_PROJECT_DIR"
+        say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files)"
+        return 0
+      fi
+      report_rsync_failure "$rsync_rc" "$rsync_err"
+      rm -rf "$dest" 2>/dev/null || true
+      ensure_dir "$dest"
+    fi
+    if need_cmd tar && (cd "$SOURCE_PROJECT_DIR" && tar -cf - --null -T "$SCAN_FILE_LIST" 2>/dev/null) | (cd "$dest" && tar -xf - 2>/dev/null) && dest_has_files; then
+      FILTERED_PROJECT_DIR="$dest"
+      PROJECT_DIR="$FILTERED_PROJECT_DIR"
+      say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files, tar fallback)"
+      return 0
+    fi
+    rm -rf "$dest" 2>/dev/null || true
+    ensure_dir "$dest"
+    if need_cmd python3 && python3 - "$SOURCE_PROJECT_DIR" "$dest" "$SCAN_FILE_LIST" <<'PY' 2>/dev/null
+import os
+import shutil
+import sys
+
+src, dst = os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2])
+with open(sys.argv[3], "rb") as fh:
+    for rel in fh.read().split(b"\0"):
+        if not rel:
+            continue
+        target = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        try:
+            shutil.copy2(os.path.join(src, rel), target, follow_symlinks=False)
+        except (OSError, shutil.Error):
+            pass
+PY
+    then
+      if dest_has_files; then
+        FILTERED_PROJECT_DIR="$dest"
+        PROJECT_DIR="$FILTERED_PROJECT_DIR"
+        say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files, python fallback)"
+        return 0
+      fi
+    fi
+    say "${YELLOW}${WARN}${RESET} Could not copy the scan file list; copying the whole tree instead"
+    rm -rf "$dest" 2>/dev/null || true
+    ensure_dir "$dest"
+  fi
+
   # Try rsync first (fastest and most reliable)
   if need_cmd rsync; then
     local -a args=(-a --delete)
@@ -3497,6 +3659,7 @@ cleanup(){
     wait "$TEE_PID" 2>/dev/null || true
     TEE_PID=""
   fi
+  [[ -n "${SCAN_FILE_LIST:-}" && -f "$SCAN_FILE_LIST" ]] && rm -f "$SCAN_FILE_LIST" 2>/dev/null
   local dir="${TMPDIR_RUN:-}"
   [[ -n "$dir" && "$dir" != "/" ]] || return 0
   rm -rf "$dir" 2>/dev/null || true
@@ -4835,7 +4998,7 @@ case "$FORMAT" in
             say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
           if [[ "$UBS_PROFILE" == "1" ]]; then
-            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (copy " + (.copy_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")"')"
+            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", copy " + (.copy_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")"')"
           fi
           if [[ -n "$COMPARISON_FILE" && -f "$COMPARISON_FILE" ]]; then
             say "$(jq -r --slurpfile base "$COMPARISON_FILE" --arg path "$COMPARISON_FILE" '

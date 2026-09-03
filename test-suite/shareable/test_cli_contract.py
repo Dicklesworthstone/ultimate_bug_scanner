@@ -348,6 +348,40 @@ def check_file_list_workspace() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_workspaces_without_rsync() -> None:
+    # Git for Windows ships no rsync (bead B11): explicit multi-file targets,
+    # directory targets and --staged must still scan, through tar or python,
+    # with the same totals as the rsync path. UBS_TEST_NO_RSYNC=1 is the seam.
+    buggy = REPO_ROOT / "test-suite" / "python" / "security" / "parser_token_compare_buggy.py"
+    args = [str(buggy), str(PY_CLEAN), "--ci", "--only=python", "--format=json"]
+    with_rsync = run(args)
+    without = run(args, env={"UBS_TEST_NO_RSYNC": "1"})
+    ok = False
+    detail = f"exit={with_rsync.returncode}/{without.returncode}"
+    try:
+        a = json.loads(with_rsync.stdout)["totals"]
+        b = json.loads(without.stdout)["totals"]
+        ok = a == b and a["files"] == 2 and "copied with tar" in without.stderr and "rsync not found" not in without.stderr
+        detail += f" totals={a} vs {b}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" {exc}"
+    report("explicit_targets_without_rsync", ok, detail, without if not ok else None)
+
+    dir_args = [str(REPO_ROOT / "test-suite" / "python" / "security"), str(PY_CLEAN), "--ci", "--only=python", "--format=json"]
+    with_rsync = run(dir_args)
+    without = run(dir_args, env={"UBS_TEST_NO_RSYNC": "1"})
+    ok = False
+    detail = f"exit={with_rsync.returncode}/{without.returncode}"
+    try:
+        a = json.loads(with_rsync.stdout)["totals"]
+        b = json.loads(without.stdout)["totals"]
+        ok = a == b and a["files"] > 2 and "copied with tar" in without.stderr
+        detail += f" totals={a} vs {b}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" {exc}"
+    report("directory_target_without_rsync", ok, detail, without if not ok else None)
+
+
 def check_single_file_fast_path() -> None:
     # One explicit source file is scanned in place (bead C3): only its language
     # runs, no workspace is announced, and sample paths are the real path.
@@ -652,6 +686,7 @@ def main() -> int:
         check_size_refusal_envelope,
         check_file_list_workspace,
         check_single_file_fast_path,
+        check_workspaces_without_rsync,
     ):
         try:
             check()

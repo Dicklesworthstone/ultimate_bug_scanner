@@ -83,7 +83,12 @@ declare -A HELPER_CHECKSUMS=(
 # ─────────────────────────────────────────────────────────────────────────────
 # Capabilities & helpers (must be defined before first use)
 # ─────────────────────────────────────────────────────────────────────────────
-need_cmd(){ command -v "$1" >/dev/null 2>&1; }
+need_cmd(){
+  # Test seam (bead B11): pretend rsync is absent, as on Git for Windows, so the
+  # tar/python workspace tiers can be exercised on a box that has rsync.
+  if [[ "${1:-}" == "rsync" && "${UBS_TEST_NO_RSYNC:-0}" == "1" ]]; then return 1; fi
+  command -v "$1" >/dev/null 2>&1
+}
 date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
 
 # Milliseconds since the epoch (bash 5 EPOCHREALTIME, else date +%s%N).
@@ -1549,43 +1554,86 @@ PY
 # workspace exactly as before: nothing about the module contract changes here.
 SCAN_DATA_EXTENSIONS="png,jpg,jpeg,gif,bmp,ico,webp,tif,tiff,psd,svg,heic,mp3,wav,flac,ogg,m4a,aac,mp4,mov,avi,mkv,webm,ttf,otf,woff,woff2,eot,zip,tar,gz,tgz,bz2,xz,zst,7z,rar,jar,war,ear,whl,egg,o,obj,a,lib,so,dll,dylib,exe,bin,class,pyc,pyo,wasm,pdb,db,sqlite,sqlite3,parquet,arrow,feather,npy,npz,pkl,pickle,h5,hdf5,pt,pth,ckpt,safetensors,onnx,pb,tflite,gguf,csv,tsv,jsonl,ndjson,avro,orc,pdf,doc,docx,xls,xlsx,ppt,pptx,map,log,iso,img,dmg,pkg,deb,rpm,apk,ipa"
 
-build_scan_file_list(){
-  [[ "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" ]] || return 1
-  need_cmd rg && need_cmd python3 || return 1
-  local t0 pat list stats
-  t0="$(now_ms)"
-  local -a rg_args=(--files -0 --hidden --no-ignore --no-messages) pats
-  IFS=',' read -r -a pats <<<"$GLOBAL_EXCLUDE_PATTERNS"
+# rg globs for the ignore patterns (.ubsignore/rsync semantics: a bare name
+# matches at any depth; a pattern with a slash matches anywhere unless anchored
+# with a leading slash). Prints one -g argument per line.
+ignore_globs_for_rg(){
+  local pat
+  local -a pats
+  IFS=',' read -r -a pats <<<"${1:-}"
   for pat in "${pats[@]}"; do
     [[ -z "$pat" ]] && continue
-    # .ubsignore/rsync semantics: a bare name matches at any depth; a pattern
-    # with a slash matches anywhere unless anchored with a leading slash.
     case "$pat" in
-      /*) rg_args+=( -g "!${pat#/}" ) ;;
-      \*\*/*) rg_args+=( -g "!$pat" ) ;;
-      */*) rg_args+=( -g "!**/$pat" ) ;;
-      *) rg_args+=( -g "!$pat" ) ;;
+      /*) printf '%s\n' "!${pat#/}" ;;
+      \*\*/*) printf '%s\n' "!$pat" ;;
+      */*) printf '%s\n' "!**/$pat" ;;
+      *) printf '%s\n' "!$pat" ;;
     esac
   done
-  list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
-  local raw="$list.raw" rg_rc=0
-  # rg exits 1 when nothing matched (an empty tree is a valid answer), 2 on error.
-  (cd "$SOURCE_PROJECT_DIR" && rg "${rg_args[@]}" > "$raw" 2>/dev/null) || rg_rc=$?
-  if [[ "$rg_rc" -gt 1 ]]; then
-    rm -f "$list" "$raw" 2>/dev/null
-    return 1
+}
+
+# List the files to scan under ROOT into OUT (NUL-separated, relative to ROOT):
+# rg --files with the ignore globs when rg is present, else a Python walk with
+# fnmatch on the same patterns; then the Python filter drops binary/data
+# extensions and files above UBS_MAX_FILE_MB and sums the rest. Prints
+# "<kept> <bytes> <skipped_big> <skipped_data>". Needs python3.
+list_scan_files(){
+  local root="$1" out="$2" raw rg_rc=0 mode="list"
+  need_cmd python3 || return 1
+  raw="$out.raw"
+  if need_cmd rg; then
+    local -a rg_args=(--files -0 --hidden --no-ignore --no-messages) globs
+    mapfile -t globs < <(ignore_globs_for_rg "$GLOBAL_EXCLUDE_PATTERNS")
+    local g
+    for g in "${globs[@]}"; do rg_args+=( -g "$g" ); done
+    # rg exits 1 when nothing matched (an empty tree is a valid answer), 2 on error.
+    (cd "$root" && rg "${rg_args[@]}" > "$raw" 2>/dev/null) || rg_rc=$?
+    if [[ "$rg_rc" -gt 1 ]]; then rm -f "$raw" 2>/dev/null; return 1; fi
+  else
+    mode="walk"
+    : > "$raw"
   fi
-  if ! stats="$(python3 - "$SOURCE_PROJECT_DIR" "$raw" "$list" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" <<'PY'
+  local stats
+  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" <<'PY'
+import fnmatch
 import os
 import sys
 
 root = os.fsencode(sys.argv[1])
 raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
 data_exts = set(sys.argv[5].split(","))
+mode, patterns = sys.argv[6], [p for p in sys.argv[7].split(",") if p]
 cap = max_mb * 1024 * 1024 if max_mb > 0 else 0
+
+
+def excluded(rel, name):
+    for pat in patterns:
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat):
+            return True
+        for part in rel.split("/"):
+            if fnmatch.fnmatch(part, pat):
+                return True
+    return False
+
+
+entries = []
+if mode == "walk":
+    for base, dirs, files in os.walk(root, topdown=True):
+        rel_root = os.path.relpath(base, root)
+        keep = []
+        for d in dirs:
+            rel = d if rel_root == "." else os.path.join(rel_root, d)
+            if not excluded(os.fsdecode(rel), os.fsdecode(d)):
+                keep.append(d)
+        dirs[:] = keep
+        for f in files:
+            rel = f if rel_root == "." else os.path.join(rel_root, f)
+            if not excluded(os.fsdecode(rel), os.fsdecode(f)):
+                entries.append(rel)
+else:
+    with open(raw, "rb") as fh:
+        entries = fh.read().split(b"\0")
 kept, total, big, data = [], 0, 0, 0
-with open(raw, "rb") as fh:
-    entries = fh.read().split(b"\0")
 for rel in entries:
     if not rel:
         continue
@@ -1597,23 +1645,87 @@ for rel in entries:
         data += 1
         continue
     try:
-        size = os.stat(os.path.join(root, rel), follow_symlinks=False).st_size
+        st = os.lstat(os.path.join(root, rel))
     except OSError:
         continue
-    if cap and size > cap:
+    if not os.path.isfile(os.path.join(root, rel)):
+        continue
+    if cap and st.st_size > cap:
         big += 1
         continue
     kept.append(rel)
-    total += size
+    total += st.st_size
 with open(out, "wb") as fh:
     fh.write(b"\0".join(kept) + (b"\0" if kept else b""))
 print(len(kept), total, big, data)
 PY
 )"; then
-    rm -f "$list" "$raw" 2>/dev/null
+    rm -f "$raw" 2>/dev/null
     return 1
   fi
   rm -f "$raw" 2>/dev/null
+  printf '%s\n' "$stats"
+}
+
+# Copy the files named in LIST (NUL-separated, relative to SRC) into DEST,
+# preserving the hierarchy: rsync when present, else tar, else Python. Prints
+# the tier used when it is not rsync. Returns 1 when every tier failed or DEST
+# ended up without files.
+copy_file_list(){
+  local src="$1" list="$2" dest="$3" label="${4:-scan workspace}"
+  [[ -s "$list" ]] || return 1
+  ensure_dir "$dest"
+  has_files(){ [[ -n "$(find "$dest" -type f 2>/dev/null | head -n 1)" ]]; }
+  if need_cmd rsync; then
+    local rsync_err="$TMPDIR_RUN/rsync_stderr_copy.txt" rsync_rc=0
+    rsync -a --from0 --files-from="$list" "$src"/ "$dest"/ >/dev/null 2>"$rsync_err" || rsync_rc=$?
+    if [[ "$rsync_rc" -eq 0 ]] && has_files; then return 0; fi
+    report_rsync_failure "$rsync_rc" "$rsync_err"
+    rm -rf "$dest" 2>/dev/null || true
+    ensure_dir "$dest"
+  fi
+  if need_cmd tar && (cd "$src" && tar -cf - --null -T "$list" 2>/dev/null) | (cd "$dest" && tar -xf - 2>/dev/null) && has_files; then
+    say "${DIM}${INFO}${RESET} ${label}: copied with tar (rsync unavailable)"
+    return 0
+  fi
+  rm -rf "$dest" 2>/dev/null || true
+  ensure_dir "$dest"
+  if need_cmd python3 && python3 - "$src" "$dest" "$list" <<'PY' 2>/dev/null
+import os
+import shutil
+import sys
+
+src, dst = os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2])
+with open(sys.argv[3], "rb") as fh:
+    for rel in fh.read().split(b"\0"):
+        if not rel:
+            continue
+        target = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        try:
+            shutil.copy2(os.path.join(src, rel), target, follow_symlinks=False)
+        except (OSError, shutil.Error):
+            pass
+PY
+  then
+    if has_files; then
+      say "${DIM}${INFO}${RESET} ${label}: copied with python (rsync and tar unavailable)"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+build_scan_file_list(){
+  [[ "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" ]] || return 1
+  need_cmd python3 || return 1
+  local t0 list stats
+  t0="$(now_ms)"
+  list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
+  if ! stats="$(list_scan_files "$SOURCE_PROJECT_DIR" "$list")"; then
+    rm -f "$list" 2>/dev/null
+    return 1
+  fi
   read -r SCAN_LIST_COUNT SCAN_LIST_BYTES SCAN_LIST_SKIPPED_BIG SCAN_LIST_SKIPPED_DATA <<<"$stats"
   if [[ ! "$SCAN_LIST_COUNT" =~ ^[0-9]+$ || ! "$SCAN_LIST_BYTES" =~ ^[0-9]+$ ]]; then
     rm -f "$list" 2>/dev/null
@@ -1966,31 +2078,22 @@ for line in sys.stdin:
     exit 0
   fi
   
-  if ! need_cmd rsync; then
-    say "${RED}$X rsync not found; required for --$mode${RESET}"
-    exit 1
-  fi
-  
   local dest="$TMPDIR_RUN/git_scan"
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
-  
+
   say "${BLUE}${INFO} Preparing shadow workspace for $mode files (${#files[@]} detected)${RESET}"
-  
-  # Use rsync with --files-from to copy only the target files while preserving hierarchy
-  local file_list="$TMPDIR_RUN/files_to_scan.txt"
-  printf "%s\n" "${files[@]}" > "$file_list"
-  
-  local rsync_err="$TMPDIR_RUN/rsync_stderr_git.txt"
-  local rsync_rc=0
-  rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>"$rsync_err" || rsync_rc=$?
-  if [[ "$rsync_rc" -eq 0 ]]; then
+
+  # NUL-separated list (names may contain anything but NUL); copy_file_list
+  # picks rsync, tar or python (bead B11: Git for Windows has no rsync).
+  local file_list="$TMPDIR_RUN/files_to_scan.0"
+  printf '%s\0' "${files[@]}" > "$file_list"
+  if copy_file_list "$scan_root" "$file_list" "$dest" "--$mode workspace"; then
     FILTERED_PROJECT_DIR="$dest"
     PROJECT_DIR="$FILTERED_PROJECT_DIR"
     say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
   else
     say "${RED}$X Failed to prepare shadow workspace${RESET}"
-    report_rsync_failure "$rsync_rc" "$rsync_err"
     exit 1
   fi
 }
@@ -2071,11 +2174,6 @@ prepare_files_workspace(){
     exit 2
   fi
 
-  if ! need_cmd rsync; then
-    say "${RED}$X rsync not found; required for explicit target scans${RESET}"
-    exit 1
-  fi
-
   local dest="$TMPDIR_RUN/files_scan"
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
@@ -2083,40 +2181,28 @@ prepare_files_workspace(){
   say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved_files[@]} file(s) and ${#dir_src[@]} directory target(s)${RESET}"
 
   if [[ ${#resolved_files[@]} -gt 0 ]]; then
-    local file_list="$TMPDIR_RUN/explicit_files.txt"
-    printf "%s\n" "${resolved_files[@]}" > "$file_list"
-    local rsync_err="$TMPDIR_RUN/rsync_stderr_files.txt"
-    local rsync_rc=0
-    rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>"$rsync_err" || rsync_rc=$?
-    if [[ "$rsync_rc" -ne 0 ]]; then
+    local file_list="$TMPDIR_RUN/explicit_files.0"
+    printf '%s\0' "${resolved_files[@]}" > "$file_list"
+    if ! copy_file_list "$scan_root" "$file_list" "$dest" "files workspace"; then
       say "${RED}$X Failed to prepare files workspace${RESET}"
-      report_rsync_failure "$rsync_rc" "$rsync_err"
       exit 1
     fi
   fi
 
   if [[ ${#dir_src[@]} -gt 0 ]]; then
-    # Directory targets honor the global ignore patterns (defaults + .ubsignore),
-    # same as a whole-project scan (see apply_ignore_filters).
-    local -a dir_excludes=()
-    local pat
-    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
-      local -a _pats
-      IFS=',' read -r -a _pats <<<"$GLOBAL_EXCLUDE_PATTERNS"
-      for pat in "${_pats[@]}"; do
-        [[ -z "$pat" ]] && continue
-        dir_excludes+=( "--exclude=$pat" )
-      done
-    fi
-    local i
+    # Directory targets are listed exactly like a whole-project scan (ignore
+    # patterns, binary/data extensions and UBS_MAX_FILE_MB applied) and copied
+    # through copy_file_list, so they need neither rsync nor rsync's --exclude.
+    local i dir_list
     for ((i=0; i<${#dir_src[@]}; i++)); do
       ensure_dir "$dest/${dir_rel[$i]}"
-      local dir_rsync_err="$TMPDIR_RUN/rsync_stderr_dir.txt"
-      local dir_rsync_rc=0
-      rsync -a "${dir_excludes[@]}" "${dir_src[$i]}"/ "$dest/${dir_rel[$i]}"/ >/dev/null 2>"$dir_rsync_err" || dir_rsync_rc=$?
-      if [[ "$dir_rsync_rc" -ne 0 ]]; then
+      dir_list="$TMPDIR_RUN/dir_target_$i.0"
+      if ! list_scan_files "${dir_src[$i]}" "$dir_list" >/dev/null; then
+        say "${RED}$X Failed to list directory target${RESET}: ${dir_src[$i]} (needs python3)"
+        exit 1
+      fi
+      if [[ -s "$dir_list" ]] && ! copy_file_list "${dir_src[$i]}" "$dir_list" "$dest/${dir_rel[$i]}" "directory target"; then
         say "${RED}$X Failed to copy directory target${RESET}: ${dir_src[$i]}"
-        report_rsync_failure "$dir_rsync_rc" "$dir_rsync_err"
         exit 1
       fi
     done
@@ -2764,51 +2850,11 @@ apply_ignore_filters(){
   # File-list workspace (bead B4): copy exactly the files build_scan_file_list
   # kept, so data directories and oversized files never reach the workspace.
   if [[ -n "$SCAN_FILE_LIST" && -s "$SCAN_FILE_LIST" ]]; then
-    if need_cmd rsync; then
-      local rsync_err="$TMPDIR_RUN/rsync_stderr_scan.txt" rsync_rc=0
-      rsync -a --from0 --files-from="$SCAN_FILE_LIST" "$SOURCE_PROJECT_DIR"/ "$dest"/ >/dev/null 2>"$rsync_err" || rsync_rc=$?
-      if [[ "$rsync_rc" -eq 0 ]] && dest_has_files; then
-        FILTERED_PROJECT_DIR="$dest"
-        PROJECT_DIR="$FILTERED_PROJECT_DIR"
-        say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files)"
-        return 0
-      fi
-      report_rsync_failure "$rsync_rc" "$rsync_err"
-      rm -rf "$dest" 2>/dev/null || true
-      ensure_dir "$dest"
-    fi
-    if need_cmd tar && (cd "$SOURCE_PROJECT_DIR" && tar -cf - --null -T "$SCAN_FILE_LIST" 2>/dev/null) | (cd "$dest" && tar -xf - 2>/dev/null) && dest_has_files; then
+    if copy_file_list "$SOURCE_PROJECT_DIR" "$SCAN_FILE_LIST" "$dest" "scan workspace"; then
       FILTERED_PROJECT_DIR="$dest"
       PROJECT_DIR="$FILTERED_PROJECT_DIR"
-      say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files, tar fallback)"
+      say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files)"
       return 0
-    fi
-    rm -rf "$dest" 2>/dev/null || true
-    ensure_dir "$dest"
-    if need_cmd python3 && python3 - "$SOURCE_PROJECT_DIR" "$dest" "$SCAN_FILE_LIST" <<'PY' 2>/dev/null
-import os
-import shutil
-import sys
-
-src, dst = os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2])
-with open(sys.argv[3], "rb") as fh:
-    for rel in fh.read().split(b"\0"):
-        if not rel:
-            continue
-        target = os.path.join(dst, rel)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        try:
-            shutil.copy2(os.path.join(src, rel), target, follow_symlinks=False)
-        except (OSError, shutil.Error):
-            pass
-PY
-    then
-      if dest_has_files; then
-        FILTERED_PROJECT_DIR="$dest"
-        PROJECT_DIR="$FILTERED_PROJECT_DIR"
-        say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files, python fallback)"
-        return 0
-      fi
     fi
     say "${YELLOW}${WARN}${RESET} Could not copy the scan file list; copying the whole tree instead"
     rm -rf "$dest" 2>/dev/null || true

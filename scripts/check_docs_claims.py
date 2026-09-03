@@ -238,8 +238,75 @@ def check_installer_flags() -> None:
     report("installer-flags", not missing, "help lists flags with no parser arm: " + ", ".join(missing) if missing else f"{len(helped)} installer flags all parsed")
 
 
+MODULE_ARM_RE = re.compile(r"^\s*((?:-[a-zA-Z]\|)?--[a-z][a-z0-9-]*(?:=\*)?(?:\|[^)\n]+)?)\)", re.M)
+
+
+def module_parser_flags() -> dict[str, set[str]]:
+    """Flags each modules/ubs-<lang>.sh accepts, read from its case arms."""
+    out: dict[str, set[str]] = {}
+    for path in sorted((ROOT / "modules").glob("ubs-*.sh")):
+        arms: set[str] = set()
+        for m in MODULE_ARM_RE.finditer(path.read_text(encoding="utf-8", errors="replace")):
+            for part in m.group(1).split("|"):
+                part = part.strip()
+                if part.startswith("--"):
+                    arms.add(part.split("=", 1)[0])
+        out[path.stem.removeprefix("ubs-")] = arms
+    return out
+
+
+def check_module_readme() -> None:
+    """modules/README.md names every module on disk, and every flag in its
+    Options block exists in the parser of every module it is claimed for
+    (all modules by default, the parenthesised subset, or all-except-X)."""
+    text = (ROOT / "modules" / "README.md").read_text(encoding="utf-8")
+    parsers = module_parser_flags()
+    on_disk = set(parsers)
+    problems: list[str] = []
+    intro = re.search(r"current modules: ([^\n]*)", text)
+    listed = set(re.findall(r"`([a-z]+)`", intro.group(1))) if intro else set()
+    missing = sorted(on_disk - listed)
+    if missing:
+        problems.append("modules on disk not named in the intro: " + ", ".join(missing))
+    block = re.search(r"Options:\n(.*?)```", text, re.S)
+    lines = block.group(1).splitlines() if block else []
+    checked = 0
+    expected_by_flag: dict[str, set[str]] = {}
+    for line in lines:
+        m = re.match(r"^(?:-[a-zA-Z], )?(--[a-z][a-z0-9-]*)", line.strip())
+        if not m:
+            continue
+        flag = m.group(1)
+        if flag == "--help":
+            continue
+        rest = line[m.end():]
+        expected = set(on_disk)
+        except_m = re.search(r"all modules except ([a-z]+)", rest)
+        subset_m = re.search(r"\(([a-z]+(?:, [a-z]+)+)\)", rest)
+        same_m = re.search(r"same modules as (--[a-z-]+)", rest)
+        if except_m:
+            expected -= {except_m.group(1)}
+        elif subset_m:
+            expected = set(subset_m.group(1).split(", "))
+        elif same_m:
+            if same_m.group(1) not in expected_by_flag:
+                problems.append(f"{flag}: refers to {same_m.group(1)}, which is documented later or not at all")
+                continue
+            expected = set(expected_by_flag[same_m.group(1)])
+        expected_by_flag[flag] = expected
+        for lang in sorted(expected):
+            if lang not in parsers:
+                problems.append(f"{flag}: README names unknown module {lang}")
+            elif flag not in parsers[lang]:
+                problems.append(f"{flag}: README claims {lang} accepts it, but modules/ubs-{lang}.sh has no parser arm")
+        checked += 1
+    if checked == 0:
+        problems.append("no Options block found in modules/README.md")
+    report("module-readme", not problems, "; ".join(problems) if problems else f"{checked} documented flags verified against {len(parsers)} module parsers")
+
+
 def main() -> int:
-    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags):
+    for check in (check_flags, check_languages, check_helpers, check_version, check_python_pin, check_exit_codes, check_installer_flags, check_module_readme):
         try:
             check()
         except Exception as exc:  # noqa: BLE001

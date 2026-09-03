@@ -147,7 +147,7 @@ resolve_python3(){
   return 0
 }
 resolve_python3 || true
-date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
+date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T\n' -1; else printf '%(%Y-%m-%d %H:%M:%S)T\n' -1; fi; }
 
 # Milliseconds since the epoch (bash 5 EPOCHREALTIME, else date +%s%N).
 now_ms(){
@@ -430,7 +430,8 @@ looks_like_toon_rust_encoder(){
 print_with_permalinks(){
   local file="$1"
   if [[ -z "$file" || ! -s "$file" ]]; then return; fi
-  if [[ -z "$GIT_BLOB_BASE" ]]; then
+  # With the one-pass post-processor (bead C3b) the links are already in the file.
+  if [[ -z "$GIT_BLOB_BASE" || -f "${TMPDIR_RUN:-/nonexistent}/postprocess.py" ]]; then
     cat "$file"
     return
   fi
@@ -4675,6 +4676,38 @@ def summary_from_text(text: str, a) -> dict:
             "warning": warning, "info": info, "timestamp": a.timestamp}
 
 
+PERMALINK = re.compile(r"^(\s*)((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?")
+
+
+def add_permalinks(text: str, a) -> str:
+    """Append ' (<blob>/<path>#L<n>)' to file:line references (bead B5 text form)."""
+    if not a.blob_base:
+        return text
+    root = Path(a.source).resolve()
+    top = Path(a.toplevel or a.source).resolve()
+    blob = a.blob_base.rstrip("/")
+    out = []
+    for raw in text.splitlines(keepends=True):
+        m = PERMALINK.match(raw)
+        if not m:
+            out.append(raw)
+            continue
+        candidate = Path((m.group(2) or "").strip())
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        try:
+            resolved = candidate.resolve(strict=True)
+            rel = resolved.relative_to(top)
+        except Exception:
+            out.append(raw)
+            continue
+        if not resolved.is_file():
+            out.append(raw)
+            continue
+        out.append(raw.rstrip("\n") + f" ({blob}/{rel.as_posix()}#L{m.group(3)})\n")
+    return "".join(out)
+
+
 def apply_partial(doc: dict, text: str) -> None:
     for ln in ANSI.sub("", text).splitlines():
         m = PARTIAL.match(ln)
@@ -4708,14 +4741,15 @@ def is_summary(doc) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress"):
+    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress", "blob_base", "toplevel"):
         ap.add_argument("--" + name.replace("_", "-"), default="")
     a = ap.parse_args()
     if a.mode == "text":
         raw = Path(a.raw).read_text(encoding="utf-8", errors="replace") if os.path.isfile(a.raw) else ""
         text = restore_text(raw if a.no_suppress == "1" else suppress(raw), a)
-        Path(a.txt).write_text(text, encoding="utf-8")
         doc = summary_from_text(text, a)
+        text = add_permalinks(text, a)
+        Path(a.txt).write_text(text, encoding="utf-8")
         apply_partial(doc, text)
         attach_metrics(doc, a.metrics_dir)
         Path(a.json).write_text(json.dumps(doc), encoding="utf-8")
@@ -4754,7 +4788,7 @@ postprocess_module(){
   python3 "$TMPDIR_RUN/postprocess.py" --mode "$mode" --lang "$lang" --raw "$raw" --txt "$txt" --json "$json" \
     --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "${FILTERED_PROJECT_DIR:-}" \
     --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
-    --no-suppress "$no_suppress"
+    --no-suppress "$no_suppress" --blob-base "${GIT_BLOB_BASE:-}" --toplevel "${GIT_TOPLEVEL:-}"
 }
 
 # Text-mode partial marker (bead D10). A module that could not evaluate part of

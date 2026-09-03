@@ -599,11 +599,13 @@ test_local_requires_flag() {
   ctx="$(mktemp_dir)"
   tmpdirs+=("$ctx")
   local home="$ctx/home" proj="$ctx/proj" inst="$ctx/inst" log="$ctx/install.log"
-  mkdir -p "$home/.local/bin" "$proj" "$inst"
+  mkdir -p "$home/.local/bin" "$proj/modules" "$inst"
   # Installer copied away from the checkout so the "repo checkout" rule does not apply.
   cp "$INSTALLER" "$inst/install.sh"
   printf '#!/usr/bin/env bash\n# Ultimate Bug Scanner (fake local runner for the installer test)\ncase "${1:-}" in --version) echo "UBS Meta-Runner v0.0.0-local-test";; *) echo "fake ubs: $*";; esac\nexit 0\n' >"$proj/ubs"
+  printf '#!/usr/bin/env bash\necho local rust module\n' >"$proj/modules/ubs-rust.sh"
   chmod +x "$proj/ubs"
+  chmod +x "$proj/modules/ubs-rust.sh"
 
   local rc=0
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
@@ -626,6 +628,12 @@ test_local_requires_flag() {
       --skip-version-check --no-path-modify --install-dir "$home/.local/bin") >"$ctx/install-local.log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ] || ! cmp -s "$proj/ubs" "$home/.local/bin/ubs"; then
     echo "[FAIL] --local did not install ./ubs from the current directory (exit $rc, log: $ctx/install-local.log)"
+    tail -n 30 "$ctx/install-local.log" || true
+    tests_failed=1
+    return 1
+  fi
+  if ! cmp -s "$proj/modules/ubs-rust.sh" "$home/.local/share/ubs/modules/ubs-rust.sh"; then
+    echo "[FAIL] --local did not seed the matching adjacent module cache (log: $ctx/install-local.log)"
     tail -n 30 "$ctx/install-local.log" || true
     tests_failed=1
     return 1
@@ -672,8 +680,8 @@ SHIM
   # The install dir is deliberately NOT on PATH so the installer also writes
   # its PATH block and alias into ~/.bashrc, which the uninstall must strip.
   (cd "$proj" && CRONTAB_SHIM_FILE="$ctx/crontab.txt" UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" \
-    HOME="$home" PATH="$shim:$PATH" SHELL=/bin/bash \
-    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-doctor \
+    HOME="$home" PATH="$shim:/usr/local/bin:/usr/bin:/bin" SHELL=/bin/bash \
+    "$INSTALLER" --easy-mode --skip-ast-grep --skip-ripgrep --skip-jq --skip-typos --skip-toon --skip-bun --skip-type-narrowing --skip-doctor \
       --skip-version-check --install-dir "$home/.local/bin") >"$ctx/install.log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[FAIL] easy-mode install exited $rc (log: $ctx/install.log)"

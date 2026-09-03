@@ -192,6 +192,7 @@ SKIP_JQ=0
 SKIP_TYPOS=0
 SKIP_TOON=0       # --skip-toon: leave toon_rust's encoder (--format=toon) alone
 LOCAL_INSTALL=0   # --local: install ./ubs from the current directory
+LOCAL_SOURCE_DIR="" # Directory whose adjacent modules must match a local runner
 SKIP_BUN=0
 SKIP_TYPE_NARROWING=0
 SKIP_HOOKS=0
@@ -281,7 +282,7 @@ HELP
   print_help_option "--non-interactive" "Skip all prompts (use defaults)"
   print_help_option "--update" "Force reinstall to latest version"
   print_help_option "--install-dir DIR" "Custom installation directory"
-  print_help_option "--local" "Install ./ubs from the current directory instead of the verified release (a repo checkout installs its own ubs automatically)"
+  print_help_option "--local" "Install ./ubs and adjacent modules from the current directory instead of the verified release (a repo checkout installs its own files automatically)"
   print_help_option "--system" "Install to /usr/local/bin (uses sudo if needed)"
   print_help_option "--no-path-modify" "Skip shell RC edits and alias creation"
   echo ""
@@ -3067,6 +3068,7 @@ install_scanner() {
   fi
 
   if [ -n "$local_source" ]; then
+    LOCAL_SOURCE_DIR="$(cd "$(dirname "$local_source")" 2>/dev/null && pwd)"
     log "Installing from local file $local_source (no release verification: you chose this file)..."
     if cp "$local_source" "$temp_path" 2>/dev/null; then
       if head -n 1 "$temp_path" | grep -q '^#!/.*bash'; then
@@ -3176,6 +3178,24 @@ install_scanner() {
     error "Installation failed - file not executable or empty"
     return 1
   fi
+}
+
+install_local_module_cache() {
+  [ -n "$LOCAL_SOURCE_DIR" ] || return 0
+  local source_modules="$LOCAL_SOURCE_DIR/modules"
+  [ -d "$source_modules" ] || return 0
+
+  local module_cache="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
+  if dry_run_enabled; then
+    log_dry_run "Would seed the module cache from $source_modules."
+    return 0
+  fi
+
+  if ! mkdir -p "$module_cache" || ! cp -R "$source_modules/." "$module_cache/"; then
+    error "Failed to seed local modules from $source_modules into $module_cache"
+    return 1
+  fi
+  success "Installed matching local modules to: $module_cache"
 }
 
 is_in_path() {
@@ -4405,6 +4425,10 @@ echo ""
 
 if ! install_scanner; then
 error "Installation failed"
+exit 1
+fi
+if ! install_local_module_cache; then
+error "Local module installation failed"
 exit 1
 fi
 echo ""

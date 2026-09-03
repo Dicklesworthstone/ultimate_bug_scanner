@@ -373,8 +373,9 @@ bash install.sh --dry-run --no-path-modify --skip-hooks --non-interactive
 # CI-friendly install that self-tests the smoke harness
 bash install.sh --easy-mode --self-test --skip-hooks
 
-# Install the ubs in the current directory (a checkout's install.sh does this by itself;
-# without --local a stray ./ubs is ignored and the verified release is installed)
+# Install the ubs and matching adjacent modules in the current directory (a checkout's
+# install.sh does this by itself; without --local a stray ./ubs is ignored and the
+# verified release is installed)
 bash install.sh --local --skip-hooks
 ```
 

@@ -286,7 +286,7 @@ def _selftest_run(tmp_prefix: str = "ubs_core_lifecycle_csharp_") -> None:
 
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("stream_leak_detected", _selftest_stream_leak),
-    ("using_suppression", _selftest_using_suppression),
+    ("suppression", _selftest_suppression),
     ("run_finds_leak", _selftest_run),
 )
 

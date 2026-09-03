@@ -4016,7 +4016,6 @@ fi
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
-if need_cmd python3; then write_postprocess_script; fi
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-module time bound + process-group teardown (issue #60)
@@ -5421,6 +5420,8 @@ say "${CYAN}${BOLD}UBS Meta-Runner v${UBS_VERSION}${RESET}  ${DIM}$(date_iso)${R
 say "${WHITE}Project:${RESET} ${CYAN}$SOURCE_PROJECT_DIR${RESET}"
 say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"
 
+# One post-processing script per run (bead C3b); defined above, used by run_lang.
+if need_cmd python3; then write_postprocess_script; fi
 read -r -a langs <<<"$(select_langs)"
 if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"

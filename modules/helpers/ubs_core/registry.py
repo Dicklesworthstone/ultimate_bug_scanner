@@ -1,7 +1,8 @@
 """ubs_core.registry — analyzer registry and run context (bead A2).
 
-Analyzers register under a (layer, language) pair. `layer` is one of the
-subcommand names of `python3 -m ubs_core`; `scan` aggregates every layer.
+Analyzers register under a (layer, language) pair; several analyzers may share
+one (layer, language). `layer` is one of the subcommand names of
+`python3 -m ubs_core`; `scan` aggregates every layer.
 """
 from __future__ import annotations
 
@@ -69,27 +70,28 @@ class Analyzer:
             raise ValueError(f"unknown lang: {self.lang}")
 
 
-_REGISTRY: dict[tuple[str, Lang], Analyzer] = {}
+_REGISTRY: dict[tuple[str, Lang], list[Analyzer]] = {}
 
 
 def register(analyzer: Analyzer) -> Analyzer:
     key = (analyzer.layer, analyzer.lang)
-    if key in _REGISTRY:
-        raise ValueError(f"duplicate analyzer for {key}: {analyzer.name}")
-    _REGISTRY[key] = analyzer
+    bucket = _REGISTRY.setdefault(key, [])
+    if any(existing.name == analyzer.name for existing in bucket):
+        raise ValueError(f"duplicate analyzer name: {analyzer.name}")
+    bucket.append(analyzer)
     return analyzer
 
 
-def get(layer: str, lang: Lang) -> Analyzer:
+def get(layer: str, lang: Lang) -> list[Analyzer]:
     try:
-        return _REGISTRY[(layer, lang)]
+        return list(_REGISTRY[(layer, lang)])
     except KeyError:
         raise KeyError(f"no analyzer registered for layer={layer!r} lang={lang!r}") from None
 
 
 def all_analyzers() -> Iterator[Analyzer]:
     for key in sorted(_REGISTRY):
-        yield _REGISTRY[key]
+        yield from _REGISTRY[key]
 
 
 def analyzers_for_layer(layer: str) -> list[Analyzer]:
@@ -116,8 +118,9 @@ def _coerce_finding(raw: dict) -> dict:
 
 def run_layer(layer: str, ctx: RunContext) -> Iterator[dict]:
     """Yield normalized findings for one layer and language."""
-    for raw in get(layer, ctx.lang).run(ctx):
-        yield _coerce_finding(raw)
+    for analyzer in get(layer, ctx.lang):
+        for raw in analyzer.run(ctx):
+            yield _coerce_finding(raw)
 
 
 def run_scan(ctx: RunContext) -> Iterator[dict]:

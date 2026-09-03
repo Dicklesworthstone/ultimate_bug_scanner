@@ -86,7 +86,8 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
         profile=_load_json_option(args.profile),
     )
     findings = run_scan(ctx) if layer == "scan" else run_layer(layer, ctx)
-    return _write_ndjson(findings, args.out)
+    _write_ndjson(findings, args.out)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

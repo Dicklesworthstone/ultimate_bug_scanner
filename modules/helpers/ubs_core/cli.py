@@ -61,7 +61,54 @@ def _build_parser() -> argparse.ArgumentParser:
     for layer in LAYERS:
         add_layer(layer, f"run the {layer} layer")
     add_layer("scan", "run every layer registered for the language")
+    suppress = sub.add_parser(
+        "suppress",
+        help="filter NDJSON findings through ubs:ignore statement-interval suppression (bead A7)",
+    )
+    suppress.add_argument("--lang", required=True, help="language of the scanned sources")
+    suppress.add_argument("--findings", default="-", help="NDJSON findings file ('-' = stdin)")
+    suppress.add_argument("--out", default="-", help="NDJSON output path ('-' = stdout)")
     return parser
+
+
+def _run_suppress(args: argparse.Namespace) -> int:
+    """Filter NDJSON findings through ubs:ignore statement-interval suppression."""
+    import json
+
+    from ubs_core.suppression import build_index
+
+    if args.findings in ("-", ""):
+        raw_lines = sys.stdin.read().splitlines()
+    else:
+        raw_lines = Path(args.findings).read_text(encoding="utf-8").splitlines()
+    findings = [json.loads(line) for line in raw_lines if line.strip()]
+
+    indexes: dict[str, object] = {}
+    kept: list[dict] = []
+    for finding in findings:
+        path = str(finding.get("path", ""))
+        if path not in indexes:
+            try:
+                text = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                text = ""
+            indexes[path] = build_index(text, lang=args.lang)
+        index = indexes[path]
+        line = int(finding.get("line", 0) or 0)
+        if index.is_suppressed(line, str(finding.get("rule", ""))):
+            continue
+        kept.append(finding)
+
+    def _emit(handle) -> None:
+        for finding in kept:
+            handle.write(json.dumps(finding, ensure_ascii=False) + "\n")
+
+    if args.out in ("-", ""):
+        _emit(sys.stdout)
+    else:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            _emit(handle)
+    return 0
 
 
 def _write_ndjson(findings_iter, out_path: str) -> int:
@@ -105,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "layer", None):
         parser.print_help(sys.stderr)
         return 2
+
+    if args.layer == "suppress":
+        return _run_suppress(args)
 
     if args.layer != "scan":
         try:

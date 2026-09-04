@@ -35,11 +35,27 @@ def _core_lib_tests() -> list[tuple[str, callable]]:
         assert out.count("\n") == code.count("\n")
         assert "note" not in out and "s" not in out
 
+    def test_suppression_trailing_and_prev() -> None:
+        from ubs_core.suppression import build_index
+
+        idx = build_index('def a(x=[]):  # ubs:ignore\n    return x\n', lang="python")
+        assert idx.is_suppressed(1, "py.mutable")
+        idx2 = build_index('# ubs:ignore\neval(x)\n', lang="python")
+        assert idx2.is_suppressed(2, "py.eval")
+
+    def test_suppression_multiline_statement() -> None:
+        from ubs_core.suppression import build_index
+
+        idx = build_index('eval(\n    # ubs:ignore\n    x)\n', lang="python")
+        assert idx.is_suppressed(1, "py.eval")
+
     return [
         ("core.io.line_col", test_line_col),
         ("core.io.find_block_end", test_find_block_end),
         ("core.lexer.span", test_span),
         ("core.lexer.strip_preserves_shape", test_strip_preserves_shape),
+        ("core.suppression.trailing_and_prev", test_suppression_trailing_and_prev),
+        ("core.suppression.multiline_statement", test_suppression_multiline_statement),
     ]
 
 

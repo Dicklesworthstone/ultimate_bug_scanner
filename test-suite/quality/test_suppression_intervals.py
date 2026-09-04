@@ -13,7 +13,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.suppression import build_index, parse_markers  # noqa: E402
 
-
+# Line numbers are load-bearing in the assertions below; count carefully.
 PY_CODE = '''import os
 
 
@@ -59,32 +59,41 @@ class PythonSuppressionTests(unittest.TestCase):
         cls.idx = build_index(PY_CODE, lang="python")
 
     def test_trailing_marker_suppresses(self) -> None:
-        self.assertTrue(self.idx.is_suppressed(4, "py.taint"))
+        # Line 5: `os.system(event["cmd"])  # ubs:ignore`
+        self.assertTrue(self.idx.is_suppressed(5, "py.taint"))
 
     def test_previous_line_marker_suppresses(self) -> None:
-        self.assertTrue(self.idx.is_suppressed(10, "py.taint"))
+        # Line 11 is the finding; line 10 is the marker.
+        self.assertTrue(self.idx.is_suppressed(11, "py.taint"))
 
     def test_marker_inside_multiline_statement(self) -> None:
-        self.assertTrue(self.idx.is_suppressed(15, "py.taint"))
+        # `os.system(` opens on line 16; the marker sits on line 17, a
+        # physical line of the same logical statement.
+        self.assertTrue(self.idx.is_suppressed(16, "py.taint"))
 
     def test_formatter_moved_marker(self) -> None:
-        # Marker sits on the first line inside the `if` block; the finding
-        # anchors at the block-opening line.
+        # `if event:` opens the block at line 24; the marker was relocated to
+        # line 25, the first line inside the block.
         self.assertTrue(self.idx.is_suppressed(24, "py.taint"))
 
     def test_rule_scoped_only_listed_rules(self) -> None:
-        self.assertTrue(self.idx.is_suppressed(29, "py.taint"))
-        self.assertFalse(self.idx.is_suppressed(29, "py.other"))
         self.assertTrue(self.idx.is_suppressed(30, "py.taint"))
-        self.assertTrue(self.idx.is_suppressed(30, "py.eval"))
+        self.assertFalse(self.idx.is_suppressed(30, "py.other"))
+        self.assertTrue(self.idx.is_suppressed(31, "py.taint"))
+        self.assertTrue(self.idx.is_suppressed(31, "py.eval"))
 
     def test_string_contents_are_not_markers(self) -> None:
-        self.assertFalse(self.idx.is_suppressed(34, "py.taint"))
+        self.assertFalse(self.idx.is_suppressed(36, "py.taint"))
 
     def test_unmarked_finding_not_suppressed(self) -> None:
-        self.assertFalse(self.idx.is_suppressed(3, "py.taint"))
+        self.assertFalse(self.idx.is_suppressed(1, "py.taint"))
+
+    def test_non_listed_rule_ignores_even_bareless_lines(self) -> None:
+        # Line 12 (`return None` in `cleaner`) has no marker anchor.
+        self.assertFalse(self.idx.is_suppressed(12, "py.other"))
 
 
+# Line numbers are load-bearing; count carefully.
 JS_CODE = '''function handler(req) {
   const {cmd} = req.query;
   child_process.exec(
@@ -109,13 +118,15 @@ class JsSuppressionTests(unittest.TestCase):
         cls.idx = build_index(JS_CODE, lang="javascript")
 
     def test_multiline_call_marker_any_line(self) -> None:
+        # `child_process.exec(` opens at line 3; the marker is on line 4.
         self.assertTrue(self.idx.is_suppressed(3, "js.taint"))
 
     def test_block_formatter_case(self) -> None:
-        self.assertTrue(self.idx.is_suppressed(11, "js.deep"))
+        # `if (req) {` opens at line 10; the marker was relocated to line 11.
+        self.assertTrue(self.idx.is_suppressed(10, "js.deep"))
 
     def test_marker_in_inner_block_does_not_leak(self) -> None:
-        # `const x` line is suppressed; the later `const y` is not.
+        # `const x` (line 12) is suppressed; the later `const y` is not.
         self.assertTrue(self.idx.is_suppressed(12, "js.deep"))
         self.assertFalse(self.idx.is_suppressed(14, "js.deep"))
 
@@ -123,6 +134,7 @@ class JsSuppressionTests(unittest.TestCase):
         self.assertFalse(self.idx.is_suppressed(3, "js.other"))
 
 
+# Line numbers are load-bearing; count carefully.
 RUBY_CODE = '''def handler(req)
   # ubs:ignore
   eval(req[:cmd])

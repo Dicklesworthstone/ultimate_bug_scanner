@@ -2,16 +2,18 @@
 
 Read-only recon by the A4-js integrator (GLM-Flash session, 2026-09-04).
 Full machine-readable report: '/home/ubuntu/.omp/agent/sessions/--data-projects-ultimate_bug_scanner--/2026-09-03T23-12-19-842Z_01a0698b-6b81-776a-8098-4b623f304fa7/JsPortRecon.md' (scout transcript).
-Status: Pattern layer DONE — 65 patterns across 16/19 categories
-(commits c5244c2, 5e212c4, 1937116: ubs_core.js_scan orchestrator +
-ubs_core/js_patterns/*, legacy-parity semantics: distinct-line counts,
-project-wide severity resolution, documented divergences in module
-docstrings). REMAINING: ast-grep rule-pack consolidation (≤3 `scan -c`
-+ one stream parser into the sink), AST-group categories (5 async,
-6 error-handling, 19 resource primary paths), heredoc completions beyond
-the 3 migrated analyzers (taint_js/guards_js/ctcompare_js done), shell
-wiring (v2 dispatch + renderers + UBS_LEGACY_MODULE_JS=1 dual path), and
-K2 sink emission (`<lang>.findings.json` NDJSON) by the module.
+Status: Pattern layer DONE (65 patterns, 16/19 categories) AND the v2 dual
+path is LIVE behind UBS_CONTRACT_V2_JS=1 (commit 402ffcb): run_contract_v2_js
+in ubs-js.sh (ONE ubs_list_files list, ONE ubs_core.js_scan process, NDJSON
+sink, legacy text labels, fd3 json summary with module-level findings[],
+--report-json receives the raw sink = K2 parity records flow TODAY).
+js_ast.py scans consolidated sgconfigs (scan -c --json=stream per grammar,
+marker suppression, severity overrides) — integration pending js_rules.py
+(37-rule generator port, in flight). REMAINING: wire js_rules.generate +
+js_ast.scan_all into run_contract_v2_js, AST-group categories (5/6/19
+primary), heredoc completions, then flip the default (legacy becomes
+UBS_LEGACY_MODULE_JS=1 escape hatch) and close with the 138-case js
+manifest diff.
 
 ## Current state (v4.7, 10,877 lines, contract v1)
 - Engines: ~100 rg pipelines (GREP_RN/RNI/RNW, 381-398; count_lines 402), ad-hoc

@@ -1,4 +1,4 @@
-"""ubs_core.js_patterns.security_node — categories 7 and 18 (bead 0xjg.4).
+r"""ubs_core.js_patterns.security_node — categories 7 and 18 (bead 0xjg.4).
 
 Faithful ports of the legacy rg pipelines in modules/ubs-js.sh:
 - CATEGORY 7 SECURITY (5568-5728, 5939-5946): eval(), new Function(),
@@ -13,22 +13,30 @@ Four of the category 7 pipelines are ast-grep-primary in the legacy module
 5711-5712); the rg FALLBACK variants are ported here per the v2 layering
 (ast-grep coverage lives in the consolidated rule packs).
 
-Legacy `grep -v` post-filters become exclude_regex (applied per matched line,
-matching the sequential `grep -v` line filters). run_node_api_checks gates its
-findings on project-wide counts (express import present, zero parser /
-validator refs); the Pattern contract is per-line, so those gates are
-projected onto the req.body line itself — divergence documented in the
-parity report.
+Deliberate divergences from the literal shell text (both verified by the
+parity run, see bead report):
+- The legacy `grep -Ev "^[[:space:]]*(//|/\*|\*)"` comment post-filters are
+  INERT under rg mode: with `--with-filename --line-number` every output line
+  is prefixed `path:line:` so the `^`-anchored filter never matches (grep -R -n
+  behaves identically). Re-creating them as live per-line exclude_regex would
+  under-count vs the legacy pipeline (e.g. `// Eval() with user input` comment
+  lines), so they are not ported. Unanchored content filters
+  (escapeHtml|sanitize|DOMPurify, noopener|noreferrer) ARE live in legacy and
+  become exclude_regex.
+- run_node_api_checks gates its findings on project-wide counts (express
+  import present, zero parser / validator refs). The Pattern contract is
+  per-line, so those gates are projected onto the req.body line itself;
+  the projection is exact whenever the legacy gate passes, and the residual
+  divergence is documented in the parity report.
+- [^,\n]+ / [^)\n]* replace the legacy [^,]+ / [^)]* spans: rg is
+  line-oriented and cannot match across newlines, while the engine's
+  whole-text finditer can; the \n exclusion restores rg's line scope.
 """
 from __future__ import annotations
 
 import re
 
 from ubs_core.js_scan import Pattern
-
-# Legacy post-filter shared by the eval / new Function / innerHTML /
-# document.write pipelines: `grep -Ev "^[[:space:]]*(//|/\*|\*)"`.
-_COMMENT_LINE = re.compile(r"^\s*(?://|/\*|\*)")
 
 PATTERNS: list[Pattern] = [
     # ── CATEGORY 7: SECURITY VULNERABILITIES ──────────────────────────────
@@ -41,40 +49,36 @@ PATTERNS: list[Pattern] = [
         title="eval() ALLOWS ARBITRARY CODE EXECUTION",
         regex=re.compile(r"(^|[^\"'])[Ee]val\s*\(", re.MULTILINE),
         thresholds=((0, "critical"),),
-        exclude_regex=_COMMENT_LINE,
     ),
-    # ubs-js.sh 5596-5602: rg fallback "(^|[^\"'])\bnew[[:space:]]+Function[[:space:]]*\("
-    # (ast-grep-primary 5598).
+    # ubs-js.sh 5596-5602: rg fallback
+    # "(^|[^\"'])\bnew[[:space:]]+Function[[:space:]]*\(" (ast-grep-primary 5598).
     Pattern(
         category=7,
         rule_id="js.security.new-function",
         title="new Function() enables code injection",
         regex=re.compile(r"(^|[^\"'])\bnew\s+Function\s*\(", re.MULTILINE),
         thresholds=((0, "critical"),),
-        exclude_regex=_COMMENT_LINE,
     ),
     # ubs-js.sh 5610-5617: rg fallback "\.innerHTML[[:space:]]*="
-    # (ast-grep-primary 5612) with `grep -v -E "escapeHtml|sanitize|DOMPurify"`
-    # then the comment-line filter. Legacy ladder: >10 warning, >0 info.
+    # (ast-grep-primary 5612) with the live `grep -v -E
+    # "escapeHtml|sanitize|DOMPurify"` filter. Legacy ladder: >10 warning,
+    # >0 info.
     Pattern(
         category=7,
         rule_id="js.security.innerhtml-unsanitized",
         title="innerHTML without sanitization - XSS risk",
         regex=re.compile(r"\.innerHTML\s*="),
         thresholds=((10, "warning"), (0, "info")),
-        exclude_regex=re.compile(
-            r"escapeHtml|sanitize|DOMPurify|^\s*(?://|/\*|\*)"
-        ),
+        exclude_regex=re.compile(r"escapeHtml|sanitize|DOMPurify"),
     ),
     # ubs-js.sh 5709-5715: GREP_RNW "document\.write" (-w → \b…\b),
-    # (ast-grep-primary 5711) with the comment-line filter.
+    # ast-grep-primary 5711.
     Pattern(
         category=7,
         rule_id="js.security.document-write",
         title="document.write() is deprecated & breaks SPAs",
         regex=re.compile(r"\bdocument\.write\b"),
         thresholds=((0, "critical"),),
-        exclude_regex=_COMMENT_LINE,
     ),
     # ubs-js.sh 5723-5724: pure rg, no post-filters.
     Pattern(
@@ -87,9 +91,9 @@ PATTERNS: list[Pattern] = [
         ),
         thresholds=((0, "critical"),),
     ),
-    # ubs-js.sh 5940-5941: pure rg; legacy `grep -Ev "noopener|noreferrer|ubs:ignore"`
-    # — the marker half is the engine's built-in exclusion.
-    # [^,\n]+ keeps the legacy rg line-scoped span under whole-text matching.
+    # ubs-js.sh 5940-5941: pure rg; legacy `grep -Ev
+    # "noopener|noreferrer|ubs:ignore"` — the marker half is the engine's
+    # built-in exclusion.
     Pattern(
         category=7,
         rule_id="js.security.window-open-blank",
@@ -142,7 +146,6 @@ PATTERNS: list[Pattern] = [
         ),
     ),
     # run_node_api_checks (ubs-js.sh 743-750): pure rg, warning >0.
-    # [^)\n]* keeps the legacy rg line-scoped span under whole-text matching.
     Pattern(
         category=18,
         rule_id="js.node.sensitive-console-log",

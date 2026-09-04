@@ -127,7 +127,12 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/io.py']='fc2a9dbd784040482108125c0911e996115fe39be5cb83568e605d2c8243b2d8'
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
   ['helpers/ubs_core/js_patterns/debug_quality.py']='de6e0c36dfb9e06691b65ec5e8fd7739ec22840ebf5c487801f998218bb78172'
-  ['helpers/ubs_core/js_scan.py']='14f6831c24ac2e61079d4eff21111c49893f3e21eabb567325519fb166d9f704'
+  ['helpers/ubs_core/js_patterns/eq_regex_dom.py']='d2513ecc6d6311612e0ccd02293d25a5373ef60cf4d689f96ec30c4c12cf4d8a'
+  ['helpers/ubs_core/js_patterns/fn_parse_perf.py']='17b7fb57674849de1d03ed2b457bdf7ec75988d6f2e5f99c3203575c1fb21a50'
+  ['helpers/ubs_core/js_patterns/null_coercion.py']='db322ed7cbbfaaf103c0bc290c567d64d61146396423eb4a81521504bc2b8688'
+  ['helpers/ubs_core/js_patterns/proto_vars.py']='b4fdf0f9ccfa5b4133f12f53dc2813fcd618530756c9a299ed16e1d0c0388b31'
+  ['helpers/ubs_core/js_patterns/security_node.py']='17913144df7d72453ee852c6907e7dfbd40bf7c6c1fcc6147da28d7187476493'
+  ['helpers/ubs_core/js_scan.py']='2d741ce7f57d1b3e57816d83ed92ffb04bd9942401d5a9e7776a6bbb40c23597'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
@@ -386,6 +391,11 @@ HELPER_ASSETS=(
   "helpers/ubs_core/io.py"
   "helpers/ubs_core/js_patterns/__init__.py"
   "helpers/ubs_core/js_patterns/debug_quality.py"
+  "helpers/ubs_core/js_patterns/eq_regex_dom.py"
+  "helpers/ubs_core/js_patterns/fn_parse_perf.py"
+  "helpers/ubs_core/js_patterns/null_coercion.py"
+  "helpers/ubs_core/js_patterns/proto_vars.py"
+  "helpers/ubs_core/js_patterns/security_node.py"
   "helpers/ubs_core/js_scan.py"
   "helpers/ubs_core/lexer.py"
   "helpers/ubs_core/registry.py"

@@ -260,11 +260,57 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        lines = [
-            f"Files scanned: {len(files)}",
+        import datetime
+
+        try:
+            from ubs_core.js_rules import REMEDIATION_MAP, SUMMARY_MAP
+        except ImportError:
+            SUMMARY_MAP, REMEDIATION_MAP = {}, {}
+        SECTION_HEADERS = {7: "Lightweight taint analysis"}
+
+        records = [
+            json.loads(line)
+            for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        by_rule: dict[str, list[dict]] = {}
+        for rec in records:
+            by_rule.setdefault(rec["rule"], []).append(rec)
+
+        lines = [f"UBS module: js (contract v2) — {args.project or args.project_dir}",
+                 f"Files scanned: {len(files)}"]
+        ordered_rules = sorted(
+            by_rule,
+            key=lambda rule: (by_rule[rule][0].get("category_id", ""), rule),
+        )
+        current_section = None
+        for rule in ordered_rules:
+            recs = by_rule[rule]
+            category_id = recs[0].get("category_id", "")
+            section = None
+            if category_id.startswith("js."):
+                tail = category_id.split(".", 1)[1]
+                for num, slug in _CATEGORY_SLUGS.items():
+                    if tail == slug:
+                        section = SECTION_HEADERS.get(num)
+                        break
+            if section is not None and section != current_section:
+                lines.append("")
+                lines.append(section)
+                current_section = section
+            severity = recs[0]["severity"]
+            title = SUMMARY_MAP.get(rule, rule)
+            lines.append(f"[{severity}] {title} ({len(recs)} found) — {rule}")
+            remediation = REMEDIATION_MAP.get(rule)
+            if remediation:
+                lines.append(f"    {remediation}")
+            for rec in recs[:5]:
+                lines.append(f"    {rec['path']}:{rec['line']}  {rec['message'][:180]}")
+        lines += [
             f"Critical issues: {counters['critical']}",
             f"Warning issues: {counters['warning']}",
             f"Info items: {counters['info']}",
+            f"Report generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
         ]
         Path(args.text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
 

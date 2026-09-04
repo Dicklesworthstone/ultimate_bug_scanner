@@ -79,6 +79,9 @@ PATTERNS: list[Pattern] = [
         title="Some functions may lack return statements",
         regex=re.compile(r"^function [A-Za-z_]", re.MULTILINE),
         thresholds=((0, "info"),),
+        # legacy two-count gate (decls > returns) approximated: silent when
+        # any return statement exists project-wide (the common case).
+        suppress_when_regex=re.compile(r"\breturn\b"),
     ),
     # ── CATEGORY 9: PARSING & TYPE CONVERSION BUGS ──────────────────────────
     # 9790-9798: rg "parseInt\(" | grep -Ev ",[[:space:]]*(10|16|8|2)\)".

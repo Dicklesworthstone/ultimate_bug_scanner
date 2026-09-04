@@ -135,6 +135,7 @@ PATTERNS: list[Pattern] = [
         gate_regex=re.compile(
             r"require\(['\"]express['\"]\)|from ['\"]express['\"]|import express"
         ),
+        suppress_when_regex=re.compile(r"express\.(?:json|urlencoded)|bodyParser"),
     ),
     # run_node_api_checks (ubs-js.sh 734-741): same body_refs count, gated on
     # validation_refs == 0 project-wide.
@@ -150,6 +151,7 @@ PATTERNS: list[Pattern] = [
         gate_regex=re.compile(
             r"require\(['\"]express['\"]\)|from ['\"]express['\"]|import express"
         ),
+        suppress_when_regex=re.compile(r"express\.(?:json|urlencoded)|bodyParser"),
     ),
     # run_node_api_checks (ubs-js.sh 743-750): pure rg, warning >0.
     Pattern(

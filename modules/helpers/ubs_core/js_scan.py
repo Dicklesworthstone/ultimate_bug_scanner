@@ -2,8 +2,8 @@
 
 Replaces the legacy module's ~350-400 process spawns with ONE python process:
 
-    python3 -m ubs_core js-scan --files-from <nul-list> --sink <ndjson> \
-        [--project-dir DIR] [--skip 1,2,3] [--lang js]
+    python3 -m ubs_core.js_scan --files-from <nul-list> --sink <ndjson> \
+        [--project-dir DIR] [--skip 1,2,3]
 
 Layers, in order:
 1. Pattern layer — regex categories aggregated from ubs_core.js_patterns.*
@@ -33,10 +33,27 @@ from ubs_core.registry import RunContext
 
 MARKER = "ubs:ignore"
 
+_CATEGORY_SLUGS = {
+    1: "null-undefined", 2: "equality", 3: "proto-object", 4: "type-coercion",
+    5: "async", 6: "error-handling", 7: "security", 8: "function-scope",
+    9: "parsing", 10: "control-flow", 11: "debug", 12: "perf",
+    13: "vars", 14: "code-quality", 15: "regex", 16: "dom",
+    17: "typescript", 18: "node", 19: "resource-lifecycle",
+}
+
+
+def slug_for_category(category: int) -> str:
+    return _CATEGORY_SLUGS.get(category, f"cat{category}")
+
 
 @dataclass(frozen=True)
 class Pattern:
-    """One legacy rg pipeline: a category-scoped regex with count thresholds."""
+    """One legacy rg pipeline: a category-scoped regex with count thresholds.
+
+    thresholds is a descending list of (min_count_exclusive, severity): the
+    first entry whose count > min_count wins; when none match, the category
+    reports nothing — mirroring the legacy `warning >15 / info >0` ladders.
+    """
 
     category: int
     rule_id: str
@@ -48,7 +65,7 @@ class Pattern:
 
 
 def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
-    """Yield (line_number, line_text) for matches, skipping marker lines."""
+    """Yield (line_number, line_text) for matches, skipping excluded lines."""
     for match in pattern.regex.finditer(text):
         line_no = text.count("\n", 0, match.start()) + 1
         line_start = text.rfind("\n", 0, match.start()) + 1
@@ -60,21 +77,6 @@ def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
             continue  # legacy count_lines drops marker lines from counts
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
             continue
-        yield line_no, line_text.strip()[:240]
-
-
-
-def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
-    """Yield (line_number, line_text) for matches, skipping marker lines."""
-    for match in pattern.regex.finditer(text):
-        line_no = text.count("\n", 0, match.start()) + 1
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line_end = text.find("\n", match.start())
-        if line_end == -1:
-            line_end = len(text)
-        line_text = text[line_start:line_end]
-        if MARKER in line_text:
-            continue  # legacy count_lines drops marker lines from counts
         yield line_no, line_text.strip()[:240]
 
 
@@ -122,19 +124,6 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
     return counters
 
 
-_CATEGORY_SLUGS = {
-    1: "null-undefined", 2: "equality", 3: "proto-object", 4: "type-coercion",
-    5: "async", 6: "error-handling", 7: "security", 8: "function-scope",
-    9: "parsing", 10: "control-flow", 11: "debug", 12: "perf",
-    13: "vars", 14: "code-quality", 15: "regex", 16: "dom",
-    17: "typescript", 18: "node", 19: "resource-lifecycle",
-}
-
-
-def slug_for_category(category: int) -> str:
-    return _CATEGORY_SLUGS.get(category, f"cat{category}")
-
-
 def load_patterns() -> list[Pattern]:
     """Aggregate PATTERNS from every ubs_core.js_patterns.* module."""
     import importlib
@@ -172,7 +161,7 @@ def run_analyzers(files: Sequence[Path], sink) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="python3 -m ubs_core js-scan")
+    parser = argparse.ArgumentParser(prog="python3 -m ubs_core.js_scan")
     parser.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
     parser.add_argument("--project-dir", default="", help="base dir for relative sink paths")

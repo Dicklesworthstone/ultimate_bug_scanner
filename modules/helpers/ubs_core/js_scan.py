@@ -3,7 +3,7 @@
 Replaces the legacy module's ~350-400 process spawns with ONE python process:
 
     python3 -m ubs_core.js_scan --files-from <nul-list> --sink <ndjson> \
-        [--project-dir DIR] [--skip 1,2,3]
+        [--project-dir DIR] [--skip 1,2,3] [--ast-rule-dir DIR]
 
 Layers, in order:
 1. Pattern layer — regex categories aggregated from ubs_core.js_patterns.*
@@ -13,8 +13,9 @@ Layers, in order:
 2. Analyzer layer — registered ubs_core analyzers for javascript
    (taint_js, guards_js, ctcompare_js) via their run(ctx).
 3. ast-grep layer — the consolidated rule packs (≤ 3 `scan -c` invocations)
-   are executed by the shell wrapper and appended to the same sink; this
-   module only defines the sink record shape.
+   via ubs_core.js_ast.scan_all; only SEVERITY_MAP ids are counted (the rest
+   of the pack is an informational dump in legacy), async rules downgrade to
+   info unless --fail-on-warning (GH #93 / ubs-js.sh 293-296).
 
 Sink record (one JSON object per line, K2 schema):
     {rule, category_id, path, line, col, severity, message, suppressed}
@@ -53,6 +54,8 @@ class Pattern:
     thresholds is a descending list of (min_count_exclusive, severity): the
     first entry whose count > min_count wins; when none match, the category
     reports nothing — mirroring the legacy `warning >15 / info >0` ladders.
+    gate_regex expresses legacy project-wide preconditions (e.g. an Express
+    import must exist somewhere before req.body patterns count).
     """
 
     category: int
@@ -62,6 +65,7 @@ class Pattern:
     thresholds: tuple[tuple[int, str], ...]
     case_insensitive: bool = False
     exclude_regex: re.Pattern[str] | None = None  # legacy `grep -v` post-filters
+    gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
 
 
 def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
@@ -94,7 +98,8 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
     whole file list (rg prints each matching line once), and severity is
     resolved ONCE per pattern from that project-wide count — every record of
     a category carries the same severity, so summed counters equal the
-    legacy print_finding buckets.
+    legacy print_finding buckets. Patterns with gate_regex stay silent unless
+    some file in the list satisfies the gate (legacy project-wide preconditions).
 
     Returns severity counters ({"critical": n, "warning": n, "info": n}).
     """
@@ -109,6 +114,10 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
         except OSError:
             continue
     for pattern in active:
+        if pattern.gate_regex is not None and not any(
+            pattern.gate_regex.search(text) for text in texts.values()
+        ):
+            continue
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
@@ -202,20 +211,25 @@ def main(argv: list[str] | None = None) -> int:
         run_analyzers(files, sink)
         if args.ast_rule_dir:
             from ubs_core.js_ast import scan_all
+            from ubs_core.js_rules import SEVERITY_MAP
 
-            overrides: dict[str, str] = {}
+            # Legacy calibration (emit_ast_rule_group): ONLY the ~19 mapped
+            # ids are counted — the rest of the rule pack is an informational
+            # dump. The declare -A severity map wins over YAML severity, and
+            # every ASYNC_ERROR group rule downgrades to info unless
+            # --fail-on-warning (ubs-js.sh 293-296 + 755-763).
+            overrides: dict[str, str] = dict(SEVERITY_MAP)
             manifest_path = Path(args.ast_rule_dir) / "manifest.json"
             if manifest_path.is_file():
                 try:
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                    overrides = {
-                        rid: meta["severity"]
-                        for rid, meta in manifest.items()
-                        if isinstance(meta, dict) and meta.get("severity")
-                    }
                 except (ValueError, OSError):
-                    overrides = {}
-            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides)
+                    pass
+            if not args.fail_on_warning:
+                for rid, severity in list(overrides.items()):
+                    if rid.startswith("js.async."):
+                        overrides[rid] = "info"
+            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides, count_only=set(SEVERITY_MAP))
             for key, value in ast_counters.items():
                 counters[key] = counters.get(key, 0) + value
 
@@ -225,9 +239,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.json_out:
         records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        import datetime
+
         doc = {
             "project": args.project or args.project_dir,
-            "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "files": len(files),
             "critical": counters["critical"],
             "warning": counters["warning"],

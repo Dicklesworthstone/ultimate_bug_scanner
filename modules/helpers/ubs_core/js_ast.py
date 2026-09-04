@@ -8,6 +8,10 @@ findings sink the pattern layer uses.
 Suppression: flat same-line + previous-line `ubs:ignore` checks (the legacy
 emit_ast_rule_group semantics, ubs-js.sh 572-577); the A7 statement-interval
 engine in the meta-runner postprocess layers the richer placements on top.
+
+Counting: when `count_only` is provided, only those rule ids are counted and
+emitted — legacy counts just the mapped emit_ast_rule_group ids and dumps
+the rest of the pack informationally (bead A4-js calibration).
 """
 from __future__ import annotations
 
@@ -40,6 +44,7 @@ def scan_config(
     lang: str,
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
+    count_only: set[str] | None = None,
 ) -> dict[str, int]:
     """Run one sgconfig over the path list; write sink records; return counters."""
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -67,6 +72,8 @@ def scan_config(
             file_str = str(match.get("file", "") or match.get("path", ""))
             if not rule_id or not file_str:
                 continue
+            if count_only is not None and rule_id not in count_only:
+                continue  # informational dump in legacy — not counted
             rng = match.get("range", {}).get("start", {})
             line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
             path = Path(file_str)
@@ -95,12 +102,13 @@ def scan_all(
     sink,
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
+    count_only: set[str] | None = None,
 ) -> dict[str, int]:
     """Run every sgconfig-<lang>.yml in rule_dir; aggregate counters."""
     total = {"critical": 0, "warning": 0, "info": 0}
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         lang = config.stem.removeprefix("sgconfig-")
-        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin)
+        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin, count_only)
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value
     return total

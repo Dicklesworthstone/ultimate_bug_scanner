@@ -3720,7 +3720,6 @@ run_contract_v2_js(){
   local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
   [[ -n "${SKIP_CATEGORIES}" ]] && scan_args+=(--skip "$SKIP_CATEGORIES")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
-  [[ -n "${CI_MODE}" && "$CI_MODE" -eq 1 ]] && scan_args+=(--fail-on-warning)
   # Consolidated ast-grep layer: generate the 37-rule pack + variants into ≤3
   # sgconfigs (one scan -c per grammar group inside ubs_core.js_ast).
   local ast_rule_dir=""

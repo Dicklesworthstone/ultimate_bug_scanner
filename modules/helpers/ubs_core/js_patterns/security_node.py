@@ -132,6 +132,9 @@ PATTERNS: list[Pattern] = [
         regex=re.compile(r"req\.body"),
         thresholds=((0, "warning"),),
         exclude_regex=re.compile(r"express\.(?:json|urlencoded)|bodyParser"),
+        gate_regex=re.compile(
+            r"require\(['\"]express['\"]\)|from ['\"]express['\"]|import express"
+        ),
     ),
     # run_node_api_checks (ubs-js.sh 734-741): same body_refs count, gated on
     # validation_refs == 0 project-wide.
@@ -143,6 +146,9 @@ PATTERNS: list[Pattern] = [
         thresholds=((0, "warning"),),
         exclude_regex=re.compile(
             r"express-validator|Joi|zod|celebrate|Ajv|yup|schema\.validate"
+        ),
+        gate_regex=re.compile(
+            r"require\(['\"]express['\"]\)|from ['\"]express['\"]|import express"
         ),
     ),
     # run_node_api_checks (ubs-js.sh 743-750): pure rg, warning >0.

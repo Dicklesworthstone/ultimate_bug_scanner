@@ -90,37 +90,51 @@ def resolve_severity(pattern: Pattern, count: int) -> str | None:
 def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip: set[int]) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
+    Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
+    whole file list (rg prints each matching line once), and severity is
+    resolved ONCE per pattern from that project-wide count — every record of
+    a category carries the same severity, so summed counters equal the
+    legacy print_finding buckets.
+
     Returns severity counters ({"critical": n, "warning": n, "info": n}).
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     active = [p for p in patterns if p.category not in skip]
     if not active:
         return counters
+    texts: dict[Path, str] = {}
     for path in files:
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
+            texts[path] = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        for pattern in active:
-            hits = list(iter_matches(pattern, text))
-            count = len(hits)
-            if not count:
-                continue
-            severity = resolve_severity(pattern, count)
-            if severity is None:
-                continue
-            counters[severity] = counters.get(severity, 0) + count
-            for line_no, line_text in hits:
-                sink.write(json.dumps({
-                    "rule": pattern.rule_id,
-                    "category_id": f"js.{slug_for_category(pattern.category)}",
-                    "path": str(path),
-                    "line": line_no,
-                    "col": 1,
-                    "severity": severity,
-                    "message": f"{pattern.title} — {line_text}",
-                    "suppressed": False,
-                }, ensure_ascii=False) + "\n")
+    for pattern in active:
+        hits: list[tuple[Path, int, str]] = []
+        seen: set[tuple[Path, int]] = set()
+        for path, text in texts.items():
+            for line_no, line_text in iter_matches(pattern, text):
+                key = (path, line_no)
+                if key in seen:
+                    continue
+                seen.add(key)
+                hits.append((path, line_no, line_text))
+        if not hits:
+            continue
+        severity = resolve_severity(pattern, len(hits))
+        if severity is None:
+            continue
+        counters[severity] = counters.get(severity, 0) + len(hits)
+        for path, line_no, line_text in hits:
+            sink.write(json.dumps({
+                "rule": pattern.rule_id,
+                "category_id": f"js.{slug_for_category(pattern.category)}",
+                "path": str(path),
+                "line": line_no,
+                "col": 1,
+                "severity": severity,
+                "message": f"{pattern.title} — {line_text}",
+                "suppressed": False,
+            }, ensure_ascii=False) + "\n")
     return counters
 
 

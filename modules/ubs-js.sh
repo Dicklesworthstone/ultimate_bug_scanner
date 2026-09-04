@@ -3749,9 +3749,14 @@ generate(Path('$ast_rule_dir'))
 }
 
 if [[ "${UBS_CONTRACT_V2_JS:-0}" == "1" && "${UBS_LEGACY_MODULE_JS:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
-  v2_status=0
-  run_contract_v2_js || v2_status=$?
-  exit "$v2_status"
+  # Env-error parity (wave 4): without a working ast-grep the v2 path cannot
+  # match the legacy finding semantics — fall through so the legacy path
+  # produces its exact env-error behavior (exit codes, messages, bin shims).
+  if check_ast_grep; then
+    v2_status=0
+    run_contract_v2_js || v2_status=$?
+    exit "$v2_status"
+  fi
 fi
 
 echo -e "${BOLD}${CYAN}"

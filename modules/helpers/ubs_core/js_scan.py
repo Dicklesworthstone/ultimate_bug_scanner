@@ -262,11 +262,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.text_out:
         import datetime
 
-        try:
-            from ubs_core.js_rules import REMEDIATION_MAP, SUMMARY_MAP
-        except ImportError:
-            SUMMARY_MAP, REMEDIATION_MAP = {}, {}
-        SECTION_HEADERS = {7: "Lightweight taint analysis"}
+        from ubs_core.js_rules import REMEDIATION_MAP, SUMMARY_MAP
+        SECTION_HEADERS = {
+            1: "NULL SAFETY & DEFENSIVE PROGRAMMING",
+            2: "MATH & ARITHMETIC PITFALLS",
+            3: "ARRAY & COLLECTION SAFETY",
+            4: "TYPE COERCION & COMPARISON TRAPS",
+            5: "ASYNC/AWAIT & PROMISE PITFALLS",
+            6: "ERROR HANDLING ANTI-PATTERNS",
+            7: "SECURITY VULNERABILITIES",
+            8: "FUNCTION & SCOPE ISSUES",
+            9: "PARSING & TYPE CONVERSION BUGS",
+            10: "CONTROL FLOW GOTCHAS",
+            11: "DEBUGGING & PRODUCTION CODE",
+            12: "MEMORY LEAKS & PERFORMANCE",
+            13: "VARIABLE & SCOPE ISSUES",
+            14: "CODE QUALITY MARKERS",
+            15: "REGEX & STRING SAFETY",
+            16: "DOM MANIPULATION SAFETY",
+            17: "TYPESCRIPT STRICTNESS",
+            18: "NODE.JS I/O & MODULES",
+            19: "RESOURCE LIFECYCLE CORRELATION",
+        }
 
         records = [
             json.loads(line)

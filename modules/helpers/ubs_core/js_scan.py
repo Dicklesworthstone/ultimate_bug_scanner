@@ -180,6 +180,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
     parser.add_argument("--project-dir", default="", help="base dir for relative sink paths")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
+    parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
+    parser.add_argument("--json-out", default="", help="write the UBS summary JSON document here")
+    parser.add_argument("--project", default="", help="project path recorded in the json summary")
+    parser.add_argument("--version", default="", help="module version recorded in the json summary")
+    parser.add_argument("--fail-on-warning", action="store_true")
     args = parser.parse_args(argv)
 
     if args.files_from in ("-", ""):
@@ -195,8 +200,36 @@ def main(argv: list[str] | None = None) -> int:
         counters = scan_patterns(patterns, files, sink, skip)
         run_analyzers(files, sink)
 
-    sys.stdout.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
-    return 0
+    exit_code = 1 if counters["critical"] else 0
+    if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
+        exit_code = 1
+
+    if args.json_out:
+        records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        doc = {
+            "project": args.project or args.project_dir,
+            "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "files": len(files),
+            "critical": counters["critical"],
+            "warning": counters["warning"],
+            "info": counters["info"],
+            "version": args.version,
+            "status": "ok",
+            "findings": records,
+        }
+        Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    if args.text_out:
+        lines = [
+            f"Files scanned: {len(files)}",
+            f"Critical issues: {counters['critical']}",
+            f"Warning issues: {counters['warning']}",
+            f"Info items: {counters['info']}",
+        ]
+        Path(args.text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
+    return exit_code
 
 
 if __name__ == "__main__":

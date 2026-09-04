@@ -3702,6 +3702,44 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
   exit 0
 fi
 
+# ── Contract-v2 path (bead 0xjg.4): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.js_scan), NDJSON findings sink (K2 schema). Opt-in
+#    while the category port completes: UBS_CONTRACT_V2_JS=1 enables it;
+#    UBS_LEGACY_MODULE_JS=1 always wins.
+run_contract_v2_js(){
+  local list_file sink helpers_dir exit_code=0
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "${SKIP_CATEGORIES}" ]] && scan_args+=(--skip "$SKIP_CATEGORIES")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  [[ -n "${CI_MODE}" && "$CI_MODE" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text) scan_args+=(--text-out /dev/stdout --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    *) echo "ERROR: contract-v2 js path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_JS=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.js_scan \
+    "${scan_args[@]}" --version "4.7" || exit_code=$?
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_JS:-0}" == "1" && "${UBS_LEGACY_MODULE_JS:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  v2_status=0
+  run_contract_v2_js || v2_status=$?
+  exit "$v2_status"
+fi
+
+echo -e "${BOLD}${CYAN}"
 maybe_clear
 
 echo -e "${BOLD}${CYAN}"

@@ -2,7 +2,16 @@
 
 Read-only recon by the A4-js integrator (GLM-Flash session, 2026-09-04).
 Full machine-readable report: '/home/ubuntu/.omp/agent/sessions/--data-projects-ultimate_bug_scanner--/2026-09-03T23-12-19-842Z_01a0698b-6b81-776a-8098-4b623f304fa7/JsPortRecon.md' (scout transcript).
-Status: RECON COMPLETE, rewrite not started. This file is the implementation blueprint.
+Status: Pattern layer DONE — 65 patterns across 16/19 categories
+(commits c5244c2, 5e212c4, 1937116: ubs_core.js_scan orchestrator +
+ubs_core/js_patterns/*, legacy-parity semantics: distinct-line counts,
+project-wide severity resolution, documented divergences in module
+docstrings). REMAINING: ast-grep rule-pack consolidation (≤3 `scan -c`
++ one stream parser into the sink), AST-group categories (5 async,
+6 error-handling, 19 resource primary paths), heredoc completions beyond
+the 3 migrated analyzers (taint_js/guards_js/ctcompare_js done), shell
+wiring (v2 dispatch + renderers + UBS_LEGACY_MODULE_JS=1 dual path), and
+K2 sink emission (`<lang>.findings.json` NDJSON) by the module.
 
 ## Current state (v4.7, 10,877 lines, contract v1)
 - Engines: ~100 rg pipelines (GREP_RN/RNI/RNW, 381-398; count_lines 402), ad-hoc

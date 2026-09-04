@@ -66,6 +66,7 @@ class Pattern:
     case_insensitive: bool = False
     exclude_regex: re.Pattern[str] | None = None  # legacy `grep -v` post-filters
     gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
+    suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide count-comparison (e.g. parsers present -> silent)
 
 
 def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
@@ -116,6 +117,10 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
     for pattern in active:
         if pattern.gate_regex is not None and not any(
             pattern.gate_regex.search(text) for text in texts.values()
+        ):
+            continue
+        if pattern.suppress_when_regex is not None and any(
+            pattern.suppress_when_regex.search(text) for text in texts.values()
         ):
             continue
         hits: list[tuple[Path, int, str]] = []

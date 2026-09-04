@@ -238,6 +238,18 @@ def main(argv: list[str] | None = None) -> int:
             for key, value in ast_counters.items():
                 counters[key] = counters.get(key, 0) + value
 
+    # The sink is the single source of truth: recount severities from it so
+    # every layer (patterns, analyzers, ast) is reflected in totals.
+    counters = {"critical": 0, "warning": 0, "info": 0}
+    for line in Path(args.sink).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            severity = json.loads(line).get("severity", "info")
+        except ValueError:
+            continue
+        counters[severity] = counters.get(severity, 0) + 1
+
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1

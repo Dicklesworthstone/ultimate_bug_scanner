@@ -58,7 +58,7 @@ declare -A MODULE_CHECKSUMS=(
   [python]='022caa877b5c7f5c4459bd45196dfb45ec3f712eb75aa8f0b727d7861784aa9f'
   [ruby]='e676f8ce6eea0c2b6bea51b244ef28e6189edd9dcf78258dad2bb2ebf068c3fa'
   [rust]='a6952e2c2dc18081dc43d79bd33621ba3ac386ea3a35df50e07248de9708da6e'
-  [swift]='0960197481c8eda9859469f227f6bdbcf5c116b813a335e2763a1188b5c6c073'
+  [swift]='5575dd7e0e2a26fb6f168a9d88cfca988e142296c55630e4c690c4dee8a5232e'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).

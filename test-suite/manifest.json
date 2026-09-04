@@ -10401,6 +10401,62 @@
       }
     },
     {
+      "id": "swift-shell-exec-free-functions-buggy",
+      "description": "Swift C free-function shell execution (system, popen, posix_spawn, module-qualified) stays critical.",
+      "path": "test-suite/swift/buggy/shell_exec_free_functions.swift",
+      "language": "swift",
+      "tags": [
+        "swift",
+        "security",
+        "buggy"
+      ],
+      "args": [
+        "--only=swift",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 5
+          }
+        },
+        "require_substrings": [
+          "Shell-backed Process/system execution"
+        ]
+      }
+    },
+    {
+      "id": "swift-shell-exec-member-calls-clean",
+      "description": "SwiftUI .system(...) member expressions and same-named method declarations are not shell execution (ubs#101).",
+      "path": "test-suite/swift/clean/swiftui_member_calls.swift",
+      "language": "swift",
+      "tags": [
+        "swift",
+        "security",
+        "clean",
+        "false-positive"
+      ],
+      "args": [
+        "--only=swift",
+        "--fail-on-warning"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Shell-backed Process/system execution"
+        ]
+      }
+    },
+    {
       "id": "swift-archive-extraction-buggy",
       "description": "Swift archive extraction should validate zip entry paths before writing files.",
       "path": "test-suite/swift/archive_extraction_buggy",

@@ -3496,6 +3496,34 @@ skip_dirs = {'.git', '.hg', '.svn', '.venv', 'DerivedData', 'build', 'dist', 've
 shell_path = re.compile(r"/(?:usr/)?bin/(?:sh|bash|zsh)$")
 name = r"[A-Za-z_][A-Za-z0-9_]*"
 
+# system(), popen() and posix_spawn() are C free functions, and a bare \b in
+# front of them also matches at the boundary between "." and the name. Swift
+# spells implicit- and qualified-member expressions with that dot, so
+# ".font(.system(size: 13))" and "Font.system(size: 12)" -- SwiftUI font
+# constructors -- were reported as shell execution (ubs#101). Requiring that no
+# "." or identifier character precede the name drops them.
+#
+# The one legitimate dotted form is a C module qualifier: "Darwin.system(...)"
+# and "Glibc.system(...)" really are the C call, so they get their own pattern
+# rather than being lost with the member calls.
+c_module = r"(?:Darwin|Glibc|SwiftGlibc|Musl|Foundation|WinSDK|ucrt|CRT|MSVCRT|Android|Bionic)"
+shell_exec_calls = re.compile(
+    r"(?<![.\w])(?:system|popen)\s*\("
+    rf"|(?<![.\w]){c_module}\s*\.\s*(?:system|popen)\s*\("
+)
+posix_spawn_calls = re.compile(
+    r"(?<![.\w])posix_spawnp?\s*\("
+    rf"|(?<![.\w]){c_module}\s*\.\s*posix_spawnp?\s*\("
+)
+# Declaring a Swift method named system/popen is not calling the C one, and the
+# declaration's name sits at a word boundary just like a call would.
+shell_exec_declarations = re.compile(r"\bfunc\s+(?:system|popen|posix_spawnp?)\s*\(")
+
+
+def executable_code(code: str) -> str:
+    """Blank out declarations so only real call sites are matched."""
+    return shell_exec_declarations.sub(lambda m: " " * len(m.group(0)), code)
+
 def should_skip(path: Path) -> bool:
     try:
         parts = path.relative_to(base).parts
@@ -3529,9 +3557,10 @@ for path in iter_swift_files(root):
         code = raw.split('//', 1)[0].strip()
         if not code:
             continue
-        if re.search(r"\b(?:system|popen)\s*\(", code):
+        callable_code = executable_code(code)
+        if shell_exec_calls.search(callable_code):
             findings.append(f"{rel(path)}:{line_no} system/popen executes through a shell")
-        if re.search(r'\bposix_spawnp?\s*\(', code) and re.search(r'"/(?:usr/)?bin/(?:sh|bash|zsh)"', code) and '"-c"' in code:
+        if posix_spawn_calls.search(callable_code) and re.search(r'"/(?:usr/)?bin/(?:sh|bash|zsh)"', code) and '"-c"' in code:
             findings.append(f"{rel(path)}:{line_no} posix_spawn shell -c")
 
         created = re.search(rf"\b(?:let|var)\s+({name})\s*=\s*Process\s*\(", code)

@@ -77,6 +77,50 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_rust.py']='155095a92a5a90ef88d668a88236f7d8611ec6f94aad42615eacdbe92b21e163'
   ['helpers/type_narrowing_swift.py']='d83d064db4418d4c245e6bcf7a386280e27c0ebdc57a7c4f6c32443887d6eeea'
   ['helpers/type_narrowing_ts.js']='37cefad3c650ae04d1c5f7da42edfca3b5dea1f0c2263025bcec527111b930c9'
+  ['helpers/ubs_core/__init__.py']='6218b34afb5e19f5657abe24d432e4b4205335e3669e6a7c8baca69eb84f9b78'
+  ['helpers/ubs_core/__main__.py']='4aed5b835f04ba3a51b13a650b15dc05e2e43436e9e8be19000551999172639e'
+  ['helpers/ubs_core/analyzers/__init__.py']='090badfe6b8be4c60de495a74b362acff5a4d9f8461dbb56d5b6718783e39b86'
+  ['helpers/ubs_core/analyzers/async_handles_csharp.py']='830d3853356dd3f631bc3ec2b949dc51f46ac8e71cb812948713bede783c898a'
+  ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='5269b88dd078cae71d1a3c2e23523032507ac49265560dd0c27273c41c38c5aa'
+  ['helpers/ubs_core/analyzers/ctcompare_go.py']='67b66f44a697628c36dc5499aa40e9bfd737391d72f6940a623ef427d7a4e64d'
+  ['helpers/ubs_core/analyzers/ctcompare_js.py']='43695373ce47cbe3ff6810d3f1dfdb748d8a104247415ba214d3bee9c225135a'
+  ['helpers/ubs_core/analyzers/ctcompare_py.py']='9b340f59fddbb1fd1b5220174ddee79944797179a09bc01a7262a1d7c8d1a2dc'
+  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='1202852a01c48643302fff163e32f4e7f2eb5f2f845aba6fe334765ab5471e19'
+  ['helpers/ubs_core/analyzers/guards_js.py']='494fb9a6a0ef641ddafdf62766f5dc043351020674578127a624f85039e62eca'
+  ['helpers/ubs_core/analyzers/guards_py.py']='59b4edae6b864cff5e8f93315765b3011b8fef4a8a3c0dfd0aa871fe879d2329'
+  ['helpers/ubs_core/analyzers/guards_ruby.py']='aed0e66449bd1b3a36f69eafdd8b9fac966c9b2eb2c11ff355da01ec64a5f61b'
+  ['helpers/ubs_core/analyzers/lifecycle_cpp.py']='245804579718f5c4beb3bb7e3522a628e7338d41127ca03febfdbaad064bb55b'
+  ['helpers/ubs_core/analyzers/lifecycle_csharp.py']='e1c18d5e427645eba8a2628853fb8fc6ca6d6259ec3d49cfc44907ce9e1b150a'
+  ['helpers/ubs_core/analyzers/lifecycle_java.py']='5b1d60fbe75a0b3f1ae25cc2c11210e5899ddbca0afd4047e3624789b561ebe2'
+  ['helpers/ubs_core/analyzers/lifecycle_py.py']='84b4fb6371c00d9b787e26feeface5cd1fd99c142d9ad840f96d81ce33647c15'
+  ['helpers/ubs_core/analyzers/lifecycle_ruby.py']='b5d928e4dc9f504c3c427f51463e5ad6bfe69f86e9cc6f591ca8757d5ce053cd'
+  ['helpers/ubs_core/analyzers/lifecycle_swift.py']='51b065554c6b5310ad66f0fd862f113d81cb6822faf23f57215cbf953e0b2c34'
+  ['helpers/ubs_core/analyzers/narrowing_csharp.py']='436ce2e1f5a5e1384915b54d67fcfaae7156d607331bbaa1f27680610a6ccd17'
+  ['helpers/ubs_core/analyzers/narrowing_kotlin.py']='d84c7099d32ccefbef2bdc253b3473ccbfa2f4532f55139ebff46de01c81ee5e'
+  ['helpers/ubs_core/analyzers/narrowing_rust.py']='54ec29f4297cbe37aec4cdaab276a6880bb16fd93377ed060e90c5de98261b12'
+  ['helpers/ubs_core/analyzers/narrowing_swift.py']='2a7971f6f6a858eb73d1f898a6fdd039a56be405222877eae3890a6343a52a73'
+  ['helpers/ubs_core/analyzers/regex_swift.py']='236c0fc8aca7c8c2d6b3270bfcc14f16e81a7caf95e500adc9ac176b33490311'
+  ['helpers/ubs_core/analyzers/taint_cpp_redirect.py']='a0aa2b41717cc34a42584f2bb41c98cae4a8ca8a278727bde536dfe9ab91b386'
+  ['helpers/ubs_core/analyzers/taint_cpp_traversal.py']='a227b9036b5e349c320ace0f0bafbc485e1a373bf24c2ee23faaf078bb1dfefc'
+  ['helpers/ubs_core/analyzers/taint_csharp_redirect.py']='fc8cfe379e8748b2205b6abacfd4128c9940898f1e105ab51d5d953b8e2b819d'
+  ['helpers/ubs_core/analyzers/taint_csharp_request.py']='8f7417712afe5399d18918b2b4ddb2f46ac4120ee53dabb2c0cf29f03806ee61'
+  ['helpers/ubs_core/analyzers/taint_elixir_redirect.py']='202e2caccea68799411b7e5952df2f56ebc16304e62acb6257c73ae53d4ced6a'
+  ['helpers/ubs_core/analyzers/taint_elixir_traversal.py']='101708e33c995cab0500d02bee67814937e29088244f992aa231f1d209677320'
+  ['helpers/ubs_core/analyzers/taint_go.py']='db62a04ce159027c6fab2941fc481b7b986faefa3996a124d22c56c0b9dfa1a7'
+  ['helpers/ubs_core/analyzers/taint_java_redirect.py']='39fb0763494056f30a450f8c9296b02effc9a18a06d6560b8beeefa67310dc90'
+  ['helpers/ubs_core/analyzers/taint_java_traversal.py']='c73cbe618a30944ca491dac09aa667f3e2599b1c54f95a8a9747bdad9135dcfd'
+  ['helpers/ubs_core/analyzers/taint_js.py']='c8488a2b33b0388e44617e0d990e8cdaca1543a779238aa22f4043a7d54a84b0'
+  ['helpers/ubs_core/analyzers/taint_py.py']='c500fea0fdb89d73c5c35c6d26a8bc3916575a25c4f51f012c32d506547370e7'
+  ['helpers/ubs_core/analyzers/taint_ruby_traversal.py']='ecff0b7c2607695048741f48551209464e80db385415490d1ebd92227a9813e0'
+  ['helpers/ubs_core/analyzers/taint_ruby_url.py']='4453f0434f95879880777748ab7d6041fa81588bf281c9ec9a2183c2cc706c63'
+  ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
+  ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='467563f6db08bc1045679d2c406e9eab3f824c7770cbf83c2756f4135b08b45d'
+  ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
+  ['helpers/ubs_core/cli.py']='c074a5b45748b3a65b30de2e6d916cd1eacef9de7964861e2a1898d0bfbd3ad3'
+  ['helpers/ubs_core/io.py']='fc2a9dbd784040482108125c0911e996115fe39be5cb83568e605d2c8243b2d8'
+  ['helpers/ubs_core/lexer.py']='1634a5009b186ff04ddbe47ded0ae234a644a37164373f514f99bdef731a697a'
+  ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
+  ['helpers/ubs_core/selftest.py']='43b76188c3d4865b2b6d0f0f03b56be2d755988b0843dbf65d82a91795d0be28'
   ['lib/ubs-common.sh']='cce2e8ce1824ce466010a2a2179c9282f6674518bd6b72785b72a1ed7c3e0016'
 )
 
@@ -268,19 +312,63 @@ add_exclude_patterns(){
 
 HELPER_ASSETS=(
   "helpers/async_task_handles_csharp.py"
+  "helpers/cfg_test_only_modules_rust.py"
   "helpers/resource_lifecycle_cpp.py"
   "helpers/resource_lifecycle_csharp.py"
-  "helpers/resource_lifecycle_py.py"
   "helpers/resource_lifecycle_go.go"
   "helpers/resource_lifecycle_java.py"
+  "helpers/resource_lifecycle_py.py"
   "helpers/resource_lifecycle_ruby.py"
   "helpers/resource_lifecycle_swift.py"
   "helpers/type_narrowing_csharp.py"
-  "helpers/type_narrowing_ts.js"
-  "helpers/type_narrowing_rust.py"
   "helpers/type_narrowing_kotlin.py"
+  "helpers/type_narrowing_rust.py"
   "helpers/type_narrowing_swift.py"
-  "helpers/cfg_test_only_modules_rust.py"
+  "helpers/type_narrowing_ts.js"
+  "helpers/ubs_core/__init__.py"
+  "helpers/ubs_core/__main__.py"
+  "helpers/ubs_core/analyzers/__init__.py"
+  "helpers/ubs_core/analyzers/async_handles_csharp.py"
+  "helpers/ubs_core/analyzers/cfg_test_only_rust.py"
+  "helpers/ubs_core/analyzers/ctcompare_go.py"
+  "helpers/ubs_core/analyzers/ctcompare_js.py"
+  "helpers/ubs_core/analyzers/ctcompare_py.py"
+  "helpers/ubs_core/analyzers/ctcompare_rust.py"
+  "helpers/ubs_core/analyzers/guards_js.py"
+  "helpers/ubs_core/analyzers/guards_py.py"
+  "helpers/ubs_core/analyzers/guards_ruby.py"
+  "helpers/ubs_core/analyzers/lifecycle_cpp.py"
+  "helpers/ubs_core/analyzers/lifecycle_csharp.py"
+  "helpers/ubs_core/analyzers/lifecycle_java.py"
+  "helpers/ubs_core/analyzers/lifecycle_py.py"
+  "helpers/ubs_core/analyzers/lifecycle_ruby.py"
+  "helpers/ubs_core/analyzers/lifecycle_swift.py"
+  "helpers/ubs_core/analyzers/narrowing_csharp.py"
+  "helpers/ubs_core/analyzers/narrowing_kotlin.py"
+  "helpers/ubs_core/analyzers/narrowing_rust.py"
+  "helpers/ubs_core/analyzers/narrowing_swift.py"
+  "helpers/ubs_core/analyzers/regex_swift.py"
+  "helpers/ubs_core/analyzers/taint_cpp_redirect.py"
+  "helpers/ubs_core/analyzers/taint_cpp_traversal.py"
+  "helpers/ubs_core/analyzers/taint_csharp_redirect.py"
+  "helpers/ubs_core/analyzers/taint_csharp_request.py"
+  "helpers/ubs_core/analyzers/taint_elixir_redirect.py"
+  "helpers/ubs_core/analyzers/taint_elixir_traversal.py"
+  "helpers/ubs_core/analyzers/taint_go.py"
+  "helpers/ubs_core/analyzers/taint_java_redirect.py"
+  "helpers/ubs_core/analyzers/taint_java_traversal.py"
+  "helpers/ubs_core/analyzers/taint_js.py"
+  "helpers/ubs_core/analyzers/taint_py.py"
+  "helpers/ubs_core/analyzers/taint_ruby_traversal.py"
+  "helpers/ubs_core/analyzers/taint_ruby_url.py"
+  "helpers/ubs_core/analyzers/taint_rust.py"
+  "helpers/ubs_core/analyzers/taint_swift_redirect.py"
+  "helpers/ubs_core/analyzers/taint_swift_traversal.py"
+  "helpers/ubs_core/cli.py"
+  "helpers/ubs_core/io.py"
+  "helpers/ubs_core/lexer.py"
+  "helpers/ubs_core/registry.py"
+  "helpers/ubs_core/selftest.py"
   "lib/ubs-common.sh"
 )
 

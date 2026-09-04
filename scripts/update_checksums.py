@@ -2,7 +2,7 @@
 """Update checksums for UBS pinned modules + helper assets.
 
 Updates:
-- `ubs`: `MODULE_CHECKSUMS` and `HELPER_CHECKSUMS` associative arrays.
+- `ubs`: `MODULE_CHECKSUMS`, `HELPER_CHECKSUMS`, and the `HELPER_ASSETS` list.
 - `SHA256SUMS`: release checksums for `install.sh` + `ubs`.
 """
 import hashlib
@@ -85,6 +85,15 @@ def main():
     }
 
     new_helper_checksums: dict[str, str] = {}
+    # ubs_core package (beads A2/A6): every shipped file is pinned and verified
+    # exactly like a flat helper, including nested analyzer modules.
+    core_dir = modules_dir / "helpers" / "ubs_core"
+    if core_dir.is_dir():
+        for path in sorted(core_dir.rglob("*")):
+            if path.is_file() and "__pycache__" not in path.parts:
+                rel = "helpers/ubs_core/" + path.relative_to(core_dir).as_posix()
+                helper_map[rel] = rel
+
     for rel in sorted(helper_map):
         path = modules_dir / helper_map[rel]
         if not path.exists():
@@ -134,6 +143,18 @@ def main():
         return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
     new_content = helper_pattern.sub(replace_helper_checksums, new_content)
+
+    # Keep the shipped-asset list in sync with helper_map (single source of
+    # truth), so ubs_core and lib ship through the same verified channel.
+    assets_pattern = re.compile(r"(HELPER_ASSETS=\s*\()([\s\S]*?)(\n\))")
+
+    def replace_assets(match):
+        prefix = match.group(1)
+        suffix = match.group(3)
+        lines = [f'  "{rel}"' for rel in sorted(helper_map) if rel in new_helper_checksums]
+        return prefix + "\n" + "\n".join(lines) + suffix
+
+    new_content = assets_pattern.sub(replace_assets, new_content)
     
     if new_content != content:
         ubs_script.write_text(new_content, encoding="utf-8")

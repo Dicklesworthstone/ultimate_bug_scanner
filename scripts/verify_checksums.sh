@@ -73,7 +73,7 @@ done
 
 echo ""
 echo "Verifying helper checksums..."
-for helper in modules/helpers/* modules/lib/*.sh; do
+while IFS= read -r -d '' helper; do
   if [[ ! -f "$helper" ]]; then
     continue
   fi
@@ -105,7 +105,7 @@ for helper in modules/helpers/* modules/lib/*.sh; do
   else
     echo -e "${GREEN}✓ $helper${NC}"
   fi
-done
+done < <(find modules/helpers modules/lib -type f ! -path "*__pycache__*" -print0 | sort -z)
 
 if [[ $FAILED -eq 1 ]]; then
   echo ""

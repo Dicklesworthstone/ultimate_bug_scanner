@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Supply-chain fail-closed checks (bridge-plan beads E2/E6).
+"""Supply-chain fail-closed checks (bridge-plan beads E2/E6, extended by A6).
 
 The meta-runner must never execute a helper whose digest does not match the
 pinned HELPER_CHECKSUMS table. These checks run a copy of `ubs` outside the git
@@ -7,6 +7,10 @@ checkout (so modules and helpers come from a --module-dir cache, which is the
 only location the runner verifies) and serve "downloads" from a local file://
 tree via UBS_REPO_RAW_BASE, so no network is involved and the refresh path can
 be forced to return tampered bytes.
+
+A6 extends coverage to the shared module library (lib/ubs-common.sh) and every
+file of the ubs_core package: tampering any of them in the cache must be
+repaired from a clean source, and tampering on both sides must fail closed.
 
 Each check prints `[supply-chain:<name>] PASS/FAIL`; failures dump the captured
 output so the log alone is enough to diagnose them.
@@ -27,6 +31,9 @@ UBS = REPO_ROOT / "ubs"
 MODULES = REPO_ROOT / "modules"
 PY_FIXTURE = REPO_ROOT / "test-suite" / "python" / "security" / "parser_token_compare_clean.py"
 TAMPERED_HELPER = "helpers/resource_lifecycle_py.py"
+LIB_ASSET = "lib/ubs-common.sh"
+CORE_ASSET = "helpers/ubs_core/io.py"
+TAMPER_SUFFIX = "\n# tampered by test_supply_chain\n"
 
 FAILURES: list[str] = []
 
@@ -46,10 +53,25 @@ def report(name: str, ok: bool, detail: str = "", proc: subprocess.CompletedProc
             print(f"  exit={proc.returncode}\n  stdout:\n{textwrap.indent(proc.stdout[-2500:], '    ')}\n  stderr:\n{textwrap.indent(proc.stderr[-2500:], '    ')}")
 
 
+def iter_shipped_files(root: Path) -> list[Path]:
+    """Files under `root` that ship and are checksum-pinned (no pycache)."""
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+
+
 class Sandbox:
     """A ubs copy outside the checkout + a module cache + a local raw base."""
 
-    def __init__(self, tmp: Path, *, tamper: bool, serve_tampered: bool, missing_helper: bool = False) -> None:
+    def __init__(
+        self,
+        tmp: Path,
+        *,
+        tamper: bool = False,
+        serve_tampered: bool = False,
+        missing_helper: bool = False,
+        tamper_targets: tuple[str, ...] = (TAMPERED_HELPER,),
+    ) -> None:
         self.tmp = tmp
         self.bin_dir = tmp / "bin"
         self.module_dir = tmp / "cache"
@@ -62,14 +84,22 @@ class Sandbox:
         for helper in (MODULES / "helpers").iterdir():
             if helper.is_file():
                 shutil.copy2(helper, self.module_dir / "helpers" / helper.name)
-        # The shared module library ships through the same helper channel (bead A1).
-        for lib in (MODULES / "lib").glob("*.sh"):
-            shutil.copy2(lib, self.module_dir / "lib" / lib.name)
+        # The shared module library and the ubs_core package ship through the
+        # same helper channel (beads A1/A2) and must be cached recursively.
+        (self.module_dir / "helpers" / "ubs_core").mkdir(parents=True, exist_ok=True)
+        for asset in (LIB_ASSET,):
+            shutil.copy2(MODULES / asset, self.module_dir / asset)
+        for core_file in iter_shipped_files(MODULES / "helpers" / "ubs_core"):
+            rel = core_file.relative_to(MODULES)
+            (self.module_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(core_file, self.module_dir / rel)
         tampered = self.module_dir / TAMPERED_HELPER
         if missing_helper:
             tampered.unlink()
         elif tamper:
-            tampered.write_text(tampered.read_text(encoding="utf-8") + "\n# tampered by test_supply_chain\n", encoding="utf-8")
+            for rel in tamper_targets:
+                target = self.module_dir / rel
+                target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
         # Local "raw.githubusercontent.com": both the release tag and main paths.
         for ref in (f"v{ubs_version()}", "main"):
             dest = self.raw_base / ref / "modules" / "helpers"
@@ -81,9 +111,14 @@ class Sandbox:
             lib_dest.mkdir()
             for lib in (MODULES / "lib").glob("*.sh"):
                 shutil.copy2(lib, lib_dest / lib.name)
+            core_dest = self.raw_base / ref / "modules" / "helpers" / "ubs_core"
+            core_dest.mkdir(parents=True, exist_ok=True)
+            for core_file in iter_shipped_files(MODULES / "helpers" / "ubs_core"):
+                shutil.copy2(core_file, core_dest / core_file.name)
             if serve_tampered:
-                served = dest / Path(TAMPERED_HELPER).name
-                served.write_text(served.read_text(encoding="utf-8") + "\n# tampered by test_supply_chain\n", encoding="utf-8")
+                for rel in tamper_targets:
+                    served = self.raw_base / ref / "modules" / rel
+                    served.write_text(served.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
 
     def run(self, *extra_env: tuple[str, str]) -> subprocess.CompletedProcess:
         env = os.environ.copy()
@@ -125,6 +160,43 @@ def check_tampered_helper_refused() -> None:
         report("tampered_helper_refused", ok, f"exit={proc.returncode}", proc)
 
 
+def check_tampered_lib_refreshed_from_clean_source() -> None:
+    # A6: a tampered cached copy of lib/ubs-common.sh is repaired from a clean
+    # source and the scan proceeds (the library ships through the helper channel).
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        proc = Sandbox(Path(tmp), tamper=True, serve_tampered=False, tamper_targets=(LIB_ASSET,)).run()
+        combined = proc.stdout + proc.stderr
+        ok = proc.returncode in (0, 1) and "failed verification" in combined and "refusing" not in combined
+        report("tampered_lib_refreshed_from_clean_source", ok, f"exit={proc.returncode}", proc)
+
+
+def test_tampered_lib_refused() -> None:
+    # A6 acceptance: tampering lib/ubs-common.sh on BOTH sides fails closed (exit 2).
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        proc = Sandbox(Path(tmp), tamper=True, serve_tampered=True, tamper_targets=(LIB_ASSET,)).run()
+        combined = proc.stdout + proc.stderr
+        ok = proc.returncode == 2 and "refusing to scan with unverified helpers" in combined
+        report("test_tampered_lib_refused", ok, f"exit={proc.returncode}", proc)
+
+
+def check_tampered_core_refreshed_from_clean_source() -> None:
+    # A6: a tampered cached ubs_core file is repaired from a clean source.
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        proc = Sandbox(Path(tmp), tamper=True, serve_tampered=False, tamper_targets=(CORE_ASSET,)).run()
+        combined = proc.stdout + proc.stderr
+        ok = proc.returncode in (0, 1) and "failed verification" in combined and "refusing" not in combined
+        report("tampered_core_refreshed_from_clean_source", ok, f"exit={proc.returncode}", proc)
+
+
+def check_tampered_core_refused() -> None:
+    # A6: tampering a ubs_core file on BOTH sides fails closed (exit 2).
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        proc = Sandbox(Path(tmp), tamper=True, serve_tampered=True, tamper_targets=(CORE_ASSET,)).run()
+        combined = proc.stdout + proc.stderr
+        ok = proc.returncode == 2 and "refusing to scan with unverified helpers" in combined
+        report("tampered_core_refused", ok, f"exit={proc.returncode}", proc)
+
+
 def check_override_allows_unverified() -> None:
     with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
         proc = Sandbox(Path(tmp), tamper=True, serve_tampered=True).run(("UBS_ALLOW_UNVERIFIED_HELPERS", "1"))
@@ -149,6 +221,10 @@ def main() -> int:
         check_healthy_cache_scans,
         check_tampered_helper_refreshed_from_clean_source,
         check_tampered_helper_refused,
+        check_tampered_lib_refreshed_from_clean_source,
+        test_tampered_lib_refused,
+        check_tampered_core_refreshed_from_clean_source,
+        check_tampered_core_refused,
         check_override_allows_unverified,
         check_download_failure_only_warns,
     ):

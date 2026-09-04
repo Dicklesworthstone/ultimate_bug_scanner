@@ -122,7 +122,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='467563f6db08bc1045679d2c406e9eab3f824c7770cbf83c2756f4135b08b45d'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
-  ['helpers/ubs_core/cli.py']='50c5888e3f1629396c33a48b08cce26c6c7f1890b13d11fd42fe66b645bac6f2'
+  ['helpers/ubs_core/cli.py']='3d82e91303184488a225ec7fde46d6c56f4f276f797be799d5ad0aaa6afc0854'
+  ['helpers/ubs_core/findings_merge.py']='e8e5845b7557973ad05707d6d2dbb5a2cedae4a7e38ab8e92b912be894cb29f5'
   ['helpers/ubs_core/io.py']='fc2a9dbd784040482108125c0911e996115fe39be5cb83568e605d2c8243b2d8'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
@@ -378,6 +379,7 @@ HELPER_ASSETS=(
   "helpers/ubs_core/analyzers/taint_swift_redirect.py"
   "helpers/ubs_core/analyzers/taint_swift_traversal.py"
   "helpers/ubs_core/cli.py"
+  "helpers/ubs_core/findings_merge.py"
   "helpers/ubs_core/io.py"
   "helpers/ubs_core/lexer.py"
   "helpers/ubs_core/registry.py"
@@ -5721,6 +5723,14 @@ generate_combined_json(){
   if ! need_cmd jq; then return 1; fi
   local t0; t0="$(now_ms)"
   merge_json_scanners >"$COMBINED_JSON_FILE" 2>/dev/null || return 1
+  # K2 findings parity: merge any contract-v2 module's NDJSON findings sink
+  # (<lang>.findings.json) into a top-level findings[] array. A no-op for
+  # modules still on the per-category summary schema.
+  local helpers_dir; helpers_dir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
+  if [[ -d "$helpers_dir/ubs_core" ]]; then
+    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
+      --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" >&2 2>&1 || true
+  fi
   PROFILE_MERGE_MS=$(( PROFILE_MERGE_MS + $(now_ms) - t0 ))
   return 0
 }
@@ -5831,12 +5841,23 @@ write_jsonl_summary(){
   if ! need_cmd jq; then return 1; fi
 
   if [[ "${JSONL_DETAIL:-1}" -eq 1 ]]; then
-    # Detailed mode: emit each finding as its own JSONL line
+    # Detailed mode: emit each finding as its own JSONL line.
+    # K2: top-level findings[] (contract-v2 NDJSON sinks) take precedence —
+    # one record per sample with rule id, location, fingerprint, suppression.
+    jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
+      (.findings // [])[] |
+      {type:"finding", project:$project, timestamp:$ts, language:.lang,
+       rule_id:.rule_id, category_id:.category_id, severity:.severity,
+       confidence:.confidence, file:.file, line:.line, col:.col,
+       message:.message, remediation:.remediation, fix:.fix,
+       fingerprint:.fingerprint, suppressed:.suppressed}
+    ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
+
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
       .scanners[] as $s |
-      ($s.findings // [])[] |
+      (($s.findings // [])[]) |
       {type:"finding", project:$project, language:$s.language} + .
-    ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
+    ' "$COMBINED_JSON_FILE" >>"$tmp" 2>/dev/null || true
 
     # Also emit scanner summaries
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '

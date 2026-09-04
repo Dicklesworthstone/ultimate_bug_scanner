@@ -68,6 +68,12 @@ def _build_parser() -> argparse.ArgumentParser:
     suppress.add_argument("--lang", required=True, help="language of the scanned sources")
     suppress.add_argument("--findings", default="-", help="NDJSON findings file ('-' = stdin)")
     suppress.add_argument("--out", default="-", help="NDJSON output path ('-' = stdout)")
+    fm = sub.add_parser(
+        "findings-merge",
+        help="merge per-module NDJSON findings sinks into the combined summary (bead K2)",
+    )
+    fm.add_argument("--tmp-dir", required=True, help="run temp dir holding <lang>.findings.json sinks")
+    fm.add_argument("--combined", required=True, help="combined summary JSON document")
     return parser
 
 
@@ -148,6 +154,17 @@ def main(argv: list[str] | None = None) -> int:
         from ubs_core.selftest import run_self_tests
 
         return run_self_tests()
+
+    if args.layer == "findings-merge":
+        from ubs_core.findings_merge import merge
+
+        try:
+            merged = merge(Path(args.tmp_dir), Path(args.combined))
+        except ValueError as exc:
+            print(f"findings-merge: {exc}", file=sys.stderr)
+            return 2
+        sys.stdout.write(f"{merged}\n")
+        return 0
 
     if not getattr(args, "layer", None):
         parser.print_help(sys.stderr)

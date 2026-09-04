@@ -13298,6 +13298,466 @@
           "Interpolated SQL reaches execution sink"
         ]
       }
+    },
+    {
+      "id": "python-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the python module.",
+      "path": "test-suite/python/suppression/suppression_buggy.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=python"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "suppression_buggy.py:"
+        ]
+      }
+    },
+    {
+      "id": "python-suppression-intervals-nomarkers",
+      "description": "A7 control: the same python code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/python/suppression/suppression_buggy_nomarkers.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=python"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.py:"
+        ]
+      }
+    },
+    {
+      "id": "js-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the js module.",
+      "path": "test-suite/js/suppression/suppression_buggy.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=js"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "suppression_buggy.js:"
+        ]
+      }
+    },
+    {
+      "id": "js-suppression-intervals-nomarkers",
+      "description": "A7 control: the same js code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/js/suppression/suppression_buggy_nomarkers.js",
+      "language": "js",
+      "tags": [
+        "js",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=js"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.js:"
+        ]
+      }
+    },
+    {
+      "id": "cpp-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the cpp module.",
+      "path": "test-suite/cpp/suppression/suppression_buggy.cpp",
+      "language": "cpp",
+      "tags": [
+        "cpp",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=cpp"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "forbid_substrings": [
+          "suppression_buggy.cpp:"
+        ]
+      }
+    },
+    {
+      "id": "cpp-suppression-intervals-nomarkers",
+      "description": "A7 control: the same cpp code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/cpp/suppression/suppression_buggy_nomarkers.cpp",
+      "language": "cpp",
+      "tags": [
+        "cpp",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=cpp"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.cpp:"
+        ]
+      }
+    },
+    {
+      "id": "rust-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the rust module.",
+      "path": "test-suite/rust/suppression/suppression_buggy.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=rust"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "suppression_buggy.rs:"
+        ]
+      }
+    },
+    {
+      "id": "rust-suppression-intervals-nomarkers",
+      "description": "A7 control: the same rust code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/rust/suppression/suppression_buggy_nomarkers.rs",
+      "language": "rust",
+      "tags": [
+        "rust",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=rust"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.rs:"
+        ]
+      }
+    },
+    {
+      "id": "golang-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the golang module.",
+      "path": "test-suite/golang/suppression/suppression_buggy.go",
+      "language": "golang",
+      "tags": [
+        "golang",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=golang"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "suppression_buggy.go:"
+        ]
+      }
+    },
+    {
+      "id": "golang-suppression-intervals-nomarkers",
+      "description": "A7 control: the same golang code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/golang/suppression/suppression_buggy_nomarkers.go",
+      "language": "golang",
+      "tags": [
+        "golang",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=golang"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.go:"
+        ]
+      }
+    },
+    {
+      "id": "java-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the java module.",
+      "path": "test-suite/java/suppression/suppression_buggy.java",
+      "language": "java",
+      "tags": [
+        "java",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=java"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "forbid_substrings": [
+          "suppression_buggy.java:"
+        ]
+      }
+    },
+    {
+      "id": "java-suppression-intervals-nomarkers",
+      "description": "A7 control: the same java code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/java/suppression/suppression_buggy_nomarkers.java",
+      "language": "java",
+      "tags": [
+        "java",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=java"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.java:"
+        ]
+      }
+    },
+    {
+      "id": "ruby-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the ruby module.",
+      "path": "test-suite/ruby/suppression/suppression_buggy.rb",
+      "language": "ruby",
+      "tags": [
+        "ruby",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=ruby"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "suppression_buggy.rb:"
+        ]
+      }
+    },
+    {
+      "id": "ruby-suppression-intervals-nomarkers",
+      "description": "A7 control: the same ruby code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/ruby/suppression/suppression_buggy_nomarkers.rb",
+      "language": "ruby",
+      "tags": [
+        "ruby",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=ruby"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.rb:"
+        ]
+      }
+    },
+    {
+      "id": "swift-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the swift module.",
+      "path": "test-suite/swift/suppression/suppression_buggy.swift",
+      "language": "swift",
+      "tags": [
+        "swift",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=swift"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "forbid_substrings": [
+          "suppression_buggy.swift:"
+        ]
+      }
+    },
+    {
+      "id": "swift-suppression-intervals-nomarkers",
+      "description": "A7 control: the same swift code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/swift/suppression/suppression_buggy_nomarkers.swift",
+      "language": "swift",
+      "tags": [
+        "swift",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=swift"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "warning": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.swift:"
+        ]
+      }
+    },
+    {
+      "id": "csharp-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the csharp module.",
+      "path": "test-suite/csharp/suppression/suppression_buggy.cs",
+      "language": "csharp",
+      "tags": [
+        "csharp",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=csharp"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "forbid_substrings": [
+          "suppression_buggy.cs:"
+        ]
+      }
+    },
+    {
+      "id": "csharp-suppression-intervals-nomarkers",
+      "description": "A7 control: the same csharp code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/csharp/suppression/suppression_buggy_nomarkers.cs",
+      "language": "csharp",
+      "tags": [
+        "csharp",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=csharp"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.cs:"
+        ]
+      }
+    },
+    {
+      "id": "elixir-suppression-intervals-markers",
+      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the elixir module.",
+      "path": "test-suite/elixir/suppression/suppression_buggy.ex",
+      "language": "elixir",
+      "tags": [
+        "elixir",
+        "suppression",
+        "regression"
+      ],
+      "args": [
+        "--only=elixir"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "forbid_substrings": [
+          "suppression_buggy.ex:"
+        ]
+      }
+    },
+    {
+      "id": "elixir-suppression-intervals-nomarkers",
+      "description": "A7 control: the same elixir code without markers keeps its findings (proves the markers do the suppressing).",
+      "path": "test-suite/elixir/suppression/suppression_buggy_nomarkers.ex",
+      "language": "elixir",
+      "tags": [
+        "elixir",
+        "suppression",
+        "regression",
+        "buggy"
+      ],
+      "args": [
+        "--only=elixir"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        },
+        "require_substrings": [
+          "suppression_buggy_nomarkers.ex:"
+        ]
+      }
     }
   ]
 }

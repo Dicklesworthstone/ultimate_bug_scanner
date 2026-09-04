@@ -78,11 +78,15 @@ class SuppressionIndex:
 def parse_markers(text: str, lang: str = "python") -> list[Marker]:
     """Return `ubs:ignore` markers per line, ignoring occurrences in strings.
 
-    Comments survive the mask (strip_comments=False) because markers naturally
+    Comments survive the mask (preserve_comments=True) because markers naturally
     live in comments; string contents are blanked so documented examples like
-    `use "ubs:ignore" carefully` never suppress anything.
+    `use "ubs:ignore" carefully` never suppress anything. Comment detection
+    stays active, so an apostrophe in a comment ("don't") cannot open a
+    phantom string and hide later markers.
     """
-    masked = strip_comments_and_strings(text, lang=lang, strip_strings=True, strip_comments=False)
+    masked = strip_comments_and_strings(
+        text, lang=lang, strip_strings=True, strip_comments=True, preserve_comments=True
+    )
     markers: list[Marker] = []
     for lineno, line in enumerate(masked.splitlines(), start=1):
         for match in MARKER_RE.finditer(line):
@@ -190,7 +194,7 @@ def build_index(text: str, lang: str = "python") -> SuppressionIndex:
         text,
         lang="python" if lang in _HASH_LANGS else "c_like",
         strip_strings=True,
-        strip_comments=False,
+        strip_comments=True,
     )
     lines = masked.splitlines()
     index = SuppressionIndex()

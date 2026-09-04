@@ -51,7 +51,7 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 declare -A MODULE_CHECKSUMS=(
   [cpp]='eb71d850e74f736cd5b50b6893e8051e4409321fe94ade75cac30ed1740d4e9e'
   [csharp]='0a6e5df41560b291e4bfed7a40c2216239caec4aeaddaa5a36e45c9d5624f559'
-  [elixir]='27f9bc72107b5dc0fcb2bdf20333aa4ce01411b5cf0e8f01a9ce0a80e4d5e21c'
+  [elixir]='fa027f4a36326697784117a44353bd8c2030c9da2b7ecb094f3fc437fb3e659e'
   [golang]='06f389a0b71e6a196cc50fad45256a9d9d0009d78c6fd46e2baa6f817e428c5e'
   [java]='40bea15174de2cd545e4ac891659f3ce30876d36284b846fea52b03ca7c1659d'
   [js]='de0e9cf86144a1cd7ef33e5c10e1c0d4f07732cd70c57807a42681fce8c66485'
@@ -86,6 +86,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/ctcompare_js.py']='43695373ce47cbe3ff6810d3f1dfdb748d8a104247415ba214d3bee9c225135a'
   ['helpers/ubs_core/analyzers/ctcompare_py.py']='9b340f59fddbb1fd1b5220174ddee79944797179a09bc01a7262a1d7c8d1a2dc'
   ['helpers/ubs_core/analyzers/ctcompare_rust.py']='1202852a01c48643302fff163e32f4e7f2eb5f2f845aba6fe334765ab5471e19'
+  ['helpers/ubs_core/analyzers/guards_generic.py']='61ef81e6255aa3c09ed175648f8cbd99ee2bff9a98ed3c968781533beb91b4a5'
   ['helpers/ubs_core/analyzers/guards_js.py']='494fb9a6a0ef641ddafdf62766f5dc043351020674578127a624f85039e62eca'
   ['helpers/ubs_core/analyzers/guards_py.py']='59b4edae6b864cff5e8f93315765b3011b8fef4a8a3c0dfd0aa871fe879d2329'
   ['helpers/ubs_core/analyzers/guards_ruby.py']='aed0e66449bd1b3a36f69eafdd8b9fac966c9b2eb2c11ff355da01ec64a5f61b'
@@ -95,8 +96,13 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/lifecycle_py.py']='84b4fb6371c00d9b787e26feeface5cd1fd99c142d9ad840f96d81ce33647c15'
   ['helpers/ubs_core/analyzers/lifecycle_ruby.py']='b5d928e4dc9f504c3c427f51463e5ad6bfe69f86e9cc6f591ca8757d5ce053cd'
   ['helpers/ubs_core/analyzers/lifecycle_swift.py']='51b065554c6b5310ad66f0fd862f113d81cb6822faf23f57215cbf953e0b2c34'
+  ['helpers/ubs_core/analyzers/narrowing_cpp.py']='5681c018729ec37129d808d9f65ec51e368c060e0b0ce4d363b461afcd4d9345'
   ['helpers/ubs_core/analyzers/narrowing_csharp.py']='436ce2e1f5a5e1384915b54d67fcfaae7156d607331bbaa1f27680610a6ccd17'
+  ['helpers/ubs_core/analyzers/narrowing_elixir.py']='40af9808f556825b6ce81397c37d5ed5100ce34cbf2a7ea291be4c7f280ff7ee'
+  ['helpers/ubs_core/analyzers/narrowing_go.py']='123895581adf37f5670b8e8f3b21bc2bf75f3495e82077a80039718324be5771'
   ['helpers/ubs_core/analyzers/narrowing_kotlin.py']='d84c7099d32ccefbef2bdc253b3473ccbfa2f4532f55139ebff46de01c81ee5e'
+  ['helpers/ubs_core/analyzers/narrowing_py.py']='60a2381463f1e7e8ff66e9a6a8564baa2aff1d10c2f107e3d24b23a4341bde9a'
+  ['helpers/ubs_core/analyzers/narrowing_ruby.py']='4af90a09f6336c242dd5eb58efec6df8ab12a0a3dbe2e282a34e55d7723d2555'
   ['helpers/ubs_core/analyzers/narrowing_rust.py']='54ec29f4297cbe37aec4cdaab276a6880bb16fd93377ed060e90c5de98261b12'
   ['helpers/ubs_core/analyzers/narrowing_swift.py']='2a7971f6f6a858eb73d1f898a6fdd039a56be405222877eae3890a6343a52a73'
   ['helpers/ubs_core/analyzers/regex_swift.py']='236c0fc8aca7c8c2d6b3270bfcc14f16e81a7caf95e500adc9ac176b33490311'
@@ -118,10 +124,10 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
   ['helpers/ubs_core/cli.py']='50c5888e3f1629396c33a48b08cce26c6c7f1890b13d11fd42fe66b645bac6f2'
   ['helpers/ubs_core/io.py']='fc2a9dbd784040482108125c0911e996115fe39be5cb83568e605d2c8243b2d8'
-  ['helpers/ubs_core/lexer.py']='1634a5009b186ff04ddbe47ded0ae234a644a37164373f514f99bdef731a697a'
+  ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
-  ['helpers/ubs_core/suppression.py']='6f856e576f7bedb269f937d642aadfaa876ee991a4a27dcbe6d5543f8369515c'
+  ['helpers/ubs_core/suppression.py']='473563fd701199b1e16977cce0e26596ab6bceee1ba824fec0b1dcbda3684b1e'
   ['lib/ubs-common.sh']='cce2e8ce1824ce466010a2a2179c9282f6674518bd6b72785b72a1ed7c3e0016'
 )
 
@@ -335,6 +341,7 @@ HELPER_ASSETS=(
   "helpers/ubs_core/analyzers/ctcompare_js.py"
   "helpers/ubs_core/analyzers/ctcompare_py.py"
   "helpers/ubs_core/analyzers/ctcompare_rust.py"
+  "helpers/ubs_core/analyzers/guards_generic.py"
   "helpers/ubs_core/analyzers/guards_js.py"
   "helpers/ubs_core/analyzers/guards_py.py"
   "helpers/ubs_core/analyzers/guards_ruby.py"
@@ -344,8 +351,13 @@ HELPER_ASSETS=(
   "helpers/ubs_core/analyzers/lifecycle_py.py"
   "helpers/ubs_core/analyzers/lifecycle_ruby.py"
   "helpers/ubs_core/analyzers/lifecycle_swift.py"
+  "helpers/ubs_core/analyzers/narrowing_cpp.py"
   "helpers/ubs_core/analyzers/narrowing_csharp.py"
+  "helpers/ubs_core/analyzers/narrowing_elixir.py"
+  "helpers/ubs_core/analyzers/narrowing_go.py"
   "helpers/ubs_core/analyzers/narrowing_kotlin.py"
+  "helpers/ubs_core/analyzers/narrowing_py.py"
+  "helpers/ubs_core/analyzers/narrowing_ruby.py"
   "helpers/ubs_core/analyzers/narrowing_rust.py"
   "helpers/ubs_core/analyzers/narrowing_swift.py"
   "helpers/ubs_core/analyzers/regex_swift.py"

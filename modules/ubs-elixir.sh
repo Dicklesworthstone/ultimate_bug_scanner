@@ -537,6 +537,8 @@ def source_line(lines, line_no):
     return ''
 
 def relpath(path):
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:
@@ -775,6 +777,8 @@ def contains_tainted_path(statement: str, tainted: set[str]) -> bool:
     return any(re.search(rf'\b{re.escape(var)}\b', statement) for var in tainted)
 
 def relpath(path):
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:
@@ -1019,6 +1023,8 @@ def source_line(lines, line_no):
     return ''
 
 def relpath(path):
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:
@@ -1306,6 +1312,8 @@ def source_line(lines, line_no):
     return ''
 
 def relpath(path):
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:
@@ -1651,6 +1659,8 @@ def source_line(lines, line_no):
     return ''
 
 def relpath(path):
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:
@@ -1903,6 +1913,8 @@ def source_line(lines, line_no):
     return ''
 
 def relpath(path):
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:
@@ -2096,6 +2108,8 @@ def has_ignore(lines, line_no):
     )
 
 def relpath(path: Path) -> str:
+    if ROOT.is_file() and path == ROOT:
+        return sys.argv[1]
     try:
         return str(path.relative_to(BASE_DIR))
     except ValueError:

@@ -56,8 +56,14 @@ def strip_comments_and_strings(
     *,
     strip_strings: bool = True,
     strip_comments: bool = True,
+    preserve_comments: bool = False,
 ) -> str:
     """Mask out comments and strings with spaces while preserving newlines.
+
+    With ``preserve_comments=True`` (requires ``strip_comments=True``), comment
+    detection still runs — so quotes inside comments cannot open strings — but
+    comment text is emitted verbatim instead of blanked. This lets marker
+    parsers see `ubs:ignore` in comments while staying immune to apostrophes.
 
     Ensures that (line, column) coordinates and string offsets in the returned text
     match the original text byte-for-byte.
@@ -87,7 +93,7 @@ def strip_comments_and_strings(
 
         # Inside line comment
         if in_line_comment:
-            result.append(mask_char(ch))
+            result.append(ch if preserve_comments else mask_char(ch))
             if ch == "\n":
                 in_line_comment = False
             i += 1
@@ -95,9 +101,9 @@ def strip_comments_and_strings(
 
         # Inside block comment
         if in_block_comment:
-            result.append(mask_char(ch))
+            result.append(ch if preserve_comments else mask_char(ch))
             if ch == "*" and nxt == "/":
-                result.append(" ")
+                result.append("/" if preserve_comments else " ")
                 in_block_comment = False
                 i += 2
             else:
@@ -136,19 +142,19 @@ def strip_comments_and_strings(
         if strip_comments:
             if is_hash_comment and ch == "#":
                 in_line_comment = True
-                result.append(" ")
+                result.append(ch if preserve_comments else " ")
                 i += 1
                 continue
 
             if not is_hash_comment and ch == "/" and nxt == "/":
                 in_line_comment = True
-                result.extend("  ")
+                result.extend("//" if preserve_comments else "  ")
                 i += 2
                 continue
 
             if not is_hash_comment and ch == "/" and nxt == "*":
                 in_block_comment = True
-                result.extend("  ")
+                result.extend("/*" if preserve_comments else "  ")
                 i += 2
                 continue
 

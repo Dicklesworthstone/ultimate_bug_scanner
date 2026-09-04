@@ -3707,11 +3707,13 @@ fi
 #    while the category port completes: UBS_CONTRACT_V2_JS=1 enables it;
 #    UBS_LEGACY_MODULE_JS=1 always wins.
 run_contract_v2_js(){
-  local list_file sink helpers_dir exit_code=0
+  local list_file sink helpers_dir exit_code=0 ast_rule_dir=""
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-sink.XXXXXX)"
   helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
-  if ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2
   fi
@@ -3719,6 +3721,20 @@ run_contract_v2_js(){
   [[ -n "${SKIP_CATEGORIES}" ]] && scan_args+=(--skip "$SKIP_CATEGORIES")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   [[ -n "${CI_MODE}" && "$CI_MODE" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  # Consolidated ast-grep layer: generate the 37-rule pack + variants into ≤3
+  # sgconfigs (one scan -c per grammar group inside ubs_core.js_ast).
+  local ast_rule_dir=""
+  if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-jsv2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.js_rules import generate
+generate(Path('$ast_rule_dir'))
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
   case "$FORMAT" in
     json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text) scan_args+=(--text-out /dev/stdout --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;

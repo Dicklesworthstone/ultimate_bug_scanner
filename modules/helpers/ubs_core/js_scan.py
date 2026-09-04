@@ -180,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
     parser.add_argument("--project-dir", default="", help="base dir for relative sink paths")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
+    parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir (sgconfig-*.yml + manifest.json)")
     parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
     parser.add_argument("--json-out", default="", help="write the UBS summary JSON document here")
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
@@ -199,6 +200,24 @@ def main(argv: list[str] | None = None) -> int:
     with open(args.sink, "w", encoding="utf-8") as sink:
         counters = scan_patterns(patterns, files, sink, skip)
         run_analyzers(files, sink)
+        if args.ast_rule_dir:
+            from ubs_core.js_ast import scan_all
+
+            overrides: dict[str, str] = {}
+            manifest_path = Path(args.ast_rule_dir) / "manifest.json"
+            if manifest_path.is_file():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    overrides = {
+                        rid: meta["severity"]
+                        for rid, meta in manifest.items()
+                        if isinstance(meta, dict) and meta.get("severity")
+                    }
+                except (ValueError, OSError):
+                    overrides = {}
+            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides)
+            for key, value in ast_counters.items():
+                counters[key] = counters.get(key, 0) + value
 
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:

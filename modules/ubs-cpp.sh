@@ -50,6 +50,7 @@ cleanup() {
   [[ -n "${AST_JSON_FILE:-}" ]] && rm -f "$AST_JSON_FILE" 2>/dev/null || true
   [[ -n "${AST_CONFIG_FILE:-}" ]] && rm -f "$AST_CONFIG_FILE" 2>/dev/null || true
   [[ -n "${AST_RULE_DIR:-}" && "${AST_RULE_DIR:-}" != "/" && "${AST_RULE_DIR:-}" != "." ]] && rm -rf -- "$AST_RULE_DIR" 2>/dev/null || true
+  [[ -n "${SARIF_FINDINGS_TMP:-}" ]] && rm -f "$SARIF_FINDINGS_TMP" 2>/dev/null || true
   exit "$ec"
 }
 trap cleanup EXIT
@@ -91,6 +92,7 @@ SCAN_HIDDEN=0
 MAX_FILESIZE=""
 PATHS_FILE=""
 LIST_CATS=0
+REPORT_JSON=""
 
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(cpp.async.std-async-no-try cpp.async.future-no-get)
@@ -116,6 +118,7 @@ Options:
   -q, --quiet              Reduce non-essential output
   --format=FMT             Output format: text|json|sarif|counts (default: text)
   --list-categories        Print numeric category map and exit
+  --report-json=FILE       Also write a machine-readable JSON summary to FILE
   --counts                 Output only per-category counts (machine-friendly)
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
@@ -145,6 +148,7 @@ while [[ $# -gt 0 ]]; do
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
     --format=*)   FORMAT="${1#*=}"; ubs_validate_format "$FORMAT"; shift;;
     --list-categories) LIST_CATS=1; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --counts)     FORMAT="counts"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
@@ -428,9 +432,10 @@ emit_json_summary() {
 # SARIF parity (bead K5): in sarif mode every finding and code sample is also
 # recorded (TSV scratch log) so the SARIF document carries the heuristic
 # findings, not only the ast-grep run. Cheap: no spawn per record.
+# --report-json (K2 bridge) reuses the same scratch for the legacy payload.
 SARIF_FINDINGS_TMP=""
 sarif_log_ready(){
-  [[ "${FORMAT:-text}" == "sarif" ]] || return 1
+  [[ "${FORMAT:-text}" == "sarif" || -n "${REPORT_JSON:-}" ]] || return 1
   if [[ -z "$SARIF_FINDINGS_TMP" ]]; then
     SARIF_FINDINGS_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-sarif-findings.XXXXXX)" || return 1
     : >"$SARIF_FINDINGS_TMP"
@@ -2973,6 +2978,144 @@ should_skip() {
   return 0
 }
 
+# ── Contract-v2 path (bead 0xjg.9): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.cpp_scan), NDJSON findings sink (K2 schema). Opt-in
+#    while the ecosystem flips: UBS_CONTRACT_V2_CPP=1 enables it;
+#    UBS_LEGACY_MODULE_CPP=1 always wins.
+# ── Legacy-parity bridges for the contract-v2 path ──────────────────────────
+# The v2 layers cannot reproduce two legacy-only behaviors, so
+# run_v2_legacy_parity_bridges_cpp runs right after the cpp_scan call:
+#   1. The legacy print_header sweep: every non-skipped category announces
+#      itself even when nothing was found there, while the v2 renderer prints
+#      record-backed sections only. The record-less remainder is appended in
+#      legacy category order (text format only).
+#   2. The trailing "Summary Statistics:" block with final counts recounted
+#      from the sink plus the legacy exit formula (3535-3537 of the legacy
+#      flow: critical >0, or warnings with --fail-on-warning).
+run_v2_legacy_parity_bridges_cpp(){
+  local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}"
+  local files_n bridge_rc=0
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
+    "$scan_exit" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import sys
+
+(sink_path, text_out, files_raw, fow_raw, skip_csv, scan_exit_raw) = sys.argv[1:7]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+scan_exit = int(scan_exit_raw or "0")
+as_text = bool(text_out)
+
+# Mirror cpp_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
+SLUG = {1: "memory-raii", 2: "exceptions", 3: "concurrency", 4: "modernization",
+        5: "pointer-lifetime", 6: "numeric", 7: "undefined-behavior", 8: "headers",
+        9: "stl", 10: "string-io", 11: "macros", 12: "cmake", 13: "code-quality",
+        14: "perf", 15: "debug", 16: "resource-lifecycle"}
+SECTION = {1: "1. MEMORY & RAII", 2: "2. EXCEPTIONS & ERROR HANDLING",
+           3: "3. CONCURRENCY & ATOMICS", 4: "4. MODERNIZATION (C++20+)",
+           5: "5. POINTER & LIFETIME HAZARDS", 6: "6. NUMERIC & ARITHMETIC PITFALLS",
+           7: "7. UNDEFINED BEHAVIOR RISK ZONE", 8: "8. HEADER & INCLUDE HYGIENE",
+           9: "9. STL & ALGORITHMS", 10: "10. STRING & I/O SAFETY",
+           11: "11. MACROS & PREPROCESSOR TRAPS", 12: "12. CMAKE & BUILD HYGIENE",
+           13: "13. CODE QUALITY MARKERS", 14: "14. PERFORMANCE & ALLOCATION PRESSURE",
+           15: "15. TEST/DEBUG LEFTOVERS", 16: "16. RESOURCE LIFECYCLE CORRELATION"}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+out = []
+
+# Final severity recount over the whole sink (legacy EXIT_CODE inputs).
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+if as_text:
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        if not any(r.get("category_id") == f"cpp.{SLUG[num]}" for r in records):
+            out.append(SECTION[num])
+    out.append("")
+    out.append("Summary Statistics:")
+    out.append(f"Files scanned: {files_n}")
+    out.append(f"Critical issues: {counts['critical']}")
+    out.append(f"Warning issues: {counts['warning']}")
+    out.append(f"Info items: {counts['info']}")
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+exit_code = 1 if counts["critical"] else scan_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+run_contract_v2_cpp(){
+  local list_file sink helpers_dir exit_code=0 text_out=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "${SKIP_CATEGORIES}" ]] && scan_args+=(--skip "$SKIP_CATEGORIES")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  # No ast-grep layer in v2: the legacy pack's ast_count call sites are dead
+  # code (AST_JSON_FILE is only created by run_ast_once, which runs in the
+  # text-mode tally section AFTER every category block), so legacy totals
+  # never include rule-pack hits. See ubs_core/cpp_scan.py.
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: Path.write_text on
+      # /dev/stdout re-truncates a regular-file capture at its own offset,
+      # which would stomp the legacy-parity bridge text appended below.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 cpp path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_CPP=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.cpp_scan \
+    "${scan_args[@]}" --version "7.1" || exit_code=$?
+  # Record-less section headers + Summary Statistics + legacy exit formula.
+  run_v2_legacy_parity_bridges_cpp "$sink" "$list_file" "$exit_code" "$text_out" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_CPP:-0}" == "1" && "${UBS_LEGACY_MODULE_CPP:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env fall-through parity: without python3 the v2 path cannot run any of
+  # the detection layers — fall through so the legacy path produces its
+  # exact env-error behavior. No ast-grep requirement: that is the point
+  # of this port (see ubs_core/cpp_scan.py).
+  if command -v python3 >/dev/null 2>&1; then
+    v2_status=0
+    run_contract_v2_cpp || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Main Scan Logic
 # ────────────────────────────────────────────────────────────────────────────
@@ -3530,6 +3673,33 @@ end_scan_section
 EXIT_CODE=0
 if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi
 if [ "$FAIL_ON_WARNING" -eq 1 ] && [ $((CRITICAL_COUNT + WARNING_COUNT)) -gt 0 ]; then EXIT_CODE=1; fi
+
+# --report-json (K2 bridge): legacy payload from the recorded findings — the
+# same shape the js/python legacy modules emit (per-finding severity/count/
+# title). Written before the format exits so it applies to every format.
+if [[ -n "$REPORT_JSON" && -n "${SARIF_FINDINGS_TMP:-}" ]] && command -v python3 >/dev/null 2>&1; then
+  python3 - "$SARIF_FINDINGS_TMP" "$REPORT_JSON" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" <<'PY' 2>/dev/null || true
+import json, sys, time
+src, out, files, crit, warn, info = sys.argv[1:7]
+findings = []
+try:
+  with open(src, 'r', encoding='utf-8') as fh:
+    for raw in fh:
+      parts = raw.rstrip('\n').split('\t')
+      if parts[0] != 'F' or len(parts) < 4:
+        continue
+      try:
+        count = int(parts[2])
+      except ValueError:
+        count = 0
+      findings.append({"severity": parts[1], "count": count, "title": parts[3], "description": parts[4] if len(parts) > 4 else ""})
+except FileNotFoundError:
+  pass
+payload = {"version": "7.1", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "files": int(files), "critical": int(crit), "warning": int(warn), "info": int(info), "findings": findings}
+open(out, 'w', encoding='utf-8').write(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+fi
 
 if [[ "$FORMAT" == "counts" ]]; then
   echo "files=$TOTAL_FILES critical=$CRITICAL_COUNT warning=$WARNING_COUNT info=$INFO_COUNT"

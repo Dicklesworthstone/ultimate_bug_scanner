@@ -195,19 +195,10 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
     return counters
 
 
-def _record_category(finding: dict) -> int | None:
-    """Map an analyzer finding's rule id to its legacy category number."""
-    rule = str(finding.get("rule", ""))
-    if rule.startswith(("js.async.", "javascript.async.")):
-        return 5
-    if rule.startswith(("js.security.", "javascript.security.", "js.taint.", "javascript.taint.")):
-        return 7
-    if rule.startswith("javascript.guards."):
-        return 1
-    return None
-
 
 def load_patterns() -> list[Pattern]:
+    """Aggregate PATTERNS from every ubs_core.js_patterns.* module."""
+    import importlib
     """Aggregate PATTERNS from every ubs_core.js_patterns.* module."""
     import importlib
     import pkgutil
@@ -221,6 +212,25 @@ def load_patterns() -> list[Pattern]:
         module = importlib.import_module(f"ubs_core.js_patterns.{module_info.name}")
         patterns.extend(getattr(module, "PATTERNS", []))
     return patterns
+def _record_category(finding: dict) -> int | None:
+    """Map an analyzer finding's rule id to its legacy category number."""
+    rule = str(finding.get("rule", ""))
+    if rule.startswith(("js.async.", "javascript.async.")):
+        return 5
+    if rule.startswith(("js.security.", "javascript.security.", "js.taint.", "javascript.taint.")):
+        return 7
+    if rule.startswith("javascript.guards."):
+        return 1
+    if rule.startswith("js.hooks."):
+        return 5
+    for num, slug in _CATEGORY_SLUGS.items():
+        if rule.startswith(f"js.{slug}."):
+            return num
+    if rule.startswith("javascript.control-flow."):
+        return 10
+    if rule.startswith("javascript.function-scope."):
+        return 8
+    return None
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:

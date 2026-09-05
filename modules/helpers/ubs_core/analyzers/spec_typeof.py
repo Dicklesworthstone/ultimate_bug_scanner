@@ -9,14 +9,16 @@ operand is a quoted string literal outside the eight valid typeof results
 reported as critical ("Invalid typeof comparison"). The legacy flow matched
 the comparisons with eight ast-grep patterns and consumed the concatenated
 JSON stream in python (dedup key ``(file, line, Y literal)``); here the same
-detection runs over ``RunContext.files`` with an equivalent code-aware scan:
-``ubs_core.lexer.strip_comments_and_strings`` blanks comments (ast-grep only
-matches code nodes), then a JS-specific pass blanks template-literal text
-and regex literals while blanking string-literal *contents* — string
-delimiters stay visible so a comparison operand can be recognized, and the
-literal's text is taken from the original source at the same offsets.
-``${...}`` interpolation code stays visible. ``unquote`` and the
-valid-literal set are the heredoc code byte-for-byte.
+detection runs over ``RunContext.files`` with an equivalent code-aware
+single-pass tokenizer: comments, template-literal text and regex literals
+are blanked (ast-grep only matches code nodes) while string-literal
+delimiters stay visible so a comparison operand can be recognized — string
+*contents* are blanked, so a literal containing comparison-shaped text never
+matches, and the literal's text is taken from the original source at the
+same offsets. ``${...}`` interpolation code stays visible. A dedicated
+lexer is required because ``ubs_core.lexer`` has no template/regex
+awareness and this operand-level detection cannot run over literal text.
+``unquote`` and the valid-literal set are the heredoc code byte-for-byte.
 
 The heredoc's project-level counter becomes one finding record per unique
 (line, literal) triple, severity ``critical`` per the legacy
@@ -28,7 +30,6 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
@@ -65,14 +66,13 @@ def _regex_start_context(text: str, idx: int) -> bool:
     return not (ch in ')]')
 
 
-def _mask_strings_templates_regex(masked: str) -> str:
-    """JS-specific pass over the comment-stripped text: blank template-literal
-    *text* (keeping ``${...}`` interpolation code), blank string-literal
-    *contents* while keeping their delimiters (they are the comparison
-    operands this detector classifies), and blank regex literals. Newlines
-    preserved; offsets identical."""
-    out = list(masked)
-    n = len(masked)
+def _mask_non_code(text: str) -> str:
+    """Blank comments, template/regex text and string contents (newlines
+    preserved) so only real code — with string delimiters — survives;
+    ``${...}`` interpolation code stays visible. Offsets are identical to the
+    input."""
+    out = list(text)
+    n = len(text)
 
     def blank(a: int, b: int) -> None:
         for j in range(a, min(b, n)):
@@ -81,24 +81,37 @@ def _mask_strings_templates_regex(masked: str) -> str:
 
     i = 0
     while i < n:
-        c = masked[i]
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ''
+        if c == '/' and nxt == '/':
+            end = text.find('\n', i)
+            end = n if end == -1 else end
+            blank(i, end)
+            i = end
+            continue
+        if c == '/' and nxt == '*':
+            end = text.find('*/', i + 2)
+            end = n if end == -1 else end + 2
+            blank(i, end)
+            i = end
+            continue
         if c == '`':
             j = i + 1
             while j < n:
-                ch = masked[j]
+                ch = text[j]
                 if ch == '\\':
                     j += 2
                     continue
                 if ch == '`':
                     j += 1
                     break
-                if ch == '$' and j + 1 < n and masked[j + 1] == '{':
+                if ch == '$' and j + 1 < n and text[j + 1] == '{':
                     depth = 1
                     k = j + 2
                     while k < n and depth:
-                        if masked[k] == '{':
+                        if text[k] == '{':
                             depth += 1
-                        elif masked[k] == '}':
+                        elif text[k] == '}':
                             depth -= 1
                         k += 1
                     blank(j, j + 2)
@@ -111,7 +124,7 @@ def _mask_strings_templates_regex(masked: str) -> str:
         if c in '\'"':
             j = i + 1
             while j < n:
-                ch = masked[j]
+                ch = text[j]
                 if ch == '\\':
                     j += 2
                     continue
@@ -121,12 +134,11 @@ def _mask_strings_templates_regex(masked: str) -> str:
                 j += 1
             i = j + 1
             continue
-        if c == '/' and i + 1 < n and masked[i + 1] not in '/*' \
-                and _regex_start_context(masked, i):
+        if c == '/' and nxt not in ('/', '*') and _regex_start_context(text, i):
             j = i + 1
             in_class = False
             while j < n:
-                ch = masked[j]
+                ch = text[j]
                 if ch == '\\':
                     j += 2
                     continue
@@ -140,22 +152,15 @@ def _mask_strings_templates_regex(masked: str) -> str:
                 elif ch == '/':
                     break
                 j += 1
-            if j < n and masked[j] == '/':
+            if j < n and text[j] == '/':
                 end = j + 1
-                while end < n and (masked[end].isalnum()):
+                while end < n and (text[end].isalnum()):
                     end += 1
                 blank(i, end)
                 i = end
                 continue
         i += 1
     return ''.join(out)
-
-
-def _mask_non_code(text: str) -> str:
-    """Blank comments, template/regex text and string contents (newlines
-    preserved) so only real code — with string delimiters — survives.
-    Offsets are identical to the input."""
-    return _mask_strings_templates_regex(strip_comments_and_strings(text, strip_strings=False))
 
 
 # ── Verbatim from the legacy typeof heredoc ─────────────────────────────────
@@ -326,12 +331,14 @@ def _selftest_non_code_never_matches(
         "const s = \"if (typeof q === 'array') {}\";  // string content",
         "const re = /typeof x === 'array'/;",
         "const t = `typeof x === 'array'`;",
+        "const url = 'https://example.com'; if (typeof u === 'array') { z(); }",
     ])
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
         target = Path(tmp) / "noise.js"
         target.write_text(src, encoding="utf-8")
         findings = list(scan_file_findings(target))
-        assert findings == [], findings
+        # only the real comparison on line 5 (URL string must not blank it)
+        assert [(f[0], f[2]) for f in findings] == [(5, 'array')], findings
 
 
 def _selftest_template_interpolation_is_code(

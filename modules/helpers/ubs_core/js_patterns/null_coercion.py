@@ -40,14 +40,6 @@ PATTERNS: list[Pattern] = [
         thresholds=((15, "info"),),
         exclude_regex=re.compile(r"\?\?"),
     ),
-    Pattern(
-        category=1,
-        rule_id="js.null-undefined.deep-property-chain",
-        title="Deep property access - high crash risk",
-        # Legacy prefers ast-grep '$X.$Y.$Z.$W'; this is the rg fallback variant.
-        regex=re.compile(r"\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*"),
-        thresholds=((20, "warning"), (0, "info")),
-    ),
     # ── CATEGORY 4: TYPE COERCION & COMPARISON TRAPS (ubs-js.sh 4128-4272) ──
     Pattern(
         category=4,

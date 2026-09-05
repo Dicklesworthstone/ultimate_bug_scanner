@@ -360,6 +360,7 @@ def _synthetic_streams(file_key: str, text: str) -> tuple[list, list, list]:
 
 def run(ctx: RunContext) -> Iterable[dict]:
     cwd = Path.cwd()
+    pending: list[dict] = []
     for path in ctx.files:
         if path.suffix.lower() not in JS_EXTS:
             continue
@@ -380,16 +381,21 @@ def run(ctx: RunContext) -> Iterable[dict]:
             end_pos = as_pos(match["range"]["end"])
             if any(within((start_pos, end_pos), guard) for guard in guards_by_file.get(file_key, [])):
                 continue
-            yield {
+            pending.append({
                 "rule": "javascript.guards.deep_unguarded_chain",
                 "path": file_key,
                 "line": start_pos[0] + 1,
                 "col": start_pos[1] + 1,
                 "layer": "guards",
                 "lang": "javascript",
-                "severity": "warning",
                 "message": "Deep property access without explicit guard (obj?.a?.b?.c or if/membership check)",
-            }
+            })
+    # Legacy ladder (ubs-js.sh 3905-3917): warning > 20 unguarded chains,
+    # info for 1..20, nothing at 0 — resolved project-wide.
+    if pending:
+        severity = "warning" if len(pending) > 20 else "info"
+        for rec in pending:
+            yield dict(rec, severity=severity)
 
 
 def _selftest_guard_condition_predicates() -> None:

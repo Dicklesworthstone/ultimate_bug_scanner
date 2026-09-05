@@ -11,7 +11,7 @@ Layers, in order:
    preserves the legacy count_lines semantics; the A7 statement-interval
    engine in the meta-runner postprocess adds the richer placements).
 2. Analyzer layer — registered ubs_core analyzers for javascript
-   (taint_js, guards_js, ctcompare_js) via their run(ctx).
+   (taint_js, guards_js, ctcompare_js, the 15 async detectors) via run(ctx).
 3. ast-grep layer — the consolidated rule packs (≤ 3 `scan -c` invocations)
    via ubs_core.js_ast.scan_all; only SEVERITY_MAP ids are counted (the rest
    of the pack is an informational dump in legacy), async rules downgrade to
@@ -42,6 +42,46 @@ _CATEGORY_SLUGS = {
     17: "typescript", 18: "node", 19: "resource-lifecycle",
 }
 
+# Legacy print_finding "good" notes per category (emitted when the category
+# produced no findings at all).
+_GOOD_LINES = {
+    "null-undefined": "Deep property chains are guarded",
+    "async": "All async operations appear protected",
+    "error-handling": "Error handling looks solid",
+    "resource-lifecycle": "Resource lifecycle appears balanced",
+}
+
+# Legacy print_header titles, in category order (rendered before a section).
+_SECTION_HEADERS = {
+    1: "NULL SAFETY & DEFENSIVE PROGRAMMING",
+    2: "MATH & ARITHMETIC PITFALLS",
+    3: "ARRAY & COLLECTION SAFETY",
+    4: "TYPE COERCION & COMPARISON TRAPS",
+    5: "ASYNC/AWAIT & PROMISE PITFALLS",
+    6: "ERROR HANDLING ANTI-PATTERNS",
+    7: "SECURITY VULNERABILITIES",
+    8: "FUNCTION & SCOPE ISSUES",
+    9: "PARSING & TYPE CONVERSION BUGS",
+    10: "CONTROL FLOW GOTCHAS",
+    11: "DEBUGGING & PRODUCTION CODE",
+    12: "MEMORY LEAKS & PERFORMANCE",
+    13: "VARIABLE & SCOPE ISSUES",
+    14: "CODE QUALITY MARKERS",
+    15: "REGEX & STRING SAFETY",
+    16: "DOM MANIPULATION SAFETY",
+    17: "TYPESCRIPT STRICTNESS",
+    18: "NODE.JS I/O & MODULES",
+    19: "RESOURCE LIFECYCLE CORRELATION",
+}
+
+# Legacy print_subheader texts that manifest cases assert.
+_SUBHEADERS = {
+    7: {
+        "js.taint.": "Lightweight taint analysis",
+        "javascript.taint.": "Lightweight taint analysis",
+    },
+}
+
 
 def slug_for_category(category: int) -> str:
     return _CATEGORY_SLUGS.get(category, f"cat{category}")
@@ -55,7 +95,9 @@ class Pattern:
     first entry whose count > min_count wins; when none match, the category
     reports nothing — mirroring the legacy `warning >15 / info >0` ladders.
     gate_regex expresses legacy project-wide preconditions (e.g. an Express
-    import must exist somewhere before req.body patterns count).
+    import must exist somewhere before req.body patterns count);
+    suppress_when_regex expresses count-comparison silences (e.g. parsers
+    present anywhere silences the no-parser finding).
     """
 
     category: int
@@ -66,7 +108,7 @@ class Pattern:
     case_insensitive: bool = False
     exclude_regex: re.Pattern[str] | None = None  # legacy `grep -v` post-filters
     gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
-    suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide count-comparison (e.g. parsers present -> silent)
+    suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide count-comparison
 
 
 def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
@@ -100,7 +142,8 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
     resolved ONCE per pattern from that project-wide count — every record of
     a category carries the same severity, so summed counters equal the
     legacy print_finding buckets. Patterns with gate_regex stay silent unless
-    some file in the list satisfies the gate (legacy project-wide preconditions).
+    some file in the list satisfies the gate; patterns with
+    suppress_when_regex go silent when any file satisfies it.
 
     Returns severity counters ({"critical": n, "warning": n, "info": n}).
     """
@@ -169,7 +212,7 @@ def load_patterns() -> list[Pattern]:
 
 
 def run_analyzers(files: Sequence[Path], sink) -> None:
-    """Run registered javascript analyzers (taint, guards, ctcompare)."""
+    """Run registered javascript analyzers (taint, guards, ctcompare, async)."""
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
@@ -186,6 +229,84 @@ def run_analyzers(files: Sequence[Path], sink) -> None:
                 "message": finding.get("message", ""),
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")
+
+
+def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+    """Render the legacy-format text report from the NDJSON sink."""
+    import datetime
+
+    try:
+        from ubs_core.js_rules import REMEDIATION_MAP, SUMMARY_MAP
+    except ImportError:
+        SUMMARY_MAP, REMEDIATION_MAP = {}, {}
+
+    records = [
+        json.loads(line)
+        for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    by_rule: dict[str, list[dict]] = {}
+    for rec in records:
+        by_rule.setdefault(rec["rule"], []).append(rec)
+
+    lines = [
+        f"UBS module: js (contract v2) — {args.project or args.project_dir}",
+        f"Files scanned: {len(files)}",
+    ]
+    ordered_rules = sorted(
+        by_rule,
+        key=lambda rule: (by_rule[rule][0].get("category_id", ""), rule),
+    )
+    current_section = None
+    emitted_subheaders: set[str] = set()
+    for rule in ordered_rules:
+        recs = by_rule[rule]
+        category_id = recs[0].get("category_id", "")
+        category_num = None
+        section = None
+        subheader = None
+        if category_id.startswith("js."):
+            tail = category_id.split(".", 1)[1]
+            for num, slug in _CATEGORY_SLUGS.items():
+                if tail == slug:
+                    section = _SECTION_HEADERS.get(num)
+                    for prefix, text in _SUBHEADERS.get(num, {}).items():
+                        if rule.startswith(prefix):
+                            subheader = text
+                    break
+        if section is not None and section != current_section:
+            lines.append("")
+            lines.append(section)
+            current_section = section
+        if subheader and subheader not in emitted_subheaders:
+            lines.append(subheader)
+            emitted_subheaders.add(subheader)
+        severity = recs[0]["severity"]
+        title = SUMMARY_MAP.get(rule, rule)
+        lines.append(f"[{severity}] {title} ({len(recs)} found) — {rule}")
+        remediation = REMEDIATION_MAP.get(rule)
+        if remediation:
+            lines.append(f"    {remediation}")
+        for rec in recs[:5]:
+            lines.append(f"    {rec['path']}:{rec['line']}  {rec['message'][:180]}")
+
+    # Legacy "good" notes (print_finding "good") for emit groups whose
+    # category produced no findings at all.
+    categories_with_records = {
+        rec.get("category_id", "").rsplit(".", 1)[-1] for rec in records
+    }
+    for num, slug in _CATEGORY_SLUGS.items():
+        good = _GOOD_LINES.get(slug)
+        if good and slug not in categories_with_records:
+            lines.append(f"good: {good}")
+
+    lines += [
+        f"Critical issues: {counters['critical']}",
+        f"Warning issues: {counters['warning']}",
+        f"Info items: {counters['info']}",
+        f"Report generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+    ]
+    Path(args.text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -228,6 +349,9 @@ def main(argv: list[str] | None = None) -> int:
             if manifest_path.is_file():
                 try:
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    for rid, meta in manifest.items():
+                        if isinstance(meta, dict) and meta.get("severity") and rid not in overrides:
+                            overrides[rid] = meta["severity"]
                 except (ValueError, OSError):
                     pass
             if not args.fail_on_warning:
@@ -272,76 +396,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        import datetime
-
-        from ubs_core.js_rules import REMEDIATION_MAP, SUMMARY_MAP
-        SECTION_HEADERS = {
-            1: "NULL SAFETY & DEFENSIVE PROGRAMMING",
-            2: "MATH & ARITHMETIC PITFALLS",
-            3: "ARRAY & COLLECTION SAFETY",
-            4: "TYPE COERCION & COMPARISON TRAPS",
-            5: "ASYNC/AWAIT & PROMISE PITFALLS",
-            6: "ERROR HANDLING ANTI-PATTERNS",
-            7: "SECURITY VULNERABILITIES",
-            8: "FUNCTION & SCOPE ISSUES",
-            9: "PARSING & TYPE CONVERSION BUGS",
-            10: "CONTROL FLOW GOTCHAS",
-            11: "DEBUGGING & PRODUCTION CODE",
-            12: "MEMORY LEAKS & PERFORMANCE",
-            13: "VARIABLE & SCOPE ISSUES",
-            14: "CODE QUALITY MARKERS",
-            15: "REGEX & STRING SAFETY",
-            16: "DOM MANIPULATION SAFETY",
-            17: "TYPESCRIPT STRICTNESS",
-            18: "NODE.JS I/O & MODULES",
-            19: "RESOURCE LIFECYCLE CORRELATION",
-        }
-
-        records = [
-            json.loads(line)
-            for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        by_rule: dict[str, list[dict]] = {}
-        for rec in records:
-            by_rule.setdefault(rec["rule"], []).append(rec)
-
-        lines = [f"UBS module: js (contract v2) — {args.project or args.project_dir}",
-                 f"Files scanned: {len(files)}"]
-        ordered_rules = sorted(
-            by_rule,
-            key=lambda rule: (by_rule[rule][0].get("category_id", ""), rule),
-        )
-        current_section = None
-        for rule in ordered_rules:
-            recs = by_rule[rule]
-            category_id = recs[0].get("category_id", "")
-            section = None
-            if category_id.startswith("js."):
-                tail = category_id.split(".", 1)[1]
-                for num, slug in _CATEGORY_SLUGS.items():
-                    if tail == slug:
-                        section = SECTION_HEADERS.get(num)
-                        break
-            if section is not None and section != current_section:
-                lines.append("")
-                lines.append(section)
-                current_section = section
-            severity = recs[0]["severity"]
-            title = SUMMARY_MAP.get(rule, rule)
-            lines.append(f"[{severity}] {title} ({len(recs)} found) — {rule}")
-            remediation = REMEDIATION_MAP.get(rule)
-            if remediation:
-                lines.append(f"    {remediation}")
-            for rec in recs[:5]:
-                lines.append(f"    {rec['path']}:{rec['line']}  {rec['message'][:180]}")
-        lines += [
-            f"Critical issues: {counters['critical']}",
-            f"Warning issues: {counters['warning']}",
-            f"Info items: {counters['info']}",
-            f"Report generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
-        ]
-        Path(args.text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _render_text(args, files, counters)
 
     sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
     return exit_code

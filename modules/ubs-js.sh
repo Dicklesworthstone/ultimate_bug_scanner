@@ -3706,6 +3706,196 @@ fi
 #    orchestrator (ubs_core.js_scan), NDJSON findings sink (K2 schema). Opt-in
 #    while the category port completes: UBS_CONTRACT_V2_JS=1 enables it;
 #    UBS_LEGACY_MODULE_JS=1 always wins.
+# ── Legacy-parity bridges for the contract-v2 path ──────────────────────────
+# The v2 layers (patterns/analyzers/ast) cannot reproduce three legacy-only
+# behaviors, so run_contract_v2_js converts them right after the js_scan call:
+#   1. run_type_narrowing_checks (1220-1313): a node/bun helper over .ts/.tsx
+#      the v2 python process never runs. Each issue line becomes a sink record
+#      (rule js.typescript.type-narrowing, severity warning) and the legacy
+#      gates are re-evaluated verbatim: UBS_SKIP_TYPE_NARROWING, ts|tsx in
+#      _EXT_ARR, .ts/.tsx presence, helper file, runner availability, and the
+#      EXCLUDE_DIRS forwarding the helper needs (GH #75).
+#   2. The legacy print_header sweep: every non-skipped category announces
+#      itself even when nothing was found there (e.g. "MATH & ARITHMETIC
+#      PITFALLS" on a fixture with zero math signals), while the v2 renderer
+#      prints record-backed sections only. The record-less remainder is
+#      appended in legacy category order (text format only).
+#   3. The trailing "Summary Statistics:" block with final counts recounted
+#      from the sink (so bridged type-narrowing records are included) plus the
+#      legacy exit formula (10923-10925).
+run_v2_legacy_parity_bridges(){
+  local sink="$1" list_file="$2" js_exit="$3"
+  local fmt="${FORMAT:-text}"
+  local run_tn=0 tn_status=0 tn_raw="" helper="" js_runner="" e d
+  local allow_ts=0
+  if [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -ne 1 ]]; then
+    for e in "${_EXT_ARR[@]}"; do
+      case "$(echo "$e" | xargs)" in
+        ts|tsx) allow_ts=1 ;;
+      esac
+    done
+    # has_ts probe over the v2 file list itself (same scope the scan used).
+    local has_ts=0
+    if [[ "$allow_ts" -eq 1 && -f "$list_file" ]]; then
+      has_ts="$(tr '\0' '\n' <"$list_file" 2>/dev/null | grep -cE '\.tsx?$' || true)"
+      [[ "${has_ts:-0}" -gt 0 ]] && has_ts=1 || has_ts=0
+    fi
+    if [[ "$has_ts" -eq 1 ]]; then
+      helper="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers/type_narrowing_ts.js"
+      if [[ -f "$helper" ]]; then
+        if command -v node >/dev/null 2>&1; then
+          js_runner="node"
+        elif command -v bun >/dev/null 2>&1; then
+          js_runner="bun"
+        fi
+        if [[ -n "$js_runner" ]]; then
+          local -a helper_args=("$PROJECT_DIR")
+          local helper_excludes=""
+          for d in "${EXCLUDE_DIRS[@]}"; do
+            [[ -z "$d" ]] && continue
+            if [[ -n "$helper_excludes" ]]; then helper_excludes+=",$d"; else helper_excludes="$d"; fi
+          done
+          [[ -n "$helper_excludes" ]] && helper_args+=("--exclude=$helper_excludes")
+          tn_raw="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-tn.XXXXXX)"
+          if "$js_runner" "$helper" "${helper_args[@]}" >"$tn_raw" 2>&1; then
+            tn_status=0
+          else
+            tn_status=$?
+          fi
+          run_tn=1
+        fi
+      fi
+    fi
+  fi
+  local files_n bridge_rc=0
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$fmt" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
+    "$run_tn" "$tn_status" "$tn_raw" "$js_exit" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import os
+import sys
+
+(sink_path, fmt, files_raw, fow_raw, skip_csv, run_tn_raw, tn_status_raw,
+ tn_raw_path, js_exit_raw) = sys.argv[1:10]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+run_tn = run_tn_raw == "1"
+tn_status = int(tn_status_raw or "0")
+js_exit = int(js_exit_raw or "0")
+as_text = fmt == "text"
+
+# Mirror js_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
+SLUG = {1: "null-undefined", 2: "equality", 3: "proto-object", 4: "type-coercion",
+        5: "async", 6: "error-handling", 7: "security", 8: "function-scope",
+        9: "parsing", 10: "control-flow", 11: "debug", 12: "perf",
+        13: "vars", 14: "code-quality", 15: "regex", 16: "dom",
+        17: "typescript", 18: "node", 19: "resource-lifecycle"}
+SECTION = {1: "NULL SAFETY & DEFENSIVE PROGRAMMING", 2: "MATH & ARITHMETIC PITFALLS",
+           3: "ARRAY & COLLECTION SAFETY", 4: "TYPE COERCION & COMPARISON TRAPS",
+           5: "ASYNC/AWAIT & PROMISE PITFALLS", 6: "ERROR HANDLING ANTI-PATTERNS",
+           7: "SECURITY VULNERABILITIES", 8: "FUNCTION & SCOPE ISSUES",
+           9: "PARSING & TYPE CONVERSION BUGS", 10: "CONTROL FLOW GOTCHAS",
+           11: "DEBUGGING & PRODUCTION CODE", 12: "MEMORY LEAKS & PERFORMANCE",
+           13: "VARIABLE & SCOPE ISSUES", 14: "CODE QUALITY MARKERS",
+           15: "REGEX & STRING SAFETY", 16: "DOM MANIPULATION SAFETY",
+           17: "TYPESCRIPT STRICTNESS", 18: "NODE.JS I/O & MODULES",
+           19: "RESOURCE LIFECYCLE CORRELATION"}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+out = []
+
+def emit(line=""):
+    out.append(line)
+
+# Bridge 1: run_type_narrowing_checks output → sink records (+ text finding).
+if run_tn:
+    raw = ""
+    if tn_raw_path and os.path.isfile(tn_raw_path):
+        with open(tn_raw_path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    raw_lines = raw.splitlines()
+    issue_lines = [l for l in raw_lines if l.strip() and not l.startswith("[ubs-type-narrowing]")]
+    if tn_status != 0:
+        # Legacy 1284-1287: warning finding, count 0, raw output as description.
+        if as_text:
+            emit("Type narrowing validation")
+            emit("[warning] Type narrowing analyzer failed (0 found) — js.typescript.analyzer-failed")
+            if raw.strip():
+                emit("    " + " ".join(raw.split())[:240])
+    elif issue_lines:
+        count = len(issue_lines)
+        previews = []
+        new_records = []
+        for line in issue_lines:
+            loc, sep, msg = line.partition("\t")
+            previews.append(f"{loc} → {msg}" if sep else loc)
+            path, lineno, col = loc, 0, 1
+            parts = loc.rsplit(":", 2)
+            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                path, lineno, col = parts[0], int(parts[1]), int(parts[2])
+            new_records.append({
+                "rule": "js.typescript.type-narrowing",
+                "category_id": "js.typescript",
+                "path": path,
+                "line": lineno,
+                "col": col,
+                "severity": "warning",
+                "message": (msg if sep else loc)[:240],
+                "suppressed": False,
+            })
+        with open(sink_path, "a", encoding="utf-8") as fh:
+            for rec in new_records:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        records.extend(new_records)
+        if as_text:
+            if not any(r.get("category_id") == "js.typescript" for r in records[:-count]):
+                emit("TYPESCRIPT STRICTNESS")
+            emit("Type narrowing validation")
+            desc = "Examples: " + " ".join(previews[:3])
+            if count > 3:
+                desc += f" (and {count - 3} more)"
+            emit(f"[warning] Potentially unsafe type narrowing ({count} found) — js.typescript.type-narrowing")
+            emit(f"    {desc}")
+
+# Final severity recount over the whole sink (legacy 10923-10925 inputs).
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+# Bridge 2 + 3 (text format only; json/sarif stdout stays machine-clean).
+if as_text:
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        if not any(r.get("category_id") == f"js.{SLUG[num]}" for r in records):
+            emit(SECTION[num])
+    emit("")
+    emit("Summary Statistics:")
+    emit(f"Files scanned: {files_n}")
+    emit(f"Critical issues: {counts['critical']}")
+    emit(f"Warning issues: {counts['warning']}")
+    emit(f"Info items: {counts['info']}")
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+exit_code = 1 if counts["critical"] else js_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  if [[ -n "$tn_raw" ]]; then
+    rm -f "$tn_raw" 2>/dev/null || true
+  fi
+  return "$bridge_rc"
+}
+
 run_contract_v2_js(){
   local list_file sink helpers_dir exit_code=0 ast_rule_dir=""
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-list.XXXXXX)"
@@ -3726,9 +3916,18 @@ run_contract_v2_js(){
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-jsv2-rules.XXXXXX)"
     if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from pathlib import Path
-from ubs_core.js_rules import generate
-generate(Path('$ast_rule_dir'))
+  local text_out=""
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: Path.write_text on
+      # /dev/stdout re-truncates a regular-file capture at its own offset,
+      # which would stomp the legacy-parity bridge text appended below.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-jsv2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 js path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_JS=1" >&2; return 2 ;;
+  esac
 " 2>/dev/null; then
       ast_rule_dir=""
     fi
@@ -3741,6 +3940,11 @@ generate(Path('$ast_rule_dir'))
   esac
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.js_scan \
     "${scan_args[@]}" --version "4.7" || exit_code=$?
+  # Legacy-parity bridges: convert run_type_narrowing_checks output into sink
+  # records, append the record-less legacy section headers, and print the final
+  # "Summary Statistics:" block (counts recounted from the sink) with the
+  # legacy exit formula. See run_v2_legacy_parity_bridges above.
+  run_v2_legacy_parity_bridges "$sink" "$list_file" "$exit_code" || exit_code=$?
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi

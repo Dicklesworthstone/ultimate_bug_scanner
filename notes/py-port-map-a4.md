@@ -7,7 +7,67 @@ gated UBS_CONTRACT_V2_PY=1, escape UBS_LEGACY_MODULE_PY=1 — mirroring the
 completed A4-js arc (notes/js-port-map-a4.md, implemented in modules/ubs-js.sh
 run_contract_v2_js + modules/helpers/ubs_core/js_scan.py).
 
-Status: RECON COMPLETE. Executor follows the js playbook wave order.
+Status: PORT COMPLETE (executor PyPortExec, 2026-09-05, commits 25e4f40,
+4871431, 002c576, 0ae80c9). v2 LIVE behind UBS_CONTRACT_V2_PY=1; legacy
+default untouched; UBS_LEGACY_MODULE_PY=1 escape; sarif falls through.
+GATES: python manifest 86/86 under the gate (= legacy 86/86 baseline);
+contract_conformance PASS (10/10 modules); shellcheck no new warnings
+(11 pre-existing SC2034); ubs_core self-test 404/404; checksums refreshed.
+Full 472-case cross-language manifest under the gate env: see
+/tmp/full_v2_final.log (final evidence run).
+
+IMPLEMENTED LAYERS
+- ubs_core/py_scan.py: orchestrator (Pattern engine = js_scan semantics;
+  py_detectors loader with single-rule + RULES multi-rule protocol;
+  registry analyzers taint/lifecycle/guards/ctcompare; python.narrowing
+  GATED OFF via --enable-new-analyzers for parity); sink-recount totals;
+  legacy text renderer; --json-out = run_lang summary + raw findings[] +
+  legacy issue-64 per-rule report block (title/samples) so
+  python-json-findings-parity's "samples" assertion holds under K2.
+- ubs_core/py_rules.py + py_ast.py: 52-rule pack (write_ast_rules + async
+  rule) verbatim; ONE sgconfig-python.yml, scan -c per 400-path batch.
+  6 rules ast-grep rejects at load (_UNPARSEABLE_RULES) stay out of the
+  config — legacy per-rule scans swallowed the same errors, so both paths
+  contribute nothing for them. py.assert-used test-file suppression, async
+  rule category-gated (cat 5), everything else counts in totals only.
+- py_patterns/: debug_typing (11/13/17/18), foundations (1-4 incl.
+  first-match-wins division ladder), flow (5/6/10/21 incl. legacy grep -A
+  intent as bounded cross-line regexes), quality (8/9/12/14/15/22/23),
+  io_files (16), security_rg (eval/pickle/yaml/shell/verify/hash/mktemp).
+- py_detectors/: 34 modules — all 33 cat-7 heredocs (SQL two-tier GH #94,
+  security-assert tests/conftest suppression #64) + is_literal (cat 4),
+  json_loads, division, mutation_during_iteration, missing_returns,
+  io_open_checks (open-vs-with ratio, "open() calls missing 'with'"),
+  hardcoded_secrets, packaging editable/file:// part.
+- ubs-python.sh: run_contract_v2_py + run_v2_uv_tools_py (cat 20 raw
+  passthrough, NOT sink records; lump info counts via UV_EXTRA_INFO) +
+  run_v2_legacy_parity_bridges_py (record-less section headers + Summary
+  Statistics + legacy exit formula) + gate before CATEGORY 1.
+
+PROCESS BUDGET: 1 rule-gen python3 + 1 py_scan + ≤1 ast-grep per 400 files
++ ≤3 uv tools + 1 bridge python3 ≈ 6-8 (≤25 target).
+
+KNOWN DIVERGENCES (all parity-neutral or legacy-faithful; per-case totals
+in /tmp/legacy_totals.txt vs /tmp/v2_totals.txt style artifacts):
+- Legacy multi-layer double counting (rg + pack + heredoc on the same line)
+  consolidated where legacy's own rg layer was dead code (nested-defs grep
+  behind path: prefixes, eval/exec comment filter). Totals are range-gated;
+  all 86 cases pass both directions.
+- missing-returns (cat 8) fires info on test-suite/python/clean — inherited
+  legacy heuristic false positive, info-tier, outside the warn bound.
+- requirements.txt unpinned-lines check not portable to the v2 file list
+  (.txt not in INCLUDE_EXT); editable/file:// part ported.
+- --baseline/--summary-json/--max-samples/--max-detailed are ignored under
+  v2 (same as the shipped js v2); sarif mode uses the legacy path.
+- category_slug_for numbering unchanged; contract.json stays contract:1 —
+  FLIP DECISION (contract:2 + default-on + UBS_LEGACY_MODULE_PY escape)
+  BELONGS TO THE INTEGRATOR (Main).
+- scripts/check_docs_claims.py "helpers" check fails on HEAD too (pre-existing):
+  its on_disk set is non-recursive while HELPER_CHECKSUMS pins helpers/ubs_core/
+  subdirs; fix belongs to the checker (use rglob), not this bead.
+
+Line-drift note: section line refs below were accurate at recon time; the
+gate insertion shifted them (+~289). Subagents ported from shifted sources.
 
 # A4-python Port Map — modules/ubs-python.sh → contract v2 (bead 0xjg.5)
 

@@ -41,7 +41,23 @@ CATEGORY_ID = "js.equality"
 TITLE = "Division by variable - verify non-zero"
 REMEDIATION = "Add guards: if (divisor === 0) throw; or use fallback"
 MESSAGE = f"{TITLE} — {REMEDIATION}"
+INFO_TITLE = "Division operations found"
+INFO_MESSAGE = INFO_TITLE
 SEVERITY = "warning"
+INFO_SEVERITY = "info"
+
+def _jsx_punct(text: str, idx: int) -> bool:
+    """True for the slash of JSX ``</tag>`` / ``<tag/>`` / ``<tag />``
+    punctuation: immediately preceded by ``<`` or followed (skipping
+    whitespace) by ``>``. No JS division or regex can sit in those spots, so
+    such slashes are neither ``$L / $R`` nodes nor regex starts."""
+    if idx > 0 and text[idx - 1] == '<':
+        return True
+    j = idx + 1
+    n = len(text)
+    while j < n and text[j].isspace():
+        j += 1
+    return j < n and text[j] == '>'
 
 # A `/` is a regex-literal start when, skipping whitespace backwards, the
 # previous token is a keyword or the previous char is not an identifier /
@@ -137,7 +153,8 @@ def _mask_non_code(text: str) -> str:
         if c == '/' and nxt == '=':
             i += 2  # /= division-assignment: code, but not a $L / $R node
             continue
-        if c == '/' and nxt not in ('/', '*') and _regex_start_context(text, i):
+        if c == '/' and nxt not in ('/', '*') and not _jsx_punct(text, i) \
+                and _regex_start_context(text, i):
             j = i + 1
             in_class = False
             while j < n:
@@ -341,6 +358,8 @@ def scan_file_divisions(path: Path) -> Iterator[tuple[int, int, str]]:
         i = m.start()
         if i + 1 < len(masked) and masked[i + 1] == '=':
             continue  # /= is a different node
+        if _jsx_punct(masked, i):
+            continue  # JSX </tag>/<tag/> punctuation, never a $L / $R node
         denominator = _rhs_operand(masked, i + 1)
         if is_safe_denominator(denominator):
             continue
@@ -352,6 +371,7 @@ def scan_file_divisions(path: Path) -> Iterator[tuple[int, int, str]]:
 
 def run(ctx: RunContext) -> Iterable[dict]:
     cwd = Path.cwd()
+    hits: list[tuple[str, int, int]] = []
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
@@ -367,15 +387,25 @@ def run(ctx: RunContext) -> Iterable[dict]:
         except ValueError:
             rel = path.name
         for line, col, _denominator in scan_file_divisions(path):
-            yield {
-                "rule": RULE,
-                "category_id": CATEGORY_ID,
-                "path": str(rel),
-                "line": line,
-                "col": col,
-                "severity": SEVERITY,
-                "message": MESSAGE,
-            }
+            hits.append((str(rel), line, col))
+    if not hits:
+        return
+    # Legacy severity ladder (ubs-js.sh 4052-4063): severity is resolved ONCE
+    # from the project-wide risky count — warning above 25, info otherwise.
+    if len(hits) > 25:
+        severity, message = SEVERITY, MESSAGE
+    else:
+        severity, message = INFO_SEVERITY, INFO_MESSAGE
+    for rel, line, col in hits:
+        yield {
+            "rule": RULE,
+            "category_id": CATEGORY_ID,
+            "path": rel,
+            "line": line,
+            "col": col,
+            "severity": severity,
+            "message": message,
+        }
 
 
 def _selftest_variable_denominators_flagged(
@@ -469,6 +499,29 @@ def _selftest_non_code_never_matches(
         findings = list(scan_file_divisions(target))
         assert findings == [], findings
 
+def _selftest_severity_ladder(
+    tmp_prefix: str = "ubs_core_spec_division_ladder_",
+) -> None:
+    import tempfile
+
+    # Legacy ladder (ubs-js.sh 4052-4063): 1..25 risky -> info, >25 -> warning.
+    for count, expected_severity, expected_prefix in (
+        (3, "info", "Division operations found"),
+        (25, "info", "Division operations found"),
+        (26, "warning", "Division by variable - verify non-zero"),
+    ):
+        src = "\n".join(
+            ["function f(a, b) {"] + [f"  const r{k} = a / b;" for k in range(count)] + ["}"]
+        )
+        with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+            target = Path(tmp) / "ladder.js"
+            target.write_text(src, encoding="utf-8")
+            ctx = RunContext(lang="javascript", files=[target])
+            records = list(run(ctx))
+            assert len(records) == count, (count, records)
+            assert records[0]["severity"] == expected_severity, (count, records[0])
+            assert records[0]["message"].startswith(expected_prefix), (count, records[0])
+
 
 def _selftest_template_interpolation_is_code(
     tmp_prefix: str = "ubs_core_spec_division_template_",
@@ -499,9 +552,9 @@ def _selftest_run_record_shape(
         rec = records[0]
         assert rec["rule"] == RULE, rec
         assert rec["category_id"] == CATEGORY_ID, rec
-        assert rec["severity"] == "warning", rec
+        assert rec["severity"] == "info", rec  # single risky division: info tier
         assert rec["line"] == 1 and rec["col"] == 11, rec
-        assert rec["message"].startswith("Division by variable - verify non-zero"), rec
+        assert rec["message"].startswith("Division operations found"), rec
 
 
 SELF_TESTS: tuple[tuple[str, object], ...] = (
@@ -510,6 +563,7 @@ SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("zero-and-unguarded-risky", _selftest_zero_and_unguarded_risky),
     ("non-code-never-matches", _selftest_non_code_never_matches),
     ("template-interpolation-is-code", _selftest_template_interpolation_is_code),
+    ("severity-ladder", _selftest_severity_ladder),
     ("run-record-shape", _selftest_run_record_shape),
 )
 

@@ -54,7 +54,7 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='fa027f4a36326697784117a44353bd8c2030c9da2b7ecb094f3fc437fb3e659e'
   [golang]='06f389a0b71e6a196cc50fad45256a9d9d0009d78c6fd46e2baa6f817e428c5e'
   [java]='40bea15174de2cd545e4ac891659f3ce30876d36284b846fea52b03ca7c1659d'
-  [js]='a244653389521e833d6fc48a9b53dfa2688b8ec76d80f7b60b30d2b0dd8cc8c9'
+  [js]='97ad785073a79968999cacda58ac174938c8c071cbfc00a8fdaab2c2440427a6'
   [python]='022caa877b5c7f5c4459bd45196dfb45ec3f712eb75aa8f0b727d7861784aa9f'
   [ruby]='e676f8ce6eea0c2b6bea51b244ef28e6189edd9dcf78258dad2bb2ebf068c3fa'
   [rust]='a6952e2c2dc18081dc43d79bd33621ba3ac386ea3a35df50e07248de9708da6e'
@@ -80,7 +80,22 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/__init__.py']='6218b34afb5e19f5657abe24d432e4b4205335e3669e6a7c8baca69eb84f9b78'
   ['helpers/ubs_core/__main__.py']='4aed5b835f04ba3a51b13a650b15dc05e2e43436e9e8be19000551999172639e'
   ['helpers/ubs_core/analyzers/__init__.py']='090badfe6b8be4c60de495a74b362acff5a4d9f8461dbb56d5b6718783e39b86'
+  ['helpers/ubs_core/analyzers/async_event_emitter.py']='eaa22abf72e33569b102b9b6425082e409f8191b8e4e0dc30a16c64d3e5edbfd'
+  ['helpers/ubs_core/analyzers/async_event_listener.py']='fe7c29dd3d98efdb88bb7c07176598e9f496c21fbee69d9c41049058bf83fa1b'
+  ['helpers/ubs_core/analyzers/async_flatmap.py']='4b2c989d6962906166950f3f9590b2359e55096160b0fe82bda77aeee7d6a5d3'
+  ['helpers/ubs_core/analyzers/async_foreach.py']='cc474803af4d727ce22c8f8b59b72111879324714cd774f7068e37bc65f39c43'
   ['helpers/ubs_core/analyzers/async_handles_csharp.py']='830d3853356dd3f631bc3ec2b949dc51f46ac8e71cb812948713bede783c898a'
+  ['helpers/ubs_core/analyzers/async_jsx_handler.py']='e1bd2c9e970304c43caabbad44271319e9769873e3ae032bb6de657302bcfc20'
+  ['helpers/ubs_core/analyzers/async_map_awaited.py']='8b11c366f5aca6f293c3fef48d7ec96ac830424c86f714acc60c9f3eee09aa4e'
+  ['helpers/ubs_core/analyzers/async_map_ignored.py']='70b8babeb147c0d4d81a8128dbb1c4d5af6723f29cc182d61cd9a8a1f0131032'
+  ['helpers/ubs_core/analyzers/async_predicates.py']='8a68cfcc012b6220e5472222979537f0c6016874de0cd6c72ee626ffdc907628'
+  ['helpers/ubs_core/analyzers/async_promise_all_foreach.py']='bc2e00a5781a8ea5c395c1249f9404cc00b38119ea70bc21e1e7fc4f7395c008'
+  ['helpers/ubs_core/analyzers/async_promise_all_map.py']='da1f6024e29eba09b84536d9d5046ae9b627b24d67027d89382915b19393e5c8'
+  ['helpers/ubs_core/analyzers/async_promise_executor.py']='093cbd0bc705b696e8a222e9bc9307ab450e5fb180276cd73f835a6e79dece4a'
+  ['helpers/ubs_core/analyzers/async_react_effect.py']='9611185bed87c651dded2ba12e484245c202dc87c7c73ed7bdbb7408dd5da0ba'
+  ['helpers/ubs_core/analyzers/async_reduce.py']='6cd736c100dfaf1871c15734e46ecec3972eb0e36c5ece7b67ecef807c2b0ccc'
+  ['helpers/ubs_core/analyzers/async_sort_comparator.py']='7410aaa138a3a9204a0e47fc81ed9942f14031728edd21a991373df5d17c225b'
+  ['helpers/ubs_core/analyzers/async_timer.py']='b24c3462cfc469c330ecfc63ff63e2d20cc2b92165f627dc148ac76bbf105ea4'
   ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='5269b88dd078cae71d1a3c2e23523032507ac49265560dd0c27273c41c38c5aa'
   ['helpers/ubs_core/analyzers/ctcompare_go.py']='67b66f44a697628c36dc5499aa40e9bfd737391d72f6940a623ef427d7a4e64d'
   ['helpers/ubs_core/analyzers/ctcompare_js.py']='43695373ce47cbe3ff6810d3f1dfdb748d8a104247415ba214d3bee9c225135a'
@@ -129,12 +144,12 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
   ['helpers/ubs_core/js_patterns/debug_quality.py']='de6e0c36dfb9e06691b65ec5e8fd7739ec22840ebf5c487801f998218bb78172'
   ['helpers/ubs_core/js_patterns/eq_regex_dom.py']='d2513ecc6d6311612e0ccd02293d25a5373ef60cf4d689f96ec30c4c12cf4d8a'
-  ['helpers/ubs_core/js_patterns/fn_parse_perf.py']='17b7fb57674849de1d03ed2b457bdf7ec75988d6f2e5f99c3203575c1fb21a50'
+  ['helpers/ubs_core/js_patterns/fn_parse_perf.py']='1cd06fa7c281e2a26d1979b01008dbea8b900bf6a2444ddc4b016e02362ed89a'
   ['helpers/ubs_core/js_patterns/null_coercion.py']='db322ed7cbbfaaf103c0bc290c567d64d61146396423eb4a81521504bc2b8688'
   ['helpers/ubs_core/js_patterns/proto_vars.py']='b4fdf0f9ccfa5b4133f12f53dc2813fcd618530756c9a299ed16e1d0c0388b31'
-  ['helpers/ubs_core/js_patterns/security_node.py']='fcdb6a62ecf8c155485fee44c0029ef698db57d5a76aa39864f119ea725335da'
+  ['helpers/ubs_core/js_patterns/security_node.py']='7ceb9d14a629fb7bb89fce5c702a7ccc769260be10feab937a843b473efcf81e'
   ['helpers/ubs_core/js_rules.py']='334c18b424bfb0dffb617d3879703592ca60be9e7ac0902d7240f43e33e75e23'
-  ['helpers/ubs_core/js_scan.py']='a20017cf546bd5c6a96cb3be680f7c9cf2564b51d26281738f81717c078b8e0f'
+  ['helpers/ubs_core/js_scan.py']='234b29f3e91f56966865849c108a64bcae77141d381dfaccef3a7bed674e217b'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
@@ -346,7 +361,22 @@ HELPER_ASSETS=(
   "helpers/ubs_core/__init__.py"
   "helpers/ubs_core/__main__.py"
   "helpers/ubs_core/analyzers/__init__.py"
+  "helpers/ubs_core/analyzers/async_event_emitter.py"
+  "helpers/ubs_core/analyzers/async_event_listener.py"
+  "helpers/ubs_core/analyzers/async_flatmap.py"
+  "helpers/ubs_core/analyzers/async_foreach.py"
   "helpers/ubs_core/analyzers/async_handles_csharp.py"
+  "helpers/ubs_core/analyzers/async_jsx_handler.py"
+  "helpers/ubs_core/analyzers/async_map_awaited.py"
+  "helpers/ubs_core/analyzers/async_map_ignored.py"
+  "helpers/ubs_core/analyzers/async_predicates.py"
+  "helpers/ubs_core/analyzers/async_promise_all_foreach.py"
+  "helpers/ubs_core/analyzers/async_promise_all_map.py"
+  "helpers/ubs_core/analyzers/async_promise_executor.py"
+  "helpers/ubs_core/analyzers/async_react_effect.py"
+  "helpers/ubs_core/analyzers/async_reduce.py"
+  "helpers/ubs_core/analyzers/async_sort_comparator.py"
+  "helpers/ubs_core/analyzers/async_timer.py"
   "helpers/ubs_core/analyzers/cfg_test_only_rust.py"
   "helpers/ubs_core/analyzers/ctcompare_go.py"
   "helpers/ubs_core/analyzers/ctcompare_js.py"

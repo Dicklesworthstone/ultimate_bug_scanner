@@ -320,7 +320,6 @@ def _lhs_start(masked: str, op_idx: int) -> int:
         if c.isalnum() or c in '_$':
             while j >= 0 and (masked[j].isalnum() or masked[j] in '_$'):
                 j -= 1
-            j = skip_ws_back(j)
             if j >= 0 and masked[j] == '.':
                 j -= 1
                 j = skip_ws_back(j)

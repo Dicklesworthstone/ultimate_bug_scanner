@@ -76,6 +76,7 @@ _SECTION_HEADERS = {
 
 # Legacy print_subheader texts that manifest cases assert.
 _SUBHEADERS = {
+    5: {"js.hooks.": "React hooks dependency analysis"},
     7: {
         "js.taint.": "Lightweight taint analysis",
         "javascript.taint.": "Lightweight taint analysis",
@@ -288,15 +289,12 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         category_id = recs[0].get("category_id", "")
         section = None
         subheader = None
-        if category_id.startswith("js."):
-            tail = category_id.split(".", 1)[1]
-            for num, slug in _CATEGORY_SLUGS.items():
-                if tail == slug:
-                    section = _SECTION_HEADERS.get(num)
-                    for prefix, text in _SUBHEADERS.get(num, {}).items():
-                        if rule.startswith(prefix):
-                            subheader = text
-                    break
+        category_num = _record_category(recs[0])
+        if category_num is not None:
+            section = _SECTION_HEADERS.get(category_num)
+            for prefix, text in _SUBHEADERS.get(category_num, {}).items():
+                if rule.startswith(prefix):
+                    subheader = text
         if section is not None and section != current_section:
             lines.append("")
             lines.append(section)

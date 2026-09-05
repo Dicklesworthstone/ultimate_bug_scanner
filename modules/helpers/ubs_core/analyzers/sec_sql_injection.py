@@ -395,19 +395,22 @@ def _selftest_interpolated_sql_sink(tmp_prefix: str = "ubs_core_sec_sql_") -> No
     assert len(findings) == 1, findings
     line, sample, reason = findings[0]
     assert line == 3, findings
-    assert reason == "request-derived SQL reaches raw execution", findings
+    # legacy-faithful: the declaring line self-references its tainted SQL
+    # variable, so the reason names the variable (verified vs extracted
+    # heredoc — see test-suite/artifacts/a4-sec-sql-injection/parity.txt)
+    assert reason == "request-derived SQL variable rows reaches execution", findings
     assert "WHERE tenant" in sample, findings
 
 
 def _selftest_prisma_unsafe(tmp_prefix: str = "ubs_core_sec_sql_prisma_") -> None:
     import tempfile
 
+    # request-derived input reaching $queryRawUnsafe (legacy-verified:
+    # flags line 3 with the Prisma raw unsafe reason)
     src = "\n".join([
-        "export async function lookup(email: string) {",
-        "  const rows = await prisma.$queryRawUnsafe(",
-        "    'SELECT * FROM accounts WHERE owner = $1', email",
-        "  );",
-        "  return rows;",
+        "export async function lookup(req: Request, prisma: PrismaLike) {",
+        "  const status = req.body.status;",
+        "  return prisma.$queryRawUnsafe(`SELECT * FROM invoices WHERE status = '${status}'`);",
         "}",
         "",
     ])
@@ -417,7 +420,7 @@ def _selftest_prisma_unsafe(tmp_prefix: str = "ubs_core_sec_sql_prisma_") -> Non
         findings = list(scan_file_findings(target))
     assert len(findings) == 1, findings
     line, _sample, reason = findings[0]
-    assert line == 2, findings
+    assert line == 3, findings
     assert reason == "request-derived SQL reaches Prisma raw unsafe execution", findings
 
 
@@ -443,9 +446,12 @@ def _selftest_parameterized_clean(tmp_prefix: str = "ubs_core_sec_sql_clean_") -
 def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_sql_ign_") -> None:
     import tempfile
 
-    # line-above placement suppresses; same-line placement suppresses
+    # lines 4-5 carry a genuinely request-derived variable (legacy-verified:
+    # flagged as SQL-variable reasons without markers, clean with them —
+    # line-above and same-line placements both suppress)
     src = "\n".join([
-        "export async function list(slug: string) {",
+        "export async function list(req: Request) {",
+        "  const slug = new URL(req.url).searchParams.get('slug');",
         "  // ubs:ignore",
         "  const rows = await db.query(`SELECT * FROM tenants WHERE slug = '${slug}'`);",
         "  const rest = await db.query(`SELECT * FROM accounts WHERE slug = '${slug}'`); // ubs:ignore",
@@ -463,8 +469,11 @@ def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_sql_ign_") -> N
 def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_sql_run_") -> None:
     import tempfile
 
+    # request-derived fragment interpolated into the sink (legacy-verified:
+    # exactly one record at line 3, "raw execution" reason)
     src = (
-        "export async function list(slug: string) {\n"
+        "export async function list(req: Request) {\n"
+        "  const slug = new URL(req.url).searchParams.get('slug');\n"
         "  return db.query(`SELECT * FROM tenants WHERE slug = '${slug}'`);\n"
         "}\n"
     )
@@ -477,7 +486,7 @@ def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_sql_run_") -> Non
         assert rec["rule"] == RULE, rec
         assert rec["category_id"] == CATEGORY_ID, rec
         assert rec["severity"] == "critical", rec
-        assert rec["line"] == 2, rec
+        assert rec["line"] == 3, rec
         assert TITLE in rec["message"], rec
 
 

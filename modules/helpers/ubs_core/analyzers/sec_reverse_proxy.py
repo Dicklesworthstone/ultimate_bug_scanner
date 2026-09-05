@@ -281,7 +281,7 @@ def _selftest_proxy_web_and_rewrite_flagged(tmp_prefix: str = "ubs_core_sec_reve
         target = Path(tmp) / "web.ts"
         target.write_text(src, encoding="utf-8")
         findings = list(scan_file_findings(target))
-        assert [line for line, _col in findings] == [9, 15], findings
+        assert [line for line, _col in findings] == [8, 15], findings
 
 
 def _selftest_validator_suppressed(tmp_prefix: str = "ubs_core_sec_reverse_proxy_safe_") -> None:

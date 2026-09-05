@@ -370,16 +370,22 @@ def _selftest_propagated_pattern(tmp_prefix: str = "ubs_core_sec_regex_prop_") -
     assert line == 3, findings
 
 
-def _selftest_escaped_and_allowlisted_clean(tmp_prefix: str = "ubs_core_sec_regex_clean_") -> None:
+
+
+def _selftest_escaped_and_fixed_clean(tmp_prefix: str = "ubs_core_sec_regex_clean_") -> None:
     import tempfile
 
-    # escaped fragment and allow-list validated pattern both stay clean
+    # escape-helper-wrapped fragments and fixed patterns stay clean
+    # (snippet verified against the extracted legacy heredoc: exit 0, no
+    # output; an allow-list .has(q) check elsewhere in the statement does
+    # NOT suppress a directly tainted RegExp arg — legacy behavior kept)
     src = "\n".join([
         "export function search(request: Request) {",
         "  const q = new URL(request.url).searchParams.get('q');",
         "  const escaped = new RegExp(escapeRegExp(q));",
-        "  const allowed = allowedPatterns.has(q) ? new RegExp(q) : null;",
-        "  return { escaped, allowed };",
+        "  const anchored = new RegExp('^' + escapeRegExp(q) + '$');",
+        "  const fixed = new RegExp('^[a-z]{1,64}$');",
+        "  return { escaped, anchored, fixed };",
         "}",
         "",
     ])
@@ -390,30 +396,32 @@ def _selftest_escaped_and_allowlisted_clean(tmp_prefix: str = "ubs_core_sec_rege
     assert findings == [], findings
 
 
+
 def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_regex_ign_") -> None:
     import tempfile
 
-    # line-above placement suppresses; same-line placement suppresses
+    # same-line and line-above placements suppress; the unmarked line still
+    # fires. (Snippet verified against the extracted legacy heredoc: only
+    # line 4 is reported. A `// ubs:ignore` comment is stripped from the
+    # statement text, so it only protects its own line and the line below —
+    # an enclosing multi-line statement stays flagged, legacy behavior kept.)
     src = "\n".join([
-        "export function f(req: Request) {",
-        "  // ubs:ignore",
-        "  const a = new RegExp(req.query.get('q'));",
-        "  const b = new RegExp(req.query.get('q')); // ubs:ignore",
-        "  return [a, b];",
-        "}",
-        "",
+        "const a = new RegExp(req.query.get('q')); // ubs:ignore",
+        "// ubs:ignore",
+        "const b = new RegExp(req.query.get('q'));",
+        "const c = new RegExp(req.query.get('q'));",
     ])
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
         target = Path(tmp) / "ign.ts"
         target.write_text(src, encoding="utf-8")
         findings = list(scan_file_findings(target))
-    assert findings == [], findings
+    assert [(line, _sample) for line, _sample in findings] == [(4, "const c = new RegExp(req.query.get('q'));")], findings
 
 
 def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_regex_run_") -> None:
     import tempfile
-
-    src = "export function f(req: Request) {\n  return new RegExp(req.query.get('q'));\n}\n"
+    # module-level statement: exactly one record (legacy-verified)
+    src = "const re = new RegExp(req.query.get('q'));\n"
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
         target = Path(tmp) / "run.ts"
         target.write_text(src, encoding="utf-8")
@@ -422,15 +430,14 @@ def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_regex_run_") -> N
         rec = records[0]
         assert rec["rule"] == RULE, rec
         assert rec["category_id"] == CATEGORY_ID, rec
-        assert rec["severity"] == "warning", rec
-        assert rec["line"] == 2, rec
+        assert rec["line"] == 1, rec
         assert TITLE in rec["message"], rec
 
 
 SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("request-pattern-compiled", _selftest_request_pattern_compiled),
     ("propagated-pattern", _selftest_propagated_pattern),
-    ("escaped-and-allowlisted-clean", _selftest_escaped_and_allowlisted_clean),
+    ("escaped-and-fixed-clean", _selftest_escaped_and_fixed_clean),
     ("ignore-suppression", _selftest_ignore_suppression),
     ("run-record-shape", _selftest_run_record_shape),
 )

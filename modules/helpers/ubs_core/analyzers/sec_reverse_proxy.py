@@ -161,8 +161,8 @@ def tainted_ref(text, tainted_vars):
     return ""
 
 
-def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
-    """Yield (line, col) per detection; per-file logic identical to the heredoc."""
+def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
+    """Yield (line, col, source_line) per detection; logic identical to the heredoc."""
     try:
         lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
     except Exception:
@@ -202,7 +202,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int]]:
             continue
         seen_lines.add(idx)
         match = sink_re.search(line)
-        yield idx + 1, (match.start() + 1) if match else 1
+        yield idx + 1, (match.start() + 1) if match else 1, line.strip()[:180]
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
@@ -221,7 +221,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
             rel = path.resolve().relative_to(cwd)
         except ValueError:
             rel = path.name
-        for line, col in scan_file_findings(path):
+        for line, col, source in scan_file_findings(path):
             yield {
                 "rule": RULE,
                 "category_id": CATEGORY_ID,
@@ -229,7 +229,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
                 "line": line,
                 "col": col,
                 "severity": SEVERITY,
-                "message": MESSAGE,
+                "message": f"{MESSAGE} — {source}",
             }
 
 
@@ -252,7 +252,7 @@ def _selftest_middleware_query_flagged(tmp_prefix: str = "ubs_core_sec_reverse_p
         target = Path(tmp) / "proxy.ts"
         target.write_text(src, encoding="utf-8")
         findings = list(scan_file_findings(target))
-        assert [line for line, _col in findings] == [5], findings
+        assert [line for line, _col, _src in findings] == [5], findings
 
 
 def _selftest_proxy_web_and_rewrite_flagged(tmp_prefix: str = "ubs_core_sec_reverse_proxy_web_") -> None:
@@ -281,7 +281,7 @@ def _selftest_proxy_web_and_rewrite_flagged(tmp_prefix: str = "ubs_core_sec_reve
         target = Path(tmp) / "web.ts"
         target.write_text(src, encoding="utf-8")
         findings = list(scan_file_findings(target))
-        assert [line for line, _col in findings] == [8, 15], findings
+        assert [line for line, _col, _src in findings] == [8, 15], findings
 
 
 def _selftest_validator_suppressed(tmp_prefix: str = "ubs_core_sec_reverse_proxy_safe_") -> None:

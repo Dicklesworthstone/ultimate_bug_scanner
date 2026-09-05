@@ -262,7 +262,6 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
     for rule in ordered_rules:
         recs = by_rule[rule]
         category_id = recs[0].get("category_id", "")
-        category_num = None
         section = None
         subheader = None
         if category_id.startswith("js."):
@@ -287,7 +286,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         remediation = REMEDIATION_MAP.get(rule)
         if remediation:
             lines.append(f"    {remediation}")
-        for rec in recs[:5]:
+        cap = 25 if rule.endswith("sql-injection") else 5
+        for rec in recs[:cap]:
             lines.append(f"    {rec['path']}:{rec['line']}  {rec['message'][:180]}")
 
     # Legacy "good" notes (print_finding "good") for emit groups whose

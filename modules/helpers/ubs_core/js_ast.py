@@ -12,6 +12,10 @@ engine in the meta-runner postprocess layers the richer placements on top.
 Counting: when `count_only` is provided, only those rule ids are counted and
 emitted — legacy counts just the mapped emit_ast_rule_group ids and dumps
 the rest of the pack informationally (bead A4-js calibration).
+
+Emit conditions: js.resource.listener-no-remove carries the legacy rg-delta
+condition (ubs-js.sh 670-710) — it fires only when a file's addEventListener
+count exceeds its removeEventListener count.
 """
 from __future__ import annotations
 
@@ -26,15 +30,28 @@ _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
 
 
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
+def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
     if path not in cache:
         try:
             cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             cache[path] = []
-    lines = cache[path]
+    return cache[path]
+
+
+def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
+    lines = _file_lines(path, cache)
     idx = line_no - 1
     return any(0 <= i < len(lines) and MARKER in lines[i].lower() for i in (idx, idx - 1))
+
+
+def _listener_imbalance(path: Path, cache: dict[Path, list[str]]) -> bool:
+    """Legacy rg-delta (ubs-js.sh 670-710): addEventListener count must exceed
+    removeEventListener count in the same file for the finding to fire."""
+    lines = _file_lines(path, cache)
+    adds = sum(line.count("addEventListener") for line in lines)
+    removes = sum(line.count("removeEventListener") for line in lines)
+    return adds > removes
 
 
 def scan_config(
@@ -75,14 +92,17 @@ def scan_config(
             if count_only is not None and rule_id not in count_only:
                 continue  # informational dump in legacy — not counted
             rng = match.get("range", {}).get("start", {})
-            line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
             path = Path(file_str)
+            line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
             severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
             if severity not in counters:
                 severity = "warning"
+            if rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
+                continue  # legacy rg-delta: adds <= removes means balanced
             if _has_marker(path, line_no, cache):
                 continue  # legacy line + previous-line marker check
             counters[severity] = counters.get(severity, 0) + 1
+            message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
             sink.write(json.dumps({
                 "rule": rule_id,
                 "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
@@ -90,7 +110,7 @@ def scan_config(
                 "line": line_no,
                 "col": int(rng.get("column", 0)) + 1,
                 "severity": severity,
-                "message": str(match.get("text", ""))[:240],
+                "message": message[:240],
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")
     return counters

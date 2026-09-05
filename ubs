@@ -121,6 +121,27 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/narrowing_rust.py']='54ec29f4297cbe37aec4cdaab276a6880bb16fd93377ed060e90c5de98261b12'
   ['helpers/ubs_core/analyzers/narrowing_swift.py']='2a7971f6f6a858eb73d1f898a6fdd039a56be405222877eae3890a6343a52a73'
   ['helpers/ubs_core/analyzers/regex_swift.py']='236c0fc8aca7c8c2d6b3270bfcc14f16e81a7caf95e500adc9ac176b33490311'
+  ['helpers/ubs_core/analyzers/sec_archive_entry.py']='8e0fa1e0894e22ab9577fd38495243304937ee12a415fec4612799762ea10812'
+  ['helpers/ubs_core/analyzers/sec_cookies.py']='51159ac937df932c0a4f85f7a821fda2176af57f67d444a39eaf6a720dff3462'
+  ['helpers/ubs_core/analyzers/sec_cors.py']='9829cdaaa0f7e03e6dcbf2919dfe7810b32cc63dcbfa23250c721841aea23705'
+  ['helpers/ubs_core/analyzers/sec_dangerous_html.py']='a236bdc0a4c31c526d3145ec2a23349eda8d4583dd9fa8f28d90d6e0e11e129c'
+  ['helpers/ubs_core/analyzers/sec_fetch_abort.py']='c97160ab7268b66914622d5add6e01f556c9753669dda5e4da20f120a3aa9067'
+  ['helpers/ubs_core/analyzers/sec_hardcoded_secrets.py']='9564e2f6c67689bb70634ded9591729ad849a3b027cf6f4c50133484d4e521af'
+  ['helpers/ubs_core/analyzers/sec_header_injection.py']='3229fdd4b240227aea161666cd7e1b49f5b045f1fb372378e45cbfb19e4c187d'
+  ['helpers/ubs_core/analyzers/sec_host_header.py']='82019d4465d304ff49aaf7166be4008a79ff77cdaeb0ff3ae3afc3cc3d5c58b5'
+  ['helpers/ubs_core/analyzers/sec_jsx_target_blank.py']='faa862aed990d876d69bf3c2684c5d5f6698aed592559f5a630e9332ebb40418'
+  ['helpers/ubs_core/analyzers/sec_jwt.py']='7d4a32a0907a51960514de51d39f7014976c8c7b7664e6b2936bbb43ee971497'
+  ['helpers/ubs_core/analyzers/sec_message_origin.py']='8cd0fd1b4babd400a5e095f83161713b0011c2357f5978f7896b6a2e1e061a53'
+  ['helpers/ubs_core/analyzers/sec_open_redirect.py']='f9c24bdfc5731257c3e4bfeede9afc540552c105d3a49e654327f33513a7ee52'
+  ['helpers/ubs_core/analyzers/sec_path_traversal.py']='3d775e3a4cff45874ece82913e7249ec454f69a51e5bbd0b136474b713f8a2b1'
+  ['helpers/ubs_core/analyzers/sec_post_message.py']='b145ea65ec6bf61e7ac061ae4dce7d408602bfc8b6d80d9caabb35b9e3ed0e04'
+  ['helpers/ubs_core/analyzers/sec_request_body.py']='3c0388262e84a97efa6524e0092045aa274f3f50d55d9302fe285e3acd4c57bd'
+  ['helpers/ubs_core/analyzers/sec_request_regex.py']='e1864b9516b1bca67fe8ba1c905483edbb6bba39ed1eaba29a0332e4afd73107'
+  ['helpers/ubs_core/analyzers/sec_reverse_proxy.py']='06af021616bf3142b28c2b3f5c6435f782fb56f05ccef614b50653692fea3124'
+  ['helpers/ubs_core/analyzers/sec_sql_injection.py']='aa570ba4bdbca3811912a33bc9b7f1a5bb329a69ace3b00b93ddf5a9de0fe21e'
+  ['helpers/ubs_core/analyzers/sec_ssrf_fetch.py']='e3129ff62a7409b48a76e21bef14d1369a235ace660c7f4aff2bce150db30a56'
+  ['helpers/ubs_core/analyzers/sec_tls.py']='73a05b375432deb7870cc5f49de93a0adc4a60ad3f4abe1cb2741d94ba5415b6'
+  ['helpers/ubs_core/analyzers/sec_weak_random.py']='46a83ae8945231794c6bceb3f716f91590db4e8498659b9fddf997eb6f3721e4'
   ['helpers/ubs_core/analyzers/taint_cpp_redirect.py']='a0aa2b41717cc34a42584f2bb41c98cae4a8ca8a278727bde536dfe9ab91b386'
   ['helpers/ubs_core/analyzers/taint_cpp_traversal.py']='a227b9036b5e349c320ace0f0bafbc485e1a373bf24c2ee23faaf078bb1dfefc'
   ['helpers/ubs_core/analyzers/taint_csharp_redirect.py']='fc8cfe379e8748b2205b6abacfd4128c9940898f1e105ab51d5d953b8e2b819d'
@@ -402,6 +423,27 @@ HELPER_ASSETS=(
   "helpers/ubs_core/analyzers/narrowing_rust.py"
   "helpers/ubs_core/analyzers/narrowing_swift.py"
   "helpers/ubs_core/analyzers/regex_swift.py"
+  "helpers/ubs_core/analyzers/sec_archive_entry.py"
+  "helpers/ubs_core/analyzers/sec_cookies.py"
+  "helpers/ubs_core/analyzers/sec_cors.py"
+  "helpers/ubs_core/analyzers/sec_dangerous_html.py"
+  "helpers/ubs_core/analyzers/sec_fetch_abort.py"
+  "helpers/ubs_core/analyzers/sec_hardcoded_secrets.py"
+  "helpers/ubs_core/analyzers/sec_header_injection.py"
+  "helpers/ubs_core/analyzers/sec_host_header.py"
+  "helpers/ubs_core/analyzers/sec_jsx_target_blank.py"
+  "helpers/ubs_core/analyzers/sec_jwt.py"
+  "helpers/ubs_core/analyzers/sec_message_origin.py"
+  "helpers/ubs_core/analyzers/sec_open_redirect.py"
+  "helpers/ubs_core/analyzers/sec_path_traversal.py"
+  "helpers/ubs_core/analyzers/sec_post_message.py"
+  "helpers/ubs_core/analyzers/sec_request_body.py"
+  "helpers/ubs_core/analyzers/sec_request_regex.py"
+  "helpers/ubs_core/analyzers/sec_reverse_proxy.py"
+  "helpers/ubs_core/analyzers/sec_sql_injection.py"
+  "helpers/ubs_core/analyzers/sec_ssrf_fetch.py"
+  "helpers/ubs_core/analyzers/sec_tls.py"
+  "helpers/ubs_core/analyzers/sec_weak_random.py"
   "helpers/ubs_core/analyzers/taint_cpp_redirect.py"
   "helpers/ubs_core/analyzers/taint_cpp_traversal.py"
   "helpers/ubs_core/analyzers/taint_csharp_redirect.py"

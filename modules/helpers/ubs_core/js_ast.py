@@ -27,6 +27,18 @@ from typing import Sequence
 from ubs_core.js_scan import MARKER
 
 _ASTGREP_BIN = "ast-grep"
+
+# rule-id family -> legacy category number (for --skip filtering).
+_FAMILY_CATEGORY = {
+    "js.async": 5,
+    "js.hooks": 5,
+    "react": 5,
+    "js.error": 6,
+    "js.resource": 19,
+    "js.taint": 7,
+    "javascript.guards": 1,
+    "js.security": 7,
+}
 _BATCH = 400  # paths per scan invocation (argv length safety)
 
 
@@ -62,6 +74,7 @@ def scan_config(
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
     count_only: set[str] | None = None,
+    skip_categories: set[int] | None = None,
 ) -> dict[str, int]:
     """Run one sgconfig over the path list; write sink records; return counters."""
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -91,6 +104,11 @@ def scan_config(
                 continue
             if count_only is not None and rule_id not in count_only:
                 continue  # informational dump in legacy — not counted
+            if skip_categories:
+                family = rule_id.rsplit(".", 1)[0]
+                category = _FAMILY_CATEGORY.get(family)
+                if category is not None and category in skip_categories:
+                    continue  # --skip: the category is disabled
             rng = match.get("range", {}).get("start", {})
             path = Path(file_str)
             line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
@@ -123,12 +141,16 @@ def scan_all(
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
     count_only: set[str] | None = None,
+    skip_categories: set[int] | None = None,
 ) -> dict[str, int]:
-    """Run every sgconfig-<lang>.yml in rule_dir; aggregate counters."""
+    """Run every sgbase-<lang>.yml (base-language rules only) in rule_dir;
+    aggregate counters. The variant-bearing sgconfig-*.yml files stay
+    SARIF-only, mirroring the legacy text-mode scan of the base pack.
+    Rules whose category is skipped (--skip) are not emitted."""
     total = {"critical": 0, "warning": 0, "info": 0}
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         lang = config.stem.removeprefix("sgconfig-")
-        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin, count_only)
+        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin, count_only, skip_categories)
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value
     return total

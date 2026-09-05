@@ -801,6 +801,19 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict:
         (rule_dir / f"sgconfig-{grammar}.yml").write_text(
             "\n".join(lines) + "\n", encoding="utf-8"
         )
+        # Base-only config (bead A4-js): legacy TEXT/JSON counting scans each
+        # base rule in its declared language (ensure_ast_rule_results loops
+        # the base pack); the language variants are SARIF-only. js_scan uses
+        # these so variant rules do not fire on extension-mismatched files.
+        base_lines = ["ruleDirs:"]
+        base_lines.extend(
+            f"  - rules/{stem}.yml"
+            for stem, _rule_text in _RULES
+            if f"rules/{stem}.yml" in grammar_files[grammar]
+        )
+        (rule_dir / f"sgbase-{grammar}.yml").write_text(
+            "\n".join(base_lines) + "\n", encoding="utf-8"
+        )
 
     manifest_path = rule_dir / "manifest.json"
     manifest_path.write_text(

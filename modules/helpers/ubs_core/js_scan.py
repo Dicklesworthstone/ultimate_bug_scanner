@@ -195,6 +195,18 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
     return counters
 
 
+def _record_category(finding: dict) -> int | None:
+    """Map an analyzer finding's rule id to its legacy category number."""
+    rule = str(finding.get("rule", ""))
+    if rule.startswith(("js.async.", "javascript.async.")):
+        return 5
+    if rule.startswith(("js.security.", "javascript.security.", "js.taint.", "javascript.taint.")):
+        return 7
+    if rule.startswith("javascript.guards."):
+        return 1
+    return None
+
+
 def load_patterns() -> list[Pattern]:
     """Aggregate PATTERNS from every ubs_core.js_patterns.* module."""
     import importlib
@@ -211,7 +223,7 @@ def load_patterns() -> list[Pattern]:
     return patterns
 
 
-def run_analyzers(files: Sequence[Path], sink) -> None:
+def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
     """Run registered javascript analyzers (taint, guards, ctcompare, async)."""
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
@@ -219,6 +231,8 @@ def run_analyzers(files: Sequence[Path], sink) -> None:
     ctx = RunContext(lang="javascript", files=list(files))
     for analyzer in analyzers_for_lang("javascript"):
         for finding in analyzer.run(ctx):
+            if skip and _record_category(finding) in skip:
+                continue
             sink.write(json.dumps({
                 "rule": finding.get("rule", ""),
                 "category_id": finding.get("category_id", "js.security"),
@@ -334,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
     patterns = load_patterns()
     with open(args.sink, "w", encoding="utf-8") as sink:
         counters = scan_patterns(patterns, files, sink, skip)
-        run_analyzers(files, sink)
+        run_analyzers(files, sink, skip)
         if args.ast_rule_dir:
             from ubs_core.js_ast import scan_all
             from ubs_core.js_rules import SEVERITY_MAP
@@ -358,7 +372,7 @@ def main(argv: list[str] | None = None) -> int:
                 for rid, severity in list(overrides.items()):
                     if rid.startswith("js.async."):
                         overrides[rid] = "info"
-            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides, count_only=set(SEVERITY_MAP))
+            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides, count_only=set(SEVERITY_MAP), skip_categories=skip)
             for key, value in ast_counters.items():
                 counters[key] = counters.get(key, 0) + value
 

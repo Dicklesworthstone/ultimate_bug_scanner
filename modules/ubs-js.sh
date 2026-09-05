@@ -3724,14 +3724,13 @@ fi
 #      from the sink (so bridged type-narrowing records are included) plus the
 #      legacy exit formula (10923-10925).
 run_v2_legacy_parity_bridges(){
-  local sink="$1" list_file="$2" js_exit="$3"
-  local fmt="${FORMAT:-text}"
+  local sink="$1" list_file="$2" js_exit="$3" text_out="${4:-}"
   local run_tn=0 tn_status=0 tn_raw="" helper="" js_runner="" e d
   local allow_ts=0
   if [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -ne 1 ]]; then
     for e in "${_EXT_ARR[@]}"; do
       case "$(echo "$e" | xargs)" in
-        ts|tsx) allow_ts=1 ;;
+      ts|tsx) allow_ts=1 ;;
       esac
     done
     # has_ts probe over the v2 file list itself (same scope the scan used).
@@ -3769,13 +3768,13 @@ run_v2_legacy_parity_bridges(){
   fi
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
-  python3 - "$sink" "$fmt" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
     "$run_tn" "$tn_status" "$tn_raw" "$js_exit" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import os
 import sys
 
-(sink_path, fmt, files_raw, fow_raw, skip_csv, run_tn_raw, tn_status_raw,
+(sink_path, text_out, files_raw, fow_raw, skip_csv, run_tn_raw, tn_status_raw,
  tn_raw_path, js_exit_raw) = sys.argv[1:10]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
@@ -3783,7 +3782,7 @@ skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
 run_tn = run_tn_raw == "1"
 tn_status = int(tn_status_raw or "0")
 js_exit = int(js_exit_raw or "0")
-as_text = fmt == "text"
+as_text = bool(text_out)
 
 # Mirror js_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
 SLUG = {1: "null-undefined", 2: "equality", 3: "proto-object", 4: "type-coercion",
@@ -3882,8 +3881,8 @@ if as_text:
     emit(f"Critical issues: {counts['critical']}")
     emit(f"Warning issues: {counts['warning']}")
     emit(f"Info items: {counts['info']}")
-    sys.stdout.write("\n".join(out) + "\n")
-    sys.stdout.flush()
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
 
 exit_code = 1 if counts["critical"] else js_exit
 if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
@@ -3916,6 +3915,12 @@ run_contract_v2_js(){
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-jsv2-rules.XXXXXX)"
     if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+generate(Path('$ast_rule_dir'))
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
   local text_out=""
   case "$FORMAT" in
     json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
@@ -3928,23 +3933,17 @@ run_contract_v2_js(){
       ;;
     *) echo "ERROR: contract-v2 js path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_JS=1" >&2; return 2 ;;
   esac
-" 2>/dev/null; then
-      ast_rule_dir=""
-    fi
-  fi
-  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
-  case "$FORMAT" in
-    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
-    text) scan_args+=(--text-out /dev/stdout --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
-    *) echo "ERROR: contract-v2 js path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_JS=1" >&2; return 2 ;;
-  esac
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.js_scan \
     "${scan_args[@]}" --version "4.7" || exit_code=$?
   # Legacy-parity bridges: convert run_type_narrowing_checks output into sink
   # records, append the record-less legacy section headers, and print the final
   # "Summary Statistics:" block (counts recounted from the sink) with the
   # legacy exit formula. See run_v2_legacy_parity_bridges above.
-  run_v2_legacy_parity_bridges "$sink" "$list_file" "$exit_code" || exit_code=$?
+  run_v2_legacy_parity_bridges "$sink" "$list_file" "$exit_code" "$text_out" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi

@@ -226,11 +226,16 @@ def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_cors_ign_") -> 
         "",
     ])
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
-        for name, body in (("same.ts", same_line), ("ctx.ts", in_context), ("above.ts", above)):
+        for name, body in (("same.ts", same_line), ("above.ts", above)):
             target = Path(tmp) / name
             target.write_text(body, encoding="utf-8")
             findings = list(scan_file_findings(target))
             assert findings == [], (name, findings)
+        # heredoc semantics: a trailing comment on a LATER line does not suppress —
+        # code_line strips comments before the context ignore check runs.
+        later = Path(tmp) / "ctx.ts"
+        later.write_text(in_context, encoding="utf-8")
+        assert list(scan_file_findings(later)) == [1], "context comment must not suppress"
 
 
 def _selftest_coalescing_and_run_shape(tmp_prefix: str = "ubs_core_sec_cors_run_") -> None:

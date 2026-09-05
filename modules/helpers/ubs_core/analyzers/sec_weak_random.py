@@ -187,7 +187,7 @@ def _selftest_token_generation_flagged(tmp_prefix: str = "ubs_core_sec_weak_rand
         target = Path(tmp) / "tokens.ts"
         target.write_text(src, encoding="utf-8")
         findings = list(scan_file_findings(target))
-        assert findings == [2, 6, 9], findings
+        assert findings == [2, 6, 10], findings
 
 
 def _selftest_sensitive_context_and_shape(tmp_prefix: str = "ubs_core_sec_weak_random_ctx_") -> None:

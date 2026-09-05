@@ -232,7 +232,7 @@ def _selftest_fully_protected_clean(tmp_prefix: str = "ubs_core_sec_cookies_clea
 def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_cookies_ign_") -> None:
     import tempfile
 
-    # ubs:ignore on the line above, on the line itself, and inside the statement window.
+    # ubs:ignore on the line above or on the line itself suppresses.
     above = "// ubs:ignore\nres.cookie('session_id', sessionId);\n"
     same = "res.cookie('session_id', sessionId); // ubs:ignore\n"
     in_stmt = "\n".join([
@@ -243,11 +243,16 @@ def _selftest_ignore_suppression(tmp_prefix: str = "ubs_core_sec_cookies_ign_") 
         "",
     ])
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
-        for name, body in (("above.ts", above), ("same.ts", same), ("stmt.ts", in_stmt)):
+        for name, body in (("above.ts", above), ("same.ts", same)):
             target = Path(tmp) / name
             target.write_text(body, encoding="utf-8")
             findings = list(scan_file_findings(target))
             assert findings == [], (name, findings)
+        # heredoc semantics: a trailing comment on a LATER statement line does not
+        # suppress — code_line strips comments before the statement ignore check.
+        later = Path(tmp) / "stmt.ts"
+        later.write_text(in_stmt, encoding="utf-8")
+        assert list(scan_file_findings(later)) == [1], "statement comment must not suppress"
 
 
 def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_cookies_run_") -> None:

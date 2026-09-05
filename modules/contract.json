@@ -309,6 +309,7 @@
         "--max-filesize",
         "--only",
         "--paths-from",
+        "--report-json",
         "--respect-gitignore",
         "--rules"
       ]
@@ -377,6 +378,7 @@
         "--list-rules",
         "--no-banner",
         "--only-changed",
+        "--report-json",
         "--rules",
         "--sarif-plain",
         "--strict",
@@ -410,6 +412,7 @@
         "--no-build",
         "--no-emoji",
         "--only",
+        "--report-json",
         "--rules",
         "--sarif-out"
       ]
@@ -448,6 +451,7 @@
         "--no-bundler",
         "--only",
         "--only-rules",
+        "--report-json",
         "--rb-tools",
         "--rules",
         "--sarif-out",

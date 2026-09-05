@@ -136,6 +136,7 @@ DUMP_RULES_DIR=""
 LIST_RULES=0
 DISABLE_PIPEFAIL_DURING_SCAN=1
 SARIF_OUT=""
+REPORT_JSON=""
 JSON_OUT=""
 MIN_SEVERITY="info"     # info|warning|critical
 
@@ -215,6 +216,7 @@ while [[ $# -gt 0 ]]; do
     --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
     --no-build)   RUN_BUILD=0; shift;;
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --json-out=*)  JSON_OUT="${1#*=}"; shift;;
     --min-severity=*) MIN_SEVERITY="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
@@ -3293,6 +3295,201 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
   write_ast_rules || exit 2
   list_generated_ast_rule_ids "$AST_RULE_DIR"
   exit 0
+fi
+
+# ── Contract-v2 path (bead 0xjg.8): ONE file list (ubs_list_files), ONE
+#    python orchestrator (ubs_core.java_scan), ONE consolidated ast-grep scan,
+#    NDJSON findings sink (K2 schema). Opt-in behind UBS_CONTRACT_V2_JAVA=1;
+#    UBS_LEGACY_MODULE_JAVA=1 always wins; --format=sarif and a missing
+#    ast-grep fall through to the legacy path (env-error parity).
+# ── Legacy-parity bridges for the contract-v2 path ──────────────────────────
+# The v2 layers cannot reproduce two legacy-only behaviors, so
+# run_contract_v2_java converts them right after the java_scan call:
+#   1. The legacy print_header sweep: every non-skipped category announces
+#      itself even when nothing was found there, while the v2 renderer prints
+#      record-backed sections only. The record-less remainder is appended in
+#      legacy category order (text format only), carrying the cat-17
+#      project/java inventory line and the cat-16 Maven/Gradle build block.
+#   2. The trailing "Summary Statistics:" block with final counts recounted
+#      from the sink plus the legacy exit formula (5795-5797).
+run_v2_legacy_parity_bridges_java(){
+  local sink="$1" list_file="$2" java_exit="$3" text_out="${4:-}"
+  local files_n bridge_rc=0 java_version="unknown" proj_type="Unknown"
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  if [[ "$RUN_BUILD" -eq 1 ]]; then
+    if command -v java >/dev/null 2>&1; then
+      java_version="$(java -version 2>&1 | head -n1 || true)"
+    fi
+  fi
+  [[ -f "$PROJECT_DIR/pom.xml" ]] && proj_type="Maven"
+  if [[ -f "$PROJECT_DIR/build.gradle" || -f "$PROJECT_DIR/build.gradle.kts" ]]; then proj_type="Gradle"; fi
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
+    "$java_exit" "$java_version" "$proj_type" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import sys
+
+(sink_path, text_out, files_raw, fow_raw, skip_csv, java_exit_raw,
+ java_version, proj_type) = sys.argv[1:9]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+java_exit = int(java_exit_raw or "0")
+as_text = bool(text_out)
+
+# Mirror java_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
+SLUG = {1: "null-optional", 2: "equality", 3: "concurrency", 4: "security",
+        5: "io", 6: "logging", 7: "regex", 8: "collections",
+        9: "control-flow", 10: "streams-perf", 11: "serialization", 12: "java21",
+        13: "sql", 14: "annotations", 15: "ast-grep", 16: "build",
+        17: "inventory", 18: "api-misuse", 19: "resource-lifecycle",
+        20: "filesystem", 21: "secrets", 22: "logging-practices"}
+SECTION = {1: "1. NULL & OPTIONAL PITFALLS", 2: "2. EQUALITY & HASHCODE",
+           3: "3. CONCURRENCY & THREADING", 4: "4. SECURITY",
+           5: "5. I/O & RESOURCES", 6: "6. LOGGING & DEBUGGING",
+           7: "7. REGEX & STRING PITFALLS", 8: "8. COLLECTIONS & GENERICS",
+           9: "9. SWITCH & CONTROL FLOW", 10: "10. STREAMS & PERFORMANCE",
+           11: "11. SERIALIZATION & COMPATIBILITY", 12: "12. JAVA 21 FEATURES (INFO)",
+           13: "13. SQL CONSTRUCTION (HEURISTICS)", 14: "14. ANNOTATIONS & NULLNESS (HEURISTICS)",
+           15: "15. AST-GREP RULE PACK FINDINGS", 16: "16. BUILD HEALTH (Maven/Gradle)",
+           17: "17. META STATISTICS & INVENTORY", 18: "18. MISC API MISUSE",
+           19: "19. RESOURCE SAFETY & RESOURCE LIFECYCLE CORRELATION",
+           20: "20. PATH HANDLING & FILESYSTEM", 21: "21. HARD-CODED SECRETS (HEURISTICS)",
+           22: "22. LOGGING BEST PRACTICES"}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+def record_category(rec):
+    rule = str(rec.get("rule", ""))
+    category_id = str(rec.get("category_id", ""))
+    for prefix, num in (("java.taint.", 4), ("java.resource.", 19),
+                        ("java.async.", 3), ("java.optional.", 1),
+                        ("kotlin.narrowing.", 1)):
+        if rule.startswith(prefix):
+            return num
+    for num, slug in SLUG.items():
+        if category_id == f"java.{slug}":
+            return num
+    if rule.startswith("java."):
+        rest = rule[5:]
+        for num, slug in SLUG.items():
+            if rest.startswith(f"{slug}."):
+                return num
+    return None
+
+categories_with_records = {record_category(rec) for rec in records}
+
+out = []
+if as_text:
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        if not any(record_category(rec) == num for rec in records):
+            out.append(SECTION[num])
+        if num == 17:
+            out.append(f"[info] Info (project: {proj_type}, java: {java_version}) — java.inventory.meta")
+    out.append("")
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+# Final severity recount over the whole sink (legacy 5795-5797 inputs).
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+if as_text:
+    lines = [
+        "",
+        "Summary Statistics:",
+        f"Files scanned: {files_n}",
+        f"Critical issues: {counts['critical']}",
+        f"Warning issues: {counts['warning']}",
+        f"Info items: {counts['info']}",
+    ]
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+exit_code = 1 if counts["critical"] else java_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+run_contract_v2_java(){
+  local list_file sink helpers_dir exit_code=0 ast_rule_dir="" text_out="" v2_json_out=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-javav2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-javav2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "${SKIP_CATEGORIES}" ]] && scan_args+=(--skip "$SKIP_CATEGORIES")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  # Consolidated ast-grep layer: the whole pack (base + async + counted
+  # ids) into ONE sgconfig — a single scan -c invocation inside java_ast.
+  if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-javav2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.java_rules import generate
+generate(Path('$ast_rule_dir'))
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  case "$FORMAT" in
+    json)
+      # The summary doc goes to a real file, then stdout: run_module captures
+      # stdout as the module's json output; Path.write_text on /dev/stdout
+      # would re-truncate a regular-file capture at its own offset.
+      v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-javav2-json.XXXXXX)"
+      scan_args+=(--json-out "$v2_json_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    text)
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-javav2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 java path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_JAVA=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.java_scan \
+    "${scan_args[@]}" --version "1.2.2" || exit_code=$?
+  run_v2_legacy_parity_bridges_java "$sink" "$list_file" "$exit_code" "$text_out" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$v2_json_out" ]]; then
+    cat "$v2_json_out" 2>/dev/null || true
+    rm -f "$v2_json_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && rm -rf "$ast_rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_JAVA:-0}" == "1" && "${UBS_LEGACY_MODULE_JAVA:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without a working ast-grep the v2 path cannot match the
+  # legacy finding semantics (the cat-19 resource branch depends on it) —
+  # fall through so the legacy path produces its exact behavior.
+  if check_ast_grep; then
+    v2_status=0
+    run_contract_v2_java || v2_status=$?
+    exit "$v2_status"
+  fi
 fi
 
 # ────────────────────────────────────────────────────────────────────────────

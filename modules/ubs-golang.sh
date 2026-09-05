@@ -100,6 +100,7 @@ ONLY_CHANGED=0
 STRICT_MODE=0
 BASELINE_FILE=""
 NO_BANNER=0
+REPORT_JSON=""         # --report-json=FILE: NDJSON findings sink copy (contract v2 K2)
 ALLOW_NPX=0
 
 case "${UBS_CATEGORY_FILTER:-}" in
@@ -207,7 +208,8 @@ Options:
   --strict                 Treat more findings as warnings/errors (aggressive)
   --baseline=FILE          Compare against a previous text report (heuristic deltas)
   --no-banner              Disable ASCII banner
-  --allow-npx              Allow using npx @ast-grep/cli when ast-grep isn't installed
+  --report-json=FILE       Also write the NDJSON findings sink to FILE (contract v2)
+  --baseline=FILE          Compare against a previous text report (heuristic deltas)
   -h, --help               Show help
 
 Env:
@@ -239,9 +241,10 @@ while [[ $# -gt 0 ]]; do
     --go-tools)   RUN_GO_TOOLS=1; shift;;
     --test-pkgs=*) GOTEST_PKGS="${1#*=}"; shift;;
     --only-changed) ONLY_CHANGED=1; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+    --no-banner)  NO_BANNER=1; shift;;
     --strict)     STRICT_MODE=1; shift;;
     --baseline=*) BASELINE_FILE="${1#*=}"; shift;;
-    --no-banner)  NO_BANNER=1; shift;;
     --allow-npx)  ALLOW_NPX=1; shift;;
     -h|--help)    print_usage; exit 0;;
     *)
@@ -4818,8 +4821,280 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
   exit 0
 fi
 
+# ── Contract-v2 path (bead 0xjg.6): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.go_scan), NDJSON findings sink (K2 schema). Opt-in
+#    while parity is being verified: UBS_CONTRACT_V2_GO=1 enables it;
+#    UBS_LEGACY_MODULE_GO=1 always wins. sarif stays on the legacy path and a
+#    missing ast-grep/python3 falls through so the legacy path keeps its exact
+#    env-error behavior (the v2 layers are ast-grep+python3 by design).
+run_v2_legacy_parity_bridges_go(){
+  local sink="$1" list_file="$2" go_exit="$3" text_out="${4:-}" skip_csv="${5:-}" \
+        tally_file="${6:-}" life_raw="$7" life_status="$8" run_life="$9"
+  local files_n bridge_rc=0 helper_err_preview=""
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
+    "$go_exit" "$tally_file" "$life_raw" "$life_status" "$run_life" \
+    "$SCRIPT_DIR/helpers/resource_lifecycle_go.go" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import os
+import sys
+
+(sink_path, text_out, files_raw, fow_raw, skip_csv, go_exit_raw, tally_file,
+ life_raw_path, life_status_raw, run_life_raw, life_helper) = sys.argv[1:12]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+go_exit = int(go_exit_raw or "0")
+life_status = int(life_status_raw or "0")
+run_life = run_life_raw == "1"
+as_text = bool(text_out)
+
+# Mirror go_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
+SLUG = {1: "concurrency", 2: "channels", 3: "context", 4: "http",
+        5: "resource-lifecycle", 6: "error-handling", 7: "json-encoding",
+        8: "filesystem", 9: "security", 10: "reflection-unsafe",
+        11: "imports", 12: "build", 13: "testing", 14: "logging",
+        15: "style", 16: "panic-time", 17: "lifecycle-correlation",
+        18: "tooling", 19: "dependencies", 20: "defer-nil", 21: "database",
+        22: "shutdown"}
+SECTION = {1: "1. CONCURRENCY & GOROUTINE SAFETY", 2: "2. CHANNELS & SELECT",
+           3: "3. CONTEXT PROPAGATION & CANCELLATION", 4: "4. HTTP CLIENT/SERVER SAFETY",
+           5: "5. RESOURCE LIFECYCLE & DEFER", 6: "6. ERROR HANDLING & WRAPPING",
+           7: "7. JSON & ENCODING", 8: "8. FILESYSTEM & I/O",
+           9: "9. CRYPTOGRAPHY & SECURITY", 10: "10. REFLECTION & UNSAFE",
+           11: "11. IMPORT HYGIENE", 12: "12. MODULE & BUILD HYGIENE",
+           13: "13. TESTING PRACTICES", 14: "14. LOGGING & PRINTF",
+           15: "15. STYLE & MODERNIZATION", 16: "16. PANIC/RECOVER & TIME PATTERNS (AST Pack)",
+           17: "17. RESOURCE LIFECYCLE CORRELATION", 18: "18. GO TOOLING (OPTIONAL)",
+           19: "19. DEPENDENCY & BUILD DRIFT", 20: "20. NIL PANICS FROM DEFER ORDERING (AST)",
+           21: "21. DATABASE & SQL ROBUSTNESS", 22: "22. SHUTDOWN & RESOURCE RELEASE (HTTP/NET)"}
+
+# RESOURCE_LIFECYCLE_* tables (ubs-golang.sh 142-182).
+LIFE_SEVERITY = {"context_cancel": "critical", "ticker_stop": "warning",
+                 "timer_stop": "warning", "file_handle": "warning",
+                 "db_handle": "warning", "mutex_lock": "warning"}
+LIFE_SUMMARY = {"context_cancel": "context.With* without deferred cancel",
+                "ticker_stop": "time.NewTicker not stopped",
+                "timer_stop": "time.NewTimer not stopped",
+                "file_handle": "os.Open/OpenFile without defer Close()",
+                "db_handle": "sql.Open without DB.Close()",
+                "mutex_lock": "Mutex Lock without Unlock()"}
+LIFE_REMEDIATION = {
+    "context_cancel": "Store the cancel func and defer cancel() immediately after acquiring the context",
+    "ticker_stop": "Keep the ticker handle and call Stop() when finished",
+    "timer_stop": "Stop or drain timers to avoid leaks",
+    "file_handle": "Call defer f.Close() immediately after Open to avoid FD leaks",
+    "db_handle": "Close sql.DB handles when shutting down or prefer context-managed lifecycle",
+    "mutex_lock": "Pair Lock() with defer Unlock() to avoid deadlocks when returning early",
+}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+out = []
+
+def emit(line=""):
+    out.append(line)
+
+# Bridge 1: run_resource_lifecycle_checks (cat 17) → sink records + text.
+if run_life:
+    raw = ""
+    if life_raw_path and os.path.isfile(life_raw_path):
+        with open(life_raw_path, encoding="utf-8", errors="replace") as fh:
+            raw = fh.read()
+    rows = []
+    for line in raw.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 1 and parts[0].strip():
+            rows.append(parts)
+    new_records = []
+    if rows:
+        for parts in rows:
+            location = parts[0]
+            kind = parts[1] if len(parts) > 1 else ""
+            message = parts[2] if len(parts) > 2 else ""
+            severity = LIFE_SEVERITY.get(kind, "warning")
+            summary = LIFE_SUMMARY.get(kind, "Resource imbalance")
+            remediation = LIFE_REMEDIATION.get(kind, "Ensure matching cleanup call")
+            desc = f"{remediation}: {message}" if message else remediation
+            new_records.append({
+                "rule": f"go.lifecycle.{kind or 'imbalance'}",
+                "category_id": "golang.lifecycle-correlation",
+                "path": location,
+                "line": 0,
+                "col": 1,
+                "severity": severity,
+                "message": f"{summary} [{location}] — {desc}"[:300],
+                "suppressed": False,
+            })
+        with open(sink_path, "a", encoding="utf-8") as fh:
+            for rec in new_records:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        records.extend(new_records)
+        if as_text:
+            for rec in new_records:
+                emit(f"[{rec['severity']}] {LIFE_SUMMARY.get(rec['rule'].rsplit('.', 1)[-1], rec['message'])} (1 found) — {rec['rule']}")
+                location = rec["path"]
+                emit(f"    {location}  {rec['message'][:180]}")
+    elif life_status == 0:
+        if as_text:
+            emit("good: All tracked resource acquisitions have matching cleanups")
+    elif as_text:
+        emit("Info (0 found)")
+        emit("    AST helper failed (go run resource_lifecycle_go.go)")
+
+# Final severity recount over the whole sink (legacy 7935-7937 inputs).
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+# Bridge 2 + 3 (text format only; json/sarif stdout stays machine-clean):
+# record-less legacy section headers, the category-16 rule tally, and the
+# trailing "Summary Statistics:" block with the legacy exit formula.
+if as_text:
+    covered = {str(rec.get("category_id", "")) for rec in records}
+    tally = {}
+    if tally_file and os.path.isfile(tally_file):
+        try:
+            with open(tally_file, encoding="utf-8") as fh:
+                tally = json.load(fh)
+        except (ValueError, OSError):
+            tally = {}
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        if f"golang.{SLUG[num]}" in covered and num != 16:
+            continue
+        emit("")
+        emit(SECTION[num])
+        if num == 16:
+            emit("ast-grep produced structured matches. Tally by rule id:")
+            for rid, n in sorted(tally.items()):
+                emit(f"  • {rid:<44} {n:>5}")
+        if num == 17 and not run_life:
+            emit("Info (0 found)")
+            emit("    Go toolchain unavailable — Install Go to run the AST helper")
+        if num == 18:
+            emit("Info (0 found)")
+            emit("    Go tools disabled (use --go-tools) or Go not found")
+    emit("")
+    emit("Summary Statistics:")
+    emit(f"Files scanned: {files_n}")
+    emit(f"Critical issues: {counts['critical']}")
+    emit(f"Warning issues: {counts['warning']}")
+    emit(f"Info items: {counts['info']}")
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+exit_code = 1 if counts["critical"] else go_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+run_contract_v2_go(){
+  local list_file sink helpers_dir exit_code=0 text_out="" tally_file="" ast_rule_dir=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  # UBS_CATEGORY_FILTER whitelist -> legacy should_skip mapping: skip every
+  # category NOT whitelisted (105-109: resource-lifecycle allows 5,17).
+  local v2_skip="$SKIP_CATEGORIES"
+  if [[ -n "$CATEGORY_WHITELIST" ]]; then
+    local keep="" c allowed w
+    local -a _wl
+    IFS=',' read -r -a _wl <<<"$CATEGORY_WHITELIST"
+    for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22; do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  # Consolidated ast-grep layer: generate the 65-rule pack + the async rule
+  # into two sgconfigs (one scan -c per config per path batch in go_ast).
+  if command -v ast-grep >/dev/null 2>&1; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-gov2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.go_rules import generate
+generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  tally_file="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-tally.XXXXXX)"
+  scan_args+=(--tally-out "$tally_file")
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: Path.write_text on
+      # /dev/stdout re-truncates a regular-file capture at its own offset,
+      # which would stomp the legacy-parity bridge text appended below.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 golang path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_GO=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.go_scan \
+    "${scan_args[@]}" --version "$VERSION" || exit_code=$?
+  # Legacy-parity bridge: cat 17 lifecycle helper (go run) records, the
+  # record-less section headers + cat-16 tally, and the final "Summary
+  # Statistics:" block with the legacy exit formula (7935-7937).
+  local life_raw="" life_status=0 run_life=0
+  if [[ ",$v2_skip," != *",17,"* && -f "$SCRIPT_DIR/helpers/resource_lifecycle_go.go" ]] && command -v go >/dev/null 2>&1; then
+    life_raw="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-life.XXXXXX)"
+    if go run "$SCRIPT_DIR/helpers/resource_lifecycle_go.go" -- "$PROJECT_DIR" >"$life_raw" 2>/dev/null; then
+      life_status=0
+    else
+      life_status=$?
+    fi
+    run_life=1
+  fi
+  run_v2_legacy_parity_bridges_go "$sink" "$list_file" "$exit_code" "$text_out" \
+    "$v2_skip" "$tally_file" "$life_raw" "$life_status" "$run_life" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" "$tally_file" "$life_raw" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_GO:-0}" == "1" && "${UBS_LEGACY_MODULE_GO:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without a working ast-grep + python3 the v2 path cannot
+  # match the legacy finding semantics — fall through so the legacy path
+  # produces its exact env-error behavior (regex fallbacks, exit codes).
+  if check_ast_grep && command -v python3 >/dev/null 2>&1; then
+    v2_status=0
+    run_contract_v2_go || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
+
 maybe_clear
 print_banner
+
 
 index_project
 

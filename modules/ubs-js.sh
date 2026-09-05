@@ -3915,6 +3915,8 @@ run_contract_v2_js(){
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-jsv2-rules.XXXXXX)"
     if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.js_rules import generate
 generate(Path('$ast_rule_dir'))
 " 2>/dev/null; then
       ast_rule_dir=""

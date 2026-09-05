@@ -8,15 +8,18 @@ heredoc (ubs-js.sh 2857-2980, GH #73): classify the denominator of every
 every other denominator is reported. The legacy flow matched the divisions
 with ast-grep and consumed its JSON stream in python; here the same
 per-operator scan runs over ``RunContext.files`` with an equivalent
-code-aware scan: ``ubs_core.lexer.strip_comments_and_strings`` blanks
-comments and string literals (ast-grep matches code nodes only), and a
-JS-specific pass blanks regex literals and template-literal text while
-keeping ``${...}`` interpolation code (real code ast-grep matches).
-``/=`` is division-assignment, not the ``$L / $R`` node. Denominator
-classification is the heredoc logic byte-for-byte, so masking can neither
-invent a safe denominator (it only deletes characters) nor destroy one
-(safe candidates are numeric/``Math.*``/``Number.*``/``||``-literal forms
-that contain no strings).
+code-aware single-pass tokenizer that blanks comments, string/template
+literals and regex literals with spaces (ast-grep matches code nodes only,
+never trivia or literal text — ``"a/b"``, ``// a / b`` and ``/re/`` never
+match), keeps ``${...}`` template interpolation code visible (real code
+ast-grep matches), and skips ``/=`` (division-assignment is a different
+node than ``$L / $R``). A dedicated lexer is required because
+``ubs_core.lexer`` has no template/regex awareness and operator-level
+detection cannot tolerate literal-text noise. Denominator classification is
+the heredoc logic byte-for-byte, so masking can neither invent a safe
+denominator (it only deletes characters) nor destroy one (safe candidates
+are numeric/``Math.*``/``Number.*``/``||``-literal forms that contain no
+strings).
 
 The heredoc's project-level risky counter becomes one finding record per
 risky division, severity ``warning`` per the legacy ``print_finding``
@@ -28,7 +31,6 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
@@ -65,12 +67,12 @@ def _regex_start_context(text: str, idx: int) -> bool:
     return not (ch in ')]')
 
 
-def _mask_templates_and_regex(masked: str) -> str:
-    """JS-specific pass over the core-stripped text: blank regex literals and
-    template-literal *text* while keeping ``${...}`` interpolation code (it is
-    real code ast-grep matches). Newlines preserved; offsets identical."""
-    out = list(masked)
-    n = len(masked)
+def _mask_non_code(text: str) -> str:
+    """Blank comments, string/template-literal text and regex literals with
+    spaces (newlines preserved) so only real code operators survive; ``${...}``
+    interpolation code stays visible. Offsets are identical to the input."""
+    out = list(text)
+    n = len(text)
 
     def blank(a: int, b: int) -> None:
         for j in range(a, min(b, n)):
@@ -79,24 +81,50 @@ def _mask_templates_and_regex(masked: str) -> str:
 
     i = 0
     while i < n:
-        c = masked[i]
+        c = text[i]
+        nxt = text[i + 1] if i + 1 < n else ''
+        if c == '/' and nxt == '/':
+            end = text.find('\n', i)
+            end = n if end == -1 else end
+            blank(i, end)
+            i = end
+            continue
+        if c == '/' and nxt == '*':
+            end = text.find('*/', i + 2)
+            end = n if end == -1 else end + 2
+            blank(i, end)
+            i = end
+            continue
+        if c in '\'"':
+            j = i + 1
+            while j < n:
+                ch = text[j]
+                if ch == '\\':
+                    j += 2
+                    continue
+                if ch == c or ch == '\n':
+                    break
+                j += 1
+            blank(i, min(j + 1, n))
+            i = j + 1
+            continue
         if c == '`':
             j = i + 1
             while j < n:
-                ch = masked[j]
+                ch = text[j]
                 if ch == '\\':
                     j += 2
                     continue
                 if ch == '`':
                     j += 1
                     break
-                if ch == '$' and j + 1 < n and masked[j + 1] == '{':
+                if ch == '$' and j + 1 < n and text[j + 1] == '{':
                     depth = 1
                     k = j + 2
                     while k < n and depth:
-                        if masked[k] == '{':
+                        if text[k] == '{':
                             depth += 1
-                        elif masked[k] == '}':
+                        elif text[k] == '}':
                             depth -= 1
                         k += 1
                     blank(j, j + 2)
@@ -106,12 +134,14 @@ def _mask_templates_and_regex(masked: str) -> str:
                 j += 1
             i = j
             continue
-        if c == '/' and i + 1 < n and masked[i + 1] not in '/*=' \
-                and _regex_start_context(masked, i):
+        if c == '/' and nxt == '=':
+            i += 2  # /= division-assignment: code, but not a $L / $R node
+            continue
+        if c == '/' and nxt not in ('/', '*') and _regex_start_context(text, i):
             j = i + 1
             in_class = False
             while j < n:
-                ch = masked[j]
+                ch = text[j]
                 if ch == '\\':
                     j += 2
                     continue
@@ -125,22 +155,15 @@ def _mask_templates_and_regex(masked: str) -> str:
                 elif ch == '/':
                     break
                 j += 1
-            if j < n and masked[j] == '/':
+            if j < n and text[j] == '/':
                 end = j + 1
-                while end < n and (masked[end].isalnum()):
+                while end < n and (text[end].isalnum()):
                     end += 1
                 blank(i, end)
                 i = end
                 continue
         i += 1
     return ''.join(out)
-
-
-def _mask_non_code(text: str) -> str:
-    """Blank comments, string/template text and regex literals (newlines
-    preserved) so only real code operators survive. Offsets are identical to
-    the input."""
-    return _mask_templates_and_regex(strip_comments_and_strings(text))
 
 
 # ── Verbatim from the legacy analyze_division_denominators heredoc ──────────
@@ -217,10 +240,9 @@ def is_safe_denominator(text):
 
 
 def _rhs_operand(masked: str, i: int) -> str:
-    """Text of the ``$R`` operand ending at the ``/`` at index ``i - 1`` (the
-    index passed is one past the operator). Mirrors ast-grep's single-
-    expression binding: parens/groups, optional unary prefix, then a primary
-    with call and member suffixes."""
+    """Text of the ``$R`` operand starting one past the ``/`` operator index
+    ``i - 1``. Mirrors ast-grep's single-expression binding: parens/groups,
+    optional unary prefix, then a primary with call and member suffixes."""
     n = len(masked)
     j = i
     while j < n and masked[j].isspace():

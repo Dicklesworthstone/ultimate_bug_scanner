@@ -54,8 +54,8 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='fa027f4a36326697784117a44353bd8c2030c9da2b7ecb094f3fc437fb3e659e'
   [golang]='06f389a0b71e6a196cc50fad45256a9d9d0009d78c6fd46e2baa6f817e428c5e'
   [java]='40bea15174de2cd545e4ac891659f3ce30876d36284b846fea52b03ca7c1659d'
-  [js]='972e41fffb745cdb1be4f70d6865b3061571c2229f9fd07b667716634bfa4fc8'
-  [python]='022caa877b5c7f5c4459bd45196dfb45ec3f712eb75aa8f0b727d7861784aa9f'
+  [js]='6ac0437cf63c18417423a0b81df9917487d22343b9c57ab48f7f22adf4dbfab3'
+  [python]='12853ab052da094a7cf4362e04d25e6fcc1f0dd8b4a64a64966249bca695e83d'
   [ruby]='e676f8ce6eea0c2b6bea51b244ef28e6189edd9dcf78258dad2bb2ebf068c3fa'
   [rust]='a6952e2c2dc18081dc43d79bd33621ba3ac386ea3a35df50e07248de9708da6e'
   [swift]='5575dd7e0e2a26fb6f168a9d88cfca988e142296c55630e4c690c4dee8a5232e'
@@ -178,6 +178,55 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_rules.py']='aef56a2d91a68b9e4aad2586de9d94342555ad74008fb06c0ab10a8142b7eecc'
   ['helpers/ubs_core/js_scan.py']='03d707f97cd992f528c61fc4a9acf5d412335136b222e2ca8e3d05ca7d20ff6c'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
+  ['helpers/ubs_core/py_ast.py']='51bea6c246a2f2bf5a57c7b95404c67f1d6195a443ec4954e04ee6ac67998afd'
+  ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
+  ['helpers/ubs_core/py_detectors/archive_extraction.py']='bde3f4b466aa25d5845467df6795fb3a1d15597846ae8440be8ee8fd170b316c'
+  ['helpers/ubs_core/py_detectors/command_injection.py']='68db16769a53a677cf0e885f8b04b9596b10a2168b0f7fd1e52c1be256a4e941'
+  ['helpers/ubs_core/py_detectors/cookie_security.py']='fba1be4149be8f0de38118fc822114cd7fd016e58b016301cad699d18b24e243'
+  ['helpers/ubs_core/py_detectors/cors_misconfig.py']='ddbdd8315a1fd640e8e3e7c0cae8a6d1de01e2a6f279484a269628845540c29c'
+  ['helpers/ubs_core/py_detectors/crypto_misuse.py']='cc25433b614058f57c9ec672c05f5d87e63538c3fcc65851ed3abfdb5f7fe2c6'
+  ['helpers/ubs_core/py_detectors/csrf_disable.py']='7e79d19bd519d945d4a4df9e21d89f864e29ad2cd98b1bb0594970984345f938'
+  ['helpers/ubs_core/py_detectors/debug_host_config.py']='9542f55192935adabf1999506d5db13e11effee156ecb660cf888a207c9b8d12'
+  ['helpers/ubs_core/py_detectors/division.py']='2e0c5c23ba82198fd2d2ae2407c7ef88f563238a91cac32a064ef086d8eadf6f'
+  ['helpers/ubs_core/py_detectors/email_header_injection.py']='74a24a0777cecb6adc7e1e6b5b42c03cc1a38b4296293466cf217cf0251d1fe0'
+  ['helpers/ubs_core/py_detectors/file_permissions.py']='9bb0fd672c9fd3b92071bbb208e11219840e2abf2956ecf83e3185ff1b9199b2'
+  ['helpers/ubs_core/py_detectors/hardcoded_secrets.py']='9b04520774cc9646861a04e833ed6a24ea408df24f62c902e0a1c6808dba6995'
+  ['helpers/ubs_core/py_detectors/header_injection.py']='c5aaff8ab91018f4df3c048a89b19f6a0b9b4a36c4535f3ae45ae5dbbd2499cd'
+  ['helpers/ubs_core/py_detectors/host_header_poisoning.py']='ac14f4db4f35387d5b3fe94bfc15596840cd0dca22f96ef52bbe33400b2e67e5'
+  ['helpers/ubs_core/py_detectors/http_timeout.py']='d528642d6aac30103e3f2d3317b0d416921ce065a94b531ad594f459169595a2'
+  ['helpers/ubs_core/py_detectors/insecure_random.py']='ccf7b2b917dce383e7d5cb60082f0101203e76cc3976aadfe73d0b9d1a038ade'
+  ['helpers/ubs_core/py_detectors/io_open_checks.py']='ed6d844409ee75f00b5d66f67232fd0fd4f272c1f1ae3fc84bb313b838474a10'
+  ['helpers/ubs_core/py_detectors/is_literal.py']='b7770eb1c6a28bc5355485dc195f51adf190ef20b19a7d14a72d499f22ba8fc5'
+  ['helpers/ubs_core/py_detectors/json_loads.py']='a6b4d32e33fbfb1bd76df1edfa55d259989bb5218dbf6fbfb19c8ee0887ddd39'
+  ['helpers/ubs_core/py_detectors/jwt_verification.py']='f384d77bd82df1bea21037b7c47fca4be4d1cff9b41185a1b2746513dbf16e19'
+  ['helpers/ubs_core/py_detectors/ldap_injection.py']='31cd80955c932680e5d71e89a3f8d83cfa4de0ef6eb5311b5d4aa7a287d2097f'
+  ['helpers/ubs_core/py_detectors/mass_assignment.py']='ad2d9926f406a461fc16591e6f2d9731bdd48f5d0d3a69f4d355a2ddd410469c'
+  ['helpers/ubs_core/py_detectors/missing_returns.py']='1aee6c57b5b95af3161e75d8b9cd33e1bdd3422ceaf8e47e4adc33d7e104be2b'
+  ['helpers/ubs_core/py_detectors/mutation_during_iteration.py']='50831c50c1536773aeb27481beb2d632e9ce3f906379f592e22e8d27a44a73bd'
+  ['helpers/ubs_core/py_detectors/nosql_injection.py']='5117d571e16db684b8dd6d582ac19a9c811baf889d7ed1cc32eece2a35f2197a'
+  ['helpers/ubs_core/py_detectors/open_redirect.py']='e8286bdc691f56c657011c66ba3af4a98e5c5709f8e74617b0d63d639c3f6f64'
+  ['helpers/ubs_core/py_detectors/password_hashing.py']='191f24ba2fbd5acefa45a70301b83eccb222cbf6d6a77817e4fa04bcb9f50d94'
+  ['helpers/ubs_core/py_detectors/path_traversal.py']='b3451c827df549ccff16511433bb3a88f37eff20bf6c1a14be3a9b8bb86bac34'
+  ['helpers/ubs_core/py_detectors/redos_regex.py']='b096ec343b96451757fe906c7d14254bf8500c1cc27e7c243013af6677a74aad'
+  ['helpers/ubs_core/py_detectors/safe_html_xss.py']='e36f35f8b1ec02e8625a2e7848d67e26d103494501062721548a67d19df9087e'
+  ['helpers/ubs_core/py_detectors/security_assert.py']='623e2759e5a42e50e10315d5219bae3b387ba351861697d4ee98724b96b2c9ac'
+  ['helpers/ubs_core/py_detectors/sql_injection.py']='d47461a041b85334dfbe809e80d58d610e7445081d941203688e55757fff459c'
+  ['helpers/ubs_core/py_detectors/ssrf.py']='b6bdbb8d03549146081e61e2c9fd1b28c94276edbf184fa3b67d1d1349e6ba67'
+  ['helpers/ubs_core/py_detectors/subprocess_timeout.py']='b102cdc52d47e1ee2de73c3b78660ddec540d77865b2164b6c6f414b7f29a8f4'
+  ['helpers/ubs_core/py_detectors/template_autoescape.py']='373544e3181dfaf40c09b0002612951e018d599b395c6fbdb55b8317c1533640'
+  ['helpers/ubs_core/py_detectors/template_injection.py']='0fafe6cc4b6944f5c754ac7df3a44810d9a23100e3de1954033b8c42558cd807'
+  ['helpers/ubs_core/py_detectors/tls_verification.py']='54d90e5d758bdc27517f05ddbdc9fdf65a0ff1ba5c9941bfac046b5291d3bfa5'
+  ['helpers/ubs_core/py_detectors/unsafe_deserialization.py']='c349c0261fda4e5eba221303087e6e131db5dfbd85fe165ff28f7686f84a253f'
+  ['helpers/ubs_core/py_detectors/xml_parser_security.py']='c57d0423e3ab7a27d7c7d2262cf0d67d15d8d888ac258c952123eb12f4a032c8'
+  ['helpers/ubs_core/py_patterns/__init__.py']='7b9b471217121aa96668386d623d9be7ce5ce25e4866c548c3ac2d135faf768d'
+  ['helpers/ubs_core/py_patterns/debug_typing.py']='50257dcef8af20c42b456e24c6cd7752cfd56db0d89fb8a175ca342d76e26e4c'
+  ['helpers/ubs_core/py_patterns/flow.py']='76a5ad2a28aebd60fd2d7293cb0e558313d90b6119fb97c474860d324366a577'
+  ['helpers/ubs_core/py_patterns/foundations.py']='306891cf0a55775eef6d10d1718a497747b5e4e94707e5d9fe766ceacaafc1e7'
+  ['helpers/ubs_core/py_patterns/io_files.py']='cfc4ff45b29fc5e6391024475238113970d828e2d16fb21a10d384d5477c6f41'
+  ['helpers/ubs_core/py_patterns/quality.py']='67172bb6c1227370021506baa87108060227e5513be996ab52f48bb38cd4c29b'
+  ['helpers/ubs_core/py_patterns/security_rg.py']='74f4cdc7dcc70faf656161c0651097649a6ad0322e74bfb3c3860a0497b501ef'
+  ['helpers/ubs_core/py_rules.py']='5ed37ca0ba35959e495fa877837293b863847ee82159dad3bf3fedcf17d8eeb8'
+  ['helpers/ubs_core/py_scan.py']='e21fa1f825fc61d6e35f9bd48280014c490e561a23a2a4b443929ff2f33cd55a'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/suppression.py']='473563fd701199b1e16977cce0e26596ab6bceee1ba824fec0b1dcbda3684b1e'
@@ -486,6 +535,55 @@ HELPER_ASSETS=(
   "helpers/ubs_core/js_rules.py"
   "helpers/ubs_core/js_scan.py"
   "helpers/ubs_core/lexer.py"
+  "helpers/ubs_core/py_ast.py"
+  "helpers/ubs_core/py_detectors/__init__.py"
+  "helpers/ubs_core/py_detectors/archive_extraction.py"
+  "helpers/ubs_core/py_detectors/command_injection.py"
+  "helpers/ubs_core/py_detectors/cookie_security.py"
+  "helpers/ubs_core/py_detectors/cors_misconfig.py"
+  "helpers/ubs_core/py_detectors/crypto_misuse.py"
+  "helpers/ubs_core/py_detectors/csrf_disable.py"
+  "helpers/ubs_core/py_detectors/debug_host_config.py"
+  "helpers/ubs_core/py_detectors/division.py"
+  "helpers/ubs_core/py_detectors/email_header_injection.py"
+  "helpers/ubs_core/py_detectors/file_permissions.py"
+  "helpers/ubs_core/py_detectors/hardcoded_secrets.py"
+  "helpers/ubs_core/py_detectors/header_injection.py"
+  "helpers/ubs_core/py_detectors/host_header_poisoning.py"
+  "helpers/ubs_core/py_detectors/http_timeout.py"
+  "helpers/ubs_core/py_detectors/insecure_random.py"
+  "helpers/ubs_core/py_detectors/io_open_checks.py"
+  "helpers/ubs_core/py_detectors/is_literal.py"
+  "helpers/ubs_core/py_detectors/json_loads.py"
+  "helpers/ubs_core/py_detectors/jwt_verification.py"
+  "helpers/ubs_core/py_detectors/ldap_injection.py"
+  "helpers/ubs_core/py_detectors/mass_assignment.py"
+  "helpers/ubs_core/py_detectors/missing_returns.py"
+  "helpers/ubs_core/py_detectors/mutation_during_iteration.py"
+  "helpers/ubs_core/py_detectors/nosql_injection.py"
+  "helpers/ubs_core/py_detectors/open_redirect.py"
+  "helpers/ubs_core/py_detectors/password_hashing.py"
+  "helpers/ubs_core/py_detectors/path_traversal.py"
+  "helpers/ubs_core/py_detectors/redos_regex.py"
+  "helpers/ubs_core/py_detectors/safe_html_xss.py"
+  "helpers/ubs_core/py_detectors/security_assert.py"
+  "helpers/ubs_core/py_detectors/sql_injection.py"
+  "helpers/ubs_core/py_detectors/ssrf.py"
+  "helpers/ubs_core/py_detectors/subprocess_timeout.py"
+  "helpers/ubs_core/py_detectors/template_autoescape.py"
+  "helpers/ubs_core/py_detectors/template_injection.py"
+  "helpers/ubs_core/py_detectors/tls_verification.py"
+  "helpers/ubs_core/py_detectors/unsafe_deserialization.py"
+  "helpers/ubs_core/py_detectors/xml_parser_security.py"
+  "helpers/ubs_core/py_patterns/__init__.py"
+  "helpers/ubs_core/py_patterns/debug_typing.py"
+  "helpers/ubs_core/py_patterns/flow.py"
+  "helpers/ubs_core/py_patterns/foundations.py"
+  "helpers/ubs_core/py_patterns/io_files.py"
+  "helpers/ubs_core/py_patterns/quality.py"
+  "helpers/ubs_core/py_patterns/security_rg.py"
+  "helpers/ubs_core/py_rules.py"
+  "helpers/ubs_core/py_scan.py"
   "helpers/ubs_core/registry.py"
   "helpers/ubs_core/selftest.py"
   "helpers/ubs_core/suppression.py"

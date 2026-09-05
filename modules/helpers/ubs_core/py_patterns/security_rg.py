@@ -25,14 +25,14 @@ PATTERNS: list[Pattern] = [
         category=7,
         rule_id="py.security.eval-exec-usage",
         title="eval()/exec() present",
-        regex=re.compile(r"(^|[^A-Za-z0-9_])eval\(|(^|[^A-Za-z0-9_])exec\("),
+        regex=re.compile(r"(?<![A-Za-z0-9_])eval\(|(?<![A-Za-z0-9_])exec\("),
         thresholds=((0, "critical"),),
     ),
     Pattern(
         category=7,
         rule_id="py.security.pickle-usage",
         title="Insecure pickle usage",
-        regex=re.compile(r"(^|[^A-Za-z0-9_])pickle\.(load|loads)\("),
+        regex=re.compile(r"(?<![A-Za-z0-9_])pickle\.(load|loads)\("),
         thresholds=((0, "critical"),),
     ),
     Pattern(
@@ -48,7 +48,7 @@ PATTERNS: list[Pattern] = [
         rule_id="py.security.shell-true",
         title="Shell command injection risk",
         regex=re.compile(
-            r"^[^#]*\b[A-Za-z_][A-Za-z0-9_.]*\([^#]*shell[ \t]*=[ \t]*True"
+            r"(?m)^[^#\n]*\b[A-Za-z_][A-Za-z0-9_.]*\([^#\n]*shell[ \t]*=[ \t]*True"
         ),
         thresholds=((0, "critical"),),
     ),

@@ -21,7 +21,7 @@ PATTERNS: list[Pattern] = [
         # legacy ladder: warning >50 "Many print() statements - prefer logging",
         # info >20 "print() statements found", else good "Minimal print usage".
         # The two titles merge into the v2 record stream; the ladder tiers do.
-        regex=re.compile(r"^[ \t]*print\("),
+        regex=re.compile(r"(?m)^[ \t]*print\("),
         thresholds=((50, "warning"), (20, "info")),
     ),
     Pattern(
@@ -46,7 +46,7 @@ PATTERNS: list[Pattern] = [
         category=13,
         rule_id="py.variables.global-nonlocal",
         title="Frequent global/nonlocal usage",
-        regex=re.compile(r"^[ \t]*(global|nonlocal)[ \t]+[A-Za-z_]"),
+        regex=re.compile(r"(?m)^[ \t]*(global|nonlocal)[ \t]+[A-Za-z_]"),
         thresholds=((5, "info"),),
     ),
     Pattern(

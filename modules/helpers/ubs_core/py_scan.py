@@ -226,7 +226,11 @@ def load_patterns() -> list[Pattern]:
     for module_info in pkgutil.iter_modules(py_patterns.__path__):
         if module_info.name.startswith("_"):
             continue
-        module = importlib.import_module(f"ubs_core.py_patterns.{module_info.name}")
+        try:
+            module = importlib.import_module(f"ubs_core.py_patterns.{module_info.name}")
+        except Exception as exc:  # a broken pattern module must not kill the scan
+            sys.stderr.write(f"[ubs_core.py_scan] pattern module {module_info.name} failed: {exc}\n")
+            continue
         patterns.extend(getattr(module, "PATTERNS", []))
     return patterns
 
@@ -290,8 +294,11 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
 def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
     """Run ubs_core.py_detectors.* modules (legacy heredoc detector ports).
 
-    Each module exposes RULE_ID, CATEGORY, TITLE, SEVERITY, DESCRIPTION and
-    ``find(files)`` yielding (path, line, col, detail) per detection.
+    Protocol (single-rule modules): RULE_ID, CATEGORY, TITLE, SEVERITY,
+    DESCRIPTION and ``find(files)`` yielding (path, line, col, detail).
+    Multi-rule modules (e.g. the SQL two-tier detector) expose ``RULES`` —
+    a tuple of (rule_id, category, title, severity, description) tuples —
+    and ``find(files)`` yielding (rule_id, path, line, col, detail).
     """
     import importlib
     import pkgutil
@@ -301,25 +308,52 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
     for module_info in pkgutil.iter_modules(py_detectors.__path__):
         if module_info.name.startswith("_"):
             continue
-        module = importlib.import_module(f"ubs_core.py_detectors.{module_info.name}")
+        try:
+            module = importlib.import_module(f"ubs_core.py_detectors.{module_info.name}")
+        except Exception as exc:  # legacy heredoc failures degraded gracefully too
+            sys.stderr.write(f"[ubs_core.py_scan] detector module {module_info.name} failed: {exc}\n")
+            continue
         find = getattr(module, "find", None)
         if find is None:
             continue
-        category = int(getattr(module, "CATEGORY", 7))
-        if skip and category in skip:
-            continue
-        rule_id = str(getattr(module, "RULE_ID", f"py.cat{category}.{module_info.name}"))
-        title = str(getattr(module, "TITLE", rule_id))
-        severity = str(getattr(module, "SEVERITY", "warning"))
-        slug = slug_for_category(category)
-        for path, line_no, col, detail in find(files):
+        if hasattr(module, "RULES"):
+            specs = {
+                spec[0]: {"category": int(spec[1]), "title": str(spec[2]),
+                          "severity": str(spec[3]), "description": str(spec[4])}
+                for spec in module.RULES
+            }
+        else:
+            category = int(getattr(module, "CATEGORY", 7))
+            rule_id = str(getattr(module, "RULE_ID", f"py.cat{category}.{module_info.name}"))
+            specs = {rule_id: {
+                "category": category,
+                "title": str(getattr(module, "TITLE", rule_id)),
+                "severity": str(getattr(module, "SEVERITY", "warning")),
+                "description": str(getattr(module, "DESCRIPTION", "")),
+            }}
+        if skip:
+            specs = {rid: spec for rid, spec in specs.items()
+                     if spec["category"] not in skip}
+            if not specs:
+                continue
+        for hit in find(files):
+            if len(hit) == 5:
+                rule_id, path, line_no, col, detail = hit
+            else:
+                path, line_no, col, detail = hit  # single-rule convenience
+                rule_id = next(iter(specs))
+            spec = specs.get(rule_id)
+            if spec is None:
+                continue
+            slug = slug_for_category(spec["category"])
+            title = spec["title"]
             sink.write(json.dumps({
                 "rule": rule_id,
                 "category_id": f"python.{slug}",
                 "path": str(path),
                 "line": int(line_no),
                 "col": int(col),
-                "severity": severity,
+                "severity": spec["severity"],
                 "message": f"{title} — {detail}"[:300] if detail else title,
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")

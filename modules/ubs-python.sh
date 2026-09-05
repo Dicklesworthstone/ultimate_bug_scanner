@@ -10304,6 +10304,295 @@ fi
 # relax pipefail for scanning (optional)
 begin_scan_section
 
+# ── Contract-v2 path (bead 0xjg.5): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.py_scan), NDJSON findings sink (K2 schema). Opt-in
+#    while the category port completes: UBS_CONTRACT_V2_PY=1 enables it;
+#    UBS_LEGACY_MODULE_PY=1 always wins.
+# ── Legacy-parity bridge: uv tools (category 20) ────────────────────────────
+# External-tool output is printed verbatim and NEVER converted to v2 sink
+# records (js precedent: bandit `Location:` lines excluded by design). The
+# legacy lump info counts (ruff) ride to the totals recount via UV_EXTRA_INFO.
+run_v2_uv_tools_py(){
+  local sink="$1"
+  UV_EXTRA_INFO=0
+  if [[ "$ENABLE_UV_TOOLS" -ne 1 ]]; then
+    say "  ${GRAY}${INFO} uv extra analyzers disabled (--no-uv)${RESET}"
+    return 0
+  fi
+  local TOOL ruff_stdout ruff_stderr ruff_trimmed ruff_count _EXC _ign_pats _pat _match
+  IFS=',' read -r -a UVLIST <<< "$UV_TOOLS"
+  for TOOL in "${UVLIST[@]}"; do
+    case "$TOOL" in
+      ruff)
+        print_subheader "ruff (lint)"
+        ruff_stdout="$(mktemp -t ubs-ruff.XXXXXX 2>/dev/null || mktemp)"
+        ruff_stderr="$(mktemp -t ubs-ruff.XXXXXX 2>/dev/null || mktemp)"
+        run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=json >"$ruff_stdout" 2>"$ruff_stderr" || true
+        ruff_trimmed="$(tr -d '[:space:]' <"$ruff_stdout" 2>/dev/null || true)"
+        if [[ "$ruff_trimmed" == "[]" ]]; then
+          print_finding "good" "Ruff clean"
+        else
+          ruff_count=0
+          if command -v python3 >/dev/null 2>&1; then
+            ruff_count=$(python3 - "$ruff_stdout" <<'PYRUFF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print(0)
+    sys.exit(0)
+print(len(data) if isinstance(data, list) else 0)
+PYRUFF
+)
+          fi
+          cat "$ruff_stdout" 2>/dev/null || true
+          if [[ -s "$ruff_stderr" ]]; then
+            say "  ${DIM}ruff stderr:${RESET}"
+            cat "$ruff_stderr" 2>/dev/null || true
+          fi
+          if [ "${ruff_count:-0}" -gt 0 ]; then
+            print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"
+            UV_EXTRA_INFO=$((UV_EXTRA_INFO + ruff_count))
+          else
+            print_finding "info" 1 "Ruff output needs review" "Non-empty output (or parse failure)"
+            UV_EXTRA_INFO=$((UV_EXTRA_INFO + 1))
+          fi
+        fi
+        rm -f "$ruff_stdout" "$ruff_stderr" 2>/dev/null || true
+        ;;
+      bandit)
+        print_subheader "bandit (security)"
+        _EXC=""
+        for d in "${EXCLUDE_DIRS[@]}"; do
+          if [[ "$d" == /* ]]; then
+            _EXC="${_EXC:+$_EXC,}$d"
+          else
+            _EXC="${_EXC:+$_EXC,}$PROJECT_DIR/$d"
+          fi
+        done
+        if [[ -n "$EXTRA_EXCLUDES" ]]; then
+          IFS=',' read -r -a _ign_pats <<< "$EXTRA_EXCLUDES"
+          for _pat in "${_ign_pats[@]}"; do
+            [[ "$_pat" != *'*'* && "$_pat" != *'?'* && "$_pat" != *'['* ]] && continue
+            while IFS= read -r _match; do
+              [[ -z "$_match" ]] && continue
+              _EXC="${_EXC:+$_EXC,}$_match"
+            done < <(find "$PROJECT_DIR" -path "$PROJECT_DIR/$_pat" 2>/dev/null || true)
+          done
+        fi
+        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "${_EXC:-}" ; then
+          print_finding "info" 0 "Bandit scan completed" "See output above"
+        else
+          say "  ${GRAY}${INFO} bandit not executed${RESET}"
+        fi
+        ;;
+      pip-audit)
+        print_subheader "pip-audit (dependencies)"
+        if [ -f "$PROJECT_DIR/requirements.txt" ]; then
+          run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" || true
+        elif [ -f "$PROJECT_DIR/pyproject.toml" ]; then
+          run_uv_tool_text pip-audit --path "$PROJECT_DIR/pyproject.toml" || true
+        else
+          run_uv_tool_text pip-audit --path "$PROJECT_DIR" || true
+        fi
+        print_finding "info" 0 "pip-audit run (if available)" "Review advisories above"
+        ;;
+      mypy)
+        print_subheader "mypy (type-check)"
+        run_uv_tool_text mypy --hide-error-context "$PROJECT_DIR" || true
+        ;;
+      detect-secrets)
+        print_subheader "detect-secrets (secrets)"
+        run_system_or_uv_tool detect-secrets scan "$PROJECT_DIR" || true
+        ;;
+      safety)
+        print_subheader "safety (dependency vulns)"
+        if [[ -f "$PROJECT_DIR/requirements.txt" ]]; then
+          run_system_or_uv_tool safety check -r "$PROJECT_DIR/requirements.txt" --full-report || true
+        else
+          run_system_or_uv_tool safety check --full-report || true
+        fi
+        ;;
+      *)
+        say "  ${GRAY}${INFO} Unknown uv tool '$TOOL' ignored${RESET}"
+        ;;
+    esac
+  done
+}
+
+# ── Legacy-parity bridges: record-less section headers + summary + exit ─────
+# The v2 renderer prints record-backed sections only, while the legacy module
+# announces every non-skipped category (print_header) even when nothing was
+# found there. The remainder is appended in legacy category order (text only),
+# followed by the final "Summary Statistics:" block recounted from the sink
+# (plus the uv lump info counts) and the legacy exit formula (11876-11879).
+run_v2_legacy_parity_bridges_py(){
+  local sink="$1" list_file="$2" py_exit="$3" text_out="${4:-}" extra_info="${5:-0}" skip_csv="${6:-}"
+  local files_n bridge_rc=0
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
+    "$py_exit" "$extra_info" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import sys
+
+(sink_path, text_out, files_raw, fow_raw, skip_csv, py_exit_raw, extra_raw) = sys.argv[1:8]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+py_exit = int(py_exit_raw or "0")
+extra_info = int(extra_raw or "0")
+as_text = bool(text_out)
+
+# Mirror py_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
+SLUG = {1: "none", 2: "numeric", 3: "collections", 4: "comparison", 5: "async",
+        6: "error-handling", 7: "security", 8: "functions", 9: "parsing",
+        10: "control-flow", 11: "debug", 12: "perf", 13: "variables",
+        14: "code-quality", 15: "regex", 16: "io", 17: "typing", 18: "modules",
+        19: "resource-lifecycle", 20: "uv-tools", 21: "deprecations",
+        22: "packaging", 23: "notebooks"}
+SECTION = {1: "1. NONE / DEFENSIVE PROGRAMMING", 2: "2. NUMERIC / ARITHMETIC PITFALLS",
+           3: "3. COLLECTION SAFETY", 4: "4. COMPARISON & TYPE CHECKING TRAPS",
+           5: "5. ASYNC/AWAIT PITFALLS", 6: "6. ERROR HANDLING ANTI-PATTERNS",
+           7: "7. SECURITY VULNERABILITIES", 8: "8. FUNCTION & SCOPE ISSUES",
+           9: "9. PARSING & TYPE CONVERSION BUGS", 10: "10. CONTROL FLOW GOTCHAS",
+           11: "11. DEBUGGING & PRODUCTION CODE", 12: "12. PERFORMANCE & MEMORY",
+           13: "13. VARIABLE & SCOPE", 14: "14. CODE QUALITY MARKERS",
+           15: "15. REGEX & STRING SAFETY", 16: "16. I/O & RESOURCE SAFETY",
+           17: "17. TYPING STRICTNESS", 18: "18. PYTHON I/O & MODULE USAGE",
+           19: "19. RESOURCE LIFECYCLE CORRELATION", 20: "20. UV-POWERED EXTRA ANALYZERS",
+           21: "21. DEPRECATIONS & PY3.13 MIGRATIONS", 22: "22. PACKAGING & CONFIG HYGIENE",
+           23: "23. NOTEBOOK HYGIENE"}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+# Final severity recount over the whole sink (+ uv lump info), legacy
+# 11876-11879 inputs.
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+counts["info"] += extra_info
+
+out = []
+
+def emit(line=""):
+    out.append(line)
+
+# Record-less section headers (text format only; json stdout stays machine-clean).
+if as_text:
+    covered = {str(rec.get("category_id", "")) for rec in records}
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        if f"python.{SLUG[num]}" not in covered:
+            emit(SECTION[num])
+    emit("")
+    emit("Summary Statistics:")
+    emit(f"Files scanned: {files_n}")
+    emit(f"Critical issues: {counts['critical']}")
+    emit(f"Warning issues: {counts['warning']}")
+    emit(f"Info items: {counts['info']}")
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+exit_code = 1 if counts["critical"] else py_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+run_contract_v2_py(){
+  local list_file sink helpers_dir exit_code=0 text_out=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  # UBS_CATEGORY_FILTER whitelist -> legacy should_skip mapping: skip every
+  # category NOT whitelisted (139-145: resource-lifecycle allows 16,19).
+  local v2_skip="$SKIP_CATEGORIES"
+  if [[ -n "$CATEGORY_WHITELIST" ]]; then
+    local keep="" c allowed w
+    local -a _wl
+    IFS=',' read -r -a _wl <<<"$CATEGORY_WHITELIST"
+    for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  # Consolidated ast-grep layer: generate the 52-rule pack into ONE sgconfig
+  # (one `scan -c` per path batch inside ubs_core.py_ast).
+  local ast_rule_dir=""
+  if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-pyv2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.py_rules import generate
+generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: Path.write_text on
+      # /dev/stdout re-truncates a regular-file capture at its own offset,
+      # which would stomp the legacy-parity bridge text appended below.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 python path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_PY=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.py_scan \
+    "${scan_args[@]}" --version "${UBS_PY_VERSION:-unknown}" || exit_code=$?
+  # Category 20 parity bridge: raw uv-tool passthrough (not sink records).
+  if [[ ",$v2_skip," != *",20,"* ]]; then
+    run_v2_uv_tools_py "$sink"
+  fi
+  # Record-less section headers + Summary Statistics + legacy exit formula.
+  run_v2_legacy_parity_bridges_py "$sink" "$list_file" "$exit_code" "$text_out" \
+    "${UV_EXTRA_INFO:-0}" "$v2_skip" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_PY:-0}" == "1" && "${UBS_LEGACY_MODULE_PY:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without a working python3 the v2 path cannot run any of
+  # the detection layers — fall through so the legacy path produces its exact
+  # env-error behavior (info findings, exit codes). NO ast-grep requirement:
+  # that is the point of this port (legacy rg fallbacks already cover it).
+  if command -v python3 >/dev/null 2>&1; then
+    v2_status=0
+    run_contract_v2_py || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: NONE / DEFENSIVE PROGRAMMING
 # ═══════════════════════════════════════════════════════════════════════════

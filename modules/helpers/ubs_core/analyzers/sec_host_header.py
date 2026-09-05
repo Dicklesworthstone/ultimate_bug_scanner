@@ -249,7 +249,7 @@ def _selftest_new_url_and_headers_call_flagged(tmp_prefix: str = "ubs_core_sec_h
     src = "\n".join([
         "declare function headers(): { get(name: string): string | null };",
         "",
-        "export function canonicalUrl(pathname: string): string {",
+        "export function nextHeadersCanonicalUrl(pathname: string): string {",
         "  const origin = `https://${headers().get(\"host\")}`;",
         "  return new URL(pathname, origin).toString();",
         "}",

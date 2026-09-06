@@ -5950,7 +5950,7 @@ run_lang(){
     json|jsonl|toon)
       prepare_metrics_dir "$metrics_dir"
       local -a report_args=()
-      if [[ "$lang" == "js" || "$lang" == "python" || "$lang" == "cpp" || "$lang" == "golang" || "$lang" == "java" || "$lang" == "ruby" ]]; then
+      if [[ "$lang" == "js" || "$lang" == "python" || "$lang" == "cpp" || "$lang" == "golang" || "$lang" == "java" || "$lang" == "ruby" || "$lang" == "swift" || "$lang" == "elixir" || "$lang" == "rust" || "$lang" == "csharp" ]]; then
         report_args=(--report-json="$out_findings")
       elif [[ "$lang" == "csharp" ]]; then
         report_args=(--emit-findings-json="$out_findings")

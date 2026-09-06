@@ -3046,7 +3046,7 @@ print(counts['critical'], counts['warning'], counts['info'])
       say " ${DIM}Code quality improvements and best practices${RESET}"
     fi
   fi
-  if [[ -n "$REPORT_JSON" ]]; then
+  if [[ -n "${REPORT_JSON:-}" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
   rm -f "$list_file" "$sink" 2>/dev/null || true

@@ -8368,8 +8368,8 @@ _v2_sink_bucket(){
 }
 _v2_add_finding(){
   # legacy add_finding signature + a sink bucket record
-  local severity="$1" count="$2" title="$3" desc="${4:-}" category="${5:-}" samples="${6:-[]}"
-  add_finding "$severity" "$count" "$title" "$desc" "$category" "$samples"
+  local severity="$1" count="$2" title="$3" desc="${4:-}" category="${5:-}" samples_json="${6:-[]}"
+  add_finding "$severity" "$count" "$title" "$desc" "$category" "$samples_json"
   _v2_sink_bucket "$severity" "$(printf '%s' "$count" | awk 'END{print $0+0}')" "$title" "$desc" \
     "${V2_CARGO_SLUG:-}" "${category:-}" "${V2_CARGO_RULE:-}"
 }
@@ -8671,7 +8671,7 @@ run_v2_summary_json(){
 }
 
 run_v2_legacy_parity_bridges_rust(){
-  local sink="$1" text_out="${2:-}" json_out="${3:-}"
+  local sink="$1" text_out="${2:-}"
   run_v2_cargo_phases
   run_v2_cat_17_18
   local counts

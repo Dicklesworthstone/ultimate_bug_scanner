@@ -414,11 +414,21 @@ need_cmd(){
 # list). early_cleanup runs from the EXIT trap until cleanup() takes over and
 # calls it too, so a refusal or early exit leaves nothing behind.
 EARLY_TMP_PATHS=()
+TMPDIR_RUN=""
+ensure_tmpdir_run(){
+  if [[ -z "${TMPDIR_RUN:-}" || ! -d "$TMPDIR_RUN" ]]; then
+    TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
+    EARLY_TMP_PATHS+=("$TMPDIR_RUN")
+  fi
+}
 early_cleanup(){
   local p
   for p in "${EARLY_TMP_PATHS[@]}"; do
     [[ -n "$p" && -e "$p" && "$p" != "/" ]] && rm -rf "$p" 2>/dev/null
   done
+  if [[ -n "${TMPDIR_RUN:-}" && -d "$TMPDIR_RUN" && "$TMPDIR_RUN" != "/" ]]; then
+    rm -rf "$TMPDIR_RUN" 2>/dev/null || true
+  fi
   return 0
 }
 trap early_cleanup EXIT
@@ -486,7 +496,7 @@ PROFILE_LIST_MS=0
 PROFILE_FANOUT_MS=0
 PROFILE_MERGE_MS=0
 profile_json(){
-  # {"total_ms","list_ms","copy_ms","fanout_ms","merge_ms","modules":{lang: wall ms}}
+  # {"total_ms","list_ms","copy_ms","fanout_ms","merge_ms","modules":{lang: wall ms},"list_modules":{lang: list ms}}
   local total=$(( $(now_ms) - UBS_START_MS ))
   local mods="" f lang ms
   for f in "$TMPDIR_RUN"/*.ms; do
@@ -495,8 +505,20 @@ profile_json(){
     ms="$(tr -cd '0-9' < "$f")"
     mods="${mods:+$mods,}\"$(json_escape "$lang")\":${ms:-0}"
   done
-  printf '{"total_ms":%d,"list_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
-    "$total" "$PROFILE_LIST_MS" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
+  local list_mods=""
+  for f in "$TMPDIR_RUN"/*.list_ms; do
+    [[ -f "$f" ]] || continue
+    lang="$(basename "$f" .list_ms)"
+    ms="$(tr -cd '0-9' < "$f")"
+    list_mods="${list_mods:+$list_mods,}\"$(json_escape "$lang")\":${ms:-0}"
+  done
+  if [[ -n "$list_mods" ]]; then
+    printf '{"total_ms":%d,"list_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s},"list_modules":{%s}}\n' \
+      "$total" "$PROFILE_LIST_MS" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$list_mods"
+  else
+    printf '{"total_ms":%d,"list_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
+      "$total" "$PROFILE_LIST_MS" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
+  fi
 }
 
 # Machine-readable error envelope (bead B6). Environment errors and scan
@@ -1165,6 +1187,7 @@ GLOBAL_EXCLUDE_PATTERNS="$DEFAULT_IGNORES"
 FILTERED_PROJECT_DIR=""
 MODULE_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
 MODULE_DIR="$MODULE_DIR_DEFAULT"
+declare -A MODULE_PATHS=()
 UPDATE_MODULES=0
 JOBS="${JOBS:-0}"
 # Seed from the documented env var so `UBS_SKIP_TYPE_NARROWING=1 ubs .` works
@@ -1596,7 +1619,7 @@ cat <<'JSON'
           "totals": {"$ref": "#/$defs/totals"},
           "git": {"type": "object", "description": "present when the project has a GitHub remote", "properties": {"repository": {"type": "string"}, "commit": {"type": "string"}, "blob_base": {"type": "string"}}, "required": ["repository"]},
           "comparison": {"type": "object"},
-          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "copy_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "copy_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
+          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "copy_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "copy_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "list_modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
         },
         "additionalProperties": true
       },
@@ -2318,6 +2341,7 @@ ignore_globs_for_rg(){
 # "<kept> <bytes> <skipped_big> <skipped_data>". Needs python3.
 list_scan_files(){
   local root="$1" out="$2" raw rg_rc=0 mode="list"
+  local contract_file="${3:-}" per_lang_dir="${4:-}" only_langs="${5:-}" exclude_langs="${6:-}"
   need_cmd python3 || return 1
   raw="$out.raw"
   if need_cmd rg; then
@@ -2333,10 +2357,12 @@ list_scan_files(){
     : > "$raw"
   fi
   local stats
-  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" <<'PY'
+  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" "$contract_file" "$per_lang_dir" "$only_langs" "$exclude_langs" <<'PY'
 import fnmatch
+import json
 import os
 import sys
+import time
 
 root = os.fsencode(sys.argv[1])
 raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
@@ -2344,11 +2370,74 @@ data_exts = set(sys.argv[5].split(","))
 mode, patterns = sys.argv[6], [p for p in sys.argv[7].split(",") if p]
 scoped = set(sys.argv[8].split(",")) if len(sys.argv) > 8 and sys.argv[8] else set()
 source_exts = set(sys.argv[9].split(",")) if len(sys.argv) > 9 else set()
+contract_path = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
+per_lang_dir = sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else ""
+only_langs_raw = sys.argv[12] if len(sys.argv) > 12 and sys.argv[12] else ""
+exclude_langs_raw = sys.argv[13] if len(sys.argv) > 13 and sys.argv[13] else ""
 cap = max_mb * 1024 * 1024 if max_mb > 0 else 0
 
 
 def ext_of(name: bytes) -> str:
     return name.rsplit(b".", 1)[-1].lower().decode("utf-8", "replace") if b"." in name[1:] else ""
+
+
+def normalize_lang(l: str) -> str:
+    l = l.strip().lower()
+    if l == "c":
+        return "cpp"
+    if l in ("cs", "csharp", "csharp-dotnet", "dotnet", "c#"):
+        return "csharp"
+    if l in ("ex", "elixir", "phoenix"):
+        return "elixir"
+    if l in ("go", "golang"):
+        return "golang"
+    if l in ("py", "python"):
+        return "python"
+    if l in ("rb", "ruby"):
+        return "ruby"
+    if l in ("rs", "rust"):
+        return "rust"
+    if l in ("ts", "js"):
+        return "js"
+    return l
+
+
+modules_spec = {}
+if contract_path and os.path.isfile(contract_path):
+    try:
+        with open(contract_path, "r", encoding="utf-8") as fh:
+            cdata = json.load(fh)
+            modules_spec = cdata.get("modules", {})
+    except Exception:
+        modules_spec = {}
+
+all_module_langs = list(modules_spec.keys()) if modules_spec else [
+    "js", "python", "cpp", "rust", "golang", "java", "ruby", "swift", "csharp", "elixir"
+]
+
+only_set = {normalize_lang(x) for x in only_langs_raw.split(",") if x.strip()} if only_langs_raw else set()
+exclude_set = {normalize_lang(x) for x in exclude_langs_raw.split(",") if x.strip()} if exclude_langs_raw else set()
+
+if only_set:
+    target_langs = [l for l in all_module_langs if l in only_set and l not in exclude_set]
+else:
+    target_langs = [l for l in all_module_langs if l not in exclude_set]
+
+
+def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict) -> bool:
+    exts = spec.get("extensions", [])
+    if ext_str and ext_str in exts:
+        return True
+    manifests = spec.get("manifest_files", [])
+    if manifests:
+        for pat in manifests:
+            if fnmatch.fnmatch(name_str, pat) or fnmatch.fnmatch(rel_str, pat):
+                return True
+        for part in rel_str.split("/"):
+            for pat in manifests:
+                if fnmatch.fnmatch(part, pat):
+                    return True
+    return False
 
 
 # Content-scoped directories (bead B4b). A directory named obj/env/bin is
@@ -2418,6 +2507,7 @@ if scoped:
             if part in scoped_b:
                 under.setdefault(b"/".join(parts[: i + 1]), set()).add(rel)
 kept, total, big, data = [], 0, 0, 0
+kept_sizes = {}
 scoped_skipped = 0
 for rel in entries:
     if not rel:
@@ -2448,10 +2538,44 @@ for rel in entries:
         big += 1
         continue
     kept.append(rel)
+    kept_sizes[rel] = st.st_size
     total += st.st_size
+
 with open(out, "wb") as fh:
     fh.write(b"\0".join(kept) + (b"\0" if kept else b""))
-print(len(kept), total, big, data)
+
+lang_files = {l: [] for l in all_module_langs}
+selected_files = set()
+selected_bytes = 0
+
+for rel in kept:
+    rel_str = os.fsdecode(rel)
+    name_str = rel_str.rsplit("/", 1)[-1]
+    ext_str = ext_of(os.fsencode(name_str))
+    is_sel = False
+    for l in all_module_langs:
+        spec = modules_spec.get(l, {})
+        if matches_lang(rel_str, name_str, ext_str, spec):
+            lang_files[l].append(rel)
+            if l in target_langs:
+                is_sel = True
+    if is_sel:
+        selected_files.add(rel)
+        selected_bytes += kept_sizes.get(rel, 0)
+
+if per_lang_dir and os.path.isdir(per_lang_dir):
+    for l in all_module_langs:
+        t0 = time.perf_counter()
+        flist = lang_files.get(l, [])
+        l_path = os.path.join(per_lang_dir, f"{l}.files")
+        with open(l_path, "wb") as fh:
+            fh.write(b"\0".join(flist) + (b"\0" if flist else b""))
+        l_ms = max(0, int((time.perf_counter() - t0) * 1000))
+        ms_path = os.path.join(per_lang_dir, f"{l}.list_ms")
+        with open(ms_path, "w", encoding="utf-8") as fh:
+            fh.write(str(l_ms))
+
+print(len(kept), total, big, data, len(selected_files), selected_bytes)
 PY
 )"; then
     rm -f "$raw" 2>/dev/null
@@ -2547,71 +2671,6 @@ report_copy_failure(){
   fi
 }
 
-build_scan_file_list(){
-  [[ "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" ]] || return 1
-  need_cmd python3 || return 1
-  local t0 list stats
-  t0="$(now_ms)"
-  list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
-  if ! stats="$(list_scan_files "$SOURCE_PROJECT_DIR" "$list")"; then
-    rm -f "$list" 2>/dev/null
-    return 1
-  fi
-  read -r SCAN_LIST_COUNT SCAN_LIST_BYTES SCAN_LIST_SKIPPED_BIG SCAN_LIST_SKIPPED_DATA <<<"$stats"
-  if [[ ! "$SCAN_LIST_COUNT" =~ ^[0-9]+$ || ! "$SCAN_LIST_BYTES" =~ ^[0-9]+$ ]]; then
-    rm -f "$list" 2>/dev/null
-    SCAN_LIST_COUNT=0; SCAN_LIST_BYTES=0; SCAN_LIST_SKIPPED_BIG=0; SCAN_LIST_SKIPPED_DATA=0
-    return 1
-  fi
-  SCAN_FILE_LIST="$list"
-  EARLY_TMP_PATHS+=("$list")  # removed by early_cleanup / cleanup
-  PROFILE_LIST_MS=$(( $(now_ms) - t0 ))
-  return 0
-}
-
-if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" && -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
-  build_scan_file_list || true
-fi
-
-# Check 2: Refuse directories larger than MAX_DIR_SIZE_MB (unless set to 0)
-if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
-  if [[ -n "$SCAN_FILE_LIST" ]]; then
-    dir_size_mb=$(( SCAN_LIST_BYTES / 1024 / 1024 ))
-  else
-    dir_size_mb="$(dir_size_mb_filtered "$SOURCE_PROJECT_DIR" "$GLOBAL_EXCLUDE_PATTERNS")"
-  fi
-  if [[ "${QUIET:-0}" -eq 0 ]]; then
-    say "${DIM}${INFO}${RESET} Scan size after ignores: ${dir_size_mb}MB (limit ${MAX_DIR_SIZE_MB}MB)"
-    if [[ -n "$SCAN_FILE_LIST" && ( "$SCAN_LIST_SKIPPED_DATA" -gt 0 || "$SCAN_LIST_SKIPPED_BIG" -gt 0 ) ]]; then
-      say "${DIM}${INFO}${RESET} ${SCAN_LIST_COUNT} files listed for scanning; left out: ${SCAN_LIST_SKIPPED_DATA} binary/data files, ${SCAN_LIST_SKIPPED_BIG} above ${MAX_FILE_SIZE_MB}MB (UBS_MAX_FILE_MB)"
-    fi
-  fi
-  if [[ "$dir_size_mb" -gt "$MAX_DIR_SIZE_MB" ]]; then
-    refuse_scan "directory-too-large" "Directory too large (after ignores): ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB" \
-      "\"size_mb\":${dir_size_mb},\"limit_mb\":${MAX_DIR_SIZE_MB}" \
-      "UBS copies the scan target to /tmp before analysis, which can exhaust disk space." \
-      "This safety check prevents accidental scans of large directories like \$HOME." \
-      "Options: scan a smaller subdirectory; raise the limit with UBS_MAX_DIR_SIZE_MB=5000; disable it with UBS_MAX_DIR_SIZE_MB=0."
-  fi
-fi
-
-if [[ -n "$CATEGORY_FILTER" ]]; then
-  CATEGORY_FILTER="${CATEGORY_FILTER,,}"
-  if [[ "$CATEGORY_FILTER" == "resource-lifecycle" ]]; then
-    SHAREABLE_MODE=$((SHAREABLE_MODE+0))
-    if [[ -z "$ONLY_LANGS" ]]; then
-      ONLY_LANGS="python,golang,java,swift,csharp"
-    fi
-    export UBS_CATEGORY_FILTER="$CATEGORY_FILTER"
-  else
-    say "${YELLOW}${WARN}${RESET} Unknown category filter: $CATEGORY_FILTER"
-    CATEGORY_FILTER=""
-    unset UBS_CATEGORY_FILTER
-  fi
-else
-  unset UBS_CATEGORY_FILTER
-fi
-
 ensure_dir(){ mkdir -p "$1" 2>/dev/null || { say "${RED}$X cannot create $1${RESET}"; exit 1; }; }
 
 script_dir(){
@@ -2691,6 +2750,86 @@ script_path(){
     printf '%s\n' "$source"
   fi
 }
+
+build_scan_file_list(){
+  [[ "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" ]] || return 1
+  need_cmd python3 || return 1
+  local t0 list stats
+  t0="$(now_ms)"
+  ensure_tmpdir_run
+  list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
+  local contract_file=""
+  if [[ -f "$(script_dir)/modules/contract.json" ]]; then
+    contract_file="$(script_dir)/modules/contract.json"
+  elif [[ -f "$MODULE_DIR/contract.json" ]]; then
+    contract_file="$MODULE_DIR/contract.json"
+  fi
+  if ! stats="$(list_scan_files "$SOURCE_PROJECT_DIR" "$list" "$contract_file" "$TMPDIR_RUN" "$ONLY_LANGS" "$EXCLUDE_LANGS")"; then
+    rm -f "$list" 2>/dev/null
+    return 1
+  fi
+  local sel_count="" sel_bytes=""
+  read -r SCAN_LIST_COUNT SCAN_LIST_BYTES SCAN_LIST_SKIPPED_BIG SCAN_LIST_SKIPPED_DATA sel_count sel_bytes <<<"$stats"
+  if [[ ! "$SCAN_LIST_COUNT" =~ ^[0-9]+$ || ! "$SCAN_LIST_BYTES" =~ ^[0-9]+$ ]]; then
+    rm -f "$list" 2>/dev/null
+    SCAN_LIST_COUNT=0; SCAN_LIST_BYTES=0; SCAN_LIST_SKIPPED_BIG=0; SCAN_LIST_SKIPPED_DATA=0
+    return 1
+  fi
+  if [[ "$sel_bytes" =~ ^[0-9]+$ && "$sel_count" =~ ^[0-9]+$ ]]; then
+    SCAN_SELECTED_BYTES="$sel_bytes"
+    SCAN_SELECTED_COUNT="$sel_count"
+  else
+    SCAN_SELECTED_BYTES="$SCAN_LIST_BYTES"
+    SCAN_SELECTED_COUNT="$SCAN_LIST_COUNT"
+  fi
+  SCAN_FILE_LIST="$list"
+  EARLY_TMP_PATHS+=("$list")  # removed by early_cleanup / cleanup
+  PROFILE_LIST_MS=$(( $(now_ms) - t0 ))
+  return 0
+}
+
+if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" && -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+  build_scan_file_list || true
+fi
+
+# Check 2: Refuse directories larger than MAX_DIR_SIZE_MB (unless set to 0)
+if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
+  if [[ -n "$SCAN_FILE_LIST" ]]; then
+    dir_size_mb=$(( ${SCAN_SELECTED_BYTES:-$SCAN_LIST_BYTES} / 1024 / 1024 ))
+  else
+    dir_size_mb="$(dir_size_mb_filtered "$SOURCE_PROJECT_DIR" "$GLOBAL_EXCLUDE_PATTERNS")"
+  fi
+  if [[ "${QUIET:-0}" -eq 0 ]]; then
+    say "${DIM}${INFO}${RESET} Scan size after ignores: ${dir_size_mb}MB (limit ${MAX_DIR_SIZE_MB}MB)"
+    if [[ -n "$SCAN_FILE_LIST" && ( "$SCAN_LIST_SKIPPED_DATA" -gt 0 || "$SCAN_LIST_SKIPPED_BIG" -gt 0 ) ]]; then
+      say "${DIM}${INFO}${RESET} ${SCAN_SELECTED_COUNT:-$SCAN_LIST_COUNT} files listed for scanning; left out: ${SCAN_LIST_SKIPPED_DATA} binary/data files, ${SCAN_LIST_SKIPPED_BIG} above ${MAX_FILE_SIZE_MB}MB (UBS_MAX_FILE_MB)"
+    fi
+  fi
+  if [[ "$dir_size_mb" -gt "$MAX_DIR_SIZE_MB" ]]; then
+    refuse_scan "directory-too-large" "Directory too large (after ignores): ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB" \
+      "\"size_mb\":${dir_size_mb},\"limit_mb\":${MAX_DIR_SIZE_MB}" \
+      "UBS copies the scan target to /tmp before analysis, which can exhaust disk space." \
+      "This safety check prevents accidental scans of large directories like \$HOME." \
+      "Options: scan a smaller subdirectory; raise the limit with UBS_MAX_DIR_SIZE_MB=5000; disable it with UBS_MAX_DIR_SIZE_MB=0."
+  fi
+fi
+
+if [[ -n "$CATEGORY_FILTER" ]]; then
+  CATEGORY_FILTER="${CATEGORY_FILTER,,}"
+  if [[ "$CATEGORY_FILTER" == "resource-lifecycle" ]]; then
+    SHAREABLE_MODE=$((SHAREABLE_MODE+0))
+    if [[ -z "$ONLY_LANGS" ]]; then
+      ONLY_LANGS="python,golang,java,swift,csharp"
+    fi
+    export UBS_CATEGORY_FILTER="$CATEGORY_FILTER"
+  else
+    say "${YELLOW}${WARN}${RESET} Unknown category filter: $CATEGORY_FILTER"
+    CATEGORY_FILTER=""
+    unset UBS_CATEGORY_FILTER
+  fi
+else
+  unset UBS_CATEGORY_FILTER
+fi
 
 prepare_metrics_dir(){
   local dir="$1"
@@ -3746,6 +3885,30 @@ apply_ignore_filters(){
   [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]] || return 0
   [[ -d "$SOURCE_PROJECT_DIR" ]] || return 0
 
+  # Check if all selected modules support contract v2 (bead B4c).
+  # If so, they take --files-from and scan SOURCE_PROJECT_DIR directly;
+  # no temporary workspace copy is created.
+  local -a selected_langs=()
+  read -r -a selected_langs <<<"$(select_langs)"
+  if [[ ${#selected_langs[@]} -gt 0 ]]; then
+    local all_v2=1 _sl
+    for _sl in "${selected_langs[@]}"; do
+      if ! is_module_v2 "$_sl"; then
+        all_v2=0
+        break
+      fi
+    done
+    if [[ "$all_v2" -eq 1 ]]; then
+      FILTERED_PROJECT_DIR=""
+      PROJECT_DIR="$SOURCE_PROJECT_DIR"
+      PROFILE_COPY_MS=0
+      if [[ "${QUIET:-0}" -eq 0 ]]; then
+        say "${DIM}${INFO}${RESET} All selected modules support contract v2; scanning source tree directly"
+      fi
+      return 0
+    fi
+  fi
+
   local dest="$TMPDIR_RUN/scan"
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
@@ -3957,6 +4120,13 @@ fi
 # Detectors (fast ripgrep if available, else find)
 detect_lang(){
   local lang="$1" found=1
+  if [[ -n "${TMPDIR_RUN:-}" && -f "$TMPDIR_RUN/$lang.files" ]]; then
+    if [[ -s "$TMPDIR_RUN/$lang.files" ]]; then
+      return 0
+    else
+      return 1
+    fi
+  fi
   case "$lang" in
     js)
       if need_cmd rg; then
@@ -4074,6 +4244,107 @@ resolve_module_path(){
   if [ -x "$sd/modules/$base.sh" ]; then echo "$sd/modules/$base.sh"; return 0; fi
   if [ -x "$md/$base.sh" ]; then echo "$md/$base.sh"; return 0; fi
   echo "$md/$base.sh"
+}
+
+# Contract v2 detection (bead B4c): check if the module advertises contract v2
+# in its --help text; cache the result in $TMPDIR_RUN/<lang>.is_v2.
+is_module_v2(){
+  local lang="$1" module_path="${2:-}"
+  [[ -n "$lang" ]] || return 1
+  ensure_tmpdir_run
+  local cache_file="$TMPDIR_RUN/$lang.is_v2"
+  if [[ -f "$cache_file" ]]; then
+    local cached
+    cached="$(cat "$cache_file" 2>/dev/null || echo "0")"
+    [[ "$cached" == "1" ]] && return 0 || return 1
+  fi
+  if [[ -z "$module_path" ]]; then
+    module_path="${MODULE_PATHS[$lang]:-}"
+    if [[ -z "$module_path" ]]; then
+      module_path="$(resolve_module_path "$lang")"
+    fi
+  fi
+  if [[ -n "$module_path" && -e "$module_path" ]]; then
+    local help_out=""
+    if [[ -x "$module_path" ]]; then
+      help_out="$("$module_path" --help 2>&1 || true)"
+    else
+      help_out="$("$BASH" "$module_path" --help 2>&1 || true)"
+    fi
+    if printf '%s' "$help_out" | grep -q 'contract: v2'; then
+      printf '1' > "$cache_file" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  printf '0' > "$cache_file" 2>/dev/null || true
+  return 1
+}
+
+# Normalize language alias to module name (e.g. "c" -> "cpp").
+normalize_lang(){
+  case "$1" in
+    c) echo "cpp" ;;
+    cs|csharp|csharp-dotnet|dotnet|c#) echo "csharp" ;;
+    ex|elixir|phoenix) echo "elixir" ;;
+    go) echo "golang" ;;
+    py) echo "python" ;;
+    rb) echo "ruby" ;;
+    rs) echo "rust" ;;
+    ts) echo "js" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Build selected language set
+select_langs(){
+  local detected=()
+  if [[ -n "$SINGLE_FILE_TARGET" ]]; then
+    # rg applies no glob filter to an explicit file argument, so the per-language
+    # probes would claim every language for it; the extension decides instead.
+    detected=("$(lang_for_source_file "$SINGLE_FILE_TARGET")")
+  else
+    for L in "${ALL_LANGS[@]}"; do
+      detect_lang "$L" && detected+=("$L")
+    done
+  fi
+  # apply --only / --exclude
+  local filtered=() i w
+  if [[ -n "$ONLY_LANGS" ]]; then
+    IFS=',' read -r -a want <<<"$ONLY_LANGS"
+    for i in "${detected[@]}"; do
+      for w in "${want[@]}"; do [[ "$i" == "$w" ]] && filtered+=("$i"); done
+    done
+    # Also accept aliases: --only=c should match detected cpp
+    for w in "${want[@]}"; do
+      local nw; nw="$(normalize_lang "$w")"
+      if [[ "$nw" != "$w" ]]; then
+        for i in "${detected[@]}"; do
+          [[ "$i" == "$nw" ]] && filtered+=("$i")
+        done
+      fi
+    done
+  else
+    filtered=("${detected[@]}")
+  fi
+  if [[ -n "$EXCLUDE_LANGS" ]]; then
+    IFS=',' read -r -a drop <<<"$EXCLUDE_LANGS"
+    local keep=()
+    for i in "${filtered[@]}"; do
+      local skip=0; for d in "${drop[@]}"; do [[ "$i" == "$d" || "$(normalize_lang "$d")" == "$i" ]] && skip=1; done
+      [[ $skip -eq 0 ]] && keep+=("$i")
+    done
+    filtered=("${keep[@]}")
+  fi
+  # Normalize all language names to module names and deduplicate.
+  local normalized=() seen_langs=""
+  for i in "${filtered[@]}"; do
+    local n; n="$(normalize_lang "$i")"
+    if [[ " $seen_langs " != *" $n "* ]]; then
+      normalized+=("$n")
+      seen_langs="$seen_langs $n"
+    fi
+  done
+  echo "${normalized[@]}"
 }
 
 download_module(){
@@ -4652,7 +4923,7 @@ fi
 # ─────────────────────────────────────────────────────────────────────────────
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
-TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
+ensure_tmpdir_run
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-module time bound + process-group teardown (issue #60)
@@ -4743,7 +5014,11 @@ COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 if [[ "$TARGETED_SCAN_MODE" -eq 0 ]]; then
   _profile_t0="$(now_ms)"
   apply_ignore_filters
-  PROFILE_COPY_MS=$(( $(now_ms) - _profile_t0 ))
+  if [[ -n "$FILTERED_PROJECT_DIR" ]]; then
+    PROFILE_COPY_MS=$(( $(now_ms) - _profile_t0 ))
+  else
+    PROFILE_COPY_MS=0
+  fi
 fi
 if [[ "$SUGGEST_IGNORE" -eq 1 ]]; then
   suggest_ignore_candidates
@@ -4757,20 +5032,6 @@ elif [[ ${#SCAN_FILES[@]} -gt 0 ]]; then
   prepare_files_workspace
 fi
 
-# Normalize language alias to module name (e.g. "c" -> "cpp").
-normalize_lang(){
-  case "$1" in
-    c) echo "cpp" ;;
-    cs|csharp|csharp-dotnet|dotnet|c#) echo "csharp" ;;
-    ex|elixir|phoenix) echo "elixir" ;;
-    go) echo "golang" ;;
-    py) echo "python" ;;
-    rb) echo "ruby" ;;
-    rs) echo "rust" ;;
-    ts) echo "js" ;;
-    *) echo "$1" ;;
-  esac
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-language category name lookup (issue #52)
@@ -5421,57 +5682,6 @@ list_categories_for_langs(){
   exit "$list_rc"
 }
 
-# Build selected language set
-select_langs(){
-  local detected=()
-  if [[ -n "$SINGLE_FILE_TARGET" ]]; then
-    # rg applies no glob filter to an explicit file argument, so the per-language
-    # probes would claim every language for it; the extension decides instead.
-    detected=("$(lang_for_source_file "$SINGLE_FILE_TARGET")")
-  else
-    for L in "${ALL_LANGS[@]}"; do
-      detect_lang "$L" && detected+=("$L")
-    done
-  fi
-  # apply --only / --exclude
-  local filtered=() i
-  if [[ -n "$ONLY_LANGS" ]]; then
-    IFS=',' read -r -a want <<<"$ONLY_LANGS"
-    for i in "${detected[@]}"; do
-      for w in "${want[@]}"; do [[ "$i" == "$w" ]] && filtered+=("$i"); done
-    done
-    # Also accept aliases: --only=c should match detected cpp
-    for w in "${want[@]}"; do
-      local nw; nw="$(normalize_lang "$w")"
-      if [[ "$nw" != "$w" ]]; then
-        for i in "${detected[@]}"; do
-          [[ "$i" == "$nw" ]] && filtered+=("$i")
-        done
-      fi
-    done
-  else
-    filtered=("${detected[@]}")
-  fi
-  if [[ -n "$EXCLUDE_LANGS" ]]; then
-    IFS=',' read -r -a drop <<<"$EXCLUDE_LANGS"
-    local keep=()
-    for i in "${filtered[@]}"; do
-      local skip=0; for d in "${drop[@]}"; do [[ "$i" == "$d" || "$(normalize_lang "$d")" == "$i" ]] && skip=1; done
-      [[ $skip -eq 0 ]] && keep+=("$i")
-    done
-    filtered=("${keep[@]}")
-  fi
-  # Normalize all language names to module names and deduplicate.
-  local normalized=() seen_langs=""
-  for i in "${filtered[@]}"; do
-    local n; n="$(normalize_lang "$i")"
-    if [[ " $seen_langs " != *" $n "* ]]; then
-      normalized+=("$n")
-      seen_langs="$seen_langs $n"
-    fi
-  done
-  echo "${normalized[@]}"
-}
 
 # Launch a language module bounded by UBS_MODULE_TIMEOUT, in its own process
 # group, tracking its pgid so an interrupt can reap the whole subtree.
@@ -5824,6 +6034,10 @@ PY
 postprocess_module(){
   local mode="$1" lang="$2" raw="$3" txt="$4" json="$5" sarif="$6" findings="$7" metrics="$8"
   local proj no_suppress=0; proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  local ws="${FILTERED_PROJECT_DIR:-}"
+  if is_module_v2 "$lang"; then
+    ws=""
+  fi
   # Single-file fast path: the only source the findings can point at is the
   # target itself; without a marker there is nothing to suppress (bead C3).
   if [[ -n "${SINGLE_FILE_TARGET:-}" && -f "$SINGLE_FILE_TARGET" ]] \
@@ -5831,7 +6045,7 @@ postprocess_module(){
     no_suppress=1
   fi
   python3 "$TMPDIR_RUN/postprocess.py" --mode "$mode" --lang "$lang" --raw "$raw" --txt "$txt" --json "$json" \
-    --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "${FILTERED_PROJECT_DIR:-}" \
+    --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "$ws" \
     --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
     --no-suppress "$no_suppress" --blob-base "${GIT_BLOB_BASE:-}" --toplevel "${GIT_TOPLEVEL:-}" \
     --helpers-dir "${UBS_HELPERS_DIR:-$(dirname "${BASH_SOURCE[0]}")/modules/helpers}"
@@ -5860,9 +6074,13 @@ partial_status_from_text(){
 # Bead B10 decides whether this path survives.
 legacy_postprocess(){
   local mode="$1" lang="$2" raw="$3" txt="$4" json="$5" findings="$6" metrics="$7"; shift 7
+  local is_v2=0
+  is_module_v2 "$lang" && is_v2=1
   if [[ "$mode" == "json" ]]; then
-    restore_original_paths "$json"
-    [[ -s "$findings" ]] && restore_original_paths "$findings"
+    if [[ "$is_v2" -eq 0 ]]; then
+      restore_original_paths "$json"
+      [[ -s "$findings" ]] && restore_original_paths "$findings"
+    fi
     if need_cmd jq && jq -e 'type=="object" and (.files|type)=="number" and (.critical|type)=="number" and (.warning|type)=="number" and (.info|type)=="number"' "$json" >/dev/null 2>&1; then
       jq --arg language "$lang" '. + {language: $language}' "$json" > "$json.tmp" && mv "$json.tmp" "$json"
       attach_metrics_to_json "$json" "$metrics"
@@ -5873,7 +6091,9 @@ legacy_postprocess(){
     module_status=$MODULE_RUN_STATUS
   fi
   apply_inline_suppressions <"$raw" >"$txt" 2>>"$err"
-  restore_original_paths "$txt"
+  if [[ "$is_v2" -eq 0 ]]; then
+    restore_original_paths "$txt"
+  fi
   parse_text_to_json "$lang" "$txt" "$json"
   partial_status_from_text "$txt" "$json"
   attach_metrics_to_json "$json" "$metrics"
@@ -5955,7 +6175,14 @@ run_lang(){
     fi
   fi
   [[ -n "$_combined_skip" ]] && args+=("--skip=$_combined_skip")
-  args+=("$PROJECT_DIR")
+  local lang_proj_dir="$PROJECT_DIR"
+  if is_module_v2 "$lang" "$module"; then
+    if [[ -f "$TMPDIR_RUN/$lang.files" ]]; then
+      args+=("--files-from=$TMPDIR_RUN/$lang.files")
+    fi
+    lang_proj_dir="$SOURCE_PROJECT_DIR"
+  fi
+  args+=("$lang_proj_dir")
 
   case "$fmt" in
     json|jsonl|toon|sarif)

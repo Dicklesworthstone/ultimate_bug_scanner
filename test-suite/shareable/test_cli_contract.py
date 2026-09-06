@@ -348,6 +348,159 @@ def check_file_list_workspace() -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def check_files_from_for_v2_modules() -> None:
+    # Contract-v2 modules take --files-from and run against the source tree directly (bead B4c);
+    # no shadow workspace copy is built when all selected modules are v2.
+    # Unported modules in the same run still get the workspace copy.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-v2-handoff-"))
+    bin_dir = Path(tempfile.mkdtemp(prefix="ubs-v2-bin-"))
+    try:
+        (tmp / "src").mkdir()
+        (tmp / "src" / "index.js").write_text("console.log('hello');\n", encoding="utf-8")
+        (tmp / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+
+        # Fake v2 JS module that advertises "contract: v2" in --help
+        # and on scan reads --files-from and echoes findings for those files.
+        fake_js = bin_dir / "ubs-js"
+        fake_js_content = textwrap.dedent("""\
+            #!/usr/bin/env bash
+            for arg in "$@"; do
+              if [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
+                echo "ubs-js: fake javascript scanner (contract: v2)"
+                exit 0
+              fi
+            done
+            files_from=""
+            report_json=""
+            proj=""
+            format="text"
+            for arg in "$@"; do
+              case "$arg" in
+                --files-from=*) files_from="${arg#*=}" ;;
+                --report-json=*) report_json="${arg#*=}" ;;
+                --format=*) format="${arg#*=}" ;;
+                -*) ;;
+                *) proj="$arg" ;;
+              esac
+            done
+            files=()
+            if [ -n "$files_from" ] && [ -f "$files_from" ]; then
+              while IFS= read -r -d '' f || [ -n "$f" ]; do
+                [ -n "$f" ] && files+=("$f")
+              done < <(tr '\\n' '\\0' < "$files_from"; printf '\\0')
+            fi
+            file_count=${#files[@]}
+            if [ "$format" = "json" ]; then
+              samples="[]"
+              if [ "$file_count" -gt 0 ]; then
+                samples="["
+                first=1
+                for f in "${files[@]}"; do
+                  if [ "$first" -eq 1 ]; then first=0; else samples="$samples,"; fi
+                  samples="$samples{\\"file\\":\\"$f\\",\\"line\\":1,\\"code\\":\\"fake-js-code\\"}"
+                done
+                samples="$samples]"
+              fi
+              echo "{\\"language\\":\\"js\\",\\"project\\":\\"$proj\\",\\"files\\":$file_count,\\"critical\\":$file_count,\\"warning\\":0,\\"info\\":0,\\"findings\\":[{\\"id\\":\\"js.fake.bug\\",\\"title\\":\\"Fake JS Bug\\",\\"severity\\":\\"critical\\",\\"count\\":$file_count,\\"samples\\":$samples}]}"
+            else
+              echo "Files scanned: $file_count"
+              echo "Critical issues: $file_count"
+              echo "Warning issues: 0"
+              echo "Info items: 0"
+            fi
+            if [ -n "$report_json" ]; then
+              : > "$report_json"
+              for f in "${files[@]}"; do
+                echo "{\\"id\\":\\"js.fake.bug\\",\\"file\\":\\"$f\\",\\"line\\":1,\\"severity\\":\\"critical\\",\\"message\\":\\"Fake JS bug\\"}" >> "$report_json"
+              done
+            fi
+            exit 0
+        """)
+        fake_js.write_text(fake_js_content, encoding="utf-8")
+        fake_js.chmod(0o755)
+
+        env = {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}", "UBS_PROFILE": "1"}
+
+        # Case 1: Pure v2 scan (--only=js)
+        # Passes --files-from to v2 module, sets PROJECT_DIR=SOURCE_PROJECT_DIR, creates no workspace.
+        proc1 = run(["--only=js", "--ci", "--format=json", str(tmp)], env=env)
+        ok1 = False
+        detail1 = f"exit={proc1.returncode}"
+        try:
+            doc1 = json.loads(proc1.stdout)
+            prof1 = doc1.get("profile", {})
+            js1 = next(s for s in doc1["scanners"] if s["language"] == "js")
+            samples1 = [s["file"] for f in js1.get("findings", []) for s in f.get("samples", [])]
+            ok1 = (
+                proc1.returncode in (0, 1)
+                and js1["files"] == 1
+                and samples1 == ["src/index.js"]
+                and prof1.get("copy_ms") == 0
+                and "scanning source tree directly" in proc1.stderr
+                and "Created filtered scan workspace" not in proc1.stderr
+                and js1.get("project") == str(tmp)
+            )
+            detail1 += f" samples={samples1} copy_ms={prof1.get('copy_ms')} proj={js1.get('project')}"
+        except Exception as exc:  # noqa: BLE001
+            detail1 += f" ({exc})"
+        report("files_from_for_v2_modules", ok1, detail1, proc1 if not ok1 else None)
+
+        # Case 2: Mixed scan (--only=js,python)
+        # v2 JS module + unported Python module.
+        # Workspace is created for Python, but fake JS module still receives --files-from and source dir.
+        proc2 = run(["--only=js,python", "--ci", "--format=json", str(tmp)], env=env)
+        ok2 = False
+        detail2 = f"exit={proc2.returncode}"
+        try:
+            doc2 = json.loads(proc2.stdout)
+            js2 = next((s for s in doc2["scanners"] if s["language"] == "js"), None)
+            py2 = next((s for s in doc2["scanners"] if s["language"] == "python"), None)
+            samples2 = [s["file"] for f in (js2.get("findings", []) if js2 else []) for s in f.get("samples", [])]
+            ok2 = (
+                proc2.returncode in (0, 1)
+                and js2 is not None
+                and py2 is not None
+                and js2["files"] == 1
+                and samples2 == ["src/index.js"]
+                and js2.get("project") == str(tmp)
+                and "Created filtered scan workspace" in proc2.stderr
+            )
+            detail2 += f" js_samples={samples2} js_proj={js2.get('project') if js2 else 'none'}"
+        except Exception as exc:  # noqa: BLE001
+            detail2 += f" ({exc})"
+        report("files_from_v2_mixed_workspace_for_unported", ok2, detail2, proc2 if not ok2 else None)
+
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(bin_dir, ignore_errors=True)
+
+
+def check_language_aware_size_guard() -> None:
+    # Per-language lists make the size guard language-aware (bead B4c):
+    # A 3 MB Python file in the repository does not trigger a 1 MB size refusal
+    # when scanning only JS (--only=js), but triggers refusal when scanning python.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-size-guard-"))
+    try:
+        (tmp / "src").mkdir()
+        (tmp / "src" / "index.js").write_text("console.log('hi');\n", encoding="utf-8")
+        (tmp / "src" / "big.py").write_text("# big\n" + "x = 1\n" * 500_000, encoding="utf-8")  # ~3 MB
+        env = {"UBS_SKIP_SIZE_CHECK": "0", "UBS_MAX_DIR_SIZE_MB": "1"}
+
+        # --only=js sees only index.js (< 1 MB), so scan succeeds
+        proc_js = run(["--only=js", "--ci", "--format=json", str(tmp)], env=env)
+        ok_js = proc_js.returncode in (0, 1) and "Directory too large" not in proc_js.stderr and "Directory too large" not in proc_js.stdout
+
+        # --only=python sees big.py (> 1 MB), so scan is refused
+        proc_py = run(["--only=python", "--ci", "--format=json", str(tmp)], env=env)
+        ok_py = proc_py.returncode == 2 and ("Directory too large" in proc_py.stderr or "Directory too large" in proc_py.stdout)
+
+        ok = ok_js and ok_py
+        detail = f"js_rc={proc_js.returncode} py_rc={proc_py.returncode}"
+        report("language_aware_size_guard", ok, detail, proc_js if not ok_js else (proc_py if not ok_py else None))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def check_language_scoped_ignores() -> None:
     # bin/obj/env are decided by content (bead B4b): a Go program under bin/
     # and a plain package named env are scanned; a virtualenv named env, a C#
@@ -1225,6 +1378,8 @@ def main() -> int:
         check_python_shim_when_only_python_exists,
         check_doctor_fix_refuses_tampered_toon,
         check_language_scoped_ignores,
+        check_files_from_for_v2_modules,
+        check_language_aware_size_guard,
         test_ubsignore_precedence,
         test_suggest_ignore_lists_large_dirs,
         test_staged_scans_index_only,

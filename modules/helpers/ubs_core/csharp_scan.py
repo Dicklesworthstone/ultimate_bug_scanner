@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -319,9 +320,12 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
     from ubs_core.registry import RunContext, analyzers_for_lang
 
     ctx = RunContext(lang="csharp", files=list(files))
+    skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
         for finding in analyzer.run(ctx):
             rule = _ASYNC_RULE_REMAP.get(str(finding.get("rule", "")), str(finding.get("rule", "")))
+            if skip_narrowing and rule.startswith("csharp.narrowing."):
+                continue  # legacy: UBS_SKIP_TYPE_NARROWING=1 skips the helper
             meta = _rule_meta(rule)
             if meta is None:
                 if not enable_new:

@@ -17,7 +17,9 @@ output so the log alone is enough to diagnose them.
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -102,22 +104,25 @@ class Sandbox:
                 target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
         # Local "raw.githubusercontent.com": both the release tag and main paths.
         for ref in (f"v{ubs_version()}", "main"):
-            dest = self.raw_base / ref / "modules" / "helpers"
-            dest.mkdir(parents=True)
+            mod_raw_dir = self.raw_base / ref / "modules"
+            mod_raw_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(MODULES / "ubs-python.sh", mod_raw_dir / "ubs-python.sh")
+            dest = mod_raw_dir / "helpers"
+            dest.mkdir(parents=True, exist_ok=True)
             for helper in (MODULES / "helpers").iterdir():
                 if helper.is_file():
                     shutil.copy2(helper, dest / helper.name)
-            lib_dest = self.raw_base / ref / "modules" / "lib"
-            lib_dest.mkdir()
+            lib_dest = mod_raw_dir / "lib"
+            lib_dest.mkdir(parents=True, exist_ok=True)
             for lib in (MODULES / "lib").glob("*.sh"):
                 shutil.copy2(lib, lib_dest / lib.name)
-            core_dest = self.raw_base / ref / "modules" / "helpers" / "ubs_core"
+            core_dest = mod_raw_dir / "helpers" / "ubs_core"
             core_dest.mkdir(parents=True, exist_ok=True)
             for core_file in iter_shipped_files(MODULES / "helpers" / "ubs_core"):
                 shutil.copy2(core_file, core_dest / core_file.name)
             if serve_tampered:
                 for rel in tamper_targets:
-                    served = self.raw_base / ref / "modules" / rel
+                    served = mod_raw_dir / rel
                     served.write_text(served.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
 
     def run(self, *extra_env: tuple[str, str]) -> subprocess.CompletedProcess:
@@ -308,6 +313,163 @@ def test_standalone_module_verifies() -> None:
         )
 
 
+def check_tampered_module_refreshed_from_clean_source() -> None:
+    # A corrupted cached module is repaired from the (clean) source and scan proceeds.
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        sb = Sandbox(Path(tmp), tamper=True, serve_tampered=False, tamper_targets=("ubs-python.sh",))
+        proc = sb.run()
+        combined = proc.stdout + proc.stderr
+        ok = proc.returncode in (0, 1) and "failed verification" in combined and "refusing" not in combined
+        report("tampered_module_refreshed_from_clean_source", ok, f"exit={proc.returncode}", proc)
+
+
+def test_tampered_module_refused() -> None:
+    # A corrupted cached module where download is also tampered fails closed (exit 2).
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        proc = Sandbox(Path(tmp), tamper=True, serve_tampered=True, tamper_targets=("ubs-python.sh",)).run()
+        combined = proc.stdout + proc.stderr
+        ok = proc.returncode == 2 and "failed verification" in combined and "failed to ensure module" in combined
+        report("test_tampered_module_refused", ok, f"exit={proc.returncode}", proc)
+
+
+def test_corrupted_ast_grep_zip_refused() -> None:
+    """Corrupted ast-grep zip served from local fixture -> refusal with exit 2."""
+    machine = platform.machine().lower()
+    arch = "x86_64" if machine in ("x86_64", "amd64") else ("aarch64" if machine in ("arm64", "aarch64") else machine)
+    sys_name = platform.system().lower()
+    os_target = "apple-darwin" if sys_name == "darwin" else "unknown-linux-gnu"
+    target = f"{arch}-{os_target}"
+
+    js_fixture = REPO_ROOT / "test-suite" / "js" / "clean" / "security.js"
+
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-astgrep-") as tmp:
+        p = Path(tmp)
+        bin_dir = p / "bin"
+        bin_dir.mkdir()
+        shutil.copy2(UBS, bin_dir / "ubs")
+
+        cache_dir = p / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "helpers").mkdir()
+        (cache_dir / "lib").mkdir()
+        shutil.copy2(MODULES / "ubs-js.sh", cache_dir / "ubs-js.sh")
+        shutil.copy2(MODULES / "lib" / "ubs-common.sh", cache_dir / "lib" / "ubs-common.sh")
+
+        tools_dir = p / "tools"
+        tools_dir.mkdir()
+
+        ast_grep_dir = p / "ast_grep_fixtures"
+        ast_grep_dir.mkdir()
+        (ast_grep_dir / f"app-{target}.zip").write_bytes(b"PK\x03\x04corrupted_ast_grep_zip_payload")
+
+        env = os.environ.copy()
+        env["PATH"] = "/usr/local/bin:/usr/bin:/bin"
+        env["NO_COLOR"] = "1"
+        env["UBS_AST_GREP_BASE_URL"] = f"file://{ast_grep_dir}"
+        env["UBS_TOOLS_DIR"] = str(tools_dir)
+        env["UBS_NO_AUTO_UPDATE"] = "1"
+        env["UBS_ALLOW_UNVERIFIED_HELPERS"] = "1"
+
+        cmd = [str(bin_dir / "ubs"), f"--module-dir={cache_dir}", "--only=js", "--ci", "--format=json", str(js_fixture)]
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode == 2
+            and ("ast-grep checksum mismatch" in combined or "ast-grep-missing" in combined)
+        )
+        report("test_corrupted_ast_grep_zip_refused", ok, f"exit={proc.returncode}", proc)
+
+
+def test_self_update_bad_signature_refused() -> None:
+    """ubs --update against fixture server with bad SHA256SUMS signature -> nonzero and binary untouched."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-update-") as tmp:
+        p = Path(tmp)
+        bin_dir = p / "bin"
+        bin_dir.mkdir()
+        installed_ubs = bin_dir / "ubs"
+        shutil.copy2(UBS, installed_ubs)
+        installed_ubs.chmod(0o755)
+        orig_sha = hashlib.sha256(installed_ubs.read_bytes()).hexdigest()
+
+        release_dir = p / "release"
+        release_dir.mkdir()
+        (release_dir / "SHA256SUMS").write_text("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ubs\n", encoding="utf-8")
+        (release_dir / "SHA256SUMS.minisig").write_text(
+            "untrusted comment: signature\nRWTe1234567890\ntrusted comment: timestamp:1234\ncorrupted\n",
+            encoding="utf-8",
+        )
+        (release_dir / "ubs").write_text("#!/usr/bin/env bash\necho evil\n", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["UBS_RELEASE_BASE"] = f"file://{release_dir}"
+        env["UBS_MINISIGN_PUBKEY"] = "RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ"
+        env["FORCE_SELF_UPDATE"] = "1"
+        env["NO_COLOR"] = "1"
+
+        proc = subprocess.run([str(installed_ubs), "--update"], cwd=p, env=env, capture_output=True, text=True, timeout=60)
+        new_sha = hashlib.sha256(installed_ubs.read_bytes()).hexdigest()
+
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode != 0
+            and "minisign signature verification failed" in combined
+            and orig_sha == new_sha
+        )
+        report(
+            "test_self_update_bad_signature_refused",
+            ok,
+            f"exit={proc.returncode} binary_untouched={orig_sha == new_sha}",
+            proc,
+        )
+
+
+def test_sha256sums_coverage() -> None:
+    """Assert SHA256SUMS exists, covers required release files, and all digests match."""
+    sums_file = REPO_ROOT / "SHA256SUMS"
+    if not sums_file.is_file():
+        report("test_sha256sums_coverage", False, "SHA256SUMS file missing")
+        return
+
+    content = sums_file.read_text(encoding="utf-8").strip()
+    if not content:
+        report("test_sha256sums_coverage", False, "SHA256SUMS is empty")
+        return
+
+    required = {"install.sh", "ubs"}
+    found_entries: dict[str, str] = {}
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            sha, name = parts
+            name = name.strip()
+            found_entries[name] = sha
+
+    missing = required - set(found_entries.keys())
+    if missing:
+        report("test_sha256sums_coverage", False, f"Missing required entries: {missing}")
+        return
+
+    mismatches = []
+    for name, expected_sha in found_entries.items():
+        file_path = REPO_ROOT / name
+        if not file_path.is_file():
+            mismatches.append(f"{name} (file not found)")
+            continue
+        actual_sha = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        if actual_sha != expected_sha:
+            mismatches.append(f"{name} (expected {expected_sha}, got {actual_sha})")
+
+    ok = len(mismatches) == 0
+    report(
+        "test_sha256sums_coverage",
+        ok,
+        f"verified {len(found_entries)} file(s)" if ok else f"mismatches: {mismatches}",
+    )
+
+
 def main() -> int:
     for check in (
         check_healthy_cache_scans,
@@ -321,6 +483,11 @@ def main() -> int:
         check_download_failure_only_warns,
         test_tampered_helper_refused,
         test_standalone_module_verifies,
+        check_tampered_module_refreshed_from_clean_source,
+        test_tampered_module_refused,
+        test_corrupted_ast_grep_zip_refused,
+        test_self_update_bad_signature_refused,
+        test_sha256sums_coverage,
     ):
         try:
             check()

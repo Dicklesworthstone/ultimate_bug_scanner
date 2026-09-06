@@ -950,7 +950,7 @@ HELPERS_READY=0
 
 # Pinned ast-grep release for tool-cache auto-provisioning (JS/TS accuracy).
 AST_GREP_VERSION="0.45.3"
-AST_GREP_BASE_URL="https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}"
+AST_GREP_BASE_URL="${UBS_AST_GREP_BASE_URL:-https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}}"
 TOOLS_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/tools"
 TOOLS_DIR="${UBS_TOOLS_DIR:-$TOOLS_DIR_DEFAULT}"
 
@@ -4694,10 +4694,14 @@ self_update_fail(){
 
 self_update_fetch(){
   # $1 = url, $2 = output file
+  local proto="=https"
+  if [[ -n "${UBS_RELEASE_BASE:-}" ]]; then
+    proto="=https,http,file"
+  fi
   if need_cmd curl; then
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 2 --retry-delay 1 -o "$2" "$1" 2>/dev/null
+    curl -fsSL --proto "$proto" --retry 2 --retry-delay 1 -o "$2" "$1" 2>/dev/null
   elif need_cmd wget; then
-    wget --https-only -q -O "$2" "$1" 2>/dev/null
+    wget -q -O "$2" "$1" 2>/dev/null
   else
     return 1
   fi

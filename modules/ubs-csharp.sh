@@ -60,6 +60,7 @@ EXCLUDE_GLOBS=""
 
 SUMMARY_JSON=""
 EMIT_FINDINGS_JSON=""
+REPORT_JSON=""
 DUMP_RULES_DIR=""
 EXTRA_AST_RULES_DIRS=""
 LIST_RULES=0
@@ -1137,6 +1138,7 @@ parse_args() {
 
       --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
       --emit-findings-json=*) EMIT_FINDINGS_JSON="${1#*=}"; shift;;
+      --report-json=*) REPORT_JSON="${1#*=}"; shift;;
 
       --) shift; break;;
       -*)
@@ -3542,6 +3544,279 @@ search '\b(for|foreach|while)\b.*\.(Select|Where|OrderBy|GroupBy)\s*\(' "$tmp"
   fi
 }
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Contract-v2 path (bead 0xjg.12): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.csharp_scan), NDJSON findings sink (K2 schema).
+#    Opt-in: UBS_CONTRACT_V2_CSHARP=1 enables it; UBS_LEGACY_MODULE_CSHARP=1
+#    always wins; sarif and ACTIVE dotnet runs stay on the legacy path.
+# ── Legacy-parity bridge: record-less headers + summary json + exit code ────
+# The v2 renderer prints record-backed sections only, while the legacy module
+# announces every enabled category and prints static dotnet/helper notes even
+# when nothing was found. The remainder is appended in legacy category order
+# (text), the summary document is emitted (json mode / --summary-json), and
+# the legacy exit formula is applied over the sink recount.
+run_v2_legacy_parity_bridges_csharp(){
+  local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}" ast_ran="${6:-0}"
+  local files_n bridge_rc=0
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$text_out" "$files_n" "$scan_exit" "$skip_csv" \
+    "${FAIL_ON_WARNING:-0}" "${FAIL_CRITICAL_N:-}" "${FAIL_WARNING_N:-}" \
+    "$CI_MODE" "$FORMAT" "${SUMMARY_JSON:-}" \
+    "${HAS_RG:-0}" "${HAS_AST_GREP:-0}" "${HAS_DOTNET:-0}" "${STRICT_GITIGNORE:-0}" \
+    "$VERSION" "$NO_DOTNET" "$NO_DOTNET_FORMAT" \
+    "${ast_ran:-0}" <<'PYV2BRIDGE' || bridge_rc=$?
+import datetime
+import json
+import os
+import sys
+
+(sink_path, text_out, files_raw, scan_exit_raw, skip_csv, fow_raw, fcrit_raw,
+ fwarn_raw, ci_raw, fmt, summary_json, has_rg, has_ast, has_dotnet,
+ strict_gi, version, no_dotnet, no_dotnet_format, ast_ran) = sys.argv[1:20]
+files_n = int(files_raw or 0)
+scan_exit = int(scan_exit_raw or 0)
+fail_on_warning = fow_raw == "1"
+fail_crit = int(fcrit_raw) if fcrit_raw.strip().lstrip("-").isdigit() and int(fcrit_raw) >= 0 else -1
+fail_warn = int(fwarn_raw) if fwarn_raw.strip().lstrip("-").isdigit() and int(fwarn_raw) >= 0 else -1
+ci = ci_raw == "1"
+as_text = bool(text_out)
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+ast_ran = ast_ran == "1"
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except (OSError, ValueError):
+    records = []
+
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+exit_code = 1 if counts["critical"] > 0 else (scan_exit if scan_exit in (0, 1) else scan_exit)
+if fail_crit >= 0 and counts["critical"] >= fail_crit:
+    exit_code = 1
+if fail_warn >= 0 and counts["warning"] >= fail_warn:
+    exit_code = 1
+elif fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+
+# Helper statuses (legacy emit_summary_json "helpers" block), derived from
+# the sink: the A2 analyzers always ran in-process when we got here.
+def has_rule(prefix):
+    return any(str(rec.get("rule", "")).startswith(prefix) for rec in records)
+
+if os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1":
+    type_narrowing = "skipped"
+else:
+    type_narrowing = "used" if has_rule("csharp.narrowing.") else "clean"
+resource_lifecycle = "used" if has_rule("csharp.lifecycle.") else "clean"
+async_handles = "used" if has_rule("csharp.async.unobserved_task_handle") else "clean"
+
+# Summary document: legacy emit_summary_json shape + v2 sink records.
+doc = {
+    "project": os.environ.get("UBS_V2_PROJECT", ""),
+    "files": files_n,
+    "critical": counts["critical"],
+    "warning": counts["warning"],
+    "info": counts["info"],
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "format": fmt,
+    "tool": "ubs-csharp",
+    "version": version,
+    "tooling": {"rg": int(has_rg or 0), "ast_grep": int(has_ast or 0),
+                "dotnet": int(has_dotnet or 0), "python3": 1},
+    "helpers": {"type_narrowing": type_narrowing,
+                "resource_lifecycle": resource_lifecycle,
+                "async_task_handles": async_handles},
+    "exit_code": exit_code,
+    "findings": records,
+}
+if summary_json:
+    try:
+        with open(summary_json, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.write("\n")
+    except OSError:
+        pass
+
+out = []
+
+def emit(line=""):
+    out.append(line)
+
+# Record-less section headers + static notes (text format only).
+if as_text:
+    SECTION = {1: "[1] Exceptions & Nullability Hazards",
+               2: "[2] Resources & IDisposable Footguns",
+               3: "[3] Concurrency & Async Pitfalls",
+               4: "[4] Numeric & Floating-Point Traps",
+               5: "[5] Collections & LINQ Gotchas",
+               6: "[6] Strings & Allocation Smells",
+               7: "[7] Filesystem / Process / IO Risks",
+               8: "[8] Security Red Flags",
+               9: "[9] Code Quality Markers",
+               10: "[10] API Misuse & Correctness",
+               11: "[11] Tests / Debug Leftovers",
+               12: "[12] Formatting & Analyzer Signals",
+               13: "[13] Build & Test Health",
+               14: "[14] Dependency Hygiene (NuGet)",
+               15: "[15] Exception Handling Anti-patterns",
+               16: "[16] ASP.NET / Web Pitfalls",
+               17: "[17] AST-Grep Rule Pack",
+               18: "[18] Project Inventory",
+               19: "[19] Resource Lifecycle Correlation",
+               20: "[20] Async Locks / Semaphores / Await-in-Lock",
+               21: "[21] Exception Surfaces & Rethrow Issues",
+               22: "[22] Suspicious Casts & Truncation",
+               23: "[23] Parsing & Validation Robustness",
+               24: "[24] Perf / DoS Hotspots"}
+    SLUG = {1: "exceptions-null", 2: "resources", 3: "concurrency", 4: "numeric",
+            5: "collections", 6: "strings", 7: "filesystem", 8: "security",
+            9: "code-quality", 10: "api-misuse", 11: "debug", 12: "formatting",
+            13: "build", 14: "dependencies", 15: "exceptions", 16: "aspnet",
+            17: "ast-grep", 18: "inventory", 19: "resource-lifecycle",
+            20: "async-locks", 21: "rethrow", 22: "casts", 23: "parsing", 24: "perf"}
+    ok_icon = "[OK]" if ci else "✅"
+    covered = {str(rec.get("category_id", "")) for rec in records}
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        slug = SLUG.get(num)
+        if slug is not None and f"csharp.{slug}" in covered:
+            continue  # the renderer already announced this section
+        if num == 17 and ast_ran:
+            continue  # renderer's clean-note block owns the cat-17 section
+        emit(SECTION[num])
+        if num == 12:
+            if no_dotnet == "1" or no_dotnet_format == "1":
+                emit("dotnet format skipped (--no-dotnet/--no-format).")
+            elif has_dotnet != "1":
+                emit("dotnet not found.")
+        elif num == 13:
+            emit("dotnet build/test skipped (--no-dotnet or dotnet missing).")
+        elif num == 14:
+            emit("dotnet list package skipped (--no-dotnet/--no-deps or dotnet missing).")
+        elif num == 17 and not ast_ran:
+            emit("ast-grep not available (install ast-grep, or ensure 'sg' is ast-grep).")
+        elif num == 20 and ast_ran:
+            emit("Exact await-in-lock detection handled by ast-grep; skipping file-level lock/await heuristic.")
+        if num == 1 and type_narrowing == "clean":
+            emit(f"{ok_icon} No obvious null/type narrowing fallthrough bugs detected.")
+        elif num == 3 and async_handles == "clean":
+            emit(f"{ok_icon} No unobserved Task.Run/StartNew handles detected.")
+        elif num == 19 and resource_lifecycle == "clean":
+            emit(f"{ok_icon} No obvious disposable/resource leaks detected by helper.")
+    emit("")
+    emit("Summary Statistics:")
+    emit(f"  Files scanned: {files_n}")
+    emit(f"  Critical issues: {counts['critical']}")
+    emit(f"  Warning issues: {counts['warning']}")
+    emit(f"  Info items: {counts['info']}")
+    emit(f"  Exit code    : {exit_code}")
+    if has_ast == "1":
+        emit("Tip: run with --format=sarif to generate SARIF from ast-grep rules.")
+
+if as_text:
+    try:
+        with open(text_out, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError:
+        pass
+elif fmt == "json":
+    json.dump(doc, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+# ── Contract-v2 scan: ONE list, ONE orchestrator, optional ast-grep pack ────
+run_contract_v2_csharp(){
+  local list_file sink helpers_dir exit_code=0 text_out="" ast_rule_dir=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-csv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-csv2-sink.XXXXXX)"
+  helpers_dir="$SCRIPT_DIR/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" \
+      --exclude "$EXCLUDE_DIRS${EXTRA_EXCLUDE_DIRS:+,$EXTRA_EXCLUDE_DIRS}" >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  filter_file_list_with_globs "$list_file"   # legacy --exclude glob filter
+  # --only whitelist -> v2 skip mapping: skip every category NOT whitelisted.
+  local v2_skip="$SKIP_CATEGORIES"
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    local keep="" c allowed w
+    local -a _wl
+    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
+    for c in $(seq 1 24); do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  # Consolidated ast-grep layer: the 4-rule pack into ONE sgconfig (one
+  # `scan -c` per 400-path batch inside ubs_core.csharp_ast).
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-csv2-rules.XXXXXX)"
+    if ! UBS_CONTRACT_V2_CSHARP_AST_DIR="$ast_rule_dir" UBS_CONTRACT_V2_CSHARP_USER_RULES="$EXTRA_AST_RULES_DIRS" \
+      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+import os
+from pathlib import Path
+from ubs_core.csharp_rules import generate
+user = os.environ.get("UBS_CONTRACT_V2_CSHARP_USER_RULES", "")
+generate(Path(os.environ["UBS_CONTRACT_V2_CSHARP_AST_DIR"]), Path(user) if user else None)
+' 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+    if [[ -n "$ast_rule_dir" && -n "$DUMP_RULES_DIR" ]]; then
+      mkdir -p "$DUMP_RULES_DIR"
+      cp "$ast_rule_dir"/rules/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+    fi
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR" \
+    --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" --version "$VERSION" --detail-limit "$DETAIL_LIMIT")
+  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  [[ "$CI_MODE" -eq 1 ]] && scan_args+=(--ci)
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  [[ -n "${FAIL_CRITICAL_N:-}" ]] && scan_args+=(--fail-critical "$FAIL_CRITICAL_N")
+  [[ -n "${FAIL_WARNING_N:-}" ]] && scan_args+=(--fail-warning "$FAIL_WARNING_N")
+  if [[ "$FORMAT" == "text" ]]; then
+    # The report goes to a real file, not /dev/stdout: appending the
+    # record-less bridge text below would re-truncate a regular-file capture.
+    text_out="$(mktemp 2>/dev/null || mktemp -t ubs-csv2-text.XXXXXX)"
+    scan_args+=(--text-out "$text_out")
+  fi
+  local v2_ast_ran=0
+  [[ -n "$ast_rule_dir" ]] && v2_ast_ran=1
+  UBS_V2_PROJECT="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" \
+    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m ubs_core.csharp_scan "${scan_args[@]}" || exit_code=$?
+  run_v2_legacy_parity_bridges_csharp "$sink" "$list_file" "$exit_code" "$text_out" \
+    "$v2_skip" "$v2_ast_ran" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  if [[ -n "$EMIT_FINDINGS_JSON" ]]; then
+    cp "$sink" "$EMIT_FINDINGS_JSON" 2>/dev/null || true   # K2: NDJSON records (shape-keyed downstream)
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+
 # ---------- main ----------
 main() {
   parse_args "$@"
@@ -3561,6 +3836,32 @@ main() {
     list_generated_ast_rule_ids "$AST_RULES_DIR"
     exit 0
   fi
+
+  # ═══ Contract-v2 gate (bead 0xjg.12) ═══
+  # Env-error parity: without python3 the v2 path cannot run any detection
+  # layer — fall through so the legacy path produces its exact env-error
+  # behavior. ACTIVE dotnet runs (build/test/format/deps possible) also stay
+  # legacy; --no-dotnet / dotnet-less environments take the v2 path.
+  if [[ "${UBS_CONTRACT_V2_CSHARP:-0}" == "1" && "${UBS_LEGACY_MODULE_CSHARP:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+    local v2_dotnet_active=0
+    if [[ "$NO_DOTNET" -eq 0 && "$HAS_DOTNET" -eq 1 ]]; then
+      if [[ "$NO_DOTNET_BUILD" -eq 0 || "$NO_DOTNET_TEST" -eq 0 || "$NO_DOTNET_FORMAT" -eq 0 || "$NO_DOTNET_DEPS" -eq 0 ]]; then
+        v2_dotnet_active=1
+      fi
+    fi
+    if command -v python3 >/dev/null 2>&1 && [[ "$v2_dotnet_active" -eq 0 ]]; then
+      if [[ "$FORMAT" == "text" ]]; then
+        banner
+        echo "${DIM}Project: $PROJECT_DIR${RESET}"
+        note "Tools: rg=$HAS_RG ast-grep=$HAS_AST_GREP dotnet=$HAS_DOTNET python3=$HAS_PYTHON"
+        [[ "$STRICT_GITIGNORE" -eq 1 ]] && note "Strict .gitignore: ON" || note "Strict .gitignore: OFF (scanning beyond .gitignore)"
+      fi
+      local v2_status=0
+      run_contract_v2_csharp || v2_status=$?
+      exit "$v2_status"
+    fi
+  fi
+
 
   banner
 

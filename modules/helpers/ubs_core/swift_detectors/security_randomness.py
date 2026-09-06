@@ -83,7 +83,7 @@ RNG_ASSIGN_RE = re.compile(
 
 
 def strip_line_comments(line: str) -> str:
-    """The randomness heredoc's stripper: quotes kept, only `//` cut."""
+    """The randomness heredoc's stripper: string content kept, only `//` cut."""
     out = []
     quote = ''
     escape = False
@@ -91,6 +91,7 @@ def strip_line_comments(line: str) -> str:
     while i < len(line):
         ch = line[i]
         if quote:
+            out.append(ch)
             if escape:
                 escape = False
             elif ch == '\\':

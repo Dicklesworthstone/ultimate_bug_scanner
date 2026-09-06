@@ -128,6 +128,14 @@ _CATEGORY_DETECTED = {
     23: ("Detects: user-facing strings without NSLocalizedString, locale-sensitive formatting risks",
          "Localize strings and use locale-aware formatters."),
 }
+_CORRELATION_PREFIX = "ubs.correlation.urlsession."
+AST_PACK_RULE = "swift.urlsession.task-no-resume"
+
+
+def slug_for_category(category: int) -> str:
+    return _CATEGORY_SLUGS.get(category, f"cat{category}")
+
+
 @dataclass(frozen=True)
 class CheckSpec:
     """Static render metadata for one legacy check, in print order."""
@@ -317,6 +325,9 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                 cregex = re.compile(component, re.IGNORECASE)
                 for path in files:
                     for entry in file_match_entries(cregex, path, ctx.text_of(path)):
+                        # count_lines drops rg output lines carrying a marker
+                        if MARKER in entry[2] or MARKER in entry[3]:
+                            continue
                         hits.append(entry)
         else:
             for path in files:
@@ -326,6 +337,9 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                 else:
                     for entry in file_hits:
                         line_text = entry[3]
+                        # count_lines drops rg output lines carrying a marker
+                        if MARKER in entry[2] or MARKER in line_text:
+                            continue
                         if include is not None and not include.search(line_text):
                             continue
                         if exclude is not None and exclude.search(line_text):
@@ -556,7 +570,7 @@ CHECK_SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(1, "swift.optionals.force-heavy", "Force unwrap (!) occurrences", samples=True, order=10),
     CheckSpec(1, "swift.optionals.force-some", None,
               good="No obvious force unwraps detected by heuristic",
-              good_suppressed_by=("swift.optionals.force-heavy",), samples=True, order=11),
+              good_suppressed_by=("swift.optionals.force-heavy",), order=11),
     CheckSpec(1, "swift.optionals.try-bang", "try! and as! occurrences",
               good="No try!", samples=True, order=20),
     CheckSpec(1, "swift.optionals.as-bang", None, good="No as!", samples=True, order=21),
@@ -575,8 +589,10 @@ CHECK_SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(2, "swift.concurrency.async-rules", "Async concurrency coverage (ast-grep)", order=40),
     # 3. CLOSURES / CAPTURE LISTS
     CheckSpec(3, "swift.closures.strong-self", "Long-lived closures without [weak self] (heuristic)",
+              # legacy: the rg pattern in this pipeline has an unmatched ")" and
+              # never compiles, so the check ALWAYS reports the good note
               good="No obvious long-lived closure sites lacking [weak self] by heuristic",
-              samples=True, order=10),
+              order=10),
     CheckSpec(3, "swift.closures.unowned-self", "[unowned self] captures",
               good="No [unowned self] captures detected",
               desc="Unowned capture can crash if self deallocates; prefer weak + guard",
@@ -608,10 +624,10 @@ CHECK_SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(6, "swift.security.archive-extraction", "Archive extraction path traversal",
               good="No unvalidated archive extraction path construction detected",
               desc="Expand/canonicalize archive entry destinations and reject paths outside the extraction root.", order=40),
-    CheckSpec(6, "swift.taint.path-traversal", "Request-derived filesystem paths",
+    CheckSpec(6, "swift.taint.request_path_traversal", "Request-derived filesystem paths",
               good="No request-derived file path sinks detected",
               desc="Reduce request/query/url/upload filenames to a basename or canonicalize and prove the final URL stays under the allowed root.", order=50),
-    CheckSpec(6, "swift.taint.open-redirect", "Request-derived open redirects",
+    CheckSpec(6, "swift.taint.request_open_redirect", "Request-derived open redirects",
               good="No request-derived redirect sinks detected",
               desc="Validate redirect targets as local URLs or parse and allow-list their scheme and host before redirects or Location headers.", order=60),
     CheckSpec(6, "swift.taint.header-injection", "Request-derived response headers",
@@ -729,9 +745,9 @@ CHECK_SPECS: tuple[CheckSpec, ...] = (
     CheckSpec(23, "swift.l10n.string-format", "String(format:) without explicit locale (heuristic)",
               good="No String(format:) without locale found", order=20),
 )
+_BAR = "━" * 64
 
 _SPEC_BY_RULE = {spec.rule_id: spec for spec in CHECK_SPECS}
-_BAR = "━" * 71
 _LIFECYCLE_SUMMARY = {
     "timer": "Timer scheduled but never invalidated",
     "urlsession_task": "URLSession task created but not resumed/cancelled",
@@ -836,7 +852,6 @@ class _Renderer:
             if rec.get("path") and int(rec.get("line", 0) or 0) > 0
         ][:limit]
 
-    # ── the report ──
     def render(self, skip: set[int]) -> None:
         for cat in range(1, 24):
             if cat in skip:
@@ -844,11 +859,18 @@ class _Renderer:
             self.header(_SECTION_HEADERS[cat])
             self.category(cat)
             for spec in sorted([s for s in CHECK_SPECS if s.category == cat], key=lambda s: s.order):
+                if spec.subheader:
+                    self.subheader(spec.subheader)
                 self.render_spec(spec)
         self.render_ast_section()
 
     def render_spec(self, spec: CheckSpec) -> None:
         if spec.rule_id == "swift.networking.correlation":
+            # degradation/good records land under the check's own rule id;
+            # per-finding buckets use the legacy ubs.correlation.* ids
+            for rec in self.buckets.get("swift.networking.correlation", []):
+                self.finding(str(rec.get("severity", "info")), int(rec.get("count", 0) or 0),
+                             str(rec.get("title") or rec.get("message", "")), rec.get("description"))
             correlation = [r for r in self.buckets if r.startswith(_CORRELATION_PREFIX)]
             if correlation:
                 for rule in correlation:
@@ -856,20 +878,7 @@ class _Renderer:
                         self.finding(str(rec.get("severity", "info")), int(rec.get("count", 1) or 0),
                                      str(rec.get("title") or rule), rec.get("description"))
                         self.embedded_samples([rec], limit=3)
-            elif spec.good:
-                self.finding("good", 0, spec.good, None)
-            return
-        if spec.rule_id == "swift.lifecycle":
-            recs = [rec for rule, bucket in self.buckets.items()
-                    if rule.startswith("swift.lifecycle.") for rec in bucket]
-            if recs:
-                for rec in recs:
-                    kind = str(rec.get("rule", "")).rsplit(".", 1)[-1]
-                    title = _LIFECYCLE_SUMMARY.get(kind, "Resource imbalance")
-                    self.finding(str(rec.get("severity", "warning")), 1,
-                                 f"{title} [{rec.get('path', '')}:{rec.get('line', 0)}]",
-                                 str(rec.get("message", "")))
-            elif spec.good:
+            elif not self.buckets.get("swift.networking.correlation") and spec.good:
                 self.finding("good", 0, spec.good, None)
             return
         if spec.rule_id == "swift.narrowing":
@@ -880,10 +889,10 @@ class _Renderer:
             if findings:
                 count = sum(int(r.get("count", 1) or 0) for r in findings)
                 previews = [
-                    f"{r.get('path', '')}:{r.get('line', 0)} → {r.get('message', '')}"
+                    f"{r.get('path', '')}:{r.get('line', 0)}:{r.get('col', 1)} → {r.get('message', '')}"
                     for r in findings[:3]
                 ]
-                desc = f"Examples: {'; '.join(previews)}"
+                desc = f"Examples: {' '.join(previews)}"
                 if count > len(previews):
                     desc += f" (and {count - len(previews)} more)"
                 self.finding(str(findings[0].get("severity", "warning")), count,
@@ -1007,6 +1016,19 @@ def main(argv: list[str] | None = None) -> int:
             # legacy shared AG_STREAM_FILE
             scan_all(Path(args.ast_rule_dir), files, ctx, sink, skip=skip,
                      detail_limit=args.detail_limit)
+        if args.ast_available and not ctx.ast_stream_ok:
+            # legacy run_async_error_checks degradation (ast-grep present but
+            # the consolidated stream produced no output)
+            _write_record(sink, {
+                "rule": "swift.concurrency.async-rules",
+                "category": 2,
+                "severity": "info",
+                "count": 0,
+                "title": "ast-grep stream unavailable",
+                "message": "ast-grep stream unavailable",
+                "description": "Concurrency summary requires ast-grep JSON stream output",
+                "degraded": True,
+            }, skip)
         run_detectors(ctx, sink, skip)   # correlation consumes ctx.ast_records
         run_derived(ctx, sink, skip)     # process residual reads shell detector
         run_analyzers(ctx, sink, skip, enable_new=args.enable_new_analyzers)

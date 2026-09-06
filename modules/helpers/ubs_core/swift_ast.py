@@ -132,8 +132,9 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
         meta = (manifest.get(rid) or {})
         category = int(meta.get("category", 0) or 0)
 
-        if skip is not None and category in (skip or set()):
-            continue
+        # legacy parity: the AST RULE PACK FINDINGS section is NOT gated by
+        # --skip (it sits outside categories 1..23); only marker suppression
+        # applies
         if _has_marker(Path(file_str), line_no, cache):
             continue
 

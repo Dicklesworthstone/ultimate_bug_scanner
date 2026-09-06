@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ubs_core.swift_detectors._common import (
     SKIP_DIRS, has_ignore, iter_swift_files, logical_statement, rel,
-    source_line,
+    source_line, strip_line_comments,
 )
 
 RULE_ID = "swift.taint.outbound-url"

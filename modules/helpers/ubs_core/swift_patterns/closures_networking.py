@@ -8,18 +8,11 @@ from __future__ import annotations
 
 from ubs_core.swift_scan import Pattern
 
-STRONG_SELF_TRIGGER = (
-    r"(URLSession\.|DispatchQueue\.(global|main)|Timer\.scheduledTimer|"
-    r"NotificationCenter\.default\.addObserver|UIView\.animate|"
-    r"NSAnimationContext\.runAnimationGroup|\.sink\(|\.onReceive\()"
-)
-
 PATTERNS = [
-    # 3. CLOSURES / CAPTURE LISTS
-    Pattern(3, "swift.closures.strong-self", "Potential strong self captures in long-lived closures",
-            STRONG_SELF_TRIGGER, ((0, "warning"),),
-            window=3, after_regex=r"\{\s*(\[[^\]]*\])?",
-            exclude_regex=r"\[weak self\]", show_samples=True),
+    # 3. CLOSURES / CAPTURE LISTS — the strong-self pipeline pattern is kept
+    # only as documentation: its legacy rg regex has an unmatched ")" (ubs
+    # GREP_RN -e "(...\.onReceive\\()))") and never compiles, so the check is
+    # always the good note. No Pattern is emitted for it.
     Pattern(3, "swift.closures.unowned-self", "[unowned self] in closures",
             r"\[[^\]]*unowned\s+self[^\]]*\]", ((0, "warning"),), show_samples=True),
     # 4. URLSESSION / NETWORKING

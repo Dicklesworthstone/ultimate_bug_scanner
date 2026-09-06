@@ -52,6 +52,22 @@ def scan(ctx):
         # legacy: print_finding info 0 "Correlation skipped" "ast-grep unavailable"
         yield dict(DEGRADED_AST)
         return
+
+    project_dir = str(ctx.project_dir)
+
+    # legacy rg precheck (no marker filter) runs BEFORE the ast index build
+    if not any(TASK_CALL_RE.search(ctx.text_of(p)) for p in ctx.files):
+        yield {
+            "rule": "swift.networking.correlation",
+            "category": 4,
+            "severity": "good",
+            "count": 0,
+            "title": "No URLSession tasks to correlate",
+            "message": "No URLSession tasks to correlate",
+            "degraded": True,
+        }
+        return
+
     if not getattr(ctx, "ast_stream_ok", False):
         # legacy: empty consolidated stream -> "Could not build ast-grep
         # per-file index" (the AG_STREAM_READY gate)
@@ -63,21 +79,6 @@ def scan(ctx):
             "title": "Correlation skipped",
             "message": "Could not build ast-grep per-file index",
             "description": "Could not build ast-grep per-file index",
-            "degraded": True,
-        }
-        return
-
-    project_dir = str(ctx.project_dir)
-
-    # legacy rg precheck (no marker filter): any dataTask-ish match proceeds
-    if not any(TASK_CALL_RE.search(ctx.text_of(p)) for p in ctx.files):
-        yield {
-            "rule": "swift.networking.correlation",
-            "category": 4,
-            "severity": "good",
-            "count": 0,
-            "title": "No URLSession tasks to correlate",
-            "message": "No URLSession tasks to correlate",
             "degraded": True,
         }
         return

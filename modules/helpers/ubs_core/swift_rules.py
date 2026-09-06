@@ -82,13 +82,17 @@ def _first_match(pattern: re.Pattern[str], text: str) -> str:
 
 def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict:
     """Write the ast-grep rule pack, the sgconfig, and the manifest."""
-    rule_dir.mkdir(parents=True, exist_ok=True)
+    # The sgconfig lives at the pack root and points at ./rules: ast-grep
+    # treats every file under ruleDirs as a rule, so a config inside its own
+    # ruleDir would fail to parse itself (empty AG stream).
+    rules_dir = rule_dir / "rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
     if user_rules_dir and Path(user_rules_dir).is_dir():
-        shutil.copytree(user_rules_dir, rule_dir, dirs_exist_ok=True)
+        shutil.copytree(user_rules_dir, rules_dir, dirs_exist_ok=True)
 
     manifest: dict[str, dict] = {}
     for filename, body in _RULES:
-        (rule_dir / filename).write_text(body, encoding="utf-8")
+        (rules_dir / filename).write_text(body, encoding="utf-8")
         rid = _first_match(_ID_RE, body)
         if not rid:
             continue
@@ -97,20 +101,18 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict:
         cat_match = re.match(r"^c(\d{2})-", filename)
         category = int(cat_match.group(1)) if cat_match else 0
         manifest[rid] = {
-            "file": filename,
+            "file": f"rules/{filename}",
             "language": grammar,
             "severity": severity,
             "category": category,
         }
 
     config = rule_dir / "sgconfig-swift.yml"
-    config.write_text("ruleDirs:\n- .\n", encoding="utf-8")
+    config.write_text("ruleDirs:\n- rules\n", encoding="utf-8")
     (rule_dir / "manifest.json").write_text(
         json_dumps(manifest), encoding="utf-8"
     )
     return manifest
-
-
 def json_dumps(obj: dict) -> str:
     import json
 

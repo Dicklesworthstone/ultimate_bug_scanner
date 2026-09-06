@@ -27,7 +27,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040"
+UBS_LIB_CHECKSUM="6e36e0b34011b35927eebb206ace0e186b31c7e6338cb9f9cd1dbf59d82fc769"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -3771,6 +3771,8 @@ PYV2BRIDGE
 # ── Contract-v2 scan: ONE list, ONE orchestrator, optional ast-grep pack ────
 run_contract_v2_csharp(){
   local list_file sink exit_code=0 text_out="" ast_rule_dir=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-csharpv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-csharpv2-sink.XXXXXX)"
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then

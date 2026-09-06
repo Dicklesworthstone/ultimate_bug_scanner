@@ -49,16 +49,16 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='08330b7ee067ff571e0aa9ddeb25dfd91bc96631462003da3cc6efa09943b51c'
-  [csharp]='24bc10c2062f0ae5cd43440c2f50d3b94744456537aafdf5371eeda222d7d0e4'
-  [elixir]='9373438547a1a46a825bd3c0ccaa87abb58207c82ce6de56c490165b9872e776'
-  [golang]='5fffaefb0d0c5f65813d361bca2f11d8159f305cd19a32e91a0090f51f2aa11e'
-  [java]='542e56492d78f9c594a37a77357be0dad01db82ee6eee3279b324abcaa11963d'
-  [js]='bf341af8774407aebb2c579625bb54aac2e4d49282dc3f569e0fba10fb463f9f'
-  [python]='5ff30c29dc00d2d272697aa299582a773887160a328deea44635d8fe0b2a46b5'
-  [ruby]='677e1a18838225e7d0fcf528dfc1050993c2656bb237ea2b65da4f7a48268ea6'
-  [rust]='87eb3050eac1a70f293ffe0807caf885f5372acfe679fccbf438dc317365c017'
-  [swift]='63e7a6f33604f0a126b684553025d15bcb3ad64217e74d12c244486272d61834'
+  [cpp]='d563e187fdddfe6654ed411bd9e38524acb827af6160468603899fdc004a5f16'
+  [csharp]='f515884ec29b41d48ad56f4aea78e063097f0d54ff2934cfef4ae04629a0ca42'
+  [elixir]='aaddb98003ee456fef335e553d0b1636e4a3154c6910e10074f03701b51b7421'
+  [golang]='76ffaeffdf7381dbfadaeb758d080e502944c7f8f03809c4166592ca3d3e90c8'
+  [java]='527d487e9411f08ac42bcd4d41820f5f768cdb68aacacaceac89a90141c3f773'
+  [js]='a6372023d118385d181c83adbb7b71a9a228e7205a71ba3eebe4ba28d4ad45b7'
+  [python]='b3f3a58d5816a0a7bc8a769cfcadd8a73734cd23cc5400e30d644ec88aa03f0d'
+  [ruby]='5535fe6a94d79347e22c3c2327ed2508749b4ea9d222d5e3a997de95844968b4'
+  [rust]='9b7ffef10a40f750b336bce7ff0a3e43eef7a3970aa93c6af53fa59d11fbce00'
+  [swift]='6ebee17ae2277abc84164ae01a94a8a4c352c8557f0e5ba63721501f70a5a611'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -164,7 +164,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='467563f6db08bc1045679d2c406e9eab3f824c7770cbf83c2756f4135b08b45d'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
-  ['helpers/ubs_core/cli.py']='401d3d7c9b2fa99f4a005135641ae7a0bfb706c50dff6f5d08a243afb553046c'
+  ['helpers/ubs_core/cli.py']='e0ae9ca9121ef035f69d2b9490919c39d8c855c1d1df98a4af25ad598fa109c1'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='60f203857d374aa48f68180d829894d9561bad3b7535f72c22246ebc297ad86e'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='ba135d496604b1822a30b8e2942b5a3700884c4d2d11409b9c4bddf1763f1d13'
@@ -220,7 +220,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_patterns/phoenix.py']='533afcfc1a90e24ad2ce002a76d2433ef2203f7034de9047a84c7a67eb0f36a4'
   ['helpers/ubs_core/elixir_patterns/security_rg.py']='551c5357954168766253ec46bf2095b7497d500c01d2a71fbbb77849461c51c9'
   ['helpers/ubs_core/elixir_scan.py']='6ced28905245e7cd5c7e88ea8cad373cf7aad7d143f3f93e61871f7403824c33'
-  ['helpers/ubs_core/findings_merge.py']='fa659eee6ad7573a8e0521c4f2665c6c20d13efd28eb1a7010e43acb70f19f46'
+  ['helpers/ubs_core/findings_merge.py']='da2b342c518d640177ed30eab940bedd8fe7ce59ebd8dad20caa05b3f1bd5bd1'
   ['helpers/ubs_core/go_ast.py']='8742075b0f2f9e10ec0fe37a1641075eaf3480e3f30b7060a306bdff77b84d89'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -397,7 +397,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='ae19424f3b25d31ea71fff1f1fd6f3f8f65c05ef046f7ac85dcde9c17937dbd3'
   ['helpers/ubs_core/swift_scan.py']='006def40ab25a5addb8d97a85fc269db735bbe47eecdae8b5850b6fc9fc9fa5b'
-  ['lib/ubs-common.sh']='64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040'
+  ['lib/ubs-common.sh']='6e36e0b34011b35927eebb206ace0e186b31c7e6338cb9f9cd1dbf59d82fc769'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1218,6 +1218,8 @@ FORCE_SELF_UPDATE="${FORCE_SELF_UPDATE:-0}"
 [[ "$FORCE_SELF_UPDATE" =~ ^[0-9]+$ ]] || FORCE_SELF_UPDATE=0
 CATEGORY_FILTER=""
 COMPARISON_FILE=""
+SAVE_BASELINE_FILE=""
+NEW_ONLY=0
 REPORT_JSON_PATH=""
 HTML_REPORT_PATH=""
 SHAREABLE_MODE=0
@@ -1309,6 +1311,9 @@ Options:
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
   --category=CSV          Focus on category packs (e.g., resource-lifecycle for AST lifecycle analyzers)
   --profile=NAME          Severity profile forwarded to the modules (strict|loose); strict also implies --fail-on-warning
+  --baseline=FILE         Baseline JSON for comparison (alias for --comparison)
+  --save-baseline=FILE    Save the current scan findings and totals to FILE as a baseline
+  --new-only              Suppress findings present in the baseline; report only new findings
   --comparison=FILE       Baseline JSON to diff combined results against
                           (reporting only: the diff annotates the shareable
                           report; exit code still reflects CURRENT totals)
@@ -1455,6 +1460,9 @@ cat <<'JSON'
       {"name": "--module-dir", "args": "DIR", "example": "--module-dir=/tmp/ubs-modules", "description": "Where modules and helpers are cached."},
       {"name": "--update-modules", "args": null, "example": "--update-modules", "description": "Re-download modules before scanning."},
       {"name": "--comparison", "args": "FILE", "example": "--comparison=baseline.json", "description": "Baseline JSON to annotate the shareable report with deltas (exit code still reflects current totals)."},
+      {"name": "--baseline", "args": "FILE", "example": "--baseline=baseline.json", "description": "Baseline JSON file for comparison or diff mode (alias for --comparison)."},
+      {"name": "--save-baseline", "args": "FILE", "example": "--save-baseline=baseline.json", "description": "Save the current scan findings and totals to FILE as a baseline."},
+      {"name": "--new-only", "args": null, "example": "--new-only", "description": "Report only findings not present in the baseline (diff mode)."},
       {"name": "--report-json", "args": "FILE", "example": "--report-json=summary.json", "description": "Write the combined summary JSON to FILE."},
       {"name": "--html-report", "args": "FILE", "example": "--html-report=report.html", "description": "Write a shareable HTML report."},
       {"name": "--beads-jsonl", "args": "FILE", "example": "--beads-jsonl=findings.jsonl", "description": "Write findings as JSONL for Beads/strung."},
@@ -1955,6 +1963,11 @@ else
       --category)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; CATEGORY_FILTER="$1"; shift;;
+      --save-baseline=*) SAVE_BASELINE_FILE="${1#*=}"; shift;;
+      --save-baseline)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; SAVE_BASELINE_FILE="$1"; shift;;
+      --new-only) NEW_ONLY=1; shift;;
       --comparison=*|--baseline=*) COMPARISON_FILE="${1#*=}"; SHAREABLE_MODE=1; SARIF_AUTOMATION_ID="ubs-comparison"; shift;;
       --comparison|--baseline)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -6493,8 +6506,15 @@ generate_combined_json(){
   # modules still on the per-category summary schema.
   local helpers_dir; helpers_dir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
   if [[ -d "$helpers_dir/ubs_core" ]]; then
+    local -a merge_opts=()
+    local proj_dir="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+    [[ -n "$proj_dir" ]] && merge_opts+=(--project-dir "$proj_dir")
+    if [[ -n "$COMPARISON_FILE" && "$NEW_ONLY" -eq 1 ]]; then
+      merge_opts+=(--baseline "$COMPARISON_FILE" --new-only)
+    fi
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
-      --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
+      --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" \
+      "${merge_opts[@]}" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
   fi
   PROFILE_MERGE_MS=$(( PROFILE_MERGE_MS + $(now_ms) - t0 ))
   return 0
@@ -7061,7 +7081,11 @@ case "$FORMAT" in
         desired=0
         if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
         if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
-        if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
+        if [[ "$NEW_ONLY" -eq 1 ]]; then
+          status="$desired"
+        elif [[ "$desired" -gt "$status" ]]; then
+          status="$desired"
+        fi
       fi
     fi
     ;;
@@ -7078,7 +7102,11 @@ case "$FORMAT" in
 	    desired=0
 	    if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit + warn)) -gt 0 ]]; then desired=1; fi
 	    if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
-	    if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
+	    if [[ "$NEW_ONLY" -eq 1 ]]; then
+	      status="$desired"
+	    elif [[ "$desired" -gt "$status" ]]; then
+	      status="$desired"
+	    fi
 	  fi
 	fi
 
@@ -7238,6 +7266,13 @@ PY
     fi
   else
     say "${YELLOW}${WARN}${RESET} jq not available; cannot build shareable artifacts"
+  fi
+fi
+
+if [[ -n "$SAVE_BASELINE_FILE" ]]; then
+  if generate_combined_json; then
+    mkdir -p "$(dirname "$SAVE_BASELINE_FILE")" 2>/dev/null || true
+    cp "$COMBINED_JSON_FILE" "$SAVE_BASELINE_FILE" 2>/dev/null || true
   fi
 fi
 

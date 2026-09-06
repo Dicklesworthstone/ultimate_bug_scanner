@@ -1345,6 +1345,77 @@ def test_findings_parity_all_langs() -> None:
 check_findings_parity_all_langs = test_findings_parity_all_langs
 
 
+def test_baseline_new_only() -> None:
+    # B7: Fingerprinted baselines: --save-baseline saves findings with fingerprints;
+    # --baseline FILE --new-only reports only findings absent from the baseline.
+    # Alpha-renaming a local variable and inserting lines leaves the fingerprint
+    # invariant (0 new findings). Adding a real new bug produces exactly 1 new finding.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-base-"))
+    try:
+        py_file = tmp / "sample.py"
+        base_file = tmp / "baseline.json"
+        py_file.write_text(
+            "def append_item(old_var, bucket=[]):\n    return bucket\n",
+            encoding="utf-8",
+        )
+        # Step 1: save baseline
+        p1 = run([str(tmp), f"--save-baseline={base_file}", "--format=json", "--ci", "--only=python"])
+        if not base_file.is_file():
+            report("test_baseline_new_only", False, f"baseline file not created; exit={p1.returncode}", p1)
+            return
+        bdoc = json.loads(base_file.read_text(encoding="utf-8"))
+        b_findings = bdoc.get("findings", [])
+        if len(b_findings) != 1:
+            report("test_baseline_new_only", False, f"baseline finding count {len(b_findings)} != 1", p1)
+            return
+
+        # Step 2: rename local variable and insert lines above the finding
+        py_file.write_text(
+            "# inserted comment line 1\n# inserted comment line 2\n# inserted comment line 3\n\n"
+            "def append_item(new_var, bucket=[]):\n    return bucket\n",
+            encoding="utf-8",
+        )
+        p2 = run([str(tmp), f"--baseline={base_file}", "--new-only", "--format=json", "--ci", "--only=python"])
+        if p2.returncode != 0:
+            report("test_baseline_new_only", False, f"p2 (rename/insert) exit {p2.returncode} != 0", p2)
+            return
+        doc2 = json.loads(p2.stdout)
+        findings2 = doc2.get("findings", [])
+        if len(findings2) != 0:
+            report("test_baseline_new_only", False, f"p2 finding count {len(findings2)} != 0", p2)
+            return
+
+        # Step 3: add a real new bug
+        py_file.write_text(
+            "# inserted comment line 1\n# inserted comment line 2\n# inserted comment line 3\n\n"
+            "def append_item(new_var, bucket=[]):\n    return bucket\n\n"
+            "def another_buggy_func(arg, cache={}):\n    return cache\n",
+            encoding="utf-8",
+        )
+        p3 = run([str(tmp), f"--baseline={base_file}", "--new-only", "--format=json", "--ci", "--only=python"])
+        if p3.returncode != 1:
+            report("test_baseline_new_only", False, f"p3 (new bug) exit {p3.returncode} != 1", p3)
+            return
+        doc3 = json.loads(p3.stdout)
+        findings3 = doc3.get("findings", [])
+        if len(findings3) != 1:
+            report("test_baseline_new_only", False, f"p3 finding count {len(findings3)} != 1", p3)
+            return
+
+        write_case_artifacts("test_baseline_new_only", p3, {
+            "baseline_findings": len(b_findings),
+            "renamed_findings": len(findings2),
+            "new_bug_findings": len(findings3),
+            "new_finding_rule": findings3[0].get("rule_id"),
+        })
+        report("test_baseline_new_only", True, "baseline saved; rename+lines=0; new_bug=1")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+check_baseline_new_only = test_baseline_new_only
+
+
 def main() -> int:
     filter_names = set(sys.argv[1:])
     checks = (
@@ -1386,6 +1457,7 @@ def main() -> int:
         test_diff_scans_modified_only,
         test_skip_polyglot_mapping,
         check_findings_parity_all_langs,
+        test_baseline_new_only,
     )
     for check in checks:
         name = check.__name__

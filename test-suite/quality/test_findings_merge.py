@@ -161,6 +161,75 @@ class FindingsMergeTests(unittest.TestCase):
         self.assertFalse(inv["executionSuccessful"])
         self.assertEqual(inv["toolExecutionNotifications"][0]["descriptor"]["id"], "ubs/module-timeout")
 
+    def test_sarif_emits_partial_fingerprints(self) -> None:
+        doc = {
+            "version": "5.3.13",
+            "findings": [
+                {
+                    "lang": "python",
+                    "rule_id": "py.eval-exec",
+                    "severity": "critical",
+                    "file": "src/a.py",
+                    "line": 10,
+                    "fingerprint": "abc1234567890123",
+                }
+            ],
+        }
+        sarif = to_sarif(doc)
+        res = sarif["runs"][0]["results"][0]
+        self.assertIn("partialFingerprints", res)
+        self.assertEqual(res["partialFingerprints"]["ubs/v1"], "abc1234567890123")
+
+    def test_normalize_statement_invariance(self) -> None:
+        from ubs_core.findings_merge import normalize_statement
+        stmt1 = "    result = 1 / 0  # division by zero"
+        stmt2 = "answer = 1 / 0 // zero div"
+        self.assertEqual(normalize_statement(stmt1), "_ID_ = 1 / 0")
+        self.assertEqual(normalize_statement(stmt2), "_ID_ = 1 / 0")
+
+    def test_baseline_filtering_new_only(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-base-") as tmp:
+            tmp_dir = Path(tmp)
+            sink = tmp_dir / "python.findings.json"
+            sink.write_text(SINK_PY, encoding="utf-8")
+            combined = tmp_dir / "combined.json"
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+
+            # First merge: save as baseline
+            merge(tmp_dir, combined)
+            base_doc = json.loads(combined.read_text(encoding="utf-8"))
+            base_file = tmp_dir / "baseline.json"
+            base_file.write_text(json.dumps(base_doc), encoding="utf-8")
+
+            # Second merge with new_only=True and same finding: should filter out
+            combined2 = tmp_dir / "combined2.json"
+            combined2.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            count = merge(tmp_dir, combined2, baseline_path=base_file, new_only=True)
+            self.assertEqual(count, 0)
+            doc2 = json.loads(combined2.read_text(encoding="utf-8"))
+            self.assertEqual(doc2["findings"], [])
+            self.assertEqual(doc2["totals"]["critical"], 0)
+            self.assertEqual(doc2["totals"]["warning"], 0)
+
+            # Add a second genuinely new finding
+            sink2_content = SINK_PY + json.dumps({
+                "rule": "python.security.eval",
+                "path": "src/new_eval.py",
+                "line": 5,
+                "severity": "critical",
+                "message": "eval execution",
+            }) + "\n"
+            sink.write_text(sink2_content, encoding="utf-8")
+            combined3 = tmp_dir / "combined3.json"
+            combined3.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            count = merge(tmp_dir, combined3, baseline_path=base_file, new_only=True)
+            self.assertEqual(count, 1)
+            doc3 = json.loads(combined3.read_text(encoding="utf-8"))
+            self.assertEqual(len(doc3["findings"]), 1)
+            self.assertEqual(doc3["findings"][0]["rule_id"], "python.security.eval")
+            self.assertEqual(doc3["totals"]["critical"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

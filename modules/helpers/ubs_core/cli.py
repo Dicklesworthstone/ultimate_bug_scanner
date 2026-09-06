@@ -74,6 +74,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fm.add_argument("--tmp-dir", required=True, help="run temp dir holding <lang>.findings.json sinks")
     fm.add_argument("--combined", required=True, help="combined summary JSON document")
+    fm.add_argument("--project-dir", default="", help="project directory for relative path resolution")
+    fm.add_argument("--baseline", default="", help="baseline JSON document to compare against")
+    fm.add_argument("--new-only", action="store_true", help="report only findings absent from baseline")
     fs = sub.add_parser(
         "findings-sarif",
         help="generate SARIF 2.1.0 document from combined summary findings (bead K2)",
@@ -169,7 +172,13 @@ def main(argv: list[str] | None = None) -> int:
         from ubs_core.findings_merge import merge
 
         try:
-            merged = merge(Path(args.tmp_dir), Path(args.combined))
+            merged = merge(
+                Path(args.tmp_dir),
+                Path(args.combined),
+                project_dir=args.project_dir,
+                baseline_path=args.baseline,
+                new_only=args.new_only,
+            )
         except ValueError as exc:
             print(f"findings-merge: {exc}", file=sys.stderr)
             return 2

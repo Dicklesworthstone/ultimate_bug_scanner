@@ -68,6 +68,7 @@ DETAIL_LIMIT=3
 MAX_DETAILED=250
 JOBS="${JOBS:-0}"
 USER_RULE_DIR=""
+REPORT_JSON=""                         # --report-json=FILE: NDJSON findings record stream (K2)
 DISABLE_PIPEFAIL_DURING_SCAN=1
 
 ENABLE_BUNDLER_TOOLS=1
@@ -138,8 +139,8 @@ Options:
   --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
   --fail-on-warning        Exit non-zero on warnings or critical
   --rules=DIR              Additional ast-grep rules directory (merged)
-  --list-rules             List enabled ast-grep rule IDs and exit
-  --dump-rules=DIR         Persist generated ast-grep rules to DIR for test validation
+  --summary-json=FILE      Save brief summary counters JSON
+  --report-json=FILE       Also write the NDJSON findings record stream (contract-v2 sink)
   --ag-fixable-only        Limit AST output to rules that provide fixes
   --ag-preview-fix         Preview ast-grep fixes (no writes) in diff form
   --no-bundler             Disable bundler-based extra analyzers
@@ -164,6 +165,7 @@ while [[ $# -gt 0 ]]; do
     --json-out=*) JSON_OUT="${1#*=}"; shift;;
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --only-rules=*) ONLY_RULES="${1#*=}"; shift;;
@@ -286,7 +288,7 @@ say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 emit_json_summary() {
   local ts json
   ts="$(safe_date)"
-  json="$(printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json"}\n' \
+  json="$(printf '{"language":"ruby","project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"status":"ok","timestamp":"%s","format":"json"}\n' \
     "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$(json_escape "$ts")")"
   printf '%s' "$json"
   if [[ -n "$SUMMARY_JSON" ]]; then
@@ -2696,6 +2698,239 @@ fi
 begin_scan_section
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Contract-v2 path (bead 0xjg.10): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.ruby_scan), NDJSON findings sink (K2 schema).
+#    Opt-in: UBS_CONTRACT_V2_RUBY=1 enables it; UBS_LEGACY_MODULE_RUBY=1
+#    always wins; sarif stays on the legacy path.
+# ── Legacy-parity bridge: bundler tools (category 19) ───────────────────────
+# External-tool output is printed verbatim and NEVER converted to v2 sink
+# records (legacy parity: rubocop/brakeman/reek/fasterer text never bumped a
+# counter either).
+run_v2_rb_tools(){
+  if [[ "$ENABLE_BUNDLER_TOOLS" -ne 1 ]]; then
+    say "  ${GRAY}${INFO} bundler-based analyzers disabled (--no-bundler)${RESET}"
+    return 0
+  fi
+  local TOOL
+  IFS=',' read -r -a RBTOOLS <<< "$RB_TOOLS"
+  for TOOL in "${RBTOOLS[@]}"; do
+    case "$TOOL" in
+      rubocop)
+        print_subheader "rubocop (lint/style)"
+        run_rb_tool_text rubocop --format clang --force-exclusion "$PROJECT_DIR" || true
+        ;;
+      brakeman)
+        print_subheader "brakeman (Rails security)"
+        if [[ -d "$PROJECT_DIR/app" || -d "$PROJECT_DIR/config" ]]; then
+          run_rb_tool_text brakeman -q -w2 -z "$PROJECT_DIR" || true
+        else
+          say "  ${GRAY}${INFO} Rails app structure not detected; brakeman may be N/A${RESET}"
+          run_rb_tool_text brakeman -q -z "$PROJECT_DIR" || true
+        fi
+        ;;
+      bundler-audit)
+        print_subheader "bundler-audit (dependency vulns)"
+        run_bundle_audit
+        ;;
+      reek)
+        print_subheader "reek (code smells)"
+        run_rb_tool_text reek --single-line "$PROJECT_DIR" || true
+        ;;
+      fasterer)
+        print_subheader "fasterer (perf idioms)"
+        run_rb_tool_text fasterer "$PROJECT_DIR" || true
+        ;;
+      *)
+        say "  ${GRAY}${INFO} Unknown tool '$TOOL' ignored${RESET}"
+        ;;
+    esac
+  done
+}
+
+# ── Legacy-parity bridges: record-less section headers + summary + exit ─────
+# The v2 renderer prints record-backed sections only, while the legacy module
+# announces every non-skipped category (print_header) even when nothing was
+# found there. The remainder is appended in legacy category order (text only),
+# followed by the final "Summary Statistics:" block recounted from the sink
+# and the legacy exit formula.
+run_v2_legacy_parity_bridges_ruby(){
+  local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}"
+  local files_n bridge_rc=0
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
+    "$scan_exit" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import sys
+
+(sink_path, text_out, files_raw, fow_raw, skip_csv, scan_exit_raw) = sys.argv[1:7]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+scan_exit = int(scan_exit_raw or "0")
+as_text = bool(text_out)
+
+# Mirror ruby_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header
+# titles). Category 18 has no slug (its pack findings never joined totals).
+SLUG = {1: "nil", 2: "numeric", 3: "collections", 4: "comparison",
+        5: "exceptions", 6: "security", 7: "shell", 8: "io", 9: "parsing",
+        10: "control-flow", 11: "debug", 12: "perf", 13: "variables",
+        14: "code-quality", 15: "regex", 16: "concurrency", 17: "rails",
+        19: "bundler"}
+SECTION = {1: "1. NIL / DEFENSIVE PROGRAMMING", 2: "2. NUMERIC / ARITHMETIC PITFALLS",
+           3: "3. COLLECTION SAFETY", 4: "4. COMPARISON & IDIOMS",
+           5: "5. EXCEPTIONS & ERROR HANDLING", 6: "6. SECURITY VULNERABILITIES",
+           7: "7. SHELL / SUBPROCESS SAFETY", 8: "8. I/O & RESOURCE LIFECYCLE CORRELATION",
+           9: "9. PARSING & TYPE CONVERSION BUGS", 10: "10. CONTROL FLOW GOTCHAS",
+           11: "11. DEBUGGING & PRODUCTION CODE", 12: "12. PERFORMANCE & MEMORY",
+           13: "13. VARIABLE & SCOPE", 14: "14. CODE QUALITY MARKERS",
+           15: "15. REGEX & STRING SAFETY", 16: "16. CONCURRENCY & PARALLELISM",
+           17: "17. RUBY/RAILS PRACTICALS", 18: "AST-GREP RULE PACK FINDINGS",
+           19: "19. BUNDLER-POWERED EXTRA ANALYZERS"}
+SUBHEAD = {8: "Resource lifecycle correlation",
+           16: "Async error path coverage"}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+# Final severity recount over the whole sink, legacy exit formula inputs.
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+out = []
+
+def emit(line=""):
+    out.append(line)
+
+# Record-less section headers (text format only; json stdout stays machine-clean).
+if as_text:
+    covered = {str(rec.get("category_id", "")) for rec in records}
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        slug = SLUG.get(num)
+        if slug is not None and f"ruby.{slug}" in covered:
+            continue  # the renderer already announced this section
+        if slug is None and records:
+            continue  # cat 18: header only when no classified sections ran
+        emit(SECTION[num])
+        if num in SUBHEAD:
+            # Legacy printed these print_subheader lines unconditionally at
+            # the top of the cat-8/cat-16 blocks — even when the check then
+            # found nothing or the ast-grep rule failed to load.
+            emit(SUBHEAD[num])
+    emit("")
+    emit("Summary Statistics:")
+    emit(f"Files scanned: {files_n}")
+    emit(f"Critical issues: {counts['critical']}")
+    emit(f"Warning issues: {counts['warning']}")
+    emit(f"Info items: {counts['info']}")
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+exit_code = 1 if counts["critical"] else scan_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+run_contract_v2_ruby(){
+
+  local list_file sink helpers_dir exit_code=0 text_out=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  # --only whitelist -> v2 skip mapping: skip every category NOT whitelisted
+  # (numeric tokens only; the legacy --only also accepts names, which the v2
+  # path maps through the same slug table).
+  local v2_skip="$SKIP_CATEGORIES"
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    local keep="" c allowed w
+    local -a _wl
+    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
+    for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  # Consolidated ast-grep layer: the 29-rule pack into ONE sgconfig (one
+  # `scan -c` per path batch inside ubs_core.ruby_ast). Only the cat-16
+  # async rule reaches the sink (ruby_rules.CATEGORY_MAP), matching the
+  # legacy counter behavior of the rule pack.
+  local ast_rule_dir=""
+  if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-rbv2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.ruby_rules import generate
+generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: Path.write_text on
+      # /dev/stdout re-truncates a regular-file capture at its own offset,
+      # which would stomp the legacy-parity bridge text appended below.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 ruby path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_RUBY=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.ruby_scan \
+    "${scan_args[@]}" --version "2.0.1" || exit_code=$?
+  # Category 19 parity bridge: raw bundler-tool passthrough (not sink records).
+  if [[ ",$v2_skip," != *",19,"* ]]; then
+    run_v2_rb_tools
+  fi
+  # Record-less section headers + Summary Statistics + legacy exit formula.
+  run_v2_legacy_parity_bridges_ruby "$sink" "$list_file" "$exit_code" "$text_out" \
+    "$v2_skip" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_RUBY:-0}" == "1" && "${UBS_LEGACY_MODULE_RUBY:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without a working python3 the v2 path cannot run any of
+  # the detection layers — fall through so the legacy path produces its exact
+  # env-error behavior (info findings, exit codes). NO ast-grep requirement:
+  # the pattern/detector/analyzers layers run in-process either way.
+  if command -v python3 >/dev/null 2>&1; then
+    v2_status=0
+    run_contract_v2_ruby || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: NIL / DEFENSIVE PROGRAMMING
 # ═══════════════════════════════════════════════════════════════════════════
 if run_category 1; then
@@ -3598,6 +3833,14 @@ if [[ -n "$SUMMARY_JSON" ]]; then
   printf '{"timestamp":"%s","files":%s,"critical":%s,"warning":%s,"info":%s}\n' \
      "$(safe_date)" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" >"$SUMMARY_JSON"
 fi
+if [[ -n "$REPORT_JSON" ]]; then
+  # Legacy path: the summary counters object (the NDJSON findings record
+  # stream is a contract-v2 feature; see run_contract_v2_ruby).
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  printf '{"timestamp":"%s","files":%s,"critical":%s,"warning":%s,"info":%s}\n' \
+     "$(safe_date)" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" >"$REPORT_JSON"
+fi
+
 
 echo ""
 if [ "$VERBOSE" -eq 0 ]; then

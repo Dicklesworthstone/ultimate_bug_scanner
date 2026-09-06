@@ -561,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
         records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
         import datetime
 
+        legacy_findings = _legacy_report(records, args.version)["findings"]
         doc = {
             "project": args.project or args.project_dir,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -570,10 +571,10 @@ def main(argv: list[str] | None = None) -> int:
             "info": counters["info"],
             "version": args.version,
             "status": "ok",
-            "findings": records,
+            "findings": legacy_findings,
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
-            "report": _legacy_report(records, args.version),
+            "report": {"version": args.version, "findings": legacy_findings},
         }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 

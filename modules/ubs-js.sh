@@ -3769,19 +3769,20 @@ run_v2_legacy_parity_bridges(){
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
-    "$run_tn" "$tn_status" "$tn_raw" "$js_exit" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$run_tn" "$tn_status" "$tn_raw" "$js_exit" "${UBS_SKIP_TYPE_NARROWING:-0}" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import os
 import sys
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, run_tn_raw, tn_status_raw,
- tn_raw_path, js_exit_raw) = sys.argv[1:10]
+ tn_raw_path, js_exit_raw, skip_tn_raw) = sys.argv[1:11]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
 run_tn = run_tn_raw == "1"
 tn_status = int(tn_status_raw or "0")
 js_exit = int(js_exit_raw or "0")
+skip_tn = skip_tn_raw == "1"
 as_text = bool(text_out)
 
 # Mirror js_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
@@ -3861,6 +3862,10 @@ if run_tn:
                 desc += f" (and {count - 3} more)"
             emit(f"[warning] Potentially unsafe type narrowing ({count} found) — js.typescript.type-narrowing")
             emit(f"    {desc}")
+elif skip_tn and as_text:
+    emit("Type narrowing validation")
+    emit("  Type narrowing checks skipped")
+    emit("    Set UBS_SKIP_TYPE_NARROWING=0 or remove --skip-type-narrowing to re-enable")
 
 # Final severity recount over the whole sink (legacy 10923-10925 inputs).
 counts = {"critical": 0, "warning": 0, "info": 0}
@@ -3914,10 +3919,12 @@ run_contract_v2_js(){
   local ast_rule_dir=""
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-jsv2-rules.XXXXXX)"
-    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+    if ! UBS_JS_USER_RULES="${USER_RULE_DIR:-}" PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+import os
 from pathlib import Path
 from ubs_core.js_rules import generate
-generate(Path('$ast_rule_dir'))
+user = os.environ.get('UBS_JS_USER_RULES', '')
+generate(Path('$ast_rule_dir'), Path(user) if user else None)
 " 2>/dev/null; then
       ast_rule_dir=""
     fi

@@ -13,7 +13,7 @@ HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
 if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
-from ubs_core.findings_merge import load_sink, merge  # noqa: E402
+from ubs_core.findings_merge import load_sink, merge, to_sarif  # noqa: E402
 
 SUMMARY_DOC = {
     "scanners": [
@@ -98,6 +98,68 @@ class FindingsMergeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ubs-fm-") as tmp:
             with self.assertRaises(ValueError):
                 merge(Path(tmp), Path(tmp) / "missing.json")
+
+    def test_to_sarif_builds_valid_runs_and_results(self) -> None:
+        doc = {
+            "version": "5.3.13",
+            "scanners": [{"language": "python"}, {"language": "js"}],
+            "findings": [
+                {
+                    "lang": "python",
+                    "rule_id": "py.eval-exec",
+                    "category_id": "py",
+                    "severity": "critical",
+                    "file": "src/a.py",
+                    "line": 10,
+                    "col": 5,
+                    "message": "eval used",
+                    "fingerprint": "abc123",
+                    "suppressed": False,
+                },
+                {
+                    "lang": "js",
+                    "rule_id": "js.taint.xss",
+                    "category_id": "js.taint",
+                    "severity": "warning",
+                    "file": "src/b.js",
+                    "line": 20,
+                    "col": 1,
+                    "message": "xss risk",
+                    "fingerprint": "def456",
+                    "suppressed": False,
+                },
+            ],
+        }
+        sarif = to_sarif(doc, git_blob_base="https://github.com/repo/blob/sha", git_top="src")
+        self.assertEqual(sarif["version"], "2.1.0")
+        self.assertEqual(len(sarif["runs"]), 2)
+        total_results = sum(len(r["results"]) for r in sarif["runs"])
+        self.assertEqual(total_results, 2)
+
+        py_run = next(r for r in sarif["runs"] if r["tool"]["driver"]["name"] == "ubs-python")
+        self.assertEqual(len(py_run["results"]), 1)
+        res = py_run["results"][0]
+        self.assertEqual(res["ruleId"], "py.eval-exec")
+        self.assertEqual(res["level"], "error")
+        self.assertEqual(res["locations"][0]["physicalLocation"]["region"]["startLine"], 10)
+        self.assertTrue(res["locations"][0]["properties"]["permalink"].startswith("https://github.com/repo/blob/sha/"))
+
+    def test_to_sarif_partial_status_invocations(self) -> None:
+        doc = {
+            "version": "5.3.13",
+            "status": "partial",
+            "failed_modules": [{"language": "golang", "status": "timeout", "message": "timed out"}],
+            "scanners": [{"language": "golang"}],
+            "findings": [],
+        }
+        sarif = to_sarif(doc)
+        self.assertEqual(len(sarif["runs"]), 1)
+        run = sarif["runs"][0]
+        self.assertEqual(len(run["results"]), 0)
+        self.assertIn("invocations", run)
+        inv = run["invocations"][0]
+        self.assertFalse(inv["executionSuccessful"])
+        self.assertEqual(inv["toolExecutionNotifications"][0]["descriptor"]["id"], "ubs/module-timeout")
 
 
 if __name__ == "__main__":

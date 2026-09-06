@@ -380,7 +380,18 @@ def main(argv: list[str] | None = None) -> int:
                 for rid, severity in list(overrides.items()):
                     if rid.startswith("js.async."):
                         overrides[rid] = "info"
-            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides, count_only=set(SEVERITY_MAP), skip_categories=skip)
+            count_allowed = set(SEVERITY_MAP)
+            rules_dir = Path(args.ast_rule_dir) / "rules"
+            if rules_dir.is_dir():
+                for rf in rules_dir.glob("*.yml"):
+                    try:
+                        for rline in rf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                            if rline.startswith("id:"):
+                                count_allowed.add(rline.split(":", 1)[1].strip())
+                                break
+                    except OSError:
+                        pass
+            ast_counters = scan_all(Path(args.ast_rule_dir), files, sink, overrides, count_only=count_allowed, skip_categories=skip)
             for key, value in ast_counters.items():
                 counters[key] = counters.get(key, 0) + value
 

@@ -54,7 +54,7 @@ declare -A MODULE_CHECKSUMS=(
   [elixir]='ba54781fcd3591e70b1b49f866b4f36abb7d8ecfcd6f7350c2dbd73e053b133a'
   [golang]='9656e4419a18b96b8bec94563879b2a33e73825c82fe281956beed713f2b6945'
   [java]='1777b8730d3008700bcd8a93d992f4ae33bc4e4c71e303ac17900f7b87032231'
-  [js]='6ac0437cf63c18417423a0b81df9917487d22343b9c57ab48f7f22adf4dbfab3'
+  [js]='3c76ed857568fc515d27add5c26b9ab683a024af955dcf097b5cf56d6b5eea11'
   [python]='12853ab052da094a7cf4362e04d25e6fcc1f0dd8b4a64a64966249bca695e83d'
   [ruby]='41f29d7f1054f4429034badd3088103f962b0b9cb6df1c6073e334143cc8f624'
   [rust]='fb25db0292750fa1442b738cb78dc490f893083e206bccada76ed1c94dde81a9'
@@ -164,7 +164,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='467563f6db08bc1045679d2c406e9eab3f824c7770cbf83c2756f4135b08b45d'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
-  ['helpers/ubs_core/cli.py']='3d82e91303184488a225ec7fde46d6c56f4f276f797be799d5ad0aaa6afc0854'
+  ['helpers/ubs_core/cli.py']='401d3d7c9b2fa99f4a005135641ae7a0bfb706c50dff6f5d08a243afb553046c'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='60f203857d374aa48f68180d829894d9561bad3b7535f72c22246ebc297ad86e'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='ba135d496604b1822a30b8e2942b5a3700884c4d2d11409b9c4bddf1763f1d13'
@@ -220,7 +220,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_patterns/phoenix.py']='533afcfc1a90e24ad2ce002a76d2433ef2203f7034de9047a84c7a67eb0f36a4'
   ['helpers/ubs_core/elixir_patterns/security_rg.py']='551c5357954168766253ec46bf2095b7497d500c01d2a71fbbb77849461c51c9'
   ['helpers/ubs_core/elixir_scan.py']='6ced28905245e7cd5c7e88ea8cad373cf7aad7d143f3f93e61871f7403824c33'
-  ['helpers/ubs_core/findings_merge.py']='e8e5845b7557973ad05707d6d2dbb5a2cedae4a7e38ab8e92b912be894cb29f5'
+  ['helpers/ubs_core/findings_merge.py']='fa659eee6ad7573a8e0521c4f2665c6c20d13efd28eb1a7010e43acb70f19f46'
   ['helpers/ubs_core/go_ast.py']='8742075b0f2f9e10ec0fe37a1641075eaf3480e3f30b7060a306bdff77b84d89'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -279,7 +279,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_patterns/proto_vars.py']='b4fdf0f9ccfa5b4133f12f53dc2813fcd618530756c9a299ed16e1d0c0388b31'
   ['helpers/ubs_core/js_patterns/security_node.py']='7ceb9d14a629fb7bb89fce5c702a7ccc769260be10feab937a843b473efcf81e'
   ['helpers/ubs_core/js_rules.py']='aef56a2d91a68b9e4aad2586de9d94342555ad74008fb06c0ab10a8142b7eecc'
-  ['helpers/ubs_core/js_scan.py']='03d707f97cd992f528c61fc4a9acf5d412335136b222e2ca8e3d05ca7d20ff6c'
+  ['helpers/ubs_core/js_scan.py']='8d95299b1e67f068044952593e37639ee84f0b519cd02e207a3bba8ec726a1e1'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/py_ast.py']='51bea6c246a2f2bf5a57c7b95404c67f1d6195a443ec4954e04ee6ac67998afd'
   ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
@@ -329,7 +329,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='67172bb6c1227370021506baa87108060227e5513be996ab52f48bb38cd4c29b'
   ['helpers/ubs_core/py_patterns/security_rg.py']='74f4cdc7dcc70faf656161c0651097649a6ad0322e74bfb3c3860a0497b501ef'
   ['helpers/ubs_core/py_rules.py']='5ed37ca0ba35959e495fa877837293b863847ee82159dad3bf3fedcf17d8eeb8'
-  ['helpers/ubs_core/py_scan.py']='e21fa1f825fc61d6e35f9bd48280014c490e561a23a2a4b443929ff2f33cd55a'
+  ['helpers/ubs_core/py_scan.py']='84d09e6e03c94061a6b940163469d13c32a085fcd0ea230f62c263bccb6345f2'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/ruby_ast.py']='4bb0ecb0f511565d3d6e03346965a2d571b50f49f62920b542cdee539c7be4c3'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -5901,6 +5901,17 @@ run_lang(){
   export UBS_LANG="$lang"
   export UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING"
   export UBS_METRICS_DIR="$metrics_dir"
+  export UBS_CONTRACT_V2="${UBS_CONTRACT_V2:-1}"
+  export UBS_CONTRACT_V2_JS="${UBS_CONTRACT_V2_JS:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_PY="${UBS_CONTRACT_V2_PY:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_CPP="${UBS_CONTRACT_V2_CPP:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_RUST="${UBS_CONTRACT_V2_RUST:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_GO="${UBS_CONTRACT_V2_GO:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_JAVA="${UBS_CONTRACT_V2_JAVA:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_RUBY="${UBS_CONTRACT_V2_RUBY:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_SWIFT="${UBS_CONTRACT_V2_SWIFT:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_CSHARP="${UBS_CONTRACT_V2_CSHARP:-${UBS_CONTRACT_V2:-1}}"
+  export UBS_CONTRACT_V2_ELIXIR="${UBS_CONTRACT_V2_ELIXIR:-${UBS_CONTRACT_V2:-1}}"
   : > "$err" 2>/dev/null || true
 
   if [[ "${QUIET:-0}" -eq 0 ]]; then
@@ -5947,7 +5958,7 @@ run_lang(){
   args+=("$PROJECT_DIR")
 
   case "$fmt" in
-    json|jsonl|toon)
+    json|jsonl|toon|sarif)
       prepare_metrics_dir "$metrics_dir"
       local -a report_args=()
       if [[ "$lang" == "js" || "$lang" == "python" || "$lang" == "cpp" || "$lang" == "golang" || "$lang" == "java" || "$lang" == "ruby" || "$lang" == "swift" || "$lang" == "elixir" || "$lang" == "rust" || "$lang" == "csharp" ]]; then
@@ -5974,32 +5985,6 @@ run_lang(){
         fi
       else
         legacy_postprocess json "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir" "${args[@]}" "${report_args[@]}"
-      fi
-      ;;
-    sarif)
-      prepare_metrics_dir "$metrics_dir"
-      run_module "$out_sarif" "$err" "$module" "${args[@]}" --format=sarif || true
-      module_status=$MODULE_RUN_STATUS
-      if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
-        postprocess_module sarif "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
-      else
-        restore_original_paths "$out_sarif"
-      fi
-      if [[ "$MODULE_TIMED_OUT" -eq 1 ]]; then
-        : # synthetic MODULE_TIMEOUT result is written after the case block
-      elif need_cmd jq && jq -e . "$out_sarif" >/dev/null 2>&1; then
-        parse_sarif_to_json "$lang" "$out_sarif" "$out_json" || true
-        attach_metrics_to_json "$out_json" "$metrics_dir" 2>/dev/null || true
-      else
-        prepare_metrics_dir "$metrics_dir"
-        run_module "$out_raw" "$err" "$module" "${args[@]}" || true
-        module_status=$MODULE_RUN_STATUS
-        if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
-          postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
-        else
-          legacy_postprocess text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir"
-        fi
-        minimal_sarif_from_text "$lang" "$out_txt" >"$out_sarif"
       fi
       ;;
     text|*)
@@ -6265,7 +6250,7 @@ generate_combined_json(){
   local helpers_dir; helpers_dir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
   if [[ -d "$helpers_dir/ubs_core" ]]; then
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
-      --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" >&2 2>&1 || true
+      --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
   fi
   PROFILE_MERGE_MS=$(( PROFILE_MERGE_MS + $(now_ms) - t0 ))
   return 0
@@ -6278,6 +6263,26 @@ emit_combined_json(){
   else
     cat "$COMBINED_JSON_FILE"
   fi
+}
+
+emit_combined_sarif(){
+  local helpers_dir; helpers_dir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
+  if [[ -d "$helpers_dir/ubs_core" ]] && need_cmd python3; then
+    local proj_real top_real
+    proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
+    top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
+    if PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif \
+        --combined "$COMBINED_JSON_FILE" \
+        --blob "${GIT_BLOB_BASE:-}" \
+        --top "$top_real" \
+        --repo "${GIT_REMOTE_HTTP:-}" \
+        --rev "${GIT_COMMIT_SHA:-}" \
+        --auto "${SARIF_AUTOMATION_ID:-}" >"$TMPDIR_RUN/combined.sarif" 2>"$TMPDIR_RUN/sarif-builder.err"; then
+      cat "$TMPDIR_RUN/combined.sarif"
+      return 0
+    fi
+  fi
+  merge_sarif_runs
 }
 
 merge_sarif_runs(){
@@ -6380,20 +6385,23 @@ write_jsonl_summary(){
     # Detailed mode: emit each finding as its own JSONL line.
     # K2: top-level findings[] (contract-v2 NDJSON sinks) take precedence —
     # one record per sample with rule id, location, fingerprint, suppression.
-    jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-      (.findings // [])[] |
-      {type:"finding", project:$project, timestamp:$ts, language:.lang,
-       rule_id:.rule_id, category_id:.category_id, severity:.severity,
-       confidence:.confidence, file:.file, line:.line, col:.col,
-       message:.message, remediation:.remediation, fix:.fix,
-       fingerprint:.fingerprint, suppressed:.suppressed}
-    ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
-
-    jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
-      .scanners[] as $s |
-      (($s.findings // [])[]) |
-      {type:"finding", project:$project, language:$s.language} + .
-    ' "$COMBINED_JSON_FILE" >>"$tmp" 2>/dev/null || true
+    if jq -e '((.findings // []) | length) > 0' "$COMBINED_JSON_FILE" >/dev/null 2>&1; then
+      jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
+        .findings[] |
+        {type:"finding", project:$project, timestamp:$ts, language:.lang,
+         rule_id:.rule_id, category_id:.category_id, severity:.severity,
+         confidence:.confidence, file:.file, line:.line, col:.col,
+         message:.message, remediation:.remediation, fix:.fix,
+         fingerprint:.fingerprint, suppressed:.suppressed,
+         title:(.message // .rule_id), count:1}
+      ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
+    else
+      jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
+        .scanners[] as $s |
+        (($s.findings // [])[]) |
+        {type:"finding", project:$project, language:$s.language} + .
+      ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
+    fi
 
     # Also emit scanner summaries
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
@@ -6727,7 +6735,11 @@ case "$FORMAT" in
       emit_env_error_json
       status=2
     else
-      merge_sarif_runs
+      if generate_combined_json; then
+        emit_combined_sarif
+      else
+        merge_sarif_runs
+      fi
     fi
     ;;
   toon)

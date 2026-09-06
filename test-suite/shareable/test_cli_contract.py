@@ -1092,6 +1092,106 @@ def test_skip_polyglot_mapping() -> None:
 check_skip_polyglot_mapping = test_skip_polyglot_mapping
 
 
+def test_findings_parity_all_langs() -> None:
+    # K2: findings parity — meta-runner --format=json includes per-finding records
+    # for every module; jsonl, toon, and sarif derive from them.
+    manifest_file = REPO_ROOT / "test-suite" / "manifest.json"
+    with manifest_file.open(encoding="utf-8") as f:
+        data = json.load(f)
+
+    langs = ["js", "python", "cpp", "rust", "golang", "java", "ruby", "swift", "csharp", "elixir"]
+    failures = []
+    case_summary = {}
+    last_proc = None
+
+    for lang in langs:
+        cases = [c for c in data.get("cases", []) if c.get("language") == lang and "buggy" in c.get("id", "")]
+        if not cases:
+            failures.append(f"{lang}: no manifest buggy case found")
+            continue
+        c = cases[0]
+        target = str(REPO_ROOT / c["path"])
+        cid = c["id"]
+        common = ["--ignore-file=/dev/null", target, f"--only={lang}", "--ci"]
+
+        # 1. JSON
+        pj = run([*common, "--format=json"])
+        last_proc = pj
+        try:
+            doc = json.loads(pj.stdout)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{lang}: JSON parse error {exc}")
+            continue
+
+        findings = doc.get("findings", [])
+        if not findings:
+            failures.append(f"{lang}: no findings in JSON (findings[] is empty)")
+            continue
+
+        bad_rules = [f for f in findings if not str(f.get("rule_id", "")).strip()]
+        if bad_rules:
+            failures.append(f"{lang}: {len(bad_rules)} findings missing rule_id")
+            continue
+
+        expected_count = len(findings)
+
+        # 2. JSONL
+        pjl = run([*common, "--format=jsonl"])
+        last_proc = pjl
+        jl_lines = [json.loads(line) for line in pjl.stdout.splitlines() if line.strip()]
+        jl_findings = [line for line in jl_lines if line.get("type") == "finding"]
+        if len(jl_findings) != expected_count:
+            failures.append(f"{lang}: JSONL finding count {len(jl_findings)} != expected {expected_count}")
+            continue
+
+        # 3. TOON
+        pt = run([*common, "--format=toon"])
+        last_proc = pt
+        pt_dec = subprocess.run(["toon", "--decode"], input=pt.stdout, capture_output=True, text=True)
+        try:
+            tdoc = json.loads(pt_dec.stdout)
+            t_findings = tdoc.get("findings", [])
+            if len(t_findings) != expected_count:
+                failures.append(f"{lang}: TOON finding count {len(t_findings)} != expected {expected_count}")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{lang}: TOON decode error {exc}")
+            continue
+
+        # 4. SARIF
+        ps = run([*common, "--format=sarif"])
+        last_proc = ps
+        try:
+            sdoc = json.loads(ps.stdout)
+            s_results = [r for run_ in sdoc.get("runs", []) for r in run_.get("results", [])]
+            if len(s_results) != expected_count:
+                failures.append(f"{lang}: SARIF result count {len(s_results)} != expected {expected_count}")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{lang}: SARIF parse error {exc}")
+            continue
+
+        case_summary[lang] = {
+            "case_id": cid,
+            "findings": expected_count,
+            "jsonl": len(jl_findings),
+            "toon": len(t_findings),
+            "sarif": len(s_results),
+        }
+
+    ok = len(failures) == 0 and len(case_summary) == len(langs)
+    detail = "all 10 langs at parity" if ok else "; ".join(failures)
+    write_case_artifacts("test_findings_parity_all_langs", last_proc or pj, {
+        "ok": ok,
+        "failures": failures,
+        "summary": case_summary,
+    })
+    report("test_findings_parity_all_langs", ok, detail, last_proc if not ok else None)
+
+
+check_findings_parity_all_langs = test_findings_parity_all_langs
+
+
 def main() -> int:
     filter_names = set(sys.argv[1:])
     checks = (
@@ -1130,6 +1230,7 @@ def main() -> int:
         test_staged_scans_index_only,
         test_diff_scans_modified_only,
         test_skip_polyglot_mapping,
+        check_findings_parity_all_langs,
     )
     for check in checks:
         name = check.__name__

@@ -109,3 +109,150 @@ def merge(tmp_dir: Path, combined_path: Path) -> int:
         doc["findings"] = findings
         combined_path.write_text(json.dumps(doc), encoding="utf-8")
     return len(findings)
+
+
+def to_sarif(
+    doc: dict,
+    *,
+    git_blob_base: str = "",
+    git_top: str = "",
+    git_remote: str = "",
+    git_commit: str = "",
+    sarif_automation_id: str = "",
+) -> dict:
+    """Build a SARIF 2.1.0 document from the combined summary document and its findings[].
+
+    Each module scanner is given a run. If scanners is empty, runs are formed
+    from the distinct languages present in findings[], or a default 'ubs' run.
+    """
+    version = str(doc.get("version", "5.3.13"))
+    scanners = doc.get("scanners", []) or []
+    findings = doc.get("findings", []) or []
+
+    # Map findings by language
+    findings_by_lang: dict[str, list[dict]] = {}
+    for f in findings:
+        lang = str(f.get("lang") or "unknown")
+        findings_by_lang.setdefault(lang, []).append(f)
+
+    # Determine ordered list of languages for runs
+    languages: list[str] = []
+    if scanners:
+        for s in scanners:
+            if isinstance(s, dict):
+                l = str(s.get("language") or "")
+                if l and l not in languages:
+                    languages.append(l)
+    for l in findings_by_lang:
+        if l not in languages:
+            languages.append(l)
+    if not languages:
+        languages = ["ubs"]
+
+    runs: list[dict] = []
+    for lang in languages:
+        driver_name = f"ubs-{lang}" if lang != "ubs" else "ubs"
+        run: dict = {
+            "tool": {
+                "driver": {
+                    "name": driver_name,
+                    "version": version,
+                    "informationUri": "https://github.com/Dicklesworthstone/ultimate_bug_scanner",
+                }
+            },
+            "results": [],
+        }
+        if git_remote:
+            prov = {"repositoryUri": git_remote}
+            if git_commit:
+                prov["revisionId"] = git_commit
+            run["versionControlProvenance"] = [prov]
+        if sarif_automation_id:
+            run["automationDetails"] = {"id": sarif_automation_id}
+
+        lang_findings = findings_by_lang.get(lang, [])
+        for f in lang_findings:
+            rule_id = str(f.get("rule_id") or "")
+            sev = str(f.get("severity") or "warning").lower()
+            level = "error" if sev == "critical" else ("warning" if sev == "warning" else "note")
+            msg = str(f.get("message") or rule_id)
+            res: dict = {
+                "ruleId": rule_id,
+                "level": level,
+                "message": {"text": msg},
+            }
+            file_path = str(f.get("file") or "")
+            if file_path:
+                try:
+                    line_no = max(1, int(f.get("line", 1) or 1))
+                except (TypeError, ValueError):
+                    line_no = 1
+                try:
+                    col_no = max(1, int(f.get("col", 1) or 1))
+                except (TypeError, ValueError):
+                    col_no = 1
+                loc: dict = {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": file_path},
+                        "region": {
+                            "startLine": line_no,
+                            "startColumn": col_no,
+                        },
+                    }
+                }
+                if git_blob_base:
+                    rel = file_path
+                    if rel.startswith("file://"):
+                        rel = rel[7:]
+                    if git_top and rel.startswith(git_top + "/"):
+                        rel = rel[len(git_top) + 1:]
+                    elif rel.startswith("./"):
+                        rel = rel[2:]
+                    loc["properties"] = {"permalink": f"{git_blob_base}/{rel}#L{line_no}"}
+                res["locations"] = [loc]
+
+            props: dict = {}
+            if f.get("category_id"):
+                props["category_id"] = str(f["category_id"])
+            if f.get("fingerprint"):
+                props["fingerprint"] = str(f["fingerprint"])
+            if f.get("suppressed") is not None:
+                props["suppressed"] = bool(f["suppressed"])
+            if f.get("confidence"):
+                props["confidence"] = str(f["confidence"])
+            if f.get("remediation"):
+                props["remediation"] = str(f["remediation"])
+            if f.get("fix"):
+                props["fix"] = str(f["fix"])
+            if props:
+                res["properties"] = props
+            run["results"].append(res)
+
+        runs.append(run)
+
+    # Invocations for partial runs / failed modules
+    if doc.get("status") == "partial" or doc.get("failed_modules"):
+        failed = doc.get("failed_modules") or []
+        notifications = []
+        for fmod in failed:
+            if isinstance(fmod, dict):
+                st = str(fmod.get("status") or "error")
+                flang = str(fmod.get("language") or "unknown")
+                msg = str(fmod.get("message") or fmod.get("module_error") or "module did not complete")
+                notifications.append({
+                    "level": "error",
+                    "descriptor": {"id": f"ubs/module-{st}"},
+                    "message": {"text": f"{flang}: {st} — {msg}"},
+                })
+        for r in runs:
+            r["invocations"] = [{
+                "executionSuccessful": False,
+                "toolExecutionNotifications": notifications,
+            }]
+
+    return {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": runs,
+    }
+

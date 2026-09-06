@@ -74,6 +74,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fm.add_argument("--tmp-dir", required=True, help="run temp dir holding <lang>.findings.json sinks")
     fm.add_argument("--combined", required=True, help="combined summary JSON document")
+    fs = sub.add_parser(
+        "findings-sarif",
+        help="generate SARIF 2.1.0 document from combined summary findings (bead K2)",
+    )
+    fs.add_argument("--combined", required=True, help="combined summary JSON document")
+    fs.add_argument("--blob", default="", help="git blob URL base for permalinks")
+    fs.add_argument("--top", default="", help="git toplevel path")
+    fs.add_argument("--repo", default="", help="git remote repository URI")
+    fs.add_argument("--rev", default="", help="git commit SHA")
+    fs.add_argument("--auto", default="", help="SARIF automation ID")
     return parser
 
 
@@ -165,6 +175,25 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         sys.stdout.write(f"{merged}\n")
         return 0
+
+    if args.layer == "findings-sarif":
+        from ubs_core.findings_merge import to_sarif
+
+        try:
+            doc = json.loads(Path(args.combined).read_text(encoding="utf-8"))
+            sarif = to_sarif(
+                doc,
+                git_blob_base=args.blob,
+                git_top=args.top,
+                git_remote=args.repo,
+                git_commit=args.rev,
+                sarif_automation_id=args.auto,
+            )
+            sys.stdout.write(json.dumps(sarif, indent=2) + "\n")
+            return 0
+        except Exception as exc:
+            print(f"findings-sarif: {exc}", file=sys.stderr)
+            return 2
 
     if not getattr(args, "layer", None):
         parser.print_help(sys.stderr)

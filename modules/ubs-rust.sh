@@ -8347,6 +8347,463 @@ fi
 begin_scan_section
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Contract-v2 path (bead 0xjg.7): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.rust_scan) for the code-backed layers (patterns,
+#    ast bridge, detectors, analyzers), NDJSON findings sink (K2 schema).
+#    Opt-in: UBS_CONTRACT_V2_RUST=1 enables it; UBS_LEGACY_MODULE_RUST=1
+#    always wins; sarif (and everything without ast-grep or python3) stays
+#    on the legacy path.
+# ── Legacy-parity bridge: cargo phases (categories 12/13/14) ────────────────
+# The cargo machinery (check_cargo/run_cargo_subcmd/report_cargo_failure)
+# is REAL subprocess work that cannot move in-process; each finding is a
+# bucket record in the K2 sink (legacy never surfaced per-occurrence data
+# for cargo either).
+V2_SINK=""
+_v2_sink_bucket(){
+  local severity="$1" count="$2" title="$3" desc="${4:-}" cat_slug="${5:-}" cat_name="${6:-}" rule="${7:-rust.cargo.phase}"
+  [[ -n "$V2_SINK" ]] || return 0
+  printf '{"rule":"%s","category_id":"rust.%s","path":"","line":1,"col":1,"severity":"%s","message":"%s","suppressed":false,"count":%s,"title":"%s","description":"%s","category_name":"%s"}\n' \
+    "$(json_escape "$rule")" "$cat_slug" "$severity" "$(json_escape "$title")" "$count" \
+    "$(json_escape "$title")" "$(json_escape "$desc")" "$(json_escape "$cat_name")" >>"$V2_SINK"
+}
+_v2_add_finding(){
+  # legacy add_finding signature + a sink bucket record
+  local severity="$1" count="$2" title="$3" desc="${4:-}" category="${5:-}" samples="${6:-[]}"
+  add_finding "$severity" "$count" "$title" "$desc" "$category" "$samples"
+  _v2_sink_bucket "$severity" "$(printf '%s' "$count" | awk 'END{print $0+0}')" "$title" "$desc" \
+    "${V2_CARGO_SLUG:-}" "${category:-}" "${V2_CARGO_RULE:-}"
+}
+
+# _v2_report_cargo_failure / _v2_report_cargo_skipped: the legacy reporters
+# (8219-8245) with add_finding -> _v2_add_finding so the "Not evaluated"
+# info and the failure line both join the sink. Same globals
+# (CARGO_UNAVAILABLE / CARGO_UNAVAILABLE_MSG / CARGO_SKIPPED_CATEGORIES).
+_v2_report_cargo_failure() {
+  local severity="$1" logfile="$2" category="$3" title="$4"
+  local ec last
+  ec="$(cargo_phase_ec "$logfile")"
+  last="$(grep -v '^[[:space:]]*$' "$logfile" 2>/dev/null | tail -n 1 | cut -c1-200)"
+  if [[ "$severity" == "critical" || "$severity" == "warning" ]]; then
+    severity="warning"
+    if [[ "$CARGO_UNAVAILABLE" -eq 0 ]]; then
+      CARGO_UNAVAILABLE=1
+      CARGO_UNAVAILABLE_MSG="${title} (exit ${ec}): ${last:-no output captured}"
+    fi
+    print_finding "info" 1 "Not evaluated: ${title%% could not run*}${title%% failed without diagnostics*}" "cargo returned exit $ec without diagnostics; the result is partial"
+    _v2_add_finding "info" 1 "Not evaluated: ${title%% could not run*}${title%% failed without diagnostics*}" "cargo returned exit $ec without diagnostics; the result is partial" "$category"
+  fi
+  print_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}"
+  _v2_add_finding "$severity" 1 "$title (exit $ec)" "${last:-no output captured}" "$category"
+}
+
+_v2_report_cargo_skipped() {
+  local category="$1" what="$2"
+  CARGO_SKIPPED_CATEGORIES+=("$category")
+  print_finding "info" 1 "Not evaluated: $what" "cargo phases skipped: $CARGO_SKIP_REASON"
+  _v2_add_finding "info" 1 "Not evaluated: $what" "cargo phases skipped: $CARGO_SKIP_REASON" "$category"
+}
+
+run_v2_cargo_phases(){
+  # verbatim port of category blocks 12/13/14 (ubs-rust.sh 9267-9425) with
+  # add_finding -> _v2_add_finding so cargo findings join the sink.
+  if category_enabled 12; then
+  print_header "12. LINTS & STYLE (fmt/clippy)"
+  print_category "Runs: cargo fmt -- --check, cargo clippy" \
+    "Formatter and lints help maintain consistent style and catch many issues"
+  V2_CARGO_SLUG="lints"; V2_CARGO_RULE="rust.lints.phase"
+  if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
+    FMT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-fmt.XXXXXX)"; CLIPPY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-clippy.XXXXXX)"; TMP_FILES+=("$FMT_LOG" "$CLIPPY_LOG")
+    if [[ "$HAS_FMT" -eq 1 ]]; then
+      run_cargo_subcmd "fmt" "$FMT_LOG" cargo fmt -- --check
+      r_ec=$(cargo_phase_ec "$FMT_LOG")
+      if [[ "$r_ec" -eq 0 ]]; then
+        print_finding "good" "Formatting is clean"
+      elif grep -q -E '^Diff in |^[-+]' "$FMT_LOG" 2>/dev/null; then
+        print_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt"
+        _v2_add_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt" "${CATEGORY_NAME[12]}"
+      else
+        _v2_report_cargo_failure "warning" "$FMT_LOG" "${CATEGORY_NAME[12]}" "cargo fmt --check could not run"
+      fi
+    else
+      print_finding "info" 1 "rustfmt not installed; skipping format check"
+      _v2_add_finding "info" 1 "rustfmt not installed; skipping format check" "" "${CATEGORY_NAME[12]}"
+    fi
+    if [[ "$HAS_CLIPPY" -eq 1 ]]; then
+      clippy_args=(clippy)
+      [[ "$CARGO_FEATURES_ALL" -eq 1 ]] && clippy_args+=(--all-features)
+      [[ "$CARGO_TARGETS_ALL" -eq 1 ]] && clippy_args+=(--all-targets)
+      clippy_args+=(-- -D warnings)
+      run_cargo_subcmd "clippy" "$CLIPPY_LOG" cargo "${clippy_args[@]}"
+      w_e=$(count_warnings_errors "$CLIPPY_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
+      if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Clippy errors"; _v2_add_finding "critical" "$e" "Clippy errors" "" "${CATEGORY_NAME[12]}"; fi
+      if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Clippy warnings"; _v2_add_finding "warning" "$w" "Clippy warnings" "" "${CATEGORY_NAME[12]}"; fi
+      if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then
+        if [[ "$(cargo_phase_ec "$CLIPPY_LOG")" -eq 0 ]]; then
+          print_finding "good" "No clippy warnings/errors"
+        else
+          _v2_report_cargo_failure "warning" "$CLIPPY_LOG" "${CATEGORY_NAME[12]}" "cargo clippy could not run"
+        fi
+      fi
+    else
+      print_finding "info" 1 "clippy not installed; skipping lint pass"
+      _v2_add_finding "info" 1 "clippy not installed; skipping lint pass" "" "${CATEGORY_NAME[12]}"
+    fi
+  else
+    _v2_report_cargo_skipped "${CATEGORY_NAME[12]}" "formatting (cargo fmt --check) and lints (cargo clippy)"
+  fi
+  fi
+  if category_enabled 13; then
+  print_header "13. BUILD HEALTH (check/test)"
+  print_category "Runs: cargo check, cargo test --no-run" \
+    "Ensures the project compiles and tests build"
+  V2_CARGO_SLUG="build"; V2_CARGO_RULE="rust.build.phase"
+  if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
+    CHECK_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-check.XXXXXX)"; TEST_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-test.XXXXXX)"; TMP_FILES+=("$CHECK_LOG" "$TEST_LOG")
+    run_cargo_subcmd "check" "$CHECK_LOG" cargo check
+    w_e=$(count_warnings_errors "$CHECK_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
+    if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "cargo check errors"; _v2_add_finding "critical" "$e" "cargo check errors" "" "${CATEGORY_NAME[13]}"; fi
+    if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "cargo check warnings"; _v2_add_finding "warning" "$w" "cargo check warnings" "" "${CATEGORY_NAME[13]}"; fi
+    if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then
+      if [[ "$(cargo_phase_ec "$CHECK_LOG")" -eq 0 ]]; then
+        print_finding "good" "cargo check clean"
+      else
+        _v2_report_cargo_failure "critical" "$CHECK_LOG" "${CATEGORY_NAME[13]}" "cargo check could not run"
+      fi
+    fi
+    run_cargo_subcmd "test-no-run" "$TEST_LOG" cargo test --no-run
+    w_e=$(count_warnings_errors "$TEST_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
+    if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Tests failed to build (cargo test --no-run)"; _v2_add_finding "critical" "$e" "Tests failed to build (cargo test --no-run)" "" "${CATEGORY_NAME[13]}"; fi
+    if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; _v2_add_finding "warning" "$w" "Test build warnings" "" "${CATEGORY_NAME[13]}"; fi
+    if [[ "$w" -eq 0 && "$e" -eq 0 ]]; then
+      if [[ "$(cargo_phase_ec "$TEST_LOG")" -eq 0 ]]; then
+        print_finding "good" "Tests build clean"
+      else
+        _v2_report_cargo_failure "critical" "$TEST_LOG" "${CATEGORY_NAME[13]}" "cargo test --no-run could not run"
+      fi
+    fi
+  else
+    _v2_report_cargo_skipped "${CATEGORY_NAME[13]}" "compilation (cargo check) and test build (cargo test --no-run)"
+  fi
+  fi
+  if category_enabled 14; then
+  print_header "14. DEPENDENCY HYGIENE"
+  print_category "Runs: cargo audit, cargo deny check, cargo udeps, cargo outdated" \
+    "Keeps dependencies safe, minimal, and up-to-date"
+  V2_CARGO_SLUG="dependencies"; V2_CARGO_RULE="rust.dependencies.phase"
+  if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
+    if [[ "$HAS_AUDIT" -eq 1 ]]; then
+      AUDIT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-audit.XXXXXX)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" cargo audit
+      audit_vuln=$(grep -c -E "Vulnerability|RUSTSEC" "$AUDIT_LOG" 2>/dev/null || true); audit_vuln=${audit_vuln:-0}
+      if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; _v2_add_finding "critical" "$audit_vuln" "Advisories found by cargo-audit" "" "${CATEGORY_NAME[14]}"
+      elif [[ "$(cargo_phase_ec "$AUDIT_LOG")" -ne 0 ]]; then _v2_report_cargo_failure "warning" "$AUDIT_LOG" "${CATEGORY_NAME[14]}" "cargo audit could not run"
+      else print_finding "good" "No known advisories (cargo-audit)"; fi
+    else
+      print_finding "info" 1 "cargo-audit not installed; skipping advisory scan"
+      _v2_add_finding "info" 1 "cargo-audit not installed; skipping advisory scan" "" "${CATEGORY_NAME[14]}"
+    fi
+    if [[ "$HAS_DENY" -eq 1 ]]; then
+      DENY_CHECKS=(advisories bans sources)
+      if [[ -f "$PROJECT_DIR/deny.toml" || -f "$PROJECT_DIR/.cargo/deny.toml" || -f "$PROJECT_DIR/.deny.toml" ]]; then
+        DENY_CHECKS+=(licenses)
+      else
+        print_finding "info" 1 "cargo-deny licenses check skipped: no deny.toml (cargo-deny allows no license until one is listed there)"
+        _v2_add_finding "info" 1 "cargo-deny licenses check skipped: no deny.toml" "" "${CATEGORY_NAME[14]}"
+      fi
+      DENY_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-deny.XXXXXX)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" cargo deny check "${DENY_CHECKS[@]}"
+      deny_err=$(grep -c -E "error\[[^)]+\]|[[:space:]]error:" "$DENY_LOG" 2>/dev/null || true); deny_err=${deny_err:-0}
+      deny_warn=$(grep -c -E "[[:space:]]warning:" "$DENY_LOG" 2>/dev/null || true); deny_warn=${deny_warn:-0}
+      if [[ "$deny_err" -gt 0 ]]; then print_finding "critical" "$deny_err" "cargo-deny errors"; _v2_add_finding "critical" "$deny_err" "cargo-deny errors" "" "${CATEGORY_NAME[14]}"; fi
+      if [[ "$deny_warn" -gt 0 ]]; then print_finding "warning" "$deny_warn" "cargo-deny warnings"; _v2_add_finding "warning" "$deny_warn" "cargo-deny warnings" "" "${CATEGORY_NAME[14]}"; fi
+      if [[ "$deny_err" -eq 0 && "$deny_warn" -eq 0 ]]; then
+        if [[ "$(cargo_phase_ec "$DENY_LOG")" -eq 0 ]]; then print_finding "good" "cargo-deny clean"
+        else _v2_report_cargo_failure "warning" "$DENY_LOG" "${CATEGORY_NAME[14]}" "cargo deny could not run"; fi
+      fi
+    else
+      print_finding "info" 1 "cargo-deny not installed; skipping policy checks"
+      _v2_add_finding "info" 1 "cargo-deny not installed; skipping policy checks" "" "${CATEGORY_NAME[14]}"
+    fi
+    if [[ "$HAS_UDEPS" -eq 1 ]]; then
+      UDEPS_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-udeps.XXXXXX)"; TMP_FILES+=("$UDEPS_LOG"); run_cargo_subcmd "udeps" "$UDEPS_LOG" cargo udeps --all-targets
+      udeps_count=$(grep -c -E "(unused dependency|possibly unused|not used)" "$UDEPS_LOG" 2>/dev/null || true); udeps_count=${udeps_count:-0}
+      if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; _v2_add_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)" "" "${CATEGORY_NAME[14]}"
+      elif [[ "$(cargo_phase_ec "$UDEPS_LOG")" -ne 0 ]]; then _v2_report_cargo_failure "info" "$UDEPS_LOG" "${CATEGORY_NAME[14]}" "cargo udeps could not run (needs nightly)"
+      else print_finding "good" "No unused dependencies"; fi
+    else
+      print_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan"
+      _v2_add_finding "info" 1 "cargo-udeps not installed; skipping unused dep scan" "" "${CATEGORY_NAME[14]}"
+    fi
+    if [[ "$HAS_OUTDATED" -eq 1 ]]; then
+      OUT_LOG="$(mktemp 2>/dev/null || mktemp -t ubs-rust-outdated.XXXXXX)"; TMP_FILES+=("$OUT_LOG"); run_cargo_subcmd "outdated" "$OUT_LOG" cargo outdated -R
+      outdated_count=$(grep -E -c "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null || true); outdated_count=${outdated_count:-0}
+      if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; _v2_add_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)" "" "${CATEGORY_NAME[14]}"
+      elif [[ "$(cargo_phase_ec "$OUT_LOG")" -ne 0 ]]; then _v2_report_cargo_failure "info" "$OUT_LOG" "${CATEGORY_NAME[14]}" "cargo outdated could not run"
+      else print_finding "good" "Dependencies up-to-date"; fi
+    else
+      print_finding "info" 1 "cargo-outdated not installed; skipping update report"
+      _v2_add_finding "info" 1 "cargo-outdated not installed; skipping update report" "" "${CATEGORY_NAME[14]}"
+    fi
+  else
+    _v2_report_cargo_skipped "${CATEGORY_NAME[14]}" "dependency hygiene (cargo audit / deny / udeps / outdated)"
+  fi
+  fi
+}
+
+# ── Legacy-parity bridges: cat 17/18 passthrough + Summary + exit formula ───
+run_v2_cat_17_18(){
+  # Category 17 (ubs-rust.sh 9473-9480 verbatim) + 18 (9485-9501 with
+  # add_finding -> _v2_add_finding).
+  if category_enabled 17 && [[ "$FORMAT" == "text" ]]; then
+  print_header "17. AST-GREP RULE PACK FINDINGS"
+  if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_CONFIG_FILE" ]]; then
+    print_finding "info" 0 "AST rule pack staged" "Run with --format=sarif to emit SARIF from the rule pack"
+  else
+    say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+  fi
+  fi
+  if category_enabled 18; then
+  print_header "18. META STATISTICS & INVENTORY"
+  print_category "Detects: crate counts, bin/lib targets, feature flags (Cargo.toml heuristic)" \
+    "High-level view of the project layout"
+  print_subheader "Cargo.toml features (heuristic count)"
+  cargo_toml="$PROJECT_DIR/Cargo.toml"
+  if [[ -f "$cargo_toml" ]]; then
+    feature_count=$(grep -c "^\[features\]" "$cargo_toml" 2>/dev/null || true)
+    bin_count=$(grep -E -c "^\s*\[\[bin\]\]" "$cargo_toml" 2>/dev/null || true)
+    workspace=$(grep -c "^\ \[workspace\]" "$cargo_toml" 2>/dev/null || echo 0)
+    say "  ${BLUE}${INFO} Info${RESET} ${WHITE}(features sections:${RESET} ${CYAN}${feature_count}${RESET}${WHITE}, bins:${RESET} ${CYAN}${bin_count}${RESET}${WHITE}, workspace:${RESET} ${CYAN}${workspace}${RESET}${WHITE})${RESET}"
+  else
+    print_finding "info" 1 "No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)"
+    _v2_add_finding "info" 1 "No Cargo.toml at project root (workspace? set PROJECT_DIR accordingly)" "" "${CATEGORY_NAME[18]}"
+  fi
+  fi
+}
+
+run_v2_recount(){
+  # Severity recount over the whole sink (cargo buckets carry "count").
+  python3 - "$1" <<'PYV2COUNT'
+import json, sys
+
+counts = {"critical": 0, "warning": 0, "info": 0}
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            sev = rec.get("severity", "info")
+            if sev not in counts:
+                sev = "info"
+            try:
+                counts[sev] += int(rec.get("count", 1))
+            except (TypeError, ValueError):
+                counts[sev] += 1
+except OSError:
+    pass
+print(counts["critical"], counts["warning"], counts["info"])
+PYV2COUNT
+}
+
+run_v2_summary_text(){
+  # Final Summary block, mirroring ubs-rust.sh 9786-9846 (text format only;
+  # the Partial: marker line is what flips the meta-runner to status partial).
+  echo ""
+  say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+  say "${BOLD}${CYAN}                    🎯 SCAN COMPLETE 🎯                                  ${RESET}"
+  say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+  echo ""
+  say "${WHITE}${BOLD}Summary Statistics:${RESET}"
+  say "  ${WHITE}Files scanned:${RESET}    ${CYAN}$TOTAL_FILES${RESET}"
+  say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$V2_CRITICAL${RESET}"
+  say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$V2_WARNING${RESET}"
+  say "  ${BLUE}Info items:${RESET}       ${BLUE}$V2_INFO${RESET}"
+  if [[ "$CARGO_UNAVAILABLE" -eq 1 ]]; then
+    say "  ${YELLOW}${BOLD}Partial:${RESET} [CARGO_UNAVAILABLE] ${YELLOW}cargo could not run — compilation, tests and lints were not evaluated${RESET}"
+    say "  ${DIM}${CARGO_UNAVAILABLE_MSG}${RESET}"
+  fi
+  echo ""
+  say "${BOLD}${WHITE}Priority Actions:${RESET}"
+  if [ "$V2_CRITICAL" -gt 0 ]; then
+    say "  ${RED}${FIRE} ${BOLD}FIX CRITICAL ISSUES IMMEDIATELY${RESET}"
+    say "  ${DIM}These cause crashes, security vulnerabilities, or data corruption${RESET}"
+  fi
+  if [ "$V2_WARNING" -gt 0 ]; then
+    say "  ${YELLOW}${WARN} ${BOLD}Review and fix WARNING items${RESET}"
+    say "  ${DIM}These cause bugs, performance issues, or maintenance problems${RESET}"
+  fi
+  if [ "$V2_INFO" -gt 0 ]; then
+    say "  ${BLUE}${INFO} ${BOLD}Consider INFO suggestions${RESET}"
+    say "  ${DIM}Code quality improvements and best practices${RESET}"
+  fi
+  if [ "$V2_CRITICAL" -eq 0 ] && [ "$V2_WARNING" -eq 0 ]; then
+    if [ "${#CARGO_SKIPPED_CATEGORIES[@]}" -gt 0 ]; then
+      say "\n  ${GREEN}${BOLD}${SPARKLE} No critical or warning issues found by static analysis ${SPARKLE}${RESET}"
+      say "  ${YELLOW}${WARN} Not evaluated (cargo phases skipped: ${CARGO_SKIP_REASON}): $(IFS='; '; echo "${CARGO_SKIPPED_CATEGORIES[*]}")${RESET}"
+    else
+      say "\n  ${GREEN}${BOLD}${SPARKLE} EXCELLENT! No critical or warning issues found ${SPARKLE}${RESET}"
+    fi
+  fi
+  echo ""
+  say "${DIM}Scan completed at: $(now)${RESET}"
+  if [[ -n "$OUTPUT_FILE" ]]; then
+    say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+  fi
+  echo ""
+  if [ "$VERBOSE" -eq 0 ]; then
+    say "${DIM}Tip: Run with -v/--verbose for more code samples per finding.${RESET}"
+  fi
+  say "${DIM}Add to CI: ./ubs --ci --fail-on-warning . > rust-bug-scan.txt${RESET}"
+  echo ""
+}
+
+run_v2_summary_json(){
+  # Legacy emit_json_summary shape (334-342) incl. the partial envelope.
+  local status_json='"status":"ok"'
+  if [[ "$CARGO_UNAVAILABLE" -eq 1 ]]; then
+    status_json="$(printf '"status":"partial","module_error":"CARGO_UNAVAILABLE","message":"%s"' \
+      "$(json_escape "cargo could not run, so compilation, tests and lints were not evaluated: ${CARGO_UNAVAILABLE_MSG}")")"
+  fi
+  printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
+    "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$V2_CRITICAL" "$V2_WARNING" "$V2_INFO" "$(json_escape "$(now)")" "$status_json"
+}
+
+run_v2_legacy_parity_bridges_rust(){
+  local sink="$1" text_out="${2:-}" json_out="${3:-}"
+  run_v2_cargo_phases
+  run_v2_cat_17_18
+  local counts
+  counts="$(run_v2_recount "$sink")"
+  V2_CRITICAL="$(echo "$counts" | awk '{print $1}')"
+  V2_WARNING="$(echo "$counts" | awk '{print $2}')"
+  V2_INFO="$(echo "$counts" | awk '{print $3}')"
+  if [[ "$FORMAT" == "json" ]]; then
+    run_v2_summary_json
+  else
+    {
+      run_v2_summary_text
+    } >>"$text_out"
+  fi
+  # Legacy exit formula (9866-9869).
+  local exit_code=0
+  if (( V2_CRITICAL >= FAIL_CRITICAL_THRESHOLD )); then exit_code=1; fi
+  if (( FAIL_ON_WARNING == 1 )) && (( V2_CRITICAL + V2_WARNING > 0 )); then exit_code=1; fi
+  if (( FAIL_WARNING_THRESHOLD > 0 )) && (( V2_WARNING >= FAIL_WARNING_THRESHOLD )); then exit_code=1; fi
+  return "$exit_code"
+}
+
+run_contract_v2_rust(){
+  local helpers_dir list_file sink checks text_out="" rule_dir="" exit_code=0
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-sink.XXXXXX)"
+  checks="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-checks.XXXXXX)"
+  TMP_FILES+=("$list_file" "$sink" "$checks")
+  V2_SINK="$sink"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  # --only whitelist -> v2 skip mapping (numeric tokens only; non-numeric
+  # tokens never match a category number, exactly like legacy category_enabled).
+  local v2_skip="$SKIP_CATEGORIES"
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    local keep="" c allowed w
+    local -a _wl
+    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
+    for c in $(seq 1 24); do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  # Consolidated ast-grep pack (the counter-relevant ad-hoc patterns; one
+  # `scan -c` per 400-path batch inside ubs_core.rust_ast).
+  if [[ "$HAS_AST_GREP" -eq 1 && "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-rustv2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.rust_rules import generate
+generate(Path('$rule_dir'))
+" 2>/dev/null; then
+      rule_dir=""
+    fi
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --checks-out "$checks"
+    --project-dir "$PROJECT_DIR" --skip "$v2_skip" --detail-limit "$DETAIL_LIMIT")
+  [[ -n "$rule_dir" ]] && scan_args+=(--ast-rule-dir "$rule_dir")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  [[ "${EXCLUDE_TESTS:-0}" -eq 1 ]] && scan_args+=(--exclude-tests)
+  [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -eq 1 ]] && scan_args+=(--skip-type-narrowing)
+  [[ "$QUIET" -eq 1 ]] && scan_args+=(--quiet)
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.rust_scan \
+    "${scan_args[@]}" --version "2.0.1" || exit_code=$?
+  # Legacy --emit-findings-json parity: preload the FIND_* arrays from the
+  # checks sidecar so the legacy emit_findings_json (289-332) can run after
+  # the cargo bridge with the full findings list in legacy shape.
+  if [[ -n "$EMIT_FINDINGS_JSON" ]]; then
+    while IFS=$'\t' read -r sev cnt cat ttl desc samples; do
+      add_finding "$sev" "$cnt" "$ttl" "$desc" "$cat" "$samples"
+    done < <(PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$checks" <<'PYV2FIND'
+import json, sys
+
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+for f in doc.get("findings", []):
+    samples = json.dumps(f.get("samples") or [])
+    print("\t".join([
+        f.get("severity", "info"), str(f.get("count", 0)),
+        f.get("category", ""), f.get("title", ""), f.get("description", ""),
+        samples,
+    ]))
+PYV2FIND
+)
+  fi
+  text_out="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-text.XXXXXX)"
+  TMP_FILES+=("$text_out")
+  run_v2_legacy_parity_bridges_rust "$sink" "$text_out" || exit_code=$?
+  if [[ "$FORMAT" != "json" ]]; then
+    cat "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  if [[ -n "$EMIT_FINDINGS_JSON" ]]; then
+    emit_findings_json "$EMIT_FINDINGS_JSON"
+    say "${GREEN}${CHECK} Findings JSON: ${CYAN}$EMIT_FINDINGS_JSON${RESET}"
+  fi
+  if [[ -n "$SUMMARY_JSON" ]]; then
+    cat >"$SUMMARY_JSON" <<JSON
+{
+  "files": $TOTAL_FILES,
+  "critical": $V2_CRITICAL,
+  "warning": $V2_WARNING,
+  "info": $V2_INFO,
+  "timestamp": "$(now)"
+}
+JSON
+    say "${GREEN}${CHECK} Summary JSON: ${CYAN}$SUMMARY_JSON${RESET}"
+  fi
+  [[ -n "$rule_dir" ]] && rm -rf -- "$rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_RUST:-0}" == "1" && "${UBS_LEGACY_MODULE_RUST:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without python3 or ast-grep the v2 layers cannot
+  # reproduce the legacy AST-backed counts — fall through so the legacy
+  # path produces its exact behavior.
+  if command -v python3 >/dev/null 2>&1 && [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    v2_status=0
+    run_contract_v2_rust || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: OWNERSHIP & ERROR HANDLING MACROS
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 1; then

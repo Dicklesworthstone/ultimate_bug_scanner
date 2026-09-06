@@ -72,6 +72,7 @@ EX_TOOLS="dialyzer,credo,sobelow,doctor,inch,mix_audit"
 EX_TIMEOUT="${EX_TIMEOUT:-1200}"
 
 SUMMARY_JSON=""
+REPORT_JSON=""                         # --report-json=FILE: NDJSON findings record stream (K2)
 SARIF_OUT=""
 JSON_OUT=""
 
@@ -116,6 +117,7 @@ Options:
   --json-out=FILE          Save full JSON report to file (text still prints)
   --sarif-out=FILE         Save SARIF to file (text still prints)
   --summary-json=FILE      Save brief summary counters JSON
+  --report-json=FILE       Also write the NDJSON findings record stream (contract-v2 sink)
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
   --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
@@ -145,6 +147,7 @@ while [[ $# -gt 0 ]]; do
     --json-out=*) JSON_OUT="${1#*=}"; shift;;
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
@@ -227,7 +230,7 @@ say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 emit_json_summary() {
   local ts json
   ts="$(safe_date)"
-  json="$(printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json"}\n' \
+  json="$(printf '{"language":"elixir","project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"status":"ok","timestamp":"%s","format":"json"}\n' \
     "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$(json_escape "$ts")")"
   printf '%s' "$json"
   if [[ -n "$SUMMARY_JSON" ]]; then
@@ -2358,6 +2361,336 @@ fi
 begin_scan_section
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Contract-v2 path (bead 0xjg.13): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.elixir_scan), NDJSON findings sink (K2 schema).
+#    Opt-in: UBS_CONTRACT_V2_ELIXIR=1 enables it; UBS_LEGACY_MODULE_ELIXIR=1
+#    always wins; sarif stays on the legacy path. No ast-grep layer: the
+#    elixir module ships no rule pack.
+# ── Legacy-parity bridge: mix-powered analyzers (category 16) ──────────────
+# External-tool output is printed verbatim; legacy print_finding counts are
+# mirrored into TOOL_COUNTS so the parity bridge can fold them into the
+# Summary Statistics block and the exit formula.
+TOOL_COUNTS=""
+v2_tool_finding(){
+  local severity=$1 count=$2 title=$3 description="${4:-}"
+  print_finding "$severity" "$count" "$title" "$description"
+  [[ "$severity" == "good" ]] && return 0
+  TOOL_COUNTS="${TOOL_COUNTS:+$TOOL_COUNTS,}$severity:$count"
+}
+run_v2_ex_tools(){
+  if [[ "$ENABLE_MIX_TOOLS" -ne 1 || "$HAS_MIX" -ne 1 ]]; then
+    say "  ${GRAY}${INFO} Mix-based analyzers disabled (--no-mix or mix not found)${RESET}"
+    return 0
+  fi
+  local TOOL
+  IFS=',' read -r -a EXTOOLS <<< "$EX_TOOLS"
+  for TOOL in "${EXTOOLS[@]}"; do
+    case "$TOOL" in
+      dialyzer)
+        print_subheader "dialyxir / mix dialyzer (static type analysis)"
+        if ( cd "$PROJECT_DIR" && mix help dialyzer >/dev/null 2>&1 ); then
+          say "  ${DIM}Running mix dialyzer (this may take a while on first run)...${RESET}"
+          output=$(run_mix_tool "dialyzer" --format short 2>&1 || true)
+          if [[ -n "$output" ]]; then
+            errs=$(echo "$output" | grep -c -E "error:|warning:" || true)
+            if [ "$errs" -gt 0 ]; then
+              v2_tool_finding "warning" "$errs" "Dialyzer found type discrepancies" "Run 'mix dialyzer' for full details"
+            else
+              print_finding "good" "Dialyzer passed with no warnings"
+            fi
+          else
+            print_finding "good" "Dialyzer analysis clean"
+          fi
+        else
+          say "  ${GRAY}${INFO} dialyxir not installed; add {:dialyxir, \"~> 1.4\", only: [:dev], runtime: false} to mix.exs${RESET}"
+        fi
+        ;;
+      credo)
+        print_subheader "credo (code quality / style)"
+        if ( cd "$PROJECT_DIR" && mix help credo >/dev/null 2>&1 ); then
+          say "  ${DIM}Running mix credo --strict...${RESET}"
+          output=$(run_mix_tool "credo" --strict --format flycheck 2>&1 || true)
+          if [[ -n "$output" ]]; then
+            issues=$(echo "$output" | grep -c -E "^.+:[0-9]+:" || true)
+            if [ "$issues" -gt 0 ]; then
+              v2_tool_finding "info" "$issues" "Credo found code quality issues" "Run 'mix credo --strict' for full details"
+            else
+              print_finding "good" "Credo passed with no issues"
+            fi
+          else
+            print_finding "good" "Credo analysis clean"
+          fi
+        else
+          say "  ${GRAY}${INFO} credo not installed; add {:credo, \"~> 1.7\", only: [:dev, :test], runtime: false} to mix.exs${RESET}"
+        fi
+        ;;
+      sobelow)
+        print_subheader "sobelow (Phoenix security analysis)"
+        if [[ "$IS_PHOENIX" -eq 1 ]]; then
+          if ( cd "$PROJECT_DIR" && mix help sobelow >/dev/null 2>&1 ); then
+            say "  ${DIM}Running mix sobelow --config...${RESET}"
+            output=$(run_mix_tool "sobelow" --config --format txt 2>&1 || true)
+            if [[ -n "$output" ]]; then
+              vulns=$(echo "$output" | grep -c -E "^\[" || true)
+              if [ "$vulns" -gt 0 ]; then
+                v2_tool_finding "warning" "$vulns" "Sobelow found security issues" "Run 'mix sobelow --config' for full details"
+              else
+                print_finding "good" "Sobelow found no security issues"
+              fi
+            else
+              print_finding "good" "Sobelow security scan clean"
+            fi
+          else
+            say "  ${GRAY}${INFO} sobelow not installed; add {:sobelow, \"~> 0.13\", only: [:dev, :test], runtime: false} to mix.exs${RESET}"
+          fi
+        else
+          say "  ${GRAY}${INFO} Not a Phoenix project; sobelow scan skipped${RESET}"
+        fi
+        ;;
+      doctor)
+        print_subheader "doctor (documentation / typespec checking)"
+        if ( cd "$PROJECT_DIR" && mix help doctor >/dev/null 2>&1 ); then
+          say "  ${DIM}Running mix doctor...${RESET}"
+          output=$(run_mix_tool "doctor" 2>&1 || true)
+          if [[ -n "$output" ]]; then
+            issues=$(echo "$output" | grep -c -E "FAILED|WARN" || true)
+            if [ "$issues" -gt 0 ]; then
+              v2_tool_finding "info" "$issues" "Doctor found documentation/typespec issues" "Run 'mix doctor' for full details"
+            else
+              print_finding "good" "Doctor check passed"
+            fi
+          else
+            print_finding "good" "Doctor analysis clean"
+          fi
+        else
+          say "  ${GRAY}${INFO} doctor not installed; add {:doctor, \"~> 0.21\", only: :dev} to mix.exs${RESET}"
+        fi
+        ;;
+      inch)
+        print_subheader "inch_ex (documentation coverage)"
+        if ( cd "$PROJECT_DIR" && mix help inch >/dev/null 2>&1 ); then
+          say "  ${DIM}Running mix inch...${RESET}"
+          output=$(run_mix_tool "inch" 2>&1 || true)
+          if [[ -n "$output" ]]; then
+            undoc=$(echo "$output" | grep -c -E "\[U\]|\[C\]" || true)
+            if [ "$undoc" -gt 5 ]; then
+              v2_tool_finding "info" "$undoc" "inch_ex found undocumented/incomplete modules" "Run 'mix inch' for full coverage report"
+            else
+              print_finding "good" "Documentation coverage looks good"
+            fi
+          else
+            print_finding "good" "inch_ex analysis clean"
+          fi
+        else
+          say "  ${GRAY}${INFO} inch_ex not installed; add {:inch_ex, \"~> 2.0\", only: [:dev, :test]} to mix.exs${RESET}"
+        fi
+        ;;
+      mix_audit)
+        print_subheader "mix_audit (dependency vulnerability audit)"
+        if ( cd "$PROJECT_DIR" && mix help deps.audit >/dev/null 2>&1 ); then
+          say "  ${DIM}Running mix deps.audit...${RESET}"
+          output=$(run_mix_tool "deps.audit" 2>&1 || true)
+          if [[ -n "$output" ]]; then
+            vulns=$(echo "$output" | grep -c -E "Vulnerability found|advisory" || true)
+            if [ "$vulns" -gt 0 ]; then
+              v2_tool_finding "critical" "$vulns" "MixAudit found dependency vulnerabilities" "Run 'mix deps.audit' and update affected dependencies"
+            else
+              print_finding "good" "No known dependency vulnerabilities"
+            fi
+          else
+            print_finding "good" "Dependency audit clean"
+          fi
+        elif command -v mix_audit >/dev/null 2>&1; then
+          say "  ${DIM}Running mix_audit...${RESET}"
+          output=$( ( cd "$PROJECT_DIR" && with_timeout "$EX_TIMEOUT" mix_audit ) 2>&1 || true)
+          if [[ -n "$output" ]]; then
+            vulns=$(echo "$output" | grep -c -E "Vulnerability found|advisory" || true)
+            if [ "$vulns" -gt 0 ]; then
+              v2_tool_finding "critical" "$vulns" "MixAudit found dependency vulnerabilities"
+            else
+              print_finding "good" "No known dependency vulnerabilities"
+            fi
+          fi
+        else
+          say "  ${GRAY}${INFO} mix_audit not installed; add {:mix_audit, \"~> 2.1\", only: [:dev, :test], runtime: false} to mix.exs${RESET}"
+        fi
+        ;;
+      *)
+        say "  ${GRAY}${INFO} Unknown tool '$TOOL' ignored${RESET}"
+        ;;
+    esac
+  done
+}
+
+# ── Legacy-parity bridges: record-less section headers + summary + exit ─────
+# The v2 renderer prints record-backed sections only, while the legacy module
+# announces every non-skipped category (print_header) even when nothing was
+# found there. The remainder is appended in legacy category order (text only),
+# followed by the final "Summary Statistics:" block recounted from the sink
+# (plus mix-tool counts) and the legacy exit formula.
+run_v2_legacy_parity_bridges_elixir(){
+  local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}" tool_counts="${6:-}"
+  local files_n bridge_rc=0
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
+    "$scan_exit" "$tool_counts" <<'PYV2BRIDGE' || bridge_rc=$?
+import json
+import sys
+
+(sink_path, text_out, files_raw, fow_raw, skip_csv, scan_exit_raw, tool_counts) = sys.argv[1:8]
+files_n = int(files_raw or 0)
+fail_on_warning = fow_raw == "1"
+skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
+scan_exit = int(scan_exit_raw or "0")
+as_text = bool(text_out)
+
+# Mirror elixir_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header
+# titles). Category 16 rides the module-side mix-tool bridge.
+SLUG = {1: "pattern-matching", 2: "error-handling", 3: "process-otp",
+        4: "security", 5: "phoenix", 6: "ecto", 7: "concurrency", 8: "io",
+        9: "debug", 10: "perf", 11: "code-quality", 12: "config",
+        13: "testing", 14: "mix", 15: "binary-safety", 16: "analyzers"}
+SECTION = {1: "1. PATTERN MATCHING & GUARDS", 2: "2. ERROR HANDLING & EXCEPTIONS",
+           3: "3. PROCESS & OTP LIFECYCLE", 4: "4. SECURITY VULNERABILITIES",
+           5: "5. PHOENIX-SPECIFIC ISSUES", 6: "6. ECTO & DATABASE",
+           7: "7. CONCURRENCY & MESSAGING", 8: "8. I/O & RESOURCE LIFECYCLE",
+           9: "9. DEBUGGING & PRODUCTION CODE", 10: "10. PERFORMANCE & MEMORY",
+           11: "11. CODE QUALITY MARKERS", 12: "12. CONFIGURATION & ENVIRONMENT",
+           13: "13. TESTING PATTERNS", 14: "14. DEPENDENCY & MIX HYGIENE",
+           15: "15. STRING & BINARY SAFETY", 16: "16. MIX-POWERED EXTRA ANALYZERS"}
+
+try:
+    with open(sink_path, encoding="utf-8") as fh:
+        records = [json.loads(line) for line in fh if line.strip()]
+except OSError:
+    records = []
+
+# Final severity recount over the whole sink, legacy exit formula inputs.
+counts = {"critical": 0, "warning": 0, "info": 0}
+for rec in records:
+    sev = rec.get("severity", "info")
+    counts[sev if sev in counts else "info"] += 1
+
+# Mix-tool counts from the module-side bridge (legacy print_finding bumps).
+for chunk in (tool_counts or "").split(","):
+    chunk = chunk.strip()
+    if not chunk or ":" not in chunk:
+        continue
+    sev, _, raw = chunk.rpartition(":")
+    sev = sev.strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        continue
+    if sev in counts and n > 0:
+        counts[sev] += n
+
+out = []
+
+def emit(line=""):
+    out.append(line)
+
+# Record-less section headers (text format only; json stdout stays machine-clean).
+if as_text:
+    covered = {str(rec.get("category_id", "")) for rec in records}
+    for num in sorted(SECTION):
+        if num in skip:
+            continue
+        slug = SLUG.get(num)
+        if slug is not None and f"elixir.{slug}" in covered:
+            continue  # the renderer already announced this section
+        emit(SECTION[num])
+    emit("")
+    emit("Summary Statistics:")
+    emit(f"Files scanned: {files_n}")
+    emit(f"Critical issues: {counts['critical']}")
+    emit(f"Warning issues: {counts['warning']}")
+    emit(f"Info items: {counts['info']}")
+    with open(text_out, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+exit_code = 1 if counts["critical"] else scan_exit
+if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+    exit_code = 1
+sys.exit(exit_code)
+PYV2BRIDGE
+  return "$bridge_rc"
+}
+
+run_contract_v2_elixir(){
+
+  local list_file sink helpers_dir exit_code=0 text_out=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    return 2
+  fi
+  # --only whitelist -> v2 skip mapping: skip every category NOT whitelisted
+  # (numeric tokens only; the legacy --only also accepts names, which the v2
+  # path maps through the same slug table).
+  local v2_skip="$SKIP_CATEGORIES"
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    local keep="" c allowed w
+    local -a _wl
+    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
+    for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: Path.write_text on
+      # /dev/stdout re-truncates a regular-file capture at its own offset,
+      # which would stomp the legacy-parity bridge text appended below.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 elixir path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_ELIXIR=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.elixir_scan \
+    "${scan_args[@]}" --version "1.0.2" || exit_code=$?
+  # Category 16 parity bridge: raw mix-tool passthrough (legacy print_finding
+  # counts mirrored into TOOL_COUNTS for the summary/exit bridge below).
+  if [[ ",$v2_skip," != *",16,"* ]]; then
+    run_v2_ex_tools
+  fi
+  # Record-less section headers + Summary Statistics + legacy exit formula.
+  run_v2_legacy_parity_bridges_elixir "$sink" "$list_file" "$exit_code" "$text_out" \
+    "$v2_skip" "$TOOL_COUNTS" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_ELIXIR:-0}" == "1" && "${UBS_LEGACY_MODULE_ELIXIR:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without a working python3 the v2 path cannot run any of
+  # the detection layers — fall through so the legacy path produces its exact
+  # env-error behavior (info findings, exit codes).
+  if command -v python3 >/dev/null 2>&1; then
+    v2_status=0
+    run_contract_v2_elixir || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: PATTERN MATCHING & GUARDS
 # ═══════════════════════════════════════════════════════════════════════════
 if run_category 1; then
@@ -3184,6 +3517,13 @@ if [[ -n "$SUMMARY_JSON" ]]; then
   mkdir -p "$(dirname "$SUMMARY_JSON")" 2>/dev/null || true
   printf '{"timestamp":"%s","files":%s,"critical":%s,"warning":%s,"info":%s}\n' \
      "$(safe_date)" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" >"$SUMMARY_JSON"
+fi
+if [[ -n "$REPORT_JSON" ]]; then
+  # Legacy path: the summary counters object (the NDJSON findings record
+  # stream is a contract-v2 feature; see run_contract_v2_elixir).
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  printf '{"timestamp":"%s","files":%s,"critical":%s,"warning":%s,"info":%s}\n' \
+     "$(safe_date)" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" >"$REPORT_JSON"
 fi
 
 echo ""

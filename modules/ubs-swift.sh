@@ -368,7 +368,7 @@ while [[ $# -gt 0 ]]; do
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
   --rules=*) USER_RULE_DIR="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
-    --report-md=*) REPORT_MD="${1#*=}"; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --emit-csv=*) EMIT_CSV="${1#*=}"; shift;;
     --emit-html=*) EMIT_HTML="${1#*=}"; shift;;
     --max-detailed=*) MAX_DETAILED="${1#*=}"; shift;;
@@ -2902,6 +2902,169 @@ samples = '; '.join(f'{file}:{line}:{code}' for file, line, code in findings[:3]
 print(f"{len(findings)}\t{samples}")
 PY
 }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Contract-v2 path (bead 0xjg.11): ONE file list (ubs_list_files), ONE python
+#    orchestrator (ubs_core.swift_scan), NDJSON findings sink (K2 schema).
+#    Opt-in: UBS_CONTRACT_V2_SWIFT=1 enables it; UBS_LEGACY_MODULE_SWIFT=1
+#    always wins; sarif stays on the legacy path.
+# ── Legacy-parity bridges: optional analyzers + summary + exit code ─────────
+# The v2 renderer prints record-backed sections (headers, subheaders, good
+# notes) for categories 1-23 plus the ast-grep rule-pack section. The module
+# appends the optional-analyzer passthrough (real legacy functions, so the
+# say/opt_push_counts behavior is byte-identical) and the Summary Statistics
+# block recounted from the sink.
+run_contract_v2_swift(){
+  local list_file sink helpers_dir exit_code=0 text_out=""
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-list.XXXXXX)"
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-sink.XXXXXX)"
+  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  if [[ ! -e "$PROJECT_DIR" ]]; then
+    echo -e "${RED}${BOLD}Project path not found:${RESET} ${WHITE}$PROJECT_DIR${RESET}" >&2
+    rm -f "$list_file" "$sink" 2>/dev/null || true
+    return 2
+  fi
+  if [[ -f "$PROJECT_DIR" ]]; then
+    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed" >&2
+    rm -f "$list_file" "$sink" 2>/dev/null || true
+    return 2
+  fi
+  # --only whitelist / UBS_CATEGORY_FILTER whitelist -> v2 skip mapping: skip
+  # every category NOT whitelisted (legacy should_run_category order: only,
+  # then whitelist, then skip).
+  local v2_skip="$SKIP_CATEGORIES" c allowed w
+  local -a _wl whitelist
+  if [[ -n "$ONLY_CATEGORIES" || -n "$CATEGORY_WHITELIST" ]]; then
+    local keep="" source_csv="${ONLY_CATEGORIES:-$CATEGORY_WHITELIST}"
+    IFS=',' read -r -a _wl <<<"$(echo "$source_csv" | tr -d ' ')"
+    for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do
+      allowed=0
+      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
+      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
+    done
+    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
+  fi
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
+  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -eq 1 ]] && scan_args+=(--skip-type-narrowing)
+  [[ "${VERBOSE:-0}" -eq 1 ]] && scan_args+=(--detail-limit 10)
+  # Consolidated ast-grep layer: the ONE generated rule (+ user --rules=DIR)
+  # into a single sgconfig; the stream feeds the cat-4 correlation detector
+  # and the rule-pack summary buckets.
+  local ast_rule_dir="" ast_available=0
+  if check_ast_grep && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    ast_available=1
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-swv2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.swift_rules import generate
+generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null; then
+      rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+      ast_rule_dir=""
+    fi
+  fi
+  [[ "$ast_available" -eq 1 ]] && scan_args+=(--ast-available)
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  case "$FORMAT" in
+    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    text)
+      # The report goes to a real file, not /dev/stdout: the renderer writes
+      # with Path.write_text, which would re-truncate a regular-file capture.
+      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-text.XXXXXX)"
+      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      ;;
+    *) echo "ERROR: contract-v2 swift path supports text|json (got $FORMAT); set UBS_LEGACY_MODULE_SWIFT=1" >&2; return 2 ;;
+  esac
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.swift_scan \
+    "${scan_args[@]}" --max-detailed "$MAX_DETAILED" --version "$VERSION" || exit_code=$?
+  if [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  # Optional-analyzer parity bridge: run the real legacy functions (say +
+  # opt_push_counts; totals only change under UBS_INCLUDE_OPTIONALS_IN_TOTALS).
+  if [[ "$FORMAT" == "text" ]]; then
+    print_header "OPTIONAL ANALYZERS (if installed)"
+    resolve_timeout || true
+    run_swiftlint
+    run_swiftformat
+    run_periphery
+    run_xcodebuild_analyze
+  fi
+  # Summary Statistics recounted from the sink (the meta-runner parses these
+  # labels; the legacy exit formula is applied by swift_scan itself).
+  local crit warn infos
+  read -r crit warn infos <<<"$(PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+import json, sys
+counts = {'critical': 0, 'warning': 0, 'info': 0}
+try:
+    with open(sys.argv[1], encoding='utf-8') as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            sev = rec.get('severity', 'info')
+            if sev in counts:
+                counts[sev] += int(rec.get('count', 1) or 0)
+except OSError:
+    pass
+print(counts['critical'], counts['warning'], counts['info'])
+" "$sink" 2>/dev/null)" || true
+  crit=${crit:-0}; warn=${warn:-0}; infos=${infos:-0}
+  if [[ "$FORMAT" == "text" ]]; then
+    echo ""
+    say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+    say "${BOLD}${CYAN} 🎯 SCAN COMPLETE 🎯 ${RESET}"
+    say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+    say "${WHITE}${BOLD}Summary Statistics:${RESET}"
+    local files_n
+    files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+    say " ${WHITE}Files scanned:${RESET} ${CYAN}$files_n${RESET}"
+    say " ${RED}${BOLD}Critical issues:${RESET} ${RED}$crit${RESET}"
+    say " ${YELLOW}Warning issues:${RESET} ${YELLOW}$warn${RESET}"
+    say " ${BLUE}Info items:${RESET} ${BLUE}$infos${RESET}"
+    echo ""
+    say "${BOLD}${WHITE}Priority Actions:${RESET}"
+    if [[ "$crit" -gt 0 ]]; then
+      say " ${RED}${FIRE} ${BOLD}FIX CRITICAL ISSUES IMMEDIATELY${RESET}"
+      say " ${DIM}These cause crashes, security vulnerabilities, or deadlocks${RESET}"
+    fi
+    if [[ "$warn" -gt 0 ]]; then
+      say " ${YELLOW}${WARN} ${BOLD}Review and fix WARNING items${RESET}"
+      say " ${DIM}These cause bugs, performance issues, or maintenance problems${RESET}"
+    fi
+    if [[ "$infos" -gt 0 ]]; then
+      say " ${BLUE}${INFO} ${BOLD}Consider INFO suggestions${RESET}"
+      say " ${DIM}Code quality improvements and best practices${RESET}"
+    fi
+  fi
+  if [[ -n "$REPORT_JSON" ]]; then
+    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+  fi
+  rm -f "$list_file" "$sink" 2>/dev/null || true
+  [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+  return "$exit_code"
+}
+
+if [[ "${UBS_CONTRACT_V2_SWIFT:-0}" == "1" && "${UBS_LEGACY_MODULE_SWIFT:-0}" != "1" && "$FORMAT" != "sarif" ]]; then
+  # Env-error parity: without a working python3 the v2 path cannot run any of
+  # the detection layers — fall through so the legacy path produces its exact
+  # env-error behavior (info findings, exit codes). NO ast-grep requirement:
+  # the pattern/detector/analyzers layers run in-process either way.
+  if command -v python3 >/dev/null 2>&1; then
+    v2_status=0
+    run_contract_v2_swift || v2_status=$?
+    exit "$v2_status"
+  fi
+fi
 
 if [[ ! -e "$PROJECT_DIR" ]]; then
   echo -e "${RED}${BOLD}Project path not found:${RESET} ${WHITE}$PROJECT_DIR${RESET}" >&2

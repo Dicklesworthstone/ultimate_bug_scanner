@@ -926,14 +926,14 @@ def cat_8(scan: Scan, r: Renderer) -> None:
          "Use jsonwebtoken::decode with a real DecodingKey and Validation that keeps signature, expiration, issuer, and audience checks enabled and required; avoid dangerous::insecure_decode, dangerous_unsafe_decode, insecure_disable_signature_validation(), validate_exp=false, and validate_aud=false",
          3, "No JWT decode/validation bypass patterns detected")
     r.subheader("Shell command execution through -c/-lc")
-    shell = scan.ast_hits([
+    shell = (scan.ast_hits([
         "shell_std_arg_c", "shell_arg_c", "shell_std_arg_lc", "shell_arg_lc",
         "shell_std_arg_wc", "shell_arg_wc", "shell_std_arg_wcl", "shell_arg_wcl",
         "shell_std_args_c", "shell_args_c", "shell_std_args_lc", "shell_args_lc",
         "shell_std_args_wc", "shell_args_wc", "shell_std_args_wcl", "shell_args_wcl",
         "shell_std_argsref_c", "shell_argsref_c", "shell_std_argsref_lc", "shell_argsref_lc",
         "shell_std_argsref_wc", "shell_argsref_wc", "shell_std_argsref_wcl", "shell_argsref_wcl",
-    ]) + scan.rg_lines(r"(std::process::)?Command::new\([^)]*\)[^;]*\.(arg|args)\([^;]*(\"(-c|-lc|/C|/c)\")")
+    ]) or scan.rg_lines(r"(std::process::)?Command::new\([^)]*\)[^;]*\.(arg|args)\([^;]*(\"(-c|-lc|/C|/c)\")"))
     if shell:
         r.finding("critical", len(shell), "Shell command execution via -c/-lc",
                   "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input", shell[:5], 5)

@@ -198,6 +198,7 @@ while [[ $# -gt 0 ]]; do
     --no-all-targets)  CARGO_TARGETS_ALL=0; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+    --emit-findings-json=*) EMIT_FINDINGS_JSON="${1#*=}"; shift;;
     --strict-gitignore) STRICT_GITIGNORE=1; shift;;
     --exclude-tests) EXCLUDE_TESTS=1; shift;;
     --fail-critical=*) FAIL_CRITICAL_THRESHOLD="${1#*=}"; shift;;
@@ -338,7 +339,7 @@ emit_json_summary() {
     status_json="$(printf '"status":"partial","module_error":"CARGO_UNAVAILABLE","message":"%s"' \
       "$(json_escape "cargo could not run, so compilation, tests and lints were not evaluated: ${CARGO_UNAVAILABLE_MSG}")")"
   fi
-  printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
+  printf '{"language":"rust","project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
     "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" "$(json_escape "$(now)")" "$status_json"
 }
 
@@ -8667,7 +8668,7 @@ run_v2_summary_json(){
     status_json="$(printf '"status":"partial","module_error":"CARGO_UNAVAILABLE","message":"%s"' \
       "$(json_escape "cargo could not run, so compilation, tests and lints were not evaluated: ${CARGO_UNAVAILABLE_MSG}")")"
   fi
-  printf '{"project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
+  printf '{"language":"rust","project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
     "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$V2_CRITICAL" "$V2_WARNING" "$V2_INFO" "$(json_escape "$(now)")" "$status_json"
 }
 

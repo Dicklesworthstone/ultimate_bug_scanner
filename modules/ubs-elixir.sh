@@ -54,6 +54,7 @@ VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
 FORMAT="text"          # text|json|sarif
+LIST_CATS=0
 CI_MODE=0
 FAIL_ON_WARNING=0
 INCLUDE_EXT="ex,exs,eex,heex,leex,sface"
@@ -118,6 +119,7 @@ Options:
   --sarif-out=FILE         Save SARIF to file (text still prints)
   --summary-json=FILE      Save brief summary counters JSON
   --report-json=FILE       Also write the NDJSON findings record stream (contract-v2 sink)
+  --list-categories        Print numeric category map and exit
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
   --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
@@ -148,6 +150,7 @@ while [[ $# -gt 0 ]]; do
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+    --list-categories) LIST_CATS=1; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
@@ -203,6 +206,29 @@ is_machine_format(){ [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; }
 if is_machine_format; then
   QUIET=1
   USE_COLOR=0
+fi
+
+# ── Early list-categories helper ────────────────────────────────────────────
+if [[ "$LIST_CATS" -eq 1 ]]; then
+  cat <<CATS
+1  Pattern Matching & Guards
+2  Error Handling & Exceptions
+3  Process & OTP Lifecycle
+4  Security Vulnerabilities
+5  Phoenix-Specific Issues
+6  Ecto & Database
+7  Concurrency & Messaging
+8  I/O & Resource Lifecycle
+9  Debugging & Production Code
+10 Performance & Memory
+11 Code Quality Markers
+12 Configuration & Environment
+13 Testing Patterns
+14 Dependency & Mix Hygiene
+15 String & Binary Safety
+16 Mix-Powered Extra Analyzers
+CATS
+  exit 0
 fi
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -2360,6 +2386,7 @@ fi
 # relax pipefail for scanning (optional)
 begin_scan_section
 
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Contract-v2 path (bead 0xjg.13): ONE file list (ubs_list_files), ONE python
 #    orchestrator (ubs_core.elixir_scan), NDJSON findings sink (K2 schema).
@@ -2623,9 +2650,15 @@ run_contract_v2_elixir(){
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-sink.XXXXXX)"
   helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  # A tree with no elixir-source matches makes `rg --files` exit 1 — that is
+  # a valid EMPTY scan (legacy reported zero files happily), not a failure.
+  local list_rc=0
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
-  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+  else
+    ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file" || list_rc=$?
+  fi
+  if [[ "$list_rc" -gt 1 ]] && ! [[ -s "$list_file" ]]; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2
   fi
@@ -2648,7 +2681,13 @@ run_contract_v2_elixir(){
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   case "$FORMAT" in
-    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    json)
+      # Machine format: the summary doc must be the ONLY stdout content, and
+      # the meta-runner captures module stdout as the json document. Give the
+      # orchestrator a real fd 3 pointing at stdout (standalone runs have no
+      # open fd 3).
+      exec 3>&1
+      scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text)
       # The report goes to a real file, not /dev/stdout: Path.write_text on
       # /dev/stdout re-truncates a regular-file capture at its own offset,

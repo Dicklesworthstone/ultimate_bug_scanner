@@ -39,7 +39,38 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_LIB_CHECKSUM="64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
+    UBS_MODULE_LIB_DIR="$UBS_VERIFIED_ASSET_DIR"
+  elif [[ -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+      echo "warning: UBS_ALLOW_UNVERIFIED_HELPERS=1: using unverified lib at ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" >&2
+    else
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh found at unverified location; refusing to load unverified library (set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" >&2
+      exit 2
+    fi
+  fi
+fi
+if [[ -z "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+    : # override allows unverified
+  elif [[ -n "${UBS_LIB_CHECKSUM:-}" && -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    _lib_sha=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      _lib_sha="$(sha256sum "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      _lib_sha="$(shasum -a 256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+      _lib_sha="$(openssl dgst -sha256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $NF}')"
+    fi
+    if [[ -n "$_lib_sha" && "$_lib_sha" != "$UBS_LIB_CHECKSUM" ]]; then
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh failed checksum verification (expected $UBS_LIB_CHECKSUM, got $_lib_sha); refusing to load unverified library (run 'ubs doctor --fix' or reinstall)" >&2
+      exit 2
+    fi
+  fi
+fi
 if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
@@ -552,10 +583,11 @@ rg_or_grep_targets() {
 
 # Resource lifecycle correlation helper (optional)
 run_resource_lifecycle_checks() {
-  local helper="$SCRIPT_DIR/helpers/resource_lifecycle_go.go"
+  local helper=""
+  ubs_resolve_helper helper "helpers/resource_lifecycle_go.go" || helper=""
   print_subheader "Resource lifecycle correlation"
-  if [[ ! -f "$helper" ]]; then
-    print_finding "info" 0 "Resource helper missing" "Expected $helper"
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
+    print_finding "info" 0 "Resource helper missing" "Expected helpers/resource_lifecycle_go.go"
     return
   fi
   if ! command -v go >/dev/null 2>&1; then
@@ -4999,10 +5031,9 @@ PYV2BRIDGE
 }
 
 run_contract_v2_go(){
-  local list_file sink helpers_dir exit_code=0 text_out="" tally_file="" ast_rule_dir=""
-  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-list.XXXXXX)"
-  sink="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-sink.XXXXXX)"
-  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  local list_file sink exit_code=0 text_out="" tally_file="" ast_rule_dir=""
+  local helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
@@ -5058,9 +5089,11 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   # record-less section headers + cat-16 tally, and the final "Summary
   # Statistics:" block with the legacy exit formula (7935-7937).
   local life_raw="" life_status=0 run_life=0
-  if [[ ",$v2_skip," != *",17,"* && -f "$SCRIPT_DIR/helpers/resource_lifecycle_go.go" ]] && command -v go >/dev/null 2>&1; then
+  local go_life_helper=""
+  ubs_resolve_helper go_life_helper "helpers/resource_lifecycle_go.go" || go_life_helper=""
+  if [[ ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
     life_raw="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-life.XXXXXX)"
-    if go run "$SCRIPT_DIR/helpers/resource_lifecycle_go.go" -- "$PROJECT_DIR" >"$life_raw" 2>/dev/null; then
+    if go run "$go_life_helper" -- "$PROJECT_DIR" >"$life_raw" 2>/dev/null; then
       life_status=0
     else
       life_status=$?

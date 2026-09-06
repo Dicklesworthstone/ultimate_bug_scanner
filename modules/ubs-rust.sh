@@ -39,7 +39,38 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_LIB_CHECKSUM="64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
+    UBS_MODULE_LIB_DIR="$UBS_VERIFIED_ASSET_DIR"
+  elif [[ -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+      echo "warning: UBS_ALLOW_UNVERIFIED_HELPERS=1: using unverified lib at ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" >&2
+    else
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh found at unverified location; refusing to load unverified library (set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" >&2
+      exit 2
+    fi
+  fi
+fi
+if [[ -z "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+    : # override allows unverified
+  elif [[ -n "${UBS_LIB_CHECKSUM:-}" && -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    _lib_sha=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      _lib_sha="$(sha256sum "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      _lib_sha="$(shasum -a 256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+      _lib_sha="$(openssl dgst -sha256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $NF}')"
+    fi
+    if [[ -n "$_lib_sha" && "$_lib_sha" != "$UBS_LIB_CHECKSUM" ]]; then
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh failed checksum verification (expected $UBS_LIB_CHECKSUM, got $_lib_sha); refusing to load unverified library (run 'ubs doctor --fix' or reinstall)" >&2
+      exit 2
+    fi
+  fi
+fi
 if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
@@ -451,8 +482,9 @@ PY
 }
 
 run_rust_type_narrowing_checks() {
-  local helper="$SCRIPT_DIR/helpers/type_narrowing_rust.py"
-  if [[ ! -f "$helper" ]]; then
+  local helper=""
+  ubs_resolve_helper helper "helpers/type_narrowing_rust.py" || helper=""
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
     return
   fi
   if [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -eq 1 ]]; then
@@ -773,9 +805,11 @@ build_scan_file_list() {
       printf '%s\n' "$f" >>"$final_tmp"
     done <"$base_tmp"
     # GH #80: exclude files reachable only via #[cfg(test)]-gated `mod` decls.
-    if [[ "$have_python3" -eq 1 && -f "$SCRIPT_DIR/helpers/cfg_test_only_modules_rust.py" ]]; then
+    local cfg_helper=""
+    ubs_resolve_helper cfg_helper "helpers/cfg_test_only_modules_rust.py" || cfg_helper=""
+    if [[ "$have_python3" -eq 1 && -n "$cfg_helper" && -f "$cfg_helper" ]]; then
       local test_only_out
-      test_only_out="$(python3 "$SCRIPT_DIR/helpers/cfg_test_only_modules_rust.py" --files-from "$final_tmp" 2>/dev/null || true)"
+      test_only_out="$(python3 "$cfg_helper" --files-from "$final_tmp" 2>/dev/null || true)"
       if [[ -n "$test_only_out" ]]; then
         local t rp pruned_tmp
         declare -A _drop=()
@@ -8705,8 +8739,8 @@ run_v2_legacy_parity_bridges_rust(){
 }
 
 run_contract_v2_rust(){
-  local helpers_dir list_file sink checks text_out="" rule_dir="" exit_code=0
-  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  local helpers_dir="" list_file sink checks text_out="" rule_dir="" exit_code=0
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-sink.XXXXXX)"
   checks="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-checks.XXXXXX)"

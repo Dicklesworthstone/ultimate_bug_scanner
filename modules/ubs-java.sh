@@ -36,7 +36,38 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_LIB_CHECKSUM="64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
+    UBS_MODULE_LIB_DIR="$UBS_VERIFIED_ASSET_DIR"
+  elif [[ -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+      echo "warning: UBS_ALLOW_UNVERIFIED_HELPERS=1: using unverified lib at ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" >&2
+    else
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh found at unverified location; refusing to load unverified library (set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" >&2
+      exit 2
+    fi
+  fi
+fi
+if [[ -z "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+    : # override allows unverified
+  elif [[ -n "${UBS_LIB_CHECKSUM:-}" && -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    _lib_sha=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      _lib_sha="$(sha256sum "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      _lib_sha="$(shasum -a 256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+      _lib_sha="$(openssl dgst -sha256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $NF}')"
+    fi
+    if [[ -n "$_lib_sha" && "$_lib_sha" != "$UBS_LIB_CHECKSUM" ]]; then
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh failed checksum verification (expected $UBS_LIB_CHECKSUM, got $_lib_sha); refusing to load unverified library (run 'ubs doctor --fix' or reinstall)" >&2
+      exit 2
+    fi
+  fi
+fi
 if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
@@ -501,8 +532,9 @@ run_resource_lifecycle_checks() {
     print_finding "warning" "$stream_count" "File streams opened without close()" "$desc"
   fi
 
-  local jdbc_helper="$SCRIPT_DIR/helpers/resource_lifecycle_java.py"
-  if [[ -f "$jdbc_helper" ]] && command -v python3 >/dev/null 2>&1; then
+  local jdbc_helper=""
+  ubs_resolve_helper jdbc_helper "helpers/resource_lifecycle_java.py" || jdbc_helper=""
+  if [[ -n "$jdbc_helper" && -f "$jdbc_helper" ]] && command -v python3 >/dev/null 2>&1; then
     local helper_output
     if helper_output="$(python3 "$jdbc_helper" "$PROJECT_DIR" 2>/dev/null)" && [[ -n "$helper_output" ]]; then
       local stmt_count=0 rs_count=0
@@ -2283,11 +2315,10 @@ run_kotlin_type_narrowing_checks() {
     print_finding "info" 0 "Kotlin type narrowing checks skipped" "Set UBS_SKIP_TYPE_NARROWING=0 or remove --skip-type-narrowing to re-enable"
     return 0
   fi
-  local script_dir helper
-  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  helper="$script_dir/helpers/type_narrowing_kotlin.py"
-  if [[ ! -f "$helper" ]]; then
-    print_finding "info" 0 "Kotlin type narrowing helper missing" "$helper not found"
+  local helper=""
+  ubs_resolve_helper helper "helpers/type_narrowing_kotlin.py" || helper=""
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
+    print_finding "info" 0 "Kotlin type narrowing helper missing" "helpers/type_narrowing_kotlin.py not found"
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
@@ -2329,11 +2360,10 @@ run_swift_type_narrowing_checks() {
     print_finding "info" 0 "Swift type narrowing checks skipped" "Set UBS_SKIP_TYPE_NARROWING=0 or remove --skip-type-narrowing to re-enable"
     return 0
   fi
-  local script_dir helper
-  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  helper="$script_dir/helpers/type_narrowing_swift.py"
-  if [[ ! -f "$helper" ]]; then
-    print_finding "info" 0 "Swift type narrowing helper missing" "$helper not found"
+  local helper=""
+  ubs_resolve_helper helper "helpers/type_narrowing_swift.py" || helper=""
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
+    print_finding "info" 0 "Swift type narrowing helper missing" "helpers/type_narrowing_swift.py not found"
     return 0
   fi
   if ! command -v python3 >/dev/null 2>&1; then
@@ -3422,10 +3452,9 @@ PYV2BRIDGE
 }
 
 run_contract_v2_java(){
-  local list_file sink helpers_dir exit_code=0 ast_rule_dir="" text_out="" v2_json_out=""
-  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-javav2-list.XXXXXX)"
-  sink="$(mktemp 2>/dev/null || mktemp -t ubs-javav2-sink.XXXXXX)"
-  helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  local list_file sink exit_code=0 ast_rule_dir="" text_out="" v2_json_out=""
+  local helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then

@@ -49,16 +49,16 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='6b9103091935e8903cfe3165abada92b3a6e9db5671ee3875740396f12bc809e'
-  [csharp]='1aad7523b3d195a3b0def7ba115102f14f2263bee6e0ed02c0fab1697f986974'
-  [elixir]='ba54781fcd3591e70b1b49f866b4f36abb7d8ecfcd6f7350c2dbd73e053b133a'
-  [golang]='9656e4419a18b96b8bec94563879b2a33e73825c82fe281956beed713f2b6945'
-  [java]='1777b8730d3008700bcd8a93d992f4ae33bc4e4c71e303ac17900f7b87032231'
-  [js]='3c76ed857568fc515d27add5c26b9ab683a024af955dcf097b5cf56d6b5eea11'
-  [python]='12853ab052da094a7cf4362e04d25e6fcc1f0dd8b4a64a64966249bca695e83d'
-  [ruby]='41f29d7f1054f4429034badd3088103f962b0b9cb6df1c6073e334143cc8f624'
-  [rust]='fb25db0292750fa1442b738cb78dc490f893083e206bccada76ed1c94dde81a9'
-  [swift]='a3eddb3d35fbb7d4aa466228a056c99bcacbb598ed45fc6a45ce0935e57b0a49'
+  [cpp]='08330b7ee067ff571e0aa9ddeb25dfd91bc96631462003da3cc6efa09943b51c'
+  [csharp]='24bc10c2062f0ae5cd43440c2f50d3b94744456537aafdf5371eeda222d7d0e4'
+  [elixir]='9373438547a1a46a825bd3c0ccaa87abb58207c82ce6de56c490165b9872e776'
+  [golang]='5fffaefb0d0c5f65813d361bca2f11d8159f305cd19a32e91a0090f51f2aa11e'
+  [java]='542e56492d78f9c594a37a77357be0dad01db82ee6eee3279b324abcaa11963d'
+  [js]='bf341af8774407aebb2c579625bb54aac2e4d49282dc3f569e0fba10fb463f9f'
+  [python]='5ff30c29dc00d2d272697aa299582a773887160a328deea44635d8fe0b2a46b5'
+  [ruby]='677e1a18838225e7d0fcf528dfc1050993c2656bb237ea2b65da4f7a48268ea6'
+  [rust]='87eb3050eac1a70f293ffe0807caf885f5372acfe679fccbf438dc317365c017'
+  [swift]='63e7a6f33604f0a126b684553025d15bcb3ad64217e74d12c244486272d61834'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -397,7 +397,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='ae19424f3b25d31ea71fff1f1fd6f3f8f65c05ef046f7ac85dcde9c17937dbd3'
   ['helpers/ubs_core/swift_scan.py']='006def40ab25a5addb8d97a85fc269db735bbe47eecdae8b5850b6fc9fc9fa5b'
-  ['lib/ubs-common.sh']='cce2e8ce1824ce466010a2a2179c9282f6674518bd6b72785b72a1ed7c3e0016'
+  ['lib/ubs-common.sh']='64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6132,6 +6132,19 @@ run_lang(){
   export UBS_CONTRACT_V2_SWIFT="${UBS_CONTRACT_V2_SWIFT:-${UBS_CONTRACT_V2:-1}}"
   export UBS_CONTRACT_V2_CSHARP="${UBS_CONTRACT_V2_CSHARP:-${UBS_CONTRACT_V2:-1}}"
   export UBS_CONTRACT_V2_ELIXIR="${UBS_CONTRACT_V2_ELIXIR:-${UBS_CONTRACT_V2:-1}}"
+  local verified_dir=""
+  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+    verified_dir="$UBS_VERIFIED_ASSET_DIR"
+  elif [[ "${HELPERS_READY:-0}" -eq 1 && -n "${MODULE_DIR:-}" && -d "$MODULE_DIR" ]]; then
+    verified_dir="$MODULE_DIR"
+  elif [[ "$module" == "$(script_dir)/modules/"* ]]; then
+    verified_dir="$(script_dir)/modules"
+  elif [[ -n "${MODULE_DIR:-}" && -d "$MODULE_DIR" ]]; then
+    verified_dir="$MODULE_DIR"
+  fi
+  if [[ -n "$verified_dir" ]]; then
+    export UBS_VERIFIED_ASSET_DIR="$verified_dir"
+  fi
   : > "$err" 2>/dev/null || true
 
   if [[ "${QUIET:-0}" -eq 0 ]]; then

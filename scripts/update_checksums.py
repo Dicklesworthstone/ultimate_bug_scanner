@@ -65,6 +65,7 @@ def main():
         print(f"  {lang}: {checksum}")
         new_checksums[lang] = checksum
 
+    # Step 1: Compute checksums for all helper assets
     helper_map = {
         "helpers/async_task_handles_csharp.py": "helpers/async_task_handles_csharp.py",
         "helpers/cfg_test_only_modules_rust.py": "helpers/cfg_test_only_modules_rust.py",
@@ -80,13 +81,8 @@ def main():
         "helpers/type_narrowing_rust.py": "helpers/type_narrowing_rust.py",
         "helpers/type_narrowing_kotlin.py": "helpers/type_narrowing_kotlin.py",
         "helpers/type_narrowing_swift.py": "helpers/type_narrowing_swift.py",
-        # Shared module library (bead A1): shipped and verified like a helper.
-        "lib/ubs-common.sh": "lib/ubs-common.sh",
     }
 
-    new_helper_checksums: dict[str, str] = {}
-    # ubs_core package (beads A2/A6): every shipped file is pinned and verified
-    # exactly like a flat helper, including nested analyzer modules.
     core_dir = modules_dir / "helpers" / "ubs_core"
     if core_dir.is_dir():
         for path in sorted(core_dir.rglob("*")):
@@ -94,6 +90,7 @@ def main():
                 rel = "helpers/ubs_core/" + path.relative_to(core_dir).as_posix()
                 helper_map[rel] = rel
 
+    new_helper_checksums: dict[str, str] = {}
     for rel in sorted(helper_map):
         path = modules_dir / helper_map[rel]
         if not path.exists():
@@ -103,28 +100,87 @@ def main():
         print(f"  {rel}: {checksum}")
         new_helper_checksums[rel] = checksum
 
-    # Read ubs script
+    # Step 2: Update UBS_COMMON_HELPER_CHECKSUMS in modules/lib/ubs-common.sh
+    lib_common = modules_dir / "lib" / "ubs-common.sh"
+    if lib_common.exists():
+        lib_content = lib_common.read_text(encoding="utf-8")
+        lib_helper_pattern = re.compile(
+            r"(declare\s+(?:-g\s+)?-A\s+UBS_COMMON_HELPER_CHECKSUMS=\s*\()([\s\S]*?)(\))",
+            re.MULTILINE,
+        )
+        def replace_common_helpers(match):
+            prefix = match.group(1)
+            suffix = match.group(3)
+            lines = []
+            for rel in sorted(new_helper_checksums):
+                if rel.startswith("helpers/"):
+                    lines.append(f"  ['{rel}']='{new_helper_checksums[rel]}'")
+            return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
+
+        new_lib_content = lib_helper_pattern.sub(replace_common_helpers, lib_content)
+        if new_lib_content != lib_content:
+            lib_common.write_text(new_lib_content, encoding="utf-8")
+            print("✓ modules/lib/ubs-common.sh updated with helper checksums.")
+        else:
+            print("✓ modules/lib/ubs-common.sh helper checksums up to date.")
+
+        # Step 3: Compute sha256 of modules/lib/ubs-common.sh and record it
+        lib_checksum = compute_sha256(lib_common)
+        new_helper_checksums["lib/ubs-common.sh"] = lib_checksum
+        print(f"  lib/ubs-common.sh: {lib_checksum}")
+    else:
+        print(f"Warning: {lib_common} not found", file=sys.stderr)
+        lib_checksum = ""
+
+    # Step 4: Update UBS_LIB_CHECKSUM in each modules/ubs-*.sh and scripts/new-module.sh
+    if lib_checksum:
+        for mod_path in sorted(modules_dir.glob("ubs-*.sh")):
+            mod_text = mod_path.read_text(encoding="utf-8")
+            updated_mod_text = re.sub(
+                r'UBS_LIB_CHECKSUM="[^"]*"',
+                f'UBS_LIB_CHECKSUM="{lib_checksum}"',
+                mod_text,
+            )
+            if updated_mod_text != mod_text:
+                mod_path.write_text(updated_mod_text, encoding="utf-8")
+                print(f"  ✓ {mod_path.name} updated with UBS_LIB_CHECKSUM={lib_checksum}")
+
+        new_mod_path = root / "scripts" / "new-module.sh"
+        if new_mod_path.exists():
+            nm_text = new_mod_path.read_text(encoding="utf-8")
+            updated_nm_text = re.sub(
+                r'UBS_LIB_CHECKSUM="[^"]*"',
+                f'UBS_LIB_CHECKSUM="{lib_checksum}"',
+                nm_text,
+            )
+            if updated_nm_text != nm_text:
+                new_mod_path.write_text(updated_nm_text, encoding="utf-8")
+                print(f"  ✓ scripts/new-module.sh updated with UBS_LIB_CHECKSUM={lib_checksum}")
+
+    # Step 5: Compute module checksums (after UBS_LIB_CHECKSUM is updated)
+    new_checksums = {}
+    for lang, filename in lang_map.items():
+        path = modules_dir / filename
+        if not path.exists():
+            print(f"Warning: Module {filename} not found for {lang}")
+            continue
+        checksum = compute_sha256(path)
+        print(f"  {lang}: {checksum}")
+        new_checksums[lang] = checksum
+
+    # Step 6: Read and update ubs script
     content = ubs_script.read_text(encoding="utf-8")
     
     # Regex to find the MODULE_CHECKSUMS array block
-    # It looks like:
-    # declare -A MODULE_CHECKSUMS=(
-    #   [js]='...'
-    #   ...
-    # )
-    
     pattern = re.compile(r"(declare -A MODULE_CHECKSUMS=\s*\()([\s\S]*?)(\))", re.MULTILINE)
     
     def replace_checksums(match):
         prefix = match.group(1)
         suffix = match.group(3)
-        
         lines = []
-        for lang in sorted(lang_map.keys()): # Sort for stability
+        for lang in sorted(lang_map.keys()):
             if lang in new_checksums:
-                # Preserve indentation
                 lines.append(f"  [{lang}]='{new_checksums[lang]}'")
-        
         return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
     new_content = pattern.sub(replace_checksums, content)
@@ -135,7 +191,7 @@ def main():
         prefix = match.group(1)
         suffix = match.group(3)
         lines = []
-        for rel in sorted(helper_map.keys()):
+        for rel in sorted(new_helper_checksums.keys()):
             checksum = new_helper_checksums.get(rel)
             if not checksum:
                 continue
@@ -144,14 +200,12 @@ def main():
 
     new_content = helper_pattern.sub(replace_helper_checksums, new_content)
 
-    # Keep the shipped-asset list in sync with helper_map (single source of
-    # truth), so ubs_core and lib ship through the same verified channel.
     assets_pattern = re.compile(r"(HELPER_ASSETS=\s*\()([\s\S]*?)(\n\))")
 
     def replace_assets(match):
         prefix = match.group(1)
         suffix = match.group(3)
-        lines = [f'  "{rel}"' for rel in sorted(helper_map) if rel in new_helper_checksums]
+        lines = [f'  "{rel}"' for rel in sorted(new_helper_checksums.keys())]
         return prefix + "\n" + "\n".join(lines) + suffix
 
     new_content = assets_pattern.sub(replace_assets, new_content)
@@ -160,10 +214,9 @@ def main():
         ubs_script.write_text(new_content, encoding="utf-8")
         print("✓ ubs script updated with new checksums.")
     else:
-        print("✓ No changes needed.")
+        print("✓ No changes needed in ubs.")
 
-    # Keep repo SHA256SUMS up-to-date so `scripts/verify.sh` and release tooling
-    # always have the correct install + runner hashes.
+    # Step 7: Update SHA256SUMS
     release_entries = {
         "install.sh": compute_sha256(install_script),
         "ubs": compute_sha256(ubs_script),

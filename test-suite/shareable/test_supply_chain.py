@@ -216,6 +216,98 @@ def check_download_failure_only_warns() -> None:
         report("download_failure_only_warns", ok, f"exit={proc.returncode}", proc)
 
 
+def setup_module_sandbox(dest: Path) -> None:
+    (dest / "helpers").mkdir(parents=True, exist_ok=True)
+    (dest / "lib").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(MODULES / "ubs-python.sh", dest / "ubs-python.sh")
+    shutil.copy2(MODULES / LIB_ASSET, dest / LIB_ASSET)
+    for helper in (MODULES / "helpers").iterdir():
+        if helper.is_file():
+            shutil.copy2(helper, dest / "helpers" / helper.name)
+    (dest / "helpers" / "ubs_core").mkdir(parents=True, exist_ok=True)
+    for core_file in iter_shipped_files(MODULES / "helpers" / "ubs_core"):
+        rel = core_file.relative_to(MODULES)
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(core_file, dest / rel)
+
+
+def test_tampered_helper_refused() -> None:
+    """Modify a byte in a cached helper -> module exits 2 with remediation."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-standalone-") as tmp:
+        mod_dir = Path(tmp)
+        setup_module_sandbox(mod_dir)
+        target = mod_dir / TAMPERED_HELPER
+        target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
+
+        env = os.environ.copy()
+        env.update({
+            "NO_COLOR": "1",
+            "UBS_ALLOW_UNVERIFIED_HELPERS": "0",
+            "PATH": "/usr/local/bin:/usr/bin:/bin" + (":" + os.environ.get("PATH", "") if os.environ.get("PATH") else ""),
+        })
+        env.pop("UBS_VERIFIED_ASSET_DIR", None)
+
+        cmd = [str(mod_dir / "ubs-python.sh"), "--ci", "--format=json", str(PY_FIXTURE)]
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode == 2
+            and "failed checksum verification" in combined
+            and "UBS_ALLOW_UNVERIFIED_HELPERS=1" in combined
+        )
+        report("test_tampered_helper_refused", ok, f"exit={proc.returncode}", proc)
+
+
+def test_standalone_module_verifies() -> None:
+    """Standalone module run verifies against embedded checksum table."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-standalone-") as tmp:
+        mod_dir = Path(tmp)
+        setup_module_sandbox(mod_dir)
+
+        env = os.environ.copy()
+        env.update({
+            "NO_COLOR": "1",
+            "UBS_ALLOW_UNVERIFIED_HELPERS": "0",
+            "PATH": "/usr/local/bin:/usr/bin:/bin" + (":" + os.environ.get("PATH", "") if os.environ.get("PATH") else ""),
+        })
+        env.pop("UBS_VERIFIED_ASSET_DIR", None)
+
+        cmd = [str(mod_dir / "ubs-python.sh"), "--ci", "--format=json", str(PY_FIXTURE)]
+
+        # 1. Clean standalone run succeeds (verifies embedded checksum table)
+        proc_clean = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        clean_ok = proc_clean.returncode in (0, 1) and "failed checksum verification" not in (proc_clean.stdout + proc_clean.stderr)
+
+        # 2. Tampered helper + UBS_ALLOW_UNVERIFIED_HELPERS=1 warns and proceeds
+        target = mod_dir / TAMPERED_HELPER
+        target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
+        env["UBS_ALLOW_UNVERIFIED_HELPERS"] = "1"
+        proc_override = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        override_ok = (
+            proc_override.returncode in (0, 1)
+            and "UBS_ALLOW_UNVERIFIED_HELPERS=1" in (proc_override.stdout + proc_override.stderr)
+        )
+
+        # 3. UBS_VERIFIED_ASSET_DIR set to empty dir refuses unverified fallback
+        empty_dir = mod_dir / "empty_verified"
+        empty_dir.mkdir()
+        env["UBS_ALLOW_UNVERIFIED_HELPERS"] = "0"
+        env["UBS_VERIFIED_ASSET_DIR"] = str(empty_dir)
+        proc_refuse = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        refuse_ok = proc_refuse.returncode == 2 and (
+            "unverified location" in (proc_refuse.stdout + proc_refuse.stderr)
+            or "refusing" in (proc_refuse.stdout + proc_refuse.stderr)
+        )
+
+        ok = clean_ok and override_ok and refuse_ok
+        report(
+            "test_standalone_module_verifies",
+            ok,
+            f"clean={clean_ok} override={override_ok} refuse={refuse_ok}",
+            proc_clean if not clean_ok else (proc_override if not override_ok else proc_refuse),
+        )
+
+
 def main() -> int:
     for check in (
         check_healthy_cache_scans,
@@ -227,6 +319,8 @@ def main() -> int:
         check_tampered_core_refused,
         check_override_allows_unverified,
         check_download_failure_only_warns,
+        test_tampered_helper_refused,
+        test_standalone_module_verifies,
     ):
         try:
             check()

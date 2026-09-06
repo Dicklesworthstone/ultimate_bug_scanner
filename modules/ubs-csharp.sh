@@ -27,7 +27,38 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
+UBS_LIB_CHECKSUM="64d4ebbeeb2d05d497d10ec3d292b34b690b0003242e9f175d0cd1764eb83040"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
+    UBS_MODULE_LIB_DIR="$UBS_VERIFIED_ASSET_DIR"
+  elif [[ -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+      echo "warning: UBS_ALLOW_UNVERIFIED_HELPERS=1: using unverified lib at ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" >&2
+    else
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh found at unverified location; refusing to load unverified library (set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" >&2
+      exit 2
+    fi
+  fi
+fi
+if [[ -z "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
+  if [[ "${UBS_ALLOW_UNVERIFIED_HELPERS:-0}" == "1" ]]; then
+    : # override allows unverified
+  elif [[ -n "${UBS_LIB_CHECKSUM:-}" && -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
+    _lib_sha=""
+    if command -v sha256sum >/dev/null 2>&1; then
+      _lib_sha="$(sha256sum "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+      _lib_sha="$(shasum -a 256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $1}')"
+    elif command -v openssl >/dev/null 2>&1; then
+      _lib_sha="$(openssl dgst -sha256 "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" 2>/dev/null | awk '{print $NF}')"
+    fi
+    if [[ -n "$_lib_sha" && "$_lib_sha" != "$UBS_LIB_CHECKSUM" ]]; then
+      echo "✗ ${BASH_SOURCE[0]}: lib/ubs-common.sh failed checksum verification (expected $UBS_LIB_CHECKSUM, got $_lib_sha); refusing to load unverified library (run 'ubs doctor --fix' or reinstall)" >&2
+      exit 2
+    fi
+  fi
+fi
 if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
@@ -869,7 +900,8 @@ run_dotnet_step() {
 
 run_csharp_type_narrowing_checks() {
   local cat="$1"
-  local helper="$SCRIPT_DIR/helpers/type_narrowing_csharp.py"
+  local helper=""
+  ubs_resolve_helper helper "helpers/type_narrowing_csharp.py" || helper=""
   local report="$TMP_DIR/csharp.type_narrowing.tsv"
   local helper_err="$TMP_DIR/csharp.type_narrowing.err"
 
@@ -878,9 +910,9 @@ run_csharp_type_narrowing_checks() {
     [[ "$FORMAT" == "text" ]] && echo "${DIM}C# type narrowing helper skipped (UBS_SKIP_TYPE_NARROWING=1).${RESET}"
     return 0
   fi
-  if [[ ! -f "$helper" ]]; then
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
     TYPE_NARROWING_HELPER_STATUS="missing"
-    [[ "$FORMAT" == "text" ]] && echo "${DIM}C# type narrowing helper missing: $helper${RESET}"
+    [[ "$FORMAT" == "text" ]] && echo "${DIM}C# type narrowing helper missing: helpers/type_narrowing_csharp.py${RESET}"
     return 0
   fi
   if [[ "$HAS_PYTHON" -eq 0 ]]; then
@@ -925,13 +957,14 @@ run_csharp_type_narrowing_checks() {
 
 run_csharp_resource_lifecycle_helper() {
   local cat="$1"
-  local helper="$SCRIPT_DIR/helpers/resource_lifecycle_csharp.py"
+  local helper=""
+  ubs_resolve_helper helper "helpers/resource_lifecycle_csharp.py" || helper=""
   local report="$TMP_DIR/csharp.resource_lifecycle.tsv"
   local helper_err="$TMP_DIR/csharp.resource_lifecycle.err"
 
-  if [[ ! -f "$helper" ]]; then
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
     RESOURCE_LIFECYCLE_HELPER_STATUS="missing"
-    [[ "$FORMAT" == "text" ]] && echo "${DIM}C# resource lifecycle helper missing: $helper${RESET}"
+    [[ "$FORMAT" == "text" ]] && echo "${DIM}C# resource lifecycle helper missing: helpers/resource_lifecycle_csharp.py${RESET}"
     return 1
   fi
   if [[ "$HAS_PYTHON" -eq 0 ]]; then
@@ -976,13 +1009,14 @@ run_csharp_resource_lifecycle_helper() {
 
 run_csharp_async_task_handle_helper() {
   local cat="$1"
-  local helper="$SCRIPT_DIR/helpers/async_task_handles_csharp.py"
+  local helper=""
+  ubs_resolve_helper helper "helpers/async_task_handles_csharp.py" || helper=""
   local report="$TMP_DIR/csharp.async_task_handles.tsv"
   local helper_err="$TMP_DIR/csharp.async_task_handles.err"
 
-  if [[ ! -f "$helper" ]]; then
+  if [[ -z "$helper" || ! -f "$helper" ]]; then
     ASYNC_TASK_HELPER_STATUS="missing"
-    [[ "$FORMAT" == "text" ]] && echo "${DIM}C# async task-handle helper missing: $helper${RESET}"
+    [[ "$FORMAT" == "text" ]] && echo "${DIM}C# async task-handle helper missing: helpers/async_task_handles_csharp.py${RESET}"
     return 0
   fi
   if [[ "$HAS_PYTHON" -eq 0 ]]; then
@@ -3736,10 +3770,9 @@ PYV2BRIDGE
 
 # ── Contract-v2 scan: ONE list, ONE orchestrator, optional ast-grep pack ────
 run_contract_v2_csharp(){
-  local list_file sink helpers_dir exit_code=0 text_out="" ast_rule_dir=""
-  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-csv2-list.XXXXXX)"
-  sink="$(mktemp 2>/dev/null || mktemp -t ubs-csv2-sink.XXXXXX)"
-  helpers_dir="$SCRIPT_DIR/helpers"
+  local list_file sink exit_code=0 text_out="" ast_rule_dir=""
+  local helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$SCRIPT_DIR/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" \

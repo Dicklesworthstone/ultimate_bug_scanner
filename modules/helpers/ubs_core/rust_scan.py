@@ -150,6 +150,7 @@ class Scan:
         self.exclude_tests = exclude_tests
         self.skip = skip
         self.detail_limit = detail_limit
+        self.files: list[Path] = [Path(f) for f in files]
         # Authoritative-file-set membership under BOTH spellings — the legacy
         # _ubs_allowed_key_add/_ubs_file_allowed pair also matched resolved
         # paths (readlink -f), and several detector ports resolve() entries.
@@ -173,6 +174,7 @@ class Scan:
         self.counters: Counter = Counter()
         self.records: list[dict] = []
         self.checks: list[dict] = []
+        self.ast_matches: dict[str, list[dict]] = {}
         self._detector_cache: dict[tuple, list[Hit]] = {}
 
     # ── legacy filter_test_lines / _ubs_test_boundary (839-894) ────────────

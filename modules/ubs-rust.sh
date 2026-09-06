@@ -122,6 +122,7 @@ CARGO_TARGETS_ALL=1
 FAIL_CRITICAL_THRESHOLD=1
 FAIL_WARNING_THRESHOLD=0
 SUMMARY_JSON=""
+REPORT_JSON=""               # --report-json=FILE: NDJSON findings record stream (K2; contract-v2)
 EMIT_FINDINGS_JSON=""
 LIST_CATEGORIES=0
 DUMP_RULES_DIR=""
@@ -196,7 +197,7 @@ while [[ $# -gt 0 ]]; do
     --no-all-features) CARGO_FEATURES_ALL=0; shift;;
     --no-all-targets)  CARGO_TARGETS_ALL=0; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
-    --emit-findings-json=*) EMIT_FINDINGS_JSON="${1#*=}"; shift;;
+    --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --strict-gitignore) STRICT_GITIGNORE=1; shift;;
     --exclude-tests) EXCLUDE_TESTS=1; shift;;
     --fail-critical=*) FAIL_CRITICAL_THRESHOLD="${1#*=}"; shift;;
@@ -8671,9 +8672,17 @@ run_v2_summary_json(){
 }
 
 run_v2_legacy_parity_bridges_rust(){
-  local sink="$1" text_out="${2:-}"
-  run_v2_cargo_phases
-  run_v2_cat_17_18
+  # Legacy order: rust_scan's categories (already in text_out) run FIRST,
+  # then the bridge sections append, then the Summary block. The bridge
+  # functions print via say/print_finding, so their stdout is appended to
+  # the same text file (json mode is quiet — legacy printed nothing there).
+  if [[ "$FORMAT" == "json" ]]; then
+    run_v2_cargo_phases >/dev/null
+    run_v2_cat_17_18 >/dev/null
+  else
+    run_v2_cargo_phases >>"$text_out"
+    run_v2_cat_17_18 >>"$text_out"
+  fi
   local counts
   counts="$(run_v2_recount "$sink")"
   V2_CRITICAL="$(echo "$counts" | awk '{print $1}')"
@@ -8734,7 +8743,10 @@ generate(Path('$rule_dir'))
       rule_dir=""
     fi
   fi
+  text_out="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-text.XXXXXX)"
+  TMP_FILES+=("$text_out")
   local -a scan_args=(--files-from "$list_file" --sink "$sink" --checks-out "$checks"
+    --text-out "$text_out"
     --project-dir "$PROJECT_DIR" --skip "$v2_skip" --detail-limit "$DETAIL_LIMIT")
   [[ -n "$rule_dir" ]] && scan_args+=(--ast-rule-dir "$rule_dir")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
@@ -8763,8 +8775,6 @@ for f in doc.get("findings", []):
 PYV2FIND
 )
   fi
-  text_out="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-text.XXXXXX)"
-  TMP_FILES+=("$text_out")
   run_v2_legacy_parity_bridges_rust "$sink" "$text_out" || exit_code=$?
   if [[ "$FORMAT" != "json" ]]; then
     cat "$text_out" 2>/dev/null || true

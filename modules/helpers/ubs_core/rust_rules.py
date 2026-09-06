@@ -200,6 +200,19 @@ UNPARSEABLE_RULES: frozenset[str] = frozenset({
     "rc_refcell",     # Rc<RefCell<$T>> (type pattern; rg side counts)
 })
 
+RUN_MODE_RULES: dict[str, str] = {
+    # Patterns whose legacy `run --pattern` counts differ from a consolidated
+    # `scan -c` rule: scan suppresses matches NESTED inside an
+    # already-reported match of the same rule, run reports every level
+    # (probed on the A4 corpus 2026-09-05: unwrap 49 vs 43, unsafe_block 32
+    # vs 14, as_u64 7 vs 4). These three stay on a legacy `run --pattern`
+    # spawn in ubs_core.rust_ast so the counts stay byte-faithful; they are
+    # excluded from the sgconfig like the unparseable stems.
+    "unwrap": "$X.unwrap()",
+    "unsafe_block": "unsafe { $$$BODY }",
+    "as_u64": "$X as u64",
+}
+
 
 def generate(rule_dir: Path) -> dict:
     """Write the consolidated rule pack; return the manifest dict."""
@@ -208,7 +221,7 @@ def generate(rule_dir: Path) -> dict:
     rule_files: list[str] = []
     for category, check, slug, pattern in AST_PATTERNS:
         rule_id = f"rust.ast.{slug}"
-        if slug in UNPARSEABLE_RULES:
+        if slug in UNPARSEABLE_RULES or slug in RUN_MODE_RULES:
             continue
         filename = f"{slug}.yml"
         # Always double-quote the pattern (YAML flow scalar via json.dumps):

@@ -989,6 +989,13 @@ def main(argv: list[str] | None = None) -> int:
         data = sys.stdin.buffer.read()
     else:
         data = Path(args.files_from).read_bytes()
+    entries = data.split(b"\0") if b"\0" in data else data.splitlines()
+    files = [Path(raw.decode("utf-8", "surrogateescape")) for raw in entries if raw.strip()]
+    skip = _skip_set(args)
+    project_dir = Path(args.project_dir) if args.project_dir else Path(".")
+    ctx = ScanContext(files=files, project_dir=project_dir,
+                      skip_narrowing=args.skip_type_narrowing,
+                      ast_available=args.ast_available)
     patterns = load_patterns()
     with open(args.sink, "w", encoding="utf-8") as sink:
         scan_patterns(patterns, ctx, sink, skip)

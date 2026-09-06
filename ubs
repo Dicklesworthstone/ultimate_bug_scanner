@@ -49,14 +49,14 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='d563e187fdddfe6654ed411bd9e38524acb827af6160468603899fdc004a5f16'
+  [cpp]='9b0ec69719c443b99ef91a4aa2f1f9c63082fa91efcaa525713baf4f6c6688d2'
   [csharp]='f515884ec29b41d48ad56f4aea78e063097f0d54ff2934cfef4ae04629a0ca42'
   [elixir]='aaddb98003ee456fef335e553d0b1636e4a3154c6910e10074f03701b51b7421'
-  [golang]='76ffaeffdf7381dbfadaeb758d080e502944c7f8f03809c4166592ca3d3e90c8'
+  [golang]='e535992052c037d95e980a04dbb6dc08efd9413dc5a693a824cc1adc4deec6df'
   [java]='527d487e9411f08ac42bcd4d41820f5f768cdb68aacacaceac89a90141c3f773'
   [js]='a6372023d118385d181c83adbb7b71a9a228e7205a71ba3eebe4ba28d4ad45b7'
   [python]='b3f3a58d5816a0a7bc8a769cfcadd8a73734cd23cc5400e30d644ec88aa03f0d'
-  [ruby]='5535fe6a94d79347e22c3c2327ed2508749b4ea9d222d5e3a997de95844968b4'
+  [ruby]='78fb460748d62b92ef2a9378e920f973c54eb4c8864d895069983f40250a01a3'
   [rust]='9b7ffef10a40f750b336bce7ff0a3e43eef7a3970aa93c6af53fa59d11fbce00'
   [swift]='6ebee17ae2277abc84164ae01a94a8a4c352c8557f0e5ba63721501f70a5a611'
 )
@@ -5843,7 +5843,11 @@ JSON
     printf '  %s\n' "$msg"
   } >"$txt"
   if [[ "$fmt" == "sarif" ]]; then
-    minimal_sarif_from_text "$lang" "$txt" >"$sarif" 2>/dev/null || true
+    cat >"$sarif" <<SARIF
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"UBS ($lang)","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner"}},"results":[
+  {"ruleId":"ubs.module-timeout","level":"error","message":{"text":"$msg"}}
+]}]}
+SARIF
   fi
   if [[ "${QUIET:-0}" -eq 0 ]]; then
     say_err "${RED}${X}${RESET} Module '${lang}' timed out after ${secs}s (MODULE_TIMEOUT); the result is partial."
@@ -6186,15 +6190,18 @@ legacy_postprocess(){
       attach_metrics_to_json "$json" "$metrics"
       return 0
     fi
-    prepare_metrics_dir "$metrics"
-    run_module "$raw" "$err" "$module" "$@" || true
-    module_status=$MODULE_RUN_STATUS
+    module_status=2
+    say_err "${RED}${X}${RESET} Module '$lang' did not emit contract JSON (exit 2)"
+    echo "Module '$lang' did not emit contract JSON (exit 2)" >>"$err"
+    cat >"$json" <<JSON
+{"language":"$lang","project":"$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")","files":0,"critical":0,"warning":0,"info":0,"timestamp":"$(date_iso)","status":"error","module_error":"MODULE_INVALID_JSON","message":"Scanner module '$lang' output was not valid contract JSON"}
+JSON
+    return 2
   fi
   apply_inline_suppressions <"$raw" >"$txt" 2>>"$err"
   if [[ "$is_v2" -eq 0 ]]; then
     restore_original_paths "$txt"
   fi
-  parse_text_to_json "$lang" "$txt" "$json"
   partial_status_from_text "$txt" "$json"
   attach_metrics_to_json "$json" "$metrics"
 }
@@ -6309,19 +6316,20 @@ run_lang(){
 
       run_module "$out_json" "$err" "$module" "${args[@]}" "${report_args[@]}" --format=json || true
       module_status=$MODULE_RUN_STATUS
-      # Modules that implement --format=json must emit a UBS summary *object*.
-      # If they emit other JSON types (e.g., an array of findings), fall back to
-      # text mode so we can still produce a stable combined summary.
+      # Modules must emit a valid UBS summary object in JSON mode.
+      # A non-JSON or invalid module response yields an error envelope (bead B10).
       local pp_rc=0
       if [[ "$MODULE_TIMED_OUT" -eq 1 ]]; then
         : # synthetic MODULE_TIMEOUT result is written after the case block
       elif [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
         postprocess_module json "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || pp_rc=$?
         if [[ "$pp_rc" -ne 0 ]]; then
-          prepare_metrics_dir "$metrics_dir"
-          run_module "$out_raw" "$err" "$module" "${args[@]}" "${report_args[@]}" || true
-          module_status=$MODULE_RUN_STATUS
-          postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
+          module_status=2
+          say_err "${RED}${X}${RESET} Module '$lang' did not emit contract JSON (exit 2)"
+          echo "Module '$lang' did not emit contract JSON (exit 2)" >>"$err"
+          cat >"$out_json" <<JSON
+{"language":"$lang","project":"$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")","files":0,"critical":0,"warning":0,"info":0,"timestamp":"$(date_iso)","status":"error","module_error":"MODULE_INVALID_JSON","message":"Scanner module '$lang' output was not valid contract JSON"}
+JSON
         fi
       else
         legacy_postprocess json "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir" "${args[@]}" "${report_args[@]}"
@@ -6381,31 +6389,6 @@ run_lang(){
   return "$module_status"
 }
 
-# Parse legacy text logs → JSON summary (robust to colors)
-parse_text_to_json(){
-  local lang="$1" txt="$2" json="$3"
-  local critical=0 warning=0 info=0 file_count=0
-  # Strip ANSI, normalize
-  local cleaned; cleaned="$(sed -E 's/\x1B\[[0-9;]*[mK]//g' "$txt" | tr -d '\r\0')"
-  critical=$(printf '%s\n' "$cleaned" | grep -E 'Critical issues:|CRITICAL' | grep -Eo '[0-9]+' | tail -n1 || true)
-  warning=$(printf '%s\n' "$cleaned" | grep -E 'Warning issues:|Warning' | grep -Eo '[0-9]+' | tail -n1 || true)
-  info=$(printf '%s\n' "$cleaned" | grep -E 'Info items:|Info' | grep -Eo '[0-9]+' | tail -n1 || true)
-  file_count=$(printf '%s\n' "$cleaned" | grep -E 'Files scanned:' | grep -Eo '[0-9]+' | tail -n1 || true)
-  if [[ -z "$file_count" ]]; then
-    file_count=$(printf '%s\n' "$cleaned" \
-      | grep -E 'Files:[[:space:]]*[0-9]+' \
-      | head -n1 \
-      | grep -Eo '[0-9]+' \
-      | head -n1 || true)
-  fi
-  critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; file_count=${file_count:-0}
-  local proj_display
-  proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
-  cat >"$json" <<JSON
-{"language":"$lang","project":"$proj_display","files":$file_count,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
-JSON
-}
-
 attach_metrics_to_json(){
   local json_path="$1" metrics_dir="$2"
   [[ -f "$json_path" ]] || return 0
@@ -6436,22 +6419,6 @@ if extras:
     json_path.write_text(json.dumps(data))
 PY
   fi
-}
-
-minimal_sarif_from_text(){
-  local lang="$1" txt="$2"
-  local critical=0 warning=0 info=0
-  local cleaned; cleaned="$(sed -E 's/\x1B\[[0-9;]*[mK]//g' "$txt" | tr -d '\r')"
-  critical=$(printf '%s\n' "$cleaned" | grep -E 'Critical issues:|CRITICAL' | grep -Eo '[0-9]+' | tail -n1 || true)
-  warning=$(printf '%s\n' "$cleaned" | grep -E 'Warning issues:|Warning' | grep -Eo '[0-9]+' | tail -n1 || true)
-  info=$(printf '%s\n' "$cleaned" | grep -E 'Info items:|Info' | grep -Eo '[0-9]+' | tail -n1 || true)
-  cat <<SARIF
-{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"UBS ($lang)","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner"}},"results":[
-  {"ruleId":"summary.critical","level":"error","message":{"text":"$critical critical findings"}},
-  {"ruleId":"summary.warning","level":"warning","message":{"text":"$warning warnings"}},
-  {"ruleId":"summary.info","level":"note","message":{"text":"$info info items"}}
-]}]}
-SARIF
 }
 
 parse_sarif_to_json(){

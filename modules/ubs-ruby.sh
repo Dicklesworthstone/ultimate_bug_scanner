@@ -2919,7 +2919,9 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
   case "$FORMAT" in
-    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    json)
+      exec 3>&1
+      scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text)
       # The report goes to a real file, not /dev/stdout: Path.write_text on
       # /dev/stdout re-truncates a regular-file capture at its own offset,

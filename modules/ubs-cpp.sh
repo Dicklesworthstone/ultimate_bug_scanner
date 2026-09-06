@@ -3111,7 +3111,9 @@ run_contract_v2_cpp(){
   # text-mode tally section AFTER every category block), so legacy totals
   # never include rule-pack hits. See ubs_core/cpp_scan.py.
   case "$FORMAT" in
-    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    json)
+      exec 3>&1
+      scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text)
       # The report goes to a real file, not /dev/stdout: Path.write_text on
       # /dev/stdout re-truncates a regular-file capture at its own offset,

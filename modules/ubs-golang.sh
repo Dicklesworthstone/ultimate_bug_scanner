@@ -5075,7 +5075,9 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   tally_file="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-tally.XXXXXX)"
   scan_args+=(--tally-out "$tally_file")
   case "$FORMAT" in
-    json) scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
+    json)
+      exec 3>&1
+      scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text)
       # The report goes to a real file, not /dev/stdout: Path.write_text on
       # /dev/stdout re-truncates a regular-file capture at its own offset,

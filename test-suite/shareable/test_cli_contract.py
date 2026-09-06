@@ -1604,6 +1604,87 @@ def test_doctor_fix_restores_assets() -> None:
 check_doctor_fix_restores_assets = test_doctor_fix_restores_assets
 
 
+def test_module_garbage_output_yields_error_envelope() -> None:
+    # A module that emits non-JSON garbage must yield status "error" and exit 2
+    # via the error envelope, rather than falling back to text scraping (bead B10).
+    tmp_obj = tempfile.TemporaryDirectory(prefix="ubs-garbage-")
+    tmp = Path(tmp_obj.name)
+    try:
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        mock = bin_dir / "ubs-python"
+        mock.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--help\" ]; then\n"
+            "  echo \"contract: v2\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "echo \"Garbage text with Critical issues: 42 and Warning issues: 99\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        mock.chmod(0o755)
+
+        target_file = tmp / "sample.py"
+        target_file.write_text("print('hello')\n", encoding="utf-8")
+
+        env = {
+            "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}",
+        }
+
+        # 1. JSON mode test
+        proc_json = run([str(target_file), "--only=python", "--format=json", "--ci"], env=env)
+        json_ok = False
+        doc_json: dict = {}
+        try:
+            doc_json = json.loads(proc_json.stdout)
+            json_ok = (
+                proc_json.returncode == 2
+                and doc_json.get("error") == "environment"
+                and doc_json.get("status") == "error"
+                and doc_json.get("reason") == "module-failed"
+                and "python" in doc_json.get("failed_modules", [])
+                and "42" not in proc_json.stdout
+                and "99" not in proc_json.stdout
+            )
+        except Exception:
+            json_ok = False
+
+        # 2. SARIF mode test
+        proc_sarif = run([str(target_file), "--only=python", "--format=sarif", "--ci"], env=env)
+        sarif_ok = False
+        try:
+            sarif_doc = json.loads(proc_sarif.stdout)
+            inv = sarif_doc.get("runs", [{}])[0].get("invocations", [{}])[0]
+            sarif_ok = (
+                proc_sarif.returncode == 2
+                and inv.get("executionSuccessful") is False
+                and inv.get("exitCode") == 2
+                and "42" not in proc_sarif.stdout
+                and "99" not in proc_sarif.stdout
+            )
+        except Exception:
+            sarif_ok = False
+
+        overall_ok = json_ok and sarif_ok
+        detail = f"json_ok={json_ok} sarif_ok={sarif_ok} exit_json={proc_json.returncode} exit_sarif={proc_sarif.returncode}"
+        write_case_artifacts("test_module_garbage_output_yields_error_envelope", proc_json, {
+            "json_exit": proc_json.returncode,
+            "json_stdout": proc_json.stdout,
+            "json_stderr": proc_json.stderr,
+            "sarif_exit": proc_sarif.returncode,
+            "sarif_stdout": proc_sarif.stdout,
+            "ok": overall_ok,
+            "envelope": doc_json,
+        })
+        report("test_module_garbage_output_yields_error_envelope", overall_ok, detail, proc_json if not overall_ok else None)
+    finally:
+        tmp_obj.cleanup()
+
+
+check_module_garbage_output_yields_error_envelope = test_module_garbage_output_yields_error_envelope
+
+
 def main() -> int:
     filter_names = set(sys.argv[1:])
     checks = (
@@ -1648,6 +1729,7 @@ def main() -> int:
         test_baseline_new_only,
         test_doctor_json_schema,
         test_doctor_fix_restores_assets,
+        test_module_garbage_output_yields_error_envelope,
     )
     for check in checks:
         name = check.__name__

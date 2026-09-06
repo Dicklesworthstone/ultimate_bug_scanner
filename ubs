@@ -1020,7 +1020,7 @@ init_colors(){
 init_colors
 CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
 say(){
-  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" || "${FORMAT:-text}" == "toon" ]]; then
+  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" || "${FORMAT:-text}" == "toon" || "${DOCTOR_FORMAT:-text}" == "json" ]]; then
     echo -e "$*" >&2
   else
     echo -e "$*"
@@ -1287,7 +1287,7 @@ Usage: ubs [options] [PROJECT_DIR]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
        ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]   (JSON for agents)
-       ubs --schema[=json|jsonl|sarif|toon|error|all]                       (JSON Schema per format)
+       ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]                (JSON Schema per format)
 
 Options:
   --format=FMT            text|json|jsonl|sarif|toon (default: text)
@@ -1403,7 +1403,7 @@ USAGE
 # ─────────────────────────────────────────────────────────────────────────────
 # Machine-readable self-description (bead K1)
 #   ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]
-#   ubs --schema[=json|jsonl|sarif|toon|error|all]
+#   ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]
 # Both print ONE JSON document on stdout (stderr for diagnostics) and exit 0;
 # an unknown topic/format exits 2. schema_version changes when a field is
 # removed or its meaning changes; additions keep the version.
@@ -1429,10 +1429,10 @@ cat <<'JSON'
   "commands": {
     "subcommands": [
       {"name": "scan", "usage": "ubs [options] [PATH ...]", "description": "Default. Scans the project directory or the listed files/directories (union scan)."},
-      {"name": "doctor", "usage": "ubs doctor [--fix] [--module-dir=DIR]", "description": "Verify cached modules/helpers and the ast-grep toolchain; --fix re-downloads corrupted copies."},
+      {"name": "doctor", "usage": "ubs doctor [--fix] [--format=text|json] [--module-dir=DIR]", "description": "Verify cached modules/helpers and the ast-grep toolchain; --fix re-downloads corrupted copies; --format=json emits structured checks."},
       {"name": "sessions", "usage": "ubs sessions [--entries N] [--raw]", "description": "Show recent installer session summaries."},
       {"name": "robot-docs", "usage": "ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]", "description": "This document (JSON on stdout)."},
-      {"name": "--schema", "usage": "ubs --schema[=json|jsonl|sarif|toon|error|all]", "description": "JSON Schema (draft 2020-12) for each output format."}
+      {"name": "--schema", "usage": "ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]", "description": "JSON Schema (draft 2020-12) for each output format."}
     ],
     "flags": [
       {"name": "--format", "args": "FMT", "example": "--format=json", "description": "Output format: text (default), json, jsonl, sarif, toon."},
@@ -1785,6 +1785,32 @@ cat <<'JSON'
       }
     },
     "additionalProperties": true
+  },
+  "doctor": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "ubs doctor --format=json",
+    "description": "Output emitted on stdout by ubs doctor --format=json",
+    "type": "object",
+    "required": ["status", "fails", "warnings", "checks"],
+    "properties": {
+      "status": {"enum": ["ok", "error"]},
+      "fails": {"type": "integer", "minimum": 0},
+      "warnings": {"type": "integer", "minimum": 0},
+      "checks": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "required": ["id", "status", "detail"],
+          "properties": {
+            "id": {"type": "string"},
+            "status": {"enum": ["ok", "warn", "info", "err"]},
+            "detail": {"type": "string"}
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "additionalProperties": true
   }
 }
 JSON
@@ -1798,7 +1824,7 @@ emit_schema(){
     return 2
   fi
   case "$fmt" in
-    json|jsonl|sarif) ;;
+    json|jsonl|sarif|doctor) ;;
     toon) fmt="json" ;;
     error)
       schema_document | jq --arg id "$UBS_SCHEMA_ID_BASE/error.schema.json" --arg sv "$UBS_SCHEMA_VERSION" '
@@ -1812,7 +1838,7 @@ emit_schema(){
         + {toon: {"$ref": ($base + "/json.schema.json"), description: "TOON is tru-encoded json; validate the decoded document against the json schema."}}'
       return 0 ;;
     *)
-      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|all)"
+      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|doctor|all)"
       return 2 ;;
   esac
   schema_document | jq --arg key "$fmt" --arg base "$UBS_SCHEMA_ID_BASE" --arg sv "$UBS_SCHEMA_VERSION" '
@@ -1824,6 +1850,7 @@ doctor_usage(){
 Usage: ubs doctor [options]
 
 Options:
+  --format=FORMAT    Output format (text|json, default: text)
   --module-dir=DIR   Override the module cache directory (default: $MODULE_DIR_DEFAULT)
   --fix              Automatically download or refresh cached modules
   -h, --help         Show this help message
@@ -1909,22 +1936,32 @@ elif [[ "${1:-}" == "--schema" || "${1:-}" == --schema=* ]]; then
 fi
 
 DOCTOR_FIX=0
+DOCTOR_FORMAT="${FORMAT:-text}"
+MODULE_DIR_EXPLICIT=0
 if [[ "$MODE" == "doctor" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
+      --module-dir=*) MODULE_DIR="${1#*=}"; MODULE_DIR_EXPLICIT=1; shift;;
       --module-dir)
         if [[ $# -lt 2 ]]; then doctor_usage; exit 2; fi
-        shift; MODULE_DIR="$1"; shift;;
+        shift; MODULE_DIR="$1"; MODULE_DIR_EXPLICIT=1; shift;;
+      --format=*) DOCTOR_FORMAT="${1#*=}"; shift;;
+      --format)
+        if [[ $# -lt 2 ]]; then doctor_usage; exit 2; fi
+        shift; DOCTOR_FORMAT="$1"; shift;;
       --fix) DOCTOR_FIX=1; shift;;
       -h|--help) doctor_usage; exit 0;;
       *)
-        say "${RED}$X unknown doctor option${RESET}: $1"
+        say_err "${RED}$X unknown doctor option${RESET}: $1"
         doctor_usage
         exit 2
         ;;
     esac
   done
+  if [[ "$DOCTOR_FORMAT" != "text" && "$DOCTOR_FORMAT" != "json" ]]; then
+    say_err "${RED}${X}${RESET} unknown --format value for doctor: $DOCTOR_FORMAT (expected text|json)"
+    exit 2
+  fi
 elif [[ "$MODE" == "sessions" ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -3241,6 +3278,7 @@ ast_grep_target_triple(){
 }
 
 find_ast_grep_in_path(){
+  [[ "${UBS_TEST_NO_PATH_AST_GREP:-0}" == "1" ]] && return 1
   local -a dirs
   IFS=':' read -r -a dirs <<<"${PATH:-}"
   local name dir candidate
@@ -3299,7 +3337,7 @@ PY
 ensure_ast_grep_tool_cache(){
   local target expected asset url tool_root zip_path bin_name bin_path
   target="$(ast_grep_target_triple)" || return 1
-  expected="${AST_GREP_ASSET_SHA256[$target]:-}"
+  expected="${UBS_TEST_AST_GREP_SHA256:-${AST_GREP_ASSET_SHA256[$target]:-}}"
   [[ -n "$expected" ]] || return 1
 
   asset="app-${target}.zip"
@@ -3448,7 +3486,7 @@ ensure_ast_grep(){
     return 1
   }
 
-  if [[ -z "${AST_GREP_ASSET_SHA256[$target]:-}" ]]; then
+  if [[ -z "${UBS_TEST_AST_GREP_SHA256:-${AST_GREP_ASSET_SHA256[$target]:-}}" ]]; then
     say_err "${RED}${X}${RESET} Environment error: no ast-grep asset configured for $target"
     return 1
   fi
@@ -3666,24 +3704,41 @@ verify_helper_checksum(){
 
 DOCTOR_FAILS=0
 DOCTOR_WARNINGS=0
+DOCTOR_FORMAT="${DOCTOR_FORMAT:-text}"
+DOCTOR_CHECKS_FILE=""
+
 doctor_report(){
-  local level="$1" message="$2"
+  local id level message
+  if [[ $# -ge 3 ]]; then
+    id="$1"
+    level="$2"
+    message="$3"
+  else
+    level="$1"
+    message="$2"
+    id="check-$((DOCTOR_FAILS + DOCTOR_WARNINGS + 1))"
+  fi
   case "$level" in
     ok)
-      say "  ${GREEN}${CHECK}${RESET} $message"
+      [[ "$DOCTOR_FORMAT" == "text" ]] && say "  ${GREEN}${CHECK}${RESET} $message"
       ;;
     warn)
       DOCTOR_WARNINGS=$((DOCTOR_WARNINGS+1))
-      say "  ${YELLOW}${WARN}${RESET} $message"
+      [[ "$DOCTOR_FORMAT" == "text" ]] && say "  ${YELLOW}${WARN}${RESET} $message"
       ;;
     info)
-      say "  ${CYAN}${INFO}${RESET} $message"
+      [[ "$DOCTOR_FORMAT" == "text" ]] && say "  ${CYAN}${INFO}${RESET} $message"
       ;;
     err)
       DOCTOR_FAILS=$((DOCTOR_FAILS+1))
-      say "  ${RED}${X}${RESET} $message"
+      [[ "$DOCTOR_FORMAT" == "text" ]] && say "  ${RED}${X}${RESET} $message"
       ;;
   esac
+  if [[ -n "$DOCTOR_CHECKS_FILE" ]]; then
+    local detail; detail="$(printf '%s' "$message" | sed -E 's/(\x1B|\\033)\[[0-9;]*[a-zA-Z]//g')"
+    printf '{"id":"%s","status":"%s","detail":"%s"}\n' \
+      "$(json_escape "$id")" "$(json_escape "$level")" "$(json_escape "$detail")" >> "$DOCTOR_CHECKS_FILE"
+  fi
 }
 
 doctor_check_cached_helpers(){
@@ -3693,21 +3748,21 @@ doctor_check_cached_helpers(){
     helper_path="$MODULE_DIR/$rel"
     if [[ -f "$helper_path" ]]; then
       if verify_helper_checksum "$rel" "$helper_path"; then
-        doctor_report ok "helper checksum verified ($helper_path)"
+        doctor_report "helper:$rel" ok "helper checksum verified ($helper_path)"
       else
         verify_status=$?
         if [[ $verify_status -eq 2 ]]; then
-          doctor_report err "helper $rel: $VERIFY_HELPER_ERR"
+          doctor_report "helper:$rel" err "helper $rel: $VERIFY_HELPER_ERR"
         else
           if [[ "$fix" -eq 1 ]]; then
             say "    ${DIM}Refreshing helper $rel...${RESET}"
             if download_helper_asset "$rel" "$helper_path"; then
-              doctor_report ok "helper refreshed and verified ($rel)"
+              doctor_report "helper:$rel" ok "helper refreshed and verified ($rel)"
             else
-              doctor_report err "Failed to refresh helper $rel: ${VERIFY_HELPER_ERR:-see logs}"
+              doctor_report "helper:$rel" err "Failed to refresh helper $rel: ${VERIFY_HELPER_ERR:-see logs}"
             fi
           else
-            doctor_report err "helper $rel: $VERIFY_HELPER_ERR (re-run with --fix)"
+            doctor_report "helper:$rel" err "helper $rel: $VERIFY_HELPER_ERR (re-run with --fix)"
           fi
         fi
       fi
@@ -3715,44 +3770,49 @@ doctor_check_cached_helpers(){
       if [[ "$fix" -eq 1 ]]; then
         say "    ${DIM}Caching helper $rel...${RESET}"
         if download_helper_asset "$rel" "$helper_path"; then
-          doctor_report ok "helper downloaded and verified ($rel)"
+          doctor_report "helper:$rel" ok "helper downloaded and verified ($rel)"
         else
-          doctor_report err "Failed to download helper $rel: ${VERIFY_HELPER_ERR:-see logs}"
+          doctor_report "helper:$rel" err "Failed to download helper $rel: ${VERIFY_HELPER_ERR:-see logs}"
         fi
       else
-        doctor_report warn "helper $rel not cached yet (use --fix to pre-download)"
+        doctor_report "helper:$rel" warn "helper $rel not cached yet (use --fix to pre-download)"
       fi
     fi
   done
 }
 
 run_doctor(){
-  local fix="$1"
+  local fix="${1:-$DOCTOR_FIX}" fmt="${2:-$DOCTOR_FORMAT}"
+  DOCTOR_FORMAT="${fmt:-text}"
   DOCTOR_FAILS=0
   DOCTOR_WARNINGS=0
-  say "${BOLD}UBS Doctor${RESET}"
-  doctor_report info "Module cache: ${DIM}$MODULE_DIR${RESET}"
-  doctor_report info "Tool cache:   ${DIM}$TOOLS_DIR${RESET}"
+  ensure_tmpdir_run
+  DOCTOR_CHECKS_FILE="$TMPDIR_RUN/doctor_checks.jsonl"
+  : > "$DOCTOR_CHECKS_FILE"
+
+  [[ "$DOCTOR_FORMAT" == "text" ]] && say "${BOLD}UBS Doctor${RESET}"
+  doctor_report "module-cache" info "Module cache: ${DIM}$MODULE_DIR${RESET}"
+  doctor_report "tool-cache" info "Tool cache:   ${DIM}$TOOLS_DIR${RESET}"
 
   local checksum_tool
   if checksum_tool=$(checksum_tool_name); then
-    doctor_report ok "Checksum tool available: $checksum_tool"
+    doctor_report "checksum-tool" ok "Checksum tool available: $checksum_tool"
   else
-    doctor_report err "No checksum tool found (install sha256sum, shasum, or openssl)"
+    doctor_report "checksum-tool" err "No checksum tool found (install sha256sum, shasum, or openssl)"
   fi
 
   if need_cmd curl; then
-    doctor_report ok "curl available for module downloads"
+    doctor_report "download-tool" ok "curl available for module downloads"
   elif need_cmd wget; then
-    doctor_report ok "wget available for module downloads"
+    doctor_report "download-tool" ok "wget available for module downloads"
   else
-    doctor_report warn "Neither curl nor wget present; network module updates will fail"
+    doctor_report "download-tool" warn "Neither curl nor wget present; network module updates will fail"
   fi
 
   if [[ -w "$MODULE_DIR" ]]; then
-    doctor_report ok "Module cache is writable"
+    doctor_report "module-cache-writable" ok "Module cache is writable"
   else
-    doctor_report err "Module cache is not writable: $MODULE_DIR"
+    doctor_report "module-cache-writable" err "Module cache is not writable: $MODULE_DIR"
   fi
 
   # External dependency readiness (JS/TS AST engine)
@@ -3788,72 +3848,75 @@ run_doctor(){
 
   if [[ -n "$ast_bin" ]] && verify_ast_grep_bin "$ast_bin"; then
     ast_version="$("$ast_bin" --version 2>/dev/null | head -n 1 || true)"
-    doctor_report ok "ast-grep: ready (${ast_source}) ${DIM}${ast_version}${RESET}"
-    doctor_report info "ast-grep bin: ${DIM}$ast_bin${RESET}"
+    doctor_report "ast-grep" ok "ast-grep: ready (${ast_source}) ${DIM}${ast_version}${RESET}"
+    doctor_report "ast-grep-bin" info "ast-grep bin: ${DIM}$ast_bin${RESET}"
   else
     if [[ "$fix" -eq 1 ]]; then
       if ensure_ast_grep; then
         ast_version="$("$AST_GREP_BIN" --version 2>/dev/null | head -n 1 || true)"
-        doctor_report ok "ast-grep: installed (${AST_GREP_SOURCE}) ${DIM}${ast_version}${RESET}"
-        doctor_report info "ast-grep bin: ${DIM}${AST_GREP_BIN}${RESET}"
+        doctor_report "ast-grep" ok "ast-grep: installed (${AST_GREP_SOURCE}) ${DIM}${ast_version}${RESET}"
+        doctor_report "ast-grep-bin" info "ast-grep bin: ${DIM}${AST_GREP_BIN}${RESET}"
       else
-        doctor_report err "ast-grep: missing/unusable (JS/TS scans will fail)."
+        doctor_report "ast-grep" err "ast-grep: missing/unusable (JS/TS scans will fail)."
       fi
     else
-      doctor_report warn "ast-grep: missing/unusable (JS/TS scans will fail). Run: ubs doctor --fix"
+      doctor_report "ast-grep" warn "ast-grep: missing/unusable (JS/TS scans will fail). Run: ubs doctor --fix"
     fi
   fi
 
   # python3: helpers, permalinks, suppressions and the size guard's fallbacks need it.
   if [[ -n "$PYTHON_RESOLVED" ]]; then
-    doctor_report ok "python: ready ${DIM}${PYTHON_RESOLVED} $(python3 --version 2>&1 | head -n 1)${RESET}"
-    [[ "$PYTHON_SOURCE" != "path" ]] && doctor_report info "python3 comes from ${PYTHON_SOURCE} (UBS_PYTHON overrides detection)"
+    doctor_report "python" ok "python: ready ${DIM}${PYTHON_RESOLVED} $(python3 --version 2>&1 | head -n 1)${RESET}"
+    [[ "$PYTHON_SOURCE" != "path" ]] && doctor_report "python-source" info "python3 comes from ${PYTHON_SOURCE} (UBS_PYTHON overrides detection)"
   else
-    doctor_report warn "python: no python3, python or py launcher with Python >= 3.9 found (helpers, permalinks, suppressions and fallbacks degrade); set UBS_PYTHON=/path/to/python"
+    doctor_report "python" warn "python: no python3, python or py launcher with Python >= 3.9 found (helpers, permalinks, suppressions and fallbacks degrade); set UBS_PYTHON=/path/to/python"
   fi
 
   # TOON encoder (toon_rust): optional, but --format=toon exits 2 without it.
   if command -v "$TOON_BIN" >/dev/null 2>&1 && looks_like_toon_rust_encoder "$TOON_BIN"; then
-    doctor_report ok "toon encoder: ready ${DIM}$(command -v "$TOON_BIN") $("$TOON_BIN" --version 2>/dev/null | head -n 1)${RESET}"
+    doctor_report "toon-encoder" ok "toon encoder: ready ${DIM}$(command -v "$TOON_BIN") $("$TOON_BIN" --version 2>/dev/null | head -n 1)${RESET}"
   else
     if [[ "$fix" -eq 1 ]]; then
       local toon_bin
       if toon_bin="$(ensure_toon_tool_cache)"; then
         TOON_BIN="$toon_bin"
-        doctor_report ok "toon encoder: installed ${DIM}${toon_bin} $("$toon_bin" --version 2>/dev/null | head -n 1)${RESET}"
+        doctor_report "toon-encoder" ok "toon encoder: installed ${DIM}${toon_bin} $("$toon_bin" --version 2>/dev/null | head -n 1)${RESET}"
       else
-        doctor_report warn "toon encoder: could not be provisioned (see above); --format=toon exits 2 until toon_rust's toon/tru is on PATH or TOON_TRU_BIN points at it"
+        doctor_report "toon-encoder" warn "toon encoder: could not be provisioned (see above); --format=toon exits 2 until toon_rust's toon/tru is on PATH or TOON_TRU_BIN points at it"
       fi
     else
-      doctor_report info "toon encoder: not found (--format=toon exits 2 until it is installed; run 'ubs doctor --fix' to fetch the digest-pinned toon_rust release, or set TOON_TRU_BIN)"
+      doctor_report "toon-encoder" info "toon encoder: not found (--format=toon exits 2 until it is installed; run 'ubs doctor --fix' to fetch the digest-pinned toon_rust release, or set TOON_TRU_BIN)"
     fi
   fi
 
   local lang module_path verify_status cached_modules=0
   for lang in "${ALL_LANGS[@]}"; do
-    module_path="$(resolve_module_path "$lang")"
+    if [[ "${MODULE_DIR_EXPLICIT:-0}" -eq 1 ]]; then
+      module_path="$MODULE_DIR/ubs-$lang.sh"
+    else
+      module_path="$(resolve_module_path "$lang")"
+    fi
     if should_verify_module_path "$module_path"; then
       cached_modules=1
       if [[ -f "$module_path" ]]; then
         if verify_module_checksum "$lang" "$module_path"; then
-          doctor_report ok "$lang module checksum verified ($module_path)"
+          doctor_report "module:$lang" ok "$lang module checksum verified ($module_path)"
         else
           verify_status=$?
           if [[ $verify_status -eq 2 ]]; then
-            doctor_report err "$lang module: $VERIFY_MODULE_ERR"
+            doctor_report "module:$lang" err "$lang module: $VERIFY_MODULE_ERR"
           else
             if [[ "$module_path" == "$(script_dir)/modules/"* ]]; then
-              # Checkout modules are source under git: report, never download over them.
-              doctor_report err "$lang module in this checkout does not match MODULE_CHECKSUMS ($VERIFY_MODULE_ERR); run ./scripts/update_checksums.sh (doctor --fix never overwrites checkout modules)"
+              doctor_report "module:$lang" err "$lang module in this checkout does not match MODULE_CHECKSUMS ($VERIFY_MODULE_ERR); run ./scripts/update_checksums.sh (doctor --fix never overwrites checkout modules)"
             elif [[ "$fix" -eq 1 ]]; then
               say "    ${DIM}Refreshing $lang module...${RESET}"
               if download_module "$lang" "$module_path"; then
-                doctor_report ok "$lang module refreshed and verified"
+                doctor_report "module:$lang" ok "$lang module refreshed and verified"
               else
-                doctor_report err "Failed to refresh $lang module: ${VERIFY_MODULE_ERR:-see logs}"
+                doctor_report "module:$lang" err "Failed to refresh $lang module: ${VERIFY_MODULE_ERR:-see logs}"
               fi
             else
-              doctor_report err "$lang module: $VERIFY_MODULE_ERR (re-run with --fix)"
+              doctor_report "module:$lang" err "$lang module: $VERIFY_MODULE_ERR (re-run with --fix)"
             fi
           fi
         fi
@@ -3861,30 +3924,49 @@ run_doctor(){
         if [[ "$fix" -eq 1 ]]; then
           say "    ${DIM}Caching $lang module...${RESET}"
           if download_module "$lang" "$module_path"; then
-            doctor_report ok "$lang module downloaded and verified"
+            doctor_report "module:$lang" ok "$lang module downloaded and verified"
           else
-            doctor_report err "Failed to download $lang module: ${VERIFY_MODULE_ERR:-see logs}"
+            doctor_report "module:$lang" err "Failed to download $lang module: ${VERIFY_MODULE_ERR:-see logs}"
           fi
         else
-          doctor_report warn "$lang module not cached yet (use --fix to pre-download)"
+          doctor_report "module:$lang" warn "$lang module not cached yet (use --fix to pre-download)"
         fi
       fi
     else
       if [[ -x "$module_path" ]]; then
-        doctor_report info "$lang module supplied by $(dirname "$module_path") (custom/bundled, checksum skipped)"
+        doctor_report "module:$lang" info "$lang module supplied by $(dirname "$module_path") (custom/bundled, checksum skipped)"
       else
-        doctor_report warn "$lang module expected at $module_path but is not executable"
+        doctor_report "module:$lang" warn "$lang module expected at $module_path but is not executable"
       fi
     fi
   done
 
-  if [[ "$cached_modules" -eq 1 ]]; then
+  if [[ "$cached_modules" -eq 1 || "${MODULE_DIR_EXPLICIT:-0}" -eq 1 ]]; then
     doctor_check_cached_helpers "$fix"
+  fi
+
+  if [[ "$DOCTOR_FORMAT" == "json" ]]; then
+    local d_status="ok"
+    [[ $DOCTOR_FAILS -gt 0 ]] && d_status="error"
+    local checks_json="[]"
+    if [[ -s "$DOCTOR_CHECKS_FILE" ]]; then
+      if need_cmd jq; then
+        checks_json="$(jq -s '.' "$DOCTOR_CHECKS_FILE" 2>/dev/null || echo "[]")"
+      elif need_cmd python3; then
+        checks_json="$(python3 -c 'import sys, json; lines=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]; print(json.dumps(lines))' "$DOCTOR_CHECKS_FILE" 2>/dev/null || echo "[]")"
+      fi
+    fi
+    printf '{"status":"%s","fails":%d,"warnings":%d,"checks":%s}\n' \
+      "$(json_escape "$d_status")" "$DOCTOR_FAILS" "$DOCTOR_WARNINGS" "$checks_json"
+    if [[ $DOCTOR_FAILS -gt 0 ]]; then
+      return 2
+    fi
+    return 0
   fi
 
   if [[ $DOCTOR_FAILS -gt 0 ]]; then
     say "${RED}${X}${RESET} Doctor detected $DOCTOR_FAILS blocking issue(s)."
-    return 1
+    return 2
   fi
   if [[ $DOCTOR_WARNINGS -gt 0 ]]; then
     say "${YELLOW}${WARN}${RESET} Doctor completed with $DOCTOR_WARNINGS warning(s)."
@@ -4509,7 +4591,8 @@ download_helper_asset(){
       say "${RED}$X ${err_msg}${RESET}"
       return 1
     fi
-    if [ ! -s "$tmp" ]; then
+    local empty_sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    if [[ "${HELPER_CHECKSUMS[$rel]:-}" != "$empty_sha" ]] && [ ! -s "$tmp" ]; then
       rm -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} empty helper file for $rel from ${label}; trying main fallback..."
@@ -4914,7 +4997,7 @@ finalize_module_dir
 resolve_git_metadata || true  # Git metadata is optional; don't fail on repos without remotes
 
 if [[ "$MODE" == "doctor" ]]; then
-  run_doctor "$DOCTOR_FIX"
+  run_doctor "$DOCTOR_FIX" "$DOCTOR_FORMAT"
   exit $?
 fi
 

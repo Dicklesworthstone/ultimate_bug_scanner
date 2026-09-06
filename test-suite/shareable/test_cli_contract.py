@@ -1416,6 +1416,194 @@ def test_baseline_new_only() -> None:
 check_baseline_new_only = test_baseline_new_only
 
 
+def test_doctor_json_schema() -> None:
+    # ubs doctor --format=json emits structured JSON conforming to schema (bead B9).
+    proc = run(["doctor", "--format=json"])
+    ok = False
+    detail = f"exit={proc.returncode}"
+    res: dict = {"exit": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+    try:
+        data = json.loads(proc.stdout)
+        res["parsed"] = data
+        status = data.get("status")
+        fails = data.get("fails")
+        warnings = data.get("warnings")
+        checks = data.get("checks")
+        check_ids = [c.get("id") for c in checks] if isinstance(checks, list) else []
+
+        # Validate schema requirements
+        schema_ok = (
+            proc.returncode in (0, 2)
+            and status in ("ok", "error")
+            and isinstance(fails, int) and fails >= 0
+            and isinstance(warnings, int) and warnings >= 0
+            and isinstance(checks, list)
+            and len(checks) > 0
+            and all(isinstance(c, dict) and "id" in c and "status" in c and "detail" in c for c in checks)
+            and all(c.get("status") in ("ok", "warn", "info", "err") for c in checks)
+            and "module-cache" in check_ids
+            and "checksum-tool" in check_ids
+        )
+        # Test bad format exit 2
+        bad_proc = run(["doctor", "--format=bogus"])
+        bad_ok = (bad_proc.returncode == 2 and "unknown --format value for doctor" in bad_proc.stderr)
+
+        ok = schema_ok and bad_ok
+        detail = f"exit={proc.returncode} status={status} fails={fails} warnings={warnings} checks_count={len(checks)} bad_format_ok={bad_ok}"
+    except Exception as exc:  # noqa: BLE001
+        detail += f" parse_error={exc}"
+
+    res["ok"] = ok
+    write_case_artifacts("test_doctor_json_schema", proc, res)
+    report("test_doctor_json_schema", ok, detail, proc if not ok else None)
+
+
+check_doctor_json_schema = test_doctor_json_schema
+
+
+def test_doctor_fix_restores_assets() -> None:
+    # Test that doctor --fix restores deleted/corrupted module, helper, lib file, and ast-grep (bead B9).
+    import hashlib
+    import zipfile
+
+    tmp_obj = tempfile.TemporaryDirectory(prefix="ubs-docfix-")
+    tmp = Path(tmp_obj.name)
+    try:
+        version = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        mirror = tmp / "mirror"
+        mirror_v = mirror / f"v{version}" / "modules"
+        mirror_main = mirror / "main" / "modules"
+        mirror_v.mkdir(parents=True)
+        mirror_main.mkdir(parents=True)
+        shutil.copytree(REPO_ROOT / "modules", mirror_v, dirs_exist_ok=True)
+        shutil.copytree(REPO_ROOT / "modules", mirror_main, dirs_exist_ok=True)
+
+        # Prepare ast-grep fixture zip
+        ast_dir = mirror / "ast-grep"
+        ast_dir.mkdir(parents=True)
+        arch = "x86_64" if os.uname().machine in ("x86_64", "amd64") else ("aarch64" if os.uname().machine in ("arm64", "aarch64") else "x86_64")
+        os_name = "apple-darwin" if sys.platform == "darwin" else "unknown-linux-gnu"
+        target = f"{arch}-{os_name}"
+
+        real_ag = shutil.which("ast-grep")
+        if not (real_ag and os.path.isfile(real_ag) and os.access(real_ag, os.X_OK)):
+            for candidate in ("/home/ubuntu/.cargo/bin/ast-grep", "/usr/local/bin/ast-grep", "/usr/bin/ast-grep"):
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    real_ag = candidate
+                    break
+
+        if not real_ag:
+            report("test_doctor_fix_restores_assets", True, "skipped: host lacks ast-grep binary for packaging fixture")
+            return
+
+        zip_name = f"app-{target}.zip"
+        zip_path = ast_dir / zip_name
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(real_ag, arcname="ast-grep")
+        ag_zip_sha256 = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+
+        sandbox_modules = tmp / "sandbox_modules"
+        sandbox_modules.mkdir()
+        sandbox_tools = tmp / "sandbox_tools"
+        sandbox_tools.mkdir()
+
+        env = {
+            "UBS_REPO_RAW_BASE": f"file://{mirror}",
+            "UBS_AST_GREP_BASE_URL": f"file://{ast_dir}",
+            "UBS_TEST_AST_GREP_SHA256": ag_zip_sha256,
+            "UBS_TEST_NO_PATH_AST_GREP": "1",
+            "UBS_TOOLS_DIR": str(sandbox_tools),
+            "UBS_AST_GREP_BIN": "",
+        }
+
+        # Step 1: Initial fix to populate all assets into sandbox_modules and sandbox_tools
+        init_proc = run(["doctor", "--fix", f"--module-dir={sandbox_modules}"], env=env)
+        if init_proc.returncode != 0:
+            report("test_doctor_fix_restores_assets", False, f"initial doctor --fix failed: exit={init_proc.returncode}", init_proc)
+            return
+
+        mod_file = sandbox_modules / "ubs-python.sh"
+        helper_file = sandbox_modules / "helpers" / "resource_lifecycle_py.py"
+        lib_file = sandbox_modules / "lib" / "ubs-common.sh"
+        ag_bin_file = sandbox_tools / "ast-grep" / "0.45.3" / target / "ast-grep"
+
+        orig_mod_sha = hashlib.sha256(mod_file.read_bytes()).hexdigest()
+        orig_helper_sha = hashlib.sha256(helper_file.read_bytes()).hexdigest()
+        orig_lib_sha = hashlib.sha256(lib_file.read_bytes()).hexdigest()
+
+        # Step 2: Corrupt/delete the 4 assets
+        mod_file.write_text("#!/bin/bash\n# corrupted module\nexit 99\n", encoding="utf-8")
+        helper_file.write_text("# corrupted helper\n", encoding="utf-8")
+        lib_file.write_text("# corrupted lib\n", encoding="utf-8")
+        if ag_bin_file.exists():
+            ag_bin_file.unlink()
+
+        # Step 3: Run doctor WITHOUT --fix -> assert failure (exit 2) and error checks reported
+        doc_fail_proc = run(["doctor", "--format=json", f"--module-dir={sandbox_modules}"], env=env)
+        fail_ok = False
+        if doc_fail_proc.returncode == 2:
+            try:
+                fail_data = json.loads(doc_fail_proc.stdout)
+                checks_map = {c["id"]: c["status"] for c in fail_data.get("checks", [])}
+                fail_ok = (
+                    fail_data.get("status") == "error"
+                    and fail_data.get("fails", 0) >= 3
+                    and checks_map.get("module:python") == "err"
+                    and checks_map.get("helper:helpers/resource_lifecycle_py.py") == "err"
+                    and checks_map.get("helper:lib/ubs-common.sh") == "err"
+                    and checks_map.get("ast-grep") in ("warn", "err")
+                )
+            except Exception:
+                fail_ok = False
+
+        if not fail_ok:
+            report("test_doctor_fix_restores_assets", False, f"corrupted check without --fix did not fail as expected: exit={doc_fail_proc.returncode}", doc_fail_proc)
+            return
+
+        # Step 4: Run doctor WITH --fix -> assert success (exit 0) and assets restored
+        doc_fix_proc = run(["doctor", "--format=json", "--fix", f"--module-dir={sandbox_modules}"], env=env)
+        fix_ok = False
+        if doc_fix_proc.returncode == 0:
+            try:
+                fix_data = json.loads(doc_fix_proc.stdout)
+                checks_map = {c["id"]: c["status"] for c in fix_data.get("checks", [])}
+                fix_ok = (
+                    fix_data.get("status") == "ok"
+                    and fix_data.get("fails") == 0
+                    and checks_map.get("module:python") == "ok"
+                    and checks_map.get("helper:helpers/resource_lifecycle_py.py") == "ok"
+                    and checks_map.get("helper:lib/ubs-common.sh") == "ok"
+                    and checks_map.get("ast-grep") == "ok"
+                )
+            except Exception:
+                fix_ok = False
+
+        # Step 5: Verify files on disk match original checksums and ast-grep is executable
+        disk_ok = (
+            hashlib.sha256(mod_file.read_bytes()).hexdigest() == orig_mod_sha
+            and hashlib.sha256(helper_file.read_bytes()).hexdigest() == orig_helper_sha
+            and hashlib.sha256(lib_file.read_bytes()).hexdigest() == orig_lib_sha
+            and ag_bin_file.exists() and os.access(ag_bin_file, os.X_OK)
+        )
+
+        overall_ok = fail_ok and fix_ok and disk_ok
+        detail = f"fail_ok={fail_ok} fix_ok={fix_ok} disk_ok={disk_ok} exit={doc_fix_proc.returncode}"
+        write_case_artifacts("test_doctor_fix_restores_assets", doc_fix_proc, {
+            "fail_exit": doc_fail_proc.returncode,
+            "fail_stdout": doc_fail_proc.stdout,
+            "fix_exit": doc_fix_proc.returncode,
+            "fix_stdout": doc_fix_proc.stdout,
+            "disk_ok": disk_ok,
+            "ok": overall_ok,
+        })
+        report("test_doctor_fix_restores_assets", overall_ok, detail, doc_fix_proc if not overall_ok else None)
+    finally:
+        tmp_obj.cleanup()
+
+
+check_doctor_fix_restores_assets = test_doctor_fix_restores_assets
+
+
 def main() -> int:
     filter_names = set(sys.argv[1:])
     checks = (
@@ -1458,6 +1646,8 @@ def main() -> int:
         test_skip_polyglot_mapping,
         check_findings_parity_all_langs,
         test_baseline_new_only,
+        test_doctor_json_schema,
+        test_doctor_fix_restores_assets,
     )
     for check in checks:
         name = check.__name__

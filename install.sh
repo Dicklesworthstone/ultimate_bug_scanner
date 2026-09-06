@@ -1741,24 +1741,44 @@ run_post_install_doctor() {
     write_session_summary "FAILED" "" "$install_dir" "installer binary missing"
     return 0
   fi
-  log "Running 'ubs doctor --fix' (post-install health check + pre-cache modules)..."
-  local doctor_log
+  log "Running 'ubs doctor --format=json --fix' (post-install health check + pre-cache modules)..."
+  local doctor_log doctor_json
   doctor_log="$(mktemp_in_workdir "doctor.log.XXXXXX")"
+  doctor_json="$(mktemp_in_workdir "doctor.json.XXXXXX")"
   note="All checks passed"
   # Use --fix to pre-download language modules during install (avoids "not cached" warnings)
-  if NO_COLOR=1 "$installed_bin" doctor --fix >"$doctor_log" 2>&1; then
+  local doctor_rc=0
+  if NO_COLOR=1 "$installed_bin" doctor --format=json --fix >"$doctor_json" 2>"$doctor_log"; then
+    doctor_rc=0
+  else
+    doctor_rc=$?
+  fi
+  if [ "$doctor_rc" -eq 0 ]; then
     success "'ubs doctor' completed without issues"
   else
     warn "'ubs doctor' reported issues"
     status="FAIL"
     note="Review output above or run 'ubs doctor --fix'. View latest log via 'ubs sessions --entries 1'."
-    if grep -qi "checksum" "$doctor_log"; then
-      log "Checksum issues detected; running 'ubs doctor --fix' automatically..."
+    local has_checksum=0
+    if check_jq && [ -s "$doctor_json" ]; then
+      local err_count
+      err_count="$(jq -r '[.checks[]? | select(.status == "err") | select(.id | startswith("module:") or startswith("helper:"))] | length' "$doctor_json" 2>/dev/null || echo 0)"
+      [ "${err_count:-0}" -gt 0 ] && has_checksum=1
+    elif [ -s "$doctor_json" ]; then
+      if grep -qE '"id":"(module|helper):' "$doctor_json" 2>/dev/null; then
+        has_checksum=1
+      fi
+    fi
+    if [ "$has_checksum" -eq 0 ] && grep -qi "checksum" "$doctor_log"; then
+      has_checksum=1
+    fi
+    if [ "$has_checksum" -eq 1 ]; then
+      log "Checksum issues detected; running 'ubs doctor --format=json --fix' automatically..."
       {
         echo ""
         echo "---- auto doctor --fix ----"
       } >>"$doctor_log"
-      if NO_COLOR=1 "$installed_bin" doctor --fix >>"$doctor_log" 2>&1; then
+      if NO_COLOR=1 "$installed_bin" doctor --format=json --fix >"$doctor_json" 2>>"$doctor_log"; then
         success "'ubs doctor --fix' resolved checksum issues"
         status="PASS"
         note="Checksum issues auto-fixed by installer"
@@ -1768,6 +1788,13 @@ run_post_install_doctor() {
         note="Auto-fix attempted; review log or rerun manually"
       fi
     fi
+  fi
+  if [ -s "$doctor_json" ]; then
+    {
+      echo ""
+      echo "---- doctor json summary ----"
+      cat "$doctor_json"
+    } >>"$doctor_log"
   fi
   write_session_summary "$status" "$doctor_log" "$install_dir" "$note"
 }
@@ -4481,7 +4508,7 @@ run_post_install_doctor "$install_dir/$INSTALL_NAME" "$install_dir"
 # If checksum issues were auto-fixed, verify doctor now passes (no full installer re-run needed)
 if [ "$RERUN_AFTER_FIX" -eq 1 ]; then
   log "Verifying doctor passes after checksum fix..."
-  if NO_COLOR=1 "$install_dir/$INSTALL_NAME" doctor >/dev/null 2>&1; then
+  if NO_COLOR=1 "$install_dir/$INSTALL_NAME" doctor --format=json >/dev/null 2>&1; then
     success "Doctor verification passed after auto-fix"
   else
     warn "Doctor still reports issues after auto-fix. Run 'ubs doctor' to investigate."

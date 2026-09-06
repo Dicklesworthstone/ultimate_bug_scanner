@@ -4632,6 +4632,8 @@ EXIT_CODE=0
 if [[ "$FORMAT" == "json" ]]; then
   {
     printf '{'
+    printf '"language":"swift",'
+    printf '"status":"ok",'
     printf '"version":"%s",' "$(json_escape "$VERSION")"
     printf '"project":"%s",' "$(json_escape "$PROJECT_DIR")"
     printf '"files":%s,' "$TOTAL_FILES"

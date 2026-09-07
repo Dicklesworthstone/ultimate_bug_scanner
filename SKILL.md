@@ -1,11 +1,11 @@
 ---
 name: ubs
-description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 14-24 detection categories per language, 11 languages, regex + ast-grep + AST-helper analysis. The AI agent's quality gate."
+description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 14-24 detection categories per language, 12 languages, regex + ast-grep + AST-helper analysis. The AI agent's quality gate."
 ---
 
 # UBS - Ultimate Bug Scanner
 
-Static analysis tool built for AI coding workflows. Catches bugs that AI agents commonly introduce: null safety, async/await issues, security holes, memory leaks. Scans JS/TS, Python, Go, Rust, Java/Kotlin, C/C++, Ruby, Swift, C#, Elixir, and Bash. Single-file scans take a few seconds; scope scans to changed files (see Speed Tips).
+Static analysis tool built for AI coding workflows. Catches bugs that AI agents commonly introduce: null safety, async/await issues, security holes, memory leaks. Scans JS/TS, Python, Go, Rust, Java, Kotlin, C/C++, Ruby, Swift, C#, Elixir, and Bash. Single-file scans take a few seconds; scope scans to changed files (see Speed Tips).
 
 ## Why This Exists
 

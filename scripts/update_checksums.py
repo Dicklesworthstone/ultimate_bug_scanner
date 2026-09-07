@@ -48,6 +48,7 @@ def main():
         "rust": "ubs-rust.sh",
         "golang": "ubs-golang.sh",
         "java": "ubs-java.sh",
+        "kotlin": "ubs-kotlin.sh",
         "ruby": "ubs-ruby.sh",
         "swift": "ubs-swift.sh",
         "elixir": "ubs-elixir.sh",

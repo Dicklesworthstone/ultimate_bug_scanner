@@ -478,7 +478,7 @@ Measured on 2026-09-02 (v5.3.13, single runs on a 16-core Linux box; ast-grep on
 ```
 Single file (JS or Python):                   4.6–5.8 seconds
 15-file repository (this one):                9 seconds
-29K-line fixture tree, 11 languages:          40 seconds
+29K-line fixture tree, 12 languages:          40 seconds
 124K-line Python project (597 files):         143 seconds
 407K-line TypeScript monorepo (--only=js):    hit the 300 s module timeout
 ```
@@ -1377,7 +1377,7 @@ eval(safe_string)  # ubs:ignore
 
 ### **Cross-Language Async Error Detection**
 
-UBS detects unhandled async errors consistently across all 11 languages. The patterns adapt to each language's idioms while providing equivalent coverage:
+UBS detects unhandled async errors consistently across all 12 languages. The patterns adapt to each language's idioms while providing equivalent coverage:
 
 | Language | Pattern | What UBS Detects |
 |----------|---------|------------------|
@@ -1452,7 +1452,7 @@ If a helper is modified or corrupted, the scanner fails safely with remediation 
 
 ### **Unified Severity Normalization**
 
-All 11 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
+All 12 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1609,7 +1609,7 @@ Traditional linters were designed for **human developers** in **single-language 
 
 | Traditional Linting (Human-First) | UBS Approach (LLM-First) |
 |---|---|
-| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 11 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
+| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 12 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
 
 ### **2. LLMs Don't Need Auto-Fix—They ARE the Auto-Fix Engine**
 
@@ -1679,7 +1679,7 @@ pip install pylint black mypy
 curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash
 ubs .
 
-# Done. All 11 languages scanned, unified report.
+# Done. All 12 languages scanned, unified report.
 ```
 
 **This matters because:**
@@ -1884,7 +1884,7 @@ Layer 4: Metrics collection  → Time-series quality tracking
 **This combination of speed + semantic understanding + correlation is unique.**
 
 **Unified multi-language runner:**
-- Auto-detects 11 languages in one scan
+- Auto-detects 12 languages in one scan
 - Parallel execution (Go + Python + Rust simultaneously)
 - Unified JSON/SARIF output for tooling
 - Module system with lazy download/caching
@@ -2015,7 +2015,7 @@ You wouldn't use a truck for a Formula 1 race. You wouldn't use a sports car to 
 These are fundamentally incompatible goals. ESLint would never accept "10-20% false positives are fine" or "skip auto-fix entirely."
 
 **2. Multi-language meta-runner**
-- The unified runner that auto-detects 11 languages is the core innovation
+- The unified runner that auto-detects 12 languages is the core innovation
 - This doesn't fit into any single linter's architecture
 - Each linter project has different maintainers, philosophies, release cycles
 
@@ -2178,11 +2178,10 @@ Use both.
 
 **A:** Probably! The module system makes it easy to add languages.
 
-**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, C++, Ruby, Swift, C#, Elixir, Bash (11 languages)
+**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash (12 languages)
 
 **Roadmap considerations:**
 - **PHP** - High demand, lots of legacy code
-- **Kotlin** - Dedicated module (currently scanned via Java module)
 - **Scala** - JVM ecosystem
 - **Lua** - Embedded scripts and game dev
 
@@ -2219,7 +2218,7 @@ But the core tool will always be free and open source.
 
 **This isn't trying to replace ESLint.** It's solving a different problem:
 
-> **"How do I give LLM coding agents the ability to self-audit across 11 languages with zero configuration overhead and sub-5-second feedback?"**
+> **"How do I give LLM coding agents the ability to self-audit across 12 languages with zero configuration overhead and sub-5-second feedback?"**
 
 No existing tool does this because:
 - Traditional linters are human-first (need auto-fix, low FP tolerance)

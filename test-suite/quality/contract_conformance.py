@@ -54,6 +54,8 @@ DEFAULT_SNIPPETS: dict[str, str] = {
     "swift": "func clean() -> Int { return 42 }\n",
     "cs": "class Clean { static void Main() {} }\n",
     "ex": "defmodule Clean do\n  def clean, do: 42\nend\n",
+    "kt": "fun main() {}\n",
+    "kts": "println(42)\n",
     "zig": "pub fn main() void {}\n",
 }
 

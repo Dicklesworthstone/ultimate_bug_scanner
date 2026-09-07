@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# UBS module: Bash (bash). Comprehensive static analysis for Bash/POSIX-sh.
+# UBS module: Kotlin (kotlin). Comprehensive static analysis for Kotlin.
 # contract: v2
 if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
-  echo "ERROR: ubs-bash.sh requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
+  echo "ERROR: ubs-kotlin.sh requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
   exit 2
 fi
 
@@ -46,12 +46,12 @@ if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
 fi
-# shellcheck source=lib/ubs-common.sh
+# shellcheck source=modules/lib/ubs-common.sh
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 ubs_export_locale
 
 VERSION="0.1.0"
-LANGUAGE="bash"
+LANGUAGE="kotlin"
 PROJECT_DIR="."
 OUTPUT_FILE=""
 FORMAT="text"
@@ -60,7 +60,7 @@ FAIL_ON_WARNING=0
 VERBOSE=0
 QUIET=0
 JOBS=0
-INCLUDE_EXT="sh,bash"
+INCLUDE_EXT="kt,kts"
 EXTRA_EXCLUDES=""
 SKIP_CATEGORIES=""
 ONLY_CATEGORIES=""
@@ -72,7 +72,6 @@ AST_RULE_DIR=""
 DUMP_RULES_DIR=""
 LIST_RULES=0
 LIST_CATS=0
-NO_SHELLCHECK=0
 JSON_OUT=""
 SARIF_OUT=""
 SUMMARY_JSON=""
@@ -80,7 +79,7 @@ SOURCE_PROJECT_DIR=""
 
 usage(){
   cat <<'USAGE'
-Usage: ubs-bash.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]
+Usage: ubs-kotlin.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]
 
 Options:
   --format=FMT         text|json|sarif (default: text); jsonl/toon come from the meta-runner
@@ -91,8 +90,8 @@ Options:
   --no-color           disable ANSI colour
   --jobs=N             parallel hint (propagated to child tools)
   --exclude=GLOBS      additional path globs to skip (forwarded by the meta-runner)
-  --include-ext=CSV    extra file extensions to scan (default: sh,bash)
-  --skip=CSV           skip category numbers (1-6)
+  --include-ext=CSV    extra file extensions to scan (default: kt,kts)
+  --skip=CSV           skip category numbers (1-22)
   --only=CSV           run only these category numbers
   --report-json=FILE   write NDJSON findings sink to FILE
   --files-from=FILE    NUL-separated file list to scan
@@ -101,7 +100,6 @@ Options:
   --dump-rules[=DIR]   write the generated ast-grep rules to DIR
   --list-rules         print generated ast-grep rule ids and exit
   --list-categories    print the category table and exit
-  --no-shellcheck      disable ShellCheck integration
   --json-out=FILE      write JSON report to FILE
   --sarif-out=FILE     write SARIF report to FILE
   --summary-json=FILE  write summary JSON to FILE
@@ -138,7 +136,6 @@ while [[ $# -gt 0 ]]; do
     --dump-rules) DUMP_RULES_DIR="${2:-rules-dump}"; shift 2;;
     --list-rules) LIST_RULES=1; shift;;
     --list-categories) LIST_CATS=1; shift;;
-    --no-shellcheck) NO_SHELLCHECK=1; shift;;
     --json-out=*) JSON_OUT="${1#*=}"; shift;;
     --json-out) JSON_OUT="${2:-}"; shift 2;;
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
@@ -147,7 +144,7 @@ while [[ $# -gt 0 ]]; do
     --summary-json) SUMMARY_JSON="${2:-}"; shift 2;;
     --project=*) SOURCE_PROJECT_DIR="${1#*=}"; shift;;
     --project) SOURCE_PROJECT_DIR="${2:-}"; shift 2;;
-    --version) echo "ubs-bash $VERSION"; exit 0;;
+    --version) echo "ubs-kotlin $VERSION"; exit 0;;
     -h|--help) usage; exit 0;;
     -*) echo "unknown option: $1" >&2; usage >&2; exit 2;;
     *) if [[ -e "$1" || -z "$OUTPUT_FILE" ]]; then
@@ -166,12 +163,28 @@ done
 : "$JOBS" "$VERBOSE" "$QUIET" "$NO_COLOR_FLAG" "$LANGUAGE" "$CI_MODE"
 
 if [[ "$LIST_CATS" -eq 1 ]]; then
-  printf '1  syntax        Bash syntax & arithmetic gotchas\n'
-  printf '2  control-flow  Control flow & exit codes\n'
-  printf '3  security      Security & dangerous commands\n'
-  printf '4  robustness    Defensive programming & robustness\n'
-  printf '5  environment   Environment & locale hygiene\n'
-  printf '6  shellcheck    ShellCheck analysis\n'
+  printf '1   type-narrowing      Kotlin null-safety & type narrowing\n'
+  printf '2   equality            Equality & comparison pitfalls\n'
+  printf '3   concurrency         Concurrency & coroutines\n'
+  printf '4   security            Security, taint, path traversal & SSRF\n'
+  printf '5   io                  I/O & resources\n'
+  printf '6   logging             Logging & debugging\n'
+  printf '7   regex               Regex & string pitfalls\n'
+  printf '8   collections         Collections & generics\n'
+  printf '9   control-flow        Control flow & switch\n'
+  printf '10  performance         Performance & streams\n'
+  printf '11  serialization       Serialization & compatibility\n'
+  printf '12  features            Kotlin features\n'
+  printf '13  sql                 SQL construction\n'
+  printf '14  annotations         Annotations & nullness\n'
+  printf '15  ast-grep            ast-grep rule pack findings\n'
+  printf '16  build               Build health (Gradle)\n'
+  printf '17  inventory           Meta statistics & inventory\n'
+  printf '18  api-misuse          API misuse\n'
+  printf '19  resource-lifecycle  Resource lifecycle & cleanup\n'
+  printf '20  filesystem          Path handling & filesystem\n'
+  printf '21  secrets             Hard-coded secrets\n'
+  printf '22  logging-practices   Logging best practices\n'
   exit 0
 fi
 
@@ -181,140 +194,148 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
     exit 2
   fi
   helpers_dir=""
-  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
-  tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-bashv2-rules.XXXXXX)"
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="${UBS_MODULE_LIB_DIR}/helpers"
+  PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 -c "
 from pathlib import Path
-from ubs_core.bash_rules import generate
-generate(Path('$tmp_rules'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+import tempfile
+from ubs_core.kotlin_rules import generate
+with tempfile.TemporaryDirectory() as td:
+    for rule in generate(Path(td)):
+        print(rule)
 " 2>/dev/null || true
-  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | sort -u
-  rm -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
 
-run_contract_v2_bash(){
-  local list_file sink exit_code=0 text_out="" v2_json_out=""
-  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-bashv2-list.XXXXXX)"
-  sink="$(mktemp 2>/dev/null || mktemp -t ubs-bashv2-sink.XXXXXX)"
-  local helpers_dir=""
-  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
-
-  if [[ -f "$PROJECT_DIR" ]]; then
-    printf '%s\0' "$PROJECT_DIR" >"$list_file"
-  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
-    echo "ERROR: contract-v2 file list failed" >&2
-    rm -f "$list_file" "$sink" 2>/dev/null || true
-    return 2
-  fi
-
-  local v2_skip="$SKIP_CATEGORIES"
-  if [[ -n "$ONLY_CATEGORIES" ]]; then
-    local keep="" c allowed w
-    local -a _wl
-    IFS=',' read -r -a _wl <<<"$ONLY_CATEGORIES"
-    for c in 1 2 3 4 5 6; do
-      allowed=0
-      for w in "${_wl[@]}"; do [[ "$w" == "$c" ]] && allowed=1; done
-      [[ $allowed -eq 0 ]] && keep="${keep:+$keep,}$c"
-    done
-    v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
-  fi
-
-  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
-  [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
-  [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
-  [[ "$NO_SHELLCHECK" -eq 1 ]] && scan_args+=(--no-shellcheck)
-
-  local ast_rule_dir="$AST_RULE_DIR"
-  local created_ast_dir=""
-  if [[ -z "$ast_rule_dir" ]] && command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
-    created_ast_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-bashv2-rules.XXXXXX)"
-    if PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+if [[ -n "$DUMP_RULES_DIR" ]]; then
+  helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="${UBS_MODULE_LIB_DIR}/helpers"
+  mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
+  PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 -c "
 from pathlib import Path
-from ubs_core.bash_rules import generate
-generate(Path('$created_ast_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
-" 2>/dev/null; then
-      ast_rule_dir="$created_ast_dir"
-    else
-      rm -rf "$created_ast_dir" 2>/dev/null || true
-      created_ast_dir=""
-    fi
-  fi
-  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
-
-  if [[ -n "$DUMP_RULES_DIR" ]]; then
-    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
-    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from pathlib import Path
-from ubs_core.bash_rules import generate
+from ubs_core.kotlin_rules import generate
 generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
 " 2>/dev/null || true
-  fi
+  echo "Dumped rules to $DUMP_RULES_DIR"
+  exit 0
+fi
 
+# File discovery
+LIST_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-list.XXXXXX)"
+SINK_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-sink.XXXXXX)"
+JSON_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-json.XXXXXX)"
+TEXT_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-text.XXXXXX)"
+cleanup() {
+  rm -f "$LIST_FILE" "$SINK_FILE" "$JSON_TMP" "$TEXT_TMP"
+}
+trap cleanup EXIT
+
+if [[ -f "$PROJECT_DIR" ]]; then
+  printf '%s\0' "$PROJECT_DIR" > "$LIST_FILE"
+elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} > "$LIST_FILE"; then
+  echo "ERROR: contract-v2 file list failed" >&2
+  exit 2
+fi
+
+if [[ ! -s "$LIST_FILE" ]]; then
+  empty_json="{\"language\":\"kotlin\",\"project\":\"${SOURCE_PROJECT_DIR:-$PROJECT_DIR}\",\"files\":0,\"critical\":0,\"warning\":0,\"info\":0,\"status\":\"ok\",\"findings\":[],\"categories\":{},\"ast_grep_rules\":0,\"extras\":{},\"uv_tools\":[]}"
   case "$FORMAT" in
-    json|sarif)
-      v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-bashv2-json.XXXXXX)"
-      scan_args+=(--json-out "$v2_json_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+    json)
+      echo "$empty_json" > "${OUTPUT_FILE:-/dev/stdout}"
+      ;;
+    sarif)
+      echo '{"$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","version":"2.1.0","runs":[{"tool":{"driver":{"name":"ubs-kotlin","version":"0.1.0","rules":[]}},"results":[]}]}' > "${OUTPUT_FILE:-/dev/stdout}"
       ;;
     text)
-      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-bashv2-text.XXXXXX)"
-      scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      printf "UBS module: kotlin (contract v2) — %s\nFiles scanned: 0\nCritical issues: 0\nWarning issues: 0\nInfo items: 0\n" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" > "${OUTPUT_FILE:-/dev/stdout}"
       ;;
-    *) echo "ERROR: contract-v2 bash path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
   esac
+  exit 0
+fi
 
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.bash_scan \
-    "${scan_args[@]}" --version "$VERSION" || exit_code=$?
+# Run python engine
+helpers_dir=""
+ubs_resolve_helpers_dir helpers_dir || helpers_dir="${UBS_MODULE_LIB_DIR}/helpers"
 
-  if [[ "$FORMAT" == "sarif" ]]; then
-    if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-      if [[ -n "$OUTPUT_FILE" ]]; then
-        PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" 2>/dev/null | tee "$OUTPUT_FILE" || true
-      else
-        PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" 2>/dev/null || true
-      fi
-    fi
-  fi
+scan_args=(
+  --files-from "$LIST_FILE"
+  --sink "$SINK_FILE"
+  --project-dir "$PROJECT_DIR"
+  --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  --version "$VERSION"
+  --json-out "$JSON_TMP"
+  --text-out "$TEXT_TMP"
+)
 
-  if [[ -n "$text_out" ]]; then
+if [[ -n "$AST_RULE_DIR" ]]; then
+  scan_args+=(--ast-rule-dir "$AST_RULE_DIR")
+fi
+if [[ -n "$SKIP_CATEGORIES" ]]; then
+  scan_args+=(--skip "$SKIP_CATEGORIES")
+fi
+if [[ -n "$ONLY_CATEGORIES" ]]; then
+  computed_skip=$(python3 -c "
+only_set = {int(x) for x in '$ONLY_CATEGORIES'.split(',') if x.strip().isdigit()}
+all_set = set(range(1, 23))
+print(','.join(str(x) for x in sorted(all_set - only_set)))
+")
+  scan_args+=(--skip "$computed_skip")
+fi
+if [[ "$FAIL_ON_WARNING" -eq 1 ]]; then
+  scan_args+=(--fail-on-warning)
+fi
+
+exit_code=0
+PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 -m ubs_core.kotlin_scan "${scan_args[@]}" || exit_code=$?
+
+if [[ -n "$REPORT_JSON" ]]; then
+  cp "$SINK_FILE" "$REPORT_JSON"
+fi
+
+if [[ -n "$JSON_OUT" ]]; then
+  cp "$JSON_TMP" "$JSON_OUT"
+fi
+
+if [[ -n "$SUMMARY_JSON" ]]; then
+  cp "$JSON_TMP" "$SUMMARY_JSON"
+fi
+
+case "$FORMAT" in
+  json)
     if [[ -n "$OUTPUT_FILE" ]]; then
-      cat "$text_out" 2>/dev/null | tee "$OUTPUT_FILE" || true
+      cp "$JSON_TMP" "$OUTPUT_FILE"
     else
-      cat "$text_out" 2>/dev/null || true
+      cat "$JSON_TMP"
     fi
-    rm -f "$text_out" 2>/dev/null || true
-  fi
-
-  if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
+    ;;
+  sarif)
+    sarif_content=$(PYTHONPATH="${helpers_dir}${PYTHONPATH:+:${PYTHONPATH}}" python3 -c "
+import json
+from ubs_core.kotlin_scan import _render_sarif
+records = [json.loads(line) for line in open('$SINK_FILE') if line.strip()]
+counters = {'critical': 0, 'warning': 0, 'info': 0}
+for r in records:
+    sev = r.get('severity', 'info')
+    counters[sev] = counters.get(sev, 0) + 1
+files = [line for line in open('$LIST_FILE').read().split('\0') if line.strip()]
+sarif = _render_sarif(records, counters, '${SOURCE_PROJECT_DIR:-$PROJECT_DIR}', files)
+print(json.dumps(sarif, indent=2))
+")
+    if [[ -n "$SARIF_OUT" ]]; then
+      echo "$sarif_content" > "$SARIF_OUT"
+    fi
     if [[ -n "$OUTPUT_FILE" ]]; then
-      cat "$v2_json_out" 2>/dev/null | tee "$OUTPUT_FILE" || true
+      echo "$sarif_content" > "$OUTPUT_FILE"
     else
-      cat "$v2_json_out" 2>/dev/null || true
+      echo "$sarif_content"
     fi
-  fi
+    ;;
+  text)
+    if [[ -n "$OUTPUT_FILE" ]]; then
+      cp "$TEXT_TMP" "$OUTPUT_FILE"
+    else
+      cat "$TEXT_TMP"
+    fi
+    ;;
+esac
 
-  if [[ -n "$SARIF_OUT" && -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" > "$SARIF_OUT" 2>/dev/null || true
-  fi
-  if [[ -n "$JSON_OUT" && -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-    cp "$v2_json_out" "$JSON_OUT" 2>/dev/null || true
-  fi
-  if [[ -n "$SUMMARY_JSON" && -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-    cp "$v2_json_out" "$SUMMARY_JSON" 2>/dev/null || true
-  fi
-
-  if [[ -n "$v2_json_out" ]]; then
-    rm -f "$v2_json_out" 2>/dev/null || true
-  fi
-  if [[ -n "$REPORT_JSON" ]]; then
-    cp "$sink" "$REPORT_JSON" 2>/dev/null || true
-  fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
-  [[ -n "$created_ast_dir" ]] && rm -rf -- "$created_ast_dir" 2>/dev/null || true
-  return "$exit_code"
-}
-
-v2_status=0
-run_contract_v2_bash || v2_status=$?
-exit "$v2_status"
+exit "$exit_code"

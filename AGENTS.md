@@ -190,7 +190,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## ultimate_bug_scanner — This Project
 
-**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 11 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java (plus Kotlin via the Java module), Ruby, Swift, C#, Elixir, and Bash.
+**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 12 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, and Bash.
 
 ### What It Does
 
@@ -205,6 +205,7 @@ Invocation → Parse CLI args → Detect languages → ┬─ ubs-js.sh      (JS
                                                   ├─ ubs-rust.sh    (Rust)
                                                   ├─ ubs-golang.sh  (Go)
                                                   ├─ ubs-java.sh    (Java)
+                                                  ├─ ubs-kotlin.sh  (Kotlin)
                                                   ├─ ubs-ruby.sh    (Ruby)
                                                   ├─ ubs-swift.sh   (Swift)
                                                   ├─ ubs-csharp.sh  (C#)
@@ -239,6 +240,7 @@ ultimate_bug_scanner/
 │   ├── ubs-rust.sh                    # Rust scanner
 │   ├── ubs-golang.sh                  # Go scanner
 │   ├── ubs-java.sh                    # Java scanner
+│   ├── ubs-kotlin.sh                  # Kotlin scanner
 │   ├── ubs-ruby.sh                    # Ruby scanner
 │   ├── ubs-swift.sh                   # Swift scanner
 │   ├── ubs-csharp.sh                  # C# scanner

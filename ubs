@@ -49,17 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='71b638f27288939b34ae7bf329827bdcee1124ada0942d364591502ae1924a6e'
-  [cpp]='dbf62e64f6844314ffb45cc3cf6fc13b2d07c8815b650127958a3f61b5ec71e0'
-  [csharp]='46ab14181e2171ed805f98799ab41e1d3d529b5d61900fc778354de878b26170'
-  [elixir]='cb06d8571ce5f4a3c5b4d8235a9be58cbf354f582e46d443663dcebc064f94d5'
-  [golang]='2073f09c6050c5b77fa4de546520d889a3af832699c369de176e45907dc19144'
-  [java]='8a18e27e8036f7be13ab6f65333349c7863de2332f684eb75832c4c37cd22458'
-  [js]='fa8642a3c46de7b6114dd958a33b5d00570d09e20ffa949cbcdba63d99fc91ef'
-  [python]='9cc6769254be583484662f0c1624e87606dc4f1de34ae2e3c83f324ba19a6a4b'
-  [ruby]='49949249b59461b8cde202be8cec31bd729fdf8c0de5036e131f39425e425d36'
-  [rust]='2647ea1fb458988feeae4aa156cb946c2d159a49af4b947eed3519b7cca48953'
-  [swift]='69a5a2c19293636e8986e2418ded0dec9ded6ad4bd28c27c20cb77f6a518710c'
+  [bash]='4feda725de3e156c58b24435d98ecff28f12cd84cd5614904d04ee00ae057847'
+  [cpp]='5952891215203442d34d39642f4cfb11ab6447b6f48e4d11c72530386c1aeaa5'
+  [csharp]='9c4ff5e9aae1af1c889f573779045cd649f5bd84bb4f7fc1023101b738e808e3'
+  [elixir]='3f993c020cb8436fcb5de8bee5af07bbb3e1bb7a98db2face2f8cfc461141b95'
+  [golang]='b6c4524adbc4836582a2c7d414a98907a955f6f5c4a239bb2aa8642412996b5b'
+  [java]='7657fbd7330adf26d7e2ecac603dd7c38bfa026fb9de8e2121345b6d985d60f4'
+  [js]='6e2e2e10359effc5004a384068786c5321aef2d2c8a345eff1c3c42d5242a5a1'
+  [kotlin]='8ae96462e545149715b1d952baffa58b9cdbd22d59fd35c9efffacf69b64028c'
+  [python]='a5e4c9d71fc5571afaa6c52dd7afab80c9339a1a5befec9478bce691e2795abf'
+  [ruby]='50fc704dd5fd6621b141db90ccae9bca7d48e3ffbe1a9c9138510b08a40f54ae'
+  [rust]='234e2cc788504a6f9e7be99e35f7274fc1939957723ed2c17d1faa4070c1ac5d'
+  [swift]='c9209314c031aa982e4729835134f5a7613d2d654a3882dc397bb02a7806f180'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -284,6 +285,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_patterns/security_node.py']='7ceb9d14a629fb7bb89fce5c702a7ccc769260be10feab937a843b473efcf81e'
   ['helpers/ubs_core/js_rules.py']='aef56a2d91a68b9e4aad2586de9d94342555ad74008fb06c0ab10a8142b7eecc'
   ['helpers/ubs_core/js_scan.py']='f39c4ad2d9512246a1cb6002c6ab9b5a911040279a43b476ff863a4f150fcfa9'
+  ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
+  ['helpers/ubs_core/kotlin_scan.py']='cf60be5bbfd8b5fdce04b082b30b8f4628743bbb7a7e08b8540914aa9f3db915'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/py_ast.py']='65f04218142f319d77b3aaf19779714303fab261b6f210fb5aeb0ed13a0bc6af'
   ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
@@ -401,7 +404,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='ae19424f3b25d31ea71fff1f1fd6f3f8f65c05ef046f7ac85dcde9c17937dbd3'
   ['helpers/ubs_core/swift_scan.py']='006def40ab25a5addb8d97a85fc269db735bbe47eecdae8b5850b6fc9fc9fa5b'
-  ['lib/ubs-common.sh']='9cbde85cf097681dc2942fc7c5c8e8321fc7fc9e94c1e50245d426686d109b0a'
+  ['lib/ubs-common.sh']='f4cf70d3d0ca37f94f21d6d5d2bd311378822eb7d7e03adf46f911822aa7e079'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -832,6 +835,8 @@ HELPER_ASSETS=(
   "helpers/ubs_core/js_patterns/security_node.py"
   "helpers/ubs_core/js_rules.py"
   "helpers/ubs_core/js_scan.py"
+  "helpers/ubs_core/kotlin_rules.py"
+  "helpers/ubs_core/kotlin_scan.py"
   "helpers/ubs_core/lexer.py"
   "helpers/ubs_core/py_ast.py"
   "helpers/ubs_core/py_detectors/__init__.py"
@@ -1213,7 +1218,7 @@ SESSION_RAW=0
 SESSION_LOG_DIR_OVERRIDE=""
 VERIFY_MODULE_ERR=""
 VERIFY_HELPER_ERR=""
-ALL_LANGS=(js python cpp rust golang java ruby swift csharp elixir bash)
+ALL_LANGS=(js python cpp rust golang java kotlin ruby swift csharp elixir bash)
 # Per-language category skip lists, populated by --skip-LANG=N flags.
 # Bare --skip=N continues to apply globally via UBS_SKIP_CATEGORIES (issue #52).
 declare -A SKIP_BY_LANG=()
@@ -1275,7 +1280,8 @@ lang_for_source_file(){
     *.go) echo golang;;
     *.rs) echo rust;;
     *.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx) echo cpp;;
-    *.java|*.kt|*.kts) echo java;;
+    *.java) echo java;;
+    *.kt|*.kts) echo kotlin;;
     *.rb|*.rake) echo ruby;;
     *.swift) echo swift;;
     *.cs) echo csharp;;
@@ -1320,7 +1326,7 @@ Options:
   --fail-on-warning       Exit non-zero if warnings or critical exist
   -v, --verbose           Pass -v to child scanners (if supported)
   -q, --quiet             Reduce console output (also passes -q to scanners)
-  --only=CSV              Restrict to languages: js,python,c,cpp,rust,golang,java,ruby,swift,csharp,cs,elixir,ex,bash,sh
+  --only=CSV              Restrict to languages: js,python,c,cpp,rust,golang,java,kotlin,kt,ruby,swift,csharp,cs,elixir,ex,bash,sh
   --exclude=GLOB[,..]     Skip paths (globs/dirs, like .ubsignore lines); forwarded to modules
   --exclude-langs=CSV     Exclude languages (e.g. --exclude-langs=js,ruby)
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
@@ -1346,8 +1352,8 @@ Options:
   --skip-size-check       Skip directory size guard (use with care)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift/C# type narrowing checks (falls back to basic heuristics)
   --skip=CSV              Skip categories by id (e.g. --skip=js.debug,python.todo) or number
-  --skip-LANG=CSV         Skip categories in ONE language only (LANG is js/python/cpp/rust/golang/java/ruby/swift/csharp/elixir/bash;
-                          aliases c/cs/ex accepted). Example: --skip-js=8 --skip-rust=3
+  --skip-LANG=CSV         Skip categories in ONE language only (LANG is js/python/cpp/rust/golang/java/kotlin/ruby/swift/csharp/elixir/bash;
+                          aliases c/cs/kt/ex accepted). Example: --skip-js=8 --skip-rust=3
                           Use this instead of bare --skip=N in polyglot repos: category numbers are NOT stable across
                           languages (e.g. JS cat 8 = Function & Scope Issues, Rust cat 8 = SECURITY FINDINGS). Issue #52.
   --no-dotnet             Pass through to the C# module: skip dotnet checks
@@ -1455,13 +1461,13 @@ cat <<'JSON'
       {"name": "--output", "args": "FILE", "example": "--output=report.json", "description": "Also write the report to FILE (alias: -o FILE, or a trailing positional file that does not exist yet); stdout still receives it."},
       {"name": "--ci", "args": null, "example": "--ci", "description": "CI mode: stable UTC timestamps; also disables the auto-update check."},
       {"name": "--fail-on-warning", "args": null, "example": "--fail-on-warning", "description": "Exit 1 when warnings exist, not only criticals."},
-      {"name": "--only", "args": "CSV", "example": "--only=js,python", "description": "Restrict to these languages (js, python, c/cpp, rust, golang, java, ruby, swift, csharp/cs, elixir/ex, bash/sh)."},
+      {"name": "--only", "args": "CSV", "example": "--only=js,python", "description": "Restrict to these languages (js, python, c/cpp, rust, golang, java, kotlin/kt, ruby, swift, csharp/cs, elixir/ex, bash/sh)."},
       {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
       {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack."},
       {"name": "--skip", "args": "CSV", "example": "--skip=python.todo", "description": "Skip categories by stable id (e.g. python.todo) or category number."},
-      {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|ruby|swift|csharp|elixir|bash)."},
+      {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|kotlin|ruby|swift|csharp|elixir|bash)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
       {"name": "--profile", "args": "NAME", "example": "--profile=strict", "description": "Severity profile passed to the modules (strict|loose); strict also implies --fail-on-warning."},
       {"name": "--files", "args": "F1,F2", "example": "--files=a.js,b.py", "description": "Scan only the listed files (comma or space separated)."},
@@ -2473,7 +2479,8 @@ LANG_EXT_HINTS = {
     "c": "cpp", "cc": "cpp", "cpp": "cpp", "cxx": "cpp", "h": "cpp", "hh": "cpp", "hpp": "cpp", "hxx": "cpp",
     "rs": "rust",
     "go": "golang",
-    "java": "java", "kt": "java", "kts": "java",
+    "java": "java",
+    "kt": "kotlin", "kts": "kotlin",
     "rb": "ruby", "rake": "ruby", "erb": "ruby",
     "swift": "swift",
     "cs": "csharp", "csx": "csharp",
@@ -2496,6 +2503,8 @@ def normalize_lang(l: str) -> str:
         return "elixir"
     if l in ("go", "golang"):
         return "golang"
+    if l in ("kt", "kts", "kotlin"):
+        return "kotlin"
     if l in ("py", "python"):
         return "python"
     if l in ("rb", "ruby"):
@@ -2519,7 +2528,7 @@ if contract_path and os.path.isfile(contract_path):
         modules_spec = {}
 
 all_module_langs = list(modules_spec.keys()) if modules_spec else [
-    "js", "python", "cpp", "rust", "golang", "java", "ruby", "swift", "csharp", "elixir", "bash"
+    "js", "python", "cpp", "rust", "golang", "java", "kotlin", "ruby", "swift", "csharp", "elixir", "bash"
 ]
 
 only_set = {normalize_lang(x) for x in only_langs_raw.split(",") if x.strip()} if only_langs_raw else set()
@@ -4215,10 +4224,19 @@ detect_lang(){
     java)
       if need_cmd rg; then
         rg -q --hidden -g '!target/**' -g '!build/**' -g '!out/**' -g '!dist/**' \
-           -g '*.java' -g '*.kt' -g '*.kts' -g 'pom.xml' -g 'build.gradle' -g 'build.gradle.kts' -g 'settings.gradle' -g 'settings.gradle.kts' -g 'gradlew' -g 'mvnw' . "$PROJECT_DIR" 2>/dev/null && found=0
+           -g '*.java' -g 'pom.xml' -g 'build.gradle' -g 'settings.gradle' -g 'gradlew' -g 'mvnw' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
         find "$PROJECT_DIR" \( -name target -o -name build -o -name out -o -name dist -o -name .git \) -prune -o \
-          -type f \( -name '*.java' -o -name '*.kt' -o -name '*.kts' -o -name 'pom.xml' -o -name 'build.gradle' -o -name 'build.gradle.kts' -o -name 'settings.gradle' -o -name 'settings.gradle.kts' -o -name 'gradlew' -o -name 'mvnw' \) -print -quit 2>/dev/null | grep -q . && found=0
+          -type f \( -name '*.java' -o -name 'pom.xml' -o -name 'build.gradle' -o -name 'settings.gradle' -o -name 'gradlew' -o -name 'mvnw' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      ;;
+    kotlin)
+      if need_cmd rg; then
+        rg -q --hidden -g '!target/**' -g '!build/**' -g '!out/**' -g '!dist/**' \
+           -g '*.kt' -g '*.kts' -g 'build.gradle.kts' -g 'settings.gradle.kts' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name target -o -name build -o -name out -o -name dist -o -name .git \) -prune -o \
+          -type f \( -name '*.kt' -o -name '*.kts' -o -name 'build.gradle.kts' -o -name 'settings.gradle.kts' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
     ruby)
@@ -4332,6 +4350,7 @@ normalize_lang(){
     cs|csharp|csharp-dotnet|dotnet|c#) echo "csharp" ;;
     ex|elixir|phoenix) echo "elixir" ;;
     go) echo "golang" ;;
+    kt|kts|kotlin) echo "kotlin" ;;
     py) echo "python" ;;
     rb) echo "ruby" ;;
     rs) echo "rust" ;;
@@ -5336,6 +5355,42 @@ category_name_for(){
         16) echo "MIX-POWERED EXTRA ANALYZERS";;
         *) echo "(no category $cat)";;
       esac;;
+    kotlin)
+      case "$cat" in
+        1) echo "TYPE NARROWING & NULL SAFETY";;
+        2) echo "EQUALITY & COMPARISON";;
+        3) echo "CONCURRENCY & COROUTINES";;
+        4) echo "SECURITY";;
+        5) echo "I/O & RESOURCES";;
+        6) echo "LOGGING & DEBUGGING";;
+        7) echo "REGEX & STRING PITFALLS";;
+        8) echo "COLLECTIONS & GENERICS";;
+        9) echo "CONTROL FLOW & SWITCH";;
+        10) echo "PERFORMANCE & STREAMS";;
+        11) echo "SERIALIZATION & COMPATIBILITY";;
+        12) echo "KOTLIN FEATURES";;
+        13) echo "SQL CONSTRUCTION";;
+        14) echo "ANNOTATIONS & NULLNESS";;
+        15) echo "AST-GREP RULE PACK FINDINGS";;
+        16) echo "BUILD HEALTH (Gradle)";;
+        17) echo "META STATISTICS & INVENTORY";;
+        18) echo "API MISUSE";;
+        19) echo "RESOURCE LIFECYCLE & CLEANUP";;
+        20) echo "PATH HANDLING & FILESYSTEM";;
+        21) echo "HARD-CODED SECRETS";;
+        22) echo "LOGGING BEST PRACTICES";;
+        *) echo "(no category $cat)";;
+      esac;;
+    bash)
+      case "$cat" in
+        1) echo "SYNTAX";;
+        2) echo "CONTROL FLOW";;
+        3) echo "SECURITY";;
+        4) echo "ROBUSTNESS";;
+        5) echo "ENVIRONMENT";;
+        6) echo "SHELLCHECK";;
+        *) echo "(no category $cat)";;
+      esac;;
     *) echo "(unknown language $lang)";;
   esac
 }
@@ -5597,6 +5652,32 @@ category_slug_for(){
         24) echo "perf";;
         *) echo "";;
       esac;;
+    kotlin)
+      case "$cat" in
+        1) echo "type-narrowing";;
+        2) echo "equality";;
+        3) echo "concurrency";;
+        4) echo "security";;
+        5) echo "io";;
+        6) echo "logging";;
+        7) echo "regex";;
+        8) echo "collections";;
+        9) echo "control-flow";;
+        10) echo "performance";;
+        11) echo "serialization";;
+        12) echo "features";;
+        13) echo "sql";;
+        14) echo "annotations";;
+        15) echo "ast-grep";;
+        16) echo "build";;
+        17) echo "inventory";;
+        18) echo "api-misuse";;
+        19) echo "resource-lifecycle";;
+        20) echo "filesystem";;
+        21) echo "secrets";;
+        22) echo "logging-practices";;
+        *) echo "";;
+      esac;;
     elixir)
       case "$cat" in
         1) echo "pattern-matching";;
@@ -5843,7 +5924,7 @@ def _load_ubs_core(helpers_dir: str):
         return None
 
 
-_RULE_HINT = re.compile(r"\b(?:js|ts|py|rs|rust|go|java|kt|rb|swift|cs|cpp|c|ex|elixir)\.[a-z0-9_.-]+")
+_RULE_HINT = re.compile(r"\b(?:js|ts|py|rs|rust|go|java|kt|kotlin|rb|swift|cs|cpp|c|ex|elixir)\.[a-z0-9_.-]+")
 
 
 def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
@@ -6258,7 +6339,7 @@ run_lang(){
     json|jsonl|toon|sarif)
       prepare_metrics_dir "$metrics_dir"
       local -a report_args=()
-      if [[ "$lang" == "js" || "$lang" == "python" || "$lang" == "cpp" || "$lang" == "golang" || "$lang" == "java" || "$lang" == "ruby" || "$lang" == "swift" || "$lang" == "elixir" || "$lang" == "rust" || "$lang" == "csharp" ]]; then
+      if [[ "$lang" == "js" || "$lang" == "python" || "$lang" == "cpp" || "$lang" == "golang" || "$lang" == "java" || "$lang" == "kotlin" || "$lang" == "ruby" || "$lang" == "swift" || "$lang" == "elixir" || "$lang" == "rust" || "$lang" == "csharp" ]]; then
         report_args=(--report-json="$out_findings")
       elif [[ "$lang" == "csharp" ]]; then
         report_args=(--emit-findings-json="$out_findings")

@@ -1,6 +1,6 @@
 # UBS Language Modules
 
-Each `ubs-<lang>.sh` provides a consistent CLI (current modules: `js`, `python`, `cpp`, `rust`, `golang`, `java` (also scans Kotlin), `ruby`, `swift`, `csharp`, `elixir`, `bash`):
+Each `ubs-<lang>.sh` provides a consistent CLI (current modules: `js`, `python`, `cpp`, `rust`, `golang`, `java`, `kotlin`, `ruby`, `swift`, `csharp`, `elixir`, `bash`):
 
 ```
 ubs-<lang>.sh [PROJECT_DIR] [options] [OUTPUT_FILE]
@@ -19,9 +19,9 @@ Options:
 --report-json=FILE write NDJSON findings sink to FILE
 --files-from=FILE  NUL-separated file list to scan (meta-runner contract v2 hand-off)
 --rules=DIR        merge custom ast-grep rules into the built-in pack (all modules except elixir)
---list-rules       print generated ast-grep rule ids and exit (js, golang, rust, java, ruby, swift, csharp, bash)
+--list-rules       print generated ast-grep rule ids and exit (js, golang, rust, java, kotlin, ruby, swift, csharp, bash)
 --dump-rules=DIR   write the generated ast-grep rules to DIR (same modules as --list-rules)
---list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash)
+--list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin)
 -h, --help         this help
 <!-- /contract:options -->
 ```

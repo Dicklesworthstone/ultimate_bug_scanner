@@ -135,6 +135,7 @@
         "csharp",
         "elixir",
         "java",
+        "kotlin",
         "ruby",
         "rust",
         "swift"
@@ -152,6 +153,7 @@
         "golang",
         "java",
         "js",
+        "kotlin",
         "python",
         "ruby",
         "rust",
@@ -168,12 +170,13 @@
         "golang",
         "java",
         "js",
+        "kotlin",
         "ruby",
         "rust",
         "swift"
       ],
       "documented": true,
-      "doc": "print generated ast-grep rule ids and exit (js, golang, rust, java, ruby, swift, csharp, bash)"
+      "doc": "print generated ast-grep rule ids and exit (js, golang, rust, java, kotlin, ruby, swift, csharp, bash)"
     },
     {
       "flag": "--dump-rules",
@@ -184,6 +187,7 @@
         "golang",
         "java",
         "js",
+        "kotlin",
         "ruby",
         "rust",
         "swift"
@@ -197,12 +201,13 @@
         "bash",
         "cpp",
         "csharp",
+        "kotlin",
         "python",
         "rust",
         "swift"
       ],
       "documented": true,
-      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash)"
+      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin)"
     },
     {
       "flag": "--summary-json",
@@ -211,6 +216,7 @@
         "bash",
         "csharp",
         "elixir",
+        "kotlin",
         "python",
         "ruby",
         "rust",
@@ -421,18 +427,14 @@
     },
     "java": {
       "file": "ubs-java.sh",
-      "display": "Java / Kotlin",
+      "display": "Java",
       "extensions": [
-        "java",
-        "kt",
-        "kts"
+        "java"
       ],
       "manifest_files": [
         "pom.xml",
         "build.gradle",
-        "build.gradle.kts",
         "settings.gradle",
-        "settings.gradle.kts",
         "gradlew",
         ".mvn"
       ],
@@ -616,6 +618,32 @@
         "--list-categories",
         "--list-rules",
         "--no-shellcheck",
+        "--only",
+        "--project",
+        "--rules",
+        "--sarif-out",
+        "--summary-json",
+        "--version"
+      ]
+    },
+    "kotlin": {
+      "file": "ubs-kotlin.sh",
+      "display": "Kotlin",
+      "extensions": [
+        "kt",
+        "kts"
+      ],
+      "manifest_files": [
+        "build.gradle.kts",
+        "settings.gradle.kts"
+      ],
+      "contract": 2,
+      "extra_flags": [
+        "--ast-rule-dir",
+        "--dump-rules",
+        "--json-out",
+        "--list-categories",
+        "--list-rules",
         "--only",
         "--project",
         "--rules",

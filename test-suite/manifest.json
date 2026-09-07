@@ -9966,14 +9966,14 @@
       "id": "kotlin-security-command-buggy",
       "description": "Kotlin ProcessBuilder shell interpreters should be caught by the Java-family scanner.",
       "path": "test-suite/kotlin/security_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning"
       ],
       "expect": {
@@ -9992,14 +9992,14 @@
       "id": "kotlin-security-command-clean",
       "description": "Kotlin ProcessBuilder with a fixed executable and argv should remain non-critical.",
       "path": "test-suite/kotlin/security_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
         "clean"
       ],
       "args": [
-        "--only=java"
+        "--only=kotlin"
       ],
       "expect": {
         "exit_code": "zero",
@@ -10020,7 +10020,7 @@
       "id": "kotlin-archive-extraction-buggy",
       "description": "Kotlin zip extraction should validate archive entry paths before writing files.",
       "path": "test-suite/kotlin/archive_extraction_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10028,7 +10028,7 @@
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning"
       ],
       "expect": {
@@ -10047,7 +10047,7 @@
       "id": "kotlin-archive-extraction-clean",
       "description": "Kotlin zip extraction with normalized destination containment checks should stay clean.",
       "path": "test-suite/kotlin/archive_extraction_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10055,7 +10055,7 @@
         "clean"
       ],
       "args": [
-        "--only=java"
+        "--only=kotlin"
       ],
       "expect": {
         "exit_code": "zero",
@@ -10076,7 +10076,7 @@
       "id": "kotlin-request-path-traversal-buggy",
       "description": "Kotlin Ktor-style params, request paths, headers, and upload filenames should not reach file read/write/serve/delete sinks without validation.",
       "path": "test-suite/kotlin/path_traversal_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10084,7 +10084,7 @@
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10104,7 +10104,7 @@
       "id": "kotlin-request-path-traversal-clean",
       "description": "Kotlin request/header-derived paths using safe root containment or file-name reduction should stay clean.",
       "path": "test-suite/kotlin/path_traversal_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10112,7 +10112,7 @@
         "clean"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10135,7 +10135,7 @@
       "id": "kotlin-open-redirect-buggy",
       "description": "Kotlin Ktor-style request query/header redirect targets should not reach redirect sinks without same-origin or host allow-list validation.",
       "path": "test-suite/kotlin/open_redirect_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10143,7 +10143,7 @@
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10163,7 +10163,7 @@
       "id": "kotlin-open-redirect-clean",
       "description": "Kotlin request-derived redirect targets routed through a safe redirect helper should stay clean.",
       "path": "test-suite/kotlin/open_redirect_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10171,7 +10171,7 @@
         "clean"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10194,7 +10194,7 @@
       "id": "kotlin-header-injection-buggy",
       "description": "Kotlin Ktor-style request query/header values should not reach response headers without CR/LF-safe validation or encoding.",
       "path": "test-suite/kotlin/header_injection_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10202,7 +10202,7 @@
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10222,7 +10222,7 @@
       "id": "kotlin-header-injection-clean",
       "description": "Kotlin response headers using CR/LF stripping, URL encoding, or reject-on-newline guards should stay clean.",
       "path": "test-suite/kotlin/header_injection_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10230,7 +10230,7 @@
         "clean"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10253,7 +10253,7 @@
       "id": "kotlin-ssrf-buggy",
       "description": "Kotlin Ktor-style request query/header URLs should not reach HTTP client calls without scheme and host allow-list validation.",
       "path": "test-suite/kotlin/ssrf_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10261,7 +10261,7 @@
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10281,7 +10281,7 @@
       "id": "kotlin-ssrf-clean",
       "description": "Kotlin request-derived outbound URLs with explicit safe outbound URL validation should stay clean.",
       "path": "test-suite/kotlin/ssrf_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10289,7 +10289,7 @@
         "clean"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10312,7 +10312,7 @@
       "id": "kotlin-random-security-buggy",
       "description": "Kotlin tokens, sessions, CSRF nonces, OTPs, API keys, invites, and reset codes should not be generated from kotlin.random.Random, java.util.Random, ThreadLocalRandom, UUID.randomUUID, or timestamps.",
       "path": "test-suite/kotlin/security_randomness_buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10320,7 +10320,7 @@
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10340,7 +10340,7 @@
       "id": "kotlin-random-security-clean",
       "description": "Kotlin SecureRandom-backed token helpers should stay clean while non-security UI randomness remains allowed.",
       "path": "test-suite/kotlin/security_randomness_clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "security",
@@ -10348,7 +10348,7 @@
         "clean"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning",
         "--skip=1,2,3,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77"
       ],
@@ -10371,14 +10371,14 @@
       "id": "kotlin-type-narrowing-buggy",
       "description": "Kotlin null guards that do not exit before using the guarded value with '!!'.",
       "path": "test-suite/kotlin/type_narrowing/buggy",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "type-narrowing",
         "buggy"
       ],
       "args": [
-        "--only=java",
+        "--only=kotlin",
         "--fail-on-warning"
       ],
       "expect": {
@@ -10399,14 +10399,14 @@
       "id": "kotlin-type-narrowing-clean",
       "description": "Kotlin fixtures that return/throw or Elvis out early so no '!!' panic is required.",
       "path": "test-suite/kotlin/type_narrowing/clean",
-      "language": "java",
+      "language": "kotlin",
       "tags": [
         "kotlin",
         "type-narrowing",
         "clean"
       ],
       "args": [
-        "--only=java"
+        "--only=kotlin"
       ],
       "expect": {
         "exit_code": "zero",

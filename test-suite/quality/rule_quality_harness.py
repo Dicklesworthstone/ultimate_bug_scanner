@@ -240,6 +240,11 @@ def case_side_and_slug(case: dict[str, Any]) -> tuple[str | None, str | None]:
                     break
     if side is None:
         return None, None
+    SLUG_ALIASES = {
+        "shell-exec-free-functions": "shell-exec",
+        "shell-exec-member-calls": "shell-exec",
+    }
+    stem = SLUG_ALIASES.get(stem, stem)
     if path.startswith("test-suite/kotlin/"):
         stem = f"kotlin_{stem}"
     return side, stem

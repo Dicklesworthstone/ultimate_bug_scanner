@@ -1,10 +1,10 @@
 {
   "all_language_expectation_strength_scopes": {
     "all": {
-      "buggy_cases_with_required_substrings": 150,
-      "case_count": 300,
-      "clean_cases_with_forbidden_substrings": 149,
-      "strict_zero_clean_cases": 149,
+      "buggy_cases_with_required_substrings": 151,
+      "case_count": 302,
+      "clean_cases_with_forbidden_substrings": 150,
+      "strict_zero_clean_cases": 150,
       "weak_case_count": 1,
       "weak_cases": [
         {
@@ -38,9 +38,9 @@
   },
   "clean_fuzz_budget_scopes": {
     "all": {
-      "case_count": 182,
+      "case_count": 183,
       "default_iterations": 3,
-      "default_transformed_scan_count": 546
+      "default_transformed_scan_count": 549
     },
     "campaign": {
       "case_count": 98,
@@ -135,10 +135,10 @@
       "strict_zero_clean_cases": 18
     },
     "swift": {
-      "buggy_cases_with_required_substrings": 7,
-      "clean_cases_with_forbidden_substrings": 7,
-      "security_pairs": 7,
-      "strict_zero_clean_cases": 7
+      "buggy_cases_with_required_substrings": 8,
+      "clean_cases_with_forbidden_substrings": 8,
+      "security_pairs": 8,
+      "strict_zero_clean_cases": 8
     }
   },
   "metamorphic_transform_scopes": {
@@ -443,6 +443,8 @@
           "swift-security-process-clean",
           "swift-security-randomness-buggy",
           "swift-security-randomness-clean",
+          "swift-shell-exec-free-functions-buggy",
+          "swift-shell-exec-member-calls-clean",
           "swift-ssrf-buggy",
           "swift-ssrf-clean",
           "js-async-errors-buggy",
@@ -707,8 +709,8 @@
           "rust-type-narrowing-clean"
         ]
       },
-      "case_count": 363,
-      "transformed_scan_count": 558
+      "case_count": 365,
+      "transformed_scan_count": 560
     },
     "campaign": {
       "by_transform": {
@@ -3265,6 +3267,20 @@
       "slug": "security_randomness"
     },
     {
+      "buggy_case": "swift-shell-exec-free-functions-buggy",
+      "buggy_min_critical": 5,
+      "buggy_min_warning": 0,
+      "buggy_path": "test-suite/swift/buggy/shell_exec_free_functions.swift",
+      "buggy_require_count": 1,
+      "clean_case": "swift-shell-exec-member-calls-clean",
+      "clean_forbid_count": 1,
+      "clean_max_critical": 0,
+      "clean_max_warning": 0,
+      "clean_path": "test-suite/swift/clean/swiftui_member_calls.swift",
+      "language": "swift",
+      "slug": "shell-exec"
+    },
+    {
       "buggy_case": "swift-ssrf-buggy",
       "buggy_min_critical": 1,
       "buggy_min_warning": 0,
@@ -3431,6 +3447,7 @@
         "swift-request-path-traversal-clean",
         "swift-security-process-clean",
         "swift-security-randomness-clean",
+        "swift-shell-exec-member-calls-clean",
         "swift-ssrf-clean",
         "js-async-errors-clean",
         "js-typescript-async-use-effect-clean",
@@ -3764,6 +3781,8 @@
         "swift-security-process-clean",
         "swift-security-randomness-buggy",
         "swift-security-randomness-clean",
+        "swift-shell-exec-free-functions-buggy",
+        "swift-shell-exec-member-calls-clean",
         "swift-ssrf-buggy",
         "swift-ssrf-clean",
         "js-async-errors-buggy",
@@ -4490,6 +4509,8 @@
       "swift-security-process-clean",
       "swift-security-randomness-buggy",
       "swift-security-randomness-clean",
+      "swift-shell-exec-free-functions-buggy",
+      "swift-shell-exec-member-calls-clean",
       "swift-ssrf-buggy",
       "swift-ssrf-clean"
     ],
@@ -4757,11 +4778,11 @@
         "id": "rust-clean",
         "language": "rust",
         "path": "test-suite/rust/clean",
-        "warning_max": 6
+        "warning_max": 9
       }
     ],
     "strict_zero_case_count": 3,
-    "warning_budget_total": 10
+    "warning_budget_total": 13
   },
   "version": 4
 }

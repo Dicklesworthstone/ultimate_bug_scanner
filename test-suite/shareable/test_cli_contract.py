@@ -672,24 +672,40 @@ def check_single_file_fast_path() -> None:
     # One explicit source file is scanned in place (bead C3): only its language
     # runs, no workspace is announced, and sample paths are the real path.
     target = REPO_ROOT / "test-suite" / "python" / "security" / "parser_token_compare_buggy.py"
-    proc = run([str(target), "--ci", "--format=json"], env={"UBS_PROFILE": "1"})
-    ok = False
-    detail = f"exit={proc.returncode}"
+    shim_dir = Path(tempfile.mkdtemp(prefix="ubs-sf-shims-"))
+    log_file = shim_dir / "shim.log"
     try:
-        doc = json.loads(proc.stdout)
-        langs = [s["language"] for s in doc["scanners"]]
-        samples = [s for sc in doc["scanners"] for f in sc.get("findings", []) for s in f.get("samples", []) if s.get("file")]
-        rel = "test-suite/python/security/parser_token_compare_buggy.py"
-        ok = langs == ["python"] and doc["scanners"][0]["files"] == 1 and bool(samples) \
-            and all(s["file"] == rel for s in samples) \
-            and all(s.get("permalink", "").endswith(f"{rel}#L{s['line']}") for s in samples if isinstance(s.get("line"), int)) \
-            and "Scanning one file directly (no workspace)" in proc.stderr \
-            and "Preparing shadow workspace" not in proc.stderr \
-            and "copy_ms" not in doc["profile"] \
-            and isinstance(doc["profile"].get("total_ms"), int)
-        detail += f" langs={langs} samples={len(samples)}"
-    except Exception as exc:  # noqa: BLE001
-        detail += f" {exc}"
+        for cmd in ("rsync", "tar", "du"):
+            shim = shim_dir / cmd
+            shim.write_text(f'#!/bin/sh\necho "{cmd} $@" >> "{log_file}"\nexit 1\n', encoding="utf-8")
+            shim.chmod(0o755)
+        shim_env = {
+            "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
+            "UBS_PROFILE": "1",
+        }
+        proc = run([str(target), "--ci", "--format=json"], env=shim_env)
+        ok = False
+        detail = f"exit={proc.returncode}"
+        try:
+            doc = json.loads(proc.stdout)
+            langs = [s["language"] for s in doc["scanners"]]
+            samples = [s for sc in doc["scanners"] for f in sc.get("findings", []) for s in f.get("samples", []) if s.get("file")]
+            rel = "test-suite/python/security/parser_token_compare_buggy.py"
+            shim_log_content = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+            no_shims_spawned = len(shim_log_content.strip()) == 0
+            ok = langs == ["python"] and doc["scanners"][0]["files"] == 1 and bool(samples) \
+                and all(s["file"] == rel for s in samples) \
+                and all(s.get("permalink", "").endswith(f"{rel}#L{s['line']}") for s in samples if isinstance(s.get("line"), int)) \
+                and "Scanning one file directly (no workspace)" in proc.stderr \
+                and "Preparing shadow workspace" not in proc.stderr \
+                and "copy_ms" not in doc["profile"] \
+                and isinstance(doc["profile"].get("total_ms"), int) \
+                and no_shims_spawned
+            detail += f" langs={langs} samples={len(samples)} no_shims={no_shims_spawned}"
+        except Exception as exc:  # noqa: BLE001
+            detail += f" {exc}"
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
     report("single_file_fast_path", ok, detail, proc if not ok else None)
     # Two files, or a file with an extension no module owns, keep the workspace path.
     proc2 = run([str(target), str(PY_CLEAN), "--ci", "--only=python", "--format=json"])

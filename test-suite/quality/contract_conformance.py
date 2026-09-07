@@ -38,21 +38,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CONTRACT_PATH = REPO_ROOT / "modules" / "contract.json"
 MODULES_DIR = REPO_ROOT / "modules"
 
-# Dated allowlist for modules still at contract v1 (contract.json "contract": 1).
-# As Epic A4 ports each module to contract v2 (beads 0xjg.4 through 0xjg.13),
-# its entry is removed from this allowlist.
-UNPORTED_ALLOWLIST: dict[str, str] = {
-    "js": "2026-09-03 bead 0xjg.4",
-    "python": "2026-09-03 bead 0xjg.5",
-    "golang": "2026-09-03 bead 0xjg.6",
-    "rust": "2026-09-03 bead 0xjg.7",
-    "java": "2026-09-03 bead 0xjg.8",
-    "cpp": "2026-09-03 bead 0xjg.9",
-    "ruby": "2026-09-03 bead 0xjg.10",
-    "swift": "2026-09-03 bead 0xjg.11",
-    "csharp": "2026-09-03 bead 0xjg.12",
-    "elixir": "2026-09-03 bead 0xjg.13",
-}
+# All 10 modules have been ported to contract v2 (bead A9).
+UNPORTED_ALLOWLIST: dict[str, str] = {}
 
 DEFAULT_SNIPPETS: dict[str, str] = {
     "py": "def clean():\n    return 42\n",

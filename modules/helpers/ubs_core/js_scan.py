@@ -416,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         import datetime
 
         doc = {
+            "language": "js",
             "project": args.project or args.project_dir,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "files": len(files),

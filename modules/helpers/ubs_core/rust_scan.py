@@ -1380,6 +1380,8 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.text_out).write_text(r.text(), encoding="utf-8")
     if args.json_out:
         doc = {
+            "language": "rust",
+            "status": "ok",
             "project": args.project or str(project_dir),
             "files": files_n,
             "critical": scan.counters["critical"],

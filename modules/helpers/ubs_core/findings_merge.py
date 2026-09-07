@@ -270,8 +270,9 @@ def to_sarif(
 
     # Map findings by language
     findings_by_lang: dict[str, list[dict]] = {}
+    default_lang = str(doc.get("language") or "")
     for f in findings:
-        lang = str(f.get("lang") or "unknown")
+        lang = str(f.get("lang") or default_lang or "unknown")
         findings_by_lang.setdefault(lang, []).append(f)
 
     # Determine ordered list of languages for runs
@@ -285,7 +286,9 @@ def to_sarif(
     for l in findings_by_lang:
         if l not in languages:
             languages.append(l)
-    if not languages:
+    if not languages and default_lang:
+        languages = [default_lang]
+    elif not languages:
         languages = ["ubs"]
 
     runs: list[dict] = []
@@ -311,7 +314,7 @@ def to_sarif(
 
         lang_findings = findings_by_lang.get(lang, [])
         for f in lang_findings:
-            rule_id = str(f.get("rule_id") or "")
+            rule_id = str(f.get("rule_id") or f.get("rule") or "")
             sev = str(f.get("severity") or "warning").lower()
             level = "error" if sev == "critical" else ("warning" if sev == "warning" else "note")
             msg = str(f.get("message") or rule_id)
@@ -320,7 +323,7 @@ def to_sarif(
                 "level": level,
                 "message": {"text": msg},
             }
-            file_path = str(f.get("file") or "")
+            file_path = str(f.get("file") or f.get("path") or "")
             if file_path:
                 try:
                     line_no = max(1, int(f.get("line", 1) or 1))

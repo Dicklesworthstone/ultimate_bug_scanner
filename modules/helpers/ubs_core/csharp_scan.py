@@ -19,9 +19,7 @@ ONE `python3 -m ubs_core.csharp_scan` process (js/py/go/java/ruby semantics):
 All layers append to ONE NDJSON findings sink (K2 schema), the totals are
 recounted from the sink, and a legacy-flavored text report is rendered.
 
-Gating lives in modules/ubs-csharp.sh (run_contract_v2_csharp): opt-in
-UBS_CONTRACT_V2_CSHARP=1, escape UBS_LEGACY_MODULE_CSHARP=1, sarif and
-active-dotnet runs stay on the legacy path.
+Contract-v2 orchestrator for modules/ubs-csharp.sh (beads 0xjg.12 and 0xjg.18).
 """
 from __future__ import annotations
 

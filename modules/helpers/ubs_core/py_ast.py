@@ -105,10 +105,12 @@ def scan_config(
             if severity not in counters:
                 severity = "warning"
             # Suppress asserts in test files (10111).
-            if rule_id == "py.assert-used" and (
-                "test" in file_str.lower() or "conftest" in file_str.lower()
-            ):
-                continue
+            if rule_id == "py.assert-used":
+                _p = Path(file_str)
+                _name = _p.name.lower()
+                _parts = [part.lower() for part in _p.parts[:-1]]
+                if _name.startswith("test_") or _name.endswith("_test.py") or _name == "conftest.py" or any(part in {"tests", "test"} for part in _parts):
+                    continue
             if _has_marker(path, line_no, cache):
                 continue  # legacy line + previous-line marker check
             counters[severity] = counters.get(severity, 0) + 1

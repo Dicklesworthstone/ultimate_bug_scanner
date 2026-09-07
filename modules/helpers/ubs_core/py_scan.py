@@ -563,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
 
         legacy_findings = _legacy_report(records, args.version)["findings"]
         doc = {
+            "language": "python",
             "project": args.project or args.project_dir,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "files": len(files),

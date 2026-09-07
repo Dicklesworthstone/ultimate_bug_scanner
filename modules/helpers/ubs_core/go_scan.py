@@ -11,8 +11,7 @@ and the project-inventory checks (go.mod/go.sum/go.work/test-file presence).
 
 Output contract mirrors js_scan/py_scan: NDJSON findings sink, legacy text
 renderer, fd-3/`--json-out` summary object with module-level findings[].
-Opt-in via UBS_CONTRACT_V2_GO=1 (modules/ubs-golang.sh); legacy default
-byte-identical when the gate is off; UBS_LEGACY_MODULE_GO=1 always wins.
+Contract-v2 orchestrator for modules/ubs-golang.sh (beads 0xjg.6 and 0xjg.18).
 
 Parity notes:
 - Grep-pipeline counts are DISTINCT MATCHING LINES across the file list with
@@ -927,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
         import datetime
 
         doc = {
+            "language": "golang",
             "project": args.project or args.project_dir,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "files": len(files),

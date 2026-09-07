@@ -48,11 +48,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 
@@ -216,7 +217,7 @@ def pattern_hits(pattern: Pattern, texts: dict[Path, str]) -> list[tuple[Path, i
 
 
 def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
-                  skip: set[int]) -> dict[str, int]:
+                  skip: set[int], prefilter: Any = None) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
     Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
@@ -246,7 +247,14 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
             guard_re, cap = pattern.suppress_if
             if count_regex(guard_re, texts, pattern.file_regex) >= cap:
                 continue
-        hits = pattern_hits(pattern, texts)
+
+        target_texts = texts
+        if prefilter is not None and not prefilter.is_bypass and pattern.zero_finding is None:
+            target_texts = {p: txt for p, txt in texts.items() if pattern.rule_id in prefilter.candidate_rules_for(p)}
+            if not target_texts:
+                continue
+
+        hits = pattern_hits(pattern, target_texts)
         if not hits:
             if pattern.zero_finding is not None:
                 severity, title = pattern.zero_finding
@@ -321,7 +329,7 @@ def _record_category(finding: dict) -> int | None:
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  enable_new: bool = False) -> None:
+                  enable_new: bool = False, prefilter: Any = None) -> None:
     """Run registered elixir analyzers (the two taint heredoc ports).
 
     ``guards_elixir`` (guards_generic) and ``narrowing_elixir`` have no legacy
@@ -331,10 +339,15 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
-    ctx = RunContext(lang="elixir", files=list(files))
     for analyzer in analyzers_for_lang("elixir"):
         if analyzer.layer in ("narrowing", "guards") and not enable_new:
             continue
+        target_files = files
+        if prefilter is not None and not prefilter.is_bypass:
+            target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+        if not target_files:
+            continue
+        ctx = RunContext(lang="elixir", files=list(target_files))
         for finding in analyzer.run(ctx):
             rule = finding.get("rule", "")
             if skip and _record_category(finding) in skip:
@@ -521,10 +534,30 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
 
     patterns, _failures = load_patterns()
+
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+
+    elixir_analyzers = [a.name for a in analyzers_for_lang("elixir")]
+    prefilter_index = build_prefilter_index(
+        ast_rules=[],
+        patterns=patterns,
+        analyzers=elixir_analyzers,
+        lang="elixir",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, files, sink, skip)
+        scan_patterns(patterns, files, sink, skip, prefilter=prefilter_res)
         run_detectors(files, sink, skip)
-        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers)
+        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers) is reflected in totals.
@@ -561,6 +594,11 @@ def main(argv: list[str] | None = None) -> int:
             # module summary so the combined JSON keeps per-finding samples.
             "report": _legacy_report(records, args.version),
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            doc["profile"] = {
+                "files_considered": len(files),
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+            }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:

@@ -15,11 +15,12 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 MARKER = "ubs:ignore"
 
@@ -155,16 +156,24 @@ def _record_category(rec: dict) -> int | None:
     return 4
 
 
-def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: set[int]) -> None:
-    for pattern in patterns:
-        if pattern.category in skip:
-            continue
-        for path in files:
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
+def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: set[int], prefilter: Any = None) -> None:
+    for path in files:
+        active_patterns = patterns
+        if prefilter is not None and not prefilter.is_bypass:
+            cand = prefilter.candidate_rules_for(path)
+            active_patterns = [p for p in patterns if p.rule_id in cand]
+            if not active_patterns:
                 continue
-            for lineno, line in enumerate(content.splitlines(), 1):
+
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = content.splitlines()
+        for pattern in active_patterns:
+            if pattern.category in skip:
+                continue
+            for lineno, line in enumerate(lines, 1):
                 if pattern.regex.search(line):
                     if _has_suppression(line, pattern.rule_id):
                         continue
@@ -182,7 +191,7 @@ def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: se
                     }, ensure_ascii=False) + "\n")
 
 
-def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Path | None = None) -> None:
+def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Path | None = None, prefilter: Any = None) -> None:
     from ubs_core.registry import RunContext
 
     def _rel(path: str) -> str:
@@ -203,49 +212,63 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
     # 1. Type narrowing (category 1)
     if 1 not in skip:
         from ubs_core.analyzers import narrowing_kotlin
-        ctx = RunContext(lang="kotlin", files=list(files))
-        for finding in narrowing_kotlin.run(ctx):
-            rule_id = finding.get("rule", "")
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": "kotlin.type-narrowing",
-                "path": _rel(str(finding.get("path", ""))),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": finding.get("severity", "warning"),
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        aname = getattr(narrowing_kotlin, "name", "narrowing_kotlin")
+        target_files = files
+        if prefilter is not None and not prefilter.is_bypass:
+            target_files = prefilter.filter_files_for_analyzer(aname, files)
+        if target_files:
+            ctx = RunContext(lang="kotlin", files=list(target_files))
+            for finding in narrowing_kotlin.run(ctx):
+                rule_id = finding.get("rule", "")
+                sink.write(json.dumps({
+                    "rule": rule_id,
+                    "category_id": "kotlin.type-narrowing",
+                    "path": _rel(str(finding.get("path", ""))),
+                    "line": int(finding.get("line", 0) or 0),
+                    "col": int(finding.get("col", 1) or 1),
+                    "severity": finding.get("severity", "warning"),
+                    "message": finding.get("message", ""),
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
 
     # 2. Taint path traversal & redirect (category 4)
     if 4 not in skip:
         from ubs_core.analyzers.taint_java_traversal import run as run_traversal
         from ubs_core.analyzers.taint_java_redirect import run as run_redirect
 
-        ctx = RunContext(lang="java", files=list(files))
-        for finding in run_traversal(ctx):
-            sink.write(json.dumps({
-                "rule": "kotlin.taint.path_traversal",
-                "category_id": "kotlin.security",
-                "path": _rel(str(finding.get("path", ""))),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": "critical",
-                "message": finding.get("message", "Request-derived path reaches file read/write/serve sink"),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        trav_files = files
+        if prefilter is not None and not prefilter.is_bypass:
+            trav_files = prefilter.filter_files_for_analyzer("taint_java_traversal", files)
+        if trav_files:
+            ctx = RunContext(lang="java", files=list(trav_files))
+            for finding in run_traversal(ctx):
+                sink.write(json.dumps({
+                    "rule": "kotlin.taint.path_traversal",
+                    "category_id": "kotlin.security",
+                    "path": _rel(str(finding.get("path", ""))),
+                    "line": int(finding.get("line", 0) or 0),
+                    "col": int(finding.get("col", 1) or 1),
+                    "severity": "critical",
+                    "message": finding.get("message", "Request-derived path reaches file read/write/serve sink"),
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
 
-        for finding in run_redirect(ctx):
-            sink.write(json.dumps({
-                "rule": "kotlin.taint.open_redirect",
-                "category_id": "kotlin.security",
-                "path": _rel(str(finding.get("path", ""))),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": "critical",
-                "message": finding.get("message", "Unvalidated redirect from request data"),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        redir_files = files
+        if prefilter is not None and not prefilter.is_bypass:
+            redir_files = prefilter.filter_files_for_analyzer("taint_java_redirect", files)
+        if redir_files:
+            ctx = RunContext(lang="java", files=list(redir_files))
+            for finding in run_redirect(ctx):
+                sink.write(json.dumps({
+                    "rule": "kotlin.taint.open_redirect",
+                    "category_id": "kotlin.security",
+                    "path": _rel(str(finding.get("path", ""))),
+                    "line": int(finding.get("line", 0) or 0),
+                    "col": int(finding.get("col", 1) or 1),
+                    "severity": "critical",
+                    "message": finding.get("message", "Unvalidated redirect from request data"),
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
 
 
 def scan_detectors(files: Sequence[Path], sink, skip: set[int]) -> None:
@@ -428,9 +451,39 @@ def main(argv: list[str] | None = None) -> int:
 
     skip = {int(p) for p in (args.skip or "").split(",") if p.strip().isdigit()}
 
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+
+    ast_rules_input = []
+    if args.ast_rule_dir and Path(args.ast_rule_dir).is_dir():
+        for rf in sorted(Path(args.ast_rule_dir).glob("*.yml")) + sorted(Path(args.ast_rule_dir).glob("*.yaml")):
+            try:
+                text = rf.read_text(encoding="utf-8", errors="ignore")
+                id_m = re.search(r"id:\s*(\S+)", text)
+                rid = id_m.group(1) if id_m else rf.stem
+                ast_rules_input.append((rid, text))
+            except OSError:
+                pass
+
+    kotlin_analyzers = [a.name for a in analyzers_for_lang("kotlin")] + ["taint_java_traversal", "taint_java_redirect"]
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=_PATTERNS,
+        analyzers=kotlin_analyzers,
+        lang="kotlin",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(_PATTERNS, files, sink, skip)
-        scan_analyzers(files, sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None)
+        scan_patterns(_PATTERNS, files, sink, skip, prefilter=prefilter_res)
+        scan_analyzers(files, sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None, prefilter=prefilter_res)
         scan_detectors(files, sink, skip)
 
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -473,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
             "extras": {},
             "uv_tools": [],
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            summary["profile"] = {
+                "files_considered": len(files),
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+            }
         Path(args.json_out).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
     if args.text_out:

@@ -30,7 +30,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 MARKER = "ubs:ignore"
 
@@ -167,6 +167,7 @@ def scan_patterns(
     skip: set,
     phase: int,
     ast_ran: bool = False,
+    prefilter: Any = None,
 ) -> None:
     """Run one phase of patterns over the file list, writing sink records.
 
@@ -192,6 +193,8 @@ def scan_patterns(
             continue
         hits = []
         for path, text in texts.items():
+            if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
+                continue
             for line_no, line_text in enumerate(text.splitlines(), start=1):
                 if MARKER in line_text:
                     continue
@@ -304,7 +307,7 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
 
 
 def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
-                  enable_new: bool = False) -> None:
+                  enable_new: bool = False, prefilter: Any = None) -> None:
     """Run the registered csharp analyzers (taint x2, lifecycle, narrowing, async).
 
     Every one replaces a legacy check that ran inside its category, so skip
@@ -317,9 +320,15 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import RunContext, analyzers_for_lang
 
-    ctx = RunContext(lang="csharp", files=list(files))
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
+        if prefilter is not None:
+            target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+        else:
+            target_files = list(files)
+        if not target_files:
+            continue
+        ctx = RunContext(lang="csharp", files=target_files)
         for finding in analyzer.run(ctx):
             rule = _ASYNC_RULE_REMAP.get(str(finding.get("rule", "")), str(finding.get("rule", "")))
             if skip_narrowing and rule.startswith("csharp.narrowing."):
@@ -530,18 +539,54 @@ def main(argv: list | None = None) -> int:
             continue
 
     patterns = load_patterns()
+
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+    from ubs_core.csharp_rules import _RULES
+
+    cs_analyzers = [a.name for a in analyzers_for_lang("csharp")]
+    ast_rules_input = list(_RULES)
+    if args.ast_rule_dir:
+        rules_dir = Path(args.ast_rule_dir)
+        for rf in rules_dir.glob("*.yml"):
+            if rf.name.startswith(("sgconfig", "sgbase")):
+                continue
+            try:
+                text = rf.read_text(encoding="utf-8", errors="ignore")
+                id_m = re.search(r"id:\s*(\S+)", text)
+                rid = id_m.group(1) if id_m else rf.stem
+                ast_rules_input.append((rid, text))
+            except OSError:
+                pass
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=patterns,
+        analyzers=cs_analyzers,
+        lang="csharp",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     ast_ran = False
     with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, texts, sink, skip, phase=0)
+        scan_patterns(patterns, texts, sink, skip, phase=0, prefilter=prefilter_res)
         run_detectors(files, sink, skip, base_dir)
-        run_analyzers(files, sink, skip, base_dir, enable_new=args.enable_new_analyzers)
+        run_analyzers(files, sink, skip, base_dir, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         inventory_check(texts, sink, skip, project_path, len(files))
         if args.ast_rule_dir:
             from ubs_core.csharp_ast import scan_all
             from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP
 
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
             scan_all(
-                Path(args.ast_rule_dir), files, sink,
+                Path(args.ast_rule_dir), ast_files, sink,
                 severity_overrides=dict(SEVERITY_MAP),
                 count_only=None,  # legacy cat 17 ingested the whole pack
                 skip=skip,
@@ -550,7 +595,7 @@ def main(argv: list | None = None) -> int:
                 base_dir=base_dir,
             )
             ast_ran = True
-        scan_patterns(patterns, texts, sink, skip, phase=1, ast_ran=ast_ran)
+        scan_patterns(patterns, texts, sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers, inventory, ast) is counted.
@@ -577,7 +622,8 @@ def main(argv: list | None = None) -> int:
     if args.text_out:
         render_text(args, ast_ran, patterns)
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns), "ast": ast_ran}) + "\n")
+    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns), "ast": ast_ran,
+                                 "prefilter": prefilter_res.to_dict()}) + "\n")
     return exit_code
 
 

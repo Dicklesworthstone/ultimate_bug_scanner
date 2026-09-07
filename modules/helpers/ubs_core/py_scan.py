@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -156,7 +157,13 @@ def resolve_severity(pattern: Pattern, count: int) -> str | None:
     return None
 
 
-def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip: set[int]) -> dict[str, int]:
+def scan_patterns(
+    patterns: Sequence[Pattern],
+    files: Sequence[Path],
+    sink,
+    skip: set[int],
+    prefilter: Any = None,
+) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
     Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
@@ -189,6 +196,8 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
+            if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
+                continue
             for line_no, line_text in iter_matches(pattern, text):
                 key = (path, line_no)
                 if key in seen:
@@ -262,8 +271,13 @@ def _record_category(finding: dict) -> int | None:
     return None  # ast-pack rules count in totals only (legacy CURRENT_CATEGORY=0)
 
 
-def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  enable_new: bool = False) -> None:
+def run_analyzers(
+    files: Sequence[Path],
+    sink,
+    skip: set[int] | None = None,
+    enable_new: bool = False,
+    prefilter: Any = None,
+) -> None:
     """Run registered python analyzers (taint, lifecycle, guards, ctcompare).
 
     ``python.narrowing.*`` (bead D4) has no legacy python counterpart — it
@@ -272,10 +286,16 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
-    ctx = RunContext(lang="python", files=list(files))
     for analyzer in analyzers_for_lang("python"):
         if analyzer.layer == "narrowing" and not enable_new:
             continue
+        if prefilter is not None:
+            target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+        else:
+            target_files = list(files)
+        if not target_files:
+            continue
+        ctx = RunContext(lang="python", files=target_files)
         for finding in analyzer.run(ctx):
             if skip and _record_category(finding) in skip:
                 continue
@@ -511,10 +531,45 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
 
     patterns = load_patterns()
+
+    from ubs_core.py_rules import _RULES
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+    from ubs_core import analyzers  # noqa: F401
+
+    py_analyzers = [a.name for a in analyzers_for_lang("python")]
+    ast_rules_input = list(_RULES)
+    if args.ast_rule_dir:
+        rules_dir = Path(args.ast_rule_dir) / "rules"
+        if rules_dir.is_dir():
+            for rf in rules_dir.glob("*.yml"):
+                try:
+                    text = rf.read_text(encoding="utf-8", errors="ignore")
+                    id_m = re.search(r"id:\s*(\S+)", text)
+                    rid = id_m.group(1) if id_m else rf.stem
+                    ast_rules_input.append((rid, text))
+                except OSError:
+                    pass
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=patterns,
+        analyzers=py_analyzers,
+        lang="py",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     with open(args.sink, "w", encoding="utf-8") as sink:
-        counters = scan_patterns(patterns, files, sink, skip)
+        counters = scan_patterns(patterns, files, sink, skip, prefilter=prefilter_res)
         run_detectors(files, sink, skip)
-        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers)
+        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.py_ast import scan_all
             from ubs_core.py_rules import CATEGORY_MAP, SEVERITY_MAP
@@ -533,8 +588,9 @@ def main(argv: list[str] | None = None) -> int:
                             overrides[rid] = meta["severity"]
                 except (ValueError, OSError):
                     pass
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
             ast_counters = scan_all(
-                Path(args.ast_rule_dir), files, sink, overrides,
+                Path(args.ast_rule_dir), ast_files, sink, overrides,
                 count_only=None, skip_categories=None, category_map=CATEGORY_MAP,
                 skip=skip,
             )
@@ -577,12 +633,22 @@ def main(argv: list[str] | None = None) -> int:
             # module summary so the combined JSON keeps per-finding samples.
             "report": {"version": args.version, "findings": legacy_findings},
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            doc["profile"] = {
+                "files_considered": prefilter_res.files_considered,
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+                "prefilter_ms": prefilter_res.prefilter_ms,
+            }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
         _render_text(args, files, counters)
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
+    sys.stderr.write(json.dumps({
+        "counters": counters,
+        "patterns": len(patterns),
+        "prefilter": prefilter_res.to_dict(),
+    }) + "\n")
     return exit_code
 
 

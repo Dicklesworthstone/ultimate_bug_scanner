@@ -31,11 +31,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 
@@ -139,7 +140,7 @@ def resolve_severity(pattern: Pattern, count: int) -> str | None:
     return None
 
 
-def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip: set[int]) -> dict[str, int]:
+def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip: set[int], prefilter: Any = None) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
     Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
@@ -164,6 +165,8 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in scoped.items():
+            if prefilter is not None and pattern.zero_finding is None and pattern.rule_id not in prefilter.candidate_rules_for(path):
+                continue
             for line_no, line_text in iter_matches(pattern, text):
                 key = (path, line_no)
                 if key in seen:
@@ -307,7 +310,7 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  enable_new: bool = False) -> None:
+                  enable_new: bool = False, prefilter: Any = None) -> None:
     """Run registered cpp analyzers (taint traversal/redirect, lifecycle).
 
     ``cpp.narrowing.*`` (bead D4) has no legacy cpp counterpart — it stays
@@ -316,10 +319,16 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
-    ctx = RunContext(lang="cpp", files=list(files))
     for analyzer in analyzers_for_lang("cpp"):
         if analyzer.layer == "narrowing" and not enable_new:
             continue
+        if prefilter is not None:
+            target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+        else:
+            target_files = list(files)
+        if not target_files:
+            continue
+        ctx = RunContext(lang="cpp", files=target_files)
         for finding in analyzer.run(ctx):
             if skip and _record_category(finding) in skip:
                 continue
@@ -444,10 +453,31 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
 
     patterns = load_patterns()
+
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+
+    cpp_analyzers = [a.name for a in analyzers_for_lang("cpp")]
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=[],
+        patterns=patterns,
+        analyzers=cpp_analyzers,
+        lang="cpp",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     with open(args.sink, "w", encoding="utf-8") as sink:
-        counters = scan_patterns(patterns, files, sink, skip)
+        counters = scan_patterns(patterns, files, sink, skip, prefilter=prefilter_res)
         run_detectors(files, sink, skip)
-        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers)
+        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         # No ast-grep layer: the legacy pack's ast_count call sites are dead
         # code (see the module docstring) — legacy totals never include
         # rule-pack hits, and neither does v2.
@@ -484,12 +514,19 @@ def main(argv: list[str] | None = None) -> int:
             "status": "ok",
             "findings": records,
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            doc["profile"] = {
+                "files_considered": prefilter_res.files_considered,
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+                "prefilter_ms": prefilter_res.prefilter_ms,
+            }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
         _render_text(args, files, counters)
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
+    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
+                                 "prefilter": prefilter_res.to_dict()}) + "\n")
     return exit_code
 
 

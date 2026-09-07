@@ -29,11 +29,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 
@@ -179,7 +180,7 @@ def resolve_severity(pattern: Pattern, count: int) -> str | None:
     return None
 
 
-def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip: set[int]) -> dict[str, int]:
+def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip: set[int], prefilter: Any = None) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
     Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
@@ -204,6 +205,8 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink, skip
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
+            if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
+                continue
             for line_no, line_text in iter_matches(pattern, text):
                 key = (path, line_no)
                 if key in seen:
@@ -274,7 +277,8 @@ def _record_category(finding: dict) -> int | None:
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  project_dir: Path | None = None, enable_new: bool = False) -> None:
+                  project_dir: Path | None = None, enable_new: bool = False,
+                  prefilter: Any = None) -> None:
     """Run registered analyzers: java taint pair + kotlin narrowing.
 
     narrowing_kotlin registers under lang="kotlin" while the module's file
@@ -282,7 +286,7 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     each analyzer filters by suffix itself. Two calibration gates keep v2
     totals at legacy parity:
     - layer=="lifecycle" (lifecycle_java) is the legacy NO-ast-grep fallback
-      for the cat-19 resource branch; with ast-grep at the gate the counted
+    - for the cat-19 resource branch; with ast-grep at the gate the counted
       ast rule group owns those findings.
     - layer=="guards" (guards_java, bead D3) has no legacy java counterpart —
       it stays off unless ``enable_new``.
@@ -310,11 +314,17 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
             return path
 
     for lang in ("java", "kotlin"):
-        ctx = RunContext(lang=lang, files=list(files))
         for analyzer in analyzers_for_lang(lang):
             if analyzer.layer not in allowed_layers[lang]:
                 if not (enable_new and analyzer.layer == "guards" and lang == "java"):
                     continue
+            if prefilter is not None:
+                target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+            else:
+                target_files = list(files)
+            if not target_files:
+                continue
+            ctx = RunContext(lang=lang, files=target_files)
             for finding in analyzer.run(ctx):
                 if skip and _record_category(finding) in skip:
                     continue
@@ -535,12 +545,48 @@ def main(argv: list[str] | None = None) -> int:
     skip = _skip_set(args)
 
     patterns = load_patterns()
+
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+    from ubs_core.java_rules import _RULES
+
+    java_analyzers = [a.name for a in analyzers_for_lang("java")] + [a.name for a in analyzers_for_lang("kotlin")]
+    ast_rules_input = list(_RULES)
+    if args.ast_rule_dir:
+        rules_dir = Path(args.ast_rule_dir)
+        for rf in rules_dir.glob("*.yml"):
+            if rf.name.startswith(("sgconfig", "sgbase")):
+                continue
+            try:
+                text = rf.read_text(encoding="utf-8", errors="ignore")
+                id_m = re.search(r"id:\s*(\S+)", text)
+                rid = id_m.group(1) if id_m else rf.stem
+                ast_rules_input.append((rid, text))
+            except OSError:
+                pass
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=patterns,
+        analyzers=java_analyzers,
+        lang="java",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     ast_ran = False
     with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, files, sink, skip)
+        scan_patterns(patterns, files, sink, skip, prefilter=prefilter_res)
         run_analyzers(files, sink, skip,
                       project_dir=Path(args.project_dir) if args.project_dir else None,
-                      enable_new=args.enable_new_analyzers)
+                      enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res)
         run_detectors(files, sink, skip)
         if args.ast_rule_dir:
             from ubs_core.java_ast import scan_all
@@ -550,8 +596,9 @@ def main(argv: list[str] | None = None) -> int:
             # counted — the rest of the pack is an informational dump.
             # Severity comes from SEVERITY_MAP (legacy emit-group maps), and
             # only the async ids get the parser's marker check.
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
             scan_all(
-                Path(args.ast_rule_dir), files, sink,
+                Path(args.ast_rule_dir), ast_files, sink,
                 severity_overrides=dict(SEVERITY_MAP),
                 count_only=set(SEVERITY_MAP),
                 skip_categories=skip,
@@ -592,12 +639,19 @@ def main(argv: list[str] | None = None) -> int:
             "status": "ok",
             "findings": records,
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            doc["profile"] = {
+                "files_considered": prefilter_res.files_considered,
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+                "prefilter_ms": prefilter_res.prefilter_ms,
+            }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
         _render_text(args, files, counters, ast_ran)
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
+    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
+                                 "prefilter": prefilter_res.to_dict()}) + "\n")
     return exit_code
 
 

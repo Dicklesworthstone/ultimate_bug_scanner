@@ -29,7 +29,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 
@@ -216,10 +216,20 @@ def scan_files_native(
     sink,
     skip: set[int],
     reported_locations: set[tuple[str, int]],
+    prefilter: Any = None,
 ) -> dict[str, int]:
     counters = {"critical": 0, "warning": 0, "info": 0}
 
     for path in files:
+        active_checks = _NATIVE_CHECKS
+        cand = None
+        if prefilter is not None and not prefilter.is_bypass:
+            cand = prefilter.candidate_rules_for(path)
+            active_checks = [c for c in _NATIVE_CHECKS if c.rule_id in cand]
+            check_bashism = (1 not in skip and "bash.syntax.posix_bashism" in cand)
+            if not active_checks and not check_bashism:
+                continue
+
         try:
             content = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -261,7 +271,7 @@ def scan_files_native(
             has_subshell = bool(re.search(r"\$\(|`", line))
             is_static_print = is_print_line and not has_subshell
 
-            if is_posix_sh and 1 not in skip:
+            if is_posix_sh and 1 not in skip and (cand is None or "bash.syntax.posix_bashism" in cand):
                 # Check for bashisms in POSIX sh
                 if re.search(r"(?:^|[\s;&|])\[\[\s+", line) or re.search(r"^\s*function\s+[a-zA-Z_]", line):
                     rule_id = "bash.syntax.posix_bashism"
@@ -280,7 +290,7 @@ def scan_files_native(
                             "suppressed": False,
                         }) + "\n")
 
-            for check in _NATIVE_CHECKS:
+            for check in active_checks:
                 if check.category in skip:
                     continue
                 if is_static_print and check.rule_id in (
@@ -388,14 +398,21 @@ def scan_ast_rules(
     sink,
     skip: set[int],
     reported_locations: set[tuple[str, int]],
+    prefilter: Any = None,
 ) -> dict[str, int]:
     counters = {"critical": 0, "warning": 0, "info": 0}
     config = rule_dir / "sgconfig-bash.yml"
     if not config.is_file() or not shutil.which("ast-grep"):
         return counters
 
+    target_files = files
+    if prefilter is not None and not prefilter.is_bypass:
+        target_files = prefilter.ast_files
+    if not target_files:
+        return counters
+
     batch_size = 50
-    file_strs = [str(p) for p in files]
+    file_strs = [str(p) for p in target_files]
     for i in range(0, len(file_strs), batch_size):
         batch = file_strs[i:i + batch_size]
         try:
@@ -534,11 +551,52 @@ def main(argv: Sequence[str] | None = None) -> int:
     sink_path = Path(args.sink)
     sink_path.parent.mkdir(parents=True, exist_ok=True)
 
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+
+    ast_rules_input = []
+    if args.ast_rule_dir and Path(args.ast_rule_dir).is_dir():
+        rules_dir = Path(args.ast_rule_dir) / "rules"
+        search_dir = rules_dir if rules_dir.is_dir() else Path(args.ast_rule_dir)
+        for rf in sorted(search_dir.glob("*.yml")) + sorted(search_dir.glob("*.yaml")):
+            try:
+                text = rf.read_text(encoding="utf-8", errors="ignore")
+                id_m = re.search(r"id:\s*(\S+)", text)
+                rid = id_m.group(1) if id_m else rf.stem
+                ast_rules_input.append((rid, text))
+            except OSError:
+                pass
+
+    all_patterns = list(_NATIVE_CHECKS) + [
+        NativeCheck(
+            rule_id="bash.syntax.posix_bashism",
+            category=1,
+            severity="warning",
+            regex=re.compile(r"\[\[|\bfunction\b"),
+            title="Bashism in script with POSIX sh shebang",
+            remediation="Use portable POSIX sh syntax",
+        )
+    ]
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=all_patterns,
+        analyzers=[],
+        lang="bash",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     reported_locations: set[tuple[str, int]] = set()
 
     with open(sink_path, "w", encoding="utf-8") as sink:
-        c1 = scan_files_native(files, sink, skip, reported_locations)
-        c2 = scan_ast_rules(Path(args.ast_rule_dir), files, sink, skip, reported_locations) if args.ast_rule_dir else {}
+        c1 = scan_files_native(files, sink, skip, reported_locations, prefilter=prefilter_res)
+        c2 = scan_ast_rules(Path(args.ast_rule_dir), files, sink, skip, reported_locations, prefilter=prefilter_res) if args.ast_rule_dir else {}
         c3 = scan_shellcheck(files, sink, skip, reported_locations) if not args.no_shellcheck else {}
 
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -584,6 +642,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "status": "ok",
             "findings": records,
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            summary["profile"] = {
+                "files_considered": len(files),
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+            }
         Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if args.text_out:

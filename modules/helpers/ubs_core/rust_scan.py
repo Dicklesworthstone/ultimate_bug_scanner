@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -267,12 +268,13 @@ class Scan:
         return hits
 
     # ── ast layer ──────────────────────────────────────────────────────────
-    def load_ast_matches(self, rule_dir: Path | None) -> None:
+    def load_ast_matches(self, rule_dir: Path | None, ast_files: Sequence[Path] | None = None) -> None:
         if rule_dir is None:
             return
         from ubs_core import rust_ast
 
-        _, matches = rust_ast.scan_all(rule_dir, self.files)
+        targets = ast_files if ast_files is not None else self.files
+        _, matches = rust_ast.scan_all(rule_dir, targets)
         allowed = self.allowed
         for rule_id, entries in matches.items():
             kept: list[dict] = []
@@ -1341,7 +1343,43 @@ def main(argv: list[str] | None = None) -> int:
     scan = Scan(files, project_dir, args.exclude_tests, skip, args.detail_limit)
     if args.exclude_tests:
         _apply_exclude_tests(scan)
-    scan.load_ast_matches(Path(args.ast_rule_dir) if args.ast_rule_dir else None)
+
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+
+    ast_rules_input: list[tuple[str, str]] = []
+    if args.ast_rule_dir:
+        rule_dir_path = Path(args.ast_rule_dir)
+        for rf in rule_dir_path.glob("*.yml"):
+            if rf.name.startswith(("sgconfig", "sgbase")):
+                continue
+            try:
+                text = rf.read_text(encoding="utf-8", errors="ignore")
+                id_m = re.search(r"id:\s*(\S+)", text)
+                rid = id_m.group(1) if id_m else rf.stem
+                ast_rules_input.append((rid, text))
+            except OSError:
+                pass
+    from ubs_core.rust_rules import RUN_MODE_RULES
+    for slug, pat in RUN_MODE_RULES.items():
+        ast_rules_input.append((f"rust.ast.{slug}", f"rule:\n  pattern: {json.dumps(pat)}\n"))
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=[],
+        analyzers=[],
+        lang="rust",
+    )
+    prefilter_res = run_prefilter(scan.files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
+    ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else scan.files
+    scan.load_ast_matches(Path(args.ast_rule_dir) if args.ast_rule_dir else None, ast_files=ast_files)
 
     narrowing_skip_note = None
     if args.skip_type_narrowing:
@@ -1392,6 +1430,12 @@ def main(argv: list[str] | None = None) -> int:
             "version": args.version,
             "findings": scan.records,
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            doc["profile"] = {
+                "files_considered": prefilter_res.files_considered,
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+                "prefilter_ms": prefilter_res.prefilter_ms,
+            }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     exit_code = 0
@@ -1402,6 +1446,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stderr.write(json.dumps({
         "counters": dict(scan.counters), "records": len(scan.records),
         "files": len(scan.files),
+        "prefilter": prefilter_res.to_dict(),
     }) + "\n")
     return exit_code
 

@@ -34,12 +34,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import pkgutil
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 MARKER = "ubs:ignore"
 
@@ -299,7 +300,7 @@ def active_tier(pattern: Pattern, count: int) -> str | None:
     return None
 
 
-def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set[int]) -> None:
+def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set[int], prefilter: Any = None) -> None:
     """Run every pattern over the file list, writing sink records.
 
     Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
@@ -324,6 +325,8 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
             for component in pattern.components:
                 cregex = re.compile(component, re.IGNORECASE)
                 for path in files:
+                    if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
+                        continue
                     for entry in file_match_entries(cregex, path, ctx.text_of(path)):
                         # count_lines drops rg output lines carrying a marker
                         if MARKER in entry[2] or MARKER in entry[3]:
@@ -331,6 +334,8 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                         hits.append(entry)
         else:
             for path in files:
+                if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
+                    continue
                 file_hits = file_match_entries(regex, path, ctx.text_of(path))
                 if pattern.window > 0 and after is not None:
                     hits.extend(grep_after_emulation(file_hits, pattern.window, after, include, exclude, exclude_ci))
@@ -497,7 +502,7 @@ def _analyzer_category(rule: str) -> int | None:
     return None
 
 
-def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = False) -> None:
+def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = False, prefilter: Any = None) -> None:
     """Run registered swift analyzers (taint, narrowing, lifecycle).
 
     ``regex_swift`` (ReDoS deep analysis) has no legacy counter impact — the
@@ -509,7 +514,6 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import RunContext, analyzers_for_lang
 
-    run_ctx = RunContext(lang="swift", files=list(ctx.files))
     for analyzer in analyzers_for_lang("swift"):
         if analyzer.layer == "regex" and not enable_new:
             continue
@@ -535,6 +539,13 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
                     "degraded": True,
                 }, skip)
                 continue
+        if prefilter is not None:
+            target_files = prefilter.filter_files_for_analyzer(analyzer.name, ctx.files)
+        else:
+            target_files = list(ctx.files)
+        if not target_files:
+            continue
+        run_ctx = RunContext(lang="swift", files=target_files)
         try:
             findings = list(analyzer.run(run_ctx))
         except Exception as exc:
@@ -1006,15 +1017,51 @@ def main(argv: list[str] | None = None) -> int:
                       skip_narrowing=args.skip_type_narrowing,
                       ast_available=args.ast_available)
     patterns = load_patterns()
+
+    from ubs_core.prefilter import build_prefilter_index, run_prefilter
+    from ubs_core.registry import analyzers_for_lang
+    from ubs_core.swift_rules import _RULES
+
+    swift_analyzers = [a.name for a in analyzers_for_lang("swift")]
+    ast_rules_input = list(_RULES)
+    if args.ast_rule_dir:
+        rules_dir = Path(args.ast_rule_dir)
+        for rf in rules_dir.glob("*.yml"):
+            if rf.name.startswith(("sgconfig", "sgbase")):
+                continue
+            try:
+                text = rf.read_text(encoding="utf-8", errors="ignore")
+                id_m = re.search(r"id:\s*(\S+)", text)
+                rid = id_m.group(1) if id_m else rf.stem
+                ast_rules_input.append((rid, text))
+            except OSError:
+                pass
+
+    prefilter_index = build_prefilter_index(
+        ast_rules=ast_rules_input,
+        patterns=patterns,
+        analyzers=swift_analyzers,
+        lang="swift",
+    )
+    prefilter_res = run_prefilter(files, prefilter_index)
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
     with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, ctx, sink, skip)
+        scan_patterns(patterns, ctx, sink, skip, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.swift_ast import scan_all
 
             # the ast stream feeds both the rule-pack bucket records and the
             # URLSession correlation detector (ctx.ast_records), like the
             # legacy shared AG_STREAM_FILE
-            scan_all(Path(args.ast_rule_dir), files, ctx, sink, skip=skip,
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
+            scan_all(Path(args.ast_rule_dir), ast_files, ctx, sink, skip=skip,
                      detail_limit=args.detail_limit)
         if args.ast_available and not ctx.ast_stream_ok:
             # legacy run_async_error_checks degradation (ast-grep present but
@@ -1031,7 +1078,7 @@ def main(argv: list[str] | None = None) -> int:
             }, skip)
         run_detectors(ctx, sink, skip)   # correlation consumes ctx.ast_records
         run_derived(ctx, sink, skip)     # process residual reads shell detector
-        run_analyzers(ctx, sink, skip, enable_new=args.enable_new_analyzers)
+        run_analyzers(ctx, sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, derived, detectors, analyzers, ast) is reflected.
@@ -1068,6 +1115,12 @@ def main(argv: list[str] | None = None) -> int:
             "findings": records,
             "report": _legacy_report(records, args.version),
         }
+        if os.environ.get("UBS_PROFILE") == "1":
+            doc["profile"] = {
+                "files_considered": prefilter_res.files_considered,
+                "files_after_prefilter": prefilter_res.files_after_prefilter,
+                "prefilter_ms": prefilter_res.prefilter_ms,
+            }
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
@@ -1076,7 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
         renderer.render(skip)
         Path(args.text_out).write_text(renderer.text(), encoding="utf-8")
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
+    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
+                                 "prefilter": prefilter_res.to_dict()}) + "\n")
     return exit_code
 
 

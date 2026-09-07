@@ -3038,6 +3038,13 @@ resolve_git_metadata(){
   esac
 }
 
+GIT_METADATA_RESOLVED=0
+ensure_git_metadata(){
+  [[ "$GIT_METADATA_RESOLVED" -eq 1 ]] && return 0
+  GIT_METADATA_RESOLVED=1
+  resolve_git_metadata || true
+}
+
 # Single-file fast path (bead C3): the hook-driven `ubs FILE --ci` case. The
 # module gets the real file, so no workspace is copied, no path restoration
 # runs and no per-language rg probes are needed (select_langs uses the
@@ -4986,7 +4993,7 @@ check_and_update_self(){
 }
 
 finalize_module_dir
-resolve_git_metadata || true  # Git metadata is optional; don't fail on repos without remotes
+: # git metadata is computed lazily via ensure_git_metadata (bead C3)
 
 if [[ "$MODE" == "doctor" ]]; then
   run_doctor "$DOCTOR_FIX" "$DOCTOR_FORMAT"
@@ -6203,6 +6210,7 @@ postprocess_module(){
      && ! grep -q -i -E 'ubs:ignore|ubs: disable|nolint|noqa' "$SINGLE_FILE_TARGET" 2>/dev/null; then
     no_suppress=1
   fi
+  ensure_git_metadata
   python3 "$TMPDIR_RUN/postprocess.py" --mode "$mode" --lang "$lang" --raw "$raw" --txt "$txt" --json "$json" \
     --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "$ws" \
     --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
@@ -6508,6 +6516,71 @@ merge_json_scanners(){
   if ! need_cmd jq; then
     say "${YELLOW}${WARN}${RESET} jq not found; cannot emit combined JSON"; return 1
   fi
+  ensure_git_metadata
+  # Avoid the jq merge when one module ran (bead C3)
+  if [[ ${#jsons[@]} -eq 1 ]]; then
+    local single="${jsons[0]}"
+    local lang_name
+    lang_name=$(basename "$single" .json)
+    local findings_file="$TMPDIR_RUN/$lang_name.findings.json"
+    local proj_real top_real prefix
+    proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
+    top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
+    prefix="${proj_real#"$top_real"}"
+    prefix="${prefix#/}"
+    local -a f_args=()
+    if [[ -f "$findings_file" ]]; then
+      f_args=(--slurpfile fnd "$findings_file")
+    fi
+    jq "${f_args[@]}" \
+      --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" \
+      --arg repo "${GIT_REMOTE_HTTP:-}" --arg commit "${GIT_COMMIT_SHA:-}" --arg blob "${GIT_BLOB_BASE:-}" \
+      --arg top "$top_real" --arg prefix "$prefix" '
+      def nz(x): if (x|type)=="number" then x else 0 end;
+      def repo_rel(f):
+        if f | startswith("/") then
+          (if f | startswith($top + "/") then (f | ltrimstr($top + "/")) else null end)
+        else
+          (if ($prefix|length) > 0 then $prefix + "/" + (f | ltrimstr("./")) else (f | ltrimstr("./")) end)
+        end;
+      def link(sample):
+        if ($blob|length) > 0 and (sample|type) == "object" and (sample.file|type) == "string" and (sample.line|type) == "number" then
+          (repo_rel(sample.file)) as $rel
+          | if $rel == null then sample else sample + {permalink: ($blob + "/" + $rel + "#L" + (sample.line|tostring))} end
+        else sample end;
+      def git_block:
+        if ($repo|length) > 0 then
+          {git: ({repository:$repo}
+                 + (if ($commit|length) > 0 then {commit:$commit} else {} end)
+                 + (if ($blob|length) > 0 then {blob_base:$blob} else {} end))}
+        else {} end;
+      . as $sc |
+      (if ($fnd|length) > 0 and ($fnd[0].findings|type) == "array" then
+         $sc + {findings: $fnd[0].findings}
+       else $sc end) as $sc_with_findings |
+      ($sc_with_findings |
+       if (.findings|type) == "array" then
+         .findings |= map(if (.samples|type) == "array" then .samples |= map(link(.)) else . end)
+       else . end) as $sc_linked |
+      {
+        project: $project,
+        timestamp: $ts,
+        status: (if ($sc.status // "ok") != "ok" then "partial" else "ok" end),
+        failed_modules: (if ($sc.status // "ok") != "ok" then [{language: $sc.language, status: $sc.status, module_error: $sc.module_error, message: $sc.message}] else [] end)
+      }
+      + git_block
+      + {
+        scanners: [$sc_linked],
+        totals: {
+          critical: nz($sc.critical),
+          warning: nz($sc.warning),
+          info: nz($sc.info),
+          files: nz($sc.files)
+        }
+      }
+    ' "$single"
+    return 0
+  fi
   # First merge the summary JSONs
   local base_json
   base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" \
@@ -6610,15 +6683,23 @@ generate_combined_json(){
   # modules still on the per-category summary schema.
   local helpers_dir; helpers_dir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
   if [[ -d "$helpers_dir/ubs_core" ]]; then
-    local -a merge_opts=()
-    local proj_dir="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
-    [[ -n "$proj_dir" ]] && merge_opts+=(--project-dir "$proj_dir")
-    if [[ -n "$COMPARISON_FILE" && "$NEW_ONLY" -eq 1 ]]; then
-      merge_opts+=(--baseline "$COMPARISON_FILE" --new-only)
+    local need_findings_merge=0
+    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ]]; then
+      need_findings_merge=1
+    elif [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || "$NEW_ONLY" -eq 1 ]]; then
+      need_findings_merge=1
     fi
-    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
-      --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" \
-      "${merge_opts[@]}" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
+    if [[ "$need_findings_merge" -eq 1 ]]; then
+      local -a merge_opts=()
+      local proj_dir="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+      [[ -n "$proj_dir" ]] && merge_opts+=(--project-dir "$proj_dir")
+      if [[ -n "$COMPARISON_FILE" && "$NEW_ONLY" -eq 1 ]]; then
+        merge_opts+=(--baseline "$COMPARISON_FILE" --new-only)
+      fi
+      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
+        --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" \
+        "${merge_opts[@]}" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
+    fi
   fi
   PROFILE_MERGE_MS=$(( PROFILE_MERGE_MS + $(now_ms) - t0 ))
   return 0
@@ -7158,8 +7239,22 @@ case "$FORMAT" in
       # Combined human summary (if JSON pieces exist)
       if need_cmd jq && ls "$TMPDIR_RUN"/*.json >/dev/null 2>&1; then
         say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
-        if generate_combined_json; then
-          jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"' "$COMBINED_JSON_FILE"
+        tot_files=0; tot_crit=0; tot_warn=0; tot_info=0
+        if [[ ${#langs[@]} -eq 1 && -f "$TMPDIR_RUN/${langs[0]}.json" && -z "$COMPARISON_FILE" ]]; then
+          # Single-module fast path (bead C3): avoid multi-scanner merge and generate_combined_json
+          read -r tot_files tot_crit tot_warn tot_info < <(jq -r '[.files // 0, .critical // 0, .warning // 0, .info // 0] | @tsv' "$TMPDIR_RUN/${langs[0]}.json" 2>/dev/null || echo "0 0 0 0")
+          say "Files: ${tot_files:-0}\nCritical: ${tot_crit:-0}\nWarning: ${tot_warn:-0}\nInfo: ${tot_info:-0}"
+          if [[ "$RUN_STATUS" == "partial" ]]; then
+            say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
+          fi
+          if [[ "$UBS_PROFILE" == "1" ]]; then
+            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end)')"
+          fi
+          crit="${tot_crit:-0}"
+          warn="${tot_warn:-0}"
+        elif generate_combined_json; then
+          read -r tot_files tot_crit tot_warn tot_info < <(jq -r '[.totals.files // 0, .totals.critical // 0, .totals.warning // 0, .totals.info // 0] | @tsv' "$COMBINED_JSON_FILE" 2>/dev/null || echo "0 0 0 0")
+          say "Files: ${tot_files:-0}\nCritical: ${tot_crit:-0}\nWarning: ${tot_warn:-0}\nInfo: ${tot_info:-0}"
           if [[ "$RUN_STATUS" == "partial" ]]; then
             say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
@@ -7175,13 +7270,14 @@ case "$FORMAT" in
                 + ", warning " + sgn(n(.totals.warning) - n($b.warning))
                 + ", info " + sgn(n(.totals.info) - n($b.info))' "$COMBINED_JSON_FILE" 2>/dev/null || echo "Δ vs baseline: could not read $COMPARISON_FILE")"
           fi
-          totals=$(jq -r '.totals' "$COMBINED_JSON_FILE")
+          crit="${tot_crit:-0}"
+          warn="${tot_warn:-0}"
         else
           merge_json_scanners | jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
           totals=$(merge_json_scanners | jq -r '.totals')
+          crit=$(printf '%s' "$totals" | jq -r '.critical')
+          warn=$(printf '%s' "$totals" | jq -r '.warning')
         fi
-        crit=$(printf '%s' "$totals" | jq -r '.critical')
-        warn=$(printf '%s' "$totals" | jq -r '.warning')
         desired=0
         if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
         if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
@@ -7200,8 +7296,7 @@ case "$FORMAT" in
 	# when critical findings exist (or warnings in --fail-on-warning mode).
 	if [[ "$HAS_ENV_ERROR" -eq 0 && ( "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ) ]]; then
 	  if need_cmd jq && generate_combined_json; then
-	    crit=$(jq -r '.totals.critical // 0' "$COMBINED_JSON_FILE" 2>/dev/null || echo 0)
-	    warn=$(jq -r '.totals.warning // 0' "$COMBINED_JSON_FILE" 2>/dev/null || echo 0)
+	    read -r crit warn < <(jq -r '[.totals.critical // 0, .totals.warning // 0] | @tsv' "$COMBINED_JSON_FILE" 2>/dev/null || echo "0 0")
 	    crit=${crit:-0}; warn=${warn:-0}
 	    desired=0
 	    if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit + warn)) -gt 0 ]]; then desired=1; fi

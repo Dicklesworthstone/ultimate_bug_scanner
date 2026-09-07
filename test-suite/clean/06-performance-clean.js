@@ -169,7 +169,7 @@ class VirtualList {
       fragment.appendChild(item);
     }
 
-    this.container.innerHTML = '';
+    this.container.textContent = '';
     this.container.appendChild(fragment);
   }
 

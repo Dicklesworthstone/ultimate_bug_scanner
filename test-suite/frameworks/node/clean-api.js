@@ -264,8 +264,8 @@ app.get('/api/users',
   authMiddleware,
   async (req, res, next) => {
     try {
-      const page = parseInt(req.query.page) || 1;
-      const limit = Math.min(parseInt(req.query.limit) || 20, 100);  // Max 100
+      const page = parseInt(req.query.page, 10) || 1;
+      const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);  // Max 100
       const offset = (page - 1) * limit;
 
       const { rows: users } = await pool.query(
@@ -274,7 +274,7 @@ app.get('/api/users',
       );
 
       const { rows: count } = await pool.query('SELECT COUNT(*) FROM users');
-      const total = parseInt(count[0].count);
+      const total = parseInt(count[0].count, 10);
 
       res.json({
         users,

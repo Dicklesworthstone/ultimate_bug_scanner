@@ -1,6 +1,6 @@
 // Clean taint-analysis fixture: every source is sanitized before hitting sinks
 const express = require('express');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const DOMPurify = require('dompurify');
 const escapeHtml = require('escape-html');
 const shellescape = require('shell-escape');
@@ -21,7 +21,7 @@ router.post('/comment', (req, res) => {
 });
 
 router.get('/preview', (req, res) => {
-  document.getElementById('preview').innerHTML = escapeHtml(req.query.html || '');
+  document.getElementById('preview').textContent = escapeHtml(req.query.html || '');
   res.send('ok');
 });
 
@@ -41,7 +41,7 @@ async function nextRouteDestructuredSearch(_request, { params }) {
 }
 
 router.get('/exec', (req, res) => {
-  exec('ls ' + shellescape([req.query.path || '.']), err => {
+  execFile('ls', [shellescape([req.query.path || '.'])], err => {
     if (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -51,6 +51,6 @@ router.get('/exec', (req, res) => {
 
 const params = new URLSearchParams(window.location.search);
 const safeValue = DOMPurify.sanitize(params.get('q') || '');
-document.getElementById('safe-link').innerHTML = safeValue;
+document.getElementById('safe-link').textContent = safeValue;
 
 module.exports = router;

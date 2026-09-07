@@ -5,9 +5,9 @@ edition = "2021"
 license = "MIT"
 
 [[bin]]
-name = "buggy_unwrap"
+name = "buggy-unwrap"
 path = "buggy_unwrap.rs"
 
 [[bin]]
-name = "async_block"
+name = "async-block"
 path = "async_block.rs"

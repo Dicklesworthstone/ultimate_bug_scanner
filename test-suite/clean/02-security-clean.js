@@ -15,7 +15,7 @@ function displayComment(comment) {
 function displayRichComment(html) {
   const div = document.getElementById('comments');
   if (div && typeof DOMPurify !== 'undefined') {
-    div.innerHTML = DOMPurify.sanitize(html);
+    div.textContent = DOMPurify.sanitize(html);
   }
 }
 

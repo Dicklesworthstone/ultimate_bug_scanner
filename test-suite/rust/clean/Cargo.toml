@@ -5,9 +5,9 @@ edition = "2021"
 license = "MIT"
 
 [[bin]]
-name = "clean_results"
+name = "clean-results"
 path = "clean_results.rs"
 
 [[bin]]
-name = "async_struct"
+name = "async-struct"
 path = "async_struct.rs"

@@ -14,7 +14,7 @@ print(config)
 data = yaml.safe_load("debug: false")
 print(data)
 
-subprocess.run(['ls', USER_INPUT], check=True)
+subprocess.run(['ls', USER_INPUT], check=True, timeout=5)
 
 conn = sqlite3.connect(':memory:')
 cur = conn.cursor()

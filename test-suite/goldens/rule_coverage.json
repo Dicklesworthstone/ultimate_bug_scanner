@@ -4731,7 +4731,7 @@
     "cases": [
       {
         "critical_max": 0,
-        "forbid_substring_count": 0,
+        "forbid_substring_count": 2,
         "id": "js-core-clean",
         "language": "js",
         "path": "test-suite/clean",
@@ -4739,7 +4739,7 @@
       },
       {
         "critical_max": 0,
-        "forbid_substring_count": 0,
+        "forbid_substring_count": 2,
         "id": "js-module-clean",
         "language": "js",
         "path": "test-suite/js/clean",
@@ -4747,7 +4747,7 @@
       },
       {
         "critical_max": 0,
-        "forbid_substring_count": 0,
+        "forbid_substring_count": 2,
         "id": "js-node-clean",
         "language": "js",
         "path": "test-suite/frameworks/node/clean-api.js",
@@ -4755,7 +4755,7 @@
       },
       {
         "critical_max": 0,
-        "forbid_substring_count": 0,
+        "forbid_substring_count": 2,
         "id": "golang-clean",
         "language": "golang",
         "path": "test-suite/golang/clean",
@@ -4763,7 +4763,7 @@
       },
       {
         "critical_max": 0,
-        "forbid_substring_count": 0,
+        "forbid_substring_count": 2,
         "id": "rust-clean",
         "language": "rust",
         "path": "test-suite/rust/clean",

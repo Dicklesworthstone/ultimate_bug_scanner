@@ -6,7 +6,8 @@
       "--ci"
     ],
     "env": {
-      "NO_COLOR": "1"
+      "NO_COLOR": "1",
+      "RCH_CARGO_WRAPPER_BYPASS": "1"
     },
     "artifacts_dir": "artifacts"
   },
@@ -62,7 +63,11 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -202,7 +207,11 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -290,7 +299,11 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -1463,9 +1476,13 @@
             "max": 0
           },
           "warning": {
-            "max": 6
+            "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -3592,7 +3609,10 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "py.async.task-no-await"
+        ]
       }
     },
     {
@@ -3611,10 +3631,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
-            "max": 4
+            "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -5630,7 +5657,11 @@
           "warning": {
             "max": 4
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "SQL injection"
+        ]
       }
     },
     {
@@ -6746,15 +6777,24 @@
       ],
       "args": [
         "--only=js",
-        "--skip-type-narrowing"
+        "--skip-type-narrowing",
+        "--format=json"
       ],
       "expect": {
         "exit_code": "zero",
         "totals": {
           "warning": {
-            "max": 0
+            "max": 5
           }
-        }
+        },
+        "rule_ids": {
+          "forbid": [
+            "js.typescript.type-narrowing"
+          ]
+        },
+        "forbid_substrings": [
+          "Potentially unsafe type narrowing"
+        ]
       }
     },
     {
@@ -7194,9 +7234,13 @@
             "max": 0
           },
           "warning": {
-            "max": 6
+            "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -7595,10 +7639,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -7669,10 +7720,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -7697,7 +7755,11 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "CRITICAL",
+          "cargo check errors"
+        ]
       }
     },
     {
@@ -7721,7 +7783,11 @@
           "warning": {
             "max": 9
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "double free"
+        ]
       }
     },
     {
@@ -10345,10 +10411,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -10859,10 +10932,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -10913,9 +10993,13 @@
             "max": 0
           },
           "warning": {
-            "max": 3
+            "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -11373,10 +11457,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -11457,7 +11548,11 @@
           "warning": {
             "max": 1
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "SQL injection"
+        ]
       }
     },
     {
@@ -11856,10 +11951,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -11992,7 +12094,11 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -12018,7 +12124,11 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "Critical issues:",
+          "Await used while holding a lock"
+        ]
       }
     },
     {
@@ -12043,7 +12153,11 @@
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -12463,7 +12577,10 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "Null/type guard fallthrough issues"
+        ]
       }
     },
     {
@@ -12483,10 +12600,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -12510,7 +12634,10 @@
           "warning": {
             "min": 1
           }
-        }
+        },
+        "require_substrings": [
+          "Potential resource lifecycle leaks (helper)"
+        ]
       }
     },
     {
@@ -12530,10 +12657,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {
@@ -12580,10 +12714,17 @@
       "expect": {
         "exit_code": "zero",
         "totals": {
+          "critical": {
+            "max": 0
+          },
           "warning": {
             "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "CRITICAL",
+          "WARNING"
+        ]
       }
     },
     {

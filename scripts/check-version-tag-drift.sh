@@ -28,7 +28,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
+cd "$PROJECT_ROOT" || exit 1
 
 OUTPUT_JSON=0
 if [[ "${1:-}" == "--json" ]]; then

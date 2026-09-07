@@ -130,6 +130,7 @@
       "flag": "--only",
       "value": "CSV",
       "modules": [
+        "bash",
         "cpp",
         "csharp",
         "elixir",
@@ -145,6 +146,7 @@
       "flag": "--rules",
       "value": "DIR",
       "modules": [
+        "bash",
         "cpp",
         "csharp",
         "golang",
@@ -161,6 +163,7 @@
     {
       "flag": "--list-rules",
       "modules": [
+        "bash",
         "csharp",
         "golang",
         "java",
@@ -170,12 +173,13 @@
         "swift"
       ],
       "documented": true,
-      "doc": "print generated ast-grep rule ids and exit (js, golang, rust, java, ruby, swift, csharp)"
+      "doc": "print generated ast-grep rule ids and exit (js, golang, rust, java, ruby, swift, csharp, bash)"
     },
     {
       "flag": "--dump-rules",
       "value": "DIR",
       "modules": [
+        "bash",
         "csharp",
         "golang",
         "java",
@@ -190,6 +194,7 @@
     {
       "flag": "--list-categories",
       "modules": [
+        "bash",
         "cpp",
         "csharp",
         "python",
@@ -197,7 +202,22 @@
         "swift"
       ],
       "documented": true,
-      "doc": "print the category table and exit (python, rust, cpp, swift, csharp)"
+      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash)"
+    },
+    {
+      "flag": "--summary-json",
+      "value": "FILE",
+      "modules": [
+        "bash",
+        "csharp",
+        "elixir",
+        "python",
+        "ruby",
+        "rust",
+        "swift"
+      ],
+      "documented": false,
+      "doc": "write summary JSON to FILE"
     },
     {
       "flag": "--help",
@@ -319,11 +339,8 @@
       ],
       "contract": 2,
       "extra_flags": [
-        "--binary-files",
         "--counts",
-        "--exclude-dir",
         "--hidden",
-        "--include",
         "--list-categories",
         "--max-filesize",
         "--only",
@@ -581,6 +598,30 @@
         "--sarif-out",
         "--summary-json",
         "--very-verbose"
+      ]
+    },
+    "bash": {
+      "file": "ubs-bash.sh",
+      "display": "Bash",
+      "extensions": [
+        "sh",
+        "bash"
+      ],
+      "manifest_files": [],
+      "contract": 2,
+      "extra_flags": [
+        "--ast-rule-dir",
+        "--dump-rules",
+        "--json-out",
+        "--list-categories",
+        "--list-rules",
+        "--no-shellcheck",
+        "--only",
+        "--project",
+        "--rules",
+        "--sarif-out",
+        "--summary-json",
+        "--version"
       ]
     }
   }

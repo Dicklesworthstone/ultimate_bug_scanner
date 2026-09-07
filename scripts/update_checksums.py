@@ -50,7 +50,8 @@ def main():
         "java": "ubs-java.sh",
         "ruby": "ubs-ruby.sh",
         "swift": "ubs-swift.sh",
-        "elixir": "ubs-elixir.sh"
+        "elixir": "ubs-elixir.sh",
+        "bash": "ubs-bash.sh"
     }
 
     new_checksums = {}

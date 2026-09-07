@@ -13960,6 +13960,51 @@
           "suppression_buggy_nomarkers.ex:"
         ]
       }
+    },
+    {
+      "id": "bash-buggy",
+      "description": "Bash buggy fixture: reports syntax, control-flow, and dangerous execution anti-patterns.",
+      "path": "test-suite/bash/buggy",
+      "language": "bash",
+      "tags": [
+        "bash",
+        "buggy"
+      ],
+      "args": [
+        "--only=bash"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1
+          }
+        }
+      }
+    },
+    {
+      "id": "bash-clean",
+      "description": "Bash clean fixture: idiomatic shell patterns must produce zero critical or warning issues.",
+      "path": "test-suite/bash/clean",
+      "language": "bash",
+      "tags": [
+        "bash",
+        "clean"
+      ],
+      "args": [
+        "--only=bash"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        }
+      }
     }
   ]
 }

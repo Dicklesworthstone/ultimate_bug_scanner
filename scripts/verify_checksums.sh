@@ -7,7 +7,7 @@ set -euo pipefail
 # Change to project root directory
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
+cd "$PROJECT_ROOT" || exit 1
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -49,16 +49,17 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='3571ae45a683bb79efb9bf4f761b0597e5dc1b5d2791f005498b56347b2ebc8a'
-  [csharp]='c6c612469329abb9ea724a797fcbd2f350856b64481eeca946d14b889200855e'
-  [elixir]='5edec7ef8c03e6f4eb59f0479fa5f403f3058a3a7274643e58c82c20fa3db8db'
-  [golang]='a83a6271bc61ad9c09a46bdee385f3535bc49ab3f655c74961c0d87afb664eca'
-  [java]='46389f8a52700ab3d8e8991922efa7849522f9b45032020fafcff9e6a825cd01'
-  [js]='4d76c4ca5414964a717cff6552a9a67f07c1fb386868329155afcfa44af96b84'
-  [python]='1830e13c6b8d5c4eb96943b1bbd6d8e78c674e7c7d7521870dccecd369590296'
-  [ruby]='4b77720a919a6eac49d084d49ae2165437eecc96e8b96694154f185d9134877e'
-  [rust]='3ee0364463c1e15355d51ebdbcafc0df6ba4bc8fe0477e307b82197bae18e111'
-  [swift]='1a4869a9204d66e273729b3ceca27b315fe93ded0264b94b3d49bdf38554ecef'
+  [bash]='71b638f27288939b34ae7bf329827bdcee1124ada0942d364591502ae1924a6e'
+  [cpp]='dbf62e64f6844314ffb45cc3cf6fc13b2d07c8815b650127958a3f61b5ec71e0'
+  [csharp]='46ab14181e2171ed805f98799ab41e1d3d529b5d61900fc778354de878b26170'
+  [elixir]='cb06d8571ce5f4a3c5b4d8235a9be58cbf354f582e46d443663dcebc064f94d5'
+  [golang]='2073f09c6050c5b77fa4de546520d889a3af832699c369de176e45907dc19144'
+  [java]='8a18e27e8036f7be13ab6f65333349c7863de2332f684eb75832c4c37cd22458'
+  [js]='fa8642a3c46de7b6114dd958a33b5d00570d09e20ffa949cbcdba63d99fc91ef'
+  [python]='9cc6769254be583484662f0c1624e87606dc4f1de34ae2e3c83f324ba19a6a4b'
+  [ruby]='49949249b59461b8cde202be8cec31bd729fdf8c0de5036e131f39425e425d36'
+  [rust]='2647ea1fb458988feeae4aa156cb946c2d159a49af4b947eed3519b7cca48953'
+  [swift]='69a5a2c19293636e8986e2418ded0dec9ded6ad4bd28c27c20cb77f6a518710c'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -164,6 +165,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='467563f6db08bc1045679d2c406e9eab3f824c7770cbf83c2756f4135b08b45d'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
+  ['helpers/ubs_core/bash_rules.py']='b61a431da8298cb7c59e6c2858943536bb1e6308a289ee27698b119fdd7dc5f3'
+  ['helpers/ubs_core/bash_scan.py']='e3f8244ca758c7a1a2edc61b8970fbb97cf01944c15053ee7248ea369bc4148e'
   ['helpers/ubs_core/cli.py']='5c65218f3d515b0863ef4f9d3bc3f7f814b5cc0831724f6817e5c3d088aa9c77'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='60f203857d374aa48f68180d829894d9561bad3b7535f72c22246ebc297ad86e'
@@ -398,7 +401,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='ae19424f3b25d31ea71fff1f1fd6f3f8f65c05ef046f7ac85dcde9c17937dbd3'
   ['helpers/ubs_core/swift_scan.py']='006def40ab25a5addb8d97a85fc269db735bbe47eecdae8b5850b6fc9fc9fa5b'
-  ['lib/ubs-common.sh']='4f451cc49a55ab12cd481d07f570b330f933143802d06af309ffb50152efbe86'
+  ['lib/ubs-common.sh']='9cbde85cf097681dc2942fc7c5c8e8321fc7fc9e94c1e50245d426686d109b0a'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -710,6 +713,8 @@ HELPER_ASSETS=(
   "helpers/ubs_core/analyzers/taint_rust.py"
   "helpers/ubs_core/analyzers/taint_swift_redirect.py"
   "helpers/ubs_core/analyzers/taint_swift_traversal.py"
+  "helpers/ubs_core/bash_rules.py"
+  "helpers/ubs_core/bash_scan.py"
   "helpers/ubs_core/cli.py"
   "helpers/ubs_core/cpp_detectors/__init__.py"
   "helpers/ubs_core/cpp_detectors/archive_entry.py"
@@ -1208,7 +1213,7 @@ SESSION_RAW=0
 SESSION_LOG_DIR_OVERRIDE=""
 VERIFY_MODULE_ERR=""
 VERIFY_HELPER_ERR=""
-ALL_LANGS=(js python cpp rust golang java ruby swift csharp elixir)
+ALL_LANGS=(js python cpp rust golang java ruby swift csharp elixir bash)
 # Per-language category skip lists, populated by --skip-LANG=N flags.
 # Bare --skip=N continues to apply globally via UBS_SKIP_CATEGORIES (issue #52).
 declare -A SKIP_BY_LANG=()
@@ -1254,7 +1259,7 @@ fi
 # (union scan of a directory and a file that does not exist yet).
 looks_like_source_path(){
   case "${1##*/}" in
-    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyi|*.pyw|*.pyx|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.rake|*.swift|*.metal|*.cs|*.csx|*.csproj|*.sln|*.ex|*.exs|*.vue|*.svelte)
+    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyi|*.pyw|*.pyx|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.rake|*.swift|*.metal|*.cs|*.csx|*.csproj|*.sln|*.ex|*.exs|*.vue|*.svelte|*.sh|*.bash)
       return 0;;
     *) return 1;;
   esac
@@ -1275,7 +1280,16 @@ lang_for_source_file(){
     *.swift) echo swift;;
     *.cs) echo csharp;;
     *.ex|*.exs|*.heex|*.eex) echo elixir;;
-    *) return 1;;
+    *.sh|*.bash) echo bash;;
+    *)
+      if [[ -f "$1" && -r "$1" ]]; then
+        local first_line=""
+        read -r first_line < "$1" 2>/dev/null || true
+        case "$first_line" in
+          \#!/bin/bash*|\#!/bin/sh*|\#!/usr/bin/env\ bash*|\#!/usr/bin/env\ sh*) echo bash; return 0;;
+        esac
+      fi
+      return 1;;
   esac
 }
 
@@ -1306,7 +1320,7 @@ Options:
   --fail-on-warning       Exit non-zero if warnings or critical exist
   -v, --verbose           Pass -v to child scanners (if supported)
   -q, --quiet             Reduce console output (also passes -q to scanners)
-  --only=CSV              Restrict to languages: js,python,c,cpp,rust,golang,java,ruby,swift,csharp,cs,elixir,ex
+  --only=CSV              Restrict to languages: js,python,c,cpp,rust,golang,java,ruby,swift,csharp,cs,elixir,ex,bash,sh
   --exclude=GLOB[,..]     Skip paths (globs/dirs, like .ubsignore lines); forwarded to modules
   --exclude-langs=CSV     Exclude languages (e.g. --exclude-langs=js,ruby)
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
@@ -1332,7 +1346,7 @@ Options:
   --skip-size-check       Skip directory size guard (use with care)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift/C# type narrowing checks (falls back to basic heuristics)
   --skip=CSV              Skip categories by id (e.g. --skip=js.debug,python.todo) or number
-  --skip-LANG=CSV         Skip categories in ONE language only (LANG is js/python/cpp/rust/golang/java/ruby/swift/csharp/elixir;
+  --skip-LANG=CSV         Skip categories in ONE language only (LANG is js/python/cpp/rust/golang/java/ruby/swift/csharp/elixir/bash;
                           aliases c/cs/ex accepted). Example: --skip-js=8 --skip-rust=3
                           Use this instead of bare --skip=N in polyglot repos: category numbers are NOT stable across
                           languages (e.g. JS cat 8 = Function & Scope Issues, Rust cat 8 = SECURITY FINDINGS). Issue #52.
@@ -1441,13 +1455,13 @@ cat <<'JSON'
       {"name": "--output", "args": "FILE", "example": "--output=report.json", "description": "Also write the report to FILE (alias: -o FILE, or a trailing positional file that does not exist yet); stdout still receives it."},
       {"name": "--ci", "args": null, "example": "--ci", "description": "CI mode: stable UTC timestamps; also disables the auto-update check."},
       {"name": "--fail-on-warning", "args": null, "example": "--fail-on-warning", "description": "Exit 1 when warnings exist, not only criticals."},
-      {"name": "--only", "args": "CSV", "example": "--only=js,python", "description": "Restrict to these languages (js, python, c/cpp, rust, golang, java, ruby, swift, csharp/cs, elixir/ex)."},
+      {"name": "--only", "args": "CSV", "example": "--only=js,python", "description": "Restrict to these languages (js, python, c/cpp, rust, golang, java, ruby, swift, csharp/cs, elixir/ex, bash/sh)."},
       {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
       {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack."},
       {"name": "--skip", "args": "CSV", "example": "--skip=python.todo", "description": "Skip categories by stable id (e.g. python.todo) or category number."},
-      {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|ruby|swift|csharp|elixir)."},
+      {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|ruby|swift|csharp|elixir|bash)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
       {"name": "--profile", "args": "NAME", "example": "--profile=strict", "description": "Severity profile passed to the modules (strict|loose); strict also implies --fail-on-warning."},
       {"name": "--files", "args": "F1,F2", "example": "--files=a.js,b.py", "description": "Scan only the listed files (comma or space separated)."},
@@ -2267,7 +2281,7 @@ if [[ -n "$USER_EXCLUDE_PATTERNS" ]]; then
   IFS=',' read -r -a _user_excludes <<<"$USER_EXCLUDE_PATTERNS"
   for _pat in "${_user_excludes[@]}"; do
     case "${_pat,,}" in
-      js|ts|javascript|typescript|python|py|cpp|c|c++|rust|rs|golang|go|java|kotlin|kt|ruby|rb|swift|csharp|cs|c#|dotnet|elixir|ex)
+      js|ts|javascript|typescript|python|py|cpp|c|c++|rust|rs|golang|go|java|kotlin|kt|ruby|rb|swift|csharp|cs|c#|dotnet|elixir|ex|bash|sh)
         if [[ ! -e "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}/$_pat" && ! -e "$_pat" ]]; then
           say_err "${RED}${X}${RESET} --exclude now takes path globs; '$_pat' names a language and no path '$_pat' exists under ${SOURCE_PROJECT_DIR:-$PROJECT_DIR}. Use --exclude-langs=$_pat to skip the language."
           exit 2
@@ -2464,6 +2478,7 @@ LANG_EXT_HINTS = {
     "swift": "swift",
     "cs": "csharp", "csx": "csharp",
     "ex": "elixir", "exs": "elixir", "heex": "elixir",
+    "sh": "bash", "bash": "bash",
 }
 
 
@@ -2489,6 +2504,8 @@ def normalize_lang(l: str) -> str:
         return "rust"
     if l in ("ts", "js"):
         return "js"
+    if l in ("sh", "bash"):
+        return "bash"
     return l
 
 
@@ -2502,7 +2519,7 @@ if contract_path and os.path.isfile(contract_path):
         modules_spec = {}
 
 all_module_langs = list(modules_spec.keys()) if modules_spec else [
-    "js", "python", "cpp", "rust", "golang", "java", "ruby", "swift", "csharp", "elixir"
+    "js", "python", "cpp", "rust", "golang", "java", "ruby", "swift", "csharp", "elixir", "bash"
 ]
 
 only_set = {normalize_lang(x) for x in only_langs_raw.split(",") if x.strip()} if only_langs_raw else set()
@@ -2518,6 +2535,15 @@ def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: st
     exts = spec.get("extensions", [])
     if ext_str and (ext_str in exts or (ext_str in include_ext_set and (LANG_EXT_HINTS.get(ext_str) == lang or (LANG_EXT_HINTS.get(ext_str) is None and lang in target_langs)))):
         return True
+    if lang == "bash" and not ext_str:
+        try:
+            full_path = os.path.join(root, rel_str.encode("utf-8", "replace"))
+            with open(full_path, "rb") as f:
+                head = f.read(128)
+                if head.startswith(b"#!") and (b"/sh" in head.split(b"\n", 1)[0] or b"/bash" in head.split(b"\n", 1)[0]):
+                    return True
+        except Exception:
+            pass
     manifests = spec.get("manifest_files", [])
     if manifests:
         for pat in manifests:
@@ -4231,6 +4257,20 @@ detect_lang(){
           -type f \( -name '*.ex' -o -name '*.exs' -o -name 'mix.exs' -o -name 'mix.lock' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
+    bash)
+      if need_cmd rg; then
+        rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!target/**' -g '!vendor/**' \
+           -g '*.{sh,bash}' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name target -o -name vendor -o -name .git \) -prune -o \
+          -type f \( -name '*.sh' -o -name '*.bash' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      if [[ $found -ne 0 ]]; then
+        if need_cmd rg; then
+          rg -q -m 1 -e '^#!(/bin/(ba)?sh|/usr/bin/env\s+(ba)?sh)' . "$PROJECT_DIR" 2>/dev/null && found=0
+        fi
+      fi
+      ;;
   esac
   return $found
 }
@@ -4296,6 +4336,7 @@ normalize_lang(){
     rb) echo "ruby" ;;
     rs) echo "rust" ;;
     ts) echo "js" ;;
+    sh|bash) echo "bash" ;;
     *) echo "$1" ;;
   esac
 }
@@ -5574,6 +5615,16 @@ category_slug_for(){
         14) echo "mix";;
         15) echo "binary-safety";;
         16) echo "analyzers";;
+        *) echo "";;
+      esac;;
+    bash)
+      case "$cat" in
+        1) echo "syntax";;
+        2) echo "control-flow";;
+        3) echo "security";;
+        4) echo "robustness";;
+        5) echo "environment";;
+        6) echo "shellcheck";;
         *) echo "";;
       esac;;
     *) echo "";;

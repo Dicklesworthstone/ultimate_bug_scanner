@@ -190,7 +190,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## ultimate_bug_scanner — This Project
 
-**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 10 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java (plus Kotlin via the Java module), Ruby, Swift, C#, and Elixir. UBS cannot yet scan Bash, the language it is written in (bead `ultimate_bug_scanner-7mga.1`).
+**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 11 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java (plus Kotlin via the Java module), Ruby, Swift, C#, Elixir, and Bash.
 
 ### What It Does
 
@@ -208,7 +208,8 @@ Invocation → Parse CLI args → Detect languages → ┬─ ubs-js.sh      (JS
                                                   ├─ ubs-ruby.sh    (Ruby)
                                                   ├─ ubs-swift.sh   (Swift)
                                                   ├─ ubs-csharp.sh  (C#)
-                                                  └─ ubs-elixir.sh  (Elixir)
+                                                  ├─ ubs-elixir.sh  (Elixir)
+                                                  └─ ubs-bash.sh    (Bash)
                                                            │
                                                   (concurrent execution)
                                                            │
@@ -242,6 +243,7 @@ ultimate_bug_scanner/
 │   ├── ubs-swift.sh                   # Swift scanner
 │   ├── ubs-csharp.sh                  # C# scanner
 │   ├── ubs-elixir.sh                  # Elixir scanner
+│   ├── ubs-bash.sh                    # Bash/POSIX-sh scanner
 │   ├── README.md                      # Module interface contract
 │   └── helpers/                       # AST correlation & type narrowing helpers (all listed in HELPER_CHECKSUMS)
 │       ├── async_task_handles_csharp.py # C# async task-handle analysis

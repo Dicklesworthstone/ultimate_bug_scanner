@@ -32,7 +32,7 @@ compute_sha256() {
     fi
 }
 
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 # Check required files exist
 for file in ubs install.sh SHA256SUMS; do

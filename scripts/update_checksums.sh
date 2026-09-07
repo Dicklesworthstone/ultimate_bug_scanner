@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Ensure we are in the root
-cd "$ROOT_DIR"
+cd "$ROOT_DIR" || exit 1
 
 if [[ -x ".venv/bin/python3" ]]; then
     # Prefer an existing project venv if present (avoids uv re-creating it).

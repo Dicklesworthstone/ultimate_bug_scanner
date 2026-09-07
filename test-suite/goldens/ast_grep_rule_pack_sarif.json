@@ -356,7 +356,7 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 201,
+      "result_count": 203,
       "result_rule_ids": [
         "js.async.await-no-try",
         "js.async.dangling-promise",
@@ -410,7 +410,7 @@
       "fixture": "test-suite/golang",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
-      "result_count": 251,
+      "result_count": 259,
       "result_rule_ids": [
         "go.blank-import",
         "go.close-error-ignored",
@@ -519,7 +519,7 @@
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 459,
+      "result_count": 547,
       "result_rule_ids": [
         "rust.arc-mutex",
         "rust.assert-macros",
@@ -658,7 +658,7 @@
       "fixture": "test-suite/ruby",
       "label": "ruby-rule-pack",
       "module": "ubs-ruby.sh",
-      "result_count": 39,
+      "result_count": 49,
       "result_rule_ids": [
         "rails.constantize",
         "rails.csrf-skip",
@@ -737,7 +737,7 @@
       "fixture": "test-suite/java",
       "label": "java-rule-pack",
       "module": "ubs-java.sh",
-      "result_count": 77,
+      "result_count": 89,
       "result_rule_ids": [
         "java.bigdecimal-equals",
         "java.closeable-no-twr",

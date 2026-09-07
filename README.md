@@ -1043,7 +1043,7 @@ Environment Variables:
   UBS_MAX_FILE_MB          Leave files above N MB out of whole-project scans (default: 8; 0 disables)
   UBS_PYTHON               Python >= 3.9 interpreter to use as python3 (Git Bash/Windows: `python` or `py -3` are tried automatically)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
-  UBS_PROFILE=1            Add phase timings (copy, fan-out, per module, merge, total ms) to json/toon output and the text summary
+  UBS_PROFILE=1            Add phase timings (list, fan-out, per module, merge, total ms) to json/toon output and the text summary
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
 
@@ -1505,15 +1505,15 @@ Each module maps its tool-specific severity strings, numeric levels, and legacy 
 - Custom: --include-ext=js,ts,vue
 
 # Working files and memory
-- Whole-project scans list the files to scan (ignores applied; binary/data
-  files and files above UBS_MAX_FILE_MB left out) and copy only those into a
-  temporary shadow workspace under $TMPDIR so ignore rules apply to every
-  module uniformly; the workspace is deleted when the scan ends
+- Whole-project scans create no temporary copy of the tree: the meta-runner
+  lists the files to scan (ignores applied; binary/data files and files above
+  UBS_MAX_FILE_MB left out) and feeds per-language file lists directly to the
+  modules via `--files-from` against the source tree
 - One explicit source file (the agent-hook case, `ubs FILE --ci`) is handed to
   its language module in place: no workspace, no per-language detection walk
-- rsync is optional everywhere: every workspace copy (whole project, explicit
-  targets, directory targets, --staged/--diff) falls back to tar, then to a
-  Python copy, so Git for Windows (no rsync) works
+- Explicit multi-file targets, directory targets, and git modes (--staged/--diff)
+  prepare a workspace copy using copy_file_list (rsync with tar/python fallback,
+  so Git for Windows works)
 - Results are merged from per-module JSON at the end of the run
 - Memory: 45–110 MB resident on typical projects; ~840 MB was measured on a
   407K-line TypeScript tree (bead ultimate_bug_scanner-q150.6 streams that)

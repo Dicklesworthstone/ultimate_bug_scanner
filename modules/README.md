@@ -16,6 +16,8 @@ Options:
 --exclude=GLOBS    additional path globs to skip (forwarded by the meta-runner)
 --include-ext=CSV  extra file extensions to scan
 --skip=CSV         skip category numbers (numbers differ per module)
+--report-json=FILE write NDJSON findings sink to FILE
+--files-from=FILE  NUL-separated file list to scan (meta-runner contract v2 hand-off)
 --rules=DIR        merge custom ast-grep rules into the built-in pack (all modules except elixir)
 --list-rules       print generated ast-grep rule ids and exit (js, golang, rust, java, ruby, swift, csharp)
 --dump-rules=DIR   write the generated ast-grep rules to DIR (same modules as --list-rules)

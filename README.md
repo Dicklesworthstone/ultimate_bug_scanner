@@ -64,6 +64,7 @@ ubs . --profile=strict --fail-on-warning --format=json
 # Machine-readable docs and schemas for agent loops
 ubs robot-docs                # guide, commands/flags, examples, exit codes, formats, env — one JSON document
 ubs robot-docs exit-codes     # a single topic
+ubs explain py.security.open-redirect  # rule explanation: remediation, fixture examples, confidence
 ubs --schema=json             # JSON Schema (draft 2020-12) for --format=json; also jsonl|sarif|toon|error|all
 ```
 
@@ -2553,6 +2554,18 @@ Session logs capture:
 - Configured integrations
 - Any errors or warnings
 - Environment details
+
+### `ubs explain`
+
+Inspect any static analysis rule with detailed message, remediation guidance, category, calibrated confidence, and real-world buggy / clean code fixture examples from the test suite:
+
+```bash
+ubs explain py.security.open-redirect               # Human-readable ANSI text
+ubs explain py.security.open-redirect --format=json # Machine-parseable JSON
+ubs explain open_redirect                           # Fuzzy match / suggestions if unknown
+```
+
+Unknown rule IDs exit 2 with nearest fuzzy and token match suggestions so agents and developers can self-correct immediately.
 
 ---
 

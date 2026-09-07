@@ -87,6 +87,14 @@ def _build_parser() -> argparse.ArgumentParser:
     fs.add_argument("--repo", default="", help="git remote repository URI")
     fs.add_argument("--rev", default="", help="git commit SHA")
     fs.add_argument("--auto", default="", help="SARIF automation ID")
+    exp = sub.add_parser(
+        "explain",
+        help="explain a rule: message, remediation, fixture examples, confidence, category (bead K3)",
+    )
+    exp.add_argument("rule_id", nargs="?", default=None, help="rule identifier to explain")
+    exp.add_argument("--format", choices=["text", "json"], default="text", help="output format")
+    exp.add_argument("--repo-root", default=None, help="repository root path")
+    exp.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     return parser
 
 
@@ -203,6 +211,11 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"findings-sarif: {exc}", file=sys.stderr)
             return 2
+
+    if args.layer == "explain":
+        from ubs_core.explain import run_explain_cli
+
+        return run_explain_cli(args)
 
     if not getattr(args, "layer", None):
         parser.print_help(sys.stderr)

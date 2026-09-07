@@ -49,16 +49,16 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='70067db7762eb583dc2472472f360c39f26a38aaaade628ec13ad6ac36d2952e'
-  [csharp]='0374b815edc856b0a277e4ab03dbe85569bc2d7da361d1c814c7b300f66d8623'
-  [elixir]='23fa279137251f99164dfdfb8ac78a9180e743bec769ad7b29653de6ce8a3614'
-  [golang]='65cf144ef838729268ec329c806e0fa7ef87bdff4ca61c4a03dd20cdc4ea4fd1'
-  [java]='18a43353603a4240dca29404740fc83e938e0e41641956d4f26e62c7591cc836'
-  [js]='80d864f8838d919bf2429e66da96c0842a1bf632c1edafadee32fc15ccb8f4c9'
-  [python]='de335ecbfb9e9465c59a10c252a939e954b0238d0fd595f5de7457e93367448a'
-  [ruby]='1e82f88b418de0da182c695312e1c1b68910bb34aa04d4236f2b61f02aadad6d'
-  [rust]='8e344dd3ad6b88eba732fce870e09e514063772d923a29dc0dce37a6af15cf3c'
-  [swift]='135035359e944ee787ca3acc6a0452fe05106e8b66e5115b2848a01db0dac626'
+  [cpp]='24ce3f7b27808570d8f8a9efa051c5f0874da1cc4d25f75e51fb65b6f7fd36e0'
+  [csharp]='5d19292fef30bad2cee37e5302c06e220298f2236ee8f2b3f60b5d2dc37f11d1'
+  [elixir]='45b73cdf36c6e4279cf87fdf3212cb10034274ebeafb533d82eb7db17cc19524'
+  [golang]='7a102ca422d84dca079dbfd82751290aad4fde757924e756eb65930a0f67db66'
+  [java]='dc268b8a2ff00727cf3efa1a4c4b4bcde9e100f89a411332eee2ffe811c0d15e'
+  [js]='b5e0f32a528a077bbdb163357d64c487a71eb8b93699095756d6860e76b6cb57'
+  [python]='4bd422cc8f04471aaddec15ce515ff36d29bf004e8815b60eaf2c0e7c1426a67'
+  [ruby]='4642aab8ad18640797e334de4500f39c348f95e39f84cfd099b6c4f2197db4ad'
+  [rust]='111ef4aa7722a04ff852b537087b39c417c093fd0f72bf39033383969187a8e5'
+  [swift]='391b3dde48d9bd9b2f538ac2598cd8b61312456360f1d06a4cb77ea9d0af9ec4'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -164,7 +164,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='467563f6db08bc1045679d2c406e9eab3f824c7770cbf83c2756f4135b08b45d'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='98c81269a30a7fc2aa2666cfce499048e7ece01880873e53c2c5b9ca819a66e0'
-  ['helpers/ubs_core/cli.py']='e0ae9ca9121ef035f69d2b9490919c39d8c855c1d1df98a4af25ad598fa109c1'
+  ['helpers/ubs_core/cli.py']='5c65218f3d515b0863ef4f9d3bc3f7f814b5cc0831724f6817e5c3d088aa9c77'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='60f203857d374aa48f68180d829894d9561bad3b7535f72c22246ebc297ad86e'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='ba135d496604b1822a30b8e2942b5a3700884c4d2d11409b9c4bddf1763f1d13'
@@ -220,6 +220,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_patterns/phoenix.py']='533afcfc1a90e24ad2ce002a76d2433ef2203f7034de9047a84c7a67eb0f36a4'
   ['helpers/ubs_core/elixir_patterns/security_rg.py']='551c5357954168766253ec46bf2095b7497d500c01d2a71fbbb77849461c51c9'
   ['helpers/ubs_core/elixir_scan.py']='6ced28905245e7cd5c7e88ea8cad373cf7aad7d143f3f93e61871f7403824c33'
+  ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
   ['helpers/ubs_core/findings_merge.py']='da2b342c518d640177ed30eab940bedd8fe7ce59ebd8dad20caa05b3f1bd5bd1'
   ['helpers/ubs_core/go_ast.py']='8742075b0f2f9e10ec0fe37a1641075eaf3480e3f30b7060a306bdff77b84d89'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
@@ -397,7 +398,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='ae19424f3b25d31ea71fff1f1fd6f3f8f65c05ef046f7ac85dcde9c17937dbd3'
   ['helpers/ubs_core/swift_scan.py']='006def40ab25a5addb8d97a85fc269db735bbe47eecdae8b5850b6fc9fc9fa5b'
-  ['lib/ubs-common.sh']='6e36e0b34011b35927eebb206ace0e186b31c7e6338cb9f9cd1dbf59d82fc769'
+  ['lib/ubs-common.sh']='6dd9fc060a1b7ce89802be9b127cb23308e5e9133f430bd7c2e47572dbb346ef'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -765,6 +766,7 @@ HELPER_ASSETS=(
   "helpers/ubs_core/elixir_patterns/phoenix.py"
   "helpers/ubs_core/elixir_patterns/security_rg.py"
   "helpers/ubs_core/elixir_scan.py"
+  "helpers/ubs_core/explain.py"
   "helpers/ubs_core/findings_merge.py"
   "helpers/ubs_core/go_ast.py"
   "helpers/ubs_core/go_detectors/__init__.py"
@@ -1283,6 +1285,7 @@ usage() {
 Usage: ubs [options] [PROJECT_DIR]
        ubs [options] PATH1 PATH2 ...            (files and/or directories; union scan)
        ubs --files FILE1,FILE2,... [options] [PROJECT_DIR]
+       ubs explain <rule-id> [--format=text|json]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
        ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]   (JSON for agents)
@@ -1430,6 +1433,7 @@ cat <<'JSON'
       {"name": "scan", "usage": "ubs [options] [PATH ...]", "description": "Default. Scans the project directory or the listed files/directories (union scan)."},
       {"name": "doctor", "usage": "ubs doctor [--fix] [--format=text|json] [--module-dir=DIR]", "description": "Verify cached modules/helpers and the ast-grep toolchain; --fix re-downloads corrupted copies; --format=json emits structured checks."},
       {"name": "sessions", "usage": "ubs sessions [--entries N] [--raw]", "description": "Show recent installer session summaries."},
+      {"name": "explain", "usage": "ubs explain <rule-id> [--format=text|json]", "description": "Explain a rule: message, remediation, fixture examples, confidence, category."},
       {"name": "robot-docs", "usage": "ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]", "description": "This document (JSON on stdout)."},
       {"name": "--schema", "usage": "ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]", "description": "JSON Schema (draft 2020-12) for each output format."}
     ],
@@ -1484,6 +1488,7 @@ cat <<'JSON'
     {"goal": "Skip a directory for this run", "command": "ubs . --exclude=legacy,generated --format=json"},
     {"goal": "Only Python and Go", "command": "ubs . --only=python,golang --format=json"},
     {"goal": "Accept a partial run (a module timed out)", "command": "UBS_ALLOW_PARTIAL=1 ubs . --format=json"},
+    {"goal": "Explain a rule with remediation and fixture examples", "command": "ubs explain py.security.open-redirect --format=json"},
     {"goal": "Validate an output against its schema", "command": "ubs --schema=json > ubs.schema.json"}
   ],
   "exit_codes": [
@@ -1844,6 +1849,23 @@ emit_schema(){
     .[$key] + {"$id": ($base + "/" + $key + ".schema.json"), schema_version: $sv}'
 }
 
+explain_rule(){
+  local self_dir helpers_dir repo_root
+  self_dir="$(dirname "${BASH_SOURCE[0]}")"
+  helpers_dir="$self_dir/modules/helpers"
+  if [[ ! -d "$helpers_dir" && -d "${MODULE_DIR:-}/helpers" ]]; then
+    helpers_dir="${MODULE_DIR:-}/helpers"
+  fi
+  repo_root="$(cd "$self_dir" 2>/dev/null && pwd -P)" || repo_root="$self_dir"
+
+  if ! need_cmd python3; then
+    say_err "${RED}${X}${RESET} python3 is required for ubs explain"
+    return 2
+  fi
+
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.explain --repo-root "$repo_root" "$@"
+}
+
 doctor_usage(){
   cat <<DOC >&2
 Usage: ubs doctor [options]
@@ -1924,7 +1946,12 @@ PY
 
 # Self-description commands answer from static data (functions above) and
 # exit before any parsing, locking, network or scanning.
-if [[ "${1:-}" == "robot-docs" ]]; then
+if [[ "${1:-}" == "explain" ]]; then
+  shift
+  _explain_rc=0
+  explain_rule "$@" || _explain_rc=$?
+  exit "$_explain_rc"
+elif [[ "${1:-}" == "robot-docs" ]]; then
   _self_doc_rc=0
   emit_robot_docs "${2:-all}" || _self_doc_rc=$?   # `||` keeps the ERR trap quiet on exit 2
   exit "$_self_doc_rc"

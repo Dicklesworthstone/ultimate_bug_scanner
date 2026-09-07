@@ -370,6 +370,7 @@ Env:
 Args:
  PROJECT_DIR Directory to scan (default: ".")
  OUTPUT_FILE File to save the report (optional)
+contract: v2
 USAGE
 }
 
@@ -407,6 +408,8 @@ while [[ $# -gt 0 ]]; do
     --progress) PROGRESS=1; shift;;
   --respect-ignore) RESPECT_IGNORE=1; shift;;
   --no-ignore) NO_IGNORE_ALL=1; shift;;
+  --files-from=*) FILES_FROM="${1#*=}"; shift;;
+  --files-from)   FILES_FROM="${2:-}"; shift 2;;
   -h|--help) print_usage; exit 0;;
   --) shift; break;;
     *)
@@ -2960,7 +2963,7 @@ run_contract_v2_swift(){
   fi
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
-  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     rm -f "$list_file" "$sink" 2>/dev/null || true
     return 2

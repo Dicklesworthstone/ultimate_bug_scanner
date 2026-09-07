@@ -92,6 +92,7 @@ EXCLUDE_GLOBS=""
 SUMMARY_JSON=""
 EMIT_FINDINGS_JSON=""
 REPORT_JSON=""
+FILES_FROM=""
 DUMP_RULES_DIR=""
 EXTRA_AST_RULES_DIRS=""
 LIST_RULES=0
@@ -1131,6 +1132,7 @@ Options:
 
   --summary-json=FILE          Write summary JSON to file
   --emit-findings-json=FILE    Write full findings JSON to file (or use --format=json)
+contract: v2
 
 EOF
 }
@@ -1173,6 +1175,8 @@ parse_args() {
       --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
       --emit-findings-json=*) EMIT_FINDINGS_JSON="${1#*=}"; shift;;
       --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+      --files-from=*) FILES_FROM="${1#*=}"; shift;;
+      --files-from)   FILES_FROM="${2:-}"; shift 2;;
 
       --) shift; break;;
       -*)
@@ -3778,7 +3782,8 @@ run_contract_v2_csharp(){
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" \
-      --exclude "$EXCLUDE_DIRS${EXTRA_EXCLUDE_DIRS:+,$EXTRA_EXCLUDE_DIRS}" >"$list_file"; then
+      --exclude "$EXCLUDE_DIRS${EXTRA_EXCLUDE_DIRS:+,$EXTRA_EXCLUDE_DIRS}" \
+      ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2
   fi

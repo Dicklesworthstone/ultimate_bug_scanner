@@ -435,19 +435,18 @@ def check_files_from_for_v2_modules() -> None:
                 proc1.returncode in (0, 1)
                 and js1["files"] == 1
                 and samples1 == ["src/index.js"]
-                and prof1.get("copy_ms") == 0
+                and "copy_ms" not in prof1
                 and "scanning source tree directly" in proc1.stderr
                 and "Created filtered scan workspace" not in proc1.stderr
                 and js1.get("project") == str(tmp)
             )
-            detail1 += f" samples={samples1} copy_ms={prof1.get('copy_ms')} proj={js1.get('project')}"
+            detail1 += f" samples={samples1} copy_ms={'copy_ms' in prof1} proj={js1.get('project')}"
         except Exception as exc:  # noqa: BLE001
             detail1 += f" ({exc})"
         report("files_from_for_v2_modules", ok1, detail1, proc1 if not ok1 else None)
 
-        # Case 2: Mixed scan (--only=js,python)
-        # v2 JS module + unported Python module.
-        # Workspace is created for Python, but fake JS module still receives --files-from and source dir.
+        # Case 2: Polyglot scan (--only=js,python)
+        # All modules are v2: both JS and Python scan the source tree directly with no workspace copy.
         proc2 = run(["--only=js,python", "--ci", "--format=json", str(tmp)], env=env)
         ok2 = False
         detail2 = f"exit={proc2.returncode}"
@@ -463,7 +462,8 @@ def check_files_from_for_v2_modules() -> None:
                 and js2["files"] == 1
                 and samples2 == ["src/index.js"]
                 and js2.get("project") == str(tmp)
-                and "Created filtered scan workspace" in proc2.stderr
+                and "scanning source tree directly" in proc2.stderr
+                and "Created filtered scan workspace" not in proc2.stderr
             )
             detail2 += f" js_samples={samples2} js_proj={js2.get('project') if js2 else 'none'}"
         except Exception as exc:  # noqa: BLE001
@@ -685,7 +685,8 @@ def check_single_file_fast_path() -> None:
             and all(s.get("permalink", "").endswith(f"{rel}#L{s['line']}") for s in samples if isinstance(s.get("line"), int)) \
             and "Scanning one file directly (no workspace)" in proc.stderr \
             and "Preparing shadow workspace" not in proc.stderr \
-            and doc["profile"]["copy_ms"] == 0
+            and "copy_ms" not in doc["profile"] \
+            and isinstance(doc["profile"].get("total_ms"), int)
         detail += f" langs={langs} samples={len(samples)}"
     except Exception as exc:  # noqa: BLE001
         detail += f" {exc}"
@@ -896,7 +897,8 @@ def check_profile_block() -> None:
     try:
         prof = json.loads(proc.stdout)["profile"]
         ok = (
-            all(isinstance(prof[k], int) and prof[k] >= 0 for k in ("total_ms", "copy_ms", "fanout_ms", "merge_ms"))
+            all(isinstance(prof[k], int) and prof[k] >= 0 for k in ("total_ms", "list_ms", "fanout_ms", "merge_ms"))
+            and "copy_ms" not in prof
             and isinstance(prof["modules"].get("python"), int)
             and prof["total_ms"] >= prof["fanout_ms"] >= prof["modules"]["python"]
         )
@@ -1685,6 +1687,84 @@ def test_module_garbage_output_yields_error_envelope() -> None:
 check_module_garbage_output_yields_error_envelope = test_module_garbage_output_yields_error_envelope
 
 
+def check_no_shadow_copy_for_whole_project() -> None:
+    # Whole-project scans create no temporary copy of the tree (bead B4d).
+    # All modules take --files-from and run against the source tree directly.
+    # To prove no whole-project shadow copy is made, run `ubs .` with a PATH shim
+    # that makes `rsync` and `tar` log and fail. The scan must succeed with
+    # identical totals and the shim log must remain completely empty.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-noshadow-"))
+    shim_dir = Path(tempfile.mkdtemp(prefix="ubs-noshadow-shims-"))
+    log_file = shim_dir / "shim.log"
+    try:
+        (tmp / "src").mkdir()
+        (tmp / "src" / "app.py").write_text("import os\nprint('hello')\n", encoding="utf-8")
+        (tmp / "src" / "index.js").write_text("console.log('hello');\n", encoding="utf-8")
+        (tmp / "data").mkdir()
+        (tmp / "data" / "sample.bin").write_bytes(b"\0" * 2000)
+
+        # Base run: whole-project scan of `.` with UBS_PROFILE=1
+        proc_base = run([".", "--ci", "--format=json"], cwd=tmp, env={"UBS_PROFILE": "1"})
+
+        # Create shims for rsync and tar that log any call and fail
+        for cmd in ("rsync", "tar"):
+            shim = shim_dir / cmd
+            shim.write_text(f'#!/bin/sh\necho "{cmd} $@" >> "{log_file}"\nexit 1\n', encoding="utf-8")
+            shim.chmod(0o755)
+
+        # Shimmed run: whole-project scan of `.` with PATH prepended with shim_dir
+        shim_env = {
+            "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
+            "UBS_PROFILE": "1",
+        }
+        proc_shim = run([".", "--ci", "--format=json"], cwd=tmp, env=shim_env)
+
+        ok = False
+        detail = f"base_exit={proc_base.returncode} shim_exit={proc_shim.returncode}"
+        try:
+            doc_base = json.loads(proc_base.stdout)
+            doc_shim = json.loads(proc_shim.stdout)
+            shim_log_content = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+            prof = doc_shim.get("profile", {})
+
+            same_totals = doc_base.get("totals") == doc_shim.get("totals") and doc_shim.get("totals", {}).get("files", 0) >= 2
+            no_shim_calls = len(shim_log_content.strip()) == 0
+            no_copy_ms = "copy_ms" not in prof
+            has_list_ms = isinstance(prof.get("list_ms"), int)
+            no_workspace_msg = "Created filtered scan workspace" not in proc_shim.stderr
+            source_direct_msg = "scanning source tree directly" in proc_shim.stderr
+
+            ok = (
+                proc_shim.returncode in (0, 1)
+                and same_totals
+                and no_shim_calls
+                and no_copy_ms
+                and has_list_ms
+                and no_workspace_msg
+                and source_direct_msg
+            )
+            detail += f" totals={doc_shim.get('totals')} shim_log_len={len(shim_log_content)} list_ms={prof.get('list_ms')} copy_ms_in_prof={'copy_ms' in prof}"
+        except Exception as exc:  # noqa: BLE001
+            detail += f" ({exc})"
+
+        write_case_artifacts("test_no_shadow_copy_for_whole_project", proc_shim, {
+            "base_exit": proc_base.returncode,
+            "shim_exit": proc_shim.returncode,
+            "shim_log": shim_log_content if "shim_log_content" in locals() else "",
+            "base_totals": doc_base.get("totals") if "doc_base" in locals() else None,
+            "shim_totals": doc_shim.get("totals") if "doc_shim" in locals() else None,
+            "profile": prof if "prof" in locals() else None,
+            "ok": ok,
+        })
+        report("test_no_shadow_copy_for_whole_project", ok, detail, proc_shim if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(shim_dir, ignore_errors=True)
+
+
+test_no_shadow_copy_for_whole_project = check_no_shadow_copy_for_whole_project
+
+
 def main() -> int:
     filter_names = set(sys.argv[1:])
     checks = (
@@ -1730,6 +1810,7 @@ def main() -> int:
         test_doctor_json_schema,
         test_doctor_fix_restores_assets,
         test_module_garbage_output_yields_error_envelope,
+        test_no_shadow_copy_for_whole_project,
     )
     for check in checks:
         name = check.__name__

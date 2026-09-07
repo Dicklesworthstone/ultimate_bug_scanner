@@ -105,6 +105,7 @@ EX_TIMEOUT="${EX_TIMEOUT:-1200}"
 
 SUMMARY_JSON=""
 REPORT_JSON=""                         # --report-json=FILE: NDJSON findings record stream (K2)
+FILES_FROM=""
 SARIF_OUT=""
 JSON_OUT=""
 
@@ -167,6 +168,7 @@ Env:
 Args:
   PROJECT_DIR              Directory to scan (default: ".")
   OUTPUT_FILE              File to save the report (optional)
+contract: v2
 USAGE
 }
 
@@ -181,6 +183,8 @@ while [[ $# -gt 0 ]]; do
     --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
     --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
+    --files-from=*) FILES_FROM="${1#*=}"; shift;;
+    --files-from)   FILES_FROM="${2:-}"; shift 2;;
     --list-categories) LIST_CATS=1; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
@@ -2688,7 +2692,7 @@ run_contract_v2_elixir(){
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
   else
-    ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file" || list_rc=$?
+    ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file" || list_rc=$?
   fi
   if [[ "$list_rc" -gt 1 ]] && ! [[ -s "$list_file" ]]; then
     echo "ERROR: contract-v2 file list failed" >&2

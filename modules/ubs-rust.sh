@@ -204,6 +204,7 @@ Env:
 Args:
   PROJECT_DIR                Directory to scan (default: ".")
   OUTPUT_FILE                File to save the report (optional)
+contract: v2
 USAGE
 }
 
@@ -234,6 +235,8 @@ while [[ $# -gt 0 ]]; do
     --exclude-tests) EXCLUDE_TESTS=1; shift;;
     --fail-critical=*) FAIL_CRITICAL_THRESHOLD="${1#*=}"; shift;;
     --fail-warning=*)  FAIL_WARNING_THRESHOLD="${1#*=}"; shift;;
+    --files-from=*) FILES_FROM="${1#*=}"; shift;;
+    --files-from)   FILES_FROM="${2:-}"; shift 2;;
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ "$PROJECT_DIR" == "." && ! "$1" =~ ^- ]]; then
@@ -8748,7 +8751,7 @@ run_contract_v2_rust(){
   V2_SINK="$sink"
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
-  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2
   fi

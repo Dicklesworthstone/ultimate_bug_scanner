@@ -160,7 +160,11 @@ def check_helpers() -> None:
     ubs_text = (ROOT / "ubs").read_text(encoding="utf-8")
     block = re.search(r"declare -A HELPER_CHECKSUMS=\((.*?)\n\)", ubs_text, re.S)
     pinned = set(re.findall(r"\['((?:helpers|lib)/[^']+)'\]", block.group(1))) if block else set()
-    on_disk = {f"helpers/{p.name}" for p in (ROOT / "modules" / "helpers").iterdir() if p.is_file() and not p.name.startswith(".")}
+    on_disk = {
+        p.relative_to(ROOT / "modules").as_posix()
+        for p in (ROOT / "modules" / "helpers").rglob("*")
+        if p.is_file() and not p.name.startswith(".") and "__pycache__" not in p.parts
+    }
     # The shared module library ships through the same checksum channel.
     on_disk |= {f"lib/{p.name}" for p in (ROOT / "modules" / "lib").glob("*.sh")}
     agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -170,8 +174,9 @@ def check_helpers() -> None:
     for name in sorted(pinned - on_disk):
         problems.append(f"HELPER_CHECKSUMS lists missing file {name}")
     for name in sorted(on_disk):
-        if name.split("/")[-1] not in agents:
-            problems.append(f"AGENTS.md does not mention helper {name}")
+        if not name.startswith("helpers/ubs_core/"):
+            if name.split("/")[-1] not in agents:
+                problems.append(f"AGENTS.md does not mention helper {name}")
     report("helpers", not problems, "; ".join(problems) if problems else f"{len(on_disk)} helpers pinned and documented")
 
 

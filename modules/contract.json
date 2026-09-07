@@ -1,6 +1,6 @@
 {
   "contract_version": 1,
-  "about": "Machine-readable contract of the language modules (bead A3b, 2026-09-03). Hand-maintained; scripts/check_docs_claims.py verifies every flag here against each module's argument parser, renders modules/README.md's Options block from it (scripts/gen_module_readme.py) and fails when a parser flag shared by 7+ modules is missing here. Per-module `contract` becomes 2 once the A4 port (modules/lib/ubs-common.sh + ubs_core, --files-from) lands.",
+  "about": "Machine-readable contract of the language modules (bead A3b, 2026-09-03). Hand-maintained; scripts/check_docs_claims.py verifies every flag here against each module's argument parser, renders modules/README.md's Options block from it (scripts/gen_module_readme.py) and fails when a parser flag shared by 7+ modules is missing here. Per-module `contract` is 2 for all modules following the A4 port (modules/lib/ubs-common.sh + ubs_core, --files-from).",
   "invocation": "modules/ubs-<lang>.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]",
   "formats": {
     "module": [
@@ -111,6 +111,20 @@
       "modules": "all",
       "documented": true,
       "doc": "skip category numbers (numbers differ per module)"
+    },
+    {
+      "flag": "--report-json",
+      "value": "FILE",
+      "modules": "all",
+      "documented": true,
+      "doc": "write NDJSON findings sink to FILE"
+    },
+    {
+      "flag": "--files-from",
+      "value": "FILE",
+      "modules": "all",
+      "documented": true,
+      "doc": "NUL-separated file list to scan (meta-runner contract v2 hand-off)"
     },
     {
       "flag": "--only",
@@ -225,12 +239,11 @@
         ".env",
         ".env.*"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--dump-rules",
         "--list-rules",
         "--max-samples",
-        "--report-json",
         "--rules"
       ]
     },
@@ -257,7 +270,7 @@
         ".env",
         ".env.*"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--baseline",
         "--force-color",
@@ -266,7 +279,6 @@
         "--max-file-size",
         "--max-samples",
         "--no-uv",
-        "--report-json",
         "--rules",
         "--summary-json",
         "--timeout-seconds",
@@ -277,28 +289,35 @@
       "file": "ubs-cpp.sh",
       "display": "C / C++",
       "extensions": [
-        "cpp",
+        "c",
         "cc",
+        "cpp",
         "cxx",
-        "cppm",
-        "mpp",
-        "ixx",
+        "c++",
         "h",
+        "hh",
         "hpp",
         "hxx",
-        "hh",
+        "h++",
+        "inl",
+        "tpp",
         "ipp",
-        "tpp"
+        "txx"
       ],
       "manifest_files": [
         "CMakeLists.txt",
         "Makefile",
+        "makefile",
+        "GNUmakefile",
         "meson.build",
-        "compile_commands.json",
-        ".clang-tidy",
-        ".clang-format"
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "conanfile.txt",
+        "conanfile.py",
+        "vcpkg.json"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--binary-files",
         "--counts",
@@ -309,7 +328,6 @@
         "--max-filesize",
         "--only",
         "--paths-from",
-        "--report-json",
         "--respect-gitignore",
         "--rules"
       ]
@@ -330,7 +348,7 @@
         "clippy.toml",
         "rustfmt.toml"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--binary-files",
         "--dump-rules",
@@ -368,7 +386,7 @@
         ".golangci.yml",
         ".golangci.yaml"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--allow-npx",
         "--baseline",
@@ -378,7 +396,6 @@
         "--list-rules",
         "--no-banner",
         "--only-changed",
-        "--report-json",
         "--rules",
         "--sarif-plain",
         "--strict",
@@ -402,7 +419,7 @@
         "gradlew",
         ".mvn"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--detail",
         "--dump-rules",
@@ -412,7 +429,6 @@
         "--no-build",
         "--no-emoji",
         "--only",
-        "--report-json",
         "--rules",
         "--sarif-out"
       ]
@@ -439,7 +455,7 @@
         "*.gemspec",
         ".rubocop.yml"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--ag-fixable-only",
         "--ag-preview-fix",
@@ -451,7 +467,6 @@
         "--no-bundler",
         "--only",
         "--only-rules",
-        "--report-json",
         "--rb-tools",
         "--rules",
         "--sarif-out",
@@ -480,7 +495,7 @@
         "Info.plist",
         ".swiftlint.yml"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--baseline",
         "--color",
@@ -497,7 +512,6 @@
         "--no-ignore",
         "--only",
         "--progress",
-        "--report-md",
         "--respect-ignore",
         "--rules",
         "--sdk",
@@ -521,7 +535,7 @@
         "global.json",
         "nuget.config"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--dotnet-target",
         "--dump-rules",
@@ -558,7 +572,7 @@
         "mix.exs",
         "mix.lock"
       ],
-      "contract": 1,
+      "contract": 2,
       "extra_flags": [
         "--ex-tools",
         "--json-out",

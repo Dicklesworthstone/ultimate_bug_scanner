@@ -49,16 +49,16 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='9b0ec69719c443b99ef91a4aa2f1f9c63082fa91efcaa525713baf4f6c6688d2'
-  [csharp]='f515884ec29b41d48ad56f4aea78e063097f0d54ff2934cfef4ae04629a0ca42'
-  [elixir]='aaddb98003ee456fef335e553d0b1636e4a3154c6910e10074f03701b51b7421'
-  [golang]='e535992052c037d95e980a04dbb6dc08efd9413dc5a693a824cc1adc4deec6df'
-  [java]='527d487e9411f08ac42bcd4d41820f5f768cdb68aacacaceac89a90141c3f773'
-  [js]='a6372023d118385d181c83adbb7b71a9a228e7205a71ba3eebe4ba28d4ad45b7'
-  [python]='b3f3a58d5816a0a7bc8a769cfcadd8a73734cd23cc5400e30d644ec88aa03f0d'
-  [ruby]='78fb460748d62b92ef2a9378e920f973c54eb4c8864d895069983f40250a01a3'
-  [rust]='9b7ffef10a40f750b336bce7ff0a3e43eef7a3970aa93c6af53fa59d11fbce00'
-  [swift]='6ebee17ae2277abc84164ae01a94a8a4c352c8557f0e5ba63721501f70a5a611'
+  [cpp]='70067db7762eb583dc2472472f360c39f26a38aaaade628ec13ad6ac36d2952e'
+  [csharp]='0374b815edc856b0a277e4ab03dbe85569bc2d7da361d1c814c7b300f66d8623'
+  [elixir]='23fa279137251f99164dfdfb8ac78a9180e743bec769ad7b29653de6ce8a3614'
+  [golang]='65cf144ef838729268ec329c806e0fa7ef87bdff4ca61c4a03dd20cdc4ea4fd1'
+  [java]='18a43353603a4240dca29404740fc83e938e0e41641956d4f26e62c7591cc836'
+  [js]='80d864f8838d919bf2429e66da96c0842a1bf632c1edafadee32fc15ccb8f4c9'
+  [python]='de335ecbfb9e9465c59a10c252a939e954b0238d0fd595f5de7457e93367448a'
+  [ruby]='1e82f88b418de0da182c695312e1c1b68910bb34aa04d4236f2b61f02aadad6d'
+  [rust]='8e344dd3ad6b88eba732fce870e09e514063772d923a29dc0dce37a6af15cf3c'
+  [swift]='135035359e944ee787ca3acc6a0452fe05106e8b66e5115b2848a01db0dac626'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -491,12 +491,11 @@ now_ms(){
 }
 UBS_START_MS="$(now_ms)"
 UBS_PROFILE="${UBS_PROFILE:-0}"
-PROFILE_COPY_MS=0
 PROFILE_LIST_MS=0
 PROFILE_FANOUT_MS=0
 PROFILE_MERGE_MS=0
 profile_json(){
-  # {"total_ms","list_ms","copy_ms","fanout_ms","merge_ms","modules":{lang: wall ms},"list_modules":{lang: list ms}}
+  # {"total_ms","list_ms","fanout_ms","merge_ms","modules":{lang: wall ms},"list_modules":{lang: list ms}}
   local total=$(( $(now_ms) - UBS_START_MS ))
   local mods="" f lang ms
   for f in "$TMPDIR_RUN"/*.ms; do
@@ -513,11 +512,11 @@ profile_json(){
     list_mods="${list_mods:+$list_mods,}\"$(json_escape "$lang")\":${ms:-0}"
   done
   if [[ -n "$list_mods" ]]; then
-    printf '{"total_ms":%d,"list_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s},"list_modules":{%s}}\n' \
-      "$total" "$PROFILE_LIST_MS" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$list_mods"
+    printf '{"total_ms":%d,"list_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s},"list_modules":{%s}}\n' \
+      "$total" "$PROFILE_LIST_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$list_mods"
   else
-    printf '{"total_ms":%d,"list_ms":%d,"copy_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
-      "$total" "$PROFILE_LIST_MS" "$PROFILE_COPY_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
+    printf '{"total_ms":%d,"list_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}}\n' \
+      "$total" "$PROFILE_LIST_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods"
   fi
 }
 
@@ -1504,7 +1503,7 @@ cat <<'JSON'
     {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
     {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Per-module timeout (default 300)."},
     {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
-    {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, list_ms, copy_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
+    {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, list_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
     {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables). Measured over the listed files: binary/media/archive/data files and files above UBS_MAX_FILE_MB are not counted or copied."},
     {"name": "UBS_MAX_FILE_MB", "value": "N", "description": "Leave files above N MB out of whole-project scans (default 8; 0 disables)."},
@@ -1627,7 +1626,7 @@ cat <<'JSON'
           "totals": {"$ref": "#/$defs/totals"},
           "git": {"type": "object", "description": "present when the project has a GitHub remote", "properties": {"repository": {"type": "string"}, "commit": {"type": "string"}, "blob_base": {"type": "string"}}, "required": ["repository"]},
           "comparison": {"type": "object"},
-          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "copy_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "copy_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "list_modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
+          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "list_modules": {"type": "object", "additionalProperties": {"type": "integer"}}}}
         },
         "additionalProperties": true
       },
@@ -2391,7 +2390,7 @@ ignore_globs_for_rg(){
 # "<kept> <bytes> <skipped_big> <skipped_data>". Needs python3.
 list_scan_files(){
   local root="$1" out="$2" raw rg_rc=0 mode="list"
-  local contract_file="${3:-}" per_lang_dir="${4:-}" only_langs="${5:-}" exclude_langs="${6:-}"
+  local contract_file="${3:-}" per_lang_dir="${4:-}" only_langs="${5:-}" exclude_langs="${6:-}" include_ext="${7:-}"
   need_cmd python3 || return 1
   raw="$out.raw"
   if need_cmd rg; then
@@ -2407,7 +2406,7 @@ list_scan_files(){
     : > "$raw"
   fi
   local stats
-  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" "$contract_file" "$per_lang_dir" "$only_langs" "$exclude_langs" <<'PY'
+  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" "$contract_file" "$per_lang_dir" "$only_langs" "$exclude_langs" "$include_ext" <<'PY'
 import fnmatch
 import json
 import os
@@ -2424,7 +2423,22 @@ contract_path = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
 per_lang_dir = sys.argv[11] if len(sys.argv) > 11 and sys.argv[11] else ""
 only_langs_raw = sys.argv[12] if len(sys.argv) > 12 and sys.argv[12] else ""
 exclude_langs_raw = sys.argv[13] if len(sys.argv) > 13 and sys.argv[13] else ""
+include_ext_raw = sys.argv[14] if len(sys.argv) > 14 and sys.argv[14] else ""
+include_ext_set = {x.strip().lstrip(".").lower() for x in include_ext_raw.split(",") if x.strip()}
 cap = max_mb * 1024 * 1024 if max_mb > 0 else 0
+
+LANG_EXT_HINTS = {
+    "py": "python", "pyi": "python", "pyw": "python", "pyx": "python", "ipynb": "python",
+    "js": "js", "jsx": "js", "mjs": "js", "cjs": "js", "ts": "js", "tsx": "js", "vue": "js", "svelte": "js",
+    "c": "cpp", "cc": "cpp", "cpp": "cpp", "cxx": "cpp", "h": "cpp", "hh": "cpp", "hpp": "cpp", "hxx": "cpp",
+    "rs": "rust",
+    "go": "golang",
+    "java": "java", "kt": "java", "kts": "java",
+    "rb": "ruby", "rake": "ruby", "erb": "ruby",
+    "swift": "swift",
+    "cs": "csharp", "csx": "csharp",
+    "ex": "elixir", "exs": "elixir", "heex": "elixir",
+}
 
 
 def ext_of(name: bytes) -> str:
@@ -2474,9 +2488,9 @@ else:
     target_langs = [l for l in all_module_langs if l not in exclude_set]
 
 
-def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict) -> bool:
+def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: str) -> bool:
     exts = spec.get("extensions", [])
-    if ext_str and ext_str in exts:
+    if ext_str and (ext_str in exts or (ext_str in include_ext_set and (LANG_EXT_HINTS.get(ext_str) == lang or (LANG_EXT_HINTS.get(ext_str) is None and lang in target_langs)))):
         return True
     manifests = spec.get("manifest_files", [])
     if manifests:
@@ -2605,7 +2619,7 @@ for rel in kept:
     is_sel = False
     for l in all_module_langs:
         spec = modules_spec.get(l, {})
-        if matches_lang(rel_str, name_str, ext_str, spec):
+        if matches_lang(rel_str, name_str, ext_str, spec, l):
             lang_files[l].append(rel)
             if l in target_langs:
                 is_sel = True
@@ -2814,7 +2828,7 @@ build_scan_file_list(){
   elif [[ -f "$MODULE_DIR/contract.json" ]]; then
     contract_file="$MODULE_DIR/contract.json"
   fi
-  if ! stats="$(list_scan_files "$SOURCE_PROJECT_DIR" "$list" "$contract_file" "$TMPDIR_RUN" "$ONLY_LANGS" "$EXCLUDE_LANGS")"; then
+  if ! stats="$(list_scan_files "$SOURCE_PROJECT_DIR" "$list" "$contract_file" "$TMPDIR_RUN" "$ONLY_LANGS" "$EXCLUDE_LANGS" "$INCLUDE_EXT")"; then
     rm -f "$list" 2>/dev/null
     return 1
   fi
@@ -3980,144 +3994,15 @@ apply_ignore_filters(){
   [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]] || return 0
   [[ -d "$SOURCE_PROJECT_DIR" ]] || return 0
 
-  # Check if all selected modules support contract v2 (bead B4c).
-  # If so, they take --files-from and scan SOURCE_PROJECT_DIR directly;
-  # no temporary workspace copy is created.
-  local -a selected_langs=()
-  read -r -a selected_langs <<<"$(select_langs)"
-  if [[ ${#selected_langs[@]} -gt 0 ]]; then
-    local all_v2=1 _sl
-    for _sl in "${selected_langs[@]}"; do
-      if ! is_module_v2 "$_sl"; then
-        all_v2=0
-        break
-      fi
-    done
-    if [[ "$all_v2" -eq 1 ]]; then
-      FILTERED_PROJECT_DIR=""
-      PROJECT_DIR="$SOURCE_PROJECT_DIR"
-      PROFILE_COPY_MS=0
-      if [[ "${QUIET:-0}" -eq 0 ]]; then
-        say "${DIM}${INFO}${RESET} All selected modules support contract v2; scanning source tree directly"
-      fi
-      return 0
-    fi
+  # All modules implement contract v2 and take --files-from (bead B4d).
+  # Whole-project scans run directly against SOURCE_PROJECT_DIR;
+  # no temporary shadow workspace is created.
+  FILTERED_PROJECT_DIR=""
+  PROJECT_DIR="$SOURCE_PROJECT_DIR"
+  if [[ "${QUIET:-0}" -eq 0 ]]; then
+    say "${DIM}${INFO}${RESET} All selected modules support contract v2; scanning source tree directly"
   fi
-
-  local dest="$TMPDIR_RUN/scan"
-  rm -rf "$dest" 2>/dev/null || true
-  ensure_dir "$dest"
-  local -a patterns
-  IFS=',' read -r -a patterns <<<"$GLOBAL_EXCLUDE_PATTERNS"
-
-  # Helper: check if destination has at least one file (copy succeeded meaningfully)
-  dest_has_files() {
-    [[ -n "$(find "$dest" -type f 2>/dev/null | head -n 1)" ]]
-  }
-
-  # File-list workspace (bead B4): copy exactly the files build_scan_file_list
-  # kept, so data directories and oversized files never reach the workspace.
-  if [[ -n "$SCAN_FILE_LIST" && -s "$SCAN_FILE_LIST" ]]; then
-    if copy_file_list "$SOURCE_PROJECT_DIR" "$SCAN_FILE_LIST" "$dest" "scan workspace"; then
-      FILTERED_PROJECT_DIR="$dest"
-      PROJECT_DIR="$FILTERED_PROJECT_DIR"
-      say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (${SCAN_LIST_COUNT} files)"
-      return 0
-    fi
-    say "${YELLOW}${WARN}${RESET} Could not copy the scan file list; copying the whole tree instead"
-    rm -rf "$dest" 2>/dev/null || true
-    ensure_dir "$dest"
-  fi
-
-  # Try rsync first (fastest and most reliable)
-  if need_cmd rsync; then
-    local -a args=(-a --delete)
-    for pat in "${patterns[@]}"; do
-      [[ -z "$pat" ]] && continue
-      args+=( "--exclude=$pat" )
-    done
-    if rsync "${args[@]}" "$SOURCE_PROJECT_DIR"/ "$dest"/ >/dev/null 2>&1 && dest_has_files; then
-      FILTERED_PROJECT_DIR="$dest"
-      PROJECT_DIR="$FILTERED_PROJECT_DIR"
-      say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR}"
-      return 0
-    fi
-    # Rsync failed or produced empty result; clean up and try next method
-    rm -rf "$dest" 2>/dev/null || true
-    ensure_dir "$dest"
-  fi
-
-  # Fallback: use tar with --exclude (commonly available on Windows via Git Bash/MSYS)
-  if need_cmd tar; then
-    local -a tar_excludes=()
-    for pat in "${patterns[@]}"; do
-      [[ -z "$pat" ]] && continue
-      tar_excludes+=( "--exclude=$pat" )
-    done
-    if (cd "$SOURCE_PROJECT_DIR" && tar cf - "${tar_excludes[@]}" . 2>/dev/null) | (cd "$dest" && tar xf - 2>/dev/null) && dest_has_files; then
-      FILTERED_PROJECT_DIR="$dest"
-      PROJECT_DIR="$FILTERED_PROJECT_DIR"
-      say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (tar fallback)"
-      return 0
-    fi
-    # Tar failed or produced empty result; clean up and try next method
-    rm -rf "$dest" 2>/dev/null || true
-    ensure_dir "$dest"
-  fi
-
-  # Python fallback (most reliable cross-platform)
-  if need_cmd python3; then
-    local patterns_json
-    patterns_json=$(printf '%s\n' "${patterns[@]}" | python3 -c "import sys, json; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))" 2>/dev/null)
-    if [[ -n "$patterns_json" ]] && python3 - "$SOURCE_PROJECT_DIR" "$dest" "$patterns_json" <<'PY' 2>/dev/null
-import sys, os, shutil, json, fnmatch, pathlib
-
-src = pathlib.Path(sys.argv[1]).resolve()
-dst = pathlib.Path(sys.argv[2]).resolve()
-patterns = json.loads(sys.argv[3])
-
-def should_exclude(rel_path, name):
-    for pat in patterns:
-        if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(name, pat):
-            return True
-        # Check path components
-        for part in pathlib.Path(rel_path).parts:
-            if fnmatch.fnmatch(part, pat):
-                return True
-    return False
-
-for root, dirs, files in os.walk(src, topdown=True):
-    root_path = pathlib.Path(root)
-    rel_root = root_path.relative_to(src)
-    dst_root = dst / rel_root
-
-    # Filter directories (modifying dirs in-place prunes traversal)
-    dirs[:] = [d for d in dirs if not should_exclude(str(rel_root / d), d)]
-
-    # Create destination directory
-    dst_root.mkdir(parents=True, exist_ok=True)
-
-    # Copy files that aren't excluded
-    for f in files:
-        rel_file = str(rel_root / f) if str(rel_root) != '.' else f
-        if not should_exclude(rel_file, f):
-            try:
-                shutil.copy2(root_path / f, dst_root / f)
-            except (OSError, shutil.Error):
-                pass  # Skip files that can't be copied
-PY
-    then
-      if dest_has_files; then
-        FILTERED_PROJECT_DIR="$dest"
-        PROJECT_DIR="$FILTERED_PROJECT_DIR"
-        say "${DIM}${INFO}${RESET} Created filtered scan workspace at ${FILTERED_PROJECT_DIR} (python fallback)"
-        return 0
-      fi
-    fi
-  fi
-
-  say "${YELLOW}${WARN}${RESET} Failed to apply ignore filters; scanning original tree"
-  rm -rf "$dest" 2>/dev/null || true
+  return 0
 }
 
 # Suggest directories worth adding to .ubsignore. Defined here next to
@@ -5112,13 +4997,7 @@ trap 'on_interrupt TERM' TERM
 COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 
 if [[ "$TARGETED_SCAN_MODE" -eq 0 ]]; then
-  _profile_t0="$(now_ms)"
   apply_ignore_filters
-  if [[ -n "$FILTERED_PROJECT_DIR" ]]; then
-    PROFILE_COPY_MS=$(( $(now_ms) - _profile_t0 ))
-  else
-    PROFILE_COPY_MS=0
-  fi
 fi
 if [[ "$SUGGEST_IGNORE" -eq 1 ]]; then
   suggest_ignore_candidates
@@ -6139,9 +6018,6 @@ postprocess_module(){
   local mode="$1" lang="$2" raw="$3" txt="$4" json="$5" sarif="$6" findings="$7" metrics="$8"
   local proj no_suppress=0; proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
   local ws="${FILTERED_PROJECT_DIR:-}"
-  if is_module_v2 "$lang"; then
-    ws=""
-  fi
   # Single-file fast path: the only source the findings can point at is the
   # target itself; without a marker there is nothing to suppress (bead C3).
   if [[ -n "${SINGLE_FILE_TARGET:-}" && -f "$SINGLE_FILE_TARGET" ]] \
@@ -6181,10 +6057,8 @@ legacy_postprocess(){
   local is_v2=0
   is_module_v2 "$lang" && is_v2=1
   if [[ "$mode" == "json" ]]; then
-    if [[ "$is_v2" -eq 0 ]]; then
-      restore_original_paths "$json"
-      [[ -s "$findings" ]] && restore_original_paths "$findings"
-    fi
+    restore_original_paths "$json"
+    [[ -s "$findings" ]] && restore_original_paths "$findings"
     if need_cmd jq && jq -e 'type=="object" and (.files|type)=="number" and (.critical|type)=="number" and (.warning|type)=="number" and (.info|type)=="number"' "$json" >/dev/null 2>&1; then
       jq --arg language "$lang" '. + {language: $language}' "$json" > "$json.tmp" && mv "$json.tmp" "$json"
       attach_metrics_to_json "$json" "$metrics"
@@ -6299,8 +6173,8 @@ run_lang(){
   if is_module_v2 "$lang" "$module"; then
     if [[ -f "$TMPDIR_RUN/$lang.files" ]]; then
       args+=("--files-from=$TMPDIR_RUN/$lang.files")
+      lang_proj_dir="$SOURCE_PROJECT_DIR"
     fi
-    lang_proj_dir="$SOURCE_PROJECT_DIR"
   fi
   args+=("$lang_proj_dir")
 
@@ -7110,7 +6984,7 @@ case "$FORMAT" in
             say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
           if [[ "$UBS_PROFILE" == "1" ]]; then
-            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", copy " + (.copy_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")"')"
+            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")"')"
           fi
           if [[ -n "$COMPARISON_FILE" && -f "$COMPARISON_FILE" ]]; then
             say "$(jq -r --slurpfile base "$COMPARISON_FILE" --arg path "$COMPARISON_FILE" '

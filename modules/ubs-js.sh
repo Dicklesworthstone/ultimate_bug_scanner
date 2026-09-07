@@ -278,6 +278,7 @@ Env:
 Args:
   PROJECT_DIR              Directory to scan (default: ".")
   OUTPUT_FILE              File to save the report (optional)
+contract: v2
 USAGE
 }
 
@@ -298,6 +299,8 @@ while [[ $# -gt 0 ]]; do
     --list-rules) LIST_RULES=1; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --max-samples=*) MAX_JSON_SAMPLES="${1#*=}"; shift;;
+    --files-from=*) FILES_FROM="${1#*=}"; shift;;
+    --files-from)   FILES_FROM="${2:-}"; shift 2;;
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
@@ -3939,7 +3942,7 @@ run_contract_v2_js(){
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
     printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
-  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} >"$list_file"; then
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2
   fi

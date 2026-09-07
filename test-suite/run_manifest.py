@@ -211,6 +211,32 @@ def expect_schema_errors(expect: Any, label: str) -> List[str]:
                 else:
                     errors.append(f"{label}.expect.sarif.{key} is not supported")
 
+    if "rule_ids" in expect:
+        rule_ids_expect = expect["rule_ids"]
+        if not isinstance(rule_ids_expect, dict) or not rule_ids_expect:
+            errors.append(f"{label}.expect.rule_ids must be a non-empty object")
+        else:
+            for key, value in rule_ids_expect.items():
+                if key == "min":
+                    if not isinstance(value, dict) or not value:
+                        errors.append(f"{label}.expect.rule_ids.min must be a non-empty object")
+                    else:
+                        for rule_id, count in value.items():
+                            if not nonempty_string(rule_id):
+                                errors.append(
+                                    f"{label}.expect.rule_ids.min keys must be non-empty strings"
+                                )
+                            if not is_nonnegative_int(count):
+                                errors.append(
+                                    f"{label}.expect.rule_ids.min.{rule_id} must be a non-negative integer"
+                                )
+                elif key == "forbid":
+                    errors.extend(string_list_errors(value, f"{label}.expect.rule_ids.forbid"))
+                else:
+                    errors.append(f"{label}.expect.rule_ids.{key} is not supported")
+            if not rule_ids_expect.get("min") and not rule_ids_expect.get("forbid"):
+                errors.append(f"{label}.expect.rule_ids must specify non-empty 'min' or 'forbid'")
+
     return errors
 
 
@@ -491,6 +517,7 @@ def check_expectations(
     stdout: str,
     stderr: str,
     fail_on_warning: bool,
+    findings_json_path: Optional[Path] = None,
 ) -> List[str]:
     errors: List[str] = []
     derived_exit = exit_code
@@ -569,6 +596,67 @@ def check_expectations(
             for rule_id in sarif_expect.get("forbid_rule_ids", []) or []:
                 if rule_id in observed_ids:
                     errors.append(f"forbidden SARIF rule id '{rule_id}' present")
+
+    rule_ids_expect = (expect or {}).get("rule_ids")
+    if isinstance(rule_ids_expect, dict) and rule_ids_expect:
+        findings: List[Dict[str, Any]] = []
+        has_findings = False
+        if isinstance(summary, dict) and "findings" in summary and isinstance(summary["findings"], list):
+            findings = summary["findings"]
+            has_findings = True
+        elif isinstance(summary, dict) and "scanners" in summary and isinstance(summary["scanners"], list):
+            for sc in summary["scanners"]:
+                if isinstance(sc, dict) and isinstance(sc.get("findings"), list):
+                    for f in sc["findings"]:
+                        if isinstance(f, dict):
+                            findings.append(f)
+            if findings or summary.get("totals", {}).get("files", 0) > 0:
+                has_findings = True
+        elif isinstance(summary, dict) and "sarif" in summary and isinstance(summary["sarif"], dict):
+            has_findings = True
+            for rid in summary["sarif"].get("rule_ids", []):
+                findings.append({"rule_id": rid})
+        elif findings_json_path is not None and findings_json_path.exists():
+            try:
+                raw_f = json.loads(findings_json_path.read_text(encoding="utf-8"))
+                if isinstance(raw_f, list):
+                    findings = raw_f
+                    has_findings = True
+                elif isinstance(raw_f, dict) and isinstance(raw_f.get("findings"), list):
+                    findings = raw_f["findings"]
+                    has_findings = True
+            except json.JSONDecodeError:
+                pass
+
+        if not has_findings:
+            errors.append(
+                "expect.rule_ids set but output did not contain per-finding records (run with --format=json)"
+            )
+        else:
+            rule_counts: Dict[str, int] = {}
+            for f in findings:
+                if not isinstance(f, dict):
+                    continue
+                if f.get("suppressed") is True:
+                    continue
+                rid = f.get("rule_id") or f.get("ruleId") or f.get("id")
+                if rid and isinstance(rid, str):
+                    rule_counts[rid] = rule_counts.get(rid, 0) + 1
+
+            min_expect = rule_ids_expect.get("min", {})
+            if isinstance(min_expect, dict):
+                for rule_id, min_count in min_expect.items():
+                    observed = rule_counts.get(rule_id, 0)
+                    if observed < min_count:
+                        errors.append(f"rule_id '{rule_id}' count {observed} < min {min_count}")
+
+            forbid_expect = rule_ids_expect.get("forbid", [])
+            if isinstance(forbid_expect, list):
+                for rule_id in forbid_expect:
+                    observed = rule_counts.get(rule_id, 0)
+                    if observed > 0:
+                        errors.append(f"forbidden rule_id '{rule_id}' present")
+
     return errors
 
 
@@ -811,6 +899,7 @@ def main() -> None:
             proc.stdout,
             proc.stderr,
             fail_on_warning,
+            findings_json_path,
         )
         if findings_json_path is not None:
             errors.extend(findings_json_errors(findings_json_path))

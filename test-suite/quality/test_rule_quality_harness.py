@@ -567,6 +567,45 @@ class RunManifestExpectationTest(unittest.TestCase):
         )
         self.assertIn("case js-schema-valid.bin_shims.ast-grep must be script text", errors)
 
+    def test_manifest_schema_accepts_rule_ids_expectations(self) -> None:
+        case = self.minimal_manifest_case()
+        case["expect"] = {
+            "exit_code": "nonzero",
+            "rule_ids": {
+                "min": {"py.security.sql-injection": 1, "py.security.command-injection": 2},
+                "forbid": ["py.security.hardcoded-secrets"],
+            },
+        }
+        errors = rule_quality_harness.manifest_schema_errors({"cases": [case]})
+        self.assertEqual(errors, [])
+
+    def test_manifest_schema_rejects_invalid_rule_ids_expectations(self) -> None:
+        case = self.minimal_manifest_case()
+        case["expect"] = {
+            "rule_ids": {
+                "min": "not-a-dict",
+                "forbid": "not-a-list",
+                "unsupported_key": 123,
+            }
+        }
+        errors = rule_quality_harness.manifest_schema_errors({"cases": [case]})
+        self.assertIn("case js-schema-valid.expect.rule_ids.min must be a non-empty object", errors)
+        self.assertIn("case js-schema-valid.expect.rule_ids.forbid must be a list of strings", errors)
+        self.assertIn("case js-schema-valid.expect.rule_ids.unsupported_key is not supported", errors)
+
+        case["expect"] = {
+            "rule_ids": {
+                "min": {"valid.rule": -1, "": 1},
+            }
+        }
+        errors = rule_quality_harness.manifest_schema_errors({"cases": [case]})
+        self.assertIn("case js-schema-valid.expect.rule_ids.min keys must be non-empty strings", errors)
+        self.assertIn("case js-schema-valid.expect.rule_ids.min.valid.rule must be a non-negative integer", errors)
+
+        case["expect"] = {"rule_ids": {}}
+        errors = rule_quality_harness.manifest_schema_errors({"cases": [case]})
+        self.assertIn("case js-schema-valid.expect.rule_ids must be a non-empty object", errors)
+
     def test_extract_json_summary_skips_jsonl_findings(self) -> None:
         stdout = "\n".join(
             [

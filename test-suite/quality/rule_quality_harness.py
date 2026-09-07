@@ -647,10 +647,20 @@ def expectation_strength_scopes_from_runtime(
             expect = case.get("expect", {})
             totals = expect.get("totals", {})
             reasons: list[str] = []
-            if side == "buggy" and not expect.get("require_substrings"):
+            has_required = (
+                bool(expect.get("require_substrings"))
+                or bool(expect.get("rule_ids", {}).get("min"))
+                or bool(expect.get("sarif", {}).get("require_rule_ids"))
+            )
+            has_forbidden = (
+                bool(expect.get("forbid_substrings"))
+                or bool(expect.get("rule_ids", {}).get("forbid"))
+                or bool(expect.get("sarif", {}).get("forbid_rule_ids"))
+            )
+            if side == "buggy" and not has_required:
                 reasons.append("buggy_missing_require_substrings")
             if side == "clean":
-                if not expect.get("forbid_substrings"):
+                if not has_forbidden:
                     reasons.append("clean_missing_forbid_substrings")
                 if (
                     totals.get("critical", {}).get("max") != 0
@@ -674,14 +684,22 @@ def expectation_strength_scopes_from_runtime(
                 1
                 for case in scoped_cases
                 if expectation_side(case) == "buggy"
-                and bool(case.get("expect", {}).get("require_substrings"))
+                and (
+                    bool(case.get("expect", {}).get("require_substrings"))
+                    or bool(case.get("expect", {}).get("rule_ids", {}).get("min"))
+                    or bool(case.get("expect", {}).get("sarif", {}).get("require_rule_ids"))
+                )
             ),
             "case_count": len(scoped_cases),
             "clean_cases_with_forbidden_substrings": sum(
                 1
                 for case in scoped_cases
                 if expectation_side(case) == "clean"
-                and bool(case.get("expect", {}).get("forbid_substrings"))
+                and (
+                    bool(case.get("expect", {}).get("forbid_substrings"))
+                    or bool(case.get("expect", {}).get("rule_ids", {}).get("forbid"))
+                    or bool(case.get("expect", {}).get("sarif", {}).get("forbid_rule_ids"))
+                )
             ),
             "strict_zero_clean_cases": sum(
                 1

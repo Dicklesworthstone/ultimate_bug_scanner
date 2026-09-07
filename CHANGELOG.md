@@ -10,6 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Changed
+
+- **Epic A: Engine core refactored onto contract v2 and shared ubs_core.** Removed all legacy module code paths and `UBS_LEGACY_MODULE_*` flags across all 10 language modules (`ubs-cpp.sh`, `ubs-csharp.sh`, `ubs-elixir.sh`, `ubs-golang.sh`, `ubs-java.sh`, `ubs-js.sh`, `ubs-python.sh`, `ubs-ruby.sh`, `ubs-rust.sh`, `ubs-swift.sh`). Removed over 65,000 lines of redundant code, bringing every module under 1,000 lines (e.g. `ubs-java.sh` reduced to 504 lines from 6,096 lines). All 10 modules achieve 100% pass on the contract conformance harness (`scripts/contract_conformance.py` with empty allowlist), all 472 manifest test cases pass, and all scripts pass `shellcheck -S warning`.
+
 ### Added
 
 - **Whole-project shadow copy eliminated.** All ten language modules implement contract v2 and receive per-language file lists via `--files-from` against the source tree directly. The meta-runner no longer builds a temporary shadow workspace copy for whole-project scans; `copy_file_list` is retained only for explicit multi-file targets, directory targets, and git modes (`--staged`/`--diff`). `copy_ms` has been dropped from the `profile` object (leaving `total_ms`, `list_ms`, `fanout_ms`, `merge_ms`, `modules{lang: ms}`) and the text profile summary line. Verified by `test_no_shadow_copy_for_whole_project` (scans with failing `rsync`/`tar` PATH shims succeed with identical totals and an empty shim log).

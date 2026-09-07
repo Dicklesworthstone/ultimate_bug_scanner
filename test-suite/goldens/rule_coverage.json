@@ -3,21 +3,10 @@
     "all": {
       "buggy_cases_with_required_substrings": 151,
       "case_count": 302,
-      "clean_cases_with_forbidden_substrings": 150,
-      "strict_zero_clean_cases": 150,
-      "weak_case_count": 1,
-      "weak_cases": [
-        {
-          "id": "python-taint-clean",
-          "language": "python",
-          "path": "test-suite/python/clean/taint_analysis.py",
-          "reasons": [
-            "clean_missing_forbid_substrings",
-            "clean_not_strict_zero_critical_warning"
-          ],
-          "side": "clean"
-        }
-      ]
+      "clean_cases_with_forbidden_substrings": 151,
+      "strict_zero_clean_cases": 151,
+      "weak_case_count": 0,
+      "weak_cases": []
     },
     "campaign": {
       "buggy_cases_with_required_substrings": 97,
@@ -118,9 +107,9 @@
     },
     "python": {
       "buggy_cases_with_required_substrings": 36,
-      "clean_cases_with_forbidden_substrings": 35,
+      "clean_cases_with_forbidden_substrings": 36,
       "security_pairs": 36,
-      "strict_zero_clean_cases": 35
+      "strict_zero_clean_cases": 36
     },
     "ruby": {
       "buggy_cases_with_required_substrings": 7,
@@ -2755,9 +2744,9 @@
       "buggy_path": "test-suite/python/buggy/taint_analysis.py",
       "buggy_require_count": 1,
       "clean_case": "python-taint-clean",
-      "clean_forbid_count": 0,
+      "clean_forbid_count": 3,
       "clean_max_critical": 0,
-      "clean_max_warning": 2,
+      "clean_max_warning": 0,
       "clean_path": "test-suite/python/clean/taint_analysis.py",
       "language": "python",
       "slug": "taint"

@@ -1516,9 +1516,14 @@
             "max": 0
           },
           "warning": {
-            "max": 2
+            "max": 0
           }
-        }
+        },
+        "forbid_substrings": [
+          "Unsanitized data flows to HTML response sinks",
+          "Interpolated SQL reaches execution sink",
+          "User-controlled command reaches shell or executable selection"
+        ]
       }
     },
     {

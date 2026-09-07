@@ -20,7 +20,7 @@ def search_user():
 
 def run_ls():
     path = shlex.quote(request.args.get('path', '.'))
-    subprocess.run(['ls', path], check=False)
+    subprocess.run(['ls', path], check=False, timeout=5)
 
 @app.route('/exec')
 def run_code():

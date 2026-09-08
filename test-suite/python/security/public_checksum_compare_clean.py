@@ -23,7 +23,10 @@ def prepare_public_fixture(root: Path):
 
 
 def verify_public_fixture(root: Path):
-    entry = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    try:
+        entry = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("staging manifest is not valid JSON") from exc
     payload = (root / "article.html").read_bytes()
     if entry["bytes"] != len(payload) or entry["sha256"] != hashlib.sha256(payload).hexdigest():
         raise RuntimeError("staging integrity mismatch")

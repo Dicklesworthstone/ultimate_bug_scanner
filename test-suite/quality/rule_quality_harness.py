@@ -45,6 +45,7 @@ SECURITY_COVERAGE_LANGUAGES = {
     "golang",
     "java",
     "js",
+    "kotlin",  # split out of java on 2026-09-07 (133298a); its 7 security pairs must stay counted
     "python",
     "ruby",
     "rust",

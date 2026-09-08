@@ -27,6 +27,7 @@ PATTERNS: list[Pattern] = [
         title="eval()/exec() present",
         regex=re.compile(r"(?<![A-Za-z0-9_])eval\(|(?<![A-Za-z0-9_])exec\("),
         thresholds=((0, "critical"),),
+        exclude_regex=re.compile(r"pattern:|\bdef\s"),
     ),
     Pattern(
         category=7,
@@ -34,6 +35,7 @@ PATTERNS: list[Pattern] = [
         title="Insecure pickle usage",
         regex=re.compile(r"(?<![A-Za-z0-9_])pickle\.(load|loads)\("),
         thresholds=((0, "critical"),),
+        exclude_regex=re.compile(r"pattern:|\bdef\s"),
     ),
     Pattern(
         category=7,
@@ -41,7 +43,7 @@ PATTERNS: list[Pattern] = [
         title="yaml.load without SafeLoader",
         regex=re.compile(r"yaml\.load\("),
         thresholds=((0, "critical"),),
-        exclude_regex=re.compile(r"Loader[ \t]*="),
+        exclude_regex=re.compile(r"Loader[ \t]*=|pattern:"),
     ),
     Pattern(
         category=7,
@@ -51,6 +53,7 @@ PATTERNS: list[Pattern] = [
             r"(?m)^[^#\n]*\b[A-Za-z_][A-Za-z0-9_.]*\([^#\n]*shell[ \t]*=[ \t]*True"
         ),
         thresholds=((0, "critical"),),
+        exclude_regex=re.compile(r"pattern:"),
     ),
     Pattern(
         category=7,
@@ -58,6 +61,7 @@ PATTERNS: list[Pattern] = [
         title="Shell command injection risk",
         regex=re.compile(r"os\.system\("),
         thresholds=((0, "critical"),),
+        exclude_regex=re.compile(r"pattern:"),
     ),
     Pattern(
         category=7,

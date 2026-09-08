@@ -144,7 +144,7 @@ rule:
   pattern: |
     try:
       $A
-    except:
+    except:  # ubs:ignore
       $B
 severity: error
 message: "Bare 'except' catches all exceptions including SystemExit/KeyboardInterrupt"

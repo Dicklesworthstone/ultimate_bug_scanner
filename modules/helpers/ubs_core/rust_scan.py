@@ -670,7 +670,9 @@ def _emit_guard_matches(project_dir: Path) -> Path | None:
     ast_grep = _ast_grep_bin()
     if ast_grep is None:
         return None
-    tmp = Path(tempfile.mktemp(prefix="ubs-v2-rust-guards-", suffix=".jsonl"))
+    fd, tmp_path = tempfile.mkstemp(prefix="ubs-v2-rust-guards-", suffix=".jsonl")
+    os.close(fd)
+    tmp = Path(tmp_path)
     patterns = (
         "if let Some($BIND) = $SOURCE { $BODY }",
         "if let Ok($BIND) = $SOURCE { $BODY }",

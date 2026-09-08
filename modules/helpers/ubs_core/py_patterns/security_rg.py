@@ -44,10 +44,10 @@ PATTERNS: list[Pattern] = [
         category=7,
         rule_id="py.security.yaml-load",
         title="yaml.load without SafeLoader",
-        # GH #102: only a single-argument yaml.load()/yaml.load_all() call (no
-        # Loader, keyword or positional) is a hit here. One nesting level of
-        # parentheses is allowed inside the argument (yaml.load(open(p))); a
-        # call that supplies a Loader is classified by the AST detector
+        # GH #102: only a single-argument load / load_all call (no Loader,
+        # keyword or positional) is a hit here. One nesting level of
+        # parentheses is allowed inside the argument (a stream opened inline);
+        # a call that supplies a Loader is classified by the AST detector
         # ubs_core.py_detectors.unsafe_deserialization instead.
         regex=re.compile(r"yaml\.load(?:_all)?\((?:[^(),\n]|\([^()\n]*\))*\)"),
         thresholds=((0, "critical"),),

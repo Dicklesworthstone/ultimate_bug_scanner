@@ -23,8 +23,9 @@ inside the file:
   class whose bases/constructor registrations cannot be resolved here. A
   reassuring class name never establishes safety.
 
-The no-Loader shape (``yaml.load(stream)``) stays with ``py.yaml-unsafe``
-(ast-grep pack) and ``py.security.yaml-load`` (category-7 regex).
+A call with no Loader at all (stream argument only) stays with
+``py.yaml-unsafe`` (ast-grep pack) and ``py.security.yaml-load`` (category-7
+regex).
 
 Same-file and previous-line `ubs:ignore` markers suppress a hit; hits dedupe
 per (rule, line) within a file (legacy `seen_lines`).

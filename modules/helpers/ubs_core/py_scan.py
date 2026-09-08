@@ -627,14 +627,37 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
+    all_recs: list[dict] = []
+    for f in files:
+        recs = cached_findings.get(f)
+        if recs is None and capturing_sink is not None:
+            recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+        if recs:
+            all_recs.extend(recs)
+
+    # Reconcile threshold-ladder patterns against current scan counts
+    pattern_by_id = {p.rule_id: p for p in patterns if any(min_count > 0 for min_count, _ in p.thresholds)}
+    if pattern_by_id:
+        counts_by_rule: dict[str, int] = {}
+        for r in all_recs:
+            rid = r.get("rule", "")
+            if rid in pattern_by_id:
+                counts_by_rule[rid] = counts_by_rule.get(rid, 0) + 1
+
+        filtered_recs: list[dict] = []
+        for r in all_recs:
+            rid = r.get("rule", "")
+            if rid in pattern_by_id:
+                sev = resolve_severity(pattern_by_id[rid], counts_by_rule.get(rid, 0))
+                if sev is None:
+                    continue  # Threshold not met in current file set
+                r["severity"] = sev
+            filtered_recs.append(r)
+        all_recs = filtered_recs
+
     with open(args.sink, "w", encoding="utf-8") as sink_file:
-        for f in files:
-            recs = cached_findings.get(f)
-            if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
-            if recs:
-                for r in recs:
-                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for r in all_recs:
+            sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)

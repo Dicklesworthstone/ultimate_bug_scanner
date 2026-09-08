@@ -213,6 +213,17 @@ class _UnsafeDeserializerAnalyzer(ast.NodeVisitor):
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 self.classes.setdefault(node.name, node)
+                # cls.add_constructor(...) / self.add_constructor(...) inside the
+                # class body register on this class.
+                for sub in ast.walk(node):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr in CONSTRUCTOR_REGISTRARS
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id in ('cls', 'self')
+                    ):
+                        self.registrations.setdefault(node.name, []).append(sub)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.functions.setdefault(node.name, node)
             elif isinstance(node, ast.Call):
@@ -230,6 +241,8 @@ class _UnsafeDeserializerAnalyzer(ast.NodeVisitor):
             # yaml.add_constructor(tag, fn, Loader=X) registers on X.
             loader = _keyword_value(call, 'Loader')
             return loader.id if isinstance(loader, ast.Name) else ''
+        if owner in ('cls', 'self'):
+            return ''  # attributed to the enclosing class by collect()
         return owner if isinstance(func.value, ast.Name) else ''
 
     # ── imports ─────────────────────────────────────────────────────────────

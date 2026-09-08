@@ -8,7 +8,9 @@ Python port of the runtime ast-grep rule GENERATION in modules/ubs-python.sh:
 ``generate(rule_dir, user_rules_dir=None)`` writes::
 
     <rule_dir>/rules/*.yml        the 52 base rules (byte-identical to the
-                                  legacy heredocs)
+                                  legacy heredocs, except py.yaml-unsafe,
+                                  reshaped for GH #102: single-argument
+                                  yaml.load/yaml.load_all only)
     <rule_dir>/sgconfig-python.yml  single-grammar config listing every rule
                                   file (one ``scan -c`` invocation total)
     <rule_dir>/manifest.json      rule_id -> {severity, language, file}; also

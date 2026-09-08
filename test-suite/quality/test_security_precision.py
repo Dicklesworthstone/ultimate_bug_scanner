@@ -137,6 +137,30 @@ class YamlLoaderClassificationTests(unittest.TestCase):
             [("yaml-unsafe-loader", 7), ("yaml-loader-unresolved", 8)],
         )
 
+    def test_registrations_via_alias_classmethod_and_library_constructors(self) -> None:
+        source = (
+            "import yaml as y\n"
+            "from yaml import SafeLoader\n"
+            "class A(y.SafeLoader):\n"
+            "    pass\n"
+            "y.add_constructor('tag:yaml.org,2002:python/object/apply', lambda l, n: None, Loader=A)\n"
+            "class B(y.SafeLoader):\n"
+            "    @classmethod\n"
+            "    def install(cls):\n"
+            "        cls.add_constructor('!!python/name:os.system', cls.construct_scalar)\n"
+            "class C(SafeLoader):\n"
+            "    pass\n"
+            "C.add_constructor('!pair', y.SafeLoader.construct_mapping)\n"
+            "C.add_multi_constructor('!x', SafeLoader.construct_yaml_map)\n"
+            "y.load(s, Loader=A)\n"
+            "y.load(s, Loader=B)\n"
+            "y.load(s, Loader=C)\n"
+        )
+        self.assertEqual(
+            [(rule.rsplit(".", 1)[-1], line) for rule, line, _ in unsafe_deserialization.analyze_source(source)],
+            [("yaml-unsafe-loader", 14), ("yaml-unsafe-loader", 15)],
+        )
+
     def test_legacy_pickle_loader_rule_unchanged(self) -> None:
         hits = self.hits(PY_SECURITY / "unsafe_deserialization_buggy.py")
         self.assertGreaterEqual(len(hits.get(unsafe_deserialization.RULE_ID, [])), 12)

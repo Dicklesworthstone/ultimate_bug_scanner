@@ -190,8 +190,10 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             owner = name.rsplit('.', 1)[0] if '.' in name else ''
             if name_is_sensitive(name) or name in {'hmac.new', 'hashlib.pbkdf2_hmac'} or owner == 'hmac':
                 return True
-            if short in {'digest', 'hexdigest'} and isinstance(node.func, ast.Attribute):
-                return self.digest_is_sensitive(node.func.value)
+            if short in {'digest', 'hexdigest'}:
+                if isinstance(node.func, ast.Attribute):
+                    return self.digest_is_sensitive(node.func.value)
+                return True  # bare digest(...): provenance unknown, keep reporting
             return False
         if isinstance(node, ast.BinOp):
             return self.expr_is_sensitive(node.left) or self.expr_is_sensitive(node.right)

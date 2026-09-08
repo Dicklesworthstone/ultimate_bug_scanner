@@ -4076,6 +4076,65 @@
       }
     },
     {
+      "id": "js-error-code-constants-buggy",
+      "description": "GH #102 positive controls (JS): uppercase keys, Object.freeze wrappers and E_*-shaped values do not exempt real credential literals or literal fallbacks for secret-bearing process.env variables from the hardcoded-secrets detector.",
+      "path": "test-suite/js/security/error-code-constants-buggy.mjs",
+      "language": "js",
+      "tags": [
+        "js",
+        "security",
+        "secrets",
+        "buggy"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 5
+          }
+        },
+        "require_substrings": [
+          "Possible hardcoded secrets"
+        ]
+      }
+    },
+    {
+      "id": "js-error-code-constants-clean",
+      "description": "GH #102 (JS): a public error-code dictionary (`Object.freeze({ CREDENTIALS: 'E_CREDENTIALS' })`, ERR-*/E_* enum values under credential-named keys) is diagnostic vocabulary, not secret material, and must not be reported as hardcoded secrets.",
+      "path": "test-suite/js/security/error-code-constants-clean.mjs",
+      "language": "js",
+      "tags": [
+        "js",
+        "security",
+        "secrets",
+        "clean"
+      ],
+      "args": [
+        "--only=js",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Possible hardcoded secrets"
+        ]
+      }
+    },
+    {
       "id": "js-typescript-random-security-buggy",
       "description": "TypeScript security tokens, sessions, OTPs, nonces, and invite codes should not use Math.random().",
       "path": "test-suite/js/security/random-security-buggy.ts",
@@ -9045,6 +9104,130 @@
             "max": 0
           },
           "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "python-yaml-loader-buggy",
+      "description": "GH #102 positive controls (Python): yaml.load with yaml.Loader/UnsafeLoader/FullLoader/None, a subclass of yaml.Loader with a reassuring name, and SafeLoader subclasses that register python/ tags or an eval-ing constructor stay critical; loaders imported from elsewhere, computed at runtime, or inheriting from an imported base are reported for manual review as a warning.",
+      "path": "test-suite/python/security/yaml_loader_buggy.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "security",
+        "deserialization",
+        "yaml",
+        "buggy"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 8
+          },
+          "warning": {
+            "min": 3
+          }
+        },
+        "require_substrings": [
+          "yaml.load with an unsafe Loader",
+          "yaml.load Loader not resolvable to SafeLoader",
+          "yaml.load without SafeLoader"
+        ]
+      }
+    },
+    {
+      "id": "python-yaml-loader-clean",
+      "description": "GH #102 (Python): a trivial yaml.SafeLoader subclass and a strict mapping-constructor subclass that rejects duplicate/non-string keys inherit SafeLoader's constructors; yaml.load/yaml.load_all with these, with SafeLoader/CSafeLoader/BaseLoader by keyword or position, must not be reported as unsafe YAML loading by any layer.",
+      "path": "test-suite/python/security/yaml_loader_clean.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "security",
+        "deserialization",
+        "yaml",
+        "clean"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
+            "max": 0
+          },
+          "warning": {
+            "max": 0
+          }
+        },
+        "forbid_substrings": [
+          "yaml.load with an unsafe Loader",
+          "yaml.load Loader not resolvable to SafeLoader",
+          "yaml.load without SafeLoader",
+          "py.yaml-unsafe"
+        ]
+      }
+    },
+    {
+      "id": "python-public-checksum-compare-buggy",
+      "description": "GH #102 positive controls (Python): ordinary equality authenticating a bearer secret, comparing an expected HMAC or keyed blake2 tag to a supplied one, hashing secret material, feeding a hash object a secret, or comparing a digest of unknown provenance must still trigger the constant-time comparison detector; sha256/digest/hexdigest/checksum vocabulary is not an exemption.",
+      "path": "test-suite/python/security/public_checksum_compare_buggy.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "security",
+        "constant-time",
+        "buggy"
+      ],
+      "args": [
+        "--only=python",
+        "--fail-on-warning",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 6
+          }
+        },
+        "require_substrings": [
+          "Secret, signature, or token compared with ==/!="
+        ]
+      }
+    },
+    {
+      "id": "python-public-checksum-compare-clean",
+      "description": "GH #102 (Python): an unkeyed hashlib.sha256 digest of public article bytes compared with a public staging manifest entry (direct, streamed via update(), and hashlib.new) is an integrity check, not a secret comparison. The fixture keeps the reporter's json.loads verbatim, so the unrelated json parsing warning stays visible on purpose; only the constant-time rule is asserted silent.",
+      "path": "test-suite/python/security/public_checksum_compare_clean.py",
+      "language": "python",
+      "tags": [
+        "python",
+        "security",
+        "constant-time",
+        "clean"
+      ],
+      "args": [
+        "--only=python",
+        "--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
+      ],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "critical": {
             "max": 0
           }
         },

@@ -89,7 +89,7 @@ Timing-attack vulnerable equality checks on HMAC, tokens, or hashes
 
 **Implemented:**
 - **JS / TS**: `js.security.constant-time-compare` (cases: `js-typescript-constant-time-compare-buggy`, `js-typescript-constant-time-compare-clean`)
-- **Python**: `py.security.constant-time-compare` (cases: `python-constant-time-compare-buggy`, `python-constant-time-compare-clean`)
+- **Python**: `py.security.constant-time-compare` (cases: `python-constant-time-compare-buggy`, `python-constant-time-compare-clean`, `python-public-checksum-compare-buggy`, `python-public-checksum-compare-clean`)
 - **Go**: `golang.security.constant_time_compare` (cases: `golang-constant-time-compare-buggy`, `golang-constant-time-compare-clean`)
 - **Rust**: `rust.security.constant_time_compare` (cases: `rust-constant-time-compare-buggy`, `rust-constant-time-compare-clean`)
 
@@ -146,7 +146,7 @@ CRLF injection / response header splitting from unvalidated input
 Committed API keys, JWT secrets, or insecure hardcoded fallback credentials
 
 **Implemented:**
-- **JS / TS**: `js.security.hardcoded-secrets` (cases: `js-typescript-hardcoded-secrets-buggy`, `js-typescript-hardcoded-secrets-clean`)
+- **JS / TS**: `js.security.hardcoded-secrets` (cases: `js-typescript-hardcoded-secrets-buggy`, `js-typescript-hardcoded-secrets-clean`, `js-error-code-constants-buggy`, `js-error-code-constants-clean`)
 - **Python**: `py.security.hardcoded-secrets` (cases: `python-hardcoded-secrets-buggy`, `python-hardcoded-secrets-clean`)
 - **Go**: `golang.security.hardcoded_secrets` (cases: `golang-hardcoded-secrets-buggy`, `golang-hardcoded-secrets-clean`)
 - **Rust**: `rust.security.hardcoded_secrets` (cases: `rust-hardcoded-secrets-buggy`, `rust-hardcoded-secrets-clean`)
@@ -290,7 +290,7 @@ Optional and nullability type narrowing analysis
 Deserialization of arbitrary code (pickle, YAML, marshal, etc.)
 
 **Implemented:**
-- **Python**: `py.security.deserialization` (cases: `python-unsafe-deserialization-buggy`, `python-unsafe-deserialization-clean`)
+- **Python**: `py.security.deserialization`, `py.security.yaml-unsafe-loader`, `py.security.yaml-loader-unresolved` (cases: `python-unsafe-deserialization-buggy`, `python-unsafe-deserialization-clean`, `python-yaml-loader-buggy`, `python-yaml-loader-clean`)
 - **Ruby**: `ruby.security.serialization` (cases: `ruby-serialization-buggy`, `ruby-serialization-clean`)
 
 **Planned:** JS / TS, Go, Rust, Java, C / C++, Swift, C#, Elixir

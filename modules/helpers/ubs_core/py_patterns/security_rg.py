@@ -11,8 +11,11 @@ Legacy quirks preserved:
   "path:line:code" output (the anchor can never match) — not reproduced.
 - shell=True's `^[^#]*` anchor excludes comment-led source lines the same way
   it did against rg-prefixed output.
-- yaml.load excludes lines mentioning `Loader=` (the one post-filter that
-  worked against rg output) via exclude_regex.
+- yaml.load used to exclude lines mentioning `Loader=` (the one post-filter
+  that worked against rg output). GH #102 replaced that with a regex that only
+  matches single-argument calls: a positional Loader (`yaml.load(s,
+  yaml.SafeLoader)`) is no longer a hit here, and every call that names a
+  Loader is classified by ubs_core.py_detectors.unsafe_deserialization.
 """
 from __future__ import annotations
 
@@ -39,9 +42,13 @@ PATTERNS: list[Pattern] = [
         category=7,
         rule_id="py.security.yaml-load",
         title="yaml.load without SafeLoader",
-        regex=re.compile(r"yaml\.load\("),
+        # GH #102: only a single-argument yaml.load()/yaml.load_all() call (no
+        # Loader, keyword or positional) is a hit here. One nesting level of
+        # parentheses is allowed inside the argument (yaml.load(open(p))); a
+        # call that supplies a Loader is classified by the AST detector
+        # ubs_core.py_detectors.unsafe_deserialization instead.
+        regex=re.compile(r"yaml\.load(?:_all)?\((?:[^(),\n]|\([^()\n]*\))*\)"),
         thresholds=((0, "critical"),),
-        exclude_regex=re.compile(r"Loader[ \t]*="),
     ),
     Pattern(
         category=7,

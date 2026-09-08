@@ -10,7 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixes
+
+- **Three security false positives from GH #102 (JS hardcoded secrets, Python unsafe YAML, Python constant-time compare).**
+  - `js.security.hardcoded-secrets` no longer reports SCREAMING_SNAKE identifier codes stored under credential-named keys (`Object.freeze({ CREDENTIALS: 'E_CREDENTIALS' })`, `INVALID_TOKEN: 'ERR_INVALID_TOKEN'`). The exemption applies to declaration/property/assignment literals only; a literal fallback for a secret-bearing `process.env` variable is still reported whatever its shape, and uppercase keys or `Object.freeze` wrappers around real literals still fire (`modules/helpers/ubs_core/analyzers/sec_hardcoded_secrets.py`).
+  - `py.yaml-unsafe` (ast-grep) fired on **every** `yaml.load(...)` call, `Loader=yaml.SafeLoader` included: its `not: has: pattern: Loader=$L` never matched a `keyword_argument` node. The rule now matches only single-argument `yaml.load($STREAM)` / `yaml.load_all($STREAM)`; the category-7 regex `py.security.yaml-load` matches the same shape (a positional Loader is no longer a hit). Calls that name a Loader are classified by the unsafe-deserialization detector: `Loader`/`UnsafeLoader`/`FullLoader`/`None`, subclasses of those (a reassuring name is not evidence), and SafeLoader subclasses that register `python/` tags, `construct_python_*` constructors, or constructors/methods reaching eval/exec/`__import__`/pickle are critical under the new `py.security.yaml-unsafe-loader`; loaders imported from elsewhere, computed at runtime, or with unresolvable bases/registrations are a `py.security.yaml-loader-unresolved` warning for manual review. Trivial and strict-mapping SafeLoader subclasses are clean.
+  - `python.ctcompare.secret_eq` treated any `.digest()`/`.hexdigest()` call as secret material, so a public SHA-256 manifest check (`entry["sha256"] != hashlib.sha256(payload).hexdigest()`) was a critical. An unkeyed hashlib digest of non-secret data (constructor call, or a hash object only ever fed non-secret bytes) is now an integrity check; keyed MACs (`hmac.new`, `blake2b(..., key=)`), hashes of secret material (`sha256(password)`), hash objects `update()`d with a secret, and unresolved receivers stay reported (`modules/helpers/ubs_core/analyzers/ctcompare_py.py`).
+  - Regression fixtures and manifest cases: `test-suite/js/security/error-code-constants-{buggy,clean}.mjs`, `test-suite/python/security/yaml_loader_{buggy,clean}.py`, `test-suite/python/security/public_checksum_compare_{buggy,clean}.py`; `test-suite/quality/test_security_precision.py` pins the per-line expectations and executes the checksum fixture's accept-intact/reject-modified runtime contract.
 
 ---
 

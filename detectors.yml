@@ -887,11 +887,14 @@
             "py.security.constant-time-compare"
           ],
           "fixture_pair_ids": [
-            "constant_time_compare"
+            "constant_time_compare",
+            "public_checksum_compare"
           ],
           "manifest_cases": [
             "python-constant-time-compare-buggy",
-            "python-constant-time-compare-clean"
+            "python-constant-time-compare-clean",
+            "python-public-checksum-compare-buggy",
+            "python-public-checksum-compare-clean"
           ]
         },
         "golang": {
@@ -1243,11 +1246,14 @@
             "js.security.hardcoded-secrets"
           ],
           "fixture_pair_ids": [
-            "hardcoded-secrets"
+            "hardcoded-secrets",
+            "error-code-constants"
           ],
           "manifest_cases": [
             "js-typescript-hardcoded-secrets-buggy",
-            "js-typescript-hardcoded-secrets-clean"
+            "js-typescript-hardcoded-secrets-clean",
+            "js-error-code-constants-buggy",
+            "js-error-code-constants-clean"
           ]
         },
         "python": {
@@ -1650,14 +1656,19 @@
         "python": {
           "status": "implemented",
           "rule_ids": [
-            "py.security.deserialization"
+            "py.security.deserialization",
+            "py.security.yaml-unsafe-loader",
+            "py.security.yaml-loader-unresolved"
           ],
           "fixture_pair_ids": [
-            "unsafe_deserialization"
+            "unsafe_deserialization",
+            "yaml_loader"
           ],
           "manifest_cases": [
             "python-unsafe-deserialization-buggy",
-            "python-unsafe-deserialization-clean"
+            "python-unsafe-deserialization-clean",
+            "python-yaml-loader-buggy",
+            "python-yaml-loader-clean"
           ]
         },
         "golang": {

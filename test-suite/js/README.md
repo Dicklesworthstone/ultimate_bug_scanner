@@ -35,5 +35,6 @@
 - `security/post-message-*.ts` covers TypeScript cross-origin messaging leaks from wildcard `postMessage` target origins.
 - `security/target-blank-*.tsx` covers TypeScript/React reverse-tabnabbing protection for JSX `target="_blank"` links.
 - `security/window-open-*.ts` covers TypeScript reverse-tabnabbing protection for `window.open(..., "_blank")`.
+- `security/error-code-constants-*.mjs` covers GH #102: SCREAMING_SNAKE error/enum codes under credential-named keys (`Object.freeze({ CREDENTIALS: 'E_CREDENTIALS' })`) must not be reported as hardcoded secrets, while real literals, uppercase keys, `Object.freeze` wrappers and `E_*` env fallbacks still are.
 - `resource_lifecycle/object-url-*.ts` covers TypeScript Blob/Object URL cleanup regression samples.
 - These smaller samples complement the full `test-suite/buggy` / `clean` collections and are used by the automated runner.

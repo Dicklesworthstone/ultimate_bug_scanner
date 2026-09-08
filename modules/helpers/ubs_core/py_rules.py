@@ -224,12 +224,11 @@ message: "Unpickling untrusted data is insecure; prefer safer formats"
         r'''id: py.yaml-unsafe
 language: python
 rule:
-  pattern: yaml.load($$$)
-  not:
-    has:
-      pattern: Loader=$L
+  any:
+    - pattern: yaml.load($STREAM)
+    - pattern: yaml.load_all($STREAM)
 severity: error
-message: "yaml.load without Loader=SafeLoader; prefer yaml.safe_load"
+message: "yaml.load without a Loader argument; prefer yaml.safe_load (or Loader=yaml.SafeLoader)"
 ''',
     ),
     (

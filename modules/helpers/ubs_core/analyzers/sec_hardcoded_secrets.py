@@ -12,6 +12,13 @@ logic is unchanged.
 Legacy emission: print_finding "critical" / "Possible hardcoded secrets". The
 legacy title rides in the message so the contract-v2 text renderer surfaces it
 verbatim (rule ids are not in js_rules.SUMMARY_MAP).
+
+GH #102: a literal that is itself a SCREAMING_SNAKE identifier
+(``CREDENTIALS: 'E_CREDENTIALS'``, ``INVALID_TOKEN: 'ERR_INVALID_TOKEN'``) is a
+symbolic error/enum code, not secret material. The exemption applies only to
+the declaration/property/assignment paths — a literal fallback for a
+secret-bearing ``process.env`` variable stays reported whatever its shape,
+because the code would run with that literal as the secret.
 """
 from __future__ import annotations
 
@@ -69,6 +76,12 @@ placeholder_values = {
     'not_a_secret', 'your_secret_here', 'your-api-key', 'localhost',
     '127.0.0.1', 'http://localhost', 'https://localhost', 'https://example.com',
 }
+# GH #102: SCREAMING_SNAKE (or SCREAMING-KEBAB) identifier codes such as
+# E_CREDENTIALS, ERR_INVALID_TOKEN, HTTP_401. Every segment is purely
+# alphabetic or purely numeric and at least one separator is present, so a
+# mixed-alphanumeric run (sk_live_4f8a2b91cd77e530, AKIAIOSFODNN7EXAMPLE) never
+# qualifies.
+symbolic_constant_re = re.compile(r'^[A-Z]+(?:[_-](?:[A-Z]+|[0-9]+))+$')
 
 
 def strip_line_comments(source_line: str) -> str:
@@ -171,11 +184,18 @@ def is_risky_literal(token: str) -> bool:
     return True
 
 
+def is_symbolic_constant(token: str) -> bool:
+    """True for identifier-shaped codes ('E_CREDENTIALS'), which are not secrets."""
+    return bool(symbolic_constant_re.match(unquote_literal(token).strip()))
+
+
 def first_direct_literal(expr: str) -> str:
     match = direct_literal_re.search(expr)
     if not match:
         return ""
     token = match.group(1)
+    if is_symbolic_constant(token):
+        return ""
     return token if is_risky_literal(token) else ""
 
 
@@ -350,12 +370,51 @@ def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_secrets_run_") ->
         assert TITLE in rec["message"], rec
 
 
+def _selftest_symbolic_error_codes_clean(tmp_prefix: str = "ubs_core_sec_secrets_codes_") -> None:
+    import tempfile
+
+    # GH #102: public error/enum codes shaped like identifiers are not secrets,
+    # whatever the key is called and however the object is wrapped.
+    src = "\n".join([
+        "const CODES = Object.freeze({ CREDENTIALS: 'E_CREDENTIALS' });",
+        "export const AUTH_ERRORS = { INVALID_PASSWORD: 'AUTH-INVALID-PASSWORD', TOKEN_EXPIRED: 'ERR_TOKEN_EXPIRED_401' };",
+        "let apiKeyState = 'API_KEY_MISSING';",
+        "throw new Error(CODES.CREDENTIALS);",
+        "",
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "error-codes.mjs"
+        target.write_text(src, encoding="utf-8")
+        findings = list(scan_file_findings(target))
+    assert findings == [], findings
+
+
+def _selftest_symbolic_shape_is_not_an_exemption(tmp_prefix: str = "ubs_core_sec_secrets_codes_tp_") -> None:
+    import tempfile
+
+    # GH #102 positive controls: uppercase keys, Object.freeze and an E_*
+    # value do not exempt real credential material or env fallbacks.
+    src = "\n".join([
+        "const SECRETS = Object.freeze({ API_KEY: 'sk_live_4f8a2b91cd77e530' });",
+        "const CREDENTIALS = Object.freeze({ password: 'Hunter2-Hunter2-Hunter2' });",
+        "export const jwtSecret = process.env.JWT_SECRET || 'E_JWT_SECRET';",
+        "",
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "config.mjs"
+        target.write_text(src, encoding="utf-8")
+        findings = list(scan_file_findings(target))
+    assert [line for line, _ in findings] == [1, 2, 3], findings
+
+
 SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("env-fallback-secret", _selftest_env_fallback_secret),
     ("hardcoded-assignment", _selftest_hardcoded_assignment),
     ("clean-env-required", _selftest_clean_env_required),
     ("ignore-suppression", _selftest_ignore_suppression),
     ("run-record-shape", _selftest_run_record_shape),
+    ("symbolic-error-codes-clean", _selftest_symbolic_error_codes_clean),
+    ("symbolic-shape-not-an-exemption", _selftest_symbolic_shape_is_not_an_exemption),
 )
 
 register(Analyzer(layer="regex", lang="javascript", name="sec_hardcoded_secrets", run=run, selftests=SELF_TESTS))

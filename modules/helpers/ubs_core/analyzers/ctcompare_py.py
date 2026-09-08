@@ -11,6 +11,14 @@ schema/metadata vocabulary (signature_format, credential_type, jwt_header).
 Weak terms (token, key, digest, nonce, ...) are ordinary parser/domain
 vocabulary and only become sensitive next to a security qualifier in the same
 identifier (auth_token, api_key, session_token, webhook_signature).
+
+Digest role (GH #102): ``.digest()``/``.hexdigest()`` is secret material when
+the receiver is keyed (hmac.new(...), HMAC(...), blake2b(..., key=...)) or
+hashes secret material (sha256(password)), and stays reported when the
+receiver cannot be resolved in the function. An unkeyed hashlib digest of
+non-secret bytes (``hashlib.sha256(payload).hexdigest()`` against a public
+manifest checksum) is an integrity check, not an authentication tag, and is
+not reported.
 """
 
 from __future__ import annotations
@@ -58,6 +66,16 @@ METADATA_TERMS = {
     'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
     'count', 'len', 'length',
 }
+
+# Unkeyed hashlib constructors (GH #102). ``hashlib.new`` is unkeyed too but is
+# only accepted with the explicit ``hashlib.`` owner, because a bare ``new`` may
+# be ``from hmac import new``. blake2b/blake2s become keyed MACs with ``key=``.
+UNKEYED_HASH_CTORS = {
+    'md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512',
+    'sha3_224', 'sha3_256', 'sha3_384', 'sha3_512', 'shake_128', 'shake_256',
+    'blake2b', 'blake2s',
+}
+KEYED_BLAKE_KWARGS = {'key'}
 
 def identifier_terms(text):
     text = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', text)
@@ -137,6 +155,9 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         self.path = path
         self.lines = lines
         self.sensitive_names = set()
+        # Names bound to an unkeyed hashlib object fed only non-secret data
+        # (GH #102): their .digest()/.hexdigest() is a checksum, not a tag.
+        self.unkeyed_hash_names = set()
         self.issues = []
         self.seen_lines = set()
 
@@ -167,29 +188,73 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             name = call_name(node.func)
             short = name.rsplit('.', 1)[-1]
             owner = name.rsplit('.', 1)[0] if '.' in name else ''
-            return (
-                name_is_sensitive(name)
-                or short in {'digest', 'hexdigest'}
-                or name in {'hmac.new', 'hashlib.pbkdf2_hmac'}
-                or owner == 'hmac'
-            )
+            if name_is_sensitive(name) or name in {'hmac.new', 'hashlib.pbkdf2_hmac'} or owner == 'hmac':
+                return True
+            if short in {'digest', 'hexdigest'} and isinstance(node.func, ast.Attribute):
+                return self.digest_is_sensitive(node.func.value)
+            return False
         if isinstance(node, ast.BinOp):
             return self.expr_is_sensitive(node.left) or self.expr_is_sensitive(node.right)
         if isinstance(node, ast.BoolOp):
             return any(self.expr_is_sensitive(value) for value in node.values)
         return False
 
+    def is_unkeyed_hash_ctor(self, call):
+        """hashlib.sha256(...) / sha256(...) / hashlib.new(...) without a MAC key."""
+        name = call_name(call.func)
+        owner, _, short = name.rpartition('.')
+        if owner not in ('', 'hashlib'):
+            return False
+        if short == 'new':
+            return owner == 'hashlib'
+        if short not in UNKEYED_HASH_CTORS:
+            return False
+        if short.startswith('blake2') and any(kw.arg in KEYED_BLAKE_KWARGS for kw in call.keywords):
+            return False
+        return True
+
+    def call_input_is_sensitive(self, call):
+        return any(self.expr_is_sensitive(arg) for arg in call.args) or any(
+            self.expr_is_sensitive(kw.value) for kw in call.keywords
+        )
+
+    def digest_is_sensitive(self, receiver):
+        """Role of a .digest()/.hexdigest() receiver (GH #102).
+
+        A keyed or unknown constructor, a hash over secret material, and an
+        unresolved receiver all stay secret material; only an unkeyed hashlib
+        digest of non-secret data is a plain integrity checksum.
+        """
+        if isinstance(receiver, ast.Call):
+            if self.is_unkeyed_hash_ctor(receiver):
+                return self.call_input_is_sensitive(receiver)
+            return True
+        if isinstance(receiver, ast.Name):
+            return receiver.id not in self.unkeyed_hash_names
+        return True
+
     def mark_assignment(self, names, value):
         value_sensitive = self.expr_is_sensitive(value)
+        unkeyed_hash = (
+            isinstance(value, ast.Call)
+            and self.is_unkeyed_hash_ctor(value)
+            and not self.call_input_is_sensitive(value)
+        )
         for name in names:
             if name_is_sensitive(name) or value_sensitive:
                 self.sensitive_names.add(name)
             else:
                 self.sensitive_names.discard(name)
+            if unkeyed_hash and not name_is_sensitive(name):
+                self.unkeyed_hash_names.add(name)
+            else:
+                self.unkeyed_hash_names.discard(name)
 
     def visit_FunctionDef(self, node):
         old_sensitive = set(self.sensitive_names)
+        old_unkeyed = set(self.unkeyed_hash_names)
         self.sensitive_names.clear()
+        self.unkeyed_hash_names.clear()
         for arg in list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs):
             if name_is_sensitive(arg.arg):
                 self.sensitive_names.add(arg.arg)
@@ -200,6 +265,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         for stmt in node.body:
             self.visit(stmt)
         self.sensitive_names = old_sensitive
+        self.unkeyed_hash_names = old_unkeyed
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
@@ -215,6 +281,19 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             names = target_names(node.target)
             if names:
                 self.mark_assignment(names, node.value)
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        # h = hashlib.sha256(); h.update(secret)  -> h is no longer a plain checksum.
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == 'update'
+            and isinstance(func.value, ast.Name)
+            and func.value.id in self.unkeyed_hash_names
+            and self.call_input_is_sensitive(node)
+        ):
+            self.unkeyed_hash_names.discard(func.value.id)
         self.generic_visit(node)
 
     def visit_Compare(self, node):
@@ -357,12 +436,55 @@ def _selftest_run_finds_secret_eq(tmp_prefix: str = "ubs_core_ctcompare_py_") ->
     assert findings[0]["severity"] == "critical"
 
 
+def _selftest_public_checksum_negative() -> None:
+    # GH #102: an unkeyed digest of public bytes checked against a public
+    # manifest is an integrity check, not a secret comparison.
+    code = (
+        "import hashlib\n"
+        "def verify(entry, payload):\n"
+        "    if entry['bytes'] != len(payload) or entry['sha256'] != hashlib.sha256(payload).hexdigest():\n"
+        "        raise RuntimeError('staging integrity mismatch')\n"
+        "    digest = hashlib.new('sha256', payload).hexdigest()\n"
+        "    return digest == entry['sha256']\n"
+        "def verify_streamed(entry, chunks):\n"
+        "    h = hashlib.sha256()\n"
+        "    for chunk in chunks:\n"
+        "        h.update(chunk)\n"
+        "    return h.hexdigest() != entry['sha256']\n"
+    )
+    assert not _scan_code(code), _scan_code(code)
+
+
+def _selftest_digest_role_positive() -> None:
+    # GH #102 positive controls: keyed MACs, hashes of secret material,
+    # secret-fed hash objects and unresolved receivers stay reported.
+    code = (
+        "import hashlib, hmac\n"
+        "def check_tag(key, msg, tag):\n"
+        "    return hmac.new(key, msg, 'sha256').hexdigest() == tag\n"
+        "def check_blake(key, msg, tag):\n"
+        "    return hashlib.blake2b(msg, key=key).hexdigest() == tag\n"
+        "def check_password(password, stored_hash):\n"
+        "    return hashlib.sha256(password.encode()).hexdigest() == stored_hash\n"
+        "def check_streamed(api_key, expected):\n"
+        "    h = hashlib.sha256()\n"
+        "    h.update(api_key)\n"
+        "    return h.hexdigest() == expected\n"
+        "def check_unresolved(computed, provided):\n"
+        "    return computed.hexdigest() == provided\n"
+    )
+    issues = _scan_code(code)
+    assert [line for _path, line, _code in issues] == [3, 5, 7, 11, 13], issues
+
+
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("secret_eq_positive", _selftest_secret_eq_positive),
     ("ubs_ignore_suppression", _selftest_ubs_ignore_suppression),
     ("counter_compare_negative", _selftest_counter_compare_negative),
     ("hmac_digest_positive", _selftest_hmac_digest_positive),
     ("run_finds_secret_eq", _selftest_run_finds_secret_eq),
+    ("public_checksum_negative", _selftest_public_checksum_negative),
+    ("digest_role_positive", _selftest_digest_role_positive),
 )
 
 register(Analyzer(layer="ctcompare", lang="python", name="ctcompare_py", run=run, selftests=SELF_TESTS))

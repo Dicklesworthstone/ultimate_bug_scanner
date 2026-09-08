@@ -40,7 +40,13 @@ def is_test_path(path: Path) -> bool:
     if any(part in TEST_DIR_NAMES for part in parts):
         return True
     name = path.name.lower()
-    return name.startswith('test_') or name.endswith('_test.py') or name == 'conftest.py'
+    return (
+        name.startswith('test_')
+        or name.endswith('_test.py')
+        or name == 'conftest.py'
+        or name == 'selftest.py'
+        or 'selftest' in name
+    )
 
 
 def call_name(node):
@@ -127,6 +133,8 @@ class SecurityAssertAnalyzer(ast.NodeVisitor):
         self.context_names.pop()
 
     def visit_FunctionDef(self, node):
+        if node.name.startswith(('test_', '_test', 'selftest', '_selftest')):
+            return
         self.context_names.append(node.name)
         self.generic_visit(node)
         self.context_names.pop()

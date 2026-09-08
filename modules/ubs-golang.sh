@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="ce30c96f669e7007bd4689f29bc7cab663b7edf9a3c2b4131d88dae4fca27a07"
+UBS_LIB_CHECKSUM="78a25e291c811eefe9695c1918dda47fc287874dbb1b9b6a8ff08e6e3c480be0"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -531,7 +531,12 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
     ubs_resolve_helper go_life_helper "helpers/resource_lifecycle_go.go" || go_life_helper=""
     if [[ ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
       life_raw="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-life.XXXXXX)"
-      if go run "$go_life_helper" -- "$PROJECT_DIR" >"$life_raw" 2>/dev/null; then
+      local -a life_args=()
+      if [[ -n "$list_file" && -f "$list_file" ]]; then
+        life_args+=(--files-from "$list_file")
+      fi
+      life_args+=("$PROJECT_DIR")
+      if go run "$go_life_helper" "${life_args[@]}" >"$life_raw" 2>/dev/null; then
         life_status=0
       else
         life_status=$?

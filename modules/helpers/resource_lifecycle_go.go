@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -496,11 +497,53 @@ var ignoreDirs = map[string]struct{}{
 	"bin":         {},
 }
 
+func loadUbcsIgnore(root string) ([]string, error) {
+	data, err := os.ReadFile(filepath.Join(root, ".ubsignore"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read .ubsignore: %w", err)
+	}
+	var pats []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		pats = append(pats, strings.TrimSuffix(line, "/"))
+	}
+	return pats, nil
+}
+
+func matchesAny(rel string, patterns []string) bool {
+	for _, pat := range patterns {
+		if strings.HasPrefix(rel, pat) || strings.Contains(rel, "/"+pat) || rel == pat {
+			return true
+		}
+		if matched, _ := filepath.Match(pat, rel); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(pat, filepath.Base(rel)); matched {
+			return true
+		}
+	}
+	return false
+}
+
 func collectGoFiles(root string) ([]string, error) {
+	ignores, _ := loadUbcsIgnore(root)
 	files := []string{}
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		rel, rErr := filepath.Rel(root, path)
+		if rErr == nil && len(ignores) > 0 && matchesAny(rel, ignores) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			if _, skip := ignoreDirs[d.Name()]; skip {
@@ -520,10 +563,48 @@ func collectGoFiles(root string) ([]string, error) {
 	return files, nil
 }
 
+func readFilesFrom(listPath, root string) ([]string, error) {
+	data, err := os.ReadFile(listPath)
+	if err != nil {
+		return nil, err
+	}
+	var rawEntries []string
+	if bytes.Contains(data, []byte{0}) {
+		for _, b := range bytes.Split(data, []byte{0}) {
+			if len(b) > 0 {
+				rawEntries = append(rawEntries, string(b))
+			}
+		}
+	} else {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				rawEntries = append(rawEntries, line)
+			}
+		}
+	}
+	var files []string
+	for _, entry := range rawEntries {
+		if !strings.HasSuffix(entry, ".go") {
+			continue
+		}
+		full := entry
+		if !filepath.IsAbs(full) {
+			full = filepath.Join(root, entry)
+		}
+		if st, err := os.Stat(full); err == nil && !st.IsDir() {
+			files = append(files, full)
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 func main() {
+	filesFrom := flag.String("files-from", "", "path to file containing list of Go files")
 	flag.Parse()
 	if flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: resource_lifecycle_go.go <project_dir>")
+		fmt.Fprintln(os.Stderr, "usage: resource_lifecycle_go.go [options] <project_dir>")
 		os.Exit(2)
 	}
 	root, err := filepath.Abs(flag.Arg(0))
@@ -531,7 +612,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	files, err := collectGoFiles(root)
+	var files []string
+	if *filesFrom != "" {
+		files, err = readFilesFrom(*filesFrom, root)
+	} else {
+		files, err = collectGoFiles(root)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
@@ -548,3 +634,4 @@ func main() {
 		fmt.Println(strings.Join(outputs, "\n"))
 	}
 }
+

@@ -89,14 +89,13 @@ DRIFT=0
 verify_against_tag() {
   local kind="$1" name="$2" tag_path="$3" expected="$4"
   local tag_sha
-  if ! tag_sha=$(git show "${TAG}:${tag_path}" 2>/dev/null | sha256sum | awk '{print $1}'); then
+  if ! git cat-file -e "${TAG}:${tag_path}" 2>/dev/null; then
     DRIFT=1
     DRIFT_ENTRIES+=("${kind}|${name}|${expected}|MISSING_AT_TAG")
     return
   fi
-  if [[ -z "$tag_sha" || "$tag_sha" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
-    # `git show` of a missing path can produce empty output (sha of empty
-    # string). Treat it as missing so we don't silently pass on deletions.
+  tag_sha=$(git show "${TAG}:${tag_path}" | sha256sum | awk '{print $1}')
+  if [[ -z "$tag_sha" ]]; then
     DRIFT=1
     DRIFT_ENTRIES+=("${kind}|${name}|${expected}|MISSING_AT_TAG")
     return

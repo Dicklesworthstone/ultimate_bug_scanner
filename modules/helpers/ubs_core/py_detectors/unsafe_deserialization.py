@@ -202,6 +202,14 @@ class _UnsafeDeserializerAnalyzer(ast.NodeVisitor):
 
     # ── pre-pass: classes, functions and constructor registrations ──────────
     def collect(self, tree):
+        # Imports first, so aliased registrations (import yaml as y;
+        # y.add_constructor(..., Loader=X)) resolve; visit() re-applies them
+        # idempotently.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.visit_Import(node)
+            elif isinstance(node, ast.ImportFrom):
+                self.visit_ImportFrom(node)
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
                 self.classes.setdefault(node.name, node)
@@ -375,14 +383,15 @@ class _UnsafeDeserializerAnalyzer(ast.NodeVisitor):
             # construct_python_object, construct_python_apply, ...
             return UNSAFE
         func = self.functions.get(leaf) if isinstance(node, ast.Name) else None
-        if func is None and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-            owner = node.value.id
+        if func is None and isinstance(node, ast.Attribute):
+            owner = _call_name(node.value)
             owner_cls = self.classes.get(owner)
             if owner_cls is not None:
                 func = next((n for n in owner_cls.body
                              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == leaf), None)
-            elif owner in self.modules['yaml'] or owner in self.loader_imports:
-                # yaml.SafeLoader.construct_mapping / SafeConstructor.construct_yaml_map
+            elif owner.split('.', 1)[0] in self.modules['yaml'] or owner in self.loader_imports:
+                # A PyYAML-provided constructor without "python" in its name
+                # (yaml.SafeLoader.construct_mapping, SafeLoader.construct_yaml_map).
                 return SAFE
         if func is None:
             return UNRESOLVED

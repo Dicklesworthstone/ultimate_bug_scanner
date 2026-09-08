@@ -25,6 +25,9 @@
     "UBS_SKIP_TYPE_NARROWING": "1 skips the type-narrowing helpers (also --skip-type-narrowing on ubs)",
     "UBS_AST_GREP_BIN": "explicit ast-grep binary (the meta-runner exports the verified one)",
     "UBS_MODULE_LIB_DIR": "set by the module itself: directory holding lib/ubs-common.sh next to the module",
+    "UBS_NO_CACHE": "1 disables reading and writing the Merkle-keyed incremental scan cache (also --no-cache on ubs)",
+    "UBS_CACHE_DIR": "override root directory for the Merkle-keyed incremental scan cache (also --cache-dir on ubs)",
+    "UBS_CACHE_FILE": "path where scanner writes cache metrics JSON (hits, misses, hit_rate)",
     "NO_COLOR": "disable ANSI colour (same as --no-color)"
   },
   "summary_json_keys": [

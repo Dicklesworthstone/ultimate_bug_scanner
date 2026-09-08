@@ -465,14 +465,41 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
 
-    kotlin_analyzers = [a.name for a in analyzers_for_lang("kotlin")] + ["taint_java_traversal", "taint_java_redirect"]
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=_PATTERNS,
-        analyzers=kotlin_analyzers,
+    from ubs_core.cache import CapturingSink, ScanCache
+
+    cache = ScanCache(
         lang="kotlin",
+        project_dir=args.project_dir or args.project or ".",
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"new_analyzers={args.enable_new_analyzers}",
     )
-    prefilter_res = run_prefilter(files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(files)
+
+    capturing_sink = None
+    if files_to_scan:
+        kotlin_analyzers = [a.name for a in analyzers_for_lang("kotlin")] + ["taint_java_traversal", "taint_java_redirect"]
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=_PATTERNS,
+            analyzers=kotlin_analyzers,
+            lang="kotlin",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        capturing_sink = CapturingSink()
+        scan_patterns(_PATTERNS, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        scan_analyzers(files_to_scan, capturing_sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None, prefilter=prefilter_res)
+        scan_detectors(files_to_scan, capturing_sink, skip)
+        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:
@@ -481,10 +508,17 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
-    with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(_PATTERNS, files, sink, skip, prefilter=prefilter_res)
-        scan_analyzers(files, sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None, prefilter=prefilter_res)
-        scan_detectors(files, sink, skip)
+    with open(args.sink, "w", encoding="utf-8") as sink_file:
+        for f in files:
+            recs = cached_findings.get(f)
+            if recs is None and capturing_sink is not None:
+                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+            if recs:
+                for r in recs:
+                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+    cache.write_stats(cache_file)
 
     counters = {"critical": 0, "warning": 0, "info": 0}
     records = []
@@ -511,6 +545,14 @@ def main(argv: list[str] | None = None) -> int:
             sev = rec.get("severity", "info")
             by_category[cat_id][sev] = by_category[cat_id].get(sev, 0) + 1
 
+        profile_data = {
+            "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
+            "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
+            "prefilter_ms": prefilter_res.prefilter_ms if files_to_scan else 0,
+            "cache_hits": cache.stats["hits"],
+            "cache_misses": cache.stats["misses"],
+            "cache_hit_rate": cache.stats["hit_rate"],
+        }
         summary = {
             "language": "kotlin",
             "project": args.project or args.project_dir or ".",
@@ -523,14 +565,11 @@ def main(argv: list[str] | None = None) -> int:
             "findings": records,
             "categories": by_category,
             "ast_grep_rules": len(records),
-            "extras": {},
+            "extras": {"profile": profile_data},
             "uv_tools": [],
         }
         if os.environ.get("UBS_PROFILE") == "1":
-            summary["profile"] = {
-                "files_considered": len(files),
-                "files_after_prefilter": prefilter_res.files_after_prefilter,
-            }
+            summary["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
     if args.text_out:

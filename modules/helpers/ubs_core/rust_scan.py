@@ -48,6 +48,8 @@ _CATEGORY_SLUGS: dict[int, str] = {
     24: "perf",
 }
 
+_SLUG_TO_CATEGORY: dict[str, int] = {slug: cat for cat, slug in _CATEGORY_SLUGS.items()}
+
 _CATEGORY_HEADERS: dict[int, str] = {
     1: "1. OWNERSHIP & ERROR HANDLING MACROS",
     2: "2. UNSAFE & MEMORY OPERATIONS",
@@ -332,6 +334,17 @@ class Scan:
         for hit in find(self.files, *args):
             path_str, line_no, col, code = hit[0], hit[1], hit[2], hit[3]
             path_str = str(path_str)
+            p = Path(path_str)
+            if not p.is_file() and (self.project_dir / p).is_file():
+                resolved = (self.project_dir / p).resolve()
+                matched = False
+                for f in self.files:
+                    if f.resolve() == resolved:
+                        path_str = str(f)
+                        matched = True
+                        break
+                if not matched:
+                    path_str = str(self.project_dir / p)
             # legacy: heredoc stdout -> count_lines (marker + test filter)
             if MARKER in code or self._is_test_line(path_str, int(line_no)):
                 continue
@@ -343,12 +356,13 @@ class Scan:
     def emit(self, rule_id: str, category: int, severity: str, count: int,
              title: str, hits: Sequence[Hit] | None = None,
              bucket_count: int | None = None, desc: str = "",
-             sample_limit: int = 5) -> None:
+             sample_limit: int = 0, path: str = "", line: int = 1, col: int = 1,
+             subheader: str = "") -> None:
         slug = _CATEGORY_SLUGS[category]
         if bucket_count is None:
             bucket_count = count
         self.counters[severity] += bucket_count
-        samples = [f"{h.path}:{h.line}:{h.text}" for h in (hits or [])[:sample_limit]]
+        samples = [f"{h.path}:{h.line}:{h.text}" for h in (hits or [])[:sample_limit or 5]]
         self.checks.append({
             "severity": severity,
             "count": bucket_count,
@@ -357,32 +371,48 @@ class Scan:
             "description": desc,
             "samples": samples,
         })
+        subh = subheader or _RULE_TO_SUBHEADER.get(rule_id, "")
         if hits:
             for hit in hits:
                 self.records.append({
                     "rule": rule_id,
                     "category_id": f"rust.{slug}",
+                    "category": category,
+                    "title": title,
+                    "desc": desc,
+                    "subheader": subh,
+                    "text": hit.text,
                     "path": hit.path,
                     "line": hit.line,
                     "col": hit.col,
                     "severity": severity,
                     "message": f"{title} — {hit.text.strip()[:240]}" if hit.text else title,
                     "suppressed": False,
+                    "sample_limit": sample_limit,
                 })
         else:
+            if not path and self.files:
+                path = str(self.files[0])
             self.records.append({
                 "rule": rule_id,
                 "category_id": f"rust.{slug}",
-                "path": "",
-                "line": 1,
-                "col": 1,
+                "category": category,
+                "title": title,
+                "desc": desc,
+                "subheader": subh,
+                "text": "",
+                "path": path,
+                "line": line,
+                "col": col,
                 "severity": severity,
                 "message": title,
                 "suppressed": False,
                 "count": bucket_count,
                 "title": title,
                 "category_name": _CATEGORY_NAME[category],
+                "sample_limit": sample_limit,
             })
+
 
 
 _CATEGORY_NAME = {
@@ -400,6 +430,26 @@ _CATEGORY_NAME = {
     23: "Parsing & Validation Robustness", 24: "Perf/DoS Hotspots",
 }
 
+_RULE_TO_SUBHEADER: dict[str, str] = {
+    "rust.ownership.unwrap-expect": "unwrap()/expect() usage",
+    "rust.ownership.panic-macro": "panic!/unreachable!/todo!/unimplemented!",
+    "rust.ownership.unreachable-macro": "panic!/unreachable!/todo!/unimplemented!",
+    "rust.ownership.todo-macro": "panic!/unreachable!/todo!/unimplemented!",
+    "rust.ownership.unimplemented-macro": "panic!/unreachable!/todo!/unimplemented!",
+    "rust.ownership.dbg-macro": "dbg!/println!/eprintln!",
+    "rust.ownership.println-macro": "dbg!/println!/eprintln!",
+    "rust.ownership.eprintln-macro": "dbg!/println!/eprintln!",
+    "rust.ownership.guarded-later-unwrap": "Guard clauses that still unwrap later",
+    "rust.resource-lifecycle.thread_join": "Resource lifecycle correlation",
+    "rust.resource-lifecycle.tokio_spawn": "Resource lifecycle correlation",
+    "rust.resource-lifecycle.tcp_shutdown": "Resource lifecycle correlation",
+    "rust.async-locking.std-lock-async": "std::sync lock usage inside async fn (blocking risk)",
+    "rust.async-locking.std-guard-await": "Potential std::sync guard held across await (heuristic)",
+    "rust.async-locking.tokio-guard-await": "Potential async lock guard held across await (tokio/async locks heuristic)",
+    "rust.async.tokio-task-no-await": "Async error path coverage",
+    "rust.async.spawn-handle-heuristic": "tokio::spawn usage (heuristic for detached tasks)",
+}
+
 
 def _sub(scan: Scan, r: Renderer, hits: Sequence[Hit], rule_id: str, category: int,
          severity: str, title: str, desc: str = "", sample_limit: int = 0,
@@ -407,7 +457,7 @@ def _sub(scan: Scan, r: Renderer, hits: Sequence[Hit], rule_id: str, category: i
     if hits:
         r.finding(severity, len(hits), title, desc, hits, sample_limit)
         scan.emit(rule_id, category, severity, len(hits), title, hits,
-                  desc=desc, sample_limit=max(sample_limit, 1))
+                  desc=desc, sample_limit=sample_limit or scan.detail_limit or 3)
         return len(hits)
     if good is not None:
         r.finding("good", 0, good)
@@ -421,12 +471,17 @@ class Renderer:
         self.scan = scan
         self.quiet = quiet
         self.lines: list[str] = []
+        self._emitted_headers: set[int] = set()
+        self._emitted_categories: set[int] = set()
 
     def say(self, line: str = "") -> None:
         if not self.quiet:
             self.lines.append(line)
 
     def header(self, category: int) -> None:
+        if category in self._emitted_headers:
+            return
+        self._emitted_headers.add(category)
         title = _CATEGORY_HEADERS[category]
         bar = "━" * 64
         self.say("")
@@ -435,6 +490,9 @@ class Renderer:
         self.say(f"{CYAN}{bar}{RESET}")
 
     def category(self, category: int) -> None:
+        if category in self._emitted_categories:
+            return
+        self._emitted_categories.add(category)
         detects, remediation = _CATEGORY_PRINTS[category]
         self.say("")
         self.say(f"{MAGENTA}{BOLD}▓▓▓ {detects}{RESET}")
@@ -470,6 +528,68 @@ class Renderer:
 
     def text(self) -> str:
         return "\n".join(self.lines) + ("\n" if self.lines else "")
+
+
+def replay_findings(scan: Scan, r: Renderer, cached_records: Sequence[dict]) -> None:
+    if not cached_records:
+        return
+    scan.records.extend(cached_records)
+    for rec in cached_records:
+        sev = rec.get("severity", "info")
+        scan.counters[sev] += int(rec.get("count", 1) or 1)
+
+    by_cat: dict[int, dict[tuple[str, str, str, str], list[dict]]] = {}
+    for rec in cached_records:
+        cat = rec.get("category")
+        if cat is None:
+            slug = rec.get("category_id", "").replace("rust.", "")
+            cat = _SLUG_TO_CATEGORY.get(slug, 8)
+        rule = rec.get("rule", "")
+        sev = rec.get("severity", "info")
+        title = rec.get("title")
+        if not title:
+            msg = rec.get("message", "Finding")
+            title = msg.split(" — ", 1)[0] if " — " in msg else msg
+        desc = rec.get("desc") or rec.get("description", "")
+        by_cat.setdefault(cat, {}).setdefault((rule, sev, title, desc), []).append(rec)
+
+    emitted_subheaders: set[str] = set()
+    for cat in sorted(by_cat):
+        if cat in scan.skip:
+            continue
+        if cat in _CATEGORY_HEADERS:
+            r.header(cat)
+        if cat in _CATEGORY_PRINTS:
+            r.category(cat)
+        for (rule, sev, title, desc), recs in by_cat[cat].items():
+            subh = recs[0].get("subheader") or _RULE_TO_SUBHEADER.get(rule, "")
+            if subh and subh not in emitted_subheaders:
+                r.subheader(subh)
+                emitted_subheaders.add(subh)
+            total_count = sum(int(rec.get("count", 1) or 1) for rec in recs)
+            hits: list[Hit] = []
+            for rec in recs:
+                p = rec.get("path", "")
+                if p:
+                    text = rec.get("text")
+                    if text is None:
+                        msg = rec.get("message", "")
+                        text = msg.split(" — ", 1)[1] if " — " in msg else ""
+                    hits.append(Hit(p, int(rec.get("line", 1) or 1), int(rec.get("col", 1) or 1), text or ""))
+            sample_limit = recs[0].get("sample_limit", 0)
+            if sample_limit > 0 and hits:
+                r.finding(sev, total_count, title, desc, hits, sample_limit=sample_limit)
+            else:
+                r.finding(sev, total_count, title, desc)
+            samples = [f"{h.path}:{h.line}:{h.text}" for h in hits[:5]]
+            scan.checks.append({
+                "severity": sev,
+                "count": total_count,
+                "category": _CATEGORY_NAME.get(cat, f"Category {cat}"),
+                "title": title,
+                "description": desc,
+                "samples": samples,
+            })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -666,18 +786,6 @@ def _ladder(count: int, *tiers: tuple[int, str]) -> str | None:
     return None
 
 
-def _sub(scan: Scan, r: Renderer, hits: Sequence[Hit], rule_id: str, category: int,
-         severity: str, title: str, desc: str = "", sample_limit: int = 0,
-         good: str | None = None) -> int:
-    if hits:
-        r.finding(severity, len(hits), title, desc, hits, sample_limit)
-        scan.emit(rule_id, category, severity, len(hits), title, hits)
-        return len(hits)
-    if good is not None:
-        r.finding("good", 0, good)
-    return 0
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Category flows — ubs-rust.sh 8352-9778 in legacy order
 # ─────────────────────────────────────────────────────────────────────────────
@@ -721,7 +829,8 @@ def cat_1(scan: Scan, r: Renderer, narrowing: list[Hit], narrowing_skip_note: st
             desc += f" (and {len(narrowing) - len(previews)} more)"
         r.finding("warning", len(narrowing), "Guarded Option/Result later unwrap", desc)
         scan.emit("rust.ownership.guarded-later-unwrap", 1, "warning", len(narrowing),
-                  "Guarded Option/Result later unwrap", narrowing)
+                  "Guarded Option/Result later unwrap", narrowing, desc=desc,
+                  subheader="Guard clauses that still unwrap later")
     else:
         r.finding("good", 0, "No guard/unwrap mismatches detected")
 
@@ -800,10 +909,14 @@ def cat_3(scan: Scan, r: Renderer) -> None:
     handles = scan.rg_lines(r"JoinHandle<|\.await")
     if spawn and len(handles) < len(spawn):
         diff = len(spawn) - len(handles)
-        r.finding("info", diff, "spawn without awaiting JoinHandle (heuristic)",
-                  "Ensure detached tasks handle errors appropriately")
+        desc = "Ensure detached tasks handle errors appropriately"
+        r.finding("info", diff, "spawn without awaiting JoinHandle (heuristic)", desc)
+        p = spawn[0].path if spawn else (str(scan.files[0]) if scan.files else "")
+        l = spawn[0].line if spawn else 1
+        c = spawn[0].col if spawn else 1
         scan.emit("rust.async.spawn-handle-heuristic", 3, "info", diff,
-                  "spawn without awaiting JoinHandle (heuristic)", bucket_count=diff)
+                  "spawn without awaiting JoinHandle (heuristic)", bucket_count=diff,
+                  desc=desc, path=p, line=l, col=c)
     r.subheader("Async error path coverage")
     dropped = async_error_files(scan)
     if not dropped:
@@ -1010,7 +1123,9 @@ def cat_8(scan: Scan, r: Renderer) -> None:
         r.finding("critical", len(secrets), "Possible hardcoded secrets",
                   "Use secret managers or required environment variables; do not keep literal fallbacks for secret env vars", secrets[:3], 3)
         scan.emit("rust.security.hardcoded-secrets", 8, "critical", len(secrets),
-                  "Possible hardcoded secrets", secrets)
+                  "Possible hardcoded secrets", secrets,
+                  desc="Use secret managers or required environment variables; do not keep literal fallbacks for secret env vars",
+                  sample_limit=3)
     else:
         r.finding("good", 0, "No hardcoded secrets detected")
 
@@ -1023,12 +1138,18 @@ def cat_9(scan: Scan, r: Renderer) -> None:
     note = scan.rg_lines("NOTE", ignore_case=True)
     total = len(todo) + len(fixme) + len(hack)
     breakdown = (f"TODO:{len(todo)}, FIXME:{len(fixme)}, HACK:{len(hack)}, NOTE:{len(note)}")
+    markers = todo + fixme + hack
+    p = markers[0].path if markers else (str(scan.files[0]) if scan.files else "")
+    l = markers[0].line if markers else 1
+    c = markers[0].col if markers else 1
     if total > 20:
         r.finding("warning", total, "Significant technical debt", breakdown)
-        scan.emit("rust.code-quality.tech-debt", 9, "warning", total, "Significant technical debt")
+        scan.emit("rust.code-quality.tech-debt", 9, "warning", total, "Significant technical debt",
+                  bucket_count=total, desc=breakdown, path=p, line=l, col=c)
     elif total > 0:
         r.finding("info", total, "Technical debt markers present", breakdown)
-        scan.emit("rust.code-quality.tech-debt", 9, "info", total, "Technical debt markers present")
+        scan.emit("rust.code-quality.tech-debt", 9, "info", total, "Technical debt markers present",
+                  bucket_count=total, desc=breakdown, path=p, line=l, col=c)
     else:
         r.finding("good", 0, "No TODO/FIXME/HACK markers found")
 
@@ -1060,14 +1181,15 @@ def cat_11(scan: Scan, r: Renderer) -> None:
         scan.emit("rust.tests.ignored-tests", 11, "info", len(ignored),
                   "#[ignore] tests present - verify intent", ignored)
     r.subheader("todo!/unimplemented! in tests")
-    count = _test_todo_count(scan)
+    count, p, l = _test_todo_count(scan)
     if count > 0:
         r.finding("info", count, "todo!/unimplemented! seen near #[test]")
         scan.emit("rust.tests.test-todo", 11, "info", count,
-                  "todo!/unimplemented! seen near #[test]", bucket_count=count)
+                  "todo!/unimplemented! seen near #[test]", bucket_count=count,
+                  path=p, line=l)
 
 
-def _test_todo_count(scan: Scan) -> int:
+def _test_todo_count(scan: Scan) -> tuple[int, str, int]:
     """Legacy 9259: rg '#\\[test\\]' stream -> grep -A5 -E 'todo!|unimplemented!'
     over the rg OUTPUT lines (i.e. the next 5 '#[test]' stream lines), and
     overlapping blocks count a line twice — reproduce that faithfully."""
@@ -1079,12 +1201,19 @@ def _test_todo_count(scan: Scan) -> int:
             if "#[test]" in line:
                 stream.append((path_str, line_no, line))
     total = 0
+    first_path = str(scan.files[0]) if scan.files else ""
+    first_line = 1
+    found_first = False
     for idx in range(len(stream)):
         for path_str, line_no, line in stream[idx: idx + 6]:
             if pattern.search(line):
                 if scan.stream_line_allowed(path_str, line_no, line):
+                    if not found_first:
+                        first_path = path_str
+                        first_line = line_no
+                        found_first = True
                     total += 1
-    return total
+    return total, first_path, first_line
 
 
 def cat_15(scan: Scan, r: Renderer) -> None:
@@ -1138,8 +1267,19 @@ def cat_19(scan: Scan, r: Renderer) -> None:
     if entries:
         for entry in entries:
             r.finding(entry["severity"], entry["delta"], entry["title"], entry["desc"])
-            scan.emit(f"rust.resource-lifecycle.{entry['rid']}", 19, entry["severity"],
-                      entry["delta"], entry["title"], bucket_count=entry["delta"])
+            file_path = entry.get("file", "")
+            hit = Hit(file_path, 1, 1, entry["title"]) if file_path else None
+            scan.emit(
+                f"rust.resource-lifecycle.{entry['rid']}",
+                19,
+                entry["severity"],
+                entry["delta"],
+                entry["title"],
+                hits=[hit] if hit else None,
+                bucket_count=entry["delta"],
+                desc=entry["desc"],
+                path=file_path,
+            )
     else:
         r.finding("good", 0, "All tracked resource acquisitions have matching cleanups")
 
@@ -1346,30 +1486,93 @@ def main(argv: list[str] | None = None) -> int:
 
     from ubs_core.prefilter import build_prefilter_index, run_prefilter
 
-    ast_rules_input: list[tuple[str, str]] = []
-    if args.ast_rule_dir:
-        rule_dir_path = Path(args.ast_rule_dir)
-        for rf in rule_dir_path.glob("*.yml"):
-            if rf.name.startswith(("sgconfig", "sgbase")):
-                continue
-            try:
-                text = rf.read_text(encoding="utf-8", errors="ignore")
-                id_m = re.search(r"id:\s*(\S+)", text)
-                rid = id_m.group(1) if id_m else rf.stem
-                ast_rules_input.append((rid, text))
-            except OSError:
-                pass
-    from ubs_core.rust_rules import RUN_MODE_RULES
-    for slug, pat in RUN_MODE_RULES.items():
-        ast_rules_input.append((f"rust.ast.{slug}", f"rule:\n  pattern: {json.dumps(pat)}\n"))
+    from ubs_core.cache import ScanCache
 
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=[],
-        analyzers=[],
+    original_files = list(scan.files)
+    cache = ScanCache(
         lang="rust",
+        project_dir=project_dir,
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"exclude_tests={args.exclude_tests};skip_narrowing={args.skip_type_narrowing}",
     )
-    prefilter_res = run_prefilter(scan.files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(original_files)
+
+    r = Renderer(scan, quiet=args.quiet)
+    if files_to_scan:
+        scan.files = list(files_to_scan)
+        scan.lines_map = {f: scan.lines_map[f] for f in files_to_scan if f in scan.lines_map}
+        scan.texts = {f: scan.texts[f] for f in files_to_scan if f in scan.texts}
+        ast_rules_input: list[tuple[str, str]] = []
+        if args.ast_rule_dir:
+            rule_dir_path = Path(args.ast_rule_dir)
+            for rf in rule_dir_path.glob("*.yml"):
+                if rf.name.startswith(("sgconfig", "sgbase")):
+                    continue
+                try:
+                    text = rf.read_text(encoding="utf-8", errors="ignore")
+                    id_m = re.search(r"id:\s*(\S+)", text)
+                    rid = id_m.group(1) if id_m else rf.stem
+                    ast_rules_input.append((rid, text))
+                except OSError:
+                    pass
+        from ubs_core.rust_rules import RUN_MODE_RULES
+        for slug, pat in RUN_MODE_RULES.items():
+            ast_rules_input.append((f"rust.ast.{slug}", f"rule:\n  pattern: {json.dumps(pat)}\n"))
+
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=[],
+            analyzers=[],
+            lang="rust",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
+        scan.load_ast_matches(Path(args.ast_rule_dir) if args.ast_rule_dir else None, ast_files=ast_files)
+
+        narrowing_skip_note = None
+        if args.skip_type_narrowing:
+            narrowing_skip_note = "skipped"
+        narrowing_hits: list[Hit] = []
+        try:
+            narrowing_hits = run_narrowing(scan, args.skip_type_narrowing)
+        except Exception as exc:  # legacy: helper failure -> info-0 finding
+            sys.stderr.write(f"[ubs_core.rust_scan] narrowing failed: {exc}\n")
+            narrowing_skip_note = None
+            narrowing_failed = str(exc)
+        else:
+            narrowing_failed = ""
+
+        for category in sorted(_CAT_FUNCTIONS):
+            if category in skip:
+                continue
+            if category == 1:
+                cat_1(scan, r, narrowing_hits, narrowing_skip_note)
+                if narrowing_failed:
+                    r.finding("info", 0, "Rust type narrowing helper failed", narrowing_failed)
+            else:
+                _CAT_FUNCTIONS[category](scan, r)
+
+        by_file: dict[str, list[dict]] = {}
+        for record in scan.records:
+            by_file.setdefault(record.get("path", ""), []).append(record)
+        cache.store_scanned_files(files_to_scan, by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
+
+    # Replay cached findings (for both partial and full cache hits)
+    cached_records = [rec for recs in cached_findings.values() for rec in recs]
+    if cached_records:
+        replay_findings(scan, r, cached_records)
+
+    scan.files = original_files
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:
@@ -1378,37 +1581,14 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
-    ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else scan.files
-    scan.load_ast_matches(Path(args.ast_rule_dir) if args.ast_rule_dir else None, ast_files=ast_files)
-
-    narrowing_skip_note = None
-    if args.skip_type_narrowing:
-        narrowing_skip_note = "skipped"
-    narrowing_hits: list[Hit] = []
-    try:
-        narrowing_hits = run_narrowing(scan, args.skip_type_narrowing)
-    except Exception as exc:  # legacy: helper failure -> info-0 finding
-        sys.stderr.write(f"[ubs_core.rust_scan] narrowing failed: {exc}\n")
-        narrowing_skip_note = None
-        narrowing_failed = str(exc)
-    else:
-        narrowing_failed = ""
-
-    r = Renderer(scan, quiet=args.quiet)
-    for category in sorted(_CAT_FUNCTIONS):
-        if category in skip:
-            continue
-        if category == 1:
-            cat_1(scan, r, narrowing_hits, narrowing_skip_note)
-            if narrowing_failed:
-                r.finding("info", 0, "Rust type narrowing helper failed", narrowing_failed)
-        else:
-            _CAT_FUNCTIONS[category](scan, r)
-
     # K2 sink
     with open(args.sink, "w", encoding="utf-8") as fh:
         for record in scan.records:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+    cache.write_stats(cache_file)
+
     if args.checks_out:
         Path(args.checks_out).write_text(
             json.dumps({"findings": scan.checks}, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1417,6 +1597,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.text_out:
         Path(args.text_out).write_text(r.text(), encoding="utf-8")
     if args.json_out:
+        profile_data = {
+            "files_considered": prefilter_res.files_considered if files_to_scan else len(scan.files),
+            "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
+            "prefilter_ms": prefilter_res.prefilter_ms if files_to_scan else 0,
+            "cache_hits": cache.stats["hits"],
+            "cache_misses": cache.stats["misses"],
+            "cache_hit_rate": cache.stats["hit_rate"],
+        }
         doc = {
             "language": "rust",
             "status": "ok",
@@ -1429,13 +1617,10 @@ def main(argv: list[str] | None = None) -> int:
             "format": "json",
             "version": args.version,
             "findings": scan.records,
+            "extras": {"profile": profile_data},
         }
         if os.environ.get("UBS_PROFILE") == "1":
-            doc["profile"] = {
-                "files_considered": prefilter_res.files_considered,
-                "files_after_prefilter": prefilter_res.files_after_prefilter,
-                "prefilter_ms": prefilter_res.prefilter_ms,
-            }
+            doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     exit_code = 0

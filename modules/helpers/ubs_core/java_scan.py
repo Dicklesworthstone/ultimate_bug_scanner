@@ -565,13 +565,58 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
 
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=patterns,
-        analyzers=java_analyzers,
+    from ubs_core.cache import CapturingSink, ScanCache
+
+    cache = ScanCache(
         lang="java",
+        project_dir=args.project_dir or args.project or ".",
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"new_analyzers={args.enable_new_analyzers}",
     )
-    prefilter_res = run_prefilter(files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(files)
+
+    capturing_sink = None
+    ast_ran = False
+    if files_to_scan:
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=patterns,
+            analyzers=java_analyzers,
+            lang="java",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        capturing_sink = CapturingSink()
+        scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        run_analyzers(files_to_scan, capturing_sink, skip,
+                      project_dir=Path(args.project_dir) if args.project_dir else None,
+                      enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res)
+        run_detectors(files_to_scan, capturing_sink, skip)
+        if args.ast_rule_dir:
+            from ubs_core.java_ast import scan_all
+            from ubs_core.java_rules import MARKER_SUPPRESSED_IDS, SEVERITY_MAP
+
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
+            scan_all(
+                Path(args.ast_rule_dir), ast_files, capturing_sink,
+                severity_overrides=dict(SEVERITY_MAP),
+                count_only=set(SEVERITY_MAP),
+                skip_categories=skip,
+                marker_suppressed_ids=MARKER_SUPPRESSED_IDS,
+                category_for_rule=lambda rule_id: _record_category({"rule": rule_id}),
+            )
+            ast_ran = True
+        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:
@@ -580,32 +625,17 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
-    ast_ran = False
-    with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, files, sink, skip, prefilter=prefilter_res)
-        run_analyzers(files, sink, skip,
-                      project_dir=Path(args.project_dir) if args.project_dir else None,
-                      enable_new=args.enable_new_analyzers,
-                      prefilter=prefilter_res)
-        run_detectors(files, sink, skip)
-        if args.ast_rule_dir:
-            from ubs_core.java_ast import scan_all
-            from ubs_core.java_rules import MARKER_SUPPRESSED_IDS, SEVERITY_MAP
+    with open(args.sink, "w", encoding="utf-8") as sink_file:
+        for f in files:
+            recs = cached_findings.get(f)
+            if recs is None and capturing_sink is not None:
+                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+            if recs:
+                for r in recs:
+                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-            # Legacy calibration: ONLY the resource/async/isPresent ids are
-            # counted — the rest of the pack is an informational dump.
-            # Severity comes from SEVERITY_MAP (legacy emit-group maps), and
-            # only the async ids get the parser's marker check.
-            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
-            scan_all(
-                Path(args.ast_rule_dir), ast_files, sink,
-                severity_overrides=dict(SEVERITY_MAP),
-                count_only=set(SEVERITY_MAP),
-                skip_categories=skip,
-                marker_suppressed_ids=MARKER_SUPPRESSED_IDS,
-                category_for_rule=lambda rule_id: _record_category({"rule": rule_id}),
-            )
-            ast_ran = True
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+    cache.write_stats(cache_file)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, analyzers, detectors, ast) is reflected in totals.
@@ -627,6 +657,14 @@ def main(argv: list[str] | None = None) -> int:
         records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
         import datetime
 
+        profile_data = {
+            "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
+            "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
+            "prefilter_ms": prefilter_res.prefilter_ms if files_to_scan else 0,
+            "cache_hits": cache.stats["hits"],
+            "cache_misses": cache.stats["misses"],
+            "cache_hit_rate": cache.stats["hit_rate"],
+        }
         doc = {
             "language": "java",
             "project": args.project or args.project_dir,
@@ -638,13 +676,10 @@ def main(argv: list[str] | None = None) -> int:
             "version": args.version,
             "status": "ok",
             "findings": records,
+            "extras": {"profile": profile_data},
         }
         if os.environ.get("UBS_PROFILE") == "1":
-            doc["profile"] = {
-                "files_considered": prefilter_res.files_considered,
-                "files_after_prefilter": prefilter_res.files_after_prefilter,
-                "prefilter_ms": prefilter_res.prefilter_ms,
-            }
+            doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:

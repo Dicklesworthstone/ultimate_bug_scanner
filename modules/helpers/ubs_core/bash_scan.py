@@ -577,13 +577,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     ]
 
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=all_patterns,
-        analyzers=[],
+    from ubs_core.cache import CapturingSink, ScanCache
+
+    cache = ScanCache(
         lang="bash",
+        project_dir=args.project_dir or args.project or ".",
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"no_shellcheck={args.no_shellcheck}",
     )
-    prefilter_res = run_prefilter(files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(files)
+
+    capturing_sink = None
+    if files_to_scan:
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=all_patterns,
+            analyzers=[],
+            lang="bash",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        reported_locations: set[tuple[str, int]] = set()
+        capturing_sink = CapturingSink()
+        scan_files_native(files_to_scan, capturing_sink, skip, reported_locations, prefilter=prefilter_res)
+        if args.ast_rule_dir:
+            scan_ast_rules(Path(args.ast_rule_dir), files_to_scan, capturing_sink, skip, reported_locations, prefilter=prefilter_res)
+        if not args.no_shellcheck:
+            scan_shellcheck(files_to_scan, capturing_sink, skip, reported_locations)
+        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:
@@ -592,22 +622,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         except OSError:
             pass
 
-    reported_locations: set[tuple[str, int]] = set()
+    with open(sink_path, "w", encoding="utf-8") as sink_file:
+        for f in files:
+            recs = cached_findings.get(f)
+            if recs is None and capturing_sink is not None:
+                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+            if recs:
+                for r in recs:
+                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    with open(sink_path, "w", encoding="utf-8") as sink:
-        c1 = scan_files_native(files, sink, skip, reported_locations, prefilter=prefilter_res)
-        c2 = scan_ast_rules(Path(args.ast_rule_dir), files, sink, skip, reported_locations, prefilter=prefilter_res) if args.ast_rule_dir else {}
-        c3 = scan_shellcheck(files, sink, skip, reported_locations) if not args.no_shellcheck else {}
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(sink_path)[0] + ".cache")
+    cache.write_stats(cache_file)
 
     counters = {"critical": 0, "warning": 0, "info": 0}
-    for c in (c1, c2, c3):
-        for k in counters:
-            counters[k] += c.get(k, 0)
-
     # Recount sink records to be 100% accurate
-    if sink_path.is_file():
+    if Path(sink_path).is_file():
         recount = {"critical": 0, "warning": 0, "info": 0}
-        for line in sink_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in Path(sink_path).read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
             try:
@@ -627,9 +658,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.json_out:
         records = [
             json.loads(line)
-            for line in sink_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in Path(sink_path).read_text(encoding="utf-8", errors="replace").splitlines()
             if line.strip()
         ]
+        profile_data = {
+            "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
+            "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
+            "prefilter_ms": prefilter_res.prefilter_ms if files_to_scan else 0,
+            "cache_hits": cache.stats["hits"],
+            "cache_misses": cache.stats["misses"],
+            "cache_hit_rate": cache.stats["hit_rate"],
+        }
         summary = {
             "language": "bash",
             "project": args.project or args.project_dir,
@@ -641,12 +680,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "version": args.version,
             "status": "ok",
             "findings": records,
+            "extras": {"profile": profile_data},
         }
         if os.environ.get("UBS_PROFILE") == "1":
-            summary["profile"] = {
-                "files_considered": len(files),
-                "files_after_prefilter": prefilter_res.files_after_prefilter,
-            }
+            summary["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if args.text_out:

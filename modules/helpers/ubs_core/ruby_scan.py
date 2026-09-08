@@ -582,50 +582,54 @@ def main(argv: list[str] | None = None) -> int:
 
     patterns = load_patterns()
 
-    from ubs_core.prefilter import build_prefilter_index, run_prefilter
-    from ubs_core.registry import analyzers_for_lang
-    from ubs_core.ruby_rules import _RULES
+    from ubs_core.cache import CapturingSink, ScanCache
 
-    rb_analyzers = [a.name for a in analyzers_for_lang("ruby")]
-    ast_rules_input = list(_RULES)
-    if args.ast_rule_dir:
-        rules_dir = Path(args.ast_rule_dir) / "rules"
-        if rules_dir.is_dir():
-            for rf in rules_dir.glob("*.yml"):
-                try:
-                    text = rf.read_text(encoding="utf-8", errors="ignore")
-                    id_m = re.search(r"id:\s*(\S+)", text)
-                    rid = id_m.group(1) if id_m else rf.stem
-                    ast_rules_input.append((rid, text))
-                except OSError:
-                    pass
-
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=patterns,
-        analyzers=rb_analyzers,
+    cache = ScanCache(
         lang="ruby",
+        project_dir=args.project_dir or args.project or ".",
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"new_analyzers={args.enable_new_analyzers}",
     )
-    prefilter_res = run_prefilter(files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(files)
 
-    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
-    if prefilter_file:
-        try:
-            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
-        except OSError:
-            pass
+    capturing_sink = None
+    if files_to_scan:
+        from ubs_core.ruby_rules import _RULES
+        from ubs_core.registry import analyzers_for_lang
+        from ubs_core.prefilter import build_prefilter_index, run_prefilter
+        from ubs_core import analyzers  # noqa: F401
 
-    with open(args.sink, "w", encoding="utf-8") as sink:
-        counters = scan_patterns(patterns, files, sink, skip, prefilter=prefilter_res)
-        run_detectors(files, sink, skip)
-        run_analyzers(files, sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        rb_analyzers = [a.name for a in analyzers_for_lang("ruby")]
+        ast_rules_input = list(_RULES)
+        if args.ast_rule_dir:
+            rules_dir = Path(args.ast_rule_dir) / "rules"
+            if rules_dir.is_dir():
+                for rf in rules_dir.glob("*.yml"):
+                    try:
+                        text = rf.read_text(encoding="utf-8", errors="ignore")
+                        id_m = re.search(r"id:\s*(\S+)", text)
+                        rid = id_m.group(1) if id_m else rf.stem
+                        ast_rules_input.append((rid, text))
+                    except OSError:
+                        pass
+
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=patterns,
+            analyzers=rb_analyzers,
+            lang="ruby",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        capturing_sink = CapturingSink()
+        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        run_detectors(files_to_scan, capturing_sink, skip)
+        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.ruby_ast import scan_all
             from ubs_core.ruby_rules import CATEGORY_MAP, SEVERITY_MAP
 
-            # Legacy ruby counted ONLY the cat-16 async rule into totals
-            # (run_async_error_checks); every other pack rule was a cat-18
-            # --json-out/--sarif-out passthrough with zero counter impact.
             overrides: dict[str, str] = dict(SEVERITY_MAP)
             manifest_path = Path(args.ast_rule_dir) / "manifest.json"
             if manifest_path.is_file():
@@ -636,14 +640,40 @@ def main(argv: list[str] | None = None) -> int:
                             overrides[rid] = meta["severity"]
                 except (ValueError, OSError):
                     pass
-            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
-            ast_counters = scan_all(
-                Path(args.ast_rule_dir), ast_files, sink, overrides,
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
+            scan_all(
+                Path(args.ast_rule_dir), ast_files, capturing_sink, overrides,
                 count_only=set(CATEGORY_MAP), skip_categories=None,
                 category_map=CATEGORY_MAP, skip=skip,
             )
-            for key, value in ast_counters.items():
-                counters[key] = counters.get(key, 0) + value
+        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
+    with open(args.sink, "w", encoding="utf-8") as sink_file:
+        for f in files:
+            recs = cached_findings.get(f)
+            if recs is None and capturing_sink is not None:
+                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+            if recs:
+                for r in recs:
+                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+    cache.write_stats(cache_file)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers, ast) is reflected in totals.
@@ -665,6 +695,14 @@ def main(argv: list[str] | None = None) -> int:
         records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
         import datetime
 
+        profile_data = {
+            "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
+            "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
+            "prefilter_ms": prefilter_res.prefilter_ms if files_to_scan else 0,
+            "cache_hits": cache.stats["hits"],
+            "cache_misses": cache.stats["misses"],
+            "cache_hit_rate": cache.stats["hit_rate"],
+        }
         doc = {
             "language": "ruby",
             "project": args.project or args.project_dir,
@@ -679,13 +717,10 @@ def main(argv: list[str] | None = None) -> int:
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
             "report": _legacy_report(records, args.version),
+            "extras": {"profile": profile_data},
         }
         if os.environ.get("UBS_PROFILE") == "1":
-            doc["profile"] = {
-                "files_considered": prefilter_res.files_considered,
-                "files_after_prefilter": prefilter_res.files_after_prefilter,
-                "prefilter_ms": prefilter_res.prefilter_ms,
-            }
+            doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:

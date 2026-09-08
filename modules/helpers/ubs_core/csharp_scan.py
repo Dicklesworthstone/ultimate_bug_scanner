@@ -245,14 +245,14 @@ def load_patterns() -> list:
 def _relativize(path_str: str, base_dir: Path) -> str:
     path = Path(path_str)
     if not path.is_absolute():
-        candidate = Path.cwd() / path
-        try:
-            candidate = candidate.resolve()
-        except OSError:
-            candidate = path
-        path = candidate
+        if (base_dir / path).is_file():
+            path = (base_dir / path).resolve()
+        elif (Path.cwd() / path).is_file():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
     try:
-        return str(path.resolve().relative_to(base_dir))
+        return str(path.resolve().relative_to(base_dir.resolve()))
     except (ValueError, OSError):
         return str(path)
 
@@ -540,53 +540,59 @@ def main(argv: list | None = None) -> int:
 
     patterns = load_patterns()
 
-    from ubs_core.prefilter import build_prefilter_index, run_prefilter
-    from ubs_core.registry import analyzers_for_lang
-    from ubs_core.csharp_rules import _RULES
+    from ubs_core.cache import CapturingSink, ScanCache
 
-    cs_analyzers = [a.name for a in analyzers_for_lang("csharp")]
-    ast_rules_input = list(_RULES)
-    if args.ast_rule_dir:
-        rules_dir = Path(args.ast_rule_dir)
-        for rf in rules_dir.glob("*.yml"):
-            if rf.name.startswith(("sgconfig", "sgbase")):
-                continue
-            try:
-                text = rf.read_text(encoding="utf-8", errors="ignore")
-                id_m = re.search(r"id:\s*(\S+)", text)
-                rid = id_m.group(1) if id_m else rf.stem
-                ast_rules_input.append((rid, text))
-            except OSError:
-                pass
-
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=patterns,
-        analyzers=cs_analyzers,
+    cache = ScanCache(
         lang="csharp",
+        project_dir=base_dir,
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"new_analyzers={args.enable_new_analyzers}",
     )
-    prefilter_res = run_prefilter(files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(files)
 
-    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
-    if prefilter_file:
-        try:
-            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
-        except OSError:
-            pass
-
+    capturing_sink = None
     ast_ran = False
-    with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, texts, sink, skip, phase=0, prefilter=prefilter_res)
-        run_detectors(files, sink, skip, base_dir)
-        run_analyzers(files, sink, skip, base_dir, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
-        inventory_check(texts, sink, skip, project_path, len(files))
+    if files_to_scan:
+        from ubs_core.csharp_rules import _RULES
+        from ubs_core.registry import analyzers_for_lang
+        from ubs_core.prefilter import build_prefilter_index, run_prefilter
+        from ubs_core import analyzers  # noqa: F401
+
+        cs_analyzers = [a.name for a in analyzers_for_lang("csharp")]
+        ast_rules_input = list(_RULES)
+        if args.ast_rule_dir:
+            rules_dir = Path(args.ast_rule_dir)
+            for rf in rules_dir.glob("*.yml"):
+                if rf.name.startswith(("sgconfig", "sgbase")):
+                    continue
+                try:
+                    text = rf.read_text(encoding="utf-8", errors="ignore")
+                    id_m = re.search(r"id:\s*(\S+)", text)
+                    rid = id_m.group(1) if id_m else rf.stem
+                    ast_rules_input.append((rid, text))
+                except OSError:
+                    pass
+
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=patterns,
+            analyzers=cs_analyzers,
+            lang="csharp",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        capturing_sink = CapturingSink()
+        scan_patterns(patterns, texts, capturing_sink, skip, phase=0, prefilter=prefilter_res)
+        run_detectors(files_to_scan, capturing_sink, skip, base_dir)
+        run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.csharp_ast import scan_all
             from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP
 
-            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
             scan_all(
-                Path(args.ast_rule_dir), ast_files, sink,
+                Path(args.ast_rule_dir), ast_files, capturing_sink,
                 severity_overrides=dict(SEVERITY_MAP),
                 count_only=None,  # legacy cat 17 ingested the whole pack
                 skip=skip,
@@ -595,7 +601,48 @@ def main(argv: list | None = None) -> int:
                 base_dir=base_dir,
             )
             ast_ran = True
-        scan_patterns(patterns, texts, sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)
+        scan_patterns(patterns, texts, capturing_sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)
+        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
+    inventory_records = []
+    class _InvSink:
+        def write(self, s: str):
+            if s.strip():
+                try:
+                    inventory_records.append(json.loads(s))
+                except Exception:
+                    pass
+
+    inventory_check({}, _InvSink(), skip, project_path, len(files))
+
+    with open(args.sink, "w", encoding="utf-8") as sink_file:
+        for f in files:
+            recs = cached_findings.get(f)
+            if recs is None and capturing_sink is not None:
+                recs = capturing_sink.get_for_file(f, project_dir=base_dir)
+            if recs:
+                for r in recs:
+                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for r in inventory_records:
+            sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+    cache.write_stats(cache_file)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers, inventory, ast) is counted.

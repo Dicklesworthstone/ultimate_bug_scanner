@@ -1018,55 +1018,62 @@ def main(argv: list[str] | None = None) -> int:
                       ast_available=args.ast_available)
     patterns = load_patterns()
 
-    from ubs_core.prefilter import build_prefilter_index, run_prefilter
-    from ubs_core.registry import analyzers_for_lang
-    from ubs_core.swift_rules import _RULES
+    from ubs_core.cache import CapturingSink, ScanCache
 
-    swift_analyzers = [a.name for a in analyzers_for_lang("swift")]
-    ast_rules_input = list(_RULES)
-    if args.ast_rule_dir:
-        rules_dir = Path(args.ast_rule_dir)
-        for rf in rules_dir.glob("*.yml"):
-            if rf.name.startswith(("sgconfig", "sgbase")):
-                continue
-            try:
-                text = rf.read_text(encoding="utf-8", errors="ignore")
-                id_m = re.search(r"id:\s*(\S+)", text)
-                rid = id_m.group(1) if id_m else rf.stem
-                ast_rules_input.append((rid, text))
-            except OSError:
-                pass
-
-    prefilter_index = build_prefilter_index(
-        ast_rules=ast_rules_input,
-        patterns=patterns,
-        analyzers=swift_analyzers,
+    cache = ScanCache(
         lang="swift",
+        project_dir=project_dir,
+        skip=args.skip,
+        custom_rules=args.ast_rule_dir,
+        extra=f"ast_available={args.ast_available};skip_narrowing={args.skip_type_narrowing};new_analyzers={args.enable_new_analyzers}",
     )
-    prefilter_res = run_prefilter(files, prefilter_index)
+    cached_findings, files_to_scan = cache.partition_files(files)
 
-    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
-    if prefilter_file:
-        try:
-            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
-        except OSError:
-            pass
+    capturing_sink = None
+    if files_to_scan:
+        from ubs_core.prefilter import build_prefilter_index, run_prefilter
+        from ubs_core.registry import analyzers_for_lang
+        from ubs_core.swift_rules import _RULES
 
-    with open(args.sink, "w", encoding="utf-8") as sink:
-        scan_patterns(patterns, ctx, sink, skip, prefilter=prefilter_res)
+        swift_analyzers = [a.name for a in analyzers_for_lang("swift")]
+        ast_rules_input = list(_RULES)
+        if args.ast_rule_dir:
+            rules_dir = Path(args.ast_rule_dir)
+            for rf in rules_dir.glob("*.yml"):
+                if rf.name.startswith(("sgconfig", "sgbase")):
+                    continue
+                try:
+                    text = rf.read_text(encoding="utf-8", errors="ignore")
+                    id_m = re.search(r"id:\s*(\S+)", text)
+                    rid = id_m.group(1) if id_m else rf.stem
+                    ast_rules_input.append((rid, text))
+                except OSError:
+                    pass
+
+        prefilter_index = build_prefilter_index(
+            ast_rules=ast_rules_input,
+            patterns=patterns,
+            analyzers=swift_analyzers,
+            lang="swift",
+        )
+        prefilter_res = run_prefilter(files_to_scan, prefilter_index)
+
+        scan_ctx = ScanContext(
+            files=files_to_scan,
+            project_dir=project_dir,
+            skip_narrowing=args.skip_type_narrowing,
+            ast_available=args.ast_available,
+        )
+        capturing_sink = CapturingSink()
+        scan_patterns(patterns, scan_ctx, capturing_sink, skip, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.swift_ast import scan_all
 
-            # the ast stream feeds both the rule-pack bucket records and the
-            # URLSession correlation detector (ctx.ast_records), like the
-            # legacy shared AG_STREAM_FILE
-            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files
-            scan_all(Path(args.ast_rule_dir), ast_files, ctx, sink, skip=skip,
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
+            scan_all(Path(args.ast_rule_dir), ast_files, scan_ctx, capturing_sink, skip=skip,
                      detail_limit=args.detail_limit)
-        if args.ast_available and not ctx.ast_stream_ok:
-            # legacy run_async_error_checks degradation (ast-grep present but
-            # the consolidated stream produced no output)
-            _write_record(sink, {
+        if args.ast_available and not scan_ctx.ast_stream_ok:
+            _write_record(capturing_sink, {
                 "rule": "swift.concurrency.async-rules",
                 "category": 2,
                 "severity": "info",
@@ -1076,9 +1083,37 @@ def main(argv: list[str] | None = None) -> int:
                 "description": "Concurrency summary requires ast-grep JSON stream output",
                 "degraded": True,
             }, skip)
-        run_detectors(ctx, sink, skip)   # correlation consumes ctx.ast_records
-        run_derived(ctx, sink, skip)     # process residual reads shell detector
-        run_analyzers(ctx, sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_detectors(scan_ctx, capturing_sink, skip)
+        run_derived(scan_ctx, capturing_sink, skip)
+        run_analyzers(scan_ctx, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+    else:
+        from ubs_core.prefilter import PrefilterResult
+        prefilter_res = PrefilterResult(
+            files_considered=0,
+            files_after_prefilter=0,
+            prefilter_ms=0,
+            is_bypass=False,
+        )
+
+    prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
+    if prefilter_file:
+        try:
+            Path(prefilter_file).write_text(json.dumps(prefilter_res.to_dict()), encoding="utf-8")
+        except OSError:
+            pass
+
+    with open(args.sink, "w", encoding="utf-8") as sink_file:
+        for f in files:
+            recs = cached_findings.get(f)
+            if recs is None and capturing_sink is not None:
+                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+            if recs:
+                for r in recs:
+                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+    cache.write_stats(cache_file)
 
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, derived, detectors, analyzers, ast) is reflected.
@@ -1102,6 +1137,14 @@ def main(argv: list[str] | None = None) -> int:
         import datetime
 
         records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        profile_data = {
+            "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
+            "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
+            "prefilter_ms": prefilter_res.prefilter_ms if files_to_scan else 0,
+            "cache_hits": cache.stats["hits"],
+            "cache_misses": cache.stats["misses"],
+            "cache_hit_rate": cache.stats["hit_rate"],
+        }
         doc = {
             "language": "swift",
             "project": args.project or args.project_dir,
@@ -1114,13 +1157,10 @@ def main(argv: list[str] | None = None) -> int:
             "status": "ok",
             "findings": records,
             "report": _legacy_report(records, args.version),
+            "extras": {"profile": profile_data},
         }
         if os.environ.get("UBS_PROFILE") == "1":
-            doc["profile"] = {
-                "files_considered": prefilter_res.files_considered,
-                "files_after_prefilter": prefilter_res.files_after_prefilter,
-                "prefilter_ms": prefilter_res.prefilter_ms,
-            }
+            doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:

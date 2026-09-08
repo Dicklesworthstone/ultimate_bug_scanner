@@ -211,7 +211,7 @@ def check_timeout_envelope() -> None:
     # (a green exit has to mean every requested language was scanned). The
     # Python module needs several seconds on the python fixture tree, so a 1s
     # budget times out deterministically without any module stub.
-    env = {"UBS_MODULE_TIMEOUT": "1", "UBS_MODULE_TIMEOUT_GRACE": "1"}
+    env = {"UBS_MODULE_TIMEOUT": "1", "UBS_MODULE_TIMEOUT_GRACE": "1", "UBS_NO_CACHE": "1"}
     proc = run(["--only=python", "--ci", "--format=json", str(REPO_ROOT / "test-suite" / "python")], env=env)
     ok = False
     detail = f"exit={proc.returncode}"

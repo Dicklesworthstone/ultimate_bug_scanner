@@ -55,6 +55,7 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
         p.add_argument("--rules", default=None, help="rule pack JSON")
         p.add_argument("--profile", default=None, help="profile JSON (e.g. disabled_rules)")
+        p.add_argument("--jobs", type=int, default=1, help="parallel worker count for work-stealing file shards")
         p.add_argument("--out", default="-", help="NDJSON output path ('-' = stdout)")
         return p
 
@@ -153,13 +154,32 @@ def _write_ndjson(findings_iter, out_path: str) -> int:
 
 
 def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
-    ctx = RunContext(
-        lang=args.lang,
-        files=_read_files_from(args.files_from),
-        rules=_load_json_option(args.rules),
-        profile=_load_json_option(args.profile),
-    )
-    findings = run_scan(ctx) if layer == "scan" else run_layer(layer, ctx)
+    files = _read_files_from(args.files_from)
+    jobs = getattr(args, "jobs", 1) or 1
+    rules = _load_json_option(args.rules)
+    profile = _load_json_option(args.profile)
+
+    if jobs > 1 and len(files) > 1:
+        from ubs_core.shards import run_work_stealing
+
+        def _process_shard(shard_files: list[Path]) -> list[dict]:
+            ctx = RunContext(
+                lang=args.lang,
+                files=shard_files,
+                rules=rules,
+                profile=profile,
+            )
+            return list(run_scan(ctx) if layer == "scan" else run_layer(layer, ctx))
+
+        findings = run_work_stealing(files, _process_shard, num_workers=jobs)
+    else:
+        ctx = RunContext(
+            lang=args.lang,
+            files=files,
+            rules=rules,
+            profile=profile,
+        )
+        findings = run_scan(ctx) if layer == "scan" else run_layer(layer, ctx)
     _write_ndjson(findings, args.out)
     return 0
 

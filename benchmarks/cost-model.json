@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "description": "Linear cost model coefficients per language: estimated_cost_ms = a * files + b",
+  "default": {
+    "a": 60.0,
+    "b": 1000.0
+  },
+  "coefficients": {
+    "python": {
+      "a": 180.0,
+      "b": 1500.0
+    },
+    "js": {
+      "a": 95.0,
+      "b": 1200.0
+    },
+    "bash": {
+      "a": 120.0,
+      "b": 1000.0
+    },
+    "swift": {
+      "a": 70.0,
+      "b": 1000.0
+    },
+    "golang": {
+      "a": 65.0,
+      "b": 1000.0
+    },
+    "go": {
+      "a": 65.0,
+      "b": 1000.0
+    },
+    "rust": {
+      "a": 60.0,
+      "b": 1000.0
+    },
+    "csharp": {
+      "a": 70.0,
+      "b": 1000.0
+    },
+    "java": {
+      "a": 70.0,
+      "b": 1000.0
+    },
+    "ruby": {
+      "a": 60.0,
+      "b": 1000.0
+    },
+    "cpp": {
+      "a": 60.0,
+      "b": 1000.0
+    },
+    "elixir": {
+      "a": 55.0,
+      "b": 1000.0
+    },
+    "kotlin": {
+      "a": 55.0,
+      "b": 1000.0
+    }
+  }
+}

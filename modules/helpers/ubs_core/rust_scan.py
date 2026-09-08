@@ -148,11 +148,12 @@ class Hit:
 
 class Scan:
     def __init__(self, files: Sequence[Path], project_dir: Path, exclude_tests: bool,
-                 skip: set[int], detail_limit: int) -> None:
+                 skip: set[int], detail_limit: int, jobs: int = 1) -> None:
         self.project_dir = project_dir
         self.exclude_tests = exclude_tests
         self.skip = skip
         self.detail_limit = detail_limit
+        self.jobs = max(1, int(jobs))
         self.files: list[Path] = [Path(f) for f in files]
         # Authoritative-file-set membership under BOTH spellings — the legacy
         # _ubs_allowed_key_add/_ubs_file_allowed pair also matched resolved
@@ -160,18 +161,36 @@ class Scan:
         self.allowed: set[str] = set()
         self.texts: dict[Path, str] = {}
         self.lines_map: dict[Path, list[str]] = {}
+
+        def _read_entry(p: Path) -> tuple[Path, str, list[str]]:
+            try:
+                t = p.read_text(encoding="utf-8", errors="ignore")
+                return p, t, t.splitlines()
+            except OSError:
+                return p, "", []
+
         for path in list(self.files):
             self.allowed.add(str(path))
             try:
                 self.allowed.add(str(path.resolve()))
             except OSError:
                 pass
-            try:
-                text = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            self.texts[path] = text
-            self.lines_map[path] = text.splitlines()
+
+        if self.jobs > 1 and len(self.files) > 1:
+            from ubs_core.shards import run_work_stealing
+
+            entries = run_work_stealing(self.files, lambda shard: [_read_entry(p) for p in shard], num_workers=self.jobs)
+            for p, t, lines in entries:
+                if t:
+                    self.texts[p] = t
+                    self.lines_map[p] = lines
+        else:
+            for path in list(self.files):
+                p, t, lines = _read_entry(path)
+                if t:
+                    self.texts[p] = t
+                    self.lines_map[p] = lines
+
         self.test_only: set[str] = set()
         self.boundary_cache: dict[str, int] = {}
         self.counters: Counter = Counter()
@@ -1475,12 +1494,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--files-count", type=int, default=-1,
                         help="authoritative Files-scanned count (base list, pre --exclude-tests)")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--jobs", type=int, default=1, help="parallel worker count for work-stealing file shards")
     args = parser.parse_args(argv)
 
     files = _read_files_list(args.files_from)
     project_dir = Path(args.project_dir)
     skip = {int(p) for p in args.skip.split(",") if p.strip().isdigit()}
-    scan = Scan(files, project_dir, args.exclude_tests, skip, args.detail_limit)
+    scan = Scan(files, project_dir, args.exclude_tests, skip, args.detail_limit, jobs=args.jobs)
     if args.exclude_tests:
         _apply_exclude_tests(scan)
 

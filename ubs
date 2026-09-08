@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='5c5a8e623e779280d0b4ee59535d0d320ab70202cdb0ad2b0e54db0b7ce179f5'
-  [cpp]='29768e3ef53a1d36d4aa8e2bf38289ed56ee48d200ab20d02c0c9409df17c426'
-  [csharp]='71c2922b2e03537142037ffa291c3f1180c7dd5cd9805810ac140758f80eeb6a'
-  [elixir]='d1c4cf05141ab058a70363e8fe57c54143921ef7ef1a081f6051b3b642fb2a07'
-  [golang]='1fe9f5a62998aee9ec9d1ea99fa163422a6d37f1363c31ce880b0e837296288a'
-  [java]='49f3a67f9d2a2b875210966d1b6d7717bc6acc741a9d8062279be414afabf34c'
-  [js]='bb9d8962ed5ae255b7f4b9251c259cc6bef0a4f6760fcbbcb28d522db27c937d'
-  [kotlin]='f613346dab876b945277f2c6d3d4af2923d580f8165247b74d79db5fbf4c0fc8'
-  [python]='556345b67bb01cf581276ca8e21f42531ed616ce837ca20d1071f3d1d2910d55'
-  [ruby]='7c769d79610c97282b3bd28c51e830cc29e08a59a8829a95c0f04f6519a195c7'
-  [rust]='442f8f158a2f4b168bd903e037d03205f5d626a9053212edc416d857635c525e'
-  [swift]='fececa27bf6cf28f306ef8604f1c9210608236c5c98d1c4e056767051740ced6'
+  [bash]='ae2d29c06b8e732ce0395973f998a23262b995b9b5b4becd6e4844cb02ece7c4'
+  [cpp]='d4c47305e5d86c61c6c4c69b42733e26d5bf7225e90299039b3cfff7ad9ebf70'
+  [csharp]='1526a5008f7220ec86c2729d4bab6824bd8bce1baf5c32c81bcb9f1ff5e4364b'
+  [elixir]='312a3064bb8e838c621bdb79e73af621a27a9228d639c793b5754d7f76dfc6d5'
+  [golang]='feee16e7d673fee62620d6d40e9cabdf628b87d35f12914d80870a69152776e7'
+  [java]='ac2af55a3e5b18955b5f9fca02ddd3f21cf54421536da0c5d892d6a6511291a7'
+  [js]='eda4cd857e187fd78c581ae58d7f1154e98c0311252fef201ec00523ce96b829'
+  [kotlin]='721b8e25dcbe56212e30cdabe720646a509b0180fb4a92667e7a8e1faec7bf7e'
+  [python]='05bb738a34de24f02fc3c5555e5e79d36b9d016fa513ed238cb1f649aae4576c'
+  [ruby]='e3b8304cfee97d2220f9aef44a5740a84bc16ae1999e508fa39e2e73a245f46f'
+  [rust]='5a0685fea025bc8a726041431036e00aa86fad8bd0ca096c82fe0dbe63effb77'
+  [swift]='81e750893846be6a081ab61916863c16e681936f5502b2f0af872b915af4ef86'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -79,7 +79,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_rust.py']='155095a92a5a90ef88d668a88236f7d8611ec6f94aad42615eacdbe92b21e163'
   ['helpers/type_narrowing_swift.py']='d83d064db4418d4c245e6bcf7a386280e27c0ebdc57a7c4f6c32443887d6eeea'
   ['helpers/type_narrowing_ts.js']='37cefad3c650ae04d1c5f7da42edfca3b5dea1f0c2263025bcec527111b930c9'
-  ['helpers/ubs_core/__init__.py']='6218b34afb5e19f5657abe24d432e4b4205335e3669e6a7c8baca69eb84f9b78'
+  ['helpers/ubs_core/__init__.py']='da56f2c0f546857877f7fec9854146ece87cb543b1b368efd4fd88986bf47bde'
   ['helpers/ubs_core/__main__.py']='4aed5b835f04ba3a51b13a650b15dc05e2e43436e9e8be19000551999172639e'
   ['helpers/ubs_core/analyzers/__init__.py']='090badfe6b8be4c60de495a74b362acff5a4d9f8461dbb56d5b6718783e39b86'
   ['helpers/ubs_core/analyzers/async_event_emitter.py']='eaa22abf72e33569b102b9b6425082e409f8191b8e4e0dc30a16c64d3e5edbfd'
@@ -169,7 +169,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/bash_rules.py']='b61a431da8298cb7c59e6c2858943536bb1e6308a289ee27698b119fdd7dc5f3'
   ['helpers/ubs_core/bash_scan.py']='2148f5d132083fe6ac928d3e6f21b61a2a24f48131d032d4060a0e6bc22c11d0'
   ['helpers/ubs_core/cache.py']='5218c45e221efb5c92e6427921172c106afec22372a2c61bf85741cf9bb1f15b'
-  ['helpers/ubs_core/cli.py']='5c65218f3d515b0863ef4f9d3bc3f7f814b5cc0831724f6817e5c3d088aa9c77'
+  ['helpers/ubs_core/cli.py']='7b7b8ca7ac8477b26917a9e184a9d48a300a9c4a9a478b64e1ca38b1c530f3f3'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='60f203857d374aa48f68180d829894d9561bad3b7535f72c22246ebc297ad86e'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='ba135d496604b1822a30b8e2942b5a3700884c4d2d11409b9c4bddf1763f1d13'
@@ -338,7 +338,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='67172bb6c1227370021506baa87108060227e5513be996ab52f48bb38cd4c29b'
   ['helpers/ubs_core/py_patterns/security_rg.py']='74f4cdc7dcc70faf656161c0651097649a6ad0322e74bfb3c3860a0497b501ef'
   ['helpers/ubs_core/py_rules.py']='5ed37ca0ba35959e495fa877837293b863847ee82159dad3bf3fedcf17d8eeb8'
-  ['helpers/ubs_core/py_scan.py']='908517a9998bcacfc1280e063b429efde94c08f665bae04c09e408b35f13d180'
+  ['helpers/ubs_core/py_scan.py']='87f52f32049c3debd524848519a05c1bdeffa25db4cd0870f4d8774bcae058dd'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/ruby_ast.py']='4bb0ecb0f511565d3d6e03346965a2d571b50f49f62920b542cdee539c7be4c3'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -384,8 +384,10 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='a24357ffa9b2c3f31427264431a9f5d02a00edc24c8b1da5e408d07792b3994f'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='0ff7769ea71daf041dfdba0c5c280de1e0bd71dce15dd4bd2710f5f26eb05faf'
   ['helpers/ubs_core/rust_rules.py']='33b7baeded29947da72d6b0ce27bf66b17ba0660ca3a42e1641f41f7a2bbfcdf'
-  ['helpers/ubs_core/rust_scan.py']='23a107e9ef754d22d86445f7d3ab72ae5619f5acb23ebd293a10e515029ffc11'
+  ['helpers/ubs_core/rust_scan.py']='2758889f6e8f2d890ddbfa2c08b1f2ab35ee7dc10c057193abace65601702f21'
+  ['helpers/ubs_core/scheduler.py']='9d4d936984f308c82d80d108b006a65ccd2eeb1d41e07325b621fc39147a94ed'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
+  ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
   ['helpers/ubs_core/suppression.py']='473563fd701199b1e16977cce0e26596ab6bceee1ba824fec0b1dcbda3684b1e'
   ['helpers/ubs_core/swift_ast.py']='25abac8a49c6642d3f47085550afd23f6197961ed5c13b53776456d2999e5378'
   ['helpers/ubs_core/swift_detectors/__init__.py']='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
@@ -406,7 +408,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='ae19424f3b25d31ea71fff1f1fd6f3f8f65c05ef046f7ac85dcde9c17937dbd3'
   ['helpers/ubs_core/swift_scan.py']='90a13af4032a9cd0c0f72433405816bc8f5e126d0dca38366100effd73301ef1'
-  ['lib/ubs-common.sh']='1169d9fe7a4dceebc8c6c9a2f856fb2eab8864fb1792ffd1a258695ff907684c'
+  ['lib/ubs-common.sh']='56180829066eb757623ac81d84c677ba8c52140f8427dc5da868fac4a5db01fa'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -559,12 +561,21 @@ profile_json(){
     fi
     cache_extra=",\"cache_hits\":$cache_hits,\"cache_misses\":$cache_misses,\"cache_hit_rate\":$cache_rate"
   fi
+  local slots_extra=""
+  if [[ -f "$TMPDIR_RUN/slots.profile" ]]; then
+    local s_cnt s_util
+    s_cnt="$(jq -r '.slots // 0' "$TMPDIR_RUN/slots.profile" 2>/dev/null || echo 0)"
+    s_util="$(jq -c '.slot_utilization // []' "$TMPDIR_RUN/slots.profile" 2>/dev/null || echo '[]')"
+    if [[ "$s_cnt" -gt 0 ]]; then
+      slots_extra=",\"slots\":$s_cnt,\"slot_utilization\":$s_util"
+    fi
+  fi
   if [[ -n "$list_mods" ]]; then
-    printf '{"total_ms":%d,"list_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s},"list_modules":{%s}%s%s}\n' \
-      "$total" "$PROFILE_LIST_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$list_mods" "$pf_extra" "$cache_extra"
+    printf '{"total_ms":%d,"list_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s},"list_modules":{%s}%s%s%s}\n' \
+      "$total" "$PROFILE_LIST_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$list_mods" "$pf_extra" "$cache_extra" "$slots_extra"
   else
-    printf '{"total_ms":%d,"list_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}%s%s}\n' \
-      "$total" "$PROFILE_LIST_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$pf_extra" "$cache_extra"
+    printf '{"total_ms":%d,"list_ms":%d,"fanout_ms":%d,"merge_ms":%d,"modules":{%s}%s%s%s}\n' \
+      "$total" "$PROFILE_LIST_MS" "$PROFILE_FANOUT_MS" "$PROFILE_MERGE_MS" "$mods" "$pf_extra" "$cache_extra" "$slots_extra"
   fi
 }
 
@@ -976,7 +987,9 @@ HELPER_ASSETS=(
   "helpers/ubs_core/rust_detectors/unbounded_request_body.py"
   "helpers/ubs_core/rust_rules.py"
   "helpers/ubs_core/rust_scan.py"
+  "helpers/ubs_core/scheduler.py"
   "helpers/ubs_core/selftest.py"
+  "helpers/ubs_core/shards.py"
   "helpers/ubs_core/suppression.py"
   "helpers/ubs_core/swift_ast.py"
   "helpers/ubs_core/swift_detectors/__init__.py"
@@ -1701,7 +1714,7 @@ cat <<'JSON'
           "totals": {"$ref": "#/$defs/totals"},
           "git": {"type": "object", "description": "present when the project has a GitHub remote", "properties": {"repository": {"type": "string"}, "commit": {"type": "string"}, "blob_base": {"type": "string"}}, "required": ["repository"]},
           "comparison": {"type": "object"},
-          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "list_modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "files_considered": {"type": "integer"}, "files_after_prefilter": {"type": "integer"}, "cache_hits": {"type": "integer"}, "cache_misses": {"type": "integer"}, "cache_hit_rate": {"type": "number"}}}
+          "profile": {"type": "object", "description": "present with UBS_PROFILE=1", "required": ["total_ms", "list_ms", "fanout_ms", "merge_ms", "modules"], "properties": {"total_ms": {"type": "integer"}, "list_ms": {"type": "integer"}, "fanout_ms": {"type": "integer"}, "merge_ms": {"type": "integer"}, "modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "list_modules": {"type": "object", "additionalProperties": {"type": "integer"}}, "files_considered": {"type": "integer"}, "files_after_prefilter": {"type": "integer"}, "cache_hits": {"type": "integer"}, "cache_misses": {"type": "integer"}, "cache_hit_rate": {"type": "number"}, "slots": {"type": "integer"}, "slot_utilization": {"type": "array", "items": {"type": "number"}}}}
         },
         "additionalProperties": true
       },
@@ -7116,36 +7129,136 @@ done
 # Execute modules concurrently
 # ─────────────────────────────────────────────────────────────────────────────
 declare -A PID_LANG=()
+declare -A PID_SLOT=()
+declare -A PID_START=()
+declare -a FREE_SLOTS=()
+declare -a SLOT_BUSY_MS=()
 pids=()
+
+local_cores="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+[[ "$local_cores" -lt 1 ]] && local_cores=4
+NUM_SLOTS="$local_cores"
+if [[ "${JOBS:-0}" -gt 0 && "$JOBS" -lt "$NUM_SLOTS" ]]; then
+  NUM_SLOTS="$JOBS"
+fi
+[[ "$NUM_SLOTS" -gt "${#langs[@]}" ]] && NUM_SLOTS="${#langs[@]}"
+[[ "$NUM_SLOTS" -lt 1 ]] && NUM_SLOTS=1
+
+# Order languages longest-expected-first via cost model (Graham's LPT, bead C5)
+if [[ ${#langs[@]} -gt 1 ]] && need_cmd python3; then
+  _sched_hdir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
+  [[ ! -d "$_sched_hdir" && -d "${MODULE_DIR:-}/helpers" ]] && _sched_hdir="${MODULE_DIR:-}/helpers"
+  _sched_langs="$(IFS=,; echo "${langs[*]}")"
+  _ordered_json="$(PYTHONPATH="$_sched_hdir${PYTHONPATH:+:$_sched_hdir}" python3 -m ubs_core.scheduler order \
+    --langs "$_sched_langs" --files-dir "$TMPDIR_RUN" --slots "$NUM_SLOTS" 2>/dev/null || true)"
+  if [[ -n "$_ordered_json" ]] && need_cmd jq; then
+    readarray -t _ordered_langs < <(jq -r '.ordered_langs[]' <<<"$_ordered_json" 2>/dev/null || true)
+    if [[ ${#_ordered_langs[@]} -eq ${#langs[@]} ]]; then
+      langs=("${_ordered_langs[@]}")
+    fi
+  fi
+fi
+
+for ((s = 0; s < NUM_SLOTS; s++)); do
+  FREE_SLOTS+=("$s")
+  SLOT_BUSY_MS+=("0")
+done
+
+status=0
+HAS_ENV_ERROR=0
+ENV_ERROR_LANGS=()
+total_jobs=${#langs[@]}
+finished_count=0
 _profile_fanout_t0="$(now_ms)"
+
 for L in "${langs[@]}"; do
+  if [[ ${#FREE_SLOTS[@]} -eq 0 ]]; then
+    finished_pid=""
+    if wait -n -p finished_pid; then
+      rc=0
+    else
+      rc=$?
+    fi
+    if [[ -z "$finished_pid" || -z "${PID_SLOT[$finished_pid]:-}" ]]; then
+      for p in "${pids[@]}"; do
+        if [[ -n "${PID_SLOT[$p]:-}" ]] && ! kill -0 "$p" 2>/dev/null; then
+          finished_pid="$p"
+          wait "$p" 2>/dev/null && rc=0 || rc=$?
+          break
+        fi
+      done
+    fi
+    if [[ -n "$finished_pid" && -n "${PID_SLOT[$finished_pid]:-}" ]]; then
+      s="${PID_SLOT[$finished_pid]}"
+      dur=$(( $(now_ms) - PID_START[$finished_pid] ))
+      SLOT_BUSY_MS[$s]=$(( ${SLOT_BUSY_MS[$s]} + dur ))
+      FREE_SLOTS+=("$s")
+      unset "PID_SLOT[$finished_pid]"
+      finished_count=$(( finished_count + 1 ))
+      if [[ "$rc" -eq 2 ]]; then
+        HAS_ENV_ERROR=1
+        ENV_ERROR_LANGS+=("${PID_LANG[$finished_pid]:-unknown}")
+      fi
+      if [[ "$rc" -gt "$status" ]]; then
+        status="$rc"
+      fi
+    fi
+  fi
+
+  s="${FREE_SLOTS[-1]}"
+  unset 'FREE_SLOTS[-1]'
+  t_start="$(now_ms)"
   run_lang "$L" "${MODULE_PATHS[$L]}" "$FORMAT" &
   pid=$!
   pids+=("$pid")
   PID_LANG["$pid"]="$L"
+  PID_SLOT["$pid"]="$s"
+  PID_START["$pid"]="$t_start"
 done
 
-# Wait & collect statuses
-status=0
-HAS_ENV_ERROR=0
-ENV_ERROR_LANGS=()
-for pid in "${pids[@]}"; do
-  rc=0
-  if wait "$pid"; then
+while [[ "$finished_count" -lt "$total_jobs" ]]; do
+  finished_pid=""
+  if wait -n -p finished_pid; then
     rc=0
   else
     rc=$?
   fi
-  if [[ "$rc" -eq 2 ]]; then
-    HAS_ENV_ERROR=1
-    ENV_ERROR_LANGS+=("${PID_LANG[$pid]:-unknown}")
+  if [[ -z "$finished_pid" || -z "${PID_SLOT[$finished_pid]:-}" ]]; then
+    for p in "${pids[@]}"; do
+      if [[ -n "${PID_SLOT[$p]:-}" ]] && ! kill -0 "$p" 2>/dev/null; then
+        finished_pid="$p"
+        wait "$p" 2>/dev/null && rc=0 || rc=$?
+        break
+      fi
+    done
   fi
-  if [[ "$rc" -gt "$status" ]]; then
-    status="$rc"
+  if [[ -n "$finished_pid" && -n "${PID_SLOT[$finished_pid]:-}" ]]; then
+    s="${PID_SLOT[$finished_pid]}"
+    dur=$(( $(now_ms) - PID_START[$finished_pid] ))
+    SLOT_BUSY_MS[$s]=$(( ${SLOT_BUSY_MS[$s]} + dur ))
+    FREE_SLOTS+=("$s")
+    unset "PID_SLOT[$finished_pid]"
+    finished_count=$(( finished_count + 1 ))
+    if [[ "$rc" -eq 2 ]]; then
+      HAS_ENV_ERROR=1
+      ENV_ERROR_LANGS+=("${PID_LANG[$finished_pid]:-unknown}")
+    fi
+    if [[ "$rc" -gt "$status" ]]; then
+      status="$rc"
+    fi
   fi
 done
 
 PROFILE_FANOUT_MS=$(( $(now_ms) - _profile_fanout_t0 ))
+
+# Calculate and record per-slot utilization (bead C5)
+if need_cmd python3; then
+  _sched_hdir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
+  [[ ! -d "$_sched_hdir" && -d "${MODULE_DIR:-}/helpers" ]] && _sched_hdir="${MODULE_DIR:-}/helpers"
+  _busy_joined="$(IFS=,; echo "${SLOT_BUSY_MS[*]}")"
+  PYTHONPATH="$_sched_hdir${PYTHONPATH:+:$_sched_hdir}" python3 -m ubs_core.scheduler profile \
+    --busy-ms "$_busy_joined" --makespan "$PROFILE_FANOUT_MS" --slots "$NUM_SLOTS" >"$TMPDIR_RUN/slots.profile" 2>/dev/null || true
+fi
 
 # Run-level status (bead B6): "ok" when every scanner finished, "partial" when
 # one or more timed out or crashed. A partial run exits 2 (like an environment
@@ -7315,7 +7428,7 @@ case "$FORMAT" in
             say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
           if [[ "$UBS_PROFILE" == "1" ]]; then
-            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end)')"
+            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end) + (if .slots != null and .slots > 0 then "; " + (.slots|tostring) + " slots" else "" end)')"
           fi
           crit="${tot_crit:-0}"
           warn="${tot_warn:-0}"
@@ -7326,7 +7439,7 @@ case "$FORMAT" in
             say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
           if [[ "$UBS_PROFILE" == "1" ]]; then
-            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end)')"
+            say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end) + (if .slots != null and .slots > 0 then "; " + (.slots|tostring) + " slots" else "" end)')"
           fi
           if [[ -n "$COMPARISON_FILE" && -f "$COMPARISON_FILE" ]]; then
             say "$(jq -r --slurpfile base "$COMPARISON_FILE" --arg path "$COMPARISON_FILE" '

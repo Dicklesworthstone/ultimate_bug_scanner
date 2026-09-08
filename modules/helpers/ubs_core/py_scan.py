@@ -163,6 +163,7 @@ def scan_patterns(
     sink,
     skip: set[int],
     prefilter: Any = None,
+    jobs: int = 1,
 ) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
@@ -178,12 +179,25 @@ def scan_patterns(
     active = [p for p in patterns if p.category not in skip]
     if not active:
         return counters
-    texts: dict[Path, str] = {}
-    for path in files:
+
+    def _read_text(p: Path) -> tuple[Path, str]:
         try:
-            texts[path] = path.read_text(encoding="utf-8", errors="ignore")
+            return p, p.read_text(encoding="utf-8", errors="ignore")
         except OSError:
-            continue
+            return p, ""
+
+    if jobs > 1 and len(files) > 1:
+        from ubs_core.shards import run_work_stealing
+
+        pairs = run_work_stealing(files, lambda shard: [_read_text(p) for p in shard], num_workers=jobs)
+        texts: dict[Path, str] = {p: t for p, t in pairs if t}
+    else:
+        texts = {}
+        for path in files:
+            try:
+                texts[path] = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
     for pattern in active:
         if pattern.gate_regex is not None and not any(
             pattern.gate_regex.search(text) for text in texts.values()
@@ -518,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
+    parser.add_argument("--jobs", type=int, default=1, help="parallel worker count for work-stealing file shards")
     parser.add_argument("--enable-new-analyzers", action="store_true",
                         help="run analyzers with no legacy counterpart (python.narrowing)")
     args = parser.parse_args(argv)
@@ -572,7 +587,7 @@ def main(argv: list[str] | None = None) -> int:
         prefilter_res = run_prefilter(files_to_scan, prefilter_index)
 
         capturing_sink = CapturingSink()
-        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res, jobs=args.jobs)
         run_detectors(files_to_scan, capturing_sink, skip)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         if args.ast_rule_dir:

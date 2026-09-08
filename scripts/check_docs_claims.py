@@ -338,8 +338,16 @@ def check_help_heredoc_static() -> None:
     if start < 0 or end < 0:
         report("help-heredoc", False, "usage() heredoc not found in ubs")
         return
-    offenders = [ln.strip()[:80] for ln in text[start:end].splitlines() if "`" in ln or "$(" in ln]
-    report("help-heredoc", not offenders, "; ".join(offenders) if offenders else "no command substitution in the usage() heredoc")
+    block = text[start:end]
+    offenders = [ln.strip()[:80] for ln in block.splitlines() if "`" in ln or "$(" in ln]
+    # An unescaped $NAME in the same heredoc expands too: under `set -u` a name
+    # that ubs never assigns (an optional environment variable such as
+    # XDG_CACHE_HOME) aborts `ubs --help` with "unbound variable" on every
+    # machine where it is unset. Names ubs assigns itself are fine.
+    for name in sorted(set(re.findall(r"(?<!\\)\$\{?([A-Za-z_][A-Za-z0-9_]*)", block))):
+        if not re.search(rf"^\s*(?:local\s+|declare\s+[-A-Za-z]+\s+|export\s+|readonly\s+)?{name}=", text, re.M):
+            offenders.append(f"${name} is never assigned in ubs; write \\${name} in the usage() heredoc")
+    report("help-heredoc", not offenders, "; ".join(offenders) if offenders else "no command substitution or unbound $NAME in the usage() heredoc")
 
 
 def check_module_contract() -> None:

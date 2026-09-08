@@ -1425,7 +1425,7 @@ Options:
                           themselves (loudly) on targeted scans, whose shadow workspace has no Cargo.toml.
   --no-auto-update        Disable auto-update (even if UBS_ENABLE_AUTO_UPDATE=1)
   --no-cache              Disable reading and writing the Merkle-keyed scan cache
-  --cache-dir=DIR         Directory for scan cache (default: $XDG_CACHE_HOME/ubs or ~/.cache/ubs)
+  --cache-dir=DIR         Directory for scan cache (default: \$XDG_CACHE_HOME/ubs or ~/.cache/ubs)
   --staged                Scan only files staged for commit (git index)
   --diff, --git-diff      Scan only modified files (working tree vs HEAD)
   --files=F1,F2,...       Scan only the listed files (comma or space separated)

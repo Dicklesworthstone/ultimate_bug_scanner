@@ -741,8 +741,11 @@ test_dry_run_touches_nothing() {
   before="$(snapshot)"
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
   local rc=0
+  # PATH is stripped to prove the installer needs no extra tools, but on macOS
+  # that resolves the "#!/usr/bin/env bash" shebang to the stock bash 3.2, which
+  # would only exercise the version guard. Run it under the harness's own bash.
   (cd "$proj" && UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" PATH="/usr/bin:/bin" SHELL=/bin/bash \
-    "$INSTALLER" --dry-run --non-interactive --skip-version-check) >"$log" 2>&1 || rc=$?
+    "$BASH" "$INSTALLER" --dry-run --non-interactive --skip-version-check) >"$log" 2>&1 || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[FAIL] --dry-run exited $rc (log: $log)"
     tail -n 30 "$log" || true
@@ -876,6 +879,31 @@ test_flag_order_independence() {
   echo "[PASS] flag_order_independence"
 }
 
+test_bash_guard_precedes_bash4_syntax() {
+  # The bash-version guard must execute before any top-level bash-4 syntax:
+  # bash 3.2 (stock macOS) fails on `declare -A` with "unbound variable" long
+  # before it could print the "brew install bash" guidance. 6aa8179 placed the
+  # dependency-digest table above the guard and broke `curl … | bash` on Macs
+  # without Homebrew bash. Linux CI has no bash 3.2, so the order is checked
+  # statically here.
+  echo "[TEST] bash_guard_precedes_bash4_syntax"
+  local guard_line assoc_line
+  guard_line="$(grep -n -m1 'BASH_VERSINFO\[0\] < 4' "$INSTALLER" | cut -d: -f1)"
+  assoc_line="$(grep -n -m1 -E '^declare -[A-Za-z]*A' "$INSTALLER" | cut -d: -f1)"
+  if [ -z "$guard_line" ] || [ -z "$assoc_line" ]; then
+    echo "[FAIL] could not locate the bash guard (line '${guard_line}') or the first top-level 'declare -A' (line '${assoc_line}') in install.sh"
+    tests_failed=1
+    return 1
+  fi
+  if [ "$guard_line" -ge "$assoc_line" ]; then
+    echo "[FAIL] install.sh: bash-version guard at line $guard_line comes after the first top-level 'declare -A' at line $assoc_line (bash 3.2 would die before the guard)"
+    tests_failed=1
+    return 1
+  fi
+  echo "[PASS] bash_guard_precedes_bash4_syntax"
+}
+
+test_bash_guard_precedes_bash4_syntax
 test_basic_smoke
 test_no_alias_written_when_no_path_modify
 test_skip_typos_flag

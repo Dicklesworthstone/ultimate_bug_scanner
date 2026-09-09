@@ -12,15 +12,21 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixes
 
+- **`install.sh` under stock macOS bash 3.2 died with `line 49: app: unbound variable` instead of the "install a modern bash" guidance.** The dependency-digest table (`declare -A DEP_ASSET_SHA256`) was placed above the bash-version guard in 6aa8179, so bash 3.2 failed on the associative array before reaching the guard (`curl … | bash` on a Mac without Homebrew bash, or any run with a stripped `PATH`). The guard now precedes every bash-4 construct again; `test-suite/install/run_tests.sh` checks that ordering statically and runs its stripped-`PATH` `--dry-run` scenario under the harness's own bash so the check is meaningful on macOS too.
 - **Three security false positives from GH #102 (JS hardcoded secrets, Python unsafe YAML, Python constant-time compare).**
   - `js.security.hardcoded-secrets` no longer reports SCREAMING_SNAKE identifier codes stored under credential-named keys (`Object.freeze({ CREDENTIALS: 'E_CREDENTIALS' })`, `INVALID_TOKEN: 'ERR_INVALID_TOKEN'`). The exemption applies to declaration/property/assignment literals only; a literal fallback for a secret-bearing `process.env` variable is still reported whatever its shape, and uppercase keys or `Object.freeze` wrappers around real literals still fire (`modules/helpers/ubs_core/analyzers/sec_hardcoded_secrets.py`).
   - `py.yaml-unsafe` (ast-grep) fired on **every** `yaml.load(...)` call, `Loader=yaml.SafeLoader` included: its `not: has: pattern: Loader=$L` never matched a `keyword_argument` node. The rule now matches only single-argument `yaml.load($STREAM)` / `yaml.load_all($STREAM)`; the category-7 regex `py.security.yaml-load` matches the same shape (a positional Loader is no longer a hit). Calls that name a Loader are classified by the unsafe-deserialization detector: `Loader`/`UnsafeLoader`/`FullLoader`/`None`, subclasses of those (a reassuring name is not evidence), and SafeLoader subclasses that register `python/` tags, `construct_python_*` constructors, or constructors/methods reaching eval/exec/`__import__`/pickle are critical under the new `py.security.yaml-unsafe-loader`; loaders imported from elsewhere, computed at runtime, or with unresolvable bases/registrations are a `py.security.yaml-loader-unresolved` warning for manual review. Trivial and strict-mapping SafeLoader subclasses are clean.
   - `python.ctcompare.secret_eq` treated any `.digest()`/`.hexdigest()` call as secret material, so a public SHA-256 manifest check (`entry["sha256"] != hashlib.sha256(payload).hexdigest()`) was a critical. An unkeyed hashlib digest of non-secret data (constructor call, or a hash object only ever fed non-secret bytes) is now an integrity check; keyed MACs (`hmac.new`, `blake2b(..., key=)`), hashes of secret material (`sha256(password)`), hash objects `update()`d with a secret, and unresolved receivers stay reported (`modules/helpers/ubs_core/analyzers/ctcompare_py.py`).
   - Regression fixtures and manifest cases: `test-suite/js/security/error-code-constants-{buggy,clean}.mjs`, `test-suite/python/security/yaml_loader_{buggy,clean}.py`, `test-suite/python/security/public_checksum_compare_{buggy,clean}.py`; `test-suite/quality/test_security_precision.py` pins the per-line expectations and executes the checksum fixture's accept-intact/reject-modified runtime contract.
 
+### Changes
+
+- **C#/Swift/Elixir/C++ ast-grep rule packs moved out of the module shell heredocs into `ubs_core` (`csharp_rules.py`, `swift_rules.py`, `cpp_rules.py`, `elixir_ast.py`, `elixir_rules.py`).** `--list-rules` / `--dump-rules` now work for every language (cpp, elixir and python included) instead of the previous subset; `modules/contract.json` and the meta-runner advertise the full flag surface. New coverage fixtures: `test-suite/csharp/buggy/AstRulePackBuggy.cs`, `test-suite/elixir/ast_grep_rule_pack_coverage.ex`, `test-suite/swift/ast_grep_rule_pack_coverage.swift`.
+- `.ubsignore` skips `tmp-rel-*` release scratch directories.
+
 ---
 
-## [v5.4.0] - 2026-09-08 [Release]
+## [v5.4.0] - 2026-09-08 [Tag]
 
 ### Changed
 

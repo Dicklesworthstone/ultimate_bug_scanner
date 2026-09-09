@@ -31,51 +31,10 @@ else
 fi
 ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
 
-# Dependency binaries (ast-grep, ripgrep, jq, typos) are fetched from GitHub
-# releases. UBS_INSTALLER_BINARY_BASE redirects those fetches (tests serve a
-# local mirror); the digests below are checked regardless of the base.
-DEP_BINARY_BASE="${UBS_INSTALLER_BINARY_BASE:-https://github.com}"
-if [ -n "${UBS_INSTALLER_BINARY_BASE:-}" ]; then
-  echo "WARNING: UBS_INSTALLER_BINARY_BASE=${UBS_INSTALLER_BINARY_BASE} overrides where dependency binaries are downloaded from" >&2
-fi
-
-# SHA-256 of every dependency release asset the installer can download.
-# ast-grep 0.45.3 (same table as AST_GREP_ASSET_SHA256 in ubs), jq 1.8.2 (from
-# the release's sha256sum.txt), typos 1.50.1 (computed from the release
-# archives) and toon_rust 0.2.4 (from the release's checksums.txt) are pinned
-# here; ripgrep 15.2.0 publishes a .sha256 sidecar next
-# to each asset, which is fetched and checked instead. A download whose digest
-# is unknown or does not match is never installed.
-declare -A DEP_ASSET_SHA256=(
-  [app-aarch64-apple-darwin.zip]='6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6'
-  [app-x86_64-apple-darwin.zip]='b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c'
-  [app-aarch64-unknown-linux-gnu.zip]='b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f'
-  [app-x86_64-unknown-linux-gnu.zip]='f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8'
-  [app-x86_64-pc-windows-msvc.zip]='3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059'
-  [jq-linux-amd64]='b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f'
-  [jq-linux-arm64]='8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309'
-  [jq-macos-amd64]='e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0'
-  [jq-macos-arm64]='2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e'
-  [jq-win64.exe]='a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627'
-  [typos-v1.50.1-x86_64-unknown-linux-musl.tar.gz]='edf0545109aee6a22751d04ddecb97c45be47d3aa0409564fb895eeeace91b1e'
-  [typos-v1.50.1-aarch64-unknown-linux-musl.tar.gz]='a48feb58c517977ca953e634507c72819d64df8717c33ced3e43868d174fd39e'
-  [typos-v1.50.1-x86_64-apple-darwin.tar.gz]='b31ccf2f21154b2bc8d2a84f395f746106edda0feec4817fbecdb12216df53bd'
-  [typos-v1.50.1-aarch64-apple-darwin.tar.gz]='2c940734b44b6e199e165278b662b7e17c68f068471a2a8a5e491ce635414ae6'
-  [toon-linux-amd64.tar.xz]='af6e21187c5afb6ec993b9e668d13d3b785f55571b67ced1c1e24bb53f0b1b62'
-  [toon-linux-arm64.tar.xz]='3ebc625a27ccf565eb649565aefef505ab40cddb63648a6bc0c8c54ae5bf9f57'
-  [toon-darwin-amd64.tar.xz]='e1af1cca9ea99df2eb85420fe5289c6d4adddad001b778a4c285e249acc57df8'
-  [toon-darwin-arm64.tar.xz]='fe163da70b7f504ad489aeea1e8887971df6b526b6bcdd0f37add9cdab7c2fce'
-  [toon-windows-amd64.zip]='3cfdb169a4f1a28e2fb14bffa6c775d1824f45793b9e602ce6a30be550872de8'
-  [typos-v1.50.1-x86_64-pc-windows-msvc.zip]='8740867a0d9e44a62f0803e37a669ec3c6cd17ab63cd49d00e14a96d3e03ccc3'
-)
-MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
-
-# Global copy of original args (needed in update re-exec; must not be local)
-ORIGINAL_ARGS=()
-# Flag to signal installer re-run after checksum auto-fix
-RERUN_AFTER_FIX=0
-
-# Validate bash version (requires 4.0+)
+# Validate bash version (requires 4.0+). This block must stay above the first
+# associative array (`declare -A`) and any other bash-4 syntax: bash 3.2 (the
+# stock macOS shell) dies on those with an unrelated error before it could
+# print the guidance below (test-suite/install/run_tests.sh checks the order).
 if ((BASH_VERSINFO[0] < 4)); then
   # Attempt macOS auto-remediation via Homebrew
   if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
@@ -156,6 +115,50 @@ if ((BASH_VERSINFO[0] < 4)); then
   echo "Linux: install the bash package for your distribution." >&2
   exit 2
 fi
+
+# Dependency binaries (ast-grep, ripgrep, jq, typos) are fetched from GitHub
+# releases. UBS_INSTALLER_BINARY_BASE redirects those fetches (tests serve a
+# local mirror); the digests below are checked regardless of the base.
+DEP_BINARY_BASE="${UBS_INSTALLER_BINARY_BASE:-https://github.com}"
+if [ -n "${UBS_INSTALLER_BINARY_BASE:-}" ]; then
+  echo "WARNING: UBS_INSTALLER_BINARY_BASE=${UBS_INSTALLER_BINARY_BASE} overrides where dependency binaries are downloaded from" >&2
+fi
+
+# SHA-256 of every dependency release asset the installer can download.
+# ast-grep 0.45.3 (same table as AST_GREP_ASSET_SHA256 in ubs), jq 1.8.2 (from
+# the release's sha256sum.txt), typos 1.50.1 (computed from the release
+# archives) and toon_rust 0.2.4 (from the release's checksums.txt) are pinned
+# here; ripgrep 15.2.0 publishes a .sha256 sidecar next
+# to each asset, which is fetched and checked instead. A download whose digest
+# is unknown or does not match is never installed.
+declare -A DEP_ASSET_SHA256=(
+  [app-aarch64-apple-darwin.zip]='6d2279dea5bea2ad79c66ea93f5fe54ba926e398a8a26de76c56db68fe59eac6'
+  [app-x86_64-apple-darwin.zip]='b2ffd26f42810340326a9e8a084bdc3647a8795c1a3f21fc06bd7bef3c7c5b2c'
+  [app-aarch64-unknown-linux-gnu.zip]='b39cfbc58da4b869a88b8a4bc57bd5deb0d24541e704cf7c257da7b53ec81c8f'
+  [app-x86_64-unknown-linux-gnu.zip]='f8ac830881339d1edee6b2652f54798c0f4da5a827f2db38a08ee31117783ce8'
+  [app-x86_64-pc-windows-msvc.zip]='3751b7d6be7fd39a80df1180ffe7e053903dcf92d3190e5a8336ff1746af9059'
+  [jq-linux-amd64]='b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f'
+  [jq-linux-arm64]='8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309'
+  [jq-macos-amd64]='e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0'
+  [jq-macos-arm64]='2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e'
+  [jq-win64.exe]='a6fc67fedaf9128a3309a1e2ebb8b986aeccf70122ee46d2cb4849e423f0c627'
+  [typos-v1.50.1-x86_64-unknown-linux-musl.tar.gz]='edf0545109aee6a22751d04ddecb97c45be47d3aa0409564fb895eeeace91b1e'
+  [typos-v1.50.1-aarch64-unknown-linux-musl.tar.gz]='a48feb58c517977ca953e634507c72819d64df8717c33ced3e43868d174fd39e'
+  [typos-v1.50.1-x86_64-apple-darwin.tar.gz]='b31ccf2f21154b2bc8d2a84f395f746106edda0feec4817fbecdb12216df53bd'
+  [typos-v1.50.1-aarch64-apple-darwin.tar.gz]='2c940734b44b6e199e165278b662b7e17c68f068471a2a8a5e491ce635414ae6'
+  [toon-linux-amd64.tar.xz]='af6e21187c5afb6ec993b9e668d13d3b785f55571b67ced1c1e24bb53f0b1b62'
+  [toon-linux-arm64.tar.xz]='3ebc625a27ccf565eb649565aefef505ab40cddb63648a6bc0c8c54ae5bf9f57'
+  [toon-darwin-amd64.tar.xz]='e1af1cca9ea99df2eb85420fe5289c6d4adddad001b778a4c285e249acc57df8'
+  [toon-darwin-arm64.tar.xz]='fe163da70b7f504ad489aeea1e8887971df6b526b6bcdd0f37add9cdab7c2fce'
+  [toon-windows-amd64.zip]='3cfdb169a4f1a28e2fb14bffa6c775d1824f45793b9e602ce6a30be550872de8'
+  [typos-v1.50.1-x86_64-pc-windows-msvc.zip]='8740867a0d9e44a62f0803e37a669ec3c6cd17ab63cd49d00e14a96d3e03ccc3'
+)
+MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # Set to minisign public key line (untrusted placeholder fails closed)
+
+# Global copy of original args (needed in update re-exec; must not be local)
+ORIGINAL_ARGS=()
+# Flag to signal installer re-run after checksum auto-fix
+RERUN_AFTER_FIX=0
 
 # TTY-aware color initialization
 COLOR_ENABLED=1

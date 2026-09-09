@@ -287,6 +287,9 @@ def check_module_readme() -> None:
         rest = line[m.end():]
         expected = set(on_disk)
         except_m = re.search(r"all modules except ([a-z]+)", rest)
+        # `(?:, [a-z]+)+` repeats a group whose mandatory literal ", " separator
+        # cannot be produced by [a-z], so the parse is unique and backtracking
+        # is linear. ubs:ignore[py.regex.nested-quantifiers]
         subset_m = re.search(r"\(([a-z]+(?:, [a-z]+)+)\)", rest)
         same_m = re.search(r"same modules as (--[a-z-]+)", rest)
         if except_m:

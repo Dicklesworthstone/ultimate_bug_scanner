@@ -28,3 +28,18 @@ def classify(text, marker=None, sentinel=None):
     if sentinel is not None:
         return SINGLE_QUOTED + text
     return FORMAT_TEMPLATE + text
+
+
+def tri_state(value):
+    """`is True` / `is False` are singleton identity checks, not literal traps.
+
+    Rewriting these to `==` would change behaviour: `1 == True` is true, and
+    this function exists to tell 1 and True apart.
+    """
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is not True:
+        return "other"
+    return "unknown"

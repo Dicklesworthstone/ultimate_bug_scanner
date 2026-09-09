@@ -29,7 +29,7 @@ RULE_ID = "py.comparison.is-literal"
 CATEGORY = 4
 TITLE = "Using 'is' with literals"
 SEVERITY = "warning"
-DESCRIPTION = "Use '==' (only None uses 'is')"
+DESCRIPTION = "Use '==' (the singletons None/True/False keep 'is')"
 
 SKIP_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.mypy_cache',
              '.pytest_cache', '.cache', 'build', 'dist'}

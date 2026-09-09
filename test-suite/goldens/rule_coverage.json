@@ -17,10 +17,10 @@
       "weak_cases": []
     },
     "smoke": {
-      "buggy_cases_with_required_substrings": 10,
-      "case_count": 20,
-      "clean_cases_with_forbidden_substrings": 10,
-      "strict_zero_clean_cases": 10,
+      "buggy_cases_with_required_substrings": 11,
+      "case_count": 22,
+      "clean_cases_with_forbidden_substrings": 11,
+      "strict_zero_clean_cases": 11,
       "weak_case_count": 0,
       "weak_cases": []
     }

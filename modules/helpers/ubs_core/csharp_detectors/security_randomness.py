@@ -52,7 +52,7 @@ ASSIGN_RE = re.compile(
 )
 METHOD_RE = re.compile(
     r'^\s*(?:(?:public|private|protected|internal|static|async|virtual|override|sealed|partial|readonly)\s+)*'
-    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)+'
+    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)+'  # ubs:ignore[py.regex.nested-quantifiers] — disjoint separator, verified linear
     r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:=>|\{)?'
 )
 UNSAFE_CTOR_RE = re.compile(r'\bnew\s+(?:System\.)?Random\s*\(')

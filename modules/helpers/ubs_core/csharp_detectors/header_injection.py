@@ -42,7 +42,7 @@ ANNOTATED_PARAM_RE = re.compile(
     r'(?:\s*\([^]]*\))?\]\s*'
     # No space in the class: it overlapped `\s+` under the enclosing `+`
     # and made this an exponential-backtracking match on a long line.
-    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)+'
+    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)+'  # ubs:ignore[py.regex.nested-quantifiers] — disjoint separator, verified linear
     r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)',
     re.IGNORECASE | re.MULTILINE,
 )

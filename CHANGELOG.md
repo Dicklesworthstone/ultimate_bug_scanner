@@ -10,7 +10,28 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixes
+
+- **The self-scan gate was failing on ubs itself: `./ubs . --ci --fail-on-warning` reported 705 warnings, every one a false positive.** Six rule families, all of them wrong on *any* project of this shape, not just ours:
+  - **`py.numeric.division-heavy` read `pathlib` joins as division** — 78 of the 85 warnings were `rules_dir / name`. `PurePath` overloads `/`, so a `BinOp(Div)` is only arithmetic when neither operand is a path; the new `ubs_core.py_detectors._pathlike` decides that from constructors (`Path(...)`, `Path.cwd()`), path-returning members (`.parent`, `.resolve()`), file-local bindings, annotations and callee/identifier naming. The divisor test also moved from a source-text prefix (which accepted `base / f"{x}.yml"` because an f-string starts with `f`) to the AST node kind.
+  - **`py.debug.print` failed every command line tool for printing.** The ladder counted `print(` project-wide and turned warning above 50, so 75 of the 76 files it flagged were CLI entry points doing their job. A module that declares a CLI role — shebang, `__main__` guard, `argparse`/`click`/`typer`, or `sys.argv` — is now exempt; a library module that prints instead of logging still reports.
+  - **`py.collections.index-arithmetic` had no notion of a bound** — 224 warnings, all guarded. It is now an AST walker (`ubs_core.py_detectors.index_arithmetic`) that clears an offset when an enclosing comparison bounds it (`i + 1 < len(line)`, `0 <= idx - 1`, `idx == 0 or …`, `if idx:`), when the loop supplies the bound (`range(len(x) - 1)`, `range(1, n)`, `enumerate(seq, start=1)`), when an earlier `assert` or `if …: break` establishes it, or when `IndexError` is handled. The info tier gained its own id, `py.collections.index-arithmetic-info`, matching `ruby.collections.index-arithmetic-info`.
+  - **`py.io.open-missing-with` counted the substring `open(` on raw lines** — 47 warnings on docstrings, comments and `re.compile(r"open\(")` in rule tables. It now walks the AST and understands `with`, `contextlib.closing`, `ExitStack.enter_context` and an explicit `.close()` in the same scope.
+  - **`py.comparison.is-literal` / `py.is-literal` flagged `x is True`.** `True`/`False` are interned singletons like `None`, and the advice was actively wrong: `1 == True`, so code written as `value is True or value == 1` is deliberately separating the two. Both rules now cover int/str/bytes/collection literals only.
+  - **The Python pattern layer matched inside string literals**, so a rule table quoting `$X == None`, `hashlib.md5($$$)` or `TODO` reported itself (~85 warnings). Patterns are now matched against a string-blanked, comment-preserving view of each `.py`/`.pyi` file (offset-preserving, so line numbers and code samples are unchanged); rules whose evidence genuinely lives in a literal opt out with `Pattern.scan_strings`.
+- **`py.deprecations.deprecated-api` reported `import importlib` as the removed `imp` module.** The legacy `^import[[:space:]]+imp` had no right-hand boundary. Bug-for-bug parity ends where the bug is user-visible.
+- **`py.json-load-no-try` never saw a `try` more than one node up**, so correctly guarded `try: json.load(f)` was reported — the same defect already fixed for `py.json.loads-no-try` (`stopBy: end` plus a required `except_clause`).
+
+### Changes
+
+- **Real defects the corrected rules then found, and their fixes:**
+  - **Exponential backtracking in the Java/C# type-prefix regexes** (`csharp_detectors/security_randomness.py`, `java_detectors/security_randomness.py`, `csharp_detectors/header_injection.py`). The token character class contained a space and sat next to `\s+` under a `+`, so a scanned source line of space-separated identifiers cost ~6× per extra token: 34 tokens took 1.65 s, 50 would take hours. Removing the space from the class makes the split unique and matching linear, with identical results on real declarations.
+  - **`args[i + 1]` after `args.index("--root")`** in two rust detectors crashed with `IndexError` when `--root` was the last argument; they now exit with a message.
+  - **`subprocess.run([sg, "--version"])` had no timeout and inherited stdin**, so resolving `sg` to util-linux's setgid launcher instead of ast-grep hung the scan. The probe is now bounded and reads from `/dev/null`.
+  - **`json.loads` on the NDJSON sinks was unguarded in 21 places.** A truncated final line (disk full, interrupted run, a helper killed mid-write) replaced the whole report with a `JSONDecodeError` traceback, even though the severity counters that decide the exit code never come from that re-read. `ubs_core.io.read_ndjson` / `parse_ndjson_lines` skip an unparseable record, name it on stderr, and return the rest.
+- New `Pattern` controls: `scan_strings` (match inside string literals) and `exclude_file_regex` (skip a file for one rule based on its role), both applied to the same view the rule is matched against.
+- Regression coverage: `test-suite/quality/test_python_precision.py` (44 tests) plus manifest cases `python-pathlib-division-clean`, `python-index-arithmetic-{clean,buggy}` and `python-debug-print-{cli-clean,library-buggy}`.
+- `docs/security.md` now publishes the current minisign public key (`97732BB3E99E8CBE`) instead of only describing where it should be published.
 
 ---
 

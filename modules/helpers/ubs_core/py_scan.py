@@ -36,9 +36,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.io import read_ndjson
 from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import RunContext
-from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 
@@ -137,9 +137,11 @@ class Pattern:
     text. Blanking is offset-preserving, so line numbers never move, and the
     reported code sample is always taken from the raw line.
 
-    ``exclude_file_regex`` — skip a whole file for this pattern when its raw
-    text matches. Used for rules whose finding depends on the *role* of the
-    module rather than the line (a CLI entry point prints by design).
+    ``exclude_file_regex`` — skip a whole file for this pattern when its text
+    matches. Used for rules whose finding depends on the *role* of the module
+    rather than the line (a CLI entry point prints by design). It is applied to
+    the same view the pattern is matched against, so prose in a docstring
+    cannot make a library module look like a CLI.
     """
 
     category: int
@@ -249,6 +251,10 @@ def scan_patterns(
                 )
             except Exception:  # a masker failure must not lose the rule
                 cached = text
+            if len(cached) != len(text):
+                # Offsets must line up with the raw text or every reported
+                # line number and code sample would be wrong; raw is safer.
+                cached = text
             masked[path] = cached
         return cached
 
@@ -266,9 +272,10 @@ def scan_patterns(
         for path, text in texts.items():
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue
-            if pattern.exclude_file_regex is not None and pattern.exclude_file_regex.search(text):
-                continue
             scan_text = text if pattern.scan_strings else _scan_text(path, text)
+            if (pattern.exclude_file_regex is not None
+                    and pattern.exclude_file_regex.search(scan_text)):
+                continue  # matched against the same view the rule sees
             for line_no, line_text in iter_matches(pattern, scan_text, text):
                 key = (path, line_no)
                 if key in seen:

@@ -29,9 +29,11 @@ PATTERNS: list[Pattern] = [
         # for doing its job. Modules that declare a CLI role — a shebang, a
         # `__main__` guard, an argument parser, or sys.argv — are exempt; a
         # library module that prints instead of logging still reports.
+        # Matched against the string-blanked view, so the `"__main__"` literal
+        # is not part of the test and prose in a docstring cannot fake a role.
         exclude_file_regex=re.compile(
             r"(?m)^#!.*\bpython"
-            r"|^[ \t]*if[ \t]+__name__[ \t]*==[ \t]*[\"\']__main__[\"\']"
+            r"|^[ \t]*if[ \t]+__name__[ \t]*=="
             r"|^[ \t]*(?:import|from)[ \t]+(?:argparse|click|typer)\b"
             r"|(?<![A-Za-z0-9_.])sys\.argv(?![A-Za-z0-9_])"
         ),

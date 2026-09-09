@@ -112,7 +112,6 @@ def extract_statement_region(
     return text[idx:end], end
 
 
-
 def parse_ndjson_lines(lines: Iterable[str], source: str = "") -> list[dict]:
     """Parse NDJSON records, skipping blank and malformed lines.
 

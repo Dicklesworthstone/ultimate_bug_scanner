@@ -22,8 +22,8 @@ when any of these hold:
    earlier operand of the enclosing boolean expression is searched for a
    comparison that bounds the index on the side the offset moves toward.
    ``i + 1 < len(line)`` and ``0 <= idx - 1`` guard a forward and a backward
-   offset respectively; ``idx == 0 or …`` is the equality form of a lower
-   bound.
+   offset respectively; ``idx == 0 or …`` and a bare ``if idx:`` are the
+   equality and truthiness forms of a lower bound.
 2. **The loop supplies the bound.** ``for i in range(len(x) - 1)`` covers
    ``x[i + 1]``; ``for i in range(1, n)`` covers ``x[i - 1]``; and
    ``for i, v in enumerate(seq, start=1)`` covers ``seq[i - 1]`` — the offset
@@ -92,6 +92,34 @@ def _mentions(node: ast.AST, name: str) -> bool:
     return any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node))
 
 
+def _implies_nonzero(node: ast.AST, name: str, *, when_false: bool = False) -> bool:
+    """Does this test's outcome imply `name` is non-zero?
+
+    `if i:` implies it when the test is true; `if not i: return` implies it on
+    the path where the test is false. Only a *direct* boolean operand counts —
+    `if x[i - 1]:` tests the element, not the index, and is not a guard.
+    """
+    if isinstance(node, ast.Name):
+        return not when_false and node.id == name
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _implies_nonzero(node.operand, name, when_false=not when_false)
+    if isinstance(node, ast.BoolOp):
+        # `a and b` true ⇒ every operand true; `a or b` false ⇒ every operand false.
+        if isinstance(node.op, ast.And) and not when_false:
+            return any(_implies_nonzero(v, name) for v in node.values)
+        if isinstance(node.op, ast.Or) and when_false:
+            return any(_implies_nonzero(v, name, when_false=True) for v in node.values)
+    return False
+
+
+def _in_true_branch(parent: ast.AST, child: ast.AST) -> bool:
+    """Is `child` on the path taken when `parent`'s test is true?"""
+    if isinstance(parent, ast.IfExp):
+        return child is parent.body
+    body = getattr(parent, "body", None)
+    return isinstance(body, list) and any(stmt is child for stmt in body)
+
+
 def _compare_bounds(
     node: ast.AST, name: str, want_upper: bool, *, negate: bool = False
 ) -> bool:
@@ -111,7 +139,14 @@ def _compare_bounds(
             if not (left_has or right_has):
                 continue
             if isinstance(op, _EQ_OPS):
-                return True  # `idx == 0 or …` / `if i != 0:` — an explicit case split
+                # `idx == 0 or …` / `if i != 0:` — an explicit case split on the
+                # boundary. Only against an integer literal: `i == j` says
+                # nothing about the range.
+                other = right if left_has else left
+                if isinstance(other, ast.Constant) and isinstance(other.value, int) \
+                        and not isinstance(other.value, bool):
+                    return True
+                continue
             upper_op = isinstance(op, _UPPER_OPS)
             if not upper_op and not isinstance(op, _LOWER_OPS):
                 continue
@@ -130,15 +165,26 @@ _TERMINATORS = (ast.Break, ast.Continue, ast.Return, ast.Raise)
 
 def _early_exit_bounds(block: list[ast.stmt], upto: ast.AST,
                        name: str, want_upper: bool) -> bool:
-    """`if <not in range>: break` earlier in the same block bounds the index."""
+    """A preceding statement in this block establishes the bound.
+
+    Two shapes: `if <out of range>: break` (or continue/return/raise), whose
+    surviving path knows the negation, and `assert <in range>`, which states
+    the bound directly.
+    """
     for stmt in block:
         if stmt is upto:
             return False
+        if isinstance(stmt, ast.Assert):
+            if (_compare_bounds(stmt.test, name, want_upper)
+                    or _implies_nonzero(stmt.test, name)):
+                return True
+            continue
         if not isinstance(stmt, ast.If) or stmt.orelse:
             continue
         if not all(isinstance(inner, _TERMINATORS) for inner in stmt.body):
             continue
-        if _compare_bounds(stmt.test, name, want_upper, negate=True):
+        if (_compare_bounds(stmt.test, name, want_upper, negate=True)
+                or _implies_nonzero(stmt.test, name, when_false=True)):
             return True
     return False
 
@@ -212,12 +258,13 @@ def _guarded(
                     break
                 if _compare_bounds(value, name, want_upper):
                     return True
-        elif isinstance(parent, (ast.If, ast.While, ast.IfExp)):
-            if child is not parent.test and _compare_bounds(parent.test, name, want_upper):
-                return True
-        elif isinstance(parent, ast.Assert):
-            if child is not parent.test and _compare_bounds(parent.test, name, want_upper):
-                return True
+        elif isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            if child is not parent.test:
+                if _compare_bounds(parent.test, name, want_upper):
+                    return True
+                # A truthiness split only holds on the true branch.
+                if _in_true_branch(parent, child) and _implies_nonzero(parent.test, name):
+                    return True
         elif isinstance(parent, ast.comprehension):
             if any(_compare_bounds(cond, name, want_upper) for cond in parent.ifs):
                 return True
@@ -231,7 +278,7 @@ def _guarded(
             if _loop_guards(parent.target, parent.iter, name, want_upper, offset):
                 return True
         elif isinstance(parent, ast.Try):
-            if child in parent.body and _handles_index_error(parent):
+            if any(stmt is child for stmt in parent.body) and _handles_index_error(parent):
                 return True
         for block_name in ("body", "orelse", "finalbody"):
             block = getattr(parent, block_name, None)

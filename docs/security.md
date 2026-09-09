@@ -49,7 +49,20 @@ This document captures the threat model for the UBS installer, module downloads,
 
 ## Key handling
 
-- **Minisign public key**: publish the current key line in the README example (`UBS_MINISIGN_PUBKEY`) and here. Rotate via `minisign -G` and update secrets + docs; keep old keys listed until releases signed with them are deprecated.
+- **Minisign public key** (current, key id `97732BB3E99E8CBE`):
+
+  ```
+  RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ
+  ```
+
+  ```bash
+  export UBS_MINISIGN_PUBKEY="RWS+jJ7psytzl3v4znpraY9VWBQrICXBFmT3VwvxpTzbuV2Q/CBTDmVJ"
+  minisign -Vm SHA256SUMS -P "$UBS_MINISIGN_PUBKEY" -x SHA256SUMS.minisig
+  ```
+
+  Superseded: `3168292A2B33FA20`, used for releases up to v4.6.5.
+
+  Publish the current key line in the README example (`UBS_MINISIGN_PUBKEY`) and here. Rotate via `minisign -G` and update secrets + docs; keep old keys listed until releases signed with them are deprecated.
 - **Minisign private key**: store offline; never commit. The GitHub secret should be a base64 of the private key file.
 - **Cosign**: uses OIDC keyless signing. Revocation is handled by transparency (Rekor) and by removing trust in the GitHub identity if compromised.
 

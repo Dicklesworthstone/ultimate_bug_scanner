@@ -49,7 +49,7 @@ ASSIGN_RE = re.compile(
 )
 FUNC_RE = re.compile(
     r'^\s*(?:(?:public|private|protected|static|final|synchronized|abstract|native)\s+)*'
-    r'(?:[A-Za-z_$][A-Za-z0-9_$.<>,?\[\]]+\s+)+'
+    r'(?:[A-Za-z_$][A-Za-z0-9_$.<>,?\[\]]+\s+)+'  # ubs:ignore[py.regex.nested-quantifiers] — disjoint separator, verified linear
     r'(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*\([^;]*\)\s*(?:throws\s+[^{]+)?\{?'
 )
 KOTLIN_FUNC_RE = re.compile(

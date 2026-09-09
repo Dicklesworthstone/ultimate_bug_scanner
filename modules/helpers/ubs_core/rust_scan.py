@@ -703,6 +703,8 @@ _AST_GREP_CACHE: str | None = None
 
 def _probe(binary: str, flag: str) -> str:
     """Run `binary flag` with no stdin and a short timeout; '' on any failure."""
+    import subprocess
+
     try:
         completed = subprocess.run(
             [binary, flag],

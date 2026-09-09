@@ -18,7 +18,7 @@ wrong warning. Three signals, in order of strength:
    ``for p in root.iterdir()`` make ``p`` path-like for the whole file. The
    analysis is flow-insensitive and runs to a small fixpoint so that
    ``a = Path(x)`` followed by ``b = a / "y"`` marks both.
-3. **Naming.** An identifier that ends in ``dir``/``path``/``root``/``file``…
+3. **Naming.** An identifier that ends in ``dir``/``path``/``root``/``folder``
    is path-like — including the *callee* name of a call (``get_cache_dir()``).
    This is the weakest signal, and it never applies to an anonymous result.
 
@@ -51,10 +51,12 @@ _PATH_ANNOTATIONS = frozenset({
 })
 
 # Weakest signal: identifier vocabulary. Suffix match on a lowercased name.
-_PATH_NAME_SUFFIXES = (
-    "dir", "path", "root", "folder", "parent", "cwd", "home", "file",
-)
-_PATH_NAME_EXACT = frozenset({"pth", "tmpdir", "tempdir"})
+# Deliberately short: `file`, `parent` and `home` are not here because they
+# swallow ordinary words (`profile` ends in `file`) and the shapes that matter
+# — `x.parent`, `Path.home()`, `p = q.parent` — are already covered by the
+# member and binding signals.
+_PATH_NAME_SUFFIXES = ("dir", "path", "root", "folder", "cwd")
+_PATH_NAME_EXACT = frozenset({"pth", "tempdir"})
 
 
 def _dotted(node: ast.AST) -> str:

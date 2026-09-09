@@ -24,13 +24,14 @@ This port walks the AST instead. A hit is a real call to `open` — the builtin,
 or ``.open()`` on a path — that is not managed, where managed means any of:
 
 - it is (inside) the context expression of a ``with`` item, including through
-  ``contextlib.closing(...)`` / ``ExitStack.enter_context(...)`` wrappers;
-- its result is passed straight to another call (``json.load(open(p))`` is a
-  different bug, not this one — the handle is still unmanaged, so it *is*
-  reported; a wrapper that owns the handle, ``closing``/``enter_context``,
-  is not);
-- the enclosing function closes it: the assignment target has a ``.close()``
-  call somewhere in the same function body.
+  an owning wrapper (``contextlib.closing(...)``, ``ExitStack.enter_context``);
+- it is assigned to a name (or attribute) that has ``.close()`` called on it
+  somewhere in the file.
+
+Passing the handle straight to another call does *not* manage it:
+``json.load(open(p))`` leaks the file object and is still reported. The
+``.close()`` search is file-wide rather than scope-aware on purpose — a missed
+close would be a false positive, and this rule is a warning.
 
 Ratio semantics are preserved: when nothing is unmanaged the detector is
 silent and the "File usage appears context-managed" good finding is rendered
@@ -75,7 +76,7 @@ def _owning_wrapper(node: ast.AST) -> bool:
 
 
 def _closed_names(scope: ast.AST) -> set[str]:
-    """Names that have a `.close()` called on them somewhere in this scope."""
+    """Names (and attribute tails) with a `.close()` call anywhere in `scope`."""
     closed: set[str] = set()
     for node in ast.walk(scope):
         if not isinstance(node, ast.Call):
@@ -95,7 +96,7 @@ def _managed(node: ast.Call, parents: dict[ast.AST, ast.AST],
              with_contexts: set[int], closed: set[str]) -> bool:
     # Inside a `with` context expression (possibly wrapped in closing(...)).
     child: ast.AST = node
-    while child is not None:
+    while True:
         if id(child) in with_contexts:
             return True
         parent = parents.get(child)
@@ -107,7 +108,7 @@ def _managed(node: ast.Call, parents: dict[ast.AST, ast.AST],
             if id(parent) not in with_contexts:
                 break
         child = parent
-    # Assigned to a name that is closed in the same scope.
+    # Assigned to a name that is closed somewhere in the file.
     parent = parents.get(node)
     if isinstance(parent, ast.Assign):
         for target in parent.targets:

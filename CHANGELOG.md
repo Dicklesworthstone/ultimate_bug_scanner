@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.1] - 2026-09-09 [Release]
+
 ### Fixes
 
 - **`install.sh` under stock macOS bash 3.2 died with `line 49: app: unbound variable` instead of the "install a modern bash" guidance.** The dependency-digest table (`declare -A DEP_ASSET_SHA256`) was placed above the bash-version guard in 6aa8179, so bash 3.2 failed on the associative array before reaching the guard (`curl … | bash` on a Mac without Homebrew bash, or any run with a stripped `PATH`). The guard now precedes every bash-4 construct again; `test-suite/install/run_tests.sh` checks that ordering statically and runs its stripped-`PATH` `--dry-run` scenario under the harness's own bash so the check is meaningful on macOS too.

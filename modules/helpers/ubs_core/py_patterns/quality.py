@@ -84,6 +84,7 @@ PATTERNS: list[Pattern] = [
         title="String concatenation with +",
         regex=re.compile(r"\+[ \t]*['\"]|['\"][ \t]*\+"),
         thresholds=((5, "info"),),
+        scan_strings=True,  # the quote character IS the evidence
         exclude_regex=re.compile(r"\+\+|[+\-]="),  # legacy `grep -v -E '\+\+|[+\-]='`
     ),
     # ── Category 12: PERFORMANCE & MEMORY ───────────────────────────────────
@@ -137,6 +138,11 @@ PATTERNS: list[Pattern] = [
         title="Potential catastrophic regex",
         regex=re.compile(r"\([^)\n]*\+[^)\n]*\)\+|\([^)\n]*\*[^)\n]*\)\+"),
         thresholds=((3, "warning"),),
+        scan_strings=True,  # a regex source is always a string literal
+        # A rule table that quotes a catastrophic pattern as an *example* is
+        # documenting it, not running it: `- pattern: String $R = "(a+)+";`
+        # inside an ast-grep rule is a fixture, not a compiled regex.
+        exclude_regex=re.compile(r"(?:^|[^A-Za-z0-9_])(?:pattern|regex):|- (?:pattern|regex)\b"),
     ),
     Pattern(
         category=15,
@@ -161,5 +167,6 @@ PATTERNS: list[Pattern] = [
         title="Notebooks contain outputs",
         regex=re.compile(r'"outputs":[ \t]*\[[ \t]*\{'),
         thresholds=((5, "info"),),
+        scan_strings=True,  # notebooks are JSON, not a Python token stream
     ),
 ]

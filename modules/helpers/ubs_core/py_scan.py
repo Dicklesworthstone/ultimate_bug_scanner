@@ -36,9 +36,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import RunContext
+from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
+
+# Files whose text is a Python token stream (so string blanking is valid).
+_PY_SUFFIXES = frozenset({".py", ".pyi"})
 
 _CATEGORY_SLUGS = {
     1: "none", 2: "numeric", 3: "collections", 4: "comparison",
@@ -121,6 +126,20 @@ class Pattern:
     reports nothing — mirroring the legacy `warning >15 / info >0` ladders.
     gate_regex expresses legacy project-wide preconditions;
     suppress_when_regex expresses count-comparison silences.
+
+    Two precision controls sit on top of the legacy semantics:
+
+    ``scan_strings`` — by default a pattern is matched against source with
+    **string literals blanked out** (comments are kept, so marker rules such
+    as py.code-quality.tech-debt still see `# TODO`). A rule whose evidence
+    genuinely lives inside a literal — a regex source, a logged secret, a
+    concatenated string — sets ``scan_strings=True`` to opt back into raw
+    text. Blanking is offset-preserving, so line numbers never move, and the
+    reported code sample is always taken from the raw line.
+
+    ``exclude_file_regex`` — skip a whole file for this pattern when its raw
+    text matches. Used for rules whose finding depends on the *role* of the
+    module rather than the line (a CLI entry point prints by design).
     """
 
     category: int
@@ -132,17 +151,28 @@ class Pattern:
     exclude_regex: re.Pattern[str] | None = None  # legacy `grep -v` post-filters
     gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
     suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide silencer
+    scan_strings: bool = False  # match inside string literals too
+    exclude_file_regex: re.Pattern[str] | None = None  # skip files whose text matches
 
 
-def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
-    """Yield (line_number, line_text) for matches, skipping excluded lines."""
+def iter_matches(
+    pattern: Pattern, text: str, raw_text: str | None = None
+) -> Iterable[tuple[int, str]]:
+    """Yield (line_number, line_text) for matches, skipping excluded lines.
+
+    ``text`` is what the regex runs against (string-blanked unless the pattern
+    opted out); ``raw_text`` is the original source used for the ubs:ignore
+    check, the exclude_regex post-filter and the reported code sample. Blanking
+    preserves offsets, so both share one coordinate system.
+    """
+    source = raw_text if raw_text is not None else text
     for match in pattern.regex.finditer(text):
         line_no = text.count("\n", 0, match.start()) + 1
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line_end = text.find("\n", match.start())
+        line_start = source.rfind("\n", 0, match.start()) + 1
+        line_end = source.find("\n", match.start())
         if line_end == -1:
-            line_end = len(text)
-        line_text = text[line_start:line_end]
+            line_end = len(source)
+        line_text = source[line_start:line_end]
         if MARKER in line_text:
             continue  # legacy count_lines drops marker lines from counts
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
@@ -173,6 +203,12 @@ def scan_patterns(
     a pattern carries the same severity, so summed counters equal the legacy
     print_finding buckets.
 
+    Python sources are matched with string literals blanked (comments kept)
+    unless a pattern sets ``scan_strings``; see Pattern. Without that, a
+    project that stores code snippets in literals — a linter's own rule
+    tables, a template, a test fixture embedded as a string — has every
+    snippet reported as if it were live code.
+
     Returns severity counters ({"critical": n, "warning": n, "info": n}).
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -198,6 +234,24 @@ def scan_patterns(
                 texts[path] = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
+    masked: dict[Path, str] = {}
+
+    def _scan_text(path: Path, text: str) -> str:
+        """String-blanked view of a Python source, comments preserved."""
+        if path.suffix.lower() not in _PY_SUFFIXES:
+            return text  # notebooks/requirements are not Python token streams
+        cached = masked.get(path)
+        if cached is None:
+            try:
+                cached = strip_comments_and_strings(
+                    text, lang="python", strip_strings=True,
+                    strip_comments=True, preserve_comments=True,
+                )
+            except Exception:  # a masker failure must not lose the rule
+                cached = text
+            masked[path] = cached
+        return cached
+
     for pattern in active:
         if pattern.gate_regex is not None and not any(
             pattern.gate_regex.search(text) for text in texts.values()
@@ -212,7 +266,10 @@ def scan_patterns(
         for path, text in texts.items():
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue
-            for line_no, line_text in iter_matches(pattern, text):
+            if pattern.exclude_file_regex is not None and pattern.exclude_file_regex.search(text):
+                continue
+            scan_text = text if pattern.scan_strings else _scan_text(path, text)
+            for line_no, line_text in iter_matches(pattern, scan_text, text):
                 key = (path, line_no)
                 if key in seen:
                     continue
@@ -443,11 +500,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
-    records = [
-        json.loads(line)
-        for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    records = read_ndjson(args.sink)
     by_rule: dict[str, list[dict]] = {}
     for rec in records:
         by_rule.setdefault(rec["rule"], []).append(rec)
@@ -681,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
 
     if args.json_out:
-        records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        records = read_ndjson(args.sink)
         import datetime
 
         legacy_findings = _legacy_report(records, args.version)["findings"]

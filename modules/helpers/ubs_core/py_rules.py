@@ -121,12 +121,11 @@ message: "Use 'is (not) None' instead of '== None' or '!= None"
 language: python
 rule:
   any:
-    - pattern: $X is True
-    - pattern: $X is False
     - pattern: $X is 0
     - pattern: $X is 1
+    - pattern: $X is -1
 severity: warning
-message: "Avoid 'is' for literal comparison; use '==' (except None uses 'is')"
+message: "Avoid 'is' for int/str literals; small-int identity is a CPython implementation detail"
 ''',
     ),
     (
@@ -722,7 +721,14 @@ rule:
   pattern: json.load($F)
   not:
     inside:
+      # Same fix as py.json.loads-no-try: without `stopBy: end` this only
+      # looked at the immediate parent, so `try: x = json.load(f)` — three
+      # nodes below the try_statement — was reported as unguarded, and a
+      # `try:` with no except clause counted as protection.
       kind: try_statement
+      stopBy: end
+      has:
+        kind: except_clause
 severity: warning
 message: "json.load() without try/except crashes on malformed JSON or empty files"
 ''',

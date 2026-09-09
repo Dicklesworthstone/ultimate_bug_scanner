@@ -8,9 +8,11 @@ Faithful ports of the legacy rg pipelines in modules/ubs-python.sh:
 - CATEGORY 2 NUMERIC / ARITHMETIC PITFALLS (10763-10774): float equality,
   modulo by variable. Division is an ast walker port:
   ubs_core.py_detectors.division.
-- CATEGORY 3 COLLECTION SAFETY (10785-10792, 10855-10859): index arithmetic
-  `arr[i±k]` and len(x) comparisons. Mutation-during-iteration is a heredoc
-  detector port: ubs_core.py_detectors.mutation_during_iteration.
+- CATEGORY 3 COLLECTION SAFETY (10855-10859): len(x) comparisons. Index
+  arithmetic `arr[i±k]` (10785-10792) needs to know whether the offset is
+  bounded, which a line regex cannot, so it is an ast walker port:
+  ubs_core.py_detectors.index_arithmetic. Mutation-during-iteration is a
+  heredoc detector port: ubs_core.py_detectors.mutation_during_iteration.
 - CATEGORY 4 COMPARISON & TYPE CHECKING TRAPS (10874-10879): type(x) ==/is T.
   The `is <literal>` heredoc already lives in ubs_core.py_detectors.is_literal.
 
@@ -61,17 +63,6 @@ PATTERNS: list[Pattern] = [
         thresholds=((10, "info"),),
     ),
     # ── Category 3: COLLECTION SAFETY ───────────────────────────────────────
-    Pattern(
-        category=3,
-        rule_id="py.collections.index-arithmetic",
-        title="Array index arithmetic - verify bounds",
-        # legacy ladder (10786-10791): warning >12 "Array index arithmetic -
-        # verify bounds", else info >0 "Index arithmetic present - review".
-        # One pattern carries one title; it follows the dominant (warning)
-        # tier while the threshold ladder keeps first-match-wins severity.
-        regex=re.compile(r"\[[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*[+\-][ \t]*[0-9]+[ \t]*\]"),
-        thresholds=((12, "warning"), (0, "info")),
-    ),
     Pattern(
         category=3,
         rule_id="py.collections.len-zero",

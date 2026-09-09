@@ -156,9 +156,15 @@ PATTERNS: list[Pattern] = [
         rule_id="py.deprecations.deprecated-api",
         title="Deprecated API usage",
         # legacy 11867: `^from[[:space:]]+imp[[:space:]]+import|^import[[:space:]]+imp|asyncio\.get_event_loop\(`.
-        # `^import imp` substring-matches `import importlib` in legacy too — quirk kept.
+        # The legacy `^import imp` had no right-hand boundary, so it matched
+        # `import importlib` (and `import impl`, `import important_thing`) —
+        # every modern file that imports importlib was reported as using the
+        # removed `imp` module. The boundary is restored here; `import imp`
+        # and `import imp as x` still match.
         regex=re.compile(
-            r"(?m)^from[ \t]+imp[ \t]+import|^import[ \t]+imp|asyncio\.get_event_loop\("
+            r"(?m)^from[ \t]+imp[ \t]+import"
+            r"|^import[ \t]+imp(?![A-Za-z0-9_])"
+            r"|asyncio\.get_event_loop\("
         ),
         thresholds=((0, "warning"),),
     ),

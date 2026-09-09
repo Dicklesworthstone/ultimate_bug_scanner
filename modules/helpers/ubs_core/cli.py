@@ -18,6 +18,7 @@ import json
 import sys
 from pathlib import Path
 
+from ubs_core.io import parse_ndjson_lines
 from ubs_core.registry import LAYERS, RunContext, get as get_analyzer, run_layer, run_scan
 
 PROGRAM = "python3 -m ubs_core"
@@ -26,7 +27,10 @@ PROGRAM = "python3 -m ubs_core"
 def _load_json_option(value: str | None) -> dict:
     if not value:
         return {}
-    data = json.loads(Path(value).read_text(encoding="utf-8"))
+    try:
+        data = json.loads(Path(value).read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"profile/rules JSON is not valid JSON: {value}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"profile/rules JSON must be an object: {value}")
     return data
@@ -109,7 +113,7 @@ def _run_suppress(args: argparse.Namespace) -> int:
         raw_lines = sys.stdin.read().splitlines()
     else:
         raw_lines = Path(args.findings).read_text(encoding="utf-8").splitlines()
-    findings = [json.loads(line) for line in raw_lines if line.strip()]
+    findings = parse_ndjson_lines(raw_lines, args.findings or "<stdin>")
 
     indexes: dict[str, object] = {}
     kept: list[dict] = []

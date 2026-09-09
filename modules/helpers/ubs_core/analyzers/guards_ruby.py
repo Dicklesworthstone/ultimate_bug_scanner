@@ -167,6 +167,8 @@ def _selftest_main_emit_dialect() -> None:
         with contextlib.redirect_stdout(buf):
             rc = main(["guards_ruby.py", str(stream), "1"])
     assert rc == 0
+    # Self-test: buf holds this process's own json.dumps output and the
+    # next assert pins it byte for byte. ubs:ignore[py.parsing.json-loads-no-try]
     payload = json.loads(buf.getvalue())
     assert payload == {
         "unguarded": 2,

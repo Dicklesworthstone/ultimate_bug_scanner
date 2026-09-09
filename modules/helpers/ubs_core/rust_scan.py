@@ -701,6 +701,21 @@ def _emit_guard_matches(project_dir: Path) -> Path | None:
 _AST_GREP_CACHE: str | None = None
 
 
+def _probe(binary: str, flag: str) -> str:
+    """Run `binary flag` with no stdin and a short timeout; '' on any failure."""
+    try:
+        completed = subprocess.run(
+            [binary, flag],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return completed.stdout or ""
+
+
 def _ast_grep_bin() -> str | None:
     """Legacy check_ast_grep (7040-7062): ast-grep, or an ast-grep `sg`."""
     global _AST_GREP_CACHE
@@ -715,9 +730,12 @@ def _ast_grep_bin() -> str | None:
         return _AST_GREP_CACHE
     sg = shutil.which("sg")
     if sg:
-        out = subprocess.run([sg, "--version"], capture_output=True, text=True).stdout
+        # `sg` is also the name of util-linux's setgid launcher, which reads
+        # from stdin and never exits on its own. Probe it with a bounded
+        # timeout and closed stdin so a wrong `sg` cannot hang the scan.
+        out = _probe(sg, "--version")
         if "ast-grep" not in out.lower():
-            out = subprocess.run([sg, "--help"], capture_output=True, text=True).stdout
+            out = _probe(sg, "--help")
         if "ast-grep" in out.lower():
             _AST_GREP_CACHE = sg
             return _AST_GREP_CACHE

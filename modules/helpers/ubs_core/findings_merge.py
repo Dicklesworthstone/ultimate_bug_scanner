@@ -196,7 +196,10 @@ def merge(
     """
     if not combined_path.is_file() or combined_path.stat().st_size == 0:
         raise ValueError(f"combined summary missing or empty: {combined_path}")
-    doc = json.loads(combined_path.read_text(encoding="utf-8"))
+    try:
+        doc = json.loads(combined_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"combined summary is not valid JSON: {combined_path}: {exc}") from exc
     if not isinstance(doc, dict):
         raise ValueError("combined summary is not a JSON object")
 

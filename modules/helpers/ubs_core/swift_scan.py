@@ -41,6 +41,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
+from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 
@@ -1136,7 +1137,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_out:
         import datetime
 
-        records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        records = read_ndjson(args.sink)
         profile_data = {
             "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
             "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
@@ -1164,7 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        records = read_ndjson(args.sink)
         renderer = _Renderer(args, records)
         renderer.render(skip)
         Path(args.text_out).write_text(renderer.text(), encoding="utf-8")

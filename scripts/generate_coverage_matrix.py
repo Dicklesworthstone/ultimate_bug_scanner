@@ -39,7 +39,10 @@ def load_registry() -> dict[str, Any]:
     text = REGISTRY_PATH.read_text(encoding="utf-8").strip()
     if text.startswith("{") and text.endswith("}"):
         import json
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise SystemExit(f"{REGISTRY_PATH} is not valid JSON: {exc}") from exc
     try:
         import yaml
         with REGISTRY_PATH.open("r", encoding="utf-8") as f:

@@ -37,14 +37,19 @@ SECURITY_TERMS = (
     'confirmation', 'magiclink', 'recovery', 'signature',
 )
 ASSIGN_RE = re.compile(
+    # The type-token class must not contain a space: with one, it overlapped
+    # the `\s+` separator and the enclosing `+` made the split ambiguous —
+    # ~6x per extra token, so a 40-token line of a scanned Java/Kotlin file hung the
+    # scan (ReDoS on attacker-supplied source). Multi-token generics still
+    # match: the outer `+` re-enters after the space.
     r'^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*'
     r'(?:(?:public|private|protected|internal|static|final|volatile|transient|var|val)\s+)*'
-    r'(?:(?:[\w.$<>?,\[\]]+\s+)+)?(?:this\.)?'
+    r'(?:[\w.$<>?,\[\]]+\s+)*(?:this\.)?'
     r'(?P<lhs>[A-Za-z_$][A-Za-z0-9_$]*)(?:\s*:\s*[\w.$<>?,\[\]]+)?\s*=\s*(?P<rhs>.+)'
 )
 FUNC_RE = re.compile(
     r'^\s*(?:(?:public|private|protected|static|final|synchronized|abstract|native)\s+)*'
-    r'(?:[A-Za-z_$][A-Za-z0-9_$.<>, ?\[\]]+\s+)+'
+    r'(?:[A-Za-z_$][A-Za-z0-9_$.<>,?\[\]]+\s+)+'
     r'(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*\([^;]*\)\s*(?:throws\s+[^{]+)?\{?'
 )
 KOTLIN_FUNC_RE = re.compile(

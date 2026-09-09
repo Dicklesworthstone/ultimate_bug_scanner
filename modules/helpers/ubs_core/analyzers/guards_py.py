@@ -250,6 +250,8 @@ def _selftest_main_emit_dialect(tmp_prefix: str = "ubs_core_guards_py_") -> None
                 assert main() == 0
         finally:
             sys.argv = old_argv
+    # Self-test: buf holds this process's own json.dumps output and the
+    # next assert pins it byte for byte. ubs:ignore[py.parsing.json-loads-no-try]
     payload = json.loads(buf.getvalue())
     assert buf.getvalue() == (
         json.dumps({'unguarded': 2, 'guarded': 1, 'samples': [

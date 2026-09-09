@@ -40,14 +40,19 @@ SECURITY_TERMS = (
     'confirmation', 'magiclink', 'recovery', 'signature',
 )
 ASSIGN_RE = re.compile(
+    # The type-token class must not contain a space: with one, it overlapped
+    # the `\s+` separator and the enclosing `+` made the split ambiguous —
+    # ~6x per extra token, so a 40-token line of a scanned C# file hung the
+    # scan (ReDoS on attacker-supplied source). Multi-token generics still
+    # match: the outer `+` re-enters after the space.
     r'^\s*(?:\[[^\]]+\]\s*)*'
     r'(?:(?:public|private|protected|internal|static|readonly|const|volatile|var)\s+)*'
-    r'(?:(?:[A-Za-z_][A-Za-z0-9_.<>, ?\[\]]+\s+)+)?(?:this\.)?'
+    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)*(?:this\.)?'
     r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)'
 )
 METHOD_RE = re.compile(
     r'^\s*(?:(?:public|private|protected|internal|static|async|virtual|override|sealed|partial|readonly)\s+)*'
-    r'(?:[A-Za-z_][A-Za-z0-9_.<>, ?\[\]]+\s+)+'
+    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)+'
     r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*(?:=>|\{)?'
 )
 UNSAFE_CTOR_RE = re.compile(r'\bnew\s+(?:System\.)?Random\s*\(')

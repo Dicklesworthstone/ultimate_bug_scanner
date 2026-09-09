@@ -40,7 +40,9 @@ SOURCE_RE = re.compile(
 ANNOTATED_PARAM_RE = re.compile(
     r'\[(?:FromQuery|FromHeader|FromRoute|FromForm|FromBody|FromCookie)'
     r'(?:\s*\([^]]*\))?\]\s*'
-    r'(?:[A-Za-z_][A-Za-z0-9_.<>, ?\[\]]+\s+)+'
+    # No space in the class: it overlapped `\s+` under the enclosing `+`
+    # and made this an exponential-backtracking match on a long line.
+    r'(?:[A-Za-z_][A-Za-z0-9_.<>,?\[\]]+\s+)+'
     r'(?P<name>[A-Za-z_][A-Za-z0-9_]*)',
     re.IGNORECASE | re.MULTILINE,
 )

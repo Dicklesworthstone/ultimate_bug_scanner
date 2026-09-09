@@ -111,6 +111,8 @@ if __name__ == "__main__":
     cli_root = None
     if "--root" in args:
         i = args.index("--root")
+        if i + 1 >= len(args):
+            raise SystemExit("--root requires a directory argument")
         cli_root = Path(args[i + 1])
         del args[i:i + 2]
     root_files = [Path(p) for p in args]

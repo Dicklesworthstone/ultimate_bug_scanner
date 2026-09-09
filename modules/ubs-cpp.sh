@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="7cd29440599983c0aed356590be935b32c15a631d07deec39c6cff9a47940db8"
+UBS_LIB_CHECKSUM="2e9e6277ff9edf438bd4b42469a9392b1d3f84ee91ed41efe6273cd434059e00"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -106,6 +106,8 @@ SCAN_HIDDEN=0
 MAX_FILESIZE=""
 PATHS_FILE=""
 LIST_CATS=0
+LIST_RULES=0
+DUMP_RULES_DIR=""
 REPORT_JSON=""
 FILES_FROM=""
 
@@ -129,6 +131,8 @@ Options:
   --only=CSV               Run only these categories (e.g. --only=1,7,12)
   --fail-on-warning        Exit non-zero on warnings or critical
   --rules=DIR              Additional ast-grep rules directory (merged)
+  --dump-rules=DIR         Dump generated ast rules + config
+  --list-rules             List generated ast-grep rule IDs and exit
   --respect-gitignore=0|1  Respect VCS ignore (default: 1)
   --hidden=0|1           Scan hidden files/dirs (default: 0)
   --max-filesize=SIZE      Max file size for rg (e.g. 1M, 5M)
@@ -160,6 +164,9 @@ while [[ $# -gt 0 ]]; do
     --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
     --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
+    --dump-rules) DUMP_RULES_DIR="${2:-}"; shift 2;;
+    --list-rules) LIST_RULES=1; shift;;
     --respect-gitignore=*) RESPECT_GITIGNORE="${1#*=}"; shift;;
     --respect-gitignore)   RESPECT_GITIGNORE=1; shift;;
     --hidden=*)   SCAN_HIDDEN="${1#*=}"; shift;;
@@ -221,6 +228,29 @@ if [[ "${LIST_CATS:-0}" -eq 1 ]]; then
 16 Resource Lifecycle Correlation
 AST AST-Grep Rule Pack Findings
 CATS
+  exit 0
+fi
+
+# Early list-rules helper
+if [[ "${LIST_RULES:-0}" -eq 1 ]]; then
+  if ! command -v ast-grep >/dev/null 2>&1 || [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" == "1" ]]; then
+    echo "ERROR: --list-rules requires ast-grep." >&2
+    exit 2
+  fi
+  helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-cpp-rules.XXXXXX)"
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.cpp_rules import generate
+generate(Path('$tmp_rules'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null || true
+  if [[ -n "$DUMP_RULES_DIR" ]]; then
+    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
+    cp "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+  fi
+  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | sort -u
+  rm -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
 

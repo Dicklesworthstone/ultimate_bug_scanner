@@ -582,15 +582,15 @@ def _tls_indirect(files: Sequence[Path], title: str, rule: str) -> list[dict]:
 def _exec_shell(files: Sequence[Path], ast_matches: dict) -> list[dict]:
     # ubs-golang.sh 7535-7543: AST rule first, regex fallback through
     # count_lines (marker-filtered).
-    rule = "go.security.exec-shell"
     title = "exec.Command shell interpreter detected"
     hits = ast_matches.get("go.exec-sh-c") or []
     if hits:
         return [
-            _rec(rule, 9, "critical", m["path"], m["line"],
+            _rec("go.exec-sh-c", 9, "critical", m["path"], m["line"],
                  f"{title}: {m['text']}" if m["text"] else title)
             for m in hits
         ]
+    rule = "go.security.exec-shell"
     fallback_re = re.compile(
         r'exec\.Command(Context)?\(\s*"(sh|bash)"\s*,\s*"-?c"'
         r'|exec\.Command(Context)?\(\s*"cmd"\s*,\s*"/C"'

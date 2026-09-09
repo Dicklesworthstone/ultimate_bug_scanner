@@ -523,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fail-on-warning", action="store_true")
     parser.add_argument("--enable-new-analyzers", action="store_true",
                         help="run analyzers with no legacy counterpart (guards_elixir, narrowing_elixir)")
+    parser.add_argument("--ast-rule-dir", default="", help="directory of ast-grep rules to run")
     args = parser.parse_args(argv)
 
     if args.files_from in ("-", ""):
@@ -544,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
         lang="elixir",
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
-        custom_rules="",
+        custom_rules=args.ast_rule_dir,
         extra=f"new_analyzers={args.enable_new_analyzers}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
@@ -552,8 +553,24 @@ def main(argv: list[str] | None = None) -> int:
     capturing_sink = None
     if files_to_scan:
         elixir_analyzers = [a.name for a in analyzers_for_lang("elixir")]
+        ast_rules_input = []
+        if args.ast_rule_dir:
+            from ubs_core.elixir_rules import _RULES
+            ast_rules_input = list(_RULES)
+            rules_dir = Path(args.ast_rule_dir)
+            for rf in rules_dir.glob("*.yml"):
+                if rf.name.startswith(("sgconfig", "sgbase")):
+                    continue
+                try:
+                    text = rf.read_text(encoding="utf-8", errors="ignore")
+                    id_m = re.search(r"id:\s*(\S+)", text)
+                    rid = id_m.group(1) if id_m else rf.stem
+                    ast_rules_input.append((rid, text))
+                except OSError:
+                    pass
+
         prefilter_index = build_prefilter_index(
-            ast_rules=[],
+            ast_rules=ast_rules_input,
             patterns=patterns,
             analyzers=elixir_analyzers,
             lang="elixir",
@@ -564,6 +581,21 @@ def main(argv: list[str] | None = None) -> int:
         scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        if args.ast_rule_dir:
+            from ubs_core.elixir_ast import scan_all
+            from ubs_core.elixir_rules import CATEGORY_MAP, SEVERITY_MAP
+
+            ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
+            base_dir = Path(args.project_dir or args.project or ".")
+            scan_all(
+                Path(args.ast_rule_dir), ast_files, capturing_sink,
+                severity_overrides=dict(SEVERITY_MAP),
+                count_only=None,
+                skip=skip,
+                rule_category=CATEGORY_MAP,
+                slug_for_rule=lambda cat: _CATEGORY_SLUGS.get(cat, "ast"),
+                base_dir=base_dir,
+            )
         cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
         from ubs_core.prefilter import PrefilterResult

@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="7cd29440599983c0aed356590be935b32c15a631d07deec39c6cff9a47940db8"
+UBS_LIB_CHECKSUM="2e9e6277ff9edf438bd4b42469a9392b1d3f84ee91ed41efe6273cd434059e00"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -66,6 +66,9 @@ PROJECT_DIR="."
 OUTPUT_FILE=""
 FORMAT="text"          # text|json|sarif
 LIST_CATS=0
+LIST_RULES=0
+DUMP_RULES_DIR=""
+USER_RULE_DIR=""
 CI_MODE=0
 FAIL_ON_WARNING=0
 INCLUDE_EXT="ex,exs,eex,heex,leex,sface"
@@ -132,6 +135,9 @@ Options:
   --summary-json=FILE      Save brief summary counters JSON
   --report-json=FILE       Also write the NDJSON findings record stream (contract-v2 sink)
   --list-categories        Print numeric category map and exit
+  --list-rules             List generated ast-grep rule IDs and exit
+  --dump-rules=DIR         Dump generated ast-grep rules to DIR
+  --rules=DIR              Additional ast-grep rules directory (merged)
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
   --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
@@ -168,6 +174,10 @@ while [[ $# -gt 0 ]]; do
     --files-from=*) FILES_FROM="${1#*=}"; shift;;
     --files-from)   FILES_FROM="${2:-}"; shift 2;;
     --list-categories) LIST_CATS=1; shift;;
+    --list-rules) LIST_RULES=1; shift;;
+    --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
+    --dump-rules) DUMP_RULES_DIR="${2:-}"; shift 2;;
+    --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
@@ -241,6 +251,29 @@ if [[ "$LIST_CATS" -eq 1 ]]; then
 15 String & Binary Safety
 16 Mix-Powered Extra Analyzers
 CATS
+  exit 0
+fi
+
+# Early list-rules helper
+if [[ "${LIST_RULES:-0}" -eq 1 ]]; then
+  if ! command -v ast-grep >/dev/null 2>&1 || [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" == "1" ]]; then
+    echo "ERROR: --list-rules requires ast-grep." >&2
+    exit 2
+  fi
+  helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-ex-rules.XXXXXX)"
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.elixir_rules import generate
+generate(Path('$tmp_rules'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null || true
+  if [[ -n "$DUMP_RULES_DIR" ]]; then
+    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
+    cp "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+  fi
+  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | sort -u
+  rm -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
 
@@ -581,8 +614,25 @@ run_contract_v2_elixir(){
       ;;
     *) echo "ERROR: contract-v2 elixir path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
   esac
+  local ast_rule_dir=""
+  if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-exv2-rules.XXXXXX)"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.elixir_rules import generate
+generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+" 2>/dev/null; then
+      ast_rule_dir=""
+    fi
+    if [[ -n "$DUMP_RULES_DIR" && -n "$ast_rule_dir" ]]; then
+      mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
+      cp "$ast_rule_dir"/rules/*.yml "$ast_rule_dir"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+    fi
+  fi
+  [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.elixir_scan \
     "${scan_args[@]}" --version "1.0.2" || exit_code=$?
+  [[ -n "$ast_rule_dir" ]] && rm -rf "$ast_rule_dir" 2>/dev/null || true
   if [[ "$FORMAT" == "sarif" ]]; then
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=$?
     rm -f "$v2_json_out" 2>/dev/null || true

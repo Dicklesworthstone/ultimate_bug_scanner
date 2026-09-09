@@ -33,11 +33,15 @@ _MESSAGE = {
 def load_stream(path):
     data = []
     try:
-        for line in open(path, 'r', encoding='utf-8'):
-            line=line.strip()
-            if not line: continue
-            try: data.append(json.loads(line))
-            except Exception: pass
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data.append(json.loads(line))
+                except Exception:
+                    pass
     except FileNotFoundError: pass
     return data
 

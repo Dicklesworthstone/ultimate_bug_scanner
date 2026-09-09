@@ -4,3 +4,4 @@
 
 test-suite/
 rule-quality-variants/
+tmp-rel-*

@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="7cd29440599983c0aed356590be935b32c15a631d07deec39c6cff9a47940db8"
+UBS_LIB_CHECKSUM="2e9e6277ff9edf438bd4b42469a9392b1d3f84ee91ed41efe6273cd434059e00"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -361,6 +361,11 @@ from pathlib import Path
 from ubs_core.swift_rules import generate
 generate(Path('$ast_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
 " 2>/dev/null || true
+
+  if [[ -n "$DUMP_RULES_DIR" ]]; then
+    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
+    cp "$ast_dir"/rules/*.yml "$ast_dir"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+  fi
 
   if [[ "$LIST_RULES" -eq 1 ]]; then
     list_generated_ast_rule_ids "$ast_dir"

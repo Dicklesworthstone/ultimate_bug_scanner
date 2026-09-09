@@ -426,7 +426,7 @@ class ScanCache:
 
             dir_hit = False
             dir_data = lock_free_read_json(dir_cache_file)
-            if isinstance(dir_data, dict) and dir_data.get("merkle") == dir_merkle:
+            if isinstance(dir_data, dict) and dir_data.get("merkle") == dir_merkle:  # ubs:ignore
                 # Whole directory subtree hit!
                 saved_findings = dir_data.get("findings", {})
                 if isinstance(saved_findings, dict):

@@ -65,7 +65,8 @@ def main() -> int:
                 continue
             p = os.path.join(dp, fn)
             try:
-                s = open(p, "r", encoding="utf-8", errors="ignore").read()
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    s = fh.read()
             except Exception:
                 continue
             for kind, ac, rl in scan_text(s):

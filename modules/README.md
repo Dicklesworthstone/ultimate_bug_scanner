@@ -18,8 +18,8 @@ Options:
 --skip=CSV         skip category numbers (numbers differ per module)
 --report-json=FILE write NDJSON findings sink to FILE
 --files-from=FILE  NUL-separated file list to scan (meta-runner contract v2 hand-off)
---rules=DIR        merge custom ast-grep rules into the built-in pack (all modules except elixir)
---list-rules       print generated ast-grep rule ids and exit (js, golang, rust, java, kotlin, ruby, swift, csharp, bash)
+--rules=DIR        merge custom ast-grep rules into the built-in pack (all modules)
+--list-rules       print generated ast-grep rule ids and exit (all modules)
 --dump-rules=DIR   write the generated ast-grep rules to DIR (same modules as --list-rules)
 --list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin)
 -h, --help         this help

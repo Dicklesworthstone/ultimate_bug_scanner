@@ -28,9 +28,9 @@ PATTERNS: list[Pattern] = [
         category=7,
         rule_id="py.security.eval-exec-usage",
         title="eval()/exec() present",
-        regex=re.compile(r"(?<![A-Za-z0-9_])eval\(|(?<![A-Za-z0-9_])exec\("),
+        regex=re.compile(r"(?<![A-Za-z0-9_.])eval\([^\s)]|(?<![A-Za-z0-9_.])exec\([^\s)]"),
         thresholds=((0, "critical"),),
-        exclude_regex=re.compile(r"pattern:|\bdef\s"),
+        exclude_regex=re.compile(r"pattern:|\bdef\s|title=|\bmessage:|^[ \t]*#|^[ \t]*[\"']"),
     ),
     Pattern(
         category=7,
@@ -93,5 +93,6 @@ PATTERNS: list[Pattern] = [
         title="Insecure tempfile.mktemp usage",
         regex=re.compile(r"tempfile\.mktemp\("),
         thresholds=((0, "critical"),),
+        exclude_regex=re.compile(r"pattern:|\bdef\s|title=|\bmessage:|^[ \t]*#|^[ \t]*[\"']"),
     ),
 ]

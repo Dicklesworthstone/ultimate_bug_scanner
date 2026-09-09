@@ -163,34 +163,40 @@
         "swift"
       ],
       "documented": true,
-      "doc": "merge custom ast-grep rules into the built-in pack (all modules except elixir)"
+      "doc": "merge custom ast-grep rules into the built-in pack (all modules)"
     },
     {
       "flag": "--list-rules",
       "modules": [
         "bash",
+        "cpp",
         "csharp",
+        "elixir",
         "golang",
         "java",
         "js",
         "kotlin",
+        "python",
         "ruby",
         "rust",
         "swift"
       ],
       "documented": true,
-      "doc": "print generated ast-grep rule ids and exit (js, golang, rust, java, kotlin, ruby, swift, csharp, bash)"
+      "doc": "print generated ast-grep rule ids and exit (all modules)"
     },
     {
       "flag": "--dump-rules",
       "value": "DIR",
       "modules": [
         "bash",
+        "cpp",
         "csharp",
+        "elixir",
         "golang",
         "java",
         "js",
         "kotlin",
+        "python",
         "ruby",
         "rust",
         "swift"
@@ -302,8 +308,10 @@
       "contract": 2,
       "extra_flags": [
         "--baseline",
+        "--dump-rules",
         "--force-color",
         "--list-categories",
+        "--list-rules",
         "--max-detailed",
         "--max-file-size",
         "--max-samples",
@@ -349,8 +357,10 @@
       "contract": 2,
       "extra_flags": [
         "--counts",
+        "--dump-rules",
         "--hidden",
         "--list-categories",
+        "--list-rules",
         "--max-filesize",
         "--only",
         "--paths-from",
@@ -596,10 +606,14 @@
       ],
       "contract": 2,
       "extra_flags": [
+        "--dump-rules",
         "--ex-tools",
         "--json-out",
+        "--list-categories",
+        "--list-rules",
         "--no-mix",
         "--only",
+        "--rules",
         "--sarif-out",
         "--summary-json",
         "--very-verbose"

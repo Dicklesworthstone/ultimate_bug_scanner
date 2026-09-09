@@ -141,9 +141,9 @@ check_rule_list() {
     echo "❌ $module --list-rules returned $count rule ids; expected at least $min_count" >&2
     return 1
   fi
-  if grep -Ev "^(${prefix_regex})\\.[A-Za-z0-9_.-]+$" "$out" >/dev/null; then
+  if grep -Ev "^(${prefix_regex})[.-][A-Za-z0-9_.-]+$" "$out" >/dev/null; then
     echo "❌ $module --list-rules emitted non-rule output:" >&2
-    grep -Env "^(${prefix_regex})\\.[A-Za-z0-9_.-]+$" "$out" >&2 || true
+    grep -Env "^(${prefix_regex})[.-][A-Za-z0-9_.-]+$" "$out" >&2 || true
     return 1
   fi
   if ! cmp -s "$out" "$dumped_ids"; then
@@ -173,6 +173,34 @@ run_step rule-inventory-rust check_rule_list "ubs-rust.sh" "rust" 70 \
   "rust.unwrap-call" \
   "rust.unwrap-unchecked" \
   "rust.tokio-spawn-no-handle"
+run_step rule-inventory-swift check_rule_list "ubs-swift.sh" "swift" 20 \
+  "swift.urlsession.task-no-resume" \
+  "swift.force-try" \
+  "swift.md5-digest"
+run_step rule-inventory-csharp check_rule_list "ubs-csharp.sh" "cs" 20 \
+  "cs-async-discarded-task-run" \
+  "cs-await-in-lock" \
+  "cs-weak-random"
+run_step rule-inventory-elixir check_rule_list "ubs-elixir.sh" "elixir" 25 \
+  "elixir.code-eval-string" \
+  "elixir.crypto-md5" \
+  "elixir.binary-to-term-unsafe"
+run_step rule-inventory-python check_rule_list "ubs-python.sh" "py" 50 \
+  "py.async.task-no-await" \
+  "py.assert-used" \
+  "py.eval-exec"
+run_step rule-inventory-cpp check_rule_list "ubs-cpp.sh" "cpp" 30 \
+  "cpp.raw-new" \
+  "cpp.throw-in-destructor" \
+  "cpp.manual-mutex-lock"
+run_step rule-inventory-ruby check_rule_list "ubs-ruby.sh" "rb|rails|ruby" 25 \
+  "rb.eval-exec" \
+  "rails.csrf-skip" \
+  "rb.random-insecure"
+run_step rule-inventory-java check_rule_list "ubs-java.sh" "java" 20 \
+  "java.optional-get" \
+  "java.closeable-no-twr" \
+  "java.insecure-random"
 
 if command -v uv >/dev/null 2>&1; then
   PY=(uv run python)

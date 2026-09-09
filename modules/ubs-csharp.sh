@@ -26,7 +26,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="7cd29440599983c0aed356590be935b32c15a631d07deec39c6cff9a47940db8"
+UBS_LIB_CHECKSUM="2e9e6277ff9edf438bd4b42469a9392b1d3f84ee91ed41efe6273cd434059e00"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -248,55 +248,19 @@ write_ast_rules() {
   AST_RULES_DIR="$TMP_DIR/ast-rules"
   mkdir -p "$AST_RULES_DIR"
 
-  cat >"$AST_RULES_DIR/cs-async-discarded-task-run.yml"<<'YAML'
-id: cs-async-discarded-task-run
-message: "Task.Run result discarded; await or retain the Task so failures are observed."
-severity: warning
-language: csharp
-rule:
-  any:
-    - pattern: Task.Run($ARG);
-    - pattern: _ = Task.Run($ARG);
-YAML
-
-  cat >"$AST_RULES_DIR/cs-async-discarded-startnew.yml"<<'YAML'
-id: cs-async-discarded-startnew
-message: "Task.Factory.StartNew result discarded; await or retain the Task so failures are observed."
-severity: warning
-language: csharp
-rule:
-  any:
-    - pattern: Task.Factory.StartNew($ARG);
-    - pattern: _ = Task.Factory.StartNew($ARG);
-YAML
-
-  cat >"$AST_RULES_DIR/cs-await-in-lock.yml"<<'YAML'
-id: cs-await-in-lock
-message: "Await inside lock can deadlock or break monitor assumptions; move async work outside the lock."
-severity: warning
-language: csharp
-rule:
-  pattern: |
-    lock ($OBJ) { await $EXPR; }
-YAML
-
-  cat >"$AST_RULES_DIR/cs-parallel-foreach-async-lambda.yml"<<'YAML'
-id: cs-parallel-foreach-async-lambda
-message: "Parallel.ForEach with async lambda does not await the async work; use Parallel.ForEachAsync or gather Tasks."
-severity: warning
-language: csharp
-rule:
-  any:
-    - pattern: Parallel.ForEach($SRC, async $ITEM => $EXPR);
-    - pattern: Parallel.ForEach($SRC, async ($ITEM) => $EXPR);
-    - pattern: |
-        Parallel.ForEach($SRC, async $ITEM => { await $EXPR; });
-YAML
+  local helpers_dir=""
+  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from pathlib import Path
+from ubs_core.csharp_rules import generate
+generate(Path('$AST_RULES_DIR'), Path('$EXTRA_AST_RULES_DIRS') if '$EXTRA_AST_RULES_DIRS' else None)
+" 2>/dev/null || true
 
   # Config file
   AST_CONFIG_FILE="$TMP_DIR/astconfig.yml"
   cat >"$AST_CONFIG_FILE"<<YAML
 ruleDirs:
+  - $AST_RULES_DIR/rules
   - $AST_RULES_DIR
 YAML
 
@@ -312,13 +276,13 @@ YAML
 
   if [[ -n "$DUMP_RULES_DIR" ]]; then
     mkdir -p "$DUMP_RULES_DIR"
-    cp "$AST_RULES_DIR"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+    cp "$AST_RULES_DIR"/rules/*.yml "$AST_RULES_DIR"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
   fi
 }
 
 list_generated_ast_rule_ids() {
   local rules_dir="$1"
-  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rules_dir"/*.yml 2>/dev/null || true ) | sort -u
+  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rules_dir"/rules/*.yml "$rules_dir"/*.yml 2>/dev/null || true ) | sort -u
 }
 
 # ---------- categories ----------

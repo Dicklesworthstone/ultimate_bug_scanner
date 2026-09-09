@@ -187,7 +187,7 @@ def main() -> int:
 
 _KIND = {
     "Stream-like handle acquired without using/Dispose/Close": "stream_handle",
-    "CancellationTokenSource acquired without Dispose": "cts_handle",
+    "CancellationTokenSource acquired without Dispose": "cts_handle",  # ubs:ignore
     "Timer/PeriodicTimer acquired without Dispose": "timer_handle",
     "HttpRequestMessage created without Dispose": "http_request_message",
     "HttpResponseMessage result not disposed": "http_response_message",

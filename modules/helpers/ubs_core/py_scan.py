@@ -428,6 +428,8 @@ def _legacy_report(records: list[dict], version: str) -> dict:
                 "code": _sample_code(rec.get("path", ""), int(rec.get("line", 0) or 0)),
             })
         findings.append({
+            "rule": rule,
+            "rule_id": rule,
             "severity": first.get("severity", "info"),
             "count": len(recs),
             "title": _finding_title(first),

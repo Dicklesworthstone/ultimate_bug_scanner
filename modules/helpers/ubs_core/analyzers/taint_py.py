@@ -283,7 +283,7 @@ def _selftest_direct_source_sink(tmp_prefix: str = "ubs_core_taint_py_") -> None
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
         target = Path(tmp) / "view.py"
         target.write_text(
-            "render_template('hi.html', q=request.args.get('q'))\n",
+            "render_template('hi.html', q=request.args.get('q'))\n",  # ubs:ignore
             encoding="utf-8",
         )
         findings = list(run(RunContext(lang="python", files=[target])))
@@ -348,7 +348,7 @@ def _selftest_main_emit_dialect(tmp_prefix: str = "ubs_core_taint_py_main_") -> 
         target = Path(tmp) / "view.py"
         target.write_text(
             "q = request.args.get('q')\n"
-            "eval(q)\n",
+            "eval(q)\n",  # ubs:ignore
             encoding="utf-8",
         )
         buffer = io.StringIO()

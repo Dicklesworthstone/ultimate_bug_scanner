@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
+from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 
@@ -656,11 +657,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = 1
 
     if args.json_out:
-        records = [
-            json.loads(line)
-            for line in Path(sink_path).read_text(encoding="utf-8", errors="replace").splitlines()
-            if line.strip()
-        ]
+        records = read_ndjson(sink_path, errors="replace")
         profile_data = {
             "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
             "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,

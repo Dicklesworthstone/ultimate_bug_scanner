@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
+from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 
@@ -786,11 +787,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
-    records = [
-        json.loads(line)
-        for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    records = read_ndjson(args.sink)
     by_rule: dict[str, list[dict]] = {}
     for rec in records:
         by_rule.setdefault(rec["rule"], []).append(rec)
@@ -1001,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
 
     if args.json_out:
-        records = [json.loads(line) for line in Path(args.sink).read_text(encoding="utf-8").splitlines() if line.strip()]
+        records = read_ndjson(args.sink)
         import datetime
 
         doc = {

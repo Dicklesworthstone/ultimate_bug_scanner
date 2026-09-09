@@ -21,6 +21,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 
@@ -312,11 +313,7 @@ def scan_detectors(files: Sequence[Path], sink, skip: set[int]) -> None:
 
 
 def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
-    records = [
-        json.loads(line)
-        for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    records = read_ndjson(args.sink)
     by_rule: dict[str, list[dict]] = {}
     for rec in records:
         by_rule.setdefault(rec["rule"], []).append(rec)

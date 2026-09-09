@@ -1,11 +1,15 @@
-"""ubs_core.io — Line/column, location formatting, and delimiter navigation (bead A2).
+"""ubs_core.io — Line/column, location formatting, delimiter navigation, NDJSON.
 
 Stdlib-only implementation reconciling line_col, format_location, find_block_end,
-and statement extraction across UBS language helpers.
+and statement extraction across UBS language helpers, plus the shared reader for
+the NDJSON finding sinks.
 """
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
+from typing import Iterable
 
 
 def line_col(text: str, pos: int) -> tuple[int, int]:
@@ -107,3 +111,54 @@ def extract_statement_region(
         end = min(semi + 1, newline)
     return text[idx:end], end
 
+
+
+def parse_ndjson_lines(lines: Iterable[str], source: str = "") -> list[dict]:
+    """Parse NDJSON records, skipping blank and malformed lines.
+
+    The NDJSON sinks are written by this process and by helper subprocesses,
+    so a truncated final line (disk full, an interrupted run, a helper killed
+    mid-write) or a byte replaced during a lossy decode makes one line
+    unparseable. `json.loads` in a list comprehension turned that into an
+    unhandled JSONDecodeError traceback with no report at all, even though the
+    severity counters — which decide the exit code — are tallied during the
+    scan and never come from this re-read.
+
+    A skipped line is announced on stderr with its source and line number so
+    the loss is visible rather than silent; everything else is returned.
+    """
+    records: list[dict] = []
+    for line_no, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as exc:
+            where = f"{source}:{line_no}" if source else f"line {line_no}"
+            sys.stderr.write(
+                f"[ubs_core] skipping unparseable NDJSON record at {where}: {exc}\n"
+            )
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def read_ndjson(
+    path: Path | str, *, encoding: str = "utf-8", errors: str = "strict"
+) -> list[dict]:
+    """Read an NDJSON sink file through `parse_ndjson_lines`.
+
+    A missing or unreadable sink yields no records rather than raising: an
+    empty sink and an absent sink both mean "nothing was written".
+    """
+    file_path = Path(path)
+    try:
+        text = file_path.read_text(encoding=encoding, errors=errors)
+    except OSError as exc:
+        sys.stderr.write(f"[ubs_core] cannot read NDJSON sink {file_path}: {exc}\n")
+        return []
+    except UnicodeDecodeError as exc:
+        sys.stderr.write(f"[ubs_core] cannot decode NDJSON sink {file_path}: {exc}\n")
+        return []
+    return parse_ndjson_lines(text.splitlines(), str(file_path))

@@ -31,6 +31,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
+from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 
@@ -437,11 +438,7 @@ def _sample_line(meta: CheckMeta, rec: dict, detail: str) -> str:
 
 def render_text(args, ast_ran: bool, patterns: Sequence) -> None:
     """Render the record-backed sections of the legacy text report."""
-    records = [
-        json.loads(line)
-        for line in Path(args.sink).read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    records = read_ndjson(args.sink)
     by_rule: dict = {}
     for rec in records:
         by_rule.setdefault(bucket_key(rec["rule"]), []).append(rec)

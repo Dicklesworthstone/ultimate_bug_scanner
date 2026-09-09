@@ -31,6 +31,23 @@ This playbook documents how to cut and publish a signed UBS release. The release
    `MODULE_CHECKSUMS`/`HELPER_CHECKSUMS` and `SHA256SUMS`; rolls the `## [Unreleased]`
    section of `CHANGELOG.md` under `## [v5.4.0] - <date> [Release]`; verifies
    everything; then commits and creates the annotated tag `v5.4.0`. It never pushes.
+
+   **The self-scan gate runs first.** Before anything is written, the script runs
+   `./ubs . --ci --fail-on-warning` and refuses to cut the tag while it is red.
+   Because the gate sits ahead of every mutation, a red tree aborts with the
+   working tree exactly as it was — no half-bumped `VERSION`, no rolled changelog.
+   There is no opt-out: a warning UBS reports on its own source is either a real
+   defect or a false positive in a rule, and shipping either one is worse than
+   delaying the release. Reproduce a failure with the same command, fix it, and
+   re-run `cut-release.sh`.
+
+   Maintainers should also enable the local backstop once per clone, so a red
+   tree is caught at push time rather than at release time:
+
+   ```bash
+   git config core.hooksPath .githooks   # enables .githooks/pre-push (and pre-commit)
+   ```
+
 2. **Push**
    ```bash
    git push origin main --tags

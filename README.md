@@ -2262,6 +2262,42 @@ Common uv-powered entrypoints:
 - `source .venv/bin/activate && python -m pip list` – verify that every inline `python3` invocation maps to CPython 3.14.
 - `uv run python - <<'PY' …` – mirrors how the language modules embed Python helpers, but now guaranteed to execute inside the managed interpreter.
 
+### **The Self-Scan Gate**
+
+UBS has to pass its own scan. The gate is one command:
+
+```bash
+./ubs . --ci --fail-on-warning     # must exit 0: 0 critical, 0 warnings
+```
+
+A warning here is either a real defect in UBS or a false positive in a rule, and both block a release — a scanner that reports noise on its own source has no standing to report it on yours. The gate runs in two places, neither of them CI:
+
+1. **`scripts/cut-release.sh`** runs it as a sanity check *before* it writes anything. A red tree aborts the release with the working tree untouched, so there is no half-bumped state to clean up. There is no opt-out.
+2. **`.githooks/pre-push`** runs the same command before a push, so a red tree is caught on the machine that made it.
+
+### **Local Git Hooks (opt-in)**
+
+The hooks in `.githooks/` are not installed automatically. Opt in once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+That enables both:
+
+| Hook | What it does |
+|------|--------------|
+| `pre-commit` | Regenerates `MODULE_CHECKSUMS`/`HELPER_CHECKSUMS` and `SHA256SUMS` when a checksum input changed, then verifies them. Reports `br doctor` problems for `.beads/` commits without blocking. |
+| `pre-push` | Runs the self-scan gate (`./ubs . --ci --fail-on-warning`) and refuses the push when it is red. Skipped automatically for pushes that only delete refs. |
+
+The self-scan takes roughly 20 seconds on this repo. For a push that genuinely cannot wait — a docs-only fix during an incident — override it once and fix the scan in the same session:
+
+```bash
+UBS_SKIP_SELF_SCAN=1 git push
+```
+
+Turn the hooks off again with `git config --unset core.hooksPath`.
+
 ---
 
 ## 🚫 **Ignoring Paths with `.ubsignore`**

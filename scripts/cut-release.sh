@@ -6,7 +6,8 @@
 #   scripts/cut-release.sh <version> [--dry-run] [--no-commit] [--allow-dirty] [--yes]
 #
 # Steps (see docs/release.md):
-#   1. sanity: semver, tag not taken, clean tree on main (unless --allow-dirty)
+#   1. sanity: semver, tag not taken, clean tree on main (unless --allow-dirty),
+#      and the self-scan gate `./ubs . --ci --fail-on-warning` (no opt-out)
 #   2. bump VERSION, UBS_VERSION in ubs, the README version badge
 #   3. regenerate MODULE_CHECKSUMS/HELPER_CHECKSUMS (in ubs) and SHA256SUMS
 #   4. roll CHANGELOG.md: "## [Unreleased]" becomes "## [v<version>] - <date> [Release]"
@@ -76,6 +77,33 @@ if ! grep -q '^## \[Unreleased\]' CHANGELOG.md; then
   echo "error: CHANGELOG.md has no '## [Unreleased]' section to roll into $TAG" >&2
   exit 1
 fi
+
+# 1b. Self-scan gate ----------------------------------------------------------
+# UBS has to pass its own scan before it may be released: shipping a scanner
+# that reports warnings on its own source is the one defect nobody else can
+# catch for us. The gate runs here, before any file is written, so a red tree
+# aborts with the working tree untouched rather than half-bumped. There is no
+# opt-out: a red self-scan is either a real bug or a false positive in a rule,
+# and both are release blockers.
+if [[ ! -x ./ubs ]]; then
+  echo "error: ./ubs is not executable; cannot run the self-scan gate" >&2
+  exit 1
+fi
+say "Self-scan gate: ./ubs . --ci --fail-on-warning"
+# Explicit XXXXXX template: `mktemp -t <prefix>` appends the random suffix on
+# BSD/macOS but is a template with too few X's on GNU coreutils, which errors.
+ubs_tmpdir="${TMPDIR:-/tmp}"
+ubs_tmpdir="${ubs_tmpdir%/}"
+self_scan_log="$(mktemp "$ubs_tmpdir/ubs-self-scan.XXXXXX")"
+if ! ./ubs . --ci --fail-on-warning >"$self_scan_log" 2>&1; then
+  echo "error: the UBS self-scan is red; refusing to cut $TAG" >&2
+  echo "  reproduce with: ./ubs . --ci --fail-on-warning" >&2
+  echo "  full log: $self_scan_log" >&2
+  tail -n 40 "$self_scan_log" >&2
+  exit 1
+fi
+rm -f "$self_scan_log"
+say "self-scan: clean (0 critical, 0 warnings)"
 
 say "Cutting release $TAG (from $VERSION_OLD) on $branch in $ROOT_DIR"
 plan "VERSION: $VERSION_OLD -> $VERSION_NEW"

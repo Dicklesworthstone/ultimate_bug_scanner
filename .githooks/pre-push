@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Local backstop for the UBS self-scan gate.
+#
+# UBS releases are cut with scripts/cut-release.sh, which refuses to cut a tag
+# while `./ubs . --ci --fail-on-warning` is red. This hook runs the *same*
+# command before a push so a red tree is caught on the machine that made it,
+# not at release time. There is no GitHub Actions equivalent by design.
+#
+# Opt in once per clone:
+#     git config core.hooksPath .githooks
+#
+# Escape hatch for a push that genuinely cannot wait (a docs-only fix during an
+# incident, say). Use it deliberately, and fix the scan in the same session:
+#     UBS_SKIP_SELF_SCAN=1 git push
+#
+# The hook is skipped automatically when the push only deletes refs, since there
+# is no new content to scan.
+#
+# It scans the working tree, not the commits being pushed — the same thing the
+# release gate scans, and the thing you can actually fix right now.
+
+set -uo pipefail
+
+if [[ -n "${UBS_SKIP_SELF_SCAN:-}" ]]; then
+  printf 'pre-push: self-scan skipped (UBS_SKIP_SELF_SCAN is set)\n' >&2
+  exit 0
+fi
+
+# stdin is "<local ref> <local sha> <remote ref> <remote sha>" per ref being
+# pushed. An all-zero local sha means that ref is being deleted.
+has_content=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  [[ -z "${local_sha:-}" ]] && continue
+  [[ "$local_sha" =~ ^0+$ ]] && continue
+  has_content=1
+done
+# No stdin at all (hook invoked by hand) still scans; only an explicit
+# delete-only push is skipped.
+if [[ $has_content -eq 0 && ! -t 0 ]]; then
+  printf 'pre-push: nothing but ref deletions, self-scan skipped\n' >&2
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  printf 'pre-push: not inside a git work tree; self-scan skipped\n' >&2
+  exit 0
+}
+cd "$repo_root" || exit 1
+
+if [[ ! -x ./ubs ]]; then
+  printf 'pre-push: ./ubs is missing or not executable; cannot run the self-scan\n' >&2
+  exit 1
+fi
+
+printf 'pre-push: running the UBS self-scan (./ubs . --ci --fail-on-warning)...\n' >&2
+# Explicit XXXXXX template: `mktemp -t <prefix>` appends the random suffix on
+# BSD/macOS but is a template with too few X's on GNU coreutils, which errors.
+ubs_tmpdir="${TMPDIR:-/tmp}"
+ubs_tmpdir="${ubs_tmpdir%/}"
+log="$(mktemp "$ubs_tmpdir/ubs-self-scan.XXXXXX")" || exit 1
+if ./ubs . --ci --fail-on-warning >"$log" 2>&1; then
+  rm -f "$log"
+  printf 'pre-push: self-scan clean (0 critical, 0 warnings)\n' >&2
+  exit 0
+fi
+
+printf '\n' >&2
+printf 'pre-push: BLOCKED — the UBS self-scan is red.\n' >&2
+printf '  reproduce with: ./ubs . --ci --fail-on-warning\n' >&2
+printf '  full log:       %s\n' "$log" >&2
+printf '  override once:  UBS_SKIP_SELF_SCAN=1 git push\n\n' >&2
+tail -n 40 "$log" >&2
+exit 1

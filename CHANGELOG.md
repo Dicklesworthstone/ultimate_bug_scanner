@@ -32,6 +32,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 - New `Pattern` controls: `scan_strings` (match inside string literals) and `exclude_file_regex` (skip a file for one rule based on its role), both applied to the same view the rule is matched against.
 - Regression coverage: `test-suite/quality/test_python_precision.py` (44 tests) plus manifest cases `python-pathlib-division-clean`, `python-index-arithmetic-{clean,buggy}` and `python-debug-print-{cli-clean,library-buggy}`.
 - `docs/security.md` now publishes the current minisign public key (`97732BB3E99E8CBE`) instead of only describing where it should be published.
+- **The self-scan gate now has somewhere to run.** `./ubs . --ci --fail-on-warning` became honest in this cycle but nothing enforced it, so the next regression would have shipped unnoticed. `scripts/cut-release.sh` runs it as a step-1 sanity check — ahead of every mutation, so a red tree aborts with `VERSION`, the checksums and the changelog exactly as they were, instead of leaving a half-bumped tree to unpick — and refuses to cut the tag. There is no opt-out at release time. `.githooks/pre-push` is the local backstop running the identical command; it is opt-in per clone (`git config core.hooksPath .githooks`), skips pushes that only delete refs, and can be overridden once with `UBS_SKIP_SELF_SCAN=1` for a push that cannot wait. Documented in the README ("The Self-Scan Gate", "Local Git Hooks") and `docs/release.md`.
 
 ---
 

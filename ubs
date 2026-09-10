@@ -4902,9 +4902,19 @@ check_and_update_self(){
     case "${CI:-}" in 1|true|TRUE|True|yes|YES) return 0;; esac
   fi
 
-  # Only update if we're running the installed binary (not a local repo script)
-  # Heuristic: if the script dir contains .git, we're likely in a dev environment
-  if [[ -d "$(script_dir)/.git" ]]; then
+  # Only update if we're running the installed binary (not a local repo script).
+  # A development checkout is identified by a `.git` entry sitting directly in
+  # the scanner's own resolved directory — never in an ancestor, so an installed
+  # binary that merely happens to live inside somebody's repository is still
+  # updatable. Both Git layouts count (issue #107): an ordinary clone has a
+  # `.git` DIRECTORY, while a linked worktree (`git worktree add`) has a regular
+  # `.git` FILE holding a `gitdir:` pointer. Testing only for the directory
+  # sent worktree checkouts down the installed-binary path, where `--update`
+  # would either fail with "installed binary is not writable" or, on a writable
+  # worktree, overwrite tracked source with a release artifact.
+  local self_dir
+  self_dir="$(script_dir)"
+  if [[ -e "$self_dir/.git" ]]; then
     if [[ "${FORCE_SELF_UPDATE:-0}" -eq 1 && "${QUIET:-0}" -eq 0 ]]; then
       say_err "${BLUE}${INFO}${RESET} Development checkout detected; use git pull instead of --update."
     fi

@@ -339,6 +339,118 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
     assert "rsync:" in output, output
 
 
+def check_self_update_dev_checkout_guard(tmpdir: Path) -> None:
+    """Issue #107 regression guard: `--update` must recognize BOTH Git checkout
+    layouts as development trees. An ordinary clone has a `.git` directory; a
+    linked worktree (`git worktree add`) has a regular `.git` FILE holding a
+    `gitdir:` pointer. The guard used to test `-d .git` only, so a worktree fell
+    through to installed-binary handling — failing with "installed binary is not
+    writable" on a read-only source and, on a writable one, heading toward
+    replacing tracked source with a release artifact.
+
+    Hermetic: no network is reachable because the fake curl/wget refuse and
+    record any attempt; every scanner copy is chmod'ed read-only, and the test
+    asserts the bytes are unchanged. The installed-layout control proves the
+    guard was not widened into "never update anything"."""
+    root = tmpdir / "update_guard"
+    root.mkdir(parents=True)
+
+    # A fake downloader that refuses and records: any acquisition attempt is a
+    # failure of the guard, not something we want to actually perform.
+    fake_bin = root / "bin"
+    fake_bin.mkdir()
+    attempts = root / "acquisition.log"
+    for tool in ("curl", "wget"):
+        stub = fake_bin / tool
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "{tool} %s\\n" "$*" >> "${{ACQUISITION_LOG:?}}"\n'
+            "exit 7\n"
+        )
+        stub.chmod(0o755)
+
+    git_base = [
+        "git", "-c", "user.name=UBS Test", "-c", "user.email=ubs-test@example.invalid",
+        "-c", "commit.gpgsign=false", "-c", "protocol.file.allow=always",
+    ]
+    repo = root / "repo"
+    repo.mkdir()
+    subprocess.run([*git_base, "-C", str(repo), "init", "--quiet", "-b", "main"],
+                   check=True, capture_output=True)
+    shutil.copy2(UBS_BIN, repo / "ubs")
+    shutil.copy2(REPO_ROOT / "VERSION", repo / "VERSION")
+    subprocess.run([*git_base, "-C", str(repo), "add", "ubs", "VERSION"],
+                   check=True, capture_output=True)
+    subprocess.run([*git_base, "-C", str(repo), "commit", "--quiet", "-m", "fixture"],
+                   check=True, capture_output=True)
+    worktree = root / "worktree"
+    subprocess.run([*git_base, "-C", str(repo), "worktree", "add", "--quiet",
+                    "--detach", str(worktree)], check=True, capture_output=True)
+    assert (worktree / ".git").is_file(), "fixture: linked worktree must have a .git FILE"
+    assert not (worktree / ".git").is_dir(), "fixture: linked worktree .git must not be a dir"
+
+    installed = root / "installed"
+    installed.mkdir()
+    shutil.copy2(UBS_BIN, installed / "ubs")
+    shutil.copy2(REPO_ROOT / "VERSION", installed / "VERSION")
+    assert not (installed / ".git").exists(), "fixture: installed layout must have no .git"
+
+    binaries = {
+        "checkout": repo / "ubs",
+        "worktree": worktree / "ubs",
+        "installed": installed / "ubs",
+    }
+    before = {name: path.read_bytes() for name, path in binaries.items()}
+    for path in binaries.values():
+        path.chmod(0o555)
+
+    def update(path: Path, extra_args: list[str]) -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "NO_COLOR": "1",
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "ACQUISITION_LOG": str(attempts),
+            "UBS_NO_AUTO_UPDATE": "1",
+            "UBS_ENABLE_AUTO_UPDATE": "0",
+        }
+        return subprocess.run(
+            ["bash", str(path), "--update", *extra_args],
+            cwd=root, capture_output=True, text=True, env=env, check=False,
+        )
+
+    try:
+        for label in ("checkout", "worktree"):
+            res = update(binaries[label], [])
+            out = res.stdout + res.stderr
+            assert res.returncode == 0, f"{label}: exit {res.returncode}\n{out}"
+            assert "Development checkout detected" in out, f"{label}: {out}"
+            assert "Self-update failed" not in out, f"{label}: {out}"
+
+            quiet = update(binaries[label], ["--quiet"])
+            qout = quiet.stdout + quiet.stderr
+            assert quiet.returncode == 0, f"{label} --quiet: exit {quiet.returncode}\n{qout}"
+            assert "Development checkout detected" not in qout, f"{label} --quiet: {qout}"
+
+        # Neither Git layout may have reached the network at all.
+        dev_attempts = attempts.read_text() if attempts.exists() else ""
+        assert dev_attempts == "", (
+            "development checkouts must not attempt release acquisition:\n" + dev_attempts
+        )
+
+        # Control: an installed-layout copy is NOT a development checkout, so it
+        # still enters self-update and fails on the refusing downloader.
+        res = update(binaries["installed"], [])
+        out = res.stdout + res.stderr
+        assert res.returncode != 0, out
+        assert "Development checkout detected" not in out, out
+    finally:
+        for path in binaries.values():
+            path.chmod(0o644)
+
+    for name, path in binaries.items():
+        assert path.read_bytes() == before[name], f"{name}: scanner bytes changed"
+
+
 def main() -> None:
     tmpdir = Path(tempfile.mkdtemp(prefix="ubs-meta-runner-"))
     try:
@@ -397,6 +509,9 @@ def main() -> None:
         # Issue #99: Rust cargo phases must really run (sentinel positive
         # control) and every static-only path must say so instead of "clean".
         check_rust_cargo_phases(tmpdir)
+
+        # Issue #107: linked Git worktrees are development checkouts too.
+        check_self_update_dev_checkout_guard(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

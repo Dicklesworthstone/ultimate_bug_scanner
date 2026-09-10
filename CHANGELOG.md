@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.2] - 2026-09-10 [Release]
+
 ### Fixes
 
 - **A scanner module that did not complete could be folded into the report as a completed one (#103, #104, #105, #106).** Six symptoms, one shape: the human status line, the machine `status` field and the exit code were each computed on their own path, so they could disagree about whether the scan finished.

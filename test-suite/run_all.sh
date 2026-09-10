@@ -216,6 +216,9 @@ run_step manifest "${PY[@]}" ./run_manifest.py "$@"
 run_step shareable-reports "${PY[@]}" shareable/test_shareable_reports.py
 run_step meta-runner-modes "${PY[@]}" shareable/test_meta_runner_modes.py
 run_step cli-contract "${PY[@]}" shareable/test_cli_contract.py
+# The status line, the report `status` field and the exit code must agree for
+# every module outcome (issues #103-#106).
+run_step status-invariants "${PY[@]}" shareable/test_status_invariants.py
 run_step supply-chain "${PY[@]}" shareable/test_supply_chain.py
 run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
 # SARIF parity (bead K5): asserted for the modules whose SARIF carries their

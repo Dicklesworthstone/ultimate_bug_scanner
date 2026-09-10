@@ -69,8 +69,11 @@ ubs --schema=json             # JSON Schema (draft 2020-12) for --format=json; a
 ```
 
 Every machine format prints exactly one document (or one JSONL stream) on stdout and validates against
-`ubs --schema`; `status` is `ok` or `partial`, and environment errors/refusals are an error envelope
-with exit 2 (see "Machine-readable failures" below).
+`ubs --schema`; `status` is `ok` (every requested scanner completed), `partial` (the scan is incomplete but
+something usable came back) or `error` (a module could not run at all and no other scanner produced a
+result), and pre-scan refusals are an error envelope with exit 2 (see
+"Machine-readable failures" below). The status field, the human status line and the exit code always
+agree: anything other than `ok` exits 2 unless `UBS_ALLOW_PARTIAL=1`.
 
 ## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
 
@@ -1071,7 +1074,9 @@ In `--format=json|jsonl|sarif|toon` mode every failure is an object on stdout, n
 just text on stderr, so `ubs … --format=json | jq` always has something to parse:
 
 - Environment errors and refused scans: `{"error":"environment"|"refused","status":"error"|"refused","reason":"ast-grep-missing"|"module-failed"|"directory-too-large"|"home-directory"|"root-directory","exit_code":2,"message":…}` (JSONL adds `"type":"error"`; SARIF emits one run with `invocations[0].executionSuccessful=false` and a `toolExecutionNotifications` entry).
-- Partial runs: the normal envelope with `"status":"partial"` and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `timeout`, `error`). SARIF runs get `invocations[].executionSuccessful=false` with one notification per failed module.
+- Incomplete runs: the normal envelope with `"status":"partial"` (or `"error"` when a module could not run at all and no other scanner produced a result) and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `timeout`, `error`). A module that exits 2 is reported the same way, with `"error":"environment"`, `"reason":"module-failed"` and `"exit_code":2` added — the results from the scanners that *did* complete stay in the envelope, and every requested `--report-json` / `--html-report` / `--beads-jsonl` is still written. SARIF runs get `invocations[].executionSuccessful=false`, `exitCode: 2` and one notification per failed module.
+- Requested artifacts are a separate outcome from the analysis. If a `--report-json`, `--html-report`, `--save-baseline` or `--beads-jsonl` was requested and could not be written, the run exits 2 and says which path failed; the previous file at that path is never truncated by a failed write.
+- Comparisons are qualified before they are shown. `--comparison` emits `comparison.delta` only when both the current scan and the baseline are complete; otherwise it emits `comparison.status: "unavailable"` with a `reason` (`current_scan_incomplete`, `baseline_incomplete`, `baseline_missing`, `baseline_unreadable`) instead of a number that would read as an improvement. `--save-baseline` refuses to record a baseline from an incomplete scan, leaving any existing baseline in place, and an HTML report from an incomplete scan carries a visible "Incomplete scan" banner.
 
 **Directory size guard**
 

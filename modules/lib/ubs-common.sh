@@ -49,6 +49,45 @@ ubs_die(){
   exit "${2:-2}"
 }
 
+# ubs_deliver_file SRC DEST LABEL: copy SRC to DEST, or report why not.
+#
+# Issue #106: modules delivered their requested `--summary-json` /
+# `--report-json` with `cp … 2>/dev/null || true`, so a missing or
+# non-directory parent produced exit 0 with no artifact at all — a consumer
+# gating on the exit status archived nothing while believing delivery
+# succeeded. Analysis completion and artifact delivery are separate outcomes:
+# this returns 1 on any delivery failure so the caller can fail the run.
+#
+# The write is staged beside the destination and renamed into place, so a
+# failed write never truncates an artifact that was already there.
+ubs_deliver_file(){
+  local src="$1" dest="$2" label="${3:-artifact}" dir tmp
+  dir="$(dirname -- "$dest")"
+  if [[ ! -d "$dir" ]] && ! mkdir -p -- "$dir" 2>/dev/null; then
+    printf '✗ cannot create the directory for the requested %s: %s\n' "$label" "$dir" >&2
+    return 1
+  fi
+  if [[ ! -d "$dir" ]]; then
+    printf '✗ cannot write the requested %s: %s is not a directory\n' "$label" "$dir" >&2
+    return 1
+  fi
+  if ! tmp="$(mktemp "$dest.ubs-XXXXXX" 2>/dev/null)"; then
+    printf '✗ cannot stage the requested %s in %s (not writable?)\n' "$label" "$dir" >&2
+    return 1
+  fi
+  if ! cat -- "$src" >"$tmp" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    printf '✗ cannot write the requested %s: %s\n' "$label" "$dest" >&2
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$dest" 2>/dev/null; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    printf '✗ cannot replace the requested %s: %s\n' "$label" "$dest" >&2
+    return 1
+  fi
+  return 0
+}
+
 # ubs_with_timeout SECONDS CMD...: run CMD under `timeout` when available
 # (0 = no limit); exit status is the command's, or 124 on timeout.
 ubs_with_timeout(){
@@ -247,7 +286,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='d313c6932ee20a82fe6f493f936661818b0e82e7b391232511be2738f34c82c7'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
-  ['helpers/ubs_core/findings_merge.py']='bd0ff94bf680e14696cba2aef0c47db882f04ea1af35956cec6d83549874a9a2'
+  ['helpers/ubs_core/findings_merge.py']='2b023ec6a1b0ba9a64489e5f7fa4dc11d1a40241a3057ce4da1e82a016812243'
   ['helpers/ubs_core/go_ast.py']='8742075b0f2f9e10ec0fe37a1641075eaf3480e3f30b7060a306bdff77b84d89'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -311,7 +350,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/kotlin_scan.py']='470f33f99fada4c3797665738fa2130359dd13a8888bd74f6abe7bde496324a6'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/prefilter.py']='3d506606874f165afdc9c723cc7cf844ae148db624d87d862b7276233f13f3ee'
-  ['helpers/ubs_core/py_ast.py']='65f04218142f319d77b3aaf19779714303fab261b6f210fb5aeb0ed13a0bc6af'
+  ['helpers/ubs_core/py_ast.py']='ab9239b606c0c06f7d9ea4d1e7dbcaaf73cb86ca40445cdbf56d286e73339cc2'
   ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
   ['helpers/ubs_core/py_detectors/_pathlike.py']='90b1b71bce5606f1a5684c9122fc14ac27bbbf5ba4ebf455343e29145a0b2e1c'
   ['helpers/ubs_core/py_detectors/archive_extraction.py']='bde3f4b466aa25d5845467df6795fb3a1d15597846ae8440be8ee8fd170b316c'
@@ -361,7 +400,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='3b5a137fa381424e2d01eefcc2622985063d810fab2898ac198c722226ff5887'
   ['helpers/ubs_core/py_patterns/security_rg.py']='6b1651db78b6190bfff6a54c8663daba3a80a274a5ad113dfe69955de61d341a'
   ['helpers/ubs_core/py_rules.py']='806e5362ab07a0d15c14203533293c3acdbd8b6c056dd1d11f366c9c96c16a0a'
-  ['helpers/ubs_core/py_scan.py']='356b5c89ca66f6ffd6fa803c6171d7600e3e7e2438156ec498a35baac6a1594b'
+  ['helpers/ubs_core/py_scan.py']='115582c7f86894d7bb9d37133a74fded946733e225e03932130827f0d7ea987e'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/ruby_ast.py']='4bb0ecb0f511565d3d6e03346965a2d571b50f49f62920b542cdee539c7be4c3'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'

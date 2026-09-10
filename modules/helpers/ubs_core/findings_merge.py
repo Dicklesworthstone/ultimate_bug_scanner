@@ -244,8 +244,11 @@ def merge(
         doc["totals"]["critical"] = tot_crit
         doc["totals"]["warning"] = tot_warn
         doc["totals"]["info"] = tot_info
-        if tot_crit == 0 and tot_warn == 0:
-            doc["status"] = "ok"
+        # `status` is execution state, not a findings verdict. Filtering out
+        # findings that were already in the baseline cannot turn a run in which
+        # a scanner timed out or crashed into a complete one (issue #104): a
+        # zero-new-findings result with a non-empty failed_modules[] used to be
+        # relabelled "ok", contradicting the same document's own evidence.
 
     if findings or (baseline_path and new_only):
         doc["findings"] = findings
@@ -377,8 +380,11 @@ def to_sarif(
 
         runs.append(run)
 
-    # Invocations for partial runs / failed modules
-    if doc.get("status") == "partial" or doc.get("failed_modules"):
+    # Invocations for incomplete runs / failed modules. `exitCode` is part of
+    # the failed-invocation identity, not decoration: consumers use it to tell
+    # an environment failure (2) apart from a findings result, and dropping it
+    # made a failed run look merely unsuccessful.
+    if str(doc.get("status") or "ok") != "ok" or doc.get("failed_modules"):
         failed = doc.get("failed_modules") or []
         notifications = []
         for fmod in failed:
@@ -391,9 +397,14 @@ def to_sarif(
                     "descriptor": {"id": f"ubs/module-{st}"},
                     "message": {"text": f"{flang}: {st} — {msg}"},
                 })
+        try:
+            exit_code = int(doc.get("exit_code", 2))
+        except (TypeError, ValueError):
+            exit_code = 2
         for r in runs:
             r["invocations"] = [{
                 "executionSuccessful": False,
+                "exitCode": exit_code,
                 "toolExecutionNotifications": notifications,
             }]
 

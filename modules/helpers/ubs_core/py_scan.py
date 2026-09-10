@@ -607,6 +607,12 @@ def main(argv: list[str] | None = None) -> int:
     files = [Path(raw.decode("utf-8", "surrogateescape")) for raw in entries if raw.strip()]
     skip = _skip_set(args)
 
+    # Execution failures inside the analysis layers (issue #103). These are
+    # kept apart from findings: zero findings from an analyzer that never ran
+    # is not a clean result, and findings from a run that partly failed are
+    # still worth reporting — as a partial result.
+    scan_errors: list[str] = []
+
     patterns = load_patterns()
     from ubs_core.cache import CapturingSink, ScanCache
 
@@ -670,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
             scan_all(
                 Path(args.ast_rule_dir), ast_files, capturing_sink, overrides,
                 count_only=None, skip_categories=None, category_map=CATEGORY_MAP,
-                skip=skip,
+                skip=skip, errors=scan_errors,
             )
         cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
@@ -739,6 +745,10 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (issue #103).
+    if scan_errors:
+        exit_code = 2
 
     if args.json_out:
         records = read_ndjson(args.sink)
@@ -754,12 +764,17 @@ def main(argv: list[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "ok",
+            "status": "partial" if scan_errors else "ok",
             "findings": legacy_findings,
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
             "report": {"version": args.version, "findings": legacy_findings},
         }
+        if scan_errors:
+            doc["module_error"] = "ANALYZER_ERROR"
+            doc["message"] = (
+                "Python analysis did not complete: " + "; ".join(scan_errors[:5])
+            )[:500]
         profile_data = {
             "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
             "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
@@ -778,11 +793,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.text_out:
         _render_text(args, files, counters)
 
+    if scan_errors:
+        for problem in scan_errors:
+            sys.stderr.write(f"ubs-python: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps({
         "counters": counters,
         "patterns": len(patterns),
         "prefilter": prefilter_res.to_dict(),
         "cache": cache.stats,
+        "errors": scan_errors,
     }) + "\n")
     return exit_code
 

@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="ef2f0c1b28ecf3b3c981f9aa48606005144392e055b8f31556788978b1dd4755"
+UBS_LIB_CHECKSUM="e58dbe44f2c4a4f052838d494e34372ce3d118c06a581015c911b55d989cea2c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -132,6 +132,14 @@ print_finding() {
     info)
       local count=$2 title=$3 desc="${4:-}"
       say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"
+      say "    ${WHITE}$title${RESET}"
+      [ -n "$desc" ] && say "    ${DIM}$desc${RESET}" || true
+      ;;
+    warn|warning)
+      # An analyzer that did not complete is reported here: silence would make
+      # incomplete coverage indistinguishable from a clean result (issue #103).
+      local count=$2 title=$3 desc="${4:-}"
+      say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"
       say "    ${WHITE}$title${RESET}"
       [ -n "$desc" ] && say "    ${DIM}$desc${RESET}" || true
       ;;
@@ -350,23 +358,41 @@ if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout"
 elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD="gtimeout"
 fi
 
+# Optional-analyzer invocation status (issue #103). `|| true` used to discard
+# it entirely, so a Ruff that exited 2 without producing findings was reported
+# as "Ruff clean". UV_TOOL_STATUS is the process exit status; -1 means the tool
+# was not available at all, which is a coverage gap rather than a failure.
+UV_TOOL_STATUS=0
+UV_TOOL_ERRORS=()
+
 run_uv_tool_text() {
   local tool="$1"; shift
+  local rc=0
+  UV_TOOL_STATUS=0
   if [[ "$HAS_UV" -eq 1 ]]; then
     if [[ -n "$TIMEOUT_CMD" ]]; then
-      ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "${UVX_CMD[@]}" "$tool" "$@" || true )
+      ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "${UVX_CMD[@]}" "$tool" "$@" ) || rc=$?
     else
-      ( set +o pipefail; "${UVX_CMD[@]}" "$tool" "$@" || true )
+      ( set +o pipefail; "${UVX_CMD[@]}" "$tool" "$@" ) || rc=$?
     fi
   else
     if command -v "$tool" >/dev/null 2>&1; then
       if [[ -n "$TIMEOUT_CMD" ]]; then
-        ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "$tool" "$@" || true )
+        ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "$tool" "$@" ) || rc=$?
       else
-        ( set +o pipefail; "$tool" "$@" || true )
+        ( set +o pipefail; "$tool" "$@" ) || rc=$?
       fi
+    else
+      rc=-1
     fi
   fi
+  UV_TOOL_STATUS="$rc"
+  return 0
+}
+
+# Record an optional analyzer that was selected but did not complete.
+record_uv_tool_failure(){
+  UV_TOOL_ERRORS+=("$1")
 }
 
 run_system_or_uv_tool() {
@@ -388,7 +414,7 @@ run_v2_uv_tools_py(){
     say "  ${GRAY}${INFO} uv extra analyzers disabled (--no-uv)${RESET}"
     return 0
   fi
-  local TOOL ruff_stdout ruff_stderr ruff_trimmed ruff_count _EXC _ign_pats _pat _match
+  local TOOL ruff_stdout ruff_stderr ruff_trimmed ruff_count ruff_parsed ruff_rc _EXC _ign_pats _pat _match _pa_input _tool_out
   IFS=',' read -r -a UVLIST <<< "$UV_TOOLS"
   for TOOL in "${UVLIST[@]}"; do
     case "$TOOL" in
@@ -396,36 +422,67 @@ run_v2_uv_tools_py(){
         print_subheader "ruff (lint)"
         ruff_stdout="$(mktemp -t ubs-ruff.XXXXXX 2>/dev/null || mktemp)"
         ruff_stderr="$(mktemp -t ubs-ruff.XXXXXX 2>/dev/null || mktemp)"
-        run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=json >"$ruff_stdout" 2>"$ruff_stderr" || true
+        # `ruff check` exits 0 with no violations, 1 with violations, and >=1
+        # other codes for an error (unparseable source, bad configuration).
+        # `--no-fix` because a project config that turns fixing on would let a
+        # scan rewrite the tree it was asked to inspect.
+        run_uv_tool_text ruff check "$PROJECT_DIR" --no-fix --output-format=json >"$ruff_stdout" 2>"$ruff_stderr"
+        ruff_rc="$UV_TOOL_STATUS"
         ruff_trimmed="$(tr -d '[:space:]' <"$ruff_stdout" 2>/dev/null || true)"
-        if [[ "$ruff_trimmed" == "[]" ]]; then
-          print_finding "good" "Ruff clean"
-        else
-          ruff_count=0
-          if command -v python3 >/dev/null 2>&1; then
-            ruff_count=$(python3 - "$ruff_stdout" <<'PYRUFF'
+        ruff_count=0
+        ruff_parsed=0
+        if command -v python3 >/dev/null 2>&1 && [[ -s "$ruff_stdout" ]]; then
+          ruff_parsed=1
+          ruff_count=$(python3 - "$ruff_stdout" <<'PYRUFF'
 import json, sys
 try:
     data = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
-    print(0)
+    print(-1)
     sys.exit(0)
-print(len(data) if isinstance(data, list) else 0)
+print(len(data) if isinstance(data, list) else -1)
 PYRUFF
 )
+        fi
+        if [[ "$ruff_rc" -eq -1 ]]; then
+          say "  ${GRAY}${INFO} ruff not available; lint coverage not collected${RESET}"
+        elif [[ -z "$ruff_trimmed" ]]; then
+          # No result document at all: the analyzer never got far enough to
+          # report anything (commonly a launcher that could not provision it
+          # offline). That is missing coverage, not a clean lint — but it is
+          # also not evidence that ruff itself failed, so it does not fail the
+          # scan the way a real analyzer error does.
+          say "  ${GRAY}${INFO} ruff produced no result document (exit $ruff_rc); lint coverage not collected${RESET}"
+          if [[ -s "$ruff_stderr" ]]; then
+            say "  ${DIM}ruff stderr:${RESET}"
+            cat "$ruff_stderr" 2>/dev/null || true
           fi
+        elif [[ "$ruff_rc" -ne 0 && "$ruff_rc" -ne 1 ]]; then
+          # A failed invocation is never "clean", whatever it printed.
+          print_finding "warn" 1 "Ruff did not complete (exit $ruff_rc)" "Lint coverage is incomplete for this scan"
+          say "  ${DIM}ruff stderr:${RESET}"
+          cat "$ruff_stderr" 2>/dev/null || true
+          record_uv_tool_failure "ruff exited $ruff_rc"
+        elif [[ "$ruff_parsed" -eq 1 && "${ruff_count:-0}" -lt 0 ]]; then
+          print_finding "warn" 1 "Ruff output could not be parsed" "Expected a JSON array from --output-format=json"
+          record_uv_tool_failure "ruff produced unparseable output"
+        elif [[ "$ruff_parsed" -eq 1 ]] \
+             && { [[ "$ruff_rc" -eq 0 && "${ruff_count:-0}" -gt 0 ]] || [[ "$ruff_rc" -eq 1 && "${ruff_count:-0}" -eq 0 ]]; }; then
+          # Exit status and result document disagree: neither can be trusted.
+          # Only checked when the document was actually parsed — without
+          # python3 the count is unknown, not zero.
+          print_finding "warn" 1 "Ruff exit status contradicts its output" "exit $ruff_rc with $ruff_count finding(s)"
+          record_uv_tool_failure "ruff exit $ruff_rc contradicts $ruff_count finding(s)"
+        elif [[ "$ruff_trimmed" == "[]" ]]; then
+          print_finding "good" "Ruff clean"
+        else
           cat "$ruff_stdout" 2>/dev/null || true
           if [[ -s "$ruff_stderr" ]]; then
             say "  ${DIM}ruff stderr:${RESET}"
             cat "$ruff_stderr" 2>/dev/null || true
           fi
-          if [ "${ruff_count:-0}" -gt 0 ]; then
-            print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"
-            UV_EXTRA_INFO=$((UV_EXTRA_INFO + ruff_count))
-          else
-            print_finding "info" 1 "Ruff output needs review" "Non-empty output (or parse failure)"
-            UV_EXTRA_INFO=$((UV_EXTRA_INFO + 1))
-          fi
+          print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"
+          UV_EXTRA_INFO=$((UV_EXTRA_INFO + ruff_count))
         fi
         rm -f "$ruff_stdout" "$ruff_stderr" 2>/dev/null || true
         ;;
@@ -449,22 +506,51 @@ PYRUFF
             done < <(find "$PROJECT_DIR" -path "$PROJECT_DIR/$_pat" 2>/dev/null || true)
           done
         fi
-        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "${_EXC:-}" ; then
+        # bandit exits 0 (no issues), 1 (issues reported) or 2 (error).
+        _tool_out="$(mktemp -t ubs-bandit.XXXXXX 2>/dev/null || mktemp)"
+        run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "${_EXC:-}" >"$_tool_out" 2>&1
+        cat "$_tool_out" 2>/dev/null || true
+        if [[ "$UV_TOOL_STATUS" -eq -1 ]]; then
+          say "  ${GRAY}${INFO} bandit not available; security coverage not collected${RESET}"
+        elif [[ "$UV_TOOL_STATUS" -ne 0 && ! -s "$_tool_out" ]]; then
+          say "  ${GRAY}${INFO} bandit produced no output (exit $UV_TOOL_STATUS); security coverage not collected${RESET}"
+        elif [[ "$UV_TOOL_STATUS" -eq 0 || "$UV_TOOL_STATUS" -eq 1 ]]; then
           print_finding "info" 0 "Bandit scan completed" "See output above"
         else
-          say "  ${GRAY}${INFO} bandit not executed${RESET}"
+          print_finding "warn" 1 "Bandit did not complete (exit $UV_TOOL_STATUS)" "Security coverage is incomplete for this scan"
+          record_uv_tool_failure "bandit exited $UV_TOOL_STATUS"
         fi
+        rm -f "$_tool_out" 2>/dev/null || true
         ;;
       pip-audit)
         print_subheader "pip-audit (dependencies)"
+        # pip-audit exits 0 (no known vulnerabilities), 1 (vulnerabilities
+        # found) and other codes on error. Scanning a source tree without a
+        # resolved environment is inventory coverage, not a clean audit — say
+        # which input was used so the claim stays qualified.
+        _pa_input="$PROJECT_DIR (source tree)"
+        _tool_out="$(mktemp -t ubs-pipaudit.XXXXXX 2>/dev/null || mktemp)"
         if [ -f "$PROJECT_DIR/requirements.txt" ]; then
-          run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" || true
+          _pa_input="requirements.txt"
+          run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" >"$_tool_out" 2>&1
         elif [ -f "$PROJECT_DIR/pyproject.toml" ]; then
-          run_uv_tool_text pip-audit --path "$PROJECT_DIR/pyproject.toml" || true
+          _pa_input="pyproject.toml"
+          run_uv_tool_text pip-audit --path "$PROJECT_DIR/pyproject.toml" >"$_tool_out" 2>&1
         else
-          run_uv_tool_text pip-audit --path "$PROJECT_DIR" || true
+          run_uv_tool_text pip-audit --path "$PROJECT_DIR" >"$_tool_out" 2>&1
         fi
-        print_finding "info" 0 "pip-audit run (if available)" "Review advisories above"
+        cat "$_tool_out" 2>/dev/null || true
+        if [[ "$UV_TOOL_STATUS" -eq -1 ]]; then
+          say "  ${GRAY}${INFO} pip-audit not available; dependency coverage not collected${RESET}"
+        elif [[ "$UV_TOOL_STATUS" -ne 0 && ! -s "$_tool_out" ]]; then
+          say "  ${GRAY}${INFO} pip-audit produced no output (exit $UV_TOOL_STATUS); dependency coverage not collected${RESET}"
+        elif [[ "$UV_TOOL_STATUS" -eq 0 || "$UV_TOOL_STATUS" -eq 1 ]]; then
+          print_finding "info" 0 "pip-audit ran against $_pa_input" "Review advisories above"
+        else
+          print_finding "warn" 1 "pip-audit did not complete (exit $UV_TOOL_STATUS)" "Dependency coverage is incomplete for this scan"
+          record_uv_tool_failure "pip-audit exited $UV_TOOL_STATUS"
+        fi
+        rm -f "$_tool_out" 2>/dev/null || true
         ;;
       mypy)
         print_subheader "mypy (type-check)"
@@ -492,19 +578,22 @@ PYRUFF
 # ── Legacy-parity bridges: record-less section headers + summary + exit ─────
 run_v2_legacy_parity_bridges_py(){
   local sink="$1" list_file="$2" py_exit="$3" text_out="${4:-}" extra_info="${5:-0}" skip_csv="${6:-}"
+  local analyzer_errors="${7:-0}"
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$py_exit" "$extra_info" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$py_exit" "$extra_info" "$analyzer_errors" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import sys
 
-(sink_path, text_out, files_raw, fow_raw, skip_csv, py_exit_raw, extra_raw) = sys.argv[1:8]
+(sink_path, text_out, files_raw, fow_raw, skip_csv, py_exit_raw, extra_raw,
+ analyzer_errors_raw) = sys.argv[1:9]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
 py_exit = int(py_exit_raw or "0")
 extra_info = int(extra_raw or "0")
+analyzer_errors = int(analyzer_errors_raw or "0")
 as_text = bool(text_out)
 
 # Mirror py_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
@@ -563,9 +652,20 @@ if as_text:
     with open(text_out, "a", encoding="utf-8") as fh:
         fh.write("\n".join(out) + "\n")
 
-exit_code = 1 if counts["critical"] else py_exit
-if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
-    exit_code = 1
+# Issue #103: this recount used to overwrite an abnormal scanner status with
+# the ordinary finding exit 1 whenever criticals existed, so "the scanner
+# crashed" and "the scanner found bugs" became the same exit code. Execution
+# failures dominate severity: a scan that did not complete is reported as
+# incomplete (exit 2) whatever it managed to find, and the findings are still
+# emitted so the partial evidence is not lost.
+if py_exit not in (0, 1):
+    exit_code = py_exit
+elif analyzer_errors:
+    exit_code = 2
+else:
+    exit_code = 1 if counts["critical"] else py_exit
+    if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+        exit_code = 1
 sys.exit(exit_code)
 PYV2BRIDGE
   return "$bridge_rc"
@@ -626,6 +726,12 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
     text)
       text_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-text.XXXXXX)"
       scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      # --summary-json is a delivery request, not a format: honour it in text
+      # mode too rather than exiting 0 with nothing written (issue #106).
+      if [[ -n "$SUMMARY_JSON" ]]; then
+        v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-pyv2-json.XXXXXX)"
+        scan_args+=(--json-out "$v2_json_out")
+      fi
       ;;
     *) echo "ERROR: contract-v2 python path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
   esac
@@ -637,7 +743,31 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   fi
   # Record-less section headers + Summary Statistics + legacy exit formula.
   run_v2_legacy_parity_bridges_py "$sink" "$list_file" "$exit_code" "$text_out" \
-    "${UV_EXTRA_INFO:-0}" "$v2_skip" || exit_code=$?
+    "${UV_EXTRA_INFO:-0}" "$v2_skip" "${#UV_TOOL_ERRORS[@]}" || exit_code=$?
+  if [[ ${#UV_TOOL_ERRORS[@]} -gt 0 ]]; then
+    printf 'ubs-python: analysis incomplete: %s\n' "${UV_TOOL_ERRORS[@]}" >&2
+    # The JSON summary must not claim a completed scan either.
+    if [[ -n "$v2_json_out" && -f "$v2_json_out" ]] && command -v python3 >/dev/null 2>&1; then
+      UBS_UV_TOOL_ERRORS="$(printf '%s; ' "${UV_TOOL_ERRORS[@]}")" python3 - "$v2_json_out" <<'PYUVSTATUS' || true
+import json, os, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)
+if not isinstance(doc, dict):
+    sys.exit(0)
+detail = os.environ.get("UBS_UV_TOOL_ERRORS", "").strip().rstrip(";")
+doc["status"] = "partial"
+doc["module_error"] = "ANALYZER_ERROR"
+doc["message"] = ("Selected Python analyzers did not complete: " + detail)[:500]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, ensure_ascii=False)
+    fh.write("\n")
+PYUVSTATUS
+    fi
+  fi
 
   if [[ "$FORMAT" == "sarif" ]]; then
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then
@@ -652,14 +782,27 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
     cat "$v2_json_out" 2>/dev/null || true
   fi
-  if [[ -n "$v2_json_out" ]]; then
-    if [[ -n "$SUMMARY_JSON" ]]; then
-      cp "$v2_json_out" "$SUMMARY_JSON" 2>/dev/null || true
+  # Requested artifacts are a separate outcome from the analysis (issue #106):
+  # if one was asked for and could not be written, the run reports an
+  # environment error rather than exit 0 with nothing on disk.
+  local delivery_failed=0
+  if [[ -n "$SUMMARY_JSON" ]]; then
+    if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then
+      ubs_deliver_file "$v2_json_out" "$SUMMARY_JSON" "summary JSON" || delivery_failed=1
+    else
+      printf '✗ cannot write the requested summary JSON: this format produced no summary document\n' >&2
+      delivery_failed=1
     fi
+  fi
+  if [[ -n "$v2_json_out" ]]; then
     rm -f "$v2_json_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
-    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+    # K2: the sink IS the findings record stream.
+    ubs_deliver_file "$sink" "$REPORT_JSON" "findings report" || delivery_failed=1
+  fi
+  if [[ "$delivery_failed" -eq 1 ]]; then
+    exit_code=2
   fi
   rm -f "$list_file" "$sink" 2>/dev/null || true
   [[ -n "$ast_rule_dir" ]] && rm -rf -- "$ast_rule_dir" 2>/dev/null || true

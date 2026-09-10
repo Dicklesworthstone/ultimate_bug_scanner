@@ -1654,6 +1654,19 @@ def test_module_garbage_output_yields_error_envelope() -> None:
         proc_json = run([str(target_file), "--only=python", "--format=json", "--ci"], env=env)
         json_ok = False
         doc_json: dict = {}
+
+        def named_modules(doc: dict) -> set[str]:
+            # A pre-scan envelope lists language names; once scanners have run
+            # the failure is the richer {language,status,module_error,message}
+            # record that also carries the healthy scanners' results (#105).
+            names = set()
+            for entry in doc.get("failed_modules", []) or []:
+                if isinstance(entry, str):
+                    names.add(entry)
+                elif isinstance(entry, dict) and entry.get("language"):
+                    names.add(str(entry["language"]))
+            return names
+
         try:
             doc_json = json.loads(proc_json.stdout)
             json_ok = (
@@ -1661,7 +1674,7 @@ def test_module_garbage_output_yields_error_envelope() -> None:
                 and doc_json.get("error") == "environment"
                 and doc_json.get("status") == "error"
                 and doc_json.get("reason") == "module-failed"
-                and "python" in doc_json.get("failed_modules", [])
+                and "python" in named_modules(doc_json)
                 and "42" not in proc_json.stdout
                 and "99" not in proc_json.stdout
             )

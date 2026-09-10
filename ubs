@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='f93d5284b40ecd61e5903de831a2c670135c55d9caf05b6aa88a294cc29fb053'
-  [cpp]='f69ac2e52da7e18df0d6cd67f393a124d4b65ab08e5d347fc864e48bbd480aa8'
-  [csharp]='7cd9f6e0b1cbfe6a6913763a93fe02a9261b1d39ea5694a2c5a9804d082177a3'
-  [elixir]='1523a992c71b9cb3b82f3a6440ed17754c8f4b0e799009c5cc888b2b0bca55c5'
-  [golang]='a1449424e826dcdc61e07cf44603010b8b43ae96ed7f789d3798d9fddbf84857'
-  [java]='da77a7bc83298872109c1ebf4e6a6b9780b0683bfd69362b943fd8b8ecd8ddd9'
-  [js]='37350ceb78b836184816d8dca1b3539b6718ffb372097e4c53788e1c4177294c'
-  [kotlin]='4564b73a128213fa22bb344be10db12761e91daed849e52e83df7f063a32da38'
-  [python]='35e948a79a6a62f9fd84d366d575eff12e8e6102cc72005583f437b07a72c402'
-  [ruby]='ca19ef1c9ecb30dbcb6404cd490eba27c690c8f0835d6818c22b03290e805dd2'
-  [rust]='dab18281deac07db1c54b9e00bf51a8096a9bbf8e63007979c62983097fa5148'
-  [swift]='c95e2f3b9f180dd7e63c05e0d6c1b9a7ec40d96adf8218840b16c00407d50c1c'
+  [bash]='f01a3b4b86234e2f22d9538e800e10899002f27c49881dd3de32df49f72a1060'
+  [cpp]='80fe4401bc22f2e88ba44793ecb2097a4b4ffbdbc3b0622b651f4f18e09a2c5b'
+  [csharp]='4999f0f9c326d2be75e3c69f8e5b5345d59d35c078097fe36dd378766368a0bd'
+  [elixir]='14639526c536a043c49bfdde4d6850be1a85a9c366f06c6934080e75fb1461cb'
+  [golang]='48bd6c00e321db164f09ced5d518d8d40a020c9f2a7e49a37fb153482f902ff9'
+  [java]='2c933fbbfd8005c95c4406d9c25bf98fa17c294a2e92489274f3353f9c7997c8'
+  [js]='9e45b85513cab3208e7d7e09ed76eedd8fcdee29ba29fde021ac85df77ba64b4'
+  [kotlin]='4e536a478d8aab891b191eb88683e6c20e2579bc669495f003c9b2277cd3e739'
+  [python]='28481c0aa1dfe203dee6d29cb2a78beb6733f95374064e0ea20c264e663d39ee'
+  [ruby]='437db750c85bc03acc47418dd6e48e6abae8cbe1a3159c668581ec58c0d79749'
+  [rust]='c2826bd764d57f6dc668f5d0e63de2e38aee6b19ecca264a260a9c8f58b11cc3'
+  [swift]='1764b2ccb7d60a7ef01893ed9d684e92317525ce3631076ffe8e3cb900082956'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -229,7 +229,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='d313c6932ee20a82fe6f493f936661818b0e82e7b391232511be2738f34c82c7'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
-  ['helpers/ubs_core/findings_merge.py']='bd0ff94bf680e14696cba2aef0c47db882f04ea1af35956cec6d83549874a9a2'
+  ['helpers/ubs_core/findings_merge.py']='2b023ec6a1b0ba9a64489e5f7fa4dc11d1a40241a3057ce4da1e82a016812243'
   ['helpers/ubs_core/go_ast.py']='8742075b0f2f9e10ec0fe37a1641075eaf3480e3f30b7060a306bdff77b84d89'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -293,7 +293,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/kotlin_scan.py']='470f33f99fada4c3797665738fa2130359dd13a8888bd74f6abe7bde496324a6'
   ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
   ['helpers/ubs_core/prefilter.py']='3d506606874f165afdc9c723cc7cf844ae148db624d87d862b7276233f13f3ee'
-  ['helpers/ubs_core/py_ast.py']='65f04218142f319d77b3aaf19779714303fab261b6f210fb5aeb0ed13a0bc6af'
+  ['helpers/ubs_core/py_ast.py']='ab9239b606c0c06f7d9ea4d1e7dbcaaf73cb86ca40445cdbf56d286e73339cc2'
   ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
   ['helpers/ubs_core/py_detectors/_pathlike.py']='90b1b71bce5606f1a5684c9122fc14ac27bbbf5ba4ebf455343e29145a0b2e1c'
   ['helpers/ubs_core/py_detectors/archive_extraction.py']='bde3f4b466aa25d5845467df6795fb3a1d15597846ae8440be8ee8fd170b316c'
@@ -343,7 +343,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='3b5a137fa381424e2d01eefcc2622985063d810fab2898ac198c722226ff5887'
   ['helpers/ubs_core/py_patterns/security_rg.py']='6b1651db78b6190bfff6a54c8663daba3a80a274a5ad113dfe69955de61d341a'
   ['helpers/ubs_core/py_rules.py']='806e5362ab07a0d15c14203533293c3acdbd8b6c056dd1d11f366c9c96c16a0a'
-  ['helpers/ubs_core/py_scan.py']='356b5c89ca66f6ffd6fa803c6171d7600e3e7e2438156ec498a35baac6a1594b'
+  ['helpers/ubs_core/py_scan.py']='115582c7f86894d7bb9d37133a74fded946733e225e03932130827f0d7ea987e'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/ruby_ast.py']='4bb0ecb0f511565d3d6e03346965a2d571b50f49f62920b542cdee539c7be4c3'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -413,7 +413,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='428bc7fb8cc90df5e921fbf78a09f8fab4cee7c9d41271884734fc3ba5ee2e8e'
-  ['lib/ubs-common.sh']='ef2f0c1b28ecf3b3c981f9aa48606005144392e055b8f31556788978b1dd4755'
+  ['lib/ubs-common.sh']='e58dbe44f2c4a4f052838d494e34372ce3d118c06a581015c911b55d989cea2c'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1718,8 +1718,12 @@ cat <<'JSON'
         "properties": {
           "project": {"type": "string"},
           "timestamp": {"type": "string"},
-          "status": {"enum": ["ok", "partial"]},
+          "status": {"enum": ["ok", "partial", "error"], "description": "ok = every requested scanner completed; partial = the scan is incomplete but something usable came back; error = a module could not run at all (exit 2) and no other scanner produced a result"},
           "failed_modules": {"type": "array", "items": {"$ref": "#/$defs/failed_module"}},
+          "error": {"enum": ["environment"], "description": "present when a scanner module exited 2 (a tooling/dependency failure, not a code-quality result)"},
+          "reason": {"type": "string", "description": "module-failed | module-incomplete; present when status is not ok"},
+          "exit_code": {"const": 2, "description": "the exit status that accompanies an incomplete run; omitted under UBS_ALLOW_PARTIAL=1"},
+          "message": {"type": "string", "description": "present when status is not ok"},
           "scanners": {"type": "array", "items": {"$ref": "#/$defs/scanner"}},
           "totals": {"$ref": "#/$defs/totals"},
           "git": {"type": "object", "description": "present when the project has a GitHub remote", "properties": {"repository": {"type": "string"}, "commit": {"type": "string"}, "blob_base": {"type": "string"}}, "required": ["repository"]},
@@ -1747,11 +1751,11 @@ cat <<'JSON'
         "properties": {
           "error": {"enum": ["environment", "refused"]},
           "status": {"enum": ["error", "refused"]},
-          "reason": {"type": "string", "description": "ast-grep-missing | module-failed | directory-too-large | home-directory | root-directory"},
+          "reason": {"type": "string", "description": "ast-grep-missing | module-failed | module-incomplete | directory-too-large | home-directory | root-directory"},
           "exit_code": {"const": 2},
           "project": {"type": "string"},
           "message": {"type": "string"},
-          "failed_modules": {"type": "array", "items": {"type": "string"}},
+          "failed_modules": {"type": "array", "items": {"type": ["string", "object"]}, "description": "language names in a pre-scan envelope; {language,status,module_error,message} objects when scanners ran"},
           "size_mb": {"type": "integer"},
           "limit_mb": {"type": "integer"},
           "target": {"type": "string"}
@@ -1808,7 +1812,7 @@ cat <<'JSON'
         "properties": {
           "type": {"const": "totals"},
           "project": {"type": "string"},
-          "status": {"enum": ["ok", "partial"]},
+          "status": {"enum": ["ok", "partial", "error"]},
           "failed_modules": {"type": "array"},
           "files": {"$ref": "#/$defs/count"},
           "critical": {"$ref": "#/$defs/count"},
@@ -6772,6 +6776,42 @@ add_json_permalinks(){
   ' 2>/dev/null || printf '%s\n' "$doc"
 }
 
+# Re-assert run-level completion state on the combined document, after every
+# transformation that could have rewritten it (findings merge, --new-only
+# filtering). Execution state is an invariant of the run: a finding filter
+# changes findings, never whether every requested scanner completed (issue
+# #104). An abnormal module exit is recorded here — with the same
+# error/reason/exit_code identity the old minimal envelope carried — instead
+# of replacing the whole result and throwing away the healthy scanners'
+# evidence (issue #105).
+qualify_combined_json(){
+  [[ -s "$COMBINED_JSON_FILE" ]] || return 0
+  need_cmd jq || return 0
+  local run_status="${RUN_STATUS:-ok}"
+  local failed="${FAILED_MODULES_JSON:-[]}"
+  local reason="" message="" exit_code="null"
+  if [[ "$run_status" != "ok" ]]; then
+    message="$(incomplete_run_message)"
+    reason="$(incomplete_run_reason)"
+    # UBS_ALLOW_PARTIAL=1 is an explicit opt-in to a findings-based exit, so
+    # the document must not claim an exit code the process will not return.
+    [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]] || exit_code=2
+  fi
+  jq -c --arg status "$run_status" --argjson failed "$failed" \
+        --arg reason "$reason" --arg message "$message" \
+        --argjson exit_code "$exit_code" \
+        --argjson env_error "${HAS_ENV_ERROR:-0}" '
+    . + {status: $status, failed_modules: $failed}
+    + (if $reason == "" then {}
+       else {reason: $reason, message: $message}
+            + (if $exit_code == null then {} else {exit_code: $exit_code} end)
+            + (if $env_error == 1 then {error: "environment"} else {} end)
+       end)
+  ' "$COMBINED_JSON_FILE" >"$COMBINED_JSON_FILE.qualified" 2>/dev/null \
+    && mv "$COMBINED_JSON_FILE.qualified" "$COMBINED_JSON_FILE"
+  return 0
+}
+
 generate_combined_json(){
   [[ -n "$COMBINED_JSON_FILE" ]] || return 1
   if [[ -s "$COMBINED_JSON_FILE" ]]; then return 0; fi
@@ -6801,6 +6841,7 @@ generate_combined_json(){
         "${merge_opts[@]}" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
     fi
   fi
+  qualify_combined_json
   PROFILE_MERGE_MS=$(( PROFILE_MERGE_MS + $(now_ms) - t0 ))
   return 0
 }
@@ -6971,8 +7012,7 @@ write_jsonl_summary(){
   ' "$COMBINED_JSON_FILE" >>"$tmp"
 
   if [[ -n "$dest" ]]; then
-    mkdir -p "$(dirname "$dest")"
-    cp "$tmp" "$dest"
+    deliver_file "$tmp" "$dest" "Beads JSONL" || return 1
   else
     cat "$tmp"
   fi
@@ -7281,12 +7321,22 @@ if need_cmd python3; then
 fi
 
 # Run-level status (bead B6): "ok" when every scanner finished, "partial" when
-# one or more timed out or crashed. A partial run exits 2 (like an environment
-# error) so a green exit always means every requested language was scanned;
-# UBS_ALLOW_PARTIAL=1 restores the findings-based exit for callers that prefer
-# whatever completed. The envelope carries status/failed_modules either way.
+# one or more timed out or crashed, "error" when nothing usable came back at
+# all. An incomplete run exits 2 so a green exit always means every requested
+# language was scanned; UBS_ALLOW_PARTIAL=1 restores the findings-based exit
+# for callers that prefer whatever completed. The envelope carries
+# status/failed_modules either way.
+#
+# Issue #105: module exit 2 used to be handled separately from every other
+# abnormal exit — it replaced the whole result with a minimal error envelope
+# and returned before the requested exports. Whether a healthy scanner's
+# findings survived therefore depended on the numeric error code of an
+# unrelated module. Every abnormal outcome now converges here: the failure is
+# recorded in failed_modules, healthy evidence is kept, and the run still
+# exits 2.
 RUN_STATUS="ok"
 FAILED_MODULES_JSON="[]"
+HEALTHY_SCANNERS=0
 if need_cmd jq; then
   scanner_jsons=()
   for L in "${langs[@]}"; do
@@ -7295,7 +7345,24 @@ if need_cmd jq; then
   if [[ ${#scanner_jsons[@]} -gt 0 ]]; then
     FAILED_MODULES_JSON="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") != "ok") | {language, status, module_error, message}]' "${scanner_jsons[@]}" 2>/dev/null || echo '[]')"
     [[ "$FAILED_MODULES_JSON" != "[]" ]] && RUN_STATUS="partial"
+    HEALTHY_SCANNERS="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") == "ok")] | length' "${scanner_jsons[@]}" 2>/dev/null || echo 0)"
+    HEALTHY_SCANNERS="${HEALTHY_SCANNERS:-0}"
   fi
+fi
+# A module that exited 2 is an environment/tooling failure rather than a
+# code-quality result; it does not change what the healthy modules found, but
+# the run is incomplete either way.
+if [[ "$HAS_ENV_ERROR" -eq 1 && "$RUN_STATUS" == "ok" ]]; then
+  RUN_STATUS="partial"
+fi
+# "error" is reserved for the case the error envelope always described: a module
+# could not run at all (exit 2 — a tooling/dependency failure) AND no other
+# scanner produced a usable result, so there is nothing to report but the
+# failure. A module that ran and timed out, or that crashed after producing a
+# summary, stays "partial" — as does any failure alongside a scanner that did
+# complete.
+if [[ "$HAS_ENV_ERROR" -eq 1 && "$HEALTHY_SCANNERS" -eq 0 ]]; then
+  RUN_STATUS="error"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7326,22 +7393,60 @@ emit_env_error_report(){
   done
 }
 
-emit_env_error_json(){
-  local proj; proj="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
-  local modules_json=""
-  local first=1
-  for lang in "${ENV_ERROR_LANGS[@]}"; do
-    local lang_json; lang_json="$(json_escape "$lang")"
-    if [[ $first -eq 1 ]]; then
-      modules_json="\"$lang_json\""
-      first=0
-    else
-      modules_json+=",\"$lang_json\""
-    fi
+# Deliver a requested artifact, or fail loudly. Issue #106: `mkdir -p … || true`
+# plus `cp … 2>/dev/null || true` meant a requested report or baseline could be
+# silently absent while the command reported success, so a consumer waiting on
+# exit 0 archived nothing (or kept reusing a stale file). Staging beside the
+# destination and renaming into place also means a failed write never truncates
+# the artifact that was already there.
+deliver_file(){
+  local src="$1" dest="$2" label="$3" dir tmp
+  dir="$(dirname "$dest")"
+  if [[ ! -d "$dir" ]] && ! mkdir -p "$dir" 2>/dev/null; then
+    say_err "${RED}${X}${RESET} Cannot create the directory for the requested ${label}: $dir"
+    return 1
+  fi
+  if [[ ! -d "$dir" ]]; then
+    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dir is not a directory"
+    return 1
+  fi
+  tmp="$(mktemp "$dest.ubs-XXXXXX" 2>/dev/null)" || {
+    say_err "${RED}${X}${RESET} Cannot stage the requested ${label} in $dir (not writable?)"
+    return 1
+  }
+  if ! cat "$src" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dest"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$dest" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest"
+    return 1
+  fi
+  return 0
+}
+
+env_error_langs_json(){
+  local lang out="" first=1
+  for lang in "${ENV_ERROR_LANGS[@]:-}"; do
+    [[ -z "$lang" ]] && continue
+    if [[ $first -eq 1 ]]; then out="\"$(json_escape "$lang")\""; first=0
+    else out+=",\"$(json_escape "$lang")\""; fi
   done
-  emit_error_envelope "environment" "error" "module-failed" \
-    "One or more scanner modules could not run (tooling/dependency problem, not a code-quality failure): ${ENV_ERROR_LANGS[*]}" \
-    "\"failed_modules\":[$modules_json]"
+  printf '[%s]' "$out"
+}
+
+incomplete_run_reason(){
+  if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then printf 'module-failed'; else printf 'module-incomplete'; fi
+}
+
+incomplete_run_message(){
+  if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then
+    printf 'One or more scanner modules could not run (tooling/dependency problem, not a code-quality failure): %s' "${ENV_ERROR_LANGS[*]}"
+  else
+    printf 'One or more scanner modules did not complete; this result covers only the languages that finished'
+  fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7349,29 +7454,31 @@ emit_env_error_json(){
 # ─────────────────────────────────────────────────────────────────────────────
 case "$FORMAT" in
   json)
-    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
-      emit_env_error_report
-      emit_env_error_json
-      status=2
+    [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
+    if generate_combined_json; then
+      emit_combined_json
     else
-      if generate_combined_json; then
-        emit_combined_json
-      else
-        if ! merge_json_scanners; then
-          say "${RED}$X could not produce combined JSON${RESET}"
-          [[ "$status" -lt 1 ]] && status=1
-        fi
+      # No combined document at all (no scanner JSON, or jq missing): the
+      # minimal envelope is the only honest thing left to print.
+      if [[ "$RUN_STATUS" != "ok" ]]; then
+        emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
+          "\"failed_modules\":$(env_error_langs_json)"
+        status=2
+      elif ! merge_json_scanners; then
+        say "${RED}$X could not produce combined JSON${RESET}"
+        [[ "$status" -lt 1 ]] && status=1
       fi
     fi
     ;;
   jsonl)
-    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
-      emit_env_error_report
-      emit_env_error_json
-      status=2
+    [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
+    if write_jsonl_summary ""; then
+      :
     else
-      if write_jsonl_summary ""; then
-        :
+      if [[ "$RUN_STATUS" != "ok" ]]; then
+        emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
+          "\"failed_modules\":$(env_error_langs_json)"
+        status=2
       else
         say "${RED}$X could not produce JSONL output${RESET}"
         [[ "$status" -lt 1 ]] && status=1
@@ -7379,40 +7486,38 @@ case "$FORMAT" in
     fi
     ;;
   sarif)
-    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
-      emit_env_error_report
-      emit_env_error_json
-      status=2
+    [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
+    if generate_combined_json; then
+      emit_combined_sarif
     else
-      if generate_combined_json; then
-        emit_combined_sarif
+      if [[ "$RUN_STATUS" != "ok" ]]; then
+        emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
+          "\"failed_modules\":$(env_error_langs_json)"
+        status=2
       else
         merge_sarif_runs
       fi
     fi
     ;;
   toon)
-    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
-      emit_env_error_report
-      emit_env_error_json
+    [[ "$HAS_ENV_ERROR" -eq 1 ]] && emit_env_error_report
+    # The encoder was checked before scanning; re-check so an encoder that
+    # vanished mid-run still yields the envelope (exit 2), never JSON
+    # labelled as TOON.
+    toon_problem="$(toon_encoder_problem)"
+    if [[ -n "$toon_problem" ]]; then
+      refuse_toon_without_encoder "$toon_problem"
       status=2
+    elif generate_combined_json; then
+      emit_combined_json | "$TOON_BIN" --encode
     else
-      # The encoder was checked before scanning; re-check so an encoder that
-      # vanished mid-run still yields the envelope (exit 2), never JSON
-      # labelled as TOON.
-      toon_problem="$(toon_encoder_problem)"
-      if [[ -z "$toon_problem" ]]; then
-        if generate_combined_json; then
-          emit_combined_json | "$TOON_BIN" --encode
-        else
-          if ! merge_json_scanners | "$TOON_BIN" --encode; then
-            say "${RED}$X could not produce TOON output${RESET}"
-            [[ "$status" -lt 1 ]] && status=1
-          fi
-        fi
-      else
-        refuse_toon_without_encoder "$toon_problem"
+      if [[ "$RUN_STATUS" != "ok" ]]; then
+        emit_error_envelope "environment" "error" "$(incomplete_run_reason)" "$(incomplete_run_message)" \
+          "\"failed_modules\":$(env_error_langs_json)"
         status=2
+      elif ! merge_json_scanners | "$TOON_BIN" --encode; then
+        say "${RED}$X could not produce TOON output${RESET}"
+        [[ "$status" -lt 1 ]] && status=1
       fi
     fi
     ;;
@@ -7435,8 +7540,11 @@ case "$FORMAT" in
       say "${DIM}This is a tooling/dependency problem, not a code-quality failure.${RESET}"
       say "${DIM}See the affected scanner output above for remediation guidance.${RESET}"
       status=2
-    else
-      # Combined human summary (if JSON pieces exist)
+    fi
+    {
+      # Combined human summary (if JSON pieces exist). Issue #105: this used to
+      # be skipped entirely when any module exited 2, which hid what the
+      # healthy scanners actually found.
       if need_cmd jq && ls "$TMPDIR_RUN"/*.json >/dev/null 2>&1; then
         say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
         tot_files=0; tot_crit=0; tot_warn=0; tot_info=0
@@ -7444,8 +7552,8 @@ case "$FORMAT" in
           # Single-module fast path (bead C3): avoid multi-scanner merge and generate_combined_json
           read -r tot_files tot_crit tot_warn tot_info < <(jq -r '[.files // 0, .critical // 0, .warning // 0, .info // 0] | @tsv' "$TMPDIR_RUN/${langs[0]}.json" 2>/dev/null || echo "0 0 0 0")
           say "Files: ${tot_files:-0}\nCritical: ${tot_crit:-0}\nWarning: ${tot_warn:-0}\nInfo: ${tot_info:-0}"
-          if [[ "$RUN_STATUS" == "partial" ]]; then
-            say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
+          if [[ "$RUN_STATUS" != "ok" ]]; then
+            say "${RED}Status: ${RUN_STATUS}${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
           if [[ "$UBS_PROFILE" == "1" ]]; then
             say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end) + (if .slots != null and .slots > 0 then "; " + (.slots|tostring) + " slots" else "" end)')"
@@ -7455,20 +7563,31 @@ case "$FORMAT" in
         elif generate_combined_json; then
           read -r tot_files tot_crit tot_warn tot_info < <(jq -r '[.totals.files // 0, .totals.critical // 0, .totals.warning // 0, .totals.info // 0] | @tsv' "$COMBINED_JSON_FILE" 2>/dev/null || echo "0 0 0 0")
           say "Files: ${tot_files:-0}\nCritical: ${tot_crit:-0}\nWarning: ${tot_warn:-0}\nInfo: ${tot_info:-0}"
-          if [[ "$RUN_STATUS" == "partial" ]]; then
-            say "${RED}Status: partial${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
+          if [[ "$RUN_STATUS" != "ok" ]]; then
+            say "${RED}Status: ${RUN_STATUS}${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
           if [[ "$UBS_PROFILE" == "1" ]]; then
             say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end) + (if .slots != null and .slots > 0 then "; " + (.slots|tostring) + " slots" else "" end)')"
           fi
-          if [[ -n "$COMPARISON_FILE" && -f "$COMPARISON_FILE" ]]; then
-            say "$(jq -r --slurpfile base "$COMPARISON_FILE" --arg path "$COMPARISON_FILE" '
-              def n(x): if (x|type)=="number" then x else 0 end;
-              def sgn(x): if x >= 0 then "+" + (x|tostring) else (x|tostring) end;
-              ($base[0].totals // {}) as $b
-              | "Δ vs baseline (" + $path + "): critical " + sgn(n(.totals.critical) - n($b.critical))
-                + ", warning " + sgn(n(.totals.warning) - n($b.warning))
-                + ", info " + sgn(n(.totals.info) - n($b.info))' "$COMBINED_JSON_FILE" 2>/dev/null || echo "Δ vs baseline: could not read $COMPARISON_FILE")"
+          if [[ -n "$COMPARISON_FILE" ]]; then
+            # Both observations must be complete before a delta means anything
+            # (issue #104): a scanner that stopped running looks exactly like a
+            # batch of defects that got fixed.
+            if [[ "$RUN_STATUS" != "ok" ]]; then
+              say "${YELLOW}Δ vs baseline: unavailable — this scan is ${RUN_STATUS}, so a delta would measure coverage, not code${RESET}"
+            elif [[ ! -f "$COMPARISON_FILE" ]]; then
+              say "${YELLOW}Δ vs baseline: unavailable — could not read $COMPARISON_FILE${RESET}"
+            elif ! jq -e '(.status // "ok") == "ok" and ((.failed_modules // []) | length) == 0' "$COMPARISON_FILE" >/dev/null 2>&1; then
+              say "${YELLOW}Δ vs baseline: unavailable — $COMPARISON_FILE was recorded from an incomplete scan${RESET}"
+            else
+              say "$(jq -r --slurpfile base "$COMPARISON_FILE" --arg path "$COMPARISON_FILE" '
+                def n(x): if (x|type)=="number" then x else 0 end;
+                def sgn(x): if x >= 0 then "+" + (x|tostring) else (x|tostring) end;
+                ($base[0].totals // {}) as $b
+                | "Δ vs baseline (" + $path + "): critical " + sgn(n(.totals.critical) - n($b.critical))
+                  + ", warning " + sgn(n(.totals.warning) - n($b.warning))
+                  + ", info " + sgn(n(.totals.info) - n($b.info))' "$COMBINED_JSON_FILE" 2>/dev/null || echo "Δ vs baseline: could not read $COMPARISON_FILE")"
+            fi
           fi
           crit="${tot_crit:-0}"
           warn="${tot_warn:-0}"
@@ -7481,27 +7600,29 @@ case "$FORMAT" in
         desired=0
         if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
         if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
-        if [[ "$NEW_ONLY" -eq 1 ]]; then
+        if [[ "$NEW_ONLY" -eq 1 && "$RUN_STATUS" == "ok" ]]; then
           status="$desired"
         elif [[ "$desired" -gt "$status" ]]; then
           status="$desired"
         fi
       fi
-    fi
+    }
     ;;
 	esac
 
 	# Ensure exit status reflects merged totals in machine formats too.
 	# Some modules emit machine output but always exit 0; the meta-runner should still fail
 	# when critical findings exist (or warnings in --fail-on-warning mode).
-	if [[ "$HAS_ENV_ERROR" -eq 0 && ( "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ) ]]; then
+	if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ]]; then
 	  if need_cmd jq && generate_combined_json; then
 	    read -r crit warn < <(jq -r '[.totals.critical // 0, .totals.warning // 0] | @tsv' "$COMBINED_JSON_FILE" 2>/dev/null || echo "0 0")
 	    crit=${crit:-0}; warn=${warn:-0}
 	    desired=0
 	    if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit + warn)) -gt 0 ]]; then desired=1; fi
 	    if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
-	    if [[ "$NEW_ONLY" -eq 1 ]]; then
+	    # --new-only pins the exit code to what is NEW, but only when the scan
+	    # was complete: a filter changes findings, never execution state.
+	    if [[ "$NEW_ONLY" -eq 1 && "$RUN_STATUS" == "ok" ]]; then
 	      status="$desired"
 	    elif [[ "$desired" -gt "$status" ]]; then
 	      status="$desired"
@@ -7509,65 +7630,94 @@ case "$FORMAT" in
 	  fi
 	fi
 
-	if [[ "$HAS_ENV_ERROR" -eq 0 && "$RUN_STATUS" == "partial" ]]; then
+	# Incomplete run (a module timed out, crashed, or exited 2): exit 2 so a
+	# green exit always means every requested language was scanned. The results
+	# from the healthy modules stay in the envelope and in every requested
+	# export (issue #105) — losing them was never part of failing the run.
+	if [[ "$RUN_STATUS" != "ok" ]]; then
 	  if [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
-	    say_err "${YELLOW}${WARN}${RESET} Partial run accepted because UBS_ALLOW_PARTIAL=1 ($(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')); exit code reflects the modules that completed."
+	    say_err "${YELLOW}${WARN}${RESET} Partial run accepted because UBS_ALLOW_PARTIAL=1 ($(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}")); exit code reflects the modules that completed."
 	  else
-	    say_err "${RED}${X}${RESET} Partial run: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")'). Exit 2 — not every requested language was scanned. Set UBS_ALLOW_PARTIAL=1 to accept partial results."
+	    say_err "${RED}${X}${RESET} Partial run: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}"). Exit 2 — not every requested language was scanned. Set UBS_ALLOW_PARTIAL=1 to accept partial results."
 	    status=2
 	  fi
 	fi
 
-	if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
-	  [[ -n "$BEADS_JSONL_PATH" ]] && say_err "${YELLOW}${WARN}${RESET} Skipping Beads JSONL export due to environment error."
-	  [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] \
-    && say_err "${YELLOW}${WARN}${RESET} Skipping shareable artifacts due to environment error."
-	  exit "$status"
-	fi
-
 if [[ -n "$BEADS_JSONL_PATH" ]]; then
   if ! write_jsonl_summary "$BEADS_JSONL_PATH"; then
-    say "${YELLOW}${WARN}${RESET} Could not write Beads JSONL to $BEADS_JSONL_PATH"
+    # Requested and not delivered: exit 2 rather than let a consumer read the
+    # exit code as "the export is on disk" (issue #106).
+    say_err "${RED}${X}${RESET} Could not write the requested Beads JSONL to $BEADS_JSONL_PATH"
+    status=2
   else
     say "${DIM}${INFO}${RESET} Beads JSONL written to $BEADS_JSONL_PATH"
   fi
 fi
 
 SHAREABLE_REQUEST=0
-if [[ "$HAS_ENV_ERROR" -eq 0 ]]; then
-  [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] && SHAREABLE_REQUEST=1
-fi
+[[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] && SHAREABLE_REQUEST=1
 
-if [[ "$HAS_ENV_ERROR" -eq 0 && $SHAREABLE_REQUEST -eq 1 ]]; then
+SHAREABLE_RC=0
+if [[ $SHAREABLE_REQUEST -eq 1 ]]; then
   if generate_combined_json; then
     SHAREABLE_JSON_FILE="$COMBINED_JSON_FILE"
     SHAREABLE_TIMESTAMP="$(date_iso)"
     if ! need_cmd python3; then
-      say "${YELLOW}${WARN}${RESET} python3 not available; cannot build shareable artifacts"
+      say_err "${RED}${X}${RESET} python3 not available; cannot build the requested shareable artifacts"
+      SHAREABLE_RC=1
     else
       python3 - "$SHAREABLE_JSON_FILE" "${COMPARISON_FILE:-}" \
         "${REPORT_JSON_PATH:-}" "${HTML_REPORT_PATH:-}" \
         "${GIT_REMOTE_HTTP:-}" "${GIT_COMMIT_SHA:-}" "${GIT_BLOB_BASE:-}" \
-        "$SHAREABLE_TIMESTAMP" <<'PY' 1>&2
-import json, sys, pathlib, datetime, html
+        "$SHAREABLE_TIMESTAMP" <<'PY' 1>&2 || SHAREABLE_RC=$?
+import json, os, sys, pathlib, tempfile, html
 combined_path, baseline_path, out_json, out_html, repo_url, commit, blob_base, ts = sys.argv[1:9]
 root = pathlib.Path(combined_path)
 if not root.exists():
-    sys.exit(0)
-combined = json.loads(root.read_text())
+    sys.stderr.write("ubs: the combined result is missing; requested artifacts were not written\n")
+    sys.exit(4)
+try:
+    combined = json.loads(root.read_text())
+except (OSError, ValueError) as exc:
+    sys.stderr.write(f"ubs: the combined result could not be read ({exc}); "
+                     "requested artifacts were not written\n")
+    sys.exit(4)
+if not isinstance(combined, dict):
+    sys.stderr.write("ubs: the combined result is not a JSON object; "
+                     "requested artifacts were not written\n")
+    sys.exit(4)
 
 def load_optional(path):
+    """Return (document, reason). `reason` is set when the file cannot be used."""
     if not path:
-        return None
+        return None, "no_baseline"
     p = pathlib.Path(path)
     if not p.exists():
-        return None
+        return None, "baseline_missing"
     try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+        doc = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None, "baseline_unreadable"
+    if not isinstance(doc, dict):
+        return None, "baseline_unreadable"
+    return doc, ""
 
-baseline = load_optional(baseline_path)
+def completion_of(doc):
+    """(is_complete, failed_modules) for a scan document.
+
+    A run that timed out or lost a module is not a comparable observation: its
+    totals describe the modules that happened to finish, so a delta against it
+    measures coverage, not code (issue #104).
+    """
+    if not isinstance(doc, dict):
+        return False, []
+    failed = doc.get("failed_modules") or []
+    if not isinstance(failed, list):
+        return False, []
+    status = str(doc.get("status") or "ok")
+    return (status == "ok" and not failed), failed
+
+baseline, baseline_reason = load_optional(baseline_path)
 
 shareable = combined.copy()
 shareable["generated_at"] = ts
@@ -7593,24 +7743,78 @@ def get_totals(doc):
 cur_totals = get_totals(combined)
 base_totals = get_totals(baseline)
 
-if baseline is not None:
-    shareable["comparison"] = {
-        "baseline_path": baseline_path,
-        "delta": {
-            "critical": cur_totals["critical"] - base_totals["critical"],
-            "warning": cur_totals["warning"] - base_totals["warning"],
-            "info": cur_totals["info"] - base_totals["info"],
-        },
-        "baseline_totals": base_totals,
-    }
+# Qualify BOTH observations before emitting a delta. An unchanged tree whose
+# Python scanner timed out used to report "-3 critical", which reads as three
+# defects fixed when in fact three defects simply were not looked for.
+cur_complete, cur_failed = completion_of(combined)
+base_complete, base_failed = completion_of(baseline)
+comparison_ok = False
+if baseline_path:
+    if not cur_complete:
+        shareable["comparison"] = {
+            "baseline_path": baseline_path,
+            "status": "unavailable",
+            "reason": "current_scan_incomplete",
+            "detail": "this scan did not cover every requested language, so a delta would measure coverage, not code",
+            "failed_modules": cur_failed,
+        }
+    elif baseline is None:
+        shareable["comparison"] = {
+            "baseline_path": baseline_path,
+            "status": "unavailable",
+            "reason": baseline_reason or "baseline_unreadable",
+            "detail": "the baseline document could not be read",
+        }
+    elif not base_complete:
+        shareable["comparison"] = {
+            "baseline_path": baseline_path,
+            "status": "unavailable",
+            "reason": "baseline_incomplete",
+            "detail": "the baseline was itself recorded from an incomplete scan",
+            "baseline_failed_modules": base_failed,
+        }
+    else:
+        comparison_ok = True
+        shareable["comparison"] = {
+            "baseline_path": baseline_path,
+            "status": "ok",
+            "delta": {
+                "critical": cur_totals["critical"] - base_totals["critical"],
+                "warning": cur_totals["warning"] - base_totals["warning"],
+                "info": cur_totals["info"] - base_totals["info"],
+            },
+            "baseline_totals": base_totals,
+        }
+
+errors = []
+
+def deliver(path, payload, label):
+    """Replace `path` only after a complete write; never truncate the old file."""
+    target = pathlib.Path(path)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=f".{target.name}.", dir=target.parent,
+                                         delete=False) as stream:
+            staged = pathlib.Path(stream.name)
+            stream.write(payload.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(staged, target)
+        staged = None
+    except (OSError, ValueError) as exc:
+        errors.append(f"{label} ({path}): {exc}")
+    finally:
+        if staged is not None:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
 
 if out_json:
-    out_path = pathlib.Path(out_json)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(shareable, indent=2), encoding="utf-8")
+    deliver(out_json, json.dumps(shareable, indent=2), "report JSON")
 
 if out_html:
-    if baseline is not None:
+    if comparison_ok:
         def row(label, key):
             delta = cur_totals[key] - base_totals[key]
             return f"<tr><td>{label}</td><td>{cur_totals[key]}</td><td>{base_totals[key]}</td><td>{delta:+d}</td></tr>"
@@ -7623,7 +7827,8 @@ if out_html:
     </table>
     """
     else:
-        # No baseline: a zero column would make every count look like a regression.
+        # No usable baseline: a zero column would make every count look like a
+        # regression, and an unqualified Δ would be worse still.
         totals_html = f"""
     <table>
       <tr><th>Metric</th><th>Current</th></tr>
@@ -7632,6 +7837,34 @@ if out_html:
       <tr><td>Info</td><td>{cur_totals['info']}</td></tr>
     </table>
     """
+        comp = shareable.get("comparison")
+        if isinstance(comp, dict) and comp.get("status") == "unavailable":
+            totals_html += (
+                "<p class='warn'>Comparison unavailable ("
+                + html.escape(str(comp.get("reason", "")))
+                + "): " + html.escape(str(comp.get("detail", ""))) + "</p>"
+            )
+    # An HTML report from an incomplete scan must say so on its face: its
+    # per-language zeros mean "not scanned", not "nothing found" (issue #104).
+    banner_html = ""
+    if not cur_complete:
+        rows = []
+        for entry in cur_failed:
+            if isinstance(entry, dict):
+                rows.append(
+                    "<li><b>" + html.escape(str(entry.get("language", "?"))) + "</b>: "
+                    + html.escape(str(entry.get("status", "error"))) + " — "
+                    + html.escape(str(entry.get("message") or entry.get("module_error") or "module did not complete"))
+                    + "</li>"
+                )
+        banner_html = (
+            "<div class='partial'><h2>Incomplete scan — results are partial</h2>"
+            "<p>Status: <b>" + html.escape(str(combined.get("status", "partial"))) + "</b>. "
+            "Not every requested language was scanned, so a zero below can mean "
+            "&quot;not scanned&quot; rather than &quot;nothing found&quot;.</p>"
+            + ("<ul>" + "".join(rows) + "</ul>" if rows else "")
+            + "</div>"
+        )
     scanners = shareable.get("scanners", [])
     scanner_rows = []
     for entry in scanners:
@@ -7648,30 +7881,51 @@ if out_html:
     th,td{{border:1px solid #444;padding:0.4rem 0.8rem;text-align:left;}}
     h1{{margin-bottom:0;}}
     .meta{{color:#aaa;font-size:0.9rem;}}
+    .partial{{border:2px solid #c0392b;background:#2b1512;padding:0.6rem 1rem;margin-top:1rem;}}
+    .partial h2{{margin:0 0 0.3rem 0;color:#e74c3c;}}
+    .warn{{color:#e67e22;}}
     </style></head><body>
     <h1>Ultimate Bug Scanner Report</h1>
     <div class='meta'>Generated {html.escape(ts)}</div>
+    {banner_html}
     {totals_html}
     <h2>Per-language totals</h2>
     <table><tr><th>Language</th><th>Critical</th><th>Warning</th><th>Info</th></tr>{scanners_html}</table>
     </body></html>
     """
-    out_path = pathlib.Path(out_html)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(doc, encoding="utf-8")
+    deliver(out_html, doc, "HTML report")
+
+if errors:
+    for item in errors:
+        sys.stderr.write("ubs: could not write requested artifact: " + item + "\n")
+    sys.exit(4)
 
 print(f"Shareable summary written (critical={cur_totals['critical']}, warning={cur_totals['warning']}, info={cur_totals['info']})")
 PY
     fi
   else
-    say "${YELLOW}${WARN}${RESET} jq not available; cannot build shareable artifacts"
+    say_err "${RED}${X}${RESET} Could not build the combined result; the requested shareable artifacts were not written"
+    SHAREABLE_RC=1
+  fi
+  if [[ "$SHAREABLE_RC" -ne 0 ]]; then
+    # A requested artifact that was not delivered is an environment/delivery
+    # failure, not a findings verdict: exit 2 so nobody records "exit 0, so my
+    # report is on disk" (issue #106).
+    status=2
   fi
 fi
 
 if [[ -n "$SAVE_BASELINE_FILE" ]]; then
-  if generate_combined_json; then
-    mkdir -p "$(dirname "$SAVE_BASELINE_FILE")" 2>/dev/null || true
-    cp "$COMBINED_JSON_FILE" "$SAVE_BASELINE_FILE" 2>/dev/null || true
+  if [[ "$RUN_STATUS" != "ok" ]]; then
+    # Refusing is the point: a baseline recorded from an incomplete scan turns
+    # missing coverage into an apparent improvement on the next comparison, and
+    # would overwrite a complete baseline that is still valid (issue #104).
+    say_err "${RED}${X}${RESET} Not saving a baseline: this scan is ${RUN_STATUS} (${SAVE_BASELINE_FILE} left unchanged). Re-run once every requested language completes."
+  elif generate_combined_json; then
+    deliver_file "$COMBINED_JSON_FILE" "$SAVE_BASELINE_FILE" "baseline" || status=2
+  else
+    say_err "${RED}${X}${RESET} Could not build the combined result; the requested baseline was not saved"
+    status=2
   fi
 fi
 

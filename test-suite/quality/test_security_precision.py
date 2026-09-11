@@ -35,11 +35,13 @@ if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
 from ubs_core.analyzers import ctcompare_py  # noqa: E402
+from ubs_core.analyzers import ctcompare_rust  # noqa: E402
 from ubs_core.analyzers import sec_hardcoded_secrets  # noqa: E402
 from ubs_core.py_detectors import unsafe_deserialization  # noqa: E402
 from ubs_core.py_patterns.security_rg import PATTERNS  # noqa: E402
 from ubs_core.py_rules import _RULES  # noqa: E402
 from ubs_core.py_scan import iter_matches  # noqa: E402
+from ubs_core.rust_detectors import security_randomness  # noqa: E402
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
@@ -252,6 +254,100 @@ class ConstantTimeCompareDigestRoleTests(unittest.TestCase):
             (root / "article.html").write_bytes(b"public article BYTES")
             with self.assertRaises(RuntimeError):
                 fixture.verify_public_fixture(root)
+
+
+class RustPreparedSourceTests(unittest.TestCase):
+    COMPARE = '''const API_SECRET: &str = "secret";
+fn verify(provided: &str) {
+    let alias = next_alias;
+    let next_alias = API_SECRET;
+    let local = alias;
+    local == provided;
+    API_SECRET == (
+        provided);
+    API_SECRET == provided; // ubs:ignore
+    // ubs:ignore
+    API_SECRET != provided;
+}
+fn unrelated(token: &str) {
+    token == "BR2";
+}
+fn other(provided: &str) {
+    local == provided;
+    API_SECRET != provided;
+}
+'''
+    RANDOM = '''fn create_session_token() {
+    let token = rand::random::<u64>();
+    let token = rand::random::<u64>(); // ubs:ignore
+    // ubs:ignore
+    let token = rand::random::<u64>();
+}
+fn doc() {
+    let text = "token rand::random::<u64>() // literal";
+}
+fn csrf_nonce() {
+    let nonce = rand::random::<
+        u64>();
+}
+fn unrelated() {
+    let number = rand::random::<u64>();
+}
+'''
+
+    def test_rust_compare_multiline_alias_scopes_and_markers(self):
+        findings = ctcompare_rust.scan_file(self.COMPARE)
+        self.assertEqual([line for line, _ in findings], [6, 7, 18])
+        self.assertEqual(
+            findings,
+            [(line, self.COMPARE.splitlines()[line - 1].strip()) for line in [6, 7, 18]],
+        )
+
+    def test_rust_random_multiline_and_markers(self):
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-reuse-") as tmp:
+            path = Path(tmp) / "source.rs"
+            path.write_text(self.RANDOM, encoding="utf-8")
+            findings = list(security_randomness.find([path]))
+            self.assertEqual([hit[1] for hit in findings], [2, 11])
+            # The same pathname must observe replacement contents on a later
+            # invocation; reuse is confined to one immutable file read.
+            path.write_text("fn ordinary() {}\n", encoding="utf-8")
+            self.assertEqual(list(security_randomness.find([path])), [])
+            path.write_text(self.RANDOM, encoding="utf-8")
+            self.assertEqual(list(security_randomness.find([path])), findings)
+
+    def test_rust_compare_source_reuse_does_not_cross_scans(self):
+        first = ctcompare_rust.scan_file(self.COMPARE)
+        self.assertTrue(first)
+        self.assertEqual(ctcompare_rust.scan_file("fn ordinary(x: u32) { x == 1; }"), [])
+        self.assertEqual(ctcompare_rust.scan_file(self.COMPARE), first)
+
+    def test_rust_comment_stripping_once_per_source_line(self):
+        # Count actual calls while running the detector, without substituting
+        # its parser or outputs. Lookahead and taint fixpoint passes must reuse
+        # the prepared lines rather than rescan them.
+        counts = {}
+        codes = {ctcompare_rust.strip_line_comments.__code__,
+                 security_randomness.strip_line_comments.__code__}
+
+        def record(frame, event, arg):
+            if event == "call" and frame.f_code in codes:
+                counts[frame.f_code] = counts.get(frame.f_code, 0) + 1
+
+        previous = sys.getprofile()
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-reuse-") as tmp:
+            path = Path(tmp) / "source.rs"
+            path.write_text(self.RANDOM, encoding="utf-8")
+            try:
+                sys.setprofile(record)
+                compared = ctcompare_rust.scan_file(self.COMPARE)
+                random = list(security_randomness.find([path]))
+            finally:
+                sys.setprofile(previous)
+        self.assertEqual([line for line, _ in compared], [6, 7, 18])
+        self.assertEqual([hit[1] for hit in random], [2, 11])
+        self.assertEqual(counts[ctcompare_rust.strip_line_comments.__code__], len(self.COMPARE.splitlines()))
+        self.assertEqual(counts[security_randomness.strip_line_comments.__code__], len(self.RANDOM.splitlines()))
 
 
 if __name__ == "__main__":

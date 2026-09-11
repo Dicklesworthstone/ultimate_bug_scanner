@@ -187,14 +187,14 @@ def without_string_literals(expr: str) -> str:
     return "".join(chars)
 
 
-def logical_statement(lines, line_no):
+def logical_statement(stripped_lines, line_no):
     idx = line_no - 1
-    statement = strip_line_comments(lines[idx])
+    statement = stripped_lines[idx]
     paren = statement.count("(") - statement.count(")")
     has_end = ";" in statement or "{" in statement or "}" in statement
     lookahead = idx + 1
-    while (paren > 0 or not has_end) and lookahead < len(lines) and lookahead < idx + 10:
-        nxt = strip_line_comments(lines[lookahead]).strip()
+    while (paren > 0 or not has_end) and lookahead < len(stripped_lines) and lookahead < idx + 10:
+        nxt = stripped_lines[lookahead].strip()
         statement += " " + nxt
         paren += nxt.count("(") - nxt.count(")")
         has_end = has_end or ";" in nxt or "{" in nxt or "}" in nxt
@@ -278,13 +278,17 @@ def analyze(path: Path, issues):
     )):
         return
     lines = text.splitlines()
+    # Lookahead revisits neighboring lines. Strip once per immutable file,
+    # retaining the original lines for marker checks and finding text.
+    stripped_lines = [strip_line_comments(line) for line in lines]
+    function_sensitive = {}
     insecure_rng_vars = set()
     function_stack = []
     pending_function = ""
     brace_depth = 0
     seen = set()
-    for line_no, raw in enumerate(lines, start=1):
-        raw_statement = strip_line_comments(raw).strip()
+    for line_no, stripped in enumerate(stripped_lines, start=1):
+        raw_statement = stripped.strip()
         visible_line = without_string_literals(raw_statement)
         while function_stack and brace_depth < function_stack[-1][1]:
             function_stack.pop()
@@ -306,10 +310,12 @@ def analyze(path: Path, issues):
         if has_ignore(lines, line_no) or not raw_statement:
             brace_depth += opens - closes
             continue
-        statement = logical_statement(lines, line_no)
+        statement = logical_statement(stripped_lines, line_no)
         update_insecure_rng_vars(statement, insecure_rng_vars)
         line_sensitive = has_security_context(statement, "")
-        sensitive = line_sensitive or has_security_context("", current_function)
+        if not line_sensitive and current_function not in function_sensitive:
+            function_sensitive[current_function] = has_security_context("", current_function)
+        sensitive = line_sensitive or function_sensitive[current_function]
         source = unsafe_source(statement, insecure_rng_vars, sensitive)
         if source and sensitive:
             key = (str(path), line_no, source)

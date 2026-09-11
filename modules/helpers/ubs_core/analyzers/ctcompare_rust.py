@@ -8,6 +8,7 @@ as structured findings for the `python3 -m ubs_core` CLI.
 """
 from __future__ import annotations
 
+from functools import cache
 import os
 import re
 import sys
@@ -146,12 +147,12 @@ def strip_line_comments(line: str) -> str:
     return "".join(out)
 
 
-def statement_from(lines, line_no, max_lines=8):
+def statement_from(stripped_lines, line_no, max_lines=8):
     idx = line_no - 1
     parts = []
     balance = 0
-    for current_idx in range(idx, min(len(lines), idx + max_lines)):
-        current = strip_line_comments(lines[current_idx]).strip()
+    for current_idx in range(idx, min(len(stripped_lines), idx + max_lines)):
+        current = stripped_lines[current_idx].strip()
         if not current:
             if parts:
                 break
@@ -302,24 +303,20 @@ def blank_string_literals(text: str) -> str:
     return "".join(chars)
 
 
-def structural_line(line: str) -> str:
-    return blank_string_literals(strip_line_comments(line))
-
-
-def function_owner_by_line(lines):
+def function_owner_by_line(stripped_lines):
     """Map every 1-based line number to the innermost enclosing `fn` body id.
 
     Id 0 is module scope: everything outside a function body (`static`/`const`
     items, `impl` headers, struct fields). A body that opens and closes on one
     line still gets its own id, so a one-line function is its own taint scope.
     """
-    owner = [0] * (len(lines) + 1)
+    owner = [0] * (len(stripped_lines) + 1)
     depth = 0
     stack = []  # (fn_id, body_depth)
     next_id = 1
     pending_fn = False
-    for line_no, raw in enumerate(lines, start=1):
-        structural = structural_line(raw)
+    for line_no, stripped in enumerate(stripped_lines, start=1):
+        structural = blank_string_literals(stripped)
         if fn_decl_re.search(structural):
             pending_fn = True
         # The innermost scope active at ANY point on the line owns it, so the
@@ -345,7 +342,7 @@ def function_owner_by_line(lines):
     return owner
 
 
-def collect_sensitive_vars(lines, line_numbers, seeded=()):
+def collect_sensitive_vars(lines, stripped_lines, statement_at, line_numbers, seeded=()):
     """Taint set for ONE scope, seeded from the enclosing (module) scope.
 
     Iterated to a fixpoint so alias chains stay order-independent inside the
@@ -360,10 +357,10 @@ def collect_sensitive_vars(lines, line_numbers, seeded=()):
         for line_no in line_numbers:
             if has_ignore(lines, line_no):
                 continue
-            stripped = strip_line_comments(lines[line_no - 1]).strip()
+            stripped = stripped_lines[line_no - 1].strip()
             if not stripped:
                 continue
-            statement = statement_from(lines, line_no, max_lines=5)
+            statement = statement_at(line_no, 5)
             if not statement or safe_compare_re.search(statement):
                 continue
             match = assign_re.match(statement)
@@ -412,28 +409,38 @@ def scan_file(text: str) -> list[tuple[int, str]]:
     if "==" not in text and "!=" not in text:
         return []
     lines = text.splitlines()
-    owner = function_owner_by_line(lines)
+    # These values depend only on this file's immutable text. Reuse them across
+    # scope discovery, the four taint passes, and comparison lookahead without
+    # retaining file contents between scans. Raw lines still own suppression
+    # and displayed source text.
+    stripped_lines = [strip_line_comments(line) for line in lines]
+
+    @cache
+    def statement_at(line_no, max_lines):
+        return statement_from(stripped_lines, line_no, max_lines)
+
+    owner = function_owner_by_line(stripped_lines)
     scopes = {}
     for line_no in range(1, len(lines) + 1):
         scopes.setdefault(owner[line_no], []).append(line_no)
     # Module-scope taint (a `static API_SECRET`, a `const HMAC_KEY`) seeds every
     # function; a function's own locals stay inside it.
-    module_sensitive = collect_sensitive_vars(lines, scopes.get(0, ()))
+    module_sensitive = collect_sensitive_vars(lines, stripped_lines, statement_at, scopes.get(0, ()))
     found: list[tuple[int, str]] = []
     seen: set[int] = set()
     for scope_id, scope_lines in scopes.items():
         sensitive_vars = (
             module_sensitive
             if scope_id == 0
-            else collect_sensitive_vars(lines, scope_lines, module_sensitive)
+            else collect_sensitive_vars(lines, stripped_lines, statement_at, scope_lines, module_sensitive)
         )
         for line_no in scope_lines:
             if has_ignore(lines, line_no):
                 continue
-            stripped = strip_line_comments(lines[line_no - 1]).strip()
+            stripped = stripped_lines[line_no - 1].strip()
             if not stripped or ("==" not in stripped and "!=" not in stripped):
                 continue
-            statement = statement_from(lines, line_no)
+            statement = statement_at(line_no, 8)
             if not statement or not unsafe_secret_compare(statement, sensitive_vars):
                 continue
             if line_no in seen:

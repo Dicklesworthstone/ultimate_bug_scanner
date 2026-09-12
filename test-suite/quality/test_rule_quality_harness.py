@@ -677,6 +677,34 @@ class RunManifestExpectationTest(unittest.TestCase):
             {"critical": 6, "warning": 8, "info": 10, "files": 12},
         )
 
+    def test_parse_toon_summary_uses_totals_block_once(self) -> None:
+        stdout = "\n".join(
+            [
+                "project: parser-proof",
+                "scanners[1]:",
+                "  - language: js",
+                "    files: 1",
+                "    critical: 2",
+                "    warning: 3",
+                "    info: 4",
+                "    findings[1]{severity,title}:",
+                "      warning,fixture",
+                "totals:",
+                "  files: 1",
+                "  critical: 2",
+                "  warning: 3",
+                "  info: 4",
+            ]
+        )
+
+        summary = rule_quality_harness.parse_toon_summary(stdout, "fixture")
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["totals"],
+            {"files": 1, "critical": 2, "warning": 3, "info": 4},
+        )
+
     def test_parse_meta_runner_text_summary(self) -> None:
         summary = rule_quality_harness.parse_text_summary(
             "\n".join(

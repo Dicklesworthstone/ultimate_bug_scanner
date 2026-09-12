@@ -423,6 +423,8 @@ need_cmd(){
   # Test seam (bead B11): pretend rsync is absent, as on Git for Windows, so the
   # tar/python workspace tiers can be exercised on a box that has rsync.
   if [[ "${1:-}" == "rsync" && "${UBS_TEST_NO_RSYNC:-0}" == "1" ]]; then return 1; fi
+  # Test seam: force the Python walk in list_scan_files (issue #114).
+  if [[ "${1:-}" == "rg" && "${UBS_TEST_NO_RG:-0}" == "1" ]]; then return 1; fi
   command -v "$1" >/dev/null 2>&1
 }
 
@@ -2451,10 +2453,19 @@ patterns_csv = sys.argv[2] if len(sys.argv) > 2 else ""
 patterns = [p for p in patterns_csv.split(",") if p]
 
 def excluded(rel_path, name):
+    rel_s = str(rel_path).replace("\\", "/")
+    path = pathlib.PurePosixPath(rel_s)
     for pat in patterns:
-        if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(name, pat):
+        if not pat:
+            continue
+        if pat.startswith("/"):
+            rest = pat[1:]
+            if rest and path.full_match(rest):
+                return True
+            continue
+        if fnmatch.fnmatch(rel_s, pat) or fnmatch.fnmatch(name, pat):
             return True
-        for part in pathlib.Path(rel_path).parts:
+        for part in path.parts:
             if fnmatch.fnmatch(part, pat):
                 return True
     return False
@@ -2543,6 +2554,7 @@ import json
 import os
 import sys
 import time
+from pathlib import PurePosixPath
 
 root = os.fsencode(sys.argv[1])
 raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
@@ -2680,10 +2692,20 @@ def scoped_skip(dirpath: bytes, name: bytes, files_under: set[bytes]) -> bool:
 
 
 def excluded(rel, name):
+    rel_s = rel.replace("\\", "/") if isinstance(rel, str) else os.fsdecode(rel).replace("\\", "/")
+    name_s = name if isinstance(name, str) else os.fsdecode(name)
+    path = PurePosixPath(rel_s)
     for pat in patterns:
-        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat):
+        if not pat:
+            continue
+        if pat.startswith("/"):
+            rest = pat[1:]
+            if rest and path.full_match(rest):
+                return True
+            continue
+        if fnmatch.fnmatch(rel_s, pat) or fnmatch.fnmatch(name_s, pat):
             return True
-        for part in rel.split("/"):
+        for part in rel_s.split("/"):
             if fnmatch.fnmatch(part, pat):
                 return True
     return False
@@ -2841,13 +2863,19 @@ with open(sys.argv[3], "rb") as fh:
     for rel in fh.read().split(b"\0"):
         if not rel:
             continue
+        rel_s = os.fsdecode(rel)
+        parts = rel_s.replace("\\", "/").split("/")
+        if os.path.isabs(rel_s) or any(part == ".." for part in parts):
+            failed += 1
+            print(f"{rel_s}: path is not relative to the copy root", file=sys.stderr)
+            continue
         target = os.path.join(dst, rel)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.makedirs(os.path.dirname(target) or dst, exist_ok=True)
         try:
             shutil.copy2(os.path.join(src, rel), target, follow_symlinks=False)
         except (OSError, shutil.Error) as exc:
             failed += 1
-            print(f"{os.fsdecode(rel)}: {exc}", file=sys.stderr)
+            print(f"{rel_s}: {exc}", file=sys.stderr)
 sys.exit(1 if failed else 0)
 PY
     if [[ "$rc" -ne 0 ]]; then
@@ -3229,15 +3257,22 @@ for line in sys.stdin:
     f = line.rstrip('\n')
     if not f:
         continue
-    name = pathlib.PurePosixPath(f).name
+    path = pathlib.PurePosixPath(f)
+    name = path.name
     excluded = False
     for pat in patterns:
         if not pat:
             continue
+        if pat.startswith('/'):
+            rest = pat[1:]
+            if rest and path.full_match(rest):
+                excluded = True
+                break
+            continue
         if fnmatch.fnmatch(f, pat) or fnmatch.fnmatch(name, pat):
             excluded = True
             break
-        for part in pathlib.PurePosixPath(f).parts:
+        for part in path.parts:
             if fnmatch.fnmatch(part, pat):
                 excluded = True
                 break
@@ -3282,6 +3317,24 @@ for line in sys.stdin:
   fi
 }
 
+# Collision-safe basename for an external explicit file staged into DEST.
+_ubs_unique_dest_name(){
+  local dest="$1" base="$2" stem ext name i=0
+  if [[ "$base" == *.* && "$base" != .* ]]; then
+    ext=".${base##*.}"
+    stem="${base%.*}"
+  else
+    ext=""
+    stem="$base"
+  fi
+  name="$base"
+  while [[ -e "$dest/$name" ]]; do
+    i=$((i + 1))
+    name="${stem}__${i}${ext}"
+  done
+  printf '%s\n' "$name"
+}
+
 # Copy an explicit list of targets (from --files or multiple positional args)
 # into a shadow workspace so the rest of the pipeline scans only those paths.
 # Targets may be files OR directories (issue #88): files are copied verbatim
@@ -3295,8 +3348,12 @@ prepare_files_workspace(){
   fi
 
   # Resolve each path relative to scan_root; reject missing targets
-  local resolved_files=() dir_src=() dir_rel=()
-  local f rel abs
+  local resolved_files=() dir_src=() dir_rel=() ext_src=()
+  local f rel abs file_phys root_phys
+  if ! root_phys="$(cd "$scan_root" 2>/dev/null && pwd -P)"; then
+    say "${RED}$X cannot access scan root${RESET}: $scan_root"
+    exit 2
+  fi
   for f in "${SCAN_FILES[@]}"; do
     [[ -z "$f" ]] && continue
     if [[ "$f" == /* ]]; then
@@ -3329,8 +3386,8 @@ prepare_files_workspace(){
         exit 2
       fi
       f="$abs"
-      if [[ "$f" == "$scan_root"/* ]]; then
-        rel="${f#"$scan_root"/}"
+      if [[ "$f" == "$root_phys"/* ]]; then
+        rel="${f#"$root_phys"/}"
       else
         rel="$f"
       fi
@@ -3349,11 +3406,19 @@ prepare_files_workspace(){
       rel="${rel%/}"
       dir_rel+=("${rel#/}")
     else
-      resolved_files+=("$rel")
+      if ! file_phys="$(cd "$(dirname -- "$f")" 2>/dev/null && pwd -P)/$(basename -- "$f")"; then
+        say "${RED}$X scan target not found${RESET}: $f"
+        exit 2
+      fi
+      if [[ "$file_phys" == "$root_phys"/* ]]; then
+        resolved_files+=("${file_phys#"$root_phys"/}")
+      else
+        ext_src+=("$file_phys")
+      fi
     fi
   done
 
-  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} )) -eq 0 ]]; then
+  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} + ${#ext_src[@]} )) -eq 0 ]]; then
     say "${RED}$X no valid scan targets specified${RESET}"
     exit 2
   fi
@@ -3362,15 +3427,38 @@ prepare_files_workspace(){
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
 
-  say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved_files[@]} file(s) and ${#dir_src[@]} directory target(s)${RESET}"
+  say "${BLUE}${INFO} Preparing shadow workspace for $(( ${#resolved_files[@]} + ${#ext_src[@]} )) file(s) and ${#dir_src[@]} directory target(s)${RESET}"
 
   if [[ ${#resolved_files[@]} -gt 0 ]]; then
     local file_list="$TMPDIR_RUN/explicit_files.0"
     printf '%s\0' "${resolved_files[@]}" > "$file_list"
-    if ! copy_file_list "$scan_root" "$file_list" "$dest" "files workspace"; then
+    if ! copy_file_list "$root_phys" "$file_list" "$dest" "files workspace"; then
       say "${RED}$X Failed to prepare files workspace${RESET}"
       exit 1
     fi
+  fi
+  if [[ ${#ext_src[@]} -gt 0 ]]; then
+    local src_path dest_name parent base ext_list ext_tmp
+    for src_path in "${ext_src[@]}"; do
+      parent="$(dirname -- "$src_path")"
+      base="$(basename -- "$src_path")"
+      dest_name="$(_ubs_unique_dest_name "$dest" "$base")"
+      ext_list="$TMPDIR_RUN/ext_file.0"
+      ext_tmp="$TMPDIR_RUN/ext_one"
+      rm -rf "$ext_tmp" 2>/dev/null || true
+      printf '%s\0' "$base" > "$ext_list"
+      if ! copy_file_list "$parent" "$ext_list" "$ext_tmp" "external file"; then
+        say "${RED}$X Failed to prepare files workspace${RESET}"
+        exit 1
+      fi
+      if ! mv -- "$ext_tmp/$base" "$dest/$dest_name"; then
+        say "${RED}$X Failed to prepare files workspace${RESET}"
+        exit 1
+      fi
+      if [[ "$dest_name" != "$base" ]]; then
+        say_err "${DIM}${INFO}${RESET} external target staged as ${dest_name}: ${src_path}"
+      fi
+    done
   fi
 
   if [[ ${#dir_src[@]} -gt 0 ]]; then

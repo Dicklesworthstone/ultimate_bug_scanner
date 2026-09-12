@@ -774,6 +774,80 @@ def check_exclude_paths_skipped() -> None:
     report("exclude_paths_space_form", ok2, f"exit={proc.returncode}", proc if not ok2 else None)
 
 
+def check_multitarget_external_file_staging() -> None:
+    # Issue #113: a second target outside the scan root must not be fed to
+    # rsync --files-from as an absolute or ../ record.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-ext-stage-"))
+    proj = tmp / "project"
+    proj.mkdir()
+    (proj / "local.py").write_text("eval(input())\n")
+    (tmp / "outside.py").write_text("eval(input())\n")
+    try:
+        for env, label in ((None, "rsync"), ({"UBS_TEST_NO_RSYNC": "1"}, "tar")):
+            proc = run(
+                ["--ci", "--only=python", "--format=json", "local.py", "../outside.py"],
+                cwd=proj,
+                env=env,
+            )
+            out = proc.stdout + proc.stderr
+            ok = False
+            detail = f"exit={proc.returncode}"
+            try:
+                files = json.loads(proc.stdout)["totals"]["files"]
+                ok = (
+                    "Failed to prepare files workspace" not in out
+                    and files == 2
+                    and proc.returncode in (0, 1)
+                )
+                detail += f" files={files}"
+            except Exception as exc:  # noqa: BLE001
+                detail += f" {exc}"
+            report(f"multitarget_external_{label}", ok, detail, proc if not ok else None)
+        proc = run(
+            ["--ci", "--only=python", "--format=json", "local.py", str(tmp / "outside.py")],
+            cwd=proj,
+        )
+        ok = False
+        try:
+            files = json.loads(proc.stdout)["totals"]["files"]
+            ok = "Failed to prepare files workspace" not in (proc.stdout + proc.stderr) and files == 2
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc)
+        else:
+            detail = f"exit={proc.returncode} files={files}"
+        report("multitarget_external_absolute", ok, detail, proc if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_root_anchored_exclude_parity() -> None:
+    # Issue #114: /ignored/** is root-anchored for rg and must match the
+    # Python walk and Git shadow filters.
+    tmp = Path(tempfile.mkdtemp(prefix="ubs-root-excl-"))
+    (tmp / "keep.py").write_text("x = 1\n")
+    (tmp / "ignored").mkdir()
+    (tmp / "ignored" / "bad.py").write_text("eval(input())\n")
+    (tmp / "nested" / "ignored").mkdir(parents=True)
+    (tmp / "nested" / "ignored" / "keep.py").write_text("x = 1\n")
+    try:
+        for env, label in ((None, "rg"), ({"UBS_TEST_NO_RG": "1"}, "walk")):
+            proc = run(
+                ["--only=python", "--exclude=/ignored/**", "--ci", "--format=json", str(tmp)],
+                env=env,
+            )
+            ok = False
+            detail = f"exit={proc.returncode}"
+            try:
+                files = json.loads(proc.stdout)["totals"]["files"]
+                ok = files == 2 and proc.returncode == 0
+                detail += f" files={files}"
+            except Exception as exc:  # noqa: BLE001
+                detail += f" {exc}"
+            report(f"root_anchored_exclude_{label}", ok, detail, proc if not ok else None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def check_exclude_langs() -> None:
     proj = _exclude_project()
     proc = run(["--exclude-langs=python", "--ci", "--format=json", str(proj)])
@@ -1839,6 +1913,8 @@ def main() -> int:
         check_robot_docs_flags_parse,
         check_schema_validates_outputs,
         check_exclude_paths_skipped,
+        check_multitarget_external_file_staging,
+        check_root_anchored_exclude_parity,
         check_exclude_langs,
         check_exclude_language_name_guard,
         check_timeout_envelope,

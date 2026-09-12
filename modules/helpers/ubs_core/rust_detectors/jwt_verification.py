@@ -5,7 +5,7 @@ counted by count_jwt_verification_matches at 6765): flags lines whose
 block-comment-masked, string-masked, comment-stripped statement contains
 ``dangerous::insecure_decode``/``insecure_decode``/``dangerous_unsafe_decode``
 calls, ``.insecure_disable_signature_validation()`` or
-``validate_exp=false``/``validate_aud=false`` — or a ``decode(...)`` call
+``validate_exp=false``/``validate_aud=false`` — or a JWT ``decode(...)`` call
 whose enclosing function lacks full issuer/audience binding
 (``set_issuer`` + ``set_audience`` + required_spec_claims covering
 ``iss`` and ``aud``, narrowed to statements touching the decode's
@@ -14,6 +14,11 @@ preserved; statements accumulate over up to 10 lines and function context
 over up to 180; ``ubs:ignore`` on a line, the previous line, or the
 assembled statement suppresses it. Findings dedupe per (file, line) and
 keep file order.
+
+JWT decode calls are qualified by the crate name or resolved from file-level
+Rust use trees (including aliases and globs). Unrelated binary decoders and
+function declarations do not establish JWT use. This is lexical import
+resolution, not a Rust type checker or cross-file re-export analysis.
 
 The legacy UBS_RUST_FILE_LIST branch yielded entries unresolved and
 printed them as-is; ``find(files)`` therefore iterates the entries
@@ -57,13 +62,8 @@ signature_disabled_re = re.compile(r"\.insecure_disable_signature_validation\s*\
 claim_validation_disabled_re = re.compile(
     r"\bvalidate_(?:exp|aud)\s*(?::|=)\s*false\b"
 )
-verified_decode_re = re.compile(
-    r"(?:\bjsonwebtoken\s*::\s*)?decode\s*"
-    + call_suffix
-)
 decode_validation_arg_re = re.compile(
-    r"(?:\bjsonwebtoken\s*::\s*)?decode\s*(?:::<[^>\n]+>)?\s*"
-    r"\(\s*[^,]+,\s*[^,]+,\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)"
+    r"\s*[^,]+,\s*[^,]+,\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)"
 )
 fn_start_re = re.compile(
     r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?"
@@ -306,13 +306,77 @@ def risky_jwt_statement(statement: str) -> bool:
     )
 
 
-def line_has_jwt_candidate(line: str) -> bool:
+def imported_paths(source: str) -> Iterator[tuple[tuple[str, ...], str]]:
+    """Expand use trees without recursing on attacker-controlled brace depth."""
+    for statement in re.finditer(r"\buse\s+([^;]+);", source):
+        prefixes: list[tuple[str, ...]] = [()]
+        path: list[str] = []
+        alias: str | None = None
+        tokens = iter(re.findall(r"[A-Za-z_][A-Za-z_0-9]*|::|[{},*]", statement[1]) + [","])
+        for token in tokens:
+            if token == "::":
+                continue
+            if token == "as":
+                alias = next(tokens, None)
+            elif token == "{":
+                prefixes.append(prefixes[-1] + tuple(path))
+                path, alias = [], None
+            elif token in {",", "}"}:
+                if path:
+                    full = prefixes[-1] + tuple(path)
+                    if full[-1] == "self":
+                        full = full[:-1]
+                    if full:
+                        yield full, alias or full[-1]
+                path, alias = [], None
+                if token == "}" and len(prefixes) > 1:
+                    prefixes.pop()
+            else:
+                path.append(token)
+
+
+def jwt_decode_pattern(source: str) -> re.Pattern[str]:
+    source = mask_string_literals(source)
+    namespaces = {"jsonwebtoken"}
+    names: set[str] = set()
+    imports = list(imported_paths(source))
+    for alias in re.findall(r"\bextern\s+crate\s+jsonwebtoken\s+as\s+(\w+)\s*;", source):
+        namespaces.add(alias)
+    # Imports can refer to a crate alias declared later in the file. Each pass
+    # must add a namespace, so resolution is bounded by the number of imports.
+    for _ in range(len(imports) + 1):
+        before = len(namespaces)
+        for path, alias in imports:
+            if path[0] not in namespaces:
+                continue
+            if len(path) == 1:
+                namespaces.add(alias)
+            elif len(path) == 2 and path[1] == "decode":
+                names.add(alias)
+            elif len(path) == 2 and path[1] == "*":
+                names.add("decode")
+        if len(namespaces) == before:
+            break
+    qualified = "|".join(re.escape(name) for name in sorted(namespaces))
+    alternatives = [rf"(?:::)?(?:{qualified})\s*::\s*decode"]
+    alternatives.extend(re.escape(name) for name in sorted(names))
+    return re.compile(r"(?<![\w:.])(?:" + "|".join(alternatives) + ")" + call_suffix)
+
+
+def jwt_decode_call(code: str, pattern: re.Pattern[str]) -> re.Match[str] | None:
+    for match in pattern.finditer(code):
+        if not re.search(r"\bfn\s*$", code[:match.start()]):
+            return match
+    return None
+
+
+def line_has_jwt_candidate(line: str, pattern: re.Pattern[str]) -> bool:
     code = block_comment_re.sub(" ", mask_string_literals(line))
     return bool(
         decode_only_re.search(code)
         or signature_disabled_re.search(code)
         or claim_validation_disabled_re.search(code)
-        or verified_decode_re.search(code)
+        or jwt_decode_call(code, pattern)
     )
 
 
@@ -326,8 +390,9 @@ def lacks_claim_binding(context: str) -> bool:
     )
 
 
-def binding_context_for_decode(statement: str, context: str) -> str:
-    match = decode_validation_arg_re.search(statement)
+def binding_context_for_decode(statement: str, context: str, pattern: re.Pattern[str]) -> str:
+    call = jwt_decode_call(mask_string_literals(statement), pattern)
+    match = decode_validation_arg_re.match(statement, call.end()) if call else None
     if not match:
         return context
     validation_var = re.escape(match.group(1))
@@ -362,22 +427,23 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
             continue
         source_lines = text.splitlines()
         scan_lines = mask_block_comments_preserve_lines(text).splitlines()
+        decode_pattern = jwt_decode_pattern("\n".join(strip_line_comments(line) for line in scan_lines))
         seen = set()
         for line_no, raw in enumerate(scan_lines, start=1):
             if has_ignore(source_lines, line_no):
                 continue
             stripped = strip_line_comments(raw).strip()
-            if not stripped or not line_has_jwt_candidate(stripped):
+            if not stripped or not line_has_jwt_candidate(stripped, decode_pattern):
                 continue
             statement = statement_from(scan_lines, line_no)
             if not statement or MARKER in statement:
                 continue
             context = function_context(scan_lines, line_no)
-            binding_context = binding_context_for_decode(statement, context)
+            binding_context = binding_context_for_decode(statement, context, decode_pattern)
             code = block_comment_re.sub(" ", mask_string_literals(statement))
             if not (
                 risky_jwt_statement(statement)
-                or (verified_decode_re.search(code) and lacks_claim_binding(binding_context))
+                or (jwt_decode_call(code, decode_pattern) and lacks_claim_binding(binding_context))
             ):
                 continue
             key = (str(rust_file), line_no)

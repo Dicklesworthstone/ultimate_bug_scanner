@@ -146,6 +146,93 @@ class Hit:
     text: str
 
 
+def cargo_integration_test_root(path: Path) -> bool:
+    """Recognize only default Cargo tests/name.rs roots, not arbitrary tests/ paths.
+
+    This is manifest-backed context, not whole-program reachability analysis.
+    Custom test targets, helpers, missing/invalid metadata and symlinked sources
+    remain production/unknown. In particular this must not reuse the permissive
+    --exclude-tests boundary heuristic, which can encompass later production code.
+    """
+    if path.suffix != ".rs" or path.parent.name != "tests":
+        return False
+    try:
+        import tomllib
+    except ImportError:
+        # Older supported interpreters cannot prove the context; do not weaken it.
+        return False
+
+    def read_manifest(manifest: Path) -> dict:
+        if manifest.resolve(strict=True) != manifest:
+            raise ValueError("symlinked manifest")
+        with manifest.open("rb") as source:
+            data = source.read(1_048_577)
+        if len(data) > 1_048_576:
+            raise ValueError("manifest too large")
+        return tomllib.loads(data.decode("utf-8"))
+
+    try:
+        path = path.absolute()
+        if path.resolve(strict=True) != path:
+            return False
+        root = path.parent.parent
+        metadata = read_manifest(root / "Cargo.toml")
+        package = metadata.get("package")
+        if (not isinstance(package, dict) or not isinstance(package.get("name"), str)
+                or not package["name"] or package.get("autotests", True) is not True):
+            return False
+        # Explicit test configuration can replace autodiscovery or disable the
+        # harness. Leave custom target interpretation to a future qualified slice.
+        if "test" in metadata:
+            return False
+        # Cargo's 2015 default disables autodiscovery when ANY target is
+        # explicit. Inherited editions need the actual workspace metadata.
+        if "autotests" not in package and any(k in metadata for k in ("lib", "bin", "example", "bench")):
+            edition = package.get("edition", "2015")
+            if edition == {"workspace": True}:
+                edition = None
+                workspace_path = package.get("workspace")
+                if workspace_path is not None and not isinstance(workspace_path, str):
+                    return False
+                roots = [(root / workspace_path).resolve()] if workspace_path is not None else [root, *root.parents]
+                for parent in roots:
+                    candidate = parent / "Cargo.toml"
+                    if not candidate.exists():
+                        continue
+                    workspace = read_manifest(candidate).get("workspace")
+                    if workspace is None:
+                        continue
+                    if not isinstance(workspace, dict) or not isinstance(workspace.get("package"), dict):
+                        return False
+                    edition = workspace["package"].get("edition")
+                    break
+            if edition not in ("2018", "2021", "2024"):
+                return False
+        production_paths = ["src/lib.rs", "src/main.rs", "build.rs"]
+        build = package.get("build", False)
+        if isinstance(build, str):
+            production_paths.append(build)
+        elif not isinstance(build, bool):
+            return False
+        library = metadata.get("lib", {})
+        if not isinstance(library, dict):
+            return False
+        targets = [library]
+        for kind in ("bin", "example", "bench"):
+            entries = metadata.get(kind, [])
+            if not isinstance(entries, list) or any(not isinstance(t, dict) for t in entries):
+                return False
+            targets.extend(entries)
+        for target in targets:
+            if "path" in target:
+                if not isinstance(target["path"], str):
+                    return False
+                production_paths.append(target["path"])
+        return not any((root / entry).resolve() == path for entry in production_paths)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 class Scan:
     def __init__(self, files: Sequence[Path], project_dir: Path, exclude_tests: bool,
                  skip: set[int], detail_limit: int, jobs: int = 1) -> None:
@@ -192,6 +279,9 @@ class Scan:
                     self.lines_map[p] = lines
 
         self.test_only: set[str] = set()
+        self.integration_test_roots = {
+            str(path) for path in self.files if cargo_integration_test_root(path)
+        }
         self.boundary_cache: dict[str, int] = {}
         self.counters: Counter = Counter()
         self.records: list[dict] = []
@@ -842,9 +932,16 @@ def cat_1(scan: Scan, r: Renderer, narrowing: list[Hit], narrowing_skip_note: st
     else:
         r.finding("good", 0, "No unwrap/expect detected")
     r.subheader("panic!/unreachable!/todo!/unimplemented!")
-    _sub(scan, r, scan.ast_hits(["panic"]), "rust.ownership.panic-macro", 1,
-         "critical", "panic! macro(s) present", "Avoid panic! in library code", 5,
-         "No panic! macros")
+    panics = scan.ast_hits(["panic"])
+    integration_panics = [hit for hit in panics if hit.path in scan.integration_test_roots]
+    production_panics = [hit for hit in panics if hit.path not in scan.integration_test_roots]
+    _sub(scan, r, production_panics, "rust.ownership.panic-macro", 1,
+         "critical", "panic! macro(s) present", "Avoid panic! in library code", 5)
+    _sub(scan, r, integration_panics, "rust.ownership.panic-macro", 1,
+         "warning", "panic! in Cargo integration-test source",
+         "Retained test failure path; review test intent and ensure the source is not reused in production", 5)
+    if not panics:
+        r.finding("good", 0, "No panic! macros")
     _sub(scan, r, scan.ast_hits(["unreachable"]), "rust.ownership.unreachable-macro", 1,
          "warning", "unreachable! may panic if reached", "Double-check logic", 3)
     _sub(scan, r, scan.ast_hits(["todo"]), "rust.ownership.todo-macro", 1,
@@ -1536,7 +1633,10 @@ def main(argv: list[str] | None = None) -> int:
         project_dir=project_dir,
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
-        extra=f"exclude_tests={args.exclude_tests};skip_narrowing={args.skip_type_narrowing}",
+        # A manifest-only change can turn an integration root into production.
+        # Never replay a cached warning after its qualifying context disappears.
+        extra=(f"exclude_tests={args.exclude_tests};skip_narrowing={args.skip_type_narrowing};"
+               f"panic_context_v1={json.dumps(sorted(scan.integration_test_roots))}"),
     )
     cached_findings, files_to_scan = cache.partition_files(original_files)
 

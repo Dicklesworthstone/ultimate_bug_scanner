@@ -162,9 +162,32 @@ def check_env_skip_type_narrowing() -> None:
 
 
 def check_env_force_self_update() -> None:
-    # In a development checkout the forced check reports itself instead of updating.
-    proc = run(["--only=python", "--ci", str(PY_CLEAN)], env={"FORCE_SELF_UPDATE": "1", "UBS_NO_AUTO_UPDATE": None})
-    report("env_force_self_update", "Development checkout detected" in proc.stderr, f"exit={proc.returncode}", proc)
+    # Exercise both checkout layouts on a disposable copy. A broken guard must
+    # never replace the runner under test or reach the real update service.
+    original = UBS.read_bytes()
+    for layout in ("directory", "file"):
+        with tempfile.TemporaryDirectory(prefix="ubs-dev-update-") as tmp:
+            root = Path(tmp)
+            runner = root / "ubs"
+            shutil.copy2(UBS, runner)
+            marker = root / ".git"
+            if layout == "directory":
+                marker.mkdir()
+            else:
+                marker.write_text("gitdir: /unavailable/worktrees/test\n", encoding="utf-8")
+            log = root / "network.log"
+            for command in ("curl", "wget"):
+                shim = root / command
+                shim.write_text('#!/bin/sh\necho called >> "$UBS_TEST_NETWORK_LOG"\nexit 1\n', encoding="utf-8")
+                shim.chmod(0o755)
+            env = os.environ.copy()
+            env.update({"NO_COLOR": "1", "FORCE_SELF_UPDATE": "1", "UBS_TEST_NETWORK_LOG": str(log),
+                        "PATH": str(root) + os.pathsep + env["PATH"]})
+            proc = subprocess.run([str(runner), "--update"], cwd=root, env=env,
+                                  capture_output=True, text=True, timeout=30)
+            ok = (proc.returncode == 0 and "Development checkout detected" in proc.stderr
+                  and not log.exists() and runner.read_bytes() == original)
+            report(f"env_force_self_update_{layout}", ok, f"exit={proc.returncode}", proc)
 
 
 def check_env_ci_disables_auto_update() -> None:
@@ -1858,4 +1881,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

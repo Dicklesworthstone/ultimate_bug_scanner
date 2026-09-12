@@ -22,6 +22,8 @@ with the true positives the rule exists for:
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -41,10 +43,223 @@ from ubs_core.py_detectors import unsafe_deserialization  # noqa: E402
 from ubs_core.py_patterns.security_rg import PATTERNS  # noqa: E402
 from ubs_core.py_rules import _RULES  # noqa: E402
 from ubs_core.py_scan import iter_matches  # noqa: E402
+from ubs_core.rust_detectors import jwt_verification  # noqa: E402
 from ubs_core.rust_detectors import security_randomness  # noqa: E402
+from ubs_core import rust_rules  # noqa: E402
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
+
+
+class RustPanicContextTests(unittest.TestCase):
+    """Use the actual scanner and ast-grep, never pre-populated AST hits."""
+
+    def setUp(self) -> None:
+        self.scratch = tempfile.TemporaryDirectory(prefix="ubs_panic_context_")
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        self.rules = self.root / "rules"
+        rust_rules.generate(self.rules)
+
+    def package(self, name: str, extra: str = "", source: str = "tests/receipt.rs") -> Path:
+        root = self.root / name
+        root.mkdir(parents=True)
+        (root / "Cargo.toml").write_text(
+            '[package]\nname = "panic_context"\nversion = "0.1.0"\nedition = "2024"\n' + extra,
+            encoding="utf-8",
+        )
+        target = root / source
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('fn receipt() { panic!("wire input receipt required") }\n', encoding="utf-8")
+        return target
+
+    def scan(self, paths: list[Path], *, fail_on_warning: bool = False,
+             cache: bool = False, without_tomllib: bool = False) -> tuple[int, dict]:
+        inputs = self.root / "inputs"
+        inputs.write_bytes(b"\0".join(os.fsencode(path) for path in paths) + b"\0")
+        output = self.root / "scan.json"
+        args = [
+            "--files-from", str(inputs), "--sink", str(self.root / "findings.ndjson"),
+            "--project-dir", str(self.root), "--ast-rule-dir", str(self.rules),
+            "--skip", ",".join(map(str, range(2, 25))), "--skip-type-narrowing",
+            "--quiet", "--json-out", str(output),
+        ]
+        if fail_on_warning:
+            args.append("--fail-on-warning")
+        command = [sys.executable, "-m", "ubs_core.rust_scan"]
+        if without_tomllib:
+            command = [sys.executable, "-c", (
+                "import runpy,sys; sys.modules['tomllib']=None; "
+                "runpy.run_module('ubs_core.rust_scan',run_name='__main__')"
+            )]
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
+                   UBS_NO_CACHE="0" if cache else "1", UBS_CACHE_DIR=str(self.root / "cache"))
+        result = subprocess.run(command + args, cwd=self.root, env=env,
+                                text=True, capture_output=True, timeout=30)
+        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+        return result.returncode, json.loads(output.read_text(encoding="utf-8"))
+
+    def test_integration_panic_stays_visible_and_warning_gate_still_fails(self) -> None:
+        target = self.package("native")
+        code, doc = self.scan([target])
+        self.assertEqual(code, 0)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.ownership.panic-macro"]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual((hits[0]["severity"], hits[0]["line"]), ("warning", 1))
+        self.assertEqual(Path(hits[0]["path"]), target)
+        self.assertEqual((doc["files"], doc["critical"], doc["warning"]), (1, 0, 1))
+        self.assertEqual(self.scan([target], fail_on_warning=True)[0], 1)
+
+    def test_production_and_ambiguous_paths_remain_critical(self) -> None:
+        targets = [
+            self.package("production", source="src/lib.rs"),
+            self.package("misleading", source="src/tests/helper.rs"),
+            self.package("tests/ancestor", source="src/lib.rs"),
+            self.package("disabled", "autotests = false\n"),
+            self.package("bin_overlap", '\n[[bin]]\nname="receipt"\npath="tests/receipt.rs"\n'),
+            self.package("lib_overlap", '\n[lib]\npath="tests/receipt.rs"\n'),
+            self.package("build_overlap", 'build="tests/receipt.rs"\n'),
+            self.package("custom_harness", '\n[[test]]\nname="receipt"\nharness=false\n'),
+        ]
+        missing = self.root / "missing/tests/receipt.rs"
+        missing.parent.mkdir(parents=True)
+        missing.write_text('fn receipt() { panic!("missing metadata") }\n', encoding="utf-8")
+        targets.append(missing)
+        invalid = self.package("invalid")
+        (invalid.parent.parent / "Cargo.toml").write_text("[package\n", encoding="utf-8")
+        targets.append(invalid)
+        after = self.package("after", source="src/lib.rs")
+        after.write_text('#[cfg(test)]\nmod tests {}\nfn production() { panic!("still production") }\n',
+                         encoding="utf-8")
+        targets.append(after)
+        linked = self.root / "production/tests/linked.rs"
+        linked.parent.mkdir()
+        linked.symlink_to(targets[0])
+        targets.append(linked)
+        code, doc = self.scan(targets)
+        self.assertEqual(code, 1)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.ownership.panic-macro"]
+        self.assertEqual({Path(hit["path"]) for hit in hits}, set(targets))
+        self.assertTrue(all(hit["severity"] == "critical" for hit in hits), hits)
+
+    def test_original_default_test_module_panics_remain_critical(self) -> None:
+        fixture = REPO_ROOT / "test-suite/rust/exclude_tests_mod/src"
+        code, doc = self.scan([fixture / "lib.rs", fixture / "tests_support.rs"])
+        self.assertEqual(code, 1)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.ownership.panic-macro"]
+        self.assertEqual(len(hits), 2)
+        self.assertTrue(all(hit["severity"] == "critical" for hit in hits))
+
+    def test_missing_toml_parser_keeps_critical(self) -> None:
+        target = self.package("native")
+        code, doc = self.scan([target], without_tomllib=True)
+        self.assertEqual((code, doc["critical"]), (1, 1))
+
+    def test_legacy_autodiscovery_and_workspace_metadata_are_respected(self) -> None:
+        target = self.package("legacy", '\n[lib]\npath="src/lib.rs"\n')
+        (target.parent.parent / "src").mkdir()
+        (target.parent.parent / "src/lib.rs").write_text("", encoding="utf-8")
+        manifest = target.parent.parent / "Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('edition = "2024"', 'edition = "2015"'))
+        self.assertEqual(self.scan([target])[0], 1)
+        inherited = self.package("workspace/native", '\n[lib]\npath="src/lib.rs"\n')
+        (inherited.parent.parent / "src").mkdir()
+        (inherited.parent.parent / "src/lib.rs").write_text("", encoding="utf-8")
+        manifest = inherited.parent.parent / "Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('edition = "2024"', 'edition.workspace = true'))
+        self.assertEqual(self.scan([inherited])[0], 1)
+        workspace = self.root / "workspace/Cargo.toml"
+        workspace.write_text('[workspace]\nmembers=["native"]\n[workspace.package]\nedition="2024"\n')
+        self.assertEqual(self.scan([inherited], cache=True)[0], 0)
+        workspace.write_text(workspace.read_text().replace('"2024"', '"2015"'))
+        self.assertEqual(self.scan([inherited], cache=True)[0], 1)
+
+    def test_manifest_changes_invalidate_cached_severity(self) -> None:
+        target = self.package("native")
+        self.assertEqual(self.scan([target], cache=True)[0], 0)
+        code, cached = self.scan([target], cache=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(cached["extras"]["profile"]["cache_hits"], 1)
+        manifest = target.parent.parent / "Cargo.toml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + "autotests=false\n", encoding="utf-8")
+        code, changed = self.scan([target], cache=True)
+        self.assertEqual((code, changed["critical"]), (1, 1))
+        self.assertEqual(changed["extras"]["profile"]["cache_hits"], 0)
+
+
+class RustJwtDecoderIdentityTests(unittest.TestCase):
+    @staticmethod
+    def hits(source: str) -> list[int]:
+        with tempfile.TemporaryDirectory(prefix="ubs_rust_jwt_") as tmp:
+            target = Path(tmp) / "input.rs"
+            target.write_text(source, encoding="utf-8")
+            return [line for _, line, _, _ in jwt_verification.find([target])]
+
+    def test_binary_decoder_names_are_not_jwt_evidence(self) -> None:
+        source = (
+            "fn decode(bytes: &[u8]) -> Option<u8> { bytes.first().copied() }\n"
+            "fn exercise(bytes: &[u8]) {\n"
+            "    let _ = decode(bytes);\n"
+            "    let _ = base64::decode(bytes);\n"
+            "    let _ = Frame::decode(bytes);\n"
+            "    let _ = codec.decode(bytes);\n"
+            "}\n"
+            "// use jsonwebtoken::decode;\n"
+            'const DOC: &str = "use jsonwebtoken::decode;";\n'
+            'const RAW_DOC: &str = r#"use jsonwebtoken::*;"#;\n'
+            "/* use jsonwebtoken as jwt; */\n"
+        )
+        self.assertEqual(self.hits(source), [])
+
+    def test_imported_and_qualified_jwt_decoders_still_require_binding(self) -> None:
+        cases = [
+            ("", "jsonwebtoken::decode"),
+            ("", "::jsonwebtoken::decode"),
+            ("use jsonwebtoken::decode;", "decode"),
+            ("use jsonwebtoken::{Algorithm, decode, Validation};", "decode"),
+            ("use jsonwebtoken::decode as parse_token;", "parse_token"),
+            ("use jsonwebtoken::{decode as parse_token, Validation};", "parse_token"),
+            ("use {base64::decode as bytes, jsonwebtoken::{decode as parse_token}};", "parse_token"),
+            ("use jsonwebtoken as jwt;", "jwt::decode"),
+            ("use jsonwebtoken::{self as jwt, Validation};", "jwt::decode"),
+            ("extern crate jsonwebtoken as jwt;", "jwt::decode"),
+            ("use jsonwebtoken::*;", "decode"),
+            ("use jsonwebtoken as jwt; use jwt::decode as parse_token;", "parse_token"),
+        ]
+        for imports, call in cases:
+            with self.subTest(imports=imports, call=call):
+                source = (
+                    imports + "\n"
+                    "fn verify(token: &str, key: &DecodingKey) {\n"
+                    "    let validation = Validation::default();\n"
+                    f"    let _ = {call}::<Claims>(token, key, &validation);\n"
+                    "}\n"
+                )
+                self.assertEqual(self.hits(source), [4])
+                bound = source.replace(
+                    "    let validation = Validation::default();\n",
+                    "    let mut validation = Validation::default();\n"
+                    '    validation.set_issuer(&["issuer"]);\n'
+                    '    validation.set_audience(&["audience"]);\n'
+                    '    validation.set_required_spec_claims(&["exp", "iss", "aud"]);\n',
+                )
+                self.assertEqual(self.hits(bound), [])
+
+    def test_unrelated_qualified_calls_do_not_inherit_a_jwt_import(self) -> None:
+        self.assertEqual(self.hits(
+            "use jsonwebtoken::decode;\n"
+            "fn exercise(bytes: &[u8]) {\n"
+            "    let _ = base64::decode(bytes);\n"
+            "    let _ = Frame::decode(bytes);\n"
+            "    let _ = codec.decode(bytes);\n"
+            "}\n"
+            "mod binary { fn decode(bytes: &[u8]) {} }\n"
+        ), [])
+
+    def test_original_jwt_security_fixtures_remain_classified(self) -> None:
+        rust = REPO_ROOT / "test-suite" / "rust"
+        self.assertEqual(list(jwt_verification.find([rust / "clean/jwt_verification.rs"])), [])
+        self.assertGreaterEqual(len(list(jwt_verification.find([rust / "buggy/jwt_verification.rs"]))), 6)
 
 
 def expected_lines(path: Path, marker: str) -> list[int]:
@@ -350,5 +565,4 @@ fn unrelated() {
         self.assertEqual(counts[security_randomness.strip_line_comments.__code__], len(self.RANDOM.splitlines()))
 
 
-if __name__ == "__main__":
-    unittest.main()
+if __name__

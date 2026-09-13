@@ -328,17 +328,15 @@ def run(ctx: RunContext) -> Iterable[dict]:
             continue
         resolved = path.resolve()
         try:
-            rel = resolved.relative_to(cwd)
-            parts = rel.parts
+            parts = resolved.relative_to(cwd).parts
         except ValueError:
-            rel = path.name
             parts = ()
         if any(part in SKIP_DIRS for part in parts):
             continue
         for line_no, col, code in scan_file_findings(path):
             yield {
                 "rule": "elixir.taint.open_redirect",
-                "path": str(rel),
+                "path": str(resolved),
                 "line": line_no,
                 "col": col,
                 "layer": "taint",

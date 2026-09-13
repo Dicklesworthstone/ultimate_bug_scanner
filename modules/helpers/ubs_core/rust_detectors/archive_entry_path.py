@@ -15,6 +15,8 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.archive-entry-path"
 CATEGORY = 8
 TITLE = "Archive entry path traversal risk"
@@ -157,7 +159,7 @@ def find(files) -> Iterator[tuple[Path, int, int, str]]:
             if safe_context.search(context):
                 continue
             code = original_lines[line - 1].strip() if 0 < line <= len(original_lines) else ""
-            if "ubs:ignore" in code:
+            if has_suppression_marker(code, RULE_ID):
                 continue
             key = (str(path), line, code)
             if key in seen:
@@ -173,7 +175,7 @@ def find(files) -> Iterator[tuple[Path, int, int, str]]:
             if safe_context.search(context):
                 continue
             code = original_lines[line - 1].strip() if 0 < line <= len(original_lines) else ""
-            if "ubs:ignore" in code:
+            if has_suppression_marker(code, RULE_ID):
                 continue
             key = (str(path), line, code)
             if key in seen:

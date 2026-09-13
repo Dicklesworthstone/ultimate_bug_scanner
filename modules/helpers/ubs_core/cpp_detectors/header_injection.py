@@ -259,10 +259,7 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
         return []
     lines = text.splitlines()
     tainted = {}
-    try:
-        rel = str(path.resolve().relative_to(cwd))
-    except ValueError:
-        rel = path.name
+    rel = str(path.resolve())
     seen = set()
     issues = []
     for idx, _ in enumerate(lines, start=1):

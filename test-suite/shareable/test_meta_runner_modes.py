@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -488,6 +490,78 @@ def check_self_update_dev_checkout_guard(tmpdir: Path) -> None:
         assert path.read_bytes() == before[name], f"{name}: scanner bytes changed"
 
 
+def check_rust_scoped_marker_keeps_other_finding(tmpdir: Path) -> None:
+    """A scoped assertion marker must not hide a real secret-comparison sample."""
+    root = tmpdir / "rust-scoped-marker"
+    root.mkdir()
+    source = root / "verify.rs"
+    assertion = "rust.panic.assert-macros"
+    security = "rust.security.constant-time-compare"
+    code = "    let matches = provided_signature == expected_signature; assert!(matches);"
+    skip = ",".join(str(n) for n in range(1, 25) if n not in (8, 21))
+    env = {
+        **os.environ, "NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0",
+        "UBS_NO_CACHE": "1", "UBS_SKIP_RUST_BUILD": "1",
+    }
+
+    # Execute the actual fallback script with actual module output below.
+    # This reaches the fallback even on hosts where the fused path succeeds.
+    runner_source = UBS_BIN.read_text(encoding="utf-8")
+    fallback = runner_source.split("apply_inline_suppressions(){", 1)[1]
+    fallback = fallback.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+    fallback_path = root / "inline_suppressions.py"
+    fallback_path.write_text(fallback, encoding="utf-8")
+
+    def run(command: list[str], payload: str | None = None) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command, input=payload, cwd=root, env=env, capture_output=True,
+            text=True, check=False, timeout=180,
+        )
+
+    def require_sample(result: subprocess.CompletedProcess[str]) -> None:
+        details = f"exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        assert result.returncode == 1, details
+        visible = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        assert re.search(r"verify\.rs:2(?::|\s)", visible), details
+        assert "provided_signature == expected_signature" in visible, details
+
+    for label, marker, expected in (
+        ("baseline", "", {assertion, security}),
+        ("scoped", f" // ubs:ignore[{assertion}]", {security}),
+    ):
+        source.write_text(
+            "pub fn verify(provided_signature: &str, expected_signature: &str) {\n"
+            + code + marker + "\n}\n", encoding="utf-8",
+        )
+        common = ["--no-cargo", f"--skip={skip}", "--ci", "--fail-on-warning"]
+        meta = ["bash", str(UBS_BIN), "--only=rust", "--no-auto-update", *common]
+        result = run([*meta, "--format=json", str(source)])
+        details = f"{label}: exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        assert result.returncode == 1, details
+        try:
+            doc = json.loads(result.stdout)
+        except ValueError as exc:
+            raise AssertionError(details) from exc
+        findings = [finding for finding in doc["findings"] if finding["severity"] in ("critical", "warning")]
+        assert {finding["rule_id"] for finding in findings} == expected, details
+        assert all(finding["line"] == 2 for finding in findings), details
+        assert doc["totals"]["warning"] == int(assertion in expected), details
+        assert doc["totals"]["critical"] == 1, details
+        assert doc["status"] == "ok" and not doc.get("failed_modules"), details
+        require_sample(run([*meta, "--format=text", str(source)]))
+
+        module = run([
+            "bash", str(REPO_ROOT / "modules" / "ubs-rust.sh"),
+            *common, str(source),
+        ])
+        require_sample(module)
+        fallback_result = run([sys.executable, str(fallback_path)], module.stdout)
+        assert fallback_result.returncode == 0, fallback_result.stdout + fallback_result.stderr
+        visible = re.sub(r"\x1b\[[0-9;]*m", "", fallback_result.stdout)
+        assert re.search(r"verify\.rs:2(?::|\s)", visible), fallback_result.stdout
+        assert "provided_signature == expected_signature" in visible, fallback_result.stdout
+
+
 def main() -> None:
     tmpdir = Path(tempfile.mkdtemp(prefix="ubs-meta-runner-"))
     try:
@@ -547,6 +621,8 @@ def main() -> None:
         # Issue #99: Rust cargo phases must really run (sentinel positive
         # control) and every static-only path must say so instead of "clean".
         check_rust_cargo_phases(tmpdir)
+
+        check_rust_scoped_marker_keeps_other_finding(tmpdir)
 
         # Issue #107: linked Git worktrees are development checkouts too.
         check_self_update_dev_checkout_guard(tmpdir)

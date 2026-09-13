@@ -56,6 +56,204 @@ JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
 
 
+class NativeSourceIdentityTests(unittest.TestCase):
+    def scan(self, root: Path, language: str, paths: list[Path], extra_args: list[str],
+             expected: dict[str, list[tuple[Path, int, int, str]]], hits: int) -> list[dict]:
+        sink = root / "identity.ndjson"
+        stats = root / "identity-cache.json"
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
+                   UBS_NO_CACHE="0", UBS_CACHE_DIR=str(root / "cache"), UBS_CACHE_FILE=str(stats))
+        proc = subprocess.run(
+            [sys.executable, "-m", f"ubs_core.{language}_scan", "--files-from", "-",
+             "--sink", str(sink), "--project-dir", str(root / "project"),
+             "--fail-on-warning", *extra_args],
+            input="\0".join(str(path) for path in paths) + "\0", cwd=root, env=env,
+            text=True, capture_output=True, timeout=180,
+        )
+        context = f"{language} paths={paths}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+        owners = {source for sites in expected.values() for source, _, _, _ in sites}
+        self.assertEqual(proc.returncode, int(bool(owners)), context)
+        self.assertTrue(sink.is_file(), context)
+        self.assertTrue(stats.is_file(), context)
+        try:
+            records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+            cache_stats = json.loads(stats.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            self.fail(f"invalid native scanner output: {exc}; {context}")
+        self.assertEqual((cache_stats["hits"], cache_stats["misses"]),
+                         (hits, len(paths) - hits), context)
+        actual: dict[str, list[tuple[Path, int, int, str]]] = {rule: [] for rule in expected}
+        for record in records:
+            source = (root / record["path"]).resolve()
+            self.assertIn(source, owners, context)
+            if record["rule"] in actual:
+                actual[record["rule"]].append((source, record["line"], record["col"], record["severity"]))
+        self.assertEqual({rule: sorted(sites) for rule, sites in actual.items()},
+                         {rule: sorted(sites) for rule, sites in expected.items()}, context)
+        if not owners:
+            self.assertEqual(records, [], context)
+        return sorted(records, key=lambda record: (record["path"], record["rule"],
+                                                   record["line"], record["col"]))
+
+    def test_generated_ast_paths_keep_distinct_same_display_sources(self) -> None:
+        from ubs_core import csharp_rules, elixir_rules
+
+        cases = (
+            ("csharp", csharp_rules, ".cs", 17, "cs-md5-create", "warning", 3, 9,
+             "class Example {\n    void Run() {\n        MD5.Create();\n    }\n}\n",
+             "class Example {\n    void Run() {\n        MD5.Create();\n        MD5.Create();\n    }\n}\n",
+             "class Clean {}\n"),
+            ("elixir", elixir_rules, ".ex", 4, "elixir.code-eval-string", "critical", 1, 1,
+             "Code.eval_string(input)\n", "Code.eval_string(input)\nCode.eval_string(input)\n",
+             "value = 42\n"),
+        )
+        for language, pack, suffix, category, rule, severity, line, col, hazard, changed, clean in cases:
+            with self.subTest(language=language), tempfile.TemporaryDirectory(prefix="ubs_ast_source_identity_") as td:
+                root = Path(td)
+                outside = Path(f"outside/Case{suffix}")
+                inside = Path(f"project/outside/Case{suffix}")
+                clean_paths = [Path(f"Clean{suffix}"), Path(f"project/Clean{suffix}")]
+                for path, source in ((outside, hazard), (inside, hazard),
+                                     *((path, clean) for path in clean_paths)):
+                    (root / path).parent.mkdir(parents=True, exist_ok=True)
+                    (root / path).write_text(source, encoding="utf-8")
+                rules = root / "rules"
+                manifest = pack.generate(rules)
+                self.assertIn(rule, manifest)
+                extra = ["--ast-rule-dir", str(rules), "--skip",
+                         ",".join(str(n) for n in range(1, 25) if n != category)]
+                paths = [outside, inside, *clean_paths]
+                # Before canonical dedup, both positives were "outside/Case"
+                # despite denoting different source files at the same site.
+                expected = {rule: [(root / outside, line, col, severity),
+                                   (root / inside, line, col, severity)]}
+                cold = self.scan(root, language, paths, extra, expected, 0)
+                self.assertEqual(self.scan(root, language, paths, extra, expected, 4), cold)
+                self.scan(root, language, clean_paths, extra, {rule: []}, 2)
+                for source in (outside, inside):
+                    subset = self.scan(root, language, [source], extra,
+                                       {rule: [(root / source, line, col, severity)]}, 1)
+                    self.assertEqual(subset, [record for record in cold
+                                              if (root / record["path"]).resolve() == root / source])
+                (root / inside).write_text(changed, encoding="utf-8")
+                expected[rule].append((root / inside, line + 1, col, severity))
+                partial = self.scan(root, language, paths, extra, expected, 3)
+                self.assertEqual(self.scan(root, language, paths, extra, expected, 4), partial)
+
+    def test_rust_root_relative_detectors_ignore_existing_cwd_shadows(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_rust_source_identity_") as td:
+            root = Path(td)
+            positives = [Path("project/Same.rs"), Path("project/nested/Same.rs")]
+            shadows = [Path("Same.rs"), Path("nested/Same.rs")]
+            hazard = (
+                "fn settings() {\n"
+                '    let api_key = "abcd1234efgh5678";\n'
+                "    let disabled = true;\n"
+                "    client.danger_accept_invalid_certs(disabled);\n"
+                "}\n"
+            )
+            for path in positives + shadows:
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text(hazard if path in positives else "fn clean() {}\n",
+                                         encoding="utf-8")
+            secrets = "rust.security.hardcoded-secrets"
+            tls = "rust.security.tls-verification"
+            expected = {
+                secrets: [(root / path, 2, 1, "critical") for path in positives],
+                tls: [(root / path, 4, 1, "critical") for path in positives],
+            }
+            extra = ["--skip-type-narrowing", "--quiet", "--skip",
+                     ",".join(str(n) for n in range(1, 25) if n != 8)]
+            paths = positives + shadows
+            cold = self.scan(root, "rust", paths, extra, expected, 0)
+            self.assertEqual(self.scan(root, "rust", paths, extra, expected, 4), cold)
+            self.scan(root, "rust", shadows, extra, {secrets: [], tls: []}, 2)
+            for path in positives:
+                subset_expected = {rule: [site for site in sites if site[0] == root / path]
+                                   for rule, sites in expected.items()}
+                subset = self.scan(root, "rust", [path], extra, subset_expected, 1)
+                self.assertEqual(subset, [record for record in cold
+                                          if (root / record["path"]).resolve() == root / path])
+            (root / positives[0]).write_text(hazard.replace("disabled = true", "disabled = false"),
+                                             encoding="utf-8")
+            expected[tls] = [site for site in expected[tls] if site[0] == root / positives[1]]
+            partial = self.scan(root, "rust", paths, extra, expected, 3)
+            self.assertEqual(self.scan(root, "rust", paths, extra, expected, 4), partial)
+
+
+class CSharpSourcePathTests(unittest.TestCase):
+    def test_outside_relative_detector_paths_do_not_transfer_to_project_shadow(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_csharp_source_paths_") as td:
+            root = Path(td)
+            project = root / "project"
+            outside = Path("outside/Case.cs")
+            shadow = Path("project/outside/Case.cs")
+            inside = Path("project/Inside.cs")
+            hazard = 'var url = Request.Query["url"];\nclient.GetAsync(url);\n'
+            for path, source in ((outside, hazard), (shadow, "class Safe {}\n"), (inside, hazard)):
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text(source, encoding="utf-8")
+            sink = root / "findings.ndjson"
+            stats = root / "cache.json"
+            env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
+                       UBS_NO_CACHE="0", UBS_CACHE_DIR=str(root / "cache"), UBS_CACHE_FILE=str(stats))
+            rule_id = "csharp.security.outbound-url"
+
+            def scan(paths: list[Path], hits: int, expected: dict[Path, list[int]]) -> list[dict]:
+                self.assertTrue(all(not path.is_absolute() for path in paths))
+                proc = subprocess.run(
+                    [sys.executable, "-m", "ubs_core.csharp_scan", "--sink", str(sink),
+                     "--project-dir", str(project),
+                     "--skip", ",".join(str(n) for n in range(1, 25) if n != 8)],
+                    input="\0".join(str(path) for path in paths) + "\0",
+                    cwd=root, env=env, text=True, capture_output=True, timeout=180,
+                )
+                context = f"paths={paths}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                self.assertEqual(proc.returncode, int(bool(expected)), context)
+                self.assertTrue(sink.is_file(), context)
+                self.assertTrue(stats.is_file(), context)
+                try:
+                    records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+                    cache_stats = json.loads(stats.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as exc:
+                    self.fail(f"invalid C# scanner output: {exc}; {context}")
+                self.assertEqual((cache_stats["hits"], cache_stats["misses"]),
+                                 (hits, len(paths) - hits), context)
+                actual: dict[Path, list[int]] = {}
+                for record in records:
+                    source = (root / record["path"]).resolve()
+                    self.assertIn(source, expected, context)
+                    if record["rule"] == rule_id:
+                        self.assertEqual(record["severity"], "critical", context)
+                        self.assertEqual(record["col"], 1, context)
+                        actual.setdefault(source, []).append(record["line"])
+                self.assertEqual({path: sorted(lines) for path, lines in actual.items()}, expected, context)
+                if not expected:
+                    self.assertEqual(records, [], context)
+                return sorted(records, key=lambda record: (record["path"], record["rule"],
+                                                           record["line"], record["col"]))
+
+            outside_source = root / outside
+            inside_source = root / inside
+            paths = [outside, shadow, inside]
+            expected = {outside_source: [2], inside_source: [2]}
+            cold = scan(paths, 0, expected)
+            self.assertEqual(scan(paths, 3, expected), cold)
+            scan([shadow], 1, {})
+            outside_records = [record for record in cold
+                               if (root / record["path"]).resolve() == outside_source]
+            self.assertEqual(scan([outside], 1, {outside_source: [2]}), outside_records)
+            inside_records = [record for record in cold
+                              if (root / record["path"]).resolve() == inside_source]
+            self.assertEqual(scan([inside], 1, {inside_source: [2]}), inside_records)
+
+            outside_source.write_text(hazard + "client.GetAsync(url);\n", encoding="utf-8")
+            changed = {outside_source: [2, 3], inside_source: [2]}
+            partial = scan(paths, 2, changed)
+            self.assertEqual(scan(paths, 3, changed), partial)
+            scan([shadow], 1, {})
+
+
 class RustPanicContextTests(unittest.TestCase):
     """Use the actual scanner and ast-grep, never pre-populated AST hits."""
 
@@ -143,6 +341,79 @@ class RustPanicContextTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(sorted(hit["line"] for hit in hits), [2, 3, 4])
         self.assertEqual(doc["warning"], 3)
+
+    def test_resource_aggregate_weights_survive_full_and_partial_cache_replay(self) -> None:
+        first = self.package("aggregate_first", source="src/lib.rs")
+        second = self.package("aggregate_second", source="src/lib.rs")
+        first_source = (
+            "fn launch() {\n"
+            "    let first = std::thread::spawn(|| {});\n"
+            "    let second = std::thread::spawn(|| {});\n"
+            "    assert!(true);\n"
+            "    assert_eq!(1, 1);\n"
+            "}\n"
+        )
+        first.write_text(first_source, encoding="utf-8")
+        second.write_text(
+            "fn independent() {\n"
+            "    std::thread::spawn(|| {});\n"
+            "    std::thread::spawn(|| {});\n"
+            "    std::thread::spawn(|| {});\n"
+            "    assert!(true);\n"
+            "    assert_ne!(1, 2);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        aggregate_rule = "rust.resource-lifecycle.thread_join"
+        concrete_rule = "rust.panic.assert-macros"
+
+        def scan_counts(expected: dict[Path, int], hits: int, misses: int) -> list[dict]:
+            code, document = self.scan([first, second], categories=(19, 21), ast=False,
+                                       cache=True, fail_on_warning=True)
+            self.assertEqual(code, 1)
+            self.assertEqual(document["status"], "ok")
+            self.assertEqual(document["files"], 2)
+            profile = document["extras"]["profile"]
+            self.assertEqual((profile["cache_hits"], profile["cache_misses"]), (hits, misses))
+            records = document["findings"]
+            self.assertEqual({record["rule"] for record in records},
+                             {aggregate_rule, concrete_rule})
+            aggregates = [record for record in records if record["rule"] == aggregate_rule]
+            self.assertEqual(len(aggregates), 2)
+            self.assertEqual({Path(record["path"]): record.get("count", 1)
+                              for record in aggregates}, expected)
+            for record in aggregates:
+                self.assertEqual((record["severity"], record["line"], record["col"]),
+                                 ("critical", 1, 1))
+                if expected[Path(record["path"])] > 1:
+                    self.assertEqual(record["count"], expected[Path(record["path"])])
+            concrete = [record for record in records if record["rule"] == concrete_rule]
+            self.assertEqual(len(concrete), 4)
+            self.assertEqual(sorted((Path(record["path"]), record["line"]) for record in concrete),
+                             [(first, 4), (first, 5), (second, 5), (second, 6)])
+            self.assertTrue(all(record["severity"] == "warning" and record.get("count", 1) == 1
+                                for record in concrete), concrete)
+            self.assertEqual((document["critical"], document["warning"], document["info"]),
+                             (sum(expected.values()), 4, 0))
+            for severity in ("critical", "warning", "info"):
+                self.assertEqual(sum(record.get("count", 1) for record in records
+                                     if record["severity"] == severity), document[severity])
+            return sorted(records, key=lambda record: (record["path"], record["rule"],
+                                                       record["line"], record["col"]))
+
+        cold = scan_counts({first: 2, second: 3}, 0, 2)
+        warm = scan_counts({first: 2, second: 3}, 2, 0)
+        self.assertEqual(warm, cold)
+
+        # Repair only one acquisition. The other file must replay its weight
+        # of three while the changed file contributes a freshly scanned one.
+        first.write_text(first_source.replace("    assert_eq!(1, 1);\n",
+                                              "    assert_eq!(1, 1);\n    let _ = first.join();\n"),
+                         encoding="utf-8")
+        partial = scan_counts({first: 1, second: 3}, 1, 1)
+        self.assertEqual([record for record in partial if Path(record["path"]) == second],
+                         [record for record in cold if Path(record["path"]) == second])
+        self.assertEqual(scan_counts({first: 1, second: 3}, 2, 0), partial)
 
     def test_async_lock_inventory_does_not_duplicate_line_fallbacks(self) -> None:
         for name, acquisition, rule in (
@@ -249,6 +520,209 @@ class RustPanicContextTests(unittest.TestCase):
         code, changed = self.scan([target], cache=True)
         self.assertEqual((code, changed["critical"]), (1, 1))
         self.assertEqual(changed["extras"]["profile"]["cache_hits"], 0)
+
+
+class RustRestoredDiagnosticTests(unittest.TestCase):
+    """Exercise the real generated pack and public reports at original fixture sites."""
+
+    # Independent expectations from the legacy diagnostic contract. A generic
+    # unwrap, cast, or filesystem finding at these lines cannot satisfy them.
+    EXPECTED = {
+        "rust.casts.ptr-cast": ("info", "Raw pointer cast; verify layouts and lifetimes", (
+            (126, "ptr as *mut u8"), (139, "bytes as *const [u8]"), (140, "ptr as *mut u8"))),
+        "rust.parsing.parse-float-no-finite-check": ("info", "validate with is_finite() after parsing", (
+            (150, "input.parse::<f64>().unwrap_or(0.0)"),)),
+        "rust.numeric.instant-now-elapsed": ("warning", "you likely want elapsed() on a previously-stored Instant", (
+            (159, "Instant::now().elapsed()"),)),
+        "rust.numeric.instant-subtraction": ("warning", "use checked_sub()", (
+            (160, "Instant::now() - Duration::from_secs(1)"),)),
+        "rust.panic.from-slice-panic": ("warning", "validate length first or use try_from", (
+            (176, "Nonce::from_slice(data)"), (177, "GenericArray::from_slice(data)"),
+            (178, "Key::from_slice(data)"))),
+        "rust.numeric.i64-negate-overflow": ("info", "consider checked_neg() or promote to i128", (
+            (154, "1_i64.wrapping_neg()"), (155, "-(values.len() as i64)"))),
+        "rust.numeric.wrapping-arithmetic": ("info", "verify this is intentional and not masking a bug", (
+            (156, "1_u64.wrapping_add(values.len() as u64)"),
+            (157, "1_u64.wrapping_sub(values.len() as u64)"),
+            (158, "1_u64.wrapping_mul(values.len() as u64)"))),
+        "rust.async.tokio-spawn-no-move": ("info", "consider `async move` to avoid borrow across await", (
+            (61, "tokio::spawn(async { async_work().await })"),)),
+        "rust.async.tokio-block-in-place": ("info", "ensure this is truly needed and guarded", (
+            (64, "tokio::task::block_in_place("),)),
+        "rust.filesystem.write-not-atomic": ("info", "for durability, write to a temp file and rename", (
+            (185, "std::fs::write("),)),
+        "rust.collections.map-clone": ("info", "can often be replaced with .cloned()", (
+            (96, "items.iter().map(|item| item.clone())"),)),
+        "rust.parsing.strict-utf8": ("warning", "consider from_utf8_lossy() for untrusted input", (
+            (152, "String::from_utf8("), (153, "str::from_utf8("))),
+        "rust.perf.regex-new-unwrap": ("info", "consider compile-time regex! or handle error with context", (
+            (108, "regex::Regex::new("), (117, "regex::Regex::new("))),
+        "rust.panic.debug-assert-macros": ("info", "ensure invariants are also enforced where needed", (
+            (73, "debug_assert!("), (74, "debug_assert_eq!("), (75, "debug_assert_ne!("))),
+    }
+
+    def setUp(self) -> None:
+        self.scratch = tempfile.TemporaryDirectory(prefix="ubs_rust_restored_")
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name)
+        self.fixture = self.root / "coverage.rs"
+        shutil.copyfile(REPO_ROOT / "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs", self.fixture)
+        self.source = self.fixture.read_text(encoding="utf-8")
+        self.rules = self.root / "rules"
+        rust_rules.generate(self.rules)
+
+    def _process(self, command: list[str], cache_name: str, *, cache: bool = True) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
+                   UBS_NO_CACHE="0" if cache else "1", UBS_CACHE_DIR=str(self.root / cache_name),
+                   UBS_CACHE_FILE=str(self.root / f"{cache_name}.stats"),
+                   UBS_ENABLE_AUTO_UPDATE="0", UBS_PROFILE="1", NO_COLOR="1")
+        proc = subprocess.run(command, cwd=self.root, env=env, text=True,
+                              capture_output=True, timeout=180, check=False)
+        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        return proc
+
+    def _json(self, text: str, proc: subprocess.CompletedProcess[str]) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            self.fail(f"Invalid Rust report: {exc}; report={text!r}; stdout={proc.stdout!r}; stderr={proc.stderr!r}")
+
+    def _native(self, target: Path) -> tuple[subprocess.CompletedProcess[str], dict]:
+        paths = self.root / "inputs"
+        paths.write_bytes(os.fsencode(target) + b"\0")
+        output = self.root / "native.json"
+        proc = self._process([
+            sys.executable, "-m", "ubs_core.rust_scan", "--files-from", str(paths),
+            "--sink", str(self.root / "native.ndjson"), "--json-out", str(output),
+            "--project-dir", str(self.root), "--ast-rule-dir", str(self.rules),
+            "--skip-type-narrowing", "--quiet",
+        ], "native-cache")
+        self.assertTrue(output.is_file(), proc.stdout + proc.stderr)
+        return proc, self._json(output.read_text(encoding="utf-8"), proc)
+
+    def _cli(self, meta: bool, output_format: str, *, cache: bool = True) -> tuple[subprocess.CompletedProcess[str], dict]:
+        command = ([str(REPO_ROOT / "ubs"), "--only=rust", "--no-auto-update"] if meta
+                   else [str(REPO_ROOT / "modules/ubs-rust.sh")])
+        proc = self._process([
+            *command, "--no-cargo", f"--format={output_format}", str(self.fixture),
+        ], f"cli-cache-{meta}", cache=cache)
+        return proc, self._json(proc.stdout, proc)
+
+    def _cli_cache_counts(self, meta: bool, payload: dict, proc: subprocess.CompletedProcess[str]) -> tuple[int, int]:
+        if meta:
+            return payload["profile"]["cache_hits"], payload["profile"]["cache_misses"]
+        # The standalone Rust summary omits profile fields; its native scanner
+        # still writes this real cache-statistics sidecar on every invocation.
+        stats_path = self.root / f"cli-cache-{meta}.stats"
+        self.assertTrue(stats_path.is_file(), proc.stdout + proc.stderr)
+        stats = self._json(stats_path.read_text(encoding="utf-8"), proc)
+        return stats["hits"], stats["misses"]
+
+    def _expected_sites(self, anchors: tuple[tuple[int, str], ...]) -> list[tuple[int, int]]:
+        lines = self.source.splitlines()
+        return sorted((line, lines[line - 1].index(anchor) + 1) for line, anchor in anchors)
+
+    def _assert_native(self, records: list[dict]) -> None:
+        for rule, (severity, guidance, anchors) in self.EXPECTED.items():
+            with self.subTest(rule=rule):
+                hits = [record for record in records if record["rule"] == rule]
+                self.assertEqual(sorted((hit["line"], hit["col"]) for hit in hits),
+                                 self._expected_sites(anchors), hits)
+                for hit in hits:
+                    self.assertEqual(Path(hit["path"]).resolve(), self.fixture)
+                    self.assertEqual(hit["severity"], severity)
+                    self.assertIn(guidance, hit["message"])
+        ordinary_asserts = [record for record in records if record["rule"] == "rust.panic.assert-macros"]
+        self.assertFalse(any(record["line"] in (73, 74, 75) for record in ordinary_asserts))
+
+    def _assert_sarif(self, payload: dict) -> list[tuple]:
+        self.assertEqual(payload["version"], "2.1.0")
+        results = [result for run in payload["runs"] for result in run.get("results", [])]
+        normalized = []
+        for rule, (severity, guidance, anchors) in self.EXPECTED.items():
+            with self.subTest(rule=rule):
+                hits = [result for result in results if result["ruleId"] == rule]
+                sites = []
+                for hit in hits:
+                    location = hit["locations"][0]["physicalLocation"]
+                    self.assertTrue(location["artifactLocation"]["uri"].endswith(self.fixture.name), location)
+                    region = location["region"]
+                    sites.append((region["startLine"], region["startColumn"]))
+                    self.assertEqual(hit["level"], "note" if severity == "info" else severity)
+                    self.assertIn(guidance, hit["message"]["text"])
+                    normalized.append((rule, hit["level"], *sites[-1], hit["message"]["text"]))
+                self.assertEqual(sorted(sites), self._expected_sites(anchors), hits)
+        ordinary_asserts = [result for result in results if result["ruleId"] == "rust.panic.assert-macros"]
+        self.assertFalse(any(result["locations"][0]["physicalLocation"]["region"]["startLine"] in (73, 74, 75)
+                             for result in ordinary_asserts))
+        return sorted(normalized)
+
+    def test_original_sites_and_guidance_survive_native_cache_hits(self) -> None:
+        cold_proc, cold = self._native(self.fixture)
+        self.assertEqual(cold_proc.returncode, 1)
+        self.assertEqual(cold["status"], "ok")
+        self.assertEqual(cold["files"], 1)
+        self.assertEqual((cold["profile"]["cache_hits"], cold["profile"]["cache_misses"]), (0, 1))
+        self._assert_native(cold["findings"])
+        cold_bytes = (self.root / "native.ndjson").read_bytes()
+        warm_proc, warm = self._native(self.fixture)
+        self.assertEqual(warm_proc.returncode, cold_proc.returncode)
+        self.assertEqual((warm["profile"]["cache_hits"], warm["profile"]["cache_misses"]), (1, 0))
+        self._assert_native(warm["findings"])
+        self.assertEqual(warm["findings"], cold["findings"])
+        self.assertEqual((self.root / "native.ndjson").read_bytes(), cold_bytes)
+
+    def test_module_and_meta_sarif_preserve_uncached_and_cached_diagnostics(self) -> None:
+        for meta in (False, True):
+            with self.subTest(meta=meta):
+                cold_proc, cold = self._cli(meta, "json")
+                self.assertEqual(cold_proc.returncode, 1)
+                self.assertEqual(self._cli_cache_counts(meta, cold, cold_proc), (0, 1))
+                warm_proc, warm = self._cli(meta, "json")
+                self.assertEqual(warm_proc.returncode, cold_proc.returncode)
+                self.assertEqual(self._cli_cache_counts(meta, warm, warm_proc), (1, 0))
+                cached_proc, cached = self._cli(meta, "sarif")
+                self.assertEqual(cached_proc.returncode, cold_proc.returncode)
+                cached_sites = self._assert_sarif(cached)
+                uncached_proc, uncached = self._cli(meta, "sarif", cache=False)
+                self.assertEqual(uncached_proc.returncode, cold_proc.returncode)
+                self.assertEqual(self._assert_sarif(uncached), cached_sites)
+
+    def test_safe_variants_comments_and_strings_do_not_trigger_restored_checks(self) -> None:
+        target = self.root / "safe_variants.rs"
+        target.write_text(
+            "fn safe(input: &str, bytes: &[u8], value: i64, items: &[String]) {\n"
+            "    let _ = value as usize;\n"
+            "    let _ = input.parse::<f64>();\n"
+            "    let started = Instant::now();\n"
+            "    let _ = started.elapsed();\n"
+            "    let _ = started.checked_sub(Duration::from_secs(1));\n"
+            "    let _ = Nonce::try_from(bytes);\n"
+            "    let _ = GenericArray::try_from(bytes);\n"
+            "    let _ = Key::try_from(bytes);\n"
+            "    let _ = value.checked_neg();\n"
+            "    let _ = value.checked_add(1);\n"
+            "    let _ = value.checked_sub(1);\n"
+            "    let _ = value.checked_mul(1);\n"
+            "    let _ = std::fs::rename(\"staged\", \"live\");\n"
+            "    let _ = items.iter().cloned();\n"
+            "    let _ = String::from_utf8_lossy(bytes);\n"
+            "    let _ = str::from_utf8(bytes);\n"
+            "    let _ = regex::Regex::new(input);\n"
+            "    assert!(value != 0);\n"
+            "    tokio::task::block_in_place(|| work());\n"
+            "}\n"
+            "async fn scheduled() { let task = tokio::spawn(async move { work() }); task.await; }\n"
+            "fn work() {}\n"
+            "// Instant::now().elapsed(); debug_assert!(false); Nonce::from_slice(bytes);\n"
+            'const TEXT: &str = "tokio::spawn(async { work() }); value.wrapping_neg();";\n',
+            encoding="utf-8",
+        )
+        _, doc = self._native(target)
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual(doc["files"], 1)
+        restored = [record for record in doc["findings"] if record["rule"] in self.EXPECTED]
+        self.assertEqual(restored, [])
 
 
 class RustJwtDecoderIdentityTests(unittest.TestCase):

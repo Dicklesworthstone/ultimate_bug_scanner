@@ -562,10 +562,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
             rel_parts = ()
         if any(part in SKIP_DIRS for part in rel_parts):
             continue
-        try:
-            rel = path.resolve().relative_to(cwd)
-        except ValueError:
-            rel = path.name
+        rel = path.resolve()
         for rule, line, col, path_desc in scan_file_findings(path):
             kind = KIND_BY_RULE[rule]
             yield {

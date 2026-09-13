@@ -23,12 +23,29 @@ from dataclasses import dataclass, field
 
 from ubs_core.lexer import strip_comments_and_strings
 
-MARKER_RE = re.compile(r"ubs:ignore(?:\[([A-Za-z0-9_.,\- ]+)\])?")
+# An explicit empty scope is bare; a malformed scope must not backtrack to bare.
+MARKER_RE = re.compile(r"ubs:ignore(?:\[([A-Za-z0-9_.,\- ]*)\])?(?!\[)")
 
 _HASH_LANGS = frozenset({"python", "ruby", "elixir"})
 _BLOCK_KEYWORDS = {"ruby": ("def ", "end"), "elixir": ("do", "end")}
 _C_CONTINUATION = ("\\", "(", "[", ",", "&&", "||", "=>", "=", "+", "-", "*", "/", "?", "|", "&", "<", ">", ".")
 _PY_CONTINUATION = ("\\", "(", "[", "{", ",", "&", "|", "+", ".", "->", "do", "then", "else")
+
+
+def has_suppression_marker(text: str, rule: str | None = None) -> bool:
+    """Classify marker scope at an existing caller-selected source anchor.
+
+    This checks syntax only; callers retain their existing string masking and
+    line/statement boundaries. An unknown rule accepts only bare markers (and
+    empty scopes, as in ``parse_markers``), so collecting taint cannot discard
+    a source merely because one particular finding was annotated.
+    """
+    for match in MARKER_RE.finditer(text):
+        rules_blob = match.group(1)
+        rules = frozenset(p.strip() for p in (rules_blob or "").split(",") if p.strip())
+        if not rules or (rule is not None and rule in rules):
+            return True
+    return False
 
 
 @dataclass(frozen=True)

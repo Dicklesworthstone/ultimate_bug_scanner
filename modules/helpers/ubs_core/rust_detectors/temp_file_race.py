@@ -28,6 +28,8 @@ import re
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.temp-file-race"
 CATEGORY = 8
 TITLE = "Predictable temp-file write race"
@@ -183,7 +185,7 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
                 temp_vars.add(var)
 
         for line_idx, masked_line in enumerate(masked_lines):
-            if "ubs:ignore" in masked_line:
+            if has_suppression_marker(masked_line, RULE_ID):
                 continue
             if not re.search(
                 r"(?:\bwrite\s*\(|\b(?:(?:std\s*::\s*)?fs\s*::\s*)?File\s*::\s*create\s*\(|\bOpenOptions\s*::\s*new\s*\()",
@@ -204,7 +206,7 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
             if safe_context.search(context) or safe_context.search(statement):
                 continue
             code = original_lines[line_idx].strip() if line_idx < len(original_lines) else ""
-            if "ubs:ignore" in code:
+            if has_suppression_marker(code, RULE_ID):
                 continue
             key = (str(path), line_idx + 1, code)
             if key in seen:

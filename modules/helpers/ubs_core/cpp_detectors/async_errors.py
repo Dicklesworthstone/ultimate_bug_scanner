@@ -30,7 +30,6 @@ def _count(lines: list[str], regex: re.Pattern[str]) -> int:
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
-    cwd = Path.cwd()
     for path in files:
         if path.suffix.lower() not in {'.c', '.cc', '.cpp', '.cxx', '.c++', '.h',
                                        '.hh', '.hpp', '.hxx', '.ipp', '.tpp',
@@ -44,8 +43,5 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         if not any(_ASYNC_RE.search(line) and MARKER not in line for line in lines):
             continue
         if _count(lines, _FUTURE_RE) > 0 and _count(lines, _GET_RE) == 0:
-            try:
-                rel = str(path.resolve().relative_to(cwd))
-            except ValueError:
-                rel = path.name
+            rel = str(path.resolve())
             yield rel, 0, 1, DESCRIPTION

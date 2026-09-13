@@ -2,14 +2,14 @@
 
 Verbatim port of the run_security_randomness_checks heredoc in
 modules/ubs-swift.sh. The legacy shell printed ONE critical finding plus up
-to DETAIL_LIMIT code samples; the aggregate record carries the samples.
+to DETAIL_LIMIT code samples; structured records retain every occurrence.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-from ubs_core.swift_detectors._common import MARKER, iter_swift_files, rel
+from ubs_core.swift_detectors._common import MARKER, rel, should_skip
 
 RULE_ID = "swift.crypto.weak-randomness"
 CATEGORY = 7
@@ -231,10 +231,16 @@ def updates_rng_vars(statement: str, insecure_rng_vars: set) -> None:
         insecure_rng_vars.discard(assign.group(1))
 
 
-def collect_findings(root: Path):
+def collect_findings(ctx):
+    root = ctx.project_dir.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
-    for path in iter_swift_files(root, base, SKIP_DIRS):
+    for candidate in ctx.files:
+        path = Path(candidate).resolve()
+        if path.suffix != '.swift':
+            continue
+        if path != root and should_skip(path, base, SKIP_DIRS):
+            continue
         try:
             text = path.read_text(encoding='utf-8', errors='ignore')
         except OSError:
@@ -265,22 +271,15 @@ def collect_findings(root: Path):
 
 
 def scan(ctx):
-    root = ctx.project_dir.resolve()
-    findings = collect_findings(root)
-    if not findings:
-        return
-    samples = [
-        {"path": file_name, "line": line_no, "code": code}
-        for file_name, line_no, code in findings[:25]
-    ]
-    yield {
-        "rule": RULE_ID,
-        "category": CATEGORY,
-        "path": findings[0][0],
-        "line": findings[0][1],
-        "severity": SEVERITY,
-        "count": len(findings),
-        "title": TITLE,
-        "message": TITLE,
-        "samples": samples,
-    }
+    for file_name, line_no, code in collect_findings(ctx):
+        yield {
+            "rule": RULE_ID,
+            "category": CATEGORY,
+            "path": file_name,
+            "line": line_no,
+            "severity": SEVERITY,
+            "count": 1,
+            "title": TITLE,
+            "message": TITLE,
+            "samples": [{"path": file_name, "line": line_no, "code": code}],
+        }

@@ -15,10 +15,10 @@ where the target name is sensitive and the literal is risky (>=8 chars,
 alphanumeric, not a known placeholder, no example./example_|sample_|
 dummy_ prefix), or against ``.insert("SECRET_NAME", ...)`` map keys, or
 against env fallbacks (``env::var("SECRET").unwrap_or[_else](...)`` with a
-risky fallback literal). Suppression is two-layered (both ported
-verbatim): a line is skipped when its own line or the previous line
-carries ``ubs:ignore``, and a candidate is dropped when the assembled
-statement contains ``ubs:ignore``. A final pass dedupes per (file, line).
+risky fallback literal). Suppression retains the two legacy anchors: its
+own/previous line, and the assembled statement. Bare ``ubs:ignore`` markers
+or scopes naming this rule suppress the candidate; scopes for other rules
+do not. A final pass dedupes per (file, line).
 
 Legacy printed ``__COUNT__`` plus up to 25 ``__SAMPLE__`` lines; the 25 cap
 was a display cap (the count used all deduped issues), so find() yields
@@ -40,7 +40,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import has_suppression_marker
 
 RULE_ID = "rust.security.hardcoded-secrets"
 CATEGORY = 8
@@ -163,7 +163,9 @@ def source_line(lines, line_no):
 
 
 def has_ignore(lines, idx):
-    return MARKER in lines[idx] or (idx > 0 and MARKER in lines[idx - 1])
+    return has_suppression_marker(lines[idx], RULE_ID) or (
+        idx > 0 and has_suppression_marker(lines[idx - 1], RULE_ID)
+    )
 
 
 def normalize_name(name: str) -> str:
@@ -248,7 +250,7 @@ def analyze(path: Path, base_dir: Path, issues):
         if not (is_sensitive_name(stripped) or ENV_CALL_RE.search(stripped)):
             continue
         statement = statement_from(lines, idx)
-        if not statement or MARKER in statement:
+        if not statement or has_suppression_marker(statement, RULE_ID):
             continue
         if assignment_literal(statement) or env_fallback_literal(statement):
             issues.append((relpath(path, base_dir), idx + 1, 1, source_line(lines, idx + 1)))

@@ -17,6 +17,8 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.open-redirect"
 CATEGORY = 8
 TITLE = "Unvalidated redirect from request data"
@@ -164,12 +166,12 @@ def logical_statement(lines, line_no):
     return statement
 
 
-def has_ignore(lines, line_no):
+def has_ignore(lines, line_no, rule=None):
     idx = line_no - 1
     return (
-        0 <= idx < len(lines) and "ubs:ignore" in lines[idx]
+        0 <= idx < len(lines) and has_suppression_marker(lines[idx], rule)
     ) or (
-        0 <= idx - 1 < len(lines) and "ubs:ignore" in lines[idx - 1]
+        0 <= idx - 1 < len(lines) and has_suppression_marker(lines[idx - 1], rule)
     )
 
 
@@ -265,6 +267,8 @@ def analyze(path: Path, issues):
         if not direct and not refs:
             continue
         if has_redirect_validation_context(lines, line_no, refs):
+            continue
+        if has_ignore(lines, line_no, RULE_ID):
             continue
         key = (path, line_no)
         if key in seen:

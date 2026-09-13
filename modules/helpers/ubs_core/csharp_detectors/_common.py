@@ -156,7 +156,9 @@ def relpath(path: Path, base_dir: Path) -> str:
     try:
         return str(path.resolve().relative_to(base_dir))
     except ValueError:
-        return str(path)
+        # Outside the project, keep the source absolute: the consumer knows
+        # only the project base for relative detector paths.
+        return str(path.resolve())
 
 
 def source_line(lines, line_no):

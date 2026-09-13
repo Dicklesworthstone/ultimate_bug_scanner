@@ -1,7 +1,7 @@
 """swift_detectors.urlsession_correlation — cat 4 resume/cancel correlation.
 
-Verbatim port of run_urlsession_task_correlation's python heredoc in
-modules/ubs-swift.sh. Consumes the parsed ast-grep stream records for the
+Based on run_urlsession_task_correlation's python heredoc in modules/ubs-swift.sh.
+Consumes the parsed ast-grep stream records for the
 swift.urlsession.task-no-resume rule (stashed on ctx.ast_records by
 ubs_core.swift_ast) and correlates each task-creation site with an in-file
 resume()/cancel()/return of the assigned variable.
@@ -12,10 +12,11 @@ matches) print info-0 findings or a good note; each maps 1:1 to a record here.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 
 
 TASK_RID = "swift.urlsession.task-no-resume"
-TASK_CALL_RE = re.compile(r"\.(dataTask|uploadTask|downloadTask)\s*\(")
+TASK_CALL_RE = re.compile(r"\.\s*(dataTask|uploadTask|downloadTask)\s*\(")
 
 DEGRADED_AST = {
     "rule": "swift.networking.correlation",
@@ -46,17 +47,15 @@ FINDINGS = {
     ),
 }
 def scan(ctx):
-    import os
-
     if not ctx.ast_available:
         # legacy: print_finding info 0 "Correlation skipped" "ast-grep unavailable"
         yield dict(DEGRADED_AST)
         return
 
-    project_dir = str(ctx.project_dir)
-
-    # legacy rg precheck (no marker filter) runs BEFORE the ast index build
-    if not any(TASK_CALL_RE.search(ctx.text_of(p)) for p in ctx.files):
+    task_records = [ent for ent in ctx.ast_records if ent.get("rid") == TASK_RID]
+    # Keep the legacy no-task note, but a real AST match must never be rejected
+    # because whitespace or comments defeat this inexpensive textual precheck.
+    if not task_records and not any(TASK_CALL_RE.search(ctx.text_of(p)) for p in ctx.files):
         yield {
             "rule": "swift.networking.correlation",
             "category": 4,
@@ -83,70 +82,68 @@ def scan(ctx):
         }
         return
 
-    def norm_path(p: str) -> str:
-        if os.path.isabs(p):
-            return p
-        return os.path.normpath(os.path.join(project_dir, p))
-
-    def rel(p: str) -> str:
-        try:
-            rp = os.path.relpath(p, project_dir)
-            return rp if not rp.startswith("..") else p
-        except Exception:
-            return p
-
-    out = {}
+    out = []
     seen = set()
 
     # group stream records per file, legacy AG_FILE_INDEX semantics
     index = {}
-    for ent in ctx.ast_records:
-        if (ent.get("rid") or "") != TASK_RID:
-            continue
+    for ent in task_records:
         index.setdefault(ent.get("file"), []).append(ent)
 
     for file_key, entries in index.items():
-        abs_path = norm_path(file_key)
+        # ast-grep runs in this process's cwd. Keep its actual source
+        # identity for correlation, deduplication, and structured samples.
+        abs_path = str(_Path(file_key).resolve())
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="ignore") as fh:
-                text = fh.read()
-        except Exception:
+            source = _Path(abs_path).read_bytes()
+        except OSError:
             continue
 
-        lines = text.splitlines(True)
-        lines_no_nl = [ln.rstrip("\n") for ln in lines]
+        # ast-grep offsets address the original UTF-8 bytes, including CRLF.
+        # Decode without universal-newline translation and convert only the
+        # actual match/capture boundaries, once per source.
+        text = source.decode("utf-8", errors="ignore")
+        lines_no_nl = text.split("\n")
         offs = [0]
-        for ln in lines:
-            offs.append(offs[-1] + len(ln))
+        for ln in lines_no_nl[:-1]:
+            offs.append(offs[-1] + len(ln) + 1)
 
-        for ent in entries or []:
-            try:
-                row = int(ent.get("row", 0))
-                col = int(ent.get("col", 0))
-            except Exception:
-                row, col = 0, 0
-            if row < 0 or row >= len(lines):
+        sites = []
+        boundaries = {0}
+        for ent in entries:
+            expression = byte_span(ent.get("range"), len(source))
+            method = ent.get("method") or {}
+            method_span = byte_span(method.get("range"), len(source))
+            if expression is None or method_span is None:
                 continue
+            if not expression[0] <= method_span[0] < method_span[1] <= expression[1]:
+                continue
+            method_text = source[method_span[0]:method_span[1]]
+            if method_text not in (b"dataTask", b"uploadTask", b"downloadTask"):
+                continue
+            sites.append((ent, expression, method_span))
+            boundaries.update((*expression, *method_span))
+        positions = {}
+        previous_byte = previous_char = 0
+        for offset in sorted(boundaries):
+            previous_char += len(source[previous_byte:offset].decode("utf-8", errors="ignore"))
+            positions[offset] = previous_char
+            previous_byte = offset
 
-            line = lines[row]
-            call_col = max(0, min(col, len(line)))
-            seg = line[call_col:]
-            m = TASK_CALL_RE.search(seg)
-            if m:
-                call_col += m.start()
-            else:
-                m = TASK_CALL_RE.search(line)
-                if not m:
-                    continue
-                call_col = m.start()
-
-            key = (abs_path, row, call_col)
+        for ent, expression, method_span in sites:
+            expression_start = positions[expression[0]]
+            method_start = positions[method_span[0]]
+            row = bisect_right(offs, expression_start) - 1
+            expression_col = expression_start - offs[row]
+            key = (abs_path, expression[0], method_span[0])
             if key in seen:
                 continue
             seen.add(key)
 
-            call_start = offs[row] + call_col
-            call_end = parse_call_end(text, call_start)
+            # The receiver may itself contain calls or span several lines.
+            # Parse task arguments at METHOD, but bind the result at the start
+            # of the complete receiver expression, before any receiver text.
+            call_end = parse_call_end(text, method_start)
             if call_end is None:
                 continue
 
@@ -154,10 +151,10 @@ def scan(ctx):
             if chain in ("resume", "cancel"):
                 continue
 
-            sample = (rel(abs_path), row + 1, code_sample(lines_no_nl, row))
-            var_expr = extract_assigned_var(lines_no_nl, row, call_col)
+            sample = (abs_path, row + 1, int(ent.get("col", 0)) + 1, code_sample(lines_no_nl, row))
+            var_expr = extract_assigned_var(lines_no_nl, row, expression_col)
             if not var_expr:
-                if has_return_before(lines_no_nl, row, call_col):
+                if has_return_before(lines_no_nl, row, expression_col):
                     continue
                 add_finding(
                     out,
@@ -203,29 +200,44 @@ def scan(ctx):
             "degraded": True,
         }
         return
-    for fid, data in out.items():
+    for fid, sample in out:
         sev, title, desc = FINDINGS[fid]
+        path, line, col, code = sample
         yield {
             "rule": fid,
             "category": 4,
-            "path": data["samples"][0][0] if data["samples"] else "",
-            "line": data["samples"][0][1] if data["samples"] else 0,
+            "path": path,
+            "line": line,
+            "col": col,
             "severity": sev,
-            "count": data["count"],
+            "count": 1,
             "title": f"{fid}: {title}",
             "message": f"{fid}: {title}",
             "description": desc,
-            "samples": [
-                {"path": f, "line": ln, "code": code} for f, ln, code in data["samples"]
-            ],
+            "samples": [{"path": path, "line": line, "col": col, "code": code}],
         }
 
 
 
-# --- the heredoc's helper functions (verbatim) -------------------------------
+# --- source-range and lexical helpers --------------------------------------
 
 import re as _re  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
+
+
+def byte_span(rng, source_size: int):
+    """Read ast-grep's inclusive/exclusive UTF-8 range without guessing a site."""
+    if not isinstance(rng, dict):
+        return None
+    offsets = rng.get("byteOffset")
+    if not isinstance(offsets, dict):
+        return None
+    start, end = offsets.get("start"), offsets.get("end")
+    if not isinstance(start, int) or not isinstance(end, int):
+        return None
+    if not 0 <= start < end <= source_size:
+        return None
+    return start, end
 
 
 class Lex:
@@ -425,13 +437,15 @@ def parse_lhs_assignment(lhs: str):
         lhs,
     )
     if m:
-        return collapse_ws(m.group(1))
+        name = collapse_ws(m.group(1))
+        return name if name != "_" else None
     m = _re.search(
         r"([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\s*(?::[^=]+)?\s*=\s*$",
         lhs,
     )
     if m:
-        return collapse_ws(m.group(1))
+        name = collapse_ws(m.group(1))
+        return name if name != "_" else None
     return None
 
 
@@ -443,7 +457,7 @@ def extract_assigned_var(lines_no_nl, row: int, call_col: int):
     v = parse_lhs_assignment(lhs)
     if v:
         return v
-    if row > 0:
+    if row > 0 and not lhs.strip():
         prev = lines_no_nl[row - 1].split("//", 1)[0]
         if prev.rstrip().endswith("="):
             v = parse_lhs_assignment(prev.rstrip())
@@ -456,9 +470,9 @@ def has_return_before(lines_no_nl, row: int, call_col: int) -> bool:
     if row < 0 or row >= len(lines_no_nl):
         return False
     prefix = lines_no_nl[row][: max(0, min(call_col, len(lines_no_nl[row])))]
-    if _re.search(r"\breturn\b", prefix):
+    if _re.search(r"\breturn\s*$", prefix):
         return True
-    if row > 0 and _re.search(r"\breturn\s*$", lines_no_nl[row - 1]):
+    if not prefix.strip() and row > 0 and _re.search(r"\breturn\s*$", lines_no_nl[row - 1]):
         return True
     return False
 
@@ -469,12 +483,7 @@ def code_sample(lines_no_nl, row: int) -> str:
     return (lines_no_nl[row] or "").strip().replace("\t", " ")
 
 
-def add_finding(out: dict, fid: str, sample) -> None:
-    sev, title, desc = FINDINGS[fid]
-    b = out.setdefault(fid, {"severity": sev, "title": title, "desc": desc,
-                             "count": 0, "samples": []})
-    b["count"] += 1
-    if sample and len(b["samples"]) < 3:
-        f, ln, code = sample
-        code = (code or "").replace("\t", " ").strip()
-        b["samples"].append((f, ln, code))
+def add_finding(out: list, fid: str, sample) -> None:
+    # Keep every actual source occurrence. Rendering may limit previews only
+    # after the complete selected-file records have been replayed from cache.
+    out.append((fid, sample))

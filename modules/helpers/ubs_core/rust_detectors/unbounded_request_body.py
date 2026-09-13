@@ -25,6 +25,8 @@ import re
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.request-body-limit"
 CATEGORY = 8
 TITLE = "Request body read without explicit byte limit"
@@ -173,7 +175,7 @@ def context_around(original_lines, idx):
 
 def has_ignore(lines, idx):
     start = max(0, idx - 2)
-    return any("ubs:ignore" in lines[pos] for pos in range(start, idx + 1))
+    return any(has_suppression_marker(lines[pos], RULE_ID) for pos in range(start, idx + 1))
 
 
 def context_is_limited(context: str) -> bool:

@@ -26,6 +26,8 @@ import re
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.cors-credentials"
 CATEGORY = 8
 TITLE = "Credentialed wildcard/reflected CORS"
@@ -139,12 +141,12 @@ def logical_statement(lines, line_no, max_lines=16):
     return statement
 
 
-def has_ignore(lines, line_no):
+def has_ignore(lines, line_no, rule=None):
     idx = line_no - 1
     return (
-        0 <= idx < len(lines) and "ubs:ignore" in lines[idx]
+        0 <= idx < len(lines) and has_suppression_marker(lines[idx], rule)
     ) or (
-        0 <= idx - 1 < len(lines) and "ubs:ignore" in lines[idx - 1]
+        0 <= idx - 1 < len(lines) and has_suppression_marker(lines[idx - 1], rule)
     )
 
 
@@ -240,6 +242,8 @@ def analyze(path: Path, issues):
                     continue
                 reason = "credentials enabled with reflected request Origin"
         if not reason:
+            continue
+        if has_ignore(lines, line_no, RULE_ID):
             continue
         key = (path, line_no, reason)
         if key in seen:

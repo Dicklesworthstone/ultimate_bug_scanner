@@ -36,10 +36,8 @@ def iter_swift_files(root: Path, base: Path, skip_dirs=SKIP_DIRS) -> Iterator[Pa
 
 
 def rel(path: Path, base: Path) -> str:
-    try:
-        return str(path.relative_to(base))
-    except ValueError:
-        return path.name
+    """Keep structured detector locations tied to the complete source path."""
+    return str(path.resolve())
 
 
 def strip_line_comments(line: str, single_quotes: bool = True) -> str:

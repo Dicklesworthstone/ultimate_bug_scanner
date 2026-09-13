@@ -253,16 +253,12 @@ def scan_file_findings(path: Path):
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    cwd = Path.cwd()
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
         if should_skip(path):
             continue
-        try:
-            rel = path.resolve().relative_to(cwd)
-        except ValueError:
-            rel = path.name
+        rel = path.resolve()
         for rule, line, col, path_desc in scan_file_findings(path):
             kind = KIND_BY_RULE[rule]
             yield {

@@ -374,10 +374,10 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
-        for rule, rel, line, col, path_desc in iter_file_hits(path, base_dir):
+        for rule, _rel, line, col, path_desc in iter_file_hits(path, base_dir):
             yield {
                 "rule": rule,
-                "path": rel,
+                "path": str(path.resolve()),
                 "line": line,
                 "col": col,
                 "severity": _SEVERITY[rule],
@@ -412,7 +412,7 @@ def _selftest_xss_positive() -> None:
         assert len(findings) == 1, findings
         assert findings[0]["line"] == 10, findings[0]
         assert findings[0]["severity"] == "critical"
-        assert findings[0]["path"] == "main.go"
+        assert findings[0]["path"] == str(path.resolve())
         assert "name" in findings[0]["message"]
 
 

@@ -13,6 +13,8 @@ import re
 from pathlib import Path
 from typing import Iterator
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.sql-injection"
 CATEGORY = 8
 TITLE = "Interpolated SQL reaches execution sink"
@@ -194,12 +196,12 @@ def logical_statement(lines, line_no, max_lines=16):
     return statement
 
 
-def has_ignore(lines, line_no):
+def has_ignore(lines, line_no, rule=None):
     idx = line_no - 1
     return (
-        0 <= idx < len(lines) and "ubs:ignore" in lines[idx]
+        0 <= idx < len(lines) and has_suppression_marker(lines[idx], rule)
     ) or (
-        0 <= idx - 1 < len(lines) and "ubs:ignore" in lines[idx - 1]
+        0 <= idx - 1 < len(lines) and has_suppression_marker(lines[idx - 1], rule)
     )
 
 
@@ -360,6 +362,8 @@ def analyze(path: Path, issues):
             continue
         path_desc = tainted_path_for_expr(statement, tainted, dirty_sql)
         if not path_desc:
+            continue
+        if has_ignore(lines, line_no, RULE_ID):
             continue
         key = (path, line_no)
         if key in seen:

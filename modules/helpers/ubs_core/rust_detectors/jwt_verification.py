@@ -31,7 +31,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import has_suppression_marker
 
 RULE_ID = "rust.security.jwt-verification"
 CATEGORY = 8
@@ -284,9 +284,9 @@ def mask_string_literals(text: str) -> str:
 def has_ignore(lines, line_no):
     idx = line_no - 1
     return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
+        0 <= idx < len(lines) and has_suppression_marker(lines[idx], RULE_ID)
     ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
+        0 <= idx - 1 < len(lines) and has_suppression_marker(lines[idx - 1], RULE_ID)
     )
 
 
@@ -436,7 +436,7 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
             if not stripped or not line_has_jwt_candidate(stripped, decode_pattern):
                 continue
             statement = statement_from(scan_lines, line_no)
-            if not statement or MARKER in statement:
+            if not statement or has_suppression_marker(statement, RULE_ID):
                 continue
             context = function_context(scan_lines, line_no)
             binding_context = binding_context_for_decode(statement, context, decode_pattern)

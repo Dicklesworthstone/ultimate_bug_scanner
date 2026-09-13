@@ -2,15 +2,14 @@
 
 Verbatim port of the shell-report heredoc in modules/ubs-swift.sh (ubs#101
 semantics: bare and module-qualified C calls count, SwiftUI member
-expressions and method declarations do not). Exposes count_findings() so the
-Process-info residual derived check reuses the same number the detector sank.
+expressions and method declarations do not). The Process-info residual reuses
+the actual source anchors so shell calls cannot consume another file's count.
 """
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-from ubs_core.swift_detectors._common import iter_swift_files, rel
+from ubs_core.swift_detectors._common import rel, should_skip
 
 RULE_ID = "swift.security.shell-exec"
 CATEGORY = 6
@@ -50,10 +49,13 @@ def executable_code(code: str) -> str:
     return shell_exec_declarations.sub(lambda m: " " * len(m.group(0)), code)
 
 
-def collect_findings(root: Path):
+def collect_findings(ctx):
+    root = ctx.project_dir.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
-    for path in iter_swift_files(root, base, SKIP_DIRS):
+    for path in ctx.files:
+        if path.suffix != '.swift' or (root.is_dir() and should_skip(path.resolve(), base, SKIP_DIRS)):
+            continue
         try:
             lines = path.read_text(encoding='utf-8').splitlines()
         except (UnicodeDecodeError, OSError):
@@ -65,9 +67,9 @@ def collect_findings(root: Path):
                 continue
             callable_code = executable_code(code)
             if shell_exec_calls.search(callable_code):
-                findings.append(f"{rel(path, base)}:{line_no} system/popen executes through a shell")
+                findings.append((rel(path, base), line_no, raw.strip(), "system/popen executes through a shell"))
             if posix_spawn_calls.search(callable_code) and re.search(r'"/(?:usr/)?bin/(?:sh|bash|zsh)"', code) and '"-c"' in code:
-                findings.append(f"{rel(path, base)}:{line_no} posix_spawn shell -c")
+                findings.append((rel(path, base), line_no, raw.strip(), "posix_spawn shell -c"))
 
             created = re.search(rf"\b(?:let|var)\s+({name})\s*=\s*Process\s*\(", code)
             if created:
@@ -90,34 +92,24 @@ def collect_findings(root: Path):
 
         for proc_name, proc in processes.items():
             if proc.get('command_mode') and (proc.get('shell') or (proc.get('env') and proc.get('env_shell'))):
-                findings.append(f"{rel(path, base)}:{proc.get('line', 1)} Process {proc_name} uses shell -c")
+                line_no = proc.get('line', 1)
+                findings.append((rel(path, base), line_no, lines[line_no - 1].strip(), f"Process {proc_name} uses shell -c"))
     return findings
 
 
 def scan(ctx):
-    root = ctx.project_dir.resolve()
-    findings = collect_findings(root)
-    if not findings:
-        return
-    samples = '; '.join(findings[:3])
     desc = "Avoid /bin/sh -c, system(), and popen(); use a fixed executableURL plus an argument array."
-    yield {
-        "rule": RULE_ID,
-        "category": CATEGORY,
-        "path": findings[0].split(':')[0],
-        "line": 0,
-        "severity": SEVERITY,
-        "count": len(findings),
-        "title": TITLE,
-        "message": TITLE,
-        "description": f"{desc} Examples: {samples}",
-    }
+    for path, line, code, reason in collect_findings(ctx):
+        yield {
+            "rule": RULE_ID,
+            "category": CATEGORY,
+            "path": path,
+            "line": line,
+            "severity": SEVERITY,
+            "count": 1,
+            "title": TITLE,
+            "message": TITLE,
+            "description": f"{desc} {reason}.",
+            "samples": [{"path": path, "line": line, "code": code}],
+        }
 
-
-def count_findings(ctx) -> int:
-    """Number of shell-exec criticals the detector reports (for the residual)."""
-    try:
-        root = ctx.project_dir.resolve()
-    except OSError:
-        return 0
-    return len(collect_findings(root))

@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import has_suppression_marker
+
 MODES = ("clone", "regex_new", "string_alloc")
 MODE_RULE_IDS = {
     "clone": "rust.collections.clone-in-loop",
@@ -218,7 +220,7 @@ def find(files: Sequence[Path], mode: str) -> Iterable[tuple]:
                     continue
                 seen.add(key)
                 code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
-                if "ubs:ignore" in code:
+                if has_suppression_marker(code, MODE_RULE_IDS[mode]):
                     continue
                 yield path, line, 1, code
 

@@ -2,8 +2,8 @@
 
 Verbatim port of the archive-extraction heredoc in modules/ubs-swift.sh
 (print_subheader "Archive extraction path traversal"). The legacy shell
-aggregated the heredoc's `count\\tsamples` output into ONE critical finding
-whose description embeds the first three samples.
+aggregated the heredoc's `count\\tsamples` output into ONE critical finding.
+Structured records retain every occurrence from the selected input files.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 
 from ubs_core.swift_detectors._common import (
-    SKIP_DIRS, has_ignore, iter_swift_files, logical_statement, rel,
+    SKIP_DIRS, has_ignore, logical_statement, rel, should_skip,
     source_line, strip_line_comments,
 )
 
@@ -90,7 +90,12 @@ def scan(ctx):
     root = project.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
-    for path in iter_swift_files(root, base, SKIP_DIRS):
+    for candidate in ctx.files:
+        path = Path(candidate).resolve()
+        if path.suffix != '.swift':
+            continue
+        if path != root and should_skip(path, base, SKIP_DIRS):
+            continue
         try:
             text = path.read_text(encoding='utf-8', errors='ignore')
         except OSError:
@@ -111,18 +116,17 @@ def scan(ctx):
                 continue
             findings.append((rel(path, base), line_no, source_line(lines, line_no)))
 
-    if not findings:
-        return
-    samples = '; '.join(f'{file}:{line}:{code}' for file, line, code in findings[:3])
     desc = "Expand/canonicalize archive entry destinations and reject paths outside the extraction root."
-    yield {
-        "rule": RULE_ID,
-        "category": CATEGORY,
-        "path": findings[0][0],
-        "line": findings[0][1],
-        "severity": SEVERITY,
-        "count": len(findings),
-        "title": TITLE,
-        "message": TITLE,
-        "description": f"{desc} Examples: {samples}",
-    }
+    for file_name, line_no, code in findings:
+        yield {
+            "rule": RULE_ID,
+            "category": CATEGORY,
+            "path": file_name,
+            "line": line_no,
+            "severity": SEVERITY,
+            "count": 1,
+            "title": TITLE,
+            "message": TITLE,
+            "description": desc,
+            "samples": [{"path": file_name, "line": line_no, "code": code}],
+        }

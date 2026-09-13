@@ -14,6 +14,8 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.path-traversal"
 CATEGORY = 8
 TITLE = "Path join/push with untrusted-looking segment"
@@ -161,7 +163,7 @@ def find(files) -> Iterator[tuple[Path, int, int, str]]:
                 continue
             line = line_number(masked, hit.start())
             code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
-            if "ubs:ignore" in code:
+            if has_suppression_marker(code, RULE_ID):
                 continue
             key = (str(path), line, code)
             if key in seen:

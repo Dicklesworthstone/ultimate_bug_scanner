@@ -82,13 +82,8 @@ def scan_config(
             path = Path(file_str)
             line_no = int(rng.get("line", 0)) + 1
             col_no = int(rng.get("column", 0)) + 1
-            display = str(path)
-            if base_dir is not None:
-                try:
-                    display = str(path.resolve().relative_to(base_dir))
-                except (ValueError, OSError):
-                    display = str(path)
-            key = (rule_id, display, line_no, col_no)
+            source_path = str(path.resolve())
+            key = (rule_id, source_path, line_no, col_no)
             if key in seen:
                 continue
             seen.add(key)
@@ -110,7 +105,7 @@ def scan_config(
             sink.write(json.dumps({
                 "rule": rule_id,
                 "category_id": f"elixir.{category_slug}" if category_slug else rule_id,
-                "path": display,
+                "path": source_path,
                 "line": line_no,
                 "col": col_no,
                 "severity": severity,

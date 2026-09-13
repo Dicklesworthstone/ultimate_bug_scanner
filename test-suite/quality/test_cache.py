@@ -39,6 +39,7 @@ from ubs_core.cache import (  # noqa: E402
     compute_cache_key,
     doctor_stats,
     get_cache_base_dir,
+    get_clean_git_blobs,
     is_cache_disabled,
     prune_cache,
 )
@@ -80,6 +81,73 @@ class IncrementalCacheTests(unittest.TestCase):
             print(f"[{case_id}] FAIL ({elapsed:.3f}s): {exc}", flush=True)
             raise
 
+    def _git(self, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(self.project_dir), *args],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(proc.returncode, 0, f"{args}: {proc.stderr}")
+        return proc.stdout
+
+    def test_git_blob_reuse_is_scoped_to_the_requested_subtree(self) -> None:
+        self._git("init", "-q")
+        nested = self.project_dir / "nested"
+        nested.mkdir()
+        # NUL-delimited Git output must retain quoted, tab/newline and trailing
+        # whitespace filenames exactly; none are shell-interpolated.
+        names = ["plain.py", 'quoted".py', "tab\tname.py", "line\nname.py", "trailing.py "]
+        for name in names:
+            (nested / name).write_text("VALUE = 1\n", encoding="utf-8")
+        outside = self.project_dir / "outside.py"
+        outside.write_text("VALUE = 1\n", encoding="utf-8")
+        self._git("add", "--", "nested", "outside.py")
+        self._git("-c", "user.name=UBS Test", "-c", "user.email=test@example.invalid",
+                  "commit", "-q", "-m", "source fixture")
+        expected = {
+            name: self._git("hash-object", "--", str(nested / name)).strip()
+            for name in names
+        }
+        outside.write_text("VALUE = 200\n", encoding="utf-8")
+        self.assertTrue(self._git("status", "--porcelain"))
+        self.assertEqual(get_clean_git_blobs(nested), expected)
+
+        ignored = self.project_dir / "scratch"
+        ignored.mkdir()
+        (self.project_dir / ".gitignore").write_text("scratch/\n", encoding="utf-8")
+        (ignored / "fresh.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.assertIsNone(get_clean_git_blobs(ignored))
+        (nested / "plain.py").write_text("VALUE = 3\n", encoding="utf-8")
+        self.assertIsNone(get_clean_git_blobs(nested))
+
+    def test_git_hidden_worktree_changes_invalidate_cached_findings(self) -> None:
+        self._git("init", "-q")
+        source = self.project_dir / "source.py"
+        source.write_text("VALUE = 1\n", encoding="utf-8")
+        self._git("add", "--", "source.py")
+        self._git("-c", "user.name=UBS Test", "-c", "user.email=test@example.invalid",
+                  "commit", "-q", "-m", "source fixture")
+        for flag, clear in (("--assume-unchanged", "--no-assume-unchanged"),
+                            ("--skip-worktree", "--no-skip-worktree")):
+            with self.subTest(flag=flag):
+                source.write_text("VALUE = 1\n", encoding="utf-8")
+                self._git("update-index", flag, "--", "source.py")
+                self.assertFalse(self._git("status", "--porcelain"))
+                self.assertIsNone(get_clean_git_blobs(self.project_dir))
+                cache = ScanCache("python", self.project_dir, rulepack_hash=flag)
+                cache.store_scanned_files([source], {str(source): []})
+                cached, misses = cache.partition_files([source])
+                self.assertEqual(set(cached), {source})
+                self.assertEqual(misses, [])
+                before = source.stat()
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+                self.assertFalse(self._git("status", "--porcelain"))
+                refreshed = ScanCache("python", self.project_dir, rulepack_hash=flag)
+                cached, misses = refreshed.partition_files([source])
+                self.assertEqual(cached, {})
+                self.assertEqual(misses, [source])
+                self._git("update-index", clear, "--", "source.py")
+
     def _copy_helpers(self) -> tuple[Path, dict[str, str]]:
         helpers = self.test_root / "helpers"
         shutil.copytree(
@@ -105,7 +173,7 @@ class IncrementalCacheTests(unittest.TestCase):
     def test_helper_source_upgrades_invalidate_real_scanner_cache(self) -> None:
         helpers, run_env = self._copy_helpers()
         sources = {
-            "unsafe.py": "value = eval(input())\n",
+            "unsafe.py": "value = eval(input())\n",  # ubs:ignore[python.taint.eval] -- literal positive scanner fixture, never executed
             "handles.py": "fh = open('/tmp/cache-test.txt')\nfh.write('test')\n",
             "clean.py": "def add(x, y):\n    return x + y\n",
         }
@@ -219,6 +287,124 @@ class IncrementalCacheTests(unittest.TestCase):
         stderr, context = assert_replay(0, "explicitly disabled cache with unreadable helper")
         self.assertNotIn("cannot fingerprint helper sources:", stderr, context)
         self.assertEqual(cache_contents(), before_cache, context)
+
+    def test_report_cache_is_bound_to_file_and_reporting_context(self) -> None:
+        helpers, run_env = self._copy_helpers()
+        first = self.project_dir / "first.py"
+        second = self.project_dir / "second.py"
+        sibling = self.project_dir / "nested" / "first.py"
+        sibling.parent.mkdir()
+        body = "value = eval(input())\n"  # ubs:ignore[python.taint.eval] -- literal positive scanner fixture
+        for source in (first, second, sibling):
+            source.write_text(body, encoding="utf-8")
+        other_project = self.test_root / "other-project"
+        other_project.mkdir()
+        other = other_project / "first.py"
+        other.write_text(body, encoding="utf-8")
+        sink = self.test_root / "context.ndjson"
+        summary = self.test_root / "context.json"
+
+        def scan(source: Path, project: Path, cwd: Path, expected_hits: int) -> bytes:
+            proc = subprocess.run(
+                [sys.executable, "-m", "ubs_core.py_scan", "--sink", str(sink),
+                 "--json-out", str(summary), "--project-dir", str(project)],
+                input=str(source), capture_output=True, text=True, cwd=cwd,
+                env=run_env, timeout=180,
+            )
+            context = f"{source} cwd={cwd}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            self.assertEqual(proc.returncode, 1, context)
+            doc = self._decode_json(summary.read_text(encoding="utf-8"), context)
+            self.assertEqual(doc["status"], "ok", context)
+            self.assertEqual(doc["files"], 1, context)
+            self.assertEqual(doc["profile"]["cache_hits"], expected_hits, context)
+            self.assertEqual(doc["profile"]["cache_misses"], 1 - expected_hits, context)
+            data = sink.read_bytes()
+            records = [self._decode_json(line, context) for line in data.decode().splitlines()]
+            self.assertIn("py.security.eval-exec-usage", {record["rule"] for record in records}, context)
+            self.assertTrue(records, context)
+            for record in records:
+                path = Path(record["path"])
+                self.assertEqual(path.name, source.name, context)
+                if path.is_absolute():
+                    self.assertEqual(path, source, context)
+            return data
+
+        for source, project, cwd in (
+            (first, self.project_dir, helpers),
+            (second, self.project_dir, helpers),
+            (sibling, self.project_dir, helpers),
+            (other, other_project, helpers),
+            (first, self.project_dir, self.project_dir),
+        ):
+            with self.subTest(source=source, cwd=cwd):
+                cold = scan(source, project, cwd, 0)
+                self.assertEqual(scan(source, project, cwd, 1), cold)
+
+    def test_same_basename_findings_stay_with_their_source(self) -> None:
+        helpers, run_env = self._copy_helpers()
+        first = self.project_dir / "same.py"
+        nested = self.project_dir / self.project_dir.name / "same.py"
+        nested.parent.mkdir()
+        # The lifecycle analyzer keeps a cwd-relative path; the taint analyzer
+        # supplies its complete source path. Both must identify the same file.
+        hazard = "stream = open('local.txt')\nvalue = eval(input())\n"  # ubs:ignore[python.taint.eval] -- literal positive scanner fixture
+        clean = "answer = 42\n"
+        sink = self.test_root / "basename.ndjson"
+        summary = self.test_root / "basename.json"
+
+        def scan(paths: list[Path], cwd: Path, hits: int, owner: Path | None,
+                 eval_count: int = 1) -> list[dict]:
+            proc = subprocess.run(
+                [sys.executable, "-m", "ubs_core.py_scan", "--sink", str(sink),
+                 "--json-out", str(summary), "--project-dir", str(self.project_dir)],
+                input="\0".join(str(path) for path in paths),
+                capture_output=True, text=True, cwd=cwd, env=run_env, timeout=180,
+            )
+            context = f"{paths} cwd={cwd}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            self.assertEqual(proc.returncode, int(owner is not None), context)
+            doc = self._decode_json(summary.read_text(encoding="utf-8"), context)
+            records = [self._decode_json(line, context)
+                       for line in sink.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(doc["status"], "ok", context)
+            self.assertEqual(doc["files"], len(paths), context)
+            self.assertEqual(doc["profile"]["cache_hits"], hits, context)
+            self.assertEqual(doc["profile"]["cache_misses"], len(paths) - hits, context)
+            if owner is None:
+                self.assertEqual(records, [], context)
+                self.assertEqual(doc["critical"], 0, context)
+            else:
+                self.assertTrue(records, context)
+                for record in records:
+                    self.assertEqual((cwd / record["path"]).resolve(), owner, context)
+                self.assertEqual(sum(record["rule"] == "python.taint.eval"
+                                     for record in records), eval_count, context)
+                self.assertEqual(sum(record["rule"] == "python.lifecycle.file_handle"
+                                     for record in records), 1, context)
+            for severity in ("critical", "warning", "info"):
+                self.assertEqual(doc[severity], sum(record["severity"] == severity
+                                                   for record in records), context)
+            return records
+
+        for cwd, relative_inputs in (
+            (self.project_dir, False), (self.project_dir.parent, True), (helpers, True),
+        ):
+            with self.subTest(cwd=cwd):
+                first_input = Path(os.path.relpath(first, cwd)) if relative_inputs else first
+                nested_input = Path(os.path.relpath(nested, cwd)) if relative_inputs else nested
+                inputs = [first_input, nested_input]
+                first.write_text(hazard, encoding="utf-8")
+                nested.write_text(clean, encoding="utf-8")
+                cold = scan(inputs, cwd, 0, first)
+                self.assertEqual(scan(inputs, cwd, 2, first), cold)
+                scan([nested_input], cwd, 1, None)
+                self.assertEqual(scan([first_input], cwd, 1, first), cold)
+                first.write_text(hazard + "again = eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] -- literal positive scanner fixture
+                scan(inputs, cwd, 1, first, eval_count=2)
+                first.write_text(clean, encoding="utf-8")
+                nested.write_text(hazard, encoding="utf-8")
+                switched = scan(inputs, cwd, 0, nested)
+                self.assertEqual(scan(inputs, cwd, 2, nested), switched)
+                scan([first_input], cwd, 1, None)
 
     def test_helper_identity_applies_to_explicit_keys_for_all_languages(self) -> None:
         helpers, run_env = self._copy_helpers()
@@ -345,6 +531,7 @@ class IncrementalCacheTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 cwd=str(HELPERS_DIR),
                 env=run_env,
+                timeout=180,
             )
             self.assertEqual(proc1.returncode, 1, f"Cold scan failed: {proc1.stderr.decode()}")
             sink1_content = sink1.read_bytes()
@@ -368,6 +555,7 @@ class IncrementalCacheTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 cwd=str(HELPERS_DIR),
                 env=run_env,
+                timeout=180,
             )
             self.assertEqual(proc2.returncode, 1, f"Cached scan failed: {proc2.stderr.decode()}")
             sink2_content = sink2.read_bytes()
@@ -381,8 +569,8 @@ class IncrementalCacheTests(unittest.TestCase):
             )
 
             # Assert summary JSON findings and counts match
-            doc1 = json.loads(summary1_content)
-            doc2 = json.loads(summary2_content)
+            doc1 = self._decode_json(summary1_content, f"cold stdout={proc1.stdout!r}; stderr={proc1.stderr!r}")
+            doc2 = self._decode_json(summary2_content, f"warm stdout={proc2.stdout!r}; stderr={proc2.stderr!r}")
             self.assertEqual(doc1["critical"], doc2["critical"])
             self.assertEqual(doc1["warning"], doc2["warning"])
             self.assertEqual(doc1["info"], doc2["info"])
@@ -450,6 +638,7 @@ class IncrementalCacheTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 cwd=str(HELPERS_DIR),
                 env=dict(os.environ),
+                timeout=180,
             )
             cold_elapsed = time.perf_counter() - t0
             self.assertEqual(proc1.returncode, 1)
@@ -471,22 +660,25 @@ class IncrementalCacheTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 cwd=str(HELPERS_DIR),
                 env=dict(os.environ),
+                timeout=180,
             )
             cached_elapsed = time.perf_counter() - t1
             self.assertEqual(proc2.returncode, 1)
 
             speedup = cold_elapsed / max(cached_elapsed, 0.001)
+            # Retain the actual failed sample too; an older passing artifact
+            # must not survive and appear to describe this invocation.
+            record_artifact(case_id, {
+                "cold_elapsed_s": cold_elapsed,
+                "cached_elapsed_s": cached_elapsed,
+                "speedup_x": speedup,
+                "passed": speedup >= 5.0,
+            })
             self.assertGreaterEqual(
                 speedup,
                 5.0,
                 f"Second run was not >= 5x faster (cold: {cold_elapsed:.4f}s, cached: {cached_elapsed:.4f}s, speedup: {speedup:.2f}x)",
             )
-
-            record_artifact(case_id, {
-                "cold_elapsed_s": cold_elapsed,
-                "cached_elapsed_s": cached_elapsed,
-                "speedup_x": speedup,
-            })
 
         self._run_with_logging(case_id, _test)
 
@@ -612,7 +804,7 @@ class IncrementalCacheTests(unittest.TestCase):
             for p in self.cache_dir.rglob("*.json"):
                 if p.name.startswith(".tmp"):
                     continue
-                data = json.loads(p.read_text(encoding="utf-8"))
+                data = self._decode_json(p.read_text(encoding="utf-8"), f"concurrent cache entry {p}")
                 self.assertIsInstance(data, dict)
 
             record_artifact(case_id, {
@@ -707,9 +899,10 @@ class IncrementalCacheTests(unittest.TestCase):
                 text=True,
                 cwd=str(REPO_ROOT),
                 env=env,
+                timeout=180,
             )
             self.assertEqual(proc1.returncode, 0, f"Cold scan failed: {proc1.stderr}")
-            data1 = json.loads(proc1.stdout)
+            data1 = self._decode_json(proc1.stdout, f"cold stderr={proc1.stderr}")
             prof1 = data1.get("profile") or {}
             self.assertEqual(prof1.get("cache_hits"), 0)
             self.assertEqual(prof1.get("cache_misses"), 2)
@@ -722,9 +915,10 @@ class IncrementalCacheTests(unittest.TestCase):
                 text=True,
                 cwd=str(REPO_ROOT),
                 env=env,
+                timeout=180,
             )
             self.assertEqual(proc2.returncode, 0, f"Cached scan failed: {proc2.stderr}")
-            data2 = json.loads(proc2.stdout)
+            data2 = self._decode_json(proc2.stdout, f"warm stderr={proc2.stderr}")
             prof2 = data2.get("profile") or {}
             extras_prof2 = data2.get("extras", {}).get("profile", {})
             self.assertEqual(prof2.get("cache_hits"), 2)
@@ -739,6 +933,7 @@ class IncrementalCacheTests(unittest.TestCase):
                 text=True,
                 cwd=str(REPO_ROOT),
                 env=env,
+                timeout=180,
             )
             self.assertEqual(proc3.returncode, 0)
             self.assertIn("; cache 100% hits (2/2)", proc3.stdout)
@@ -750,9 +945,10 @@ class IncrementalCacheTests(unittest.TestCase):
                 text=True,
                 cwd=str(REPO_ROOT),
                 env=env,
+                timeout=180,
             )
             self.assertEqual(proc4.returncode, 0)
-            data4 = json.loads(proc4.stdout)
+            data4 = self._decode_json(proc4.stdout, f"cache disabled stderr={proc4.stderr}")
             prof4 = data4.get("profile") or {}
             self.assertEqual(prof4.get("cache_hits", 0), 0)
 
@@ -763,6 +959,7 @@ class IncrementalCacheTests(unittest.TestCase):
                 text=True,
                 cwd=str(REPO_ROOT),
                 env=env,
+                timeout=180,
             )
             self.assertEqual(proc5.returncode, 0)
             self.assertIn("Pruned", proc5.stdout)

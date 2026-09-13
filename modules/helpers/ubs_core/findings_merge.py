@@ -17,6 +17,8 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 
 SCANNER_SUMMARY_KEYS = {"language", "project", "files", "critical", "warning", "info", "timestamp", "status", "version"}
@@ -66,7 +68,11 @@ def _relative_path(path: str, project_dir: str | Path = "") -> str:
         return p_str
 
 
-def _extract_statement(rec: dict, project_dir: str | Path = "") -> str:
+def _extract_statement(
+    rec: dict,
+    project_dir: str | Path,
+    source_lines: Callable[[Path], list[str]],
+) -> str:
     path = str(rec.get("path", ""))
     try:
         line_no = int(rec.get("line", 0) or 0)
@@ -78,7 +84,7 @@ def _extract_statement(rec: dict, project_dir: str | Path = "") -> str:
             p = Path(project_dir, path)
         if p.is_file():
             try:
-                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+                lines = source_lines(p)
                 if 1 <= line_no <= len(lines):
                     return lines[line_no - 1]
             except OSError:
@@ -89,6 +95,22 @@ def _extract_statement(rec: dict, project_dir: str | Path = "") -> str:
 def _fingerprint(rule: str, rel_path: str, normalized_stmt: str, ordinal: int) -> str:
     src = f"{rule}\x1f{rel_path}\x1f{normalized_stmt}\x1f{ordinal}"
     return hashlib.sha256(src.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _ast_report_sources(doc: dict) -> list[tuple[str, list[dict]]]:
+    """Locate report-only AST evidence without adding it to counter findings."""
+    reports: list[tuple[str, list[dict]]] = []
+    for source in [doc, *(doc.get("scanners", []) or [])]:
+        if not isinstance(source, dict):
+            continue
+        extras = source.get("extras", {})
+        if not isinstance(extras, dict) or "ast_findings" not in extras:
+            continue
+        records = extras["ast_findings"]
+        if not isinstance(records, list) or any(not isinstance(r, dict) for r in records):
+            raise ValueError("extras.ast_findings must be an array of finding objects")
+        reports.append((str(source.get("language") or doc.get("language") or "unknown"), records))
+    return reports
 
 
 def load_baseline_fingerprints(baseline_path: str | Path) -> set[str]:
@@ -103,7 +125,10 @@ def load_baseline_fingerprints(baseline_path: str | Path) -> set[str]:
     except Exception:
         return fps
     if isinstance(data, dict):
-        for item in data.get("findings", []):
+        items = list(data.get("findings", []))
+        for _, records in _ast_report_sources(data):
+            items.extend(records)
+        for item in items:
             if isinstance(item, dict) and item.get("fingerprint"):
                 fps.add(str(item["fingerprint"]))
     elif isinstance(data, list):
@@ -143,7 +168,13 @@ def load_sink(sink: Path) -> list[dict]:
     return records
 
 
-def _normalize(rec: dict, lang: str, project_dir: str | Path = "", ordinals: dict | None = None) -> dict:
+def _normalize(
+    rec: dict,
+    lang: str,
+    source_lines: Callable[[Path], list[str]],
+    project_dir: str | Path = "",
+    ordinals: dict | None = None,
+) -> dict:
     rule = str(rec.get("rule", ""))
     path = str(rec.get("path", ""))
     try:
@@ -155,7 +186,7 @@ def _normalize(rec: dict, lang: str, project_dir: str | Path = "", ordinals: dic
     except (TypeError, ValueError):
         col = 1
     rel_path = _relative_path(path, project_dir)
-    stmt = _extract_statement(rec, project_dir)
+    stmt = _extract_statement(rec, project_dir, source_lines)
     norm_stmt = normalize_statement(stmt)
     key = (rule, norm_stmt)
     ordinal = 0
@@ -203,6 +234,13 @@ def merge(
     if not isinstance(doc, dict):
         raise ValueError("combined summary is not a JSON object")
 
+    # A monolith may contribute thousands of findings. Decode and split it
+    # once, rather than once per finding. Keep only eight recent source files,
+    # and discard the cache after this merge so the next run sees edits.
+    @lru_cache(maxsize=8)
+    def source_lines(path: Path) -> list[str]:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+
     ordinals: dict[str, dict[tuple[str, str], int]] = {}
     findings: list[dict] = []
     for sink in sorted(Path(tmp_dir).glob("*.findings.json")):
@@ -211,15 +249,29 @@ def merge(
         if not records:
             continue
         for rec in records:
-            findings.append(_normalize(rec, lang, project_dir=project_dir, ordinals=ordinals))
+            findings.append(_normalize(rec, lang, source_lines, project_dir=project_dir, ordinals=ordinals))
         for scanner in doc.get("scanners", []) or []:
             if isinstance(scanner, dict) and scanner.get("language") == lang:
                 scanner["findings_sink"] = True
+
+    ast_reports = _ast_report_sources(doc)
+    for lang, records in ast_reports:
+        normalized = []
+        for record in records:
+            if "rule_id" in record and "file" in record:
+                normalized.append(record)
+            elif _looks_like_finding(record):
+                normalized.append(_normalize(record, lang, source_lines, project_dir=project_dir, ordinals=ordinals))
+            else:
+                raise ValueError("AST report finding requires a rule id and source path")
+        records[:] = normalized
 
     if baseline_path and new_only:
         base_fps = load_baseline_fingerprints(baseline_path)
         if base_fps:
             findings = [f for f in findings if f["fingerprint"] not in base_fps]
+            for _, records in ast_reports:
+                records[:] = [f for f in records if f["fingerprint"] not in base_fps]
         # Recompute scanner and total counts to reflect new-only findings
         findings_by_lang: dict[str, list[dict]] = {}
         for f in findings:
@@ -250,7 +302,7 @@ def merge(
         # zero-new-findings result with a non-empty failed_modules[] used to be
         # relabelled "ok", contradicting the same document's own evidence.
 
-    if findings or (baseline_path and new_only):
+    if findings or ast_reports or (baseline_path and new_only):
         doc["findings"] = findings
         combined_path.write_text(json.dumps(doc), encoding="utf-8")
     return len(findings)
@@ -273,6 +325,8 @@ def to_sarif(
     version = str(doc.get("version", "5.3.13"))
     scanners = doc.get("scanners", []) or []
     findings = doc.get("findings", []) or []
+    ast_reports = _ast_report_sources(doc)
+    ast_languages = {lang for lang, _ in ast_reports}
 
     # Map findings by language
     findings_by_lang: dict[str, list[dict]] = {}
@@ -300,6 +354,8 @@ def to_sarif(
     runs: list[dict] = []
     for lang in languages:
         driver_name = f"ubs-{lang}" if lang != "ubs" else "ubs"
+        if lang in ast_languages:
+            driver_name += "-heuristics"
         run: dict = {
             "tool": {
                 "driver": {
@@ -380,6 +436,20 @@ def to_sarif(
 
         runs.append(run)
 
+    for lang, records in ast_reports:
+        # Reuse the normal location/severity/provenance conversion. This leaf
+        # document has no extras or scanners, so conversion stops after one
+        # level and never counts report-only records in the JSON summary.
+        pack = to_sarif(
+            {"language": lang, "version": version, "findings": records},
+            git_blob_base=git_blob_base, git_top=git_top,
+            git_remote=git_remote, git_commit=git_commit,
+            sarif_automation_id=sarif_automation_id,
+        )
+        for run in pack["runs"]:
+            run["tool"]["driver"]["name"] = f"ubs-{lang}-ast"
+        runs.extend(pack["runs"])
+
     # Invocations for incomplete runs / failed modules. `exitCode` is part of
     # the failed-invocation identity, not decoration: consumers use it to tell
     # an environment failure (2) apart from a findings result, and dropping it
@@ -413,4 +483,3 @@ def to_sarif(
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "runs": runs,
     }
-

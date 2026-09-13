@@ -6,6 +6,8 @@ import io
 import json
 import os
 import subprocess  # nosec B404 - unit tests intentionally exercise subprocess paths.
+import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -207,11 +209,50 @@ class RuntimeArtifactTest(unittest.TestCase):
 
 
 class RuleInventoryCoverageInvariantTest(unittest.TestCase):
+    def test_mixed_reports_require_both_raw_and_public_rule_coverage(self) -> None:
+        for label in ("js-rule-pack", "swift-rule-pack", "elixir-rule-pack"):
+            with self.subTest(label=label):
+                corpus = [{"label": label, "result_rule_ids": ["pack.rule", "heuristic.rule"]}]
+                inventory = {"label": label, "rules": [{"id": "pack.rule"}]}
+                with self.assertRaisesRegex(AssertionError, "actual generated-config corpus evidence"):
+                    rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+                inventory["generated_corpus_check"] = {"result_rule_ids": ["pack.rule"]}
+                coverage = rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+                rule_quality_harness.assert_rule_inventory_fully_covered(coverage)
+                self.assertEqual(coverage[0]["covered_generated_rule_ids"], ["pack.rule"])
+                for raw_ids in ([], ["pack.rule", "orphan.rule"]):
+                    inventory["generated_corpus_check"] = {"result_rule_ids": raw_ids}
+                    coverage = rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+                    with self.assertRaisesRegex(AssertionError, "generated ast-grep rules"):
+                        rule_quality_harness.assert_rule_inventory_fully_covered(coverage)
+                inventory["generated_corpus_check"] = {"result_rule_ids": ["pack.rule"]}
+                corpus[0]["result_rule_ids"] = ["heuristic.rule"]
+                with self.assertRaisesRegex(AssertionError, "public report omits generated rules"):
+                    rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+
+    def test_rust_coverage_requires_raw_generated_evidence(self) -> None:
+        corpus = [{"label": "rust-rule-pack", "result_rule_ids": ["rust.ownership.unwrap-expect"]}]
+        inventory = {"label": "rust-rule-pack", "rules": [{"id": "rust.ast.expect"}]}
+        with self.assertRaisesRegex(AssertionError, "actual generated-config corpus evidence"):
+            rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+
+        inventory["generated_corpus_check"] = {"result_rule_ids": ["rust.ast.expect"]}
+        coverage = rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+        rule_quality_harness.assert_rule_inventory_fully_covered(coverage)
+        self.assertEqual(coverage[0]["covered_generated_rule_ids"], ["rust.ast.expect"])
+
+        for raw_ids in ([], ["rust.ast.expect", "rust.ast.orphan"]):
+            with self.subTest(raw_ids=raw_ids):
+                inventory["generated_corpus_check"] = {"result_rule_ids": raw_ids}
+                coverage = rule_quality_harness.build_rule_inventory_coverage(corpus, [inventory])
+                with self.assertRaisesRegex(AssertionError, "generated ast-grep rules"):
+                    rule_quality_harness.assert_rule_inventory_fully_covered(coverage)
+
     def test_builds_inventory_coverage_from_corpus_and_dumped_rules(self) -> None:
         coverage = rule_quality_harness.build_rule_inventory_coverage(
             [
                 {
-                    "label": "js-rule-pack",
+                    "label": "test-rule-pack",
                     "result_rule_ids": [
                         "js.corpus-only",
                         "js.eval-call",
@@ -221,7 +262,7 @@ class RuleInventoryCoverageInvariantTest(unittest.TestCase):
             ],
             [
                 {
-                    "label": "js-rule-pack",
+                    "label": "test-rule-pack",
                     "rules": [
                         {"id": "js.dump-only"},
                         {"id": "js.eval-call"},
@@ -235,7 +276,7 @@ class RuleInventoryCoverageInvariantTest(unittest.TestCase):
             coverage,
             [
                 {
-                    "label": "js-rule-pack",
+                    "label": "test-rule-pack",
                     "corpus_result_rule_ids_without_generated_rule": ["js.corpus-only"],
                     "covered_generated_rule_count": 2,
                     "covered_generated_rule_ids": ["js.eval-call", "js.innerHTML-assign"],
@@ -283,6 +324,377 @@ class RuleInventoryCoverageInvariantTest(unittest.TestCase):
 
 
 class AstGrepRulePackHelperTest(unittest.TestCase):
+    def test_elixir_dump_keeps_a_runnable_config_and_reports_copy_errors(self) -> None:
+        spec = next(spec for spec in rule_quality_harness.AST_GREP_SARIF_CHECKS
+                    if spec["label"] == "elixir-rule-pack")
+        fixture = rule_quality_harness.REPO_ROOT / spec["fixture"]
+        module = rule_quality_harness.REPO_ROOT / "modules/ubs-elixir.sh"
+        with tempfile.TemporaryDirectory(prefix="ubs-elixir-export-") as temp_dir:
+            root = Path(temp_dir)
+            custom = root / "operator's custom rules"
+            custom.mkdir()
+            for metadata_only in (True, False):
+                with self.subTest(metadata_only=metadata_only):
+                    exported = root / ("listed rules" if metadata_only else "scanned rules")
+                    args = ["bash", str(module), f"--rules={custom}",
+                            f"--dump-rules={exported}", "--no-mix"]
+                    args += ["--list-rules"] if metadata_only else ["--format=json", str(fixture)]
+                    result = subprocess.run(args, cwd=root, text=True, capture_output=True,
+                                            timeout=60, check=False)
+                    context = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, 0 if metadata_only else 1, context)
+                    config = exported / "sgconfig-elixir.yml"
+                    self.assertTrue(config.is_file(), context)
+                    self.assertEqual(len(list((exported / "rules").glob("*.yml"))), 26, context)
+                    scan = subprocess.run(
+                        [*rule_quality_harness.ast_grep_command(), "scan", "--config",
+                         str(config), str(fixture), "--json=stream"],
+                        cwd=root, text=True, capture_output=True, timeout=30, check=False,
+                    )
+                    self.assertIn(scan.returncode, (0, 1), scan.stdout + scan.stderr)
+                    self.assertTrue(rule_quality_harness.is_ast_grep_diagnostic_stderr(scan.stderr),
+                                    scan.stderr)
+                    ids = rule_quality_harness.ast_grep_json_stream_rule_ids(scan.stdout, "elixir-export")
+                    self.assertEqual(set(ids), set(spec["expected_rule_ids"]))
+                    if metadata_only:
+                        self.assertEqual(result.stdout.splitlines(), sorted(set(ids)))
+
+                    blocked = root / ("blocked-list" if metadata_only else "blocked-scan")
+                    blocked.write_text("existing destination", encoding="utf-8")
+                    args[3] = f"--dump-rules={blocked}"
+                    refused = subprocess.run(args, cwd=root, text=True, capture_output=True,
+                                             timeout=60, check=False)
+                    self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                    self.assertIn("Could not export Elixir rule pack", refused.stderr)
+                    self.assertEqual(blocked.read_text(encoding="utf-8"), "existing destination")
+
+    def test_go_goroutine_error_rule_uses_the_invoked_function_scope(self) -> None:
+        from ubs_core.go_ast import scan_config
+        from ubs_core.go_rules import generate
+
+        rule_id = "go.async.goroutine-err-no-check"
+        cases = {
+            "discarded": ('go func(u string) { resp, _ := http.Get(u); use(resp) }(url)', True),
+            "unchecked": ('go func() { err := work(); use(err) }()', True),
+            "two_values": ('go func(a, b string) { value, err := work(a, b); use(value, err) }(x, y)', True),
+            "handled": ('go func() { value, err := work(); if err != nil { return }; use(value) }()', False),
+            "nested_worker": ('go func() { callback := func() { err := work(); use(err) }; use(callback) }()', False),
+            "nested_handler": ('go func() { err := work(); callback := func() { if err != nil { return } }; use(callback) }()', True),
+            "outside_handler": ('if err != nil { return }; go func() { err := work(); use(err) }()', True),
+            "synchronous": ('func() { err := work(); use(err) }()', False),
+            "map_lookup": ('go func() { value, _ := values[key]; use(value) }()', False),
+            "lookalikes": ('text := `go func() { err := work() }()`; use(text) // go func() { err := work() }()', False),
+        }
+        with tempfile.TemporaryDirectory(prefix="ubs-go-async-rule-") as temp_dir:
+            root = Path(temp_dir)
+            generate(root / "rules")
+            for name, (body, expected) in cases.items():
+                with self.subTest(name=name):
+                    source = root / f"{name}.go"
+                    source.write_text(f"package main\nfunc example() {{ {body}\n}}\n", encoding="utf-8")
+                    sink = io.StringIO()
+                    counts, matches = scan_config(
+                        root / "rules/sgconfig-go-async.yml", [source], {}, sink,
+                    )
+                    self.assertEqual(counts.get(rule_id, 0), int(expected), matches)
+                    try:
+                        records = [json.loads(line) for line in sink.getvalue().splitlines()]
+                    except json.JSONDecodeError as exc:
+                        self.fail(f"Invalid Go async rule NDJSON: {exc}; output={sink.getvalue()!r}")
+                    self.assertEqual(len(records), int(expected), records)
+                    if expected:
+                        self.assertEqual(records[0]["rule"], rule_id)
+                        self.assertEqual(records[0]["severity"], "warning")
+                        self.assertEqual(records[0]["line"], 2)
+
+    def test_go_ast_reports_survive_cache_hits_without_changing_counters(self) -> None:
+        expected = {
+            "go.os-remove-no-error-check", "go.content-type-prefix-match",
+            "go.sort-slice-mutates", "go.fmt-errorf-no-wrap",
+            "go.json-decode-no-limit", "go.exec-pgrep-unanchored", "go.tls-insecure-skip",
+        }
+        with tempfile.TemporaryDirectory(prefix="ubs-go-reports-") as temp_dir:
+            root = Path(temp_dir)
+            fixture = root / "report.go"
+            fixture.write_text(
+                'package main\nfunc hazards() {\n'
+                ' os.Remove("temporary")\n'
+                ' strings.HasPrefix(contentType, "application/json")\n'
+                ' sort.Slice(items, less)\n'
+                ' fmt.Errorf("context: %v", err)\n'
+                ' json.NewDecoder(body).Decode(&value)\n'
+                ' exec.Command("pgrep", pattern)\n'
+                ' transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}\n}\n',
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update({"UBS_NO_CACHE": "0", "UBS_CACHE_DIR": str(root / "cache"),
+                        "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_PROFILE": "1", "NO_COLOR": "1"})
+
+            def scan(*args: str, target: Path = fixture, meta: bool = False) -> tuple[subprocess.CompletedProcess[str], dict]:
+                command = [str(rule_quality_harness.REPO_ROOT / "ubs"), "--only=golang", "--no-auto-update"] if meta else [str(rule_quality_harness.REPO_ROOT / "modules/ubs-golang.sh")]
+                proc = subprocess.run(
+                    [*command, *args, str(target)], cwd=rule_quality_harness.REPO_ROOT,
+                    env=env, capture_output=True, text=True, timeout=180, check=False,
+                )
+                self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+                try:
+                    payload = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"Go report is not JSON: {exc}; stdout={proc.stdout!r}; stderr={proc.stderr!r}")
+                return proc, payload
+
+            cold_proc, cold = scan("--format=json")
+            self.assertEqual(cold["profile"]["cache_misses"], 1)
+            self.assertEqual(cold["profile"]["cache_hits"], 0)
+            cold_ast = cold["extras"]["ast_findings"]
+            ast_ids = {record["rule"] for record in cold_ast}
+            self.assertTrue(expected.issubset(ast_ids), sorted(ast_ids))
+            self.assertFalse(any(record.get("_report_only") for record in cold["findings"]))
+            self.assertFalse(any(record["rule"] in expected - {"go.tls-insecure-skip"} for record in cold["findings"]))
+            warm_proc, warm = scan("--format=json")
+            self.assertEqual(warm_proc.returncode, cold_proc.returncode)
+            self.assertEqual(warm["profile"]["cache_hits"], 1)
+            self.assertEqual(warm["profile"]["cache_misses"], 0)
+            self.assertEqual(warm["extras"]["ast_findings"], cold_ast)
+            self.assertEqual(warm["findings"], cold["findings"])
+            counters = {key: cold[key] for key in ("critical", "warning", "info")}
+            self.assertEqual({key: warm[key] for key in counters}, counters)
+            for meta in (False, True):
+                with self.subTest(meta=meta):
+                    sarif_proc, sarif = scan("--format=sarif", meta=meta)
+                    self.assertEqual(sarif_proc.returncode, cold_proc.returncode)
+                    rule_quality_harness.validate_sarif_payload_shape(sarif, "Go cached AST report")
+                    pack_runs = [run for run in sarif["runs"] if run["tool"]["driver"]["name"] == "ubs-golang-ast"]
+                    self.assertEqual(len(pack_runs), 1)
+                    self.assertEqual({result["ruleId"] for result in pack_runs[0]["results"]}, ast_ids)
+            _, skipped = scan("--format=json", "--skip=16")
+            self.assertEqual(skipped["extras"]["ast_findings"], [])
+            clean = root / "lookalikes.go"
+            clean.write_text('package main\n// os.Remove("temporary")\nvar text = `strings.HasPrefix(contentType, "application/json")`\n', encoding="utf-8")
+            _, negative = scan("--format=json", target=clean)
+            self.assertEqual(negative["extras"]["ast_findings"], [])
+
+    def test_ruby_ast_reports_survive_cache_hits_without_changing_counters(self) -> None:
+        spec = next(s for s in rule_quality_harness.AST_GREP_SARIF_CHECKS if s["label"] == "ruby-rule-pack")
+        module = rule_quality_harness.REPO_ROOT / "modules" / spec["module"]
+        fixture = rule_quality_harness.REPO_ROOT / spec["fixture"]
+        with tempfile.TemporaryDirectory(prefix="ubs-ruby-reports-") as temp_dir:
+            root = Path(temp_dir)
+            env = os.environ.copy()
+            env.update({"UBS_NO_CACHE": "0", "UBS_CACHE_DIR": str(root / "cache"),
+                        "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_PROFILE": "1", "NO_COLOR": "1"})
+
+            def scan(*args: str, target: Path = fixture, meta: bool = False) -> tuple[subprocess.CompletedProcess[str], dict]:
+                command = [str(rule_quality_harness.REPO_ROOT / "ubs"), "--only=ruby", "--no-auto-update"] if meta else [str(module)]
+                proc = subprocess.run(
+                    [*command, *args, str(target)], cwd=rule_quality_harness.REPO_ROOT,
+                    env=env, capture_output=True, text=True, timeout=180, check=False,
+                )
+                self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+                try:
+                    payload = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"Ruby report is not JSON: {exc}; stdout={proc.stdout!r}; stderr={proc.stderr!r}")
+                return proc, payload
+
+            cold_proc, cold = scan("--format=json")
+            self.assertEqual(cold["profile"]["cache_misses"], 1)
+            self.assertEqual(cold["profile"]["cache_hits"], 0)
+            cold_ast = cold["extras"]["ast_findings"]
+            ast_ids = {record["rule"] for record in cold_ast}
+            self.assertTrue(set(spec["expected_rule_ids"]).issubset(ast_ids), sorted(ast_ids))
+            warm_proc, warm = scan("--format=json")
+            self.assertEqual(warm_proc.returncode, cold_proc.returncode)
+            self.assertEqual(warm["profile"]["cache_hits"], 1)
+            self.assertEqual(warm["profile"]["cache_misses"], 0)
+            self.assertEqual(warm["extras"]["ast_findings"], cold_ast)
+            self.assertEqual(warm["findings"], cold["findings"])
+            counters = {key: cold[key] for key in ("critical", "warning", "info")}
+            self.assertEqual({key: warm[key] for key in counters}, counters)
+
+            for meta in (False, True):
+                with self.subTest(meta=meta):
+                    sarif_proc, sarif = scan("--format=sarif", meta=meta)
+                    self.assertEqual(sarif_proc.returncode, cold_proc.returncode)
+                    rule_quality_harness.validate_sarif_payload_shape(sarif, "Ruby cached AST report")
+                    pack_runs = [run for run in sarif["runs"] if run["tool"]["driver"]["name"] == "ubs-ruby-ast"]
+                    self.assertEqual(len(pack_runs), 1)
+                    self.assertEqual({result["ruleId"] for result in pack_runs[0]["results"]}, ast_ids)
+
+            skipped_proc, skipped = scan("--format=json", "--skip=18")
+            self.assertEqual(skipped_proc.returncode, cold_proc.returncode)
+            self.assertEqual({key: skipped[key] for key in counters}, counters)
+            self.assertTrue(all(r["rule"] == "ruby.async.thread-no-rescue" for r in skipped["extras"]["ast_findings"]))
+            clean = root / "lookalikes.rb"
+            clean.write_text('# value.equal?(true)\ntext = "value == nil"\n', encoding="utf-8")
+            _, negative = scan("--format=json", target=clean)
+            self.assertEqual(negative["extras"]["ast_findings"], [])
+
+    def test_java_ast_reports_survive_cache_hits_without_changing_counters(self) -> None:
+        from ubs_core.java_rules import SEVERITY_MAP
+
+        spec = next(s for s in rule_quality_harness.AST_GREP_SARIF_CHECKS if s["label"] == "java-rule-pack")
+        fixture = rule_quality_harness.REPO_ROOT / spec["fixture"]
+        with tempfile.TemporaryDirectory(prefix="ubs-java-reports-") as temp_dir:
+            root = Path(temp_dir)
+            env = os.environ.copy()
+            env.update({"UBS_NO_CACHE": "0", "UBS_CACHE_DIR": str(root / "cache"),
+                        "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_PROFILE": "1", "NO_COLOR": "1"})
+
+            def scan(*args: str, target: Path = fixture, meta: bool = False) -> tuple[subprocess.CompletedProcess[str], dict]:
+                command = [str(rule_quality_harness.REPO_ROOT / "ubs"), "--only=java", "--no-auto-update"] if meta else [str(rule_quality_harness.REPO_ROOT / "modules" / spec["module"]), "--no-build"]
+                proc = subprocess.run(
+                    [*command, *args, str(target)], cwd=rule_quality_harness.REPO_ROOT,
+                    env=env, capture_output=True, text=True, timeout=180, check=False,
+                )
+                self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+                try:
+                    payload = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"Java report is not JSON: {exc}; stdout={proc.stdout!r}; stderr={proc.stderr!r}")
+                return proc, payload
+
+            cold_proc, cold = scan("--format=json")
+            self.assertEqual(cold["profile"]["cache_misses"], 1)
+            self.assertEqual(cold["profile"]["cache_hits"], 0)
+            cold_ast = cold["extras"]["ast_findings"]
+            ast_ids = {record["rule"] for record in cold_ast}
+            self.assertTrue(set(spec["expected_rule_ids"]).issubset(ast_ids), sorted(ast_ids))
+            warm_proc, warm = scan("--format=json")
+            self.assertEqual(warm_proc.returncode, cold_proc.returncode)
+            self.assertEqual(warm["profile"]["cache_hits"], 1)
+            self.assertEqual(warm["profile"]["cache_misses"], 0)
+            self.assertEqual(warm["extras"]["ast_findings"], cold_ast)
+            self.assertEqual(warm["findings"], cold["findings"])
+            counters = {key: cold[key] for key in ("critical", "warning", "info")}
+            self.assertEqual({key: warm[key] for key in counters}, counters)
+            for meta in (False, True):
+                with self.subTest(meta=meta):
+                    sarif_proc, sarif = scan("--format=sarif", meta=meta)
+                    self.assertEqual(sarif_proc.returncode, cold_proc.returncode)
+                    rule_quality_harness.validate_sarif_payload_shape(sarif, "Java cached AST report")
+                    pack_runs = [run for run in sarif["runs"] if run["tool"]["driver"]["name"] == "ubs-java-ast"]
+                    self.assertEqual(len(pack_runs), 1)
+                    self.assertEqual({result["ruleId"] for result in pack_runs[0]["results"]}, ast_ids)
+
+            skipped_proc, skipped = scan("--format=json", "--skip=15")
+            self.assertEqual(skipped_proc.returncode, cold_proc.returncode)
+            self.assertEqual({key: skipped[key] for key in counters}, counters)
+            self.assertTrue(all(r["rule"] in SEVERITY_MAP for r in skipped["extras"]["ast_findings"]))
+            clean = root / "Lookalikes.java"
+            clean.write_text('class Lookalikes { String text = "System.out.println(value)"; }\n', encoding="utf-8")
+            _, negative = scan("--format=json", target=clean)
+            self.assertEqual(negative["extras"]["ast_findings"], [])
+
+    def test_ruby_thread_rule_and_invalid_configuration_are_observable(self) -> None:
+        from ubs_core.ruby_ast import scan_config
+        from ubs_core.ruby_rules import generate
+
+        with tempfile.TemporaryDirectory(prefix="ubs-ruby-thread-") as temp_dir:
+            root = Path(temp_dir)
+            rules = root / "rules"
+            generate(rules)
+            fixture = root / "threads.rb"
+            fixture.write_text(
+                "Thread.new { work }\n"
+                "Thread.new(1, 2) do |a, b|\n  work(a, b)\nend\n"
+                "Thread.new do\n  begin\n    work\n  rescue StandardError\n    warn 'failed'\n  end\nend\n"
+                "Pool.new { work }\n"
+                "# Thread.new { work }\n"
+                "text = 'Thread.new { work }'\n",
+                encoding="utf-8",
+            )
+            sink = io.StringIO()
+            counts = scan_config(
+                rules / "sgconfig-ruby.yml", [fixture], sink,
+                counted_rules={"ruby.async.thread-no-rescue"},
+            )
+            try:
+                records = [json.loads(line) for line in sink.getvalue().splitlines()]
+            except json.JSONDecodeError as exc:
+                self.fail(f"Ruby scanner emitted invalid findings: {exc}")
+            thread_records = [r for r in records if r["rule"] == "ruby.async.thread-no-rescue"]
+            self.assertEqual([r["line"] for r in thread_records], [1, 2])
+            self.assertEqual(counts, {"critical": 0, "warning": 2, "info": 0})
+
+            observed_cases = (
+                ("direct-join", "Thread.new { work }.join\n", 0),
+                ("named-value", "worker = Thread.new { work }\nworker.value\n", 0),
+                ("named-unjoined", "worker = Thread.new { work }\nother.join\n", 1),
+                ("reassigned", "worker = Thread.new { work }\nworker = other\nworker.join\n", 1),
+                ("array-join", "workers << Thread.new { work }\nworkers.each(&:join)\n", 0),
+                ("loop-join", "10.times do\n  workers << Thread.new { work }\nend\nworkers.each(&:join)\n", 0),
+                ("loop-unjoined", "10.times do\n  workers << Thread.new { work }\nend\nother.each(&:join)\n", 1),
+            )
+            for name, source, warnings in observed_cases:
+                with self.subTest(name=name):
+                    case_path = root / f"{name}.rb"
+                    case_path.write_text(source, encoding="utf-8")
+                    actual = scan_config(
+                        rules / "sgconfig-ruby.yml", [case_path], io.StringIO(),
+                        counted_rules={"ruby.async.thread-no-rescue"},
+                    )
+                    self.assertEqual(actual, {"critical": 0, "warning": warnings, "info": 0})
+
+            invalid = root / "invalid.yml"
+            invalid.write_text(
+                "id: invalid-thread-rule\nlanguage: ruby\nrule:\n  contains:\n    kind: rescue\n",
+                encoding="utf-8",
+            )
+            config = root / "sgconfig.yml"
+            config.write_text("ruleDirs:\n  - invalid.yml\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Ruby AST scan failed.*exit 8"):
+                scan_config(config, [fixture], io.StringIO())
+            with self.assertRaisesRegex(RuntimeError, "configuration is missing"):
+                scan_config(root / "absent.yml", [fixture], io.StringIO())
+
+    def test_repaired_rust_rules_match_syntax_without_comment_or_string_lookalikes(self) -> None:
+        repaired = {
+            "assert", "assert_eq", "assert_ne", "await_in_for", "http_url", "md5", "sha1",
+            "std_guard_await_expect", "std_guard_await_unwrap", "std_lock_async_lock",
+            "std_lock_async_read", "std_lock_async_write", "tokio_guard_lock",
+            "tokio_guard_read", "tokio_guard_write",
+        }
+        expected = {f"rust.ast.{slug}" for slug in repaired}
+        fixture = rule_quality_harness.REPO_ROOT / "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subprocess.run(
+                [sys.executable, str(rule_quality_harness.REPO_ROOT / "modules/helpers/ubs_core/rust_rules.py"),
+                 str(root / "rules")],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            clean = root / "lookalikes.rs"
+            clean.write_text(
+                'fn ordinary(lock: Mutex<i32>) {\n'
+                '    lock.lock();\n'
+                '    let _ = "assert!(false); md5::compute(bytes); sha1::digest(bytes)";\n'
+                '    let _ = "https://example.invalid";\n'
+                '    let _ = "prefix http://example.invalid";\n'
+                '    // "http://example.invalid"\n'
+                '    // async fn f() { let g = lock.lock().unwrap(); work().await; }\n'
+                '}\n'
+                'async fn await_before_guard(lock: Mutex<i32>) {\n'
+                '    work().await;\n'
+                '    let guard = lock.lock().unwrap();\n'
+                '}\n'
+                'async fn nested_sync() {\n'
+                '    fn ordinary(lock: Mutex<i32>) { lock.lock(); }\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            for path, required in ((fixture, expected), (clean, set())):
+                proc = subprocess.run(
+                    [*rule_quality_harness.ast_grep_command(), "scan", "--config",
+                     str(root / "rules/sgconfig-rust.yml"), str(path), "--json=stream"],
+                    capture_output=True, text=True, timeout=30, check=False,
+                )
+                self.assertIn(proc.returncode, (0, 1), proc.stderr)
+                self.assertTrue(rule_quality_harness.is_ast_grep_diagnostic_stderr(proc.stderr), proc.stderr)
+                hits = set(rule_quality_harness.ast_grep_json_stream_rule_ids(proc.stdout, str(path)))
+                self.assertEqual(hits & expected, required)
+
     def test_ast_grep_rule_pack_specs_include_swift_dumpable_rules(self) -> None:
         specs = {
             spec["label"]: spec
@@ -291,9 +703,9 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
 
         self.assertIn("swift-rule-pack", specs)
         self.assertEqual(specs["swift-rule-pack"]["module"], "ubs-swift.sh")
-        self.assertEqual(
+        self.assertIn(
+            "swift.urlsession.task-no-resume",
             specs["swift-rule-pack"]["expected_rule_ids"],
-            ("swift.urlsession.task-no-resume",),
         )
 
     def test_ast_grep_rule_pack_specs_include_ruby_dumpable_rules(self) -> None:
@@ -340,15 +752,13 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
         self.assertIn("csharp-rule-pack", specs)
         self.assertEqual(specs["csharp-rule-pack"]["module"], "ubs-csharp.sh")
         self.assertIn("--no-dotnet", specs["csharp-rule-pack"]["args"])
-        self.assertEqual(
-            specs["csharp-rule-pack"]["expected_rule_ids"],
-            (
-                "cs-async-discarded-startnew",
-                "cs-async-discarded-task-run",
-                "cs-await-in-lock",
-                "cs-parallel-foreach-async-lambda",
-            ),
-        )
+        for rule_id in (
+            "cs-async-discarded-startnew",
+            "cs-async-discarded-task-run",
+            "cs-await-in-lock",
+            "cs-parallel-foreach-async-lambda",
+        ):
+            self.assertIn(rule_id, specs["csharp-rule-pack"]["expected_rule_ids"])
 
     def test_parses_machine_readable_list_rule_ids(self) -> None:
         rule_ids = rule_quality_harness.parse_list_rule_ids(
@@ -391,19 +801,64 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
             )
 
     def test_counts_ast_grep_json_stream_objects(self) -> None:
-        count = rule_quality_harness.count_json_stream_objects(
+        rule_ids = rule_quality_harness.ast_grep_json_stream_rule_ids(
             '{"ruleId":"go.exec-sh-c"}\n\n{"ruleId":"rust.unwrap-call"}\n',
             "fixture",
         )
 
-        self.assertEqual(count, 2)
+        self.assertEqual(rule_ids, ["go.exec-sh-c", "rust.unwrap-call"])
 
     def test_rejects_invalid_ast_grep_json_stream_output(self) -> None:
         with self.assertRaisesRegex(AssertionError, "emitted invalid JSON stream output"):
-            rule_quality_harness.count_json_stream_objects(
+            rule_quality_harness.ast_grep_json_stream_rule_ids(
                 '{"ruleId":"ts.non-null-assertion-chain"}\nnot json\n',
                 "fixture",
             )
+
+    def test_rejects_non_object_or_missing_id_ast_stream_records(self) -> None:
+        for record in (None, [], "rust.ast.expect", {}, {"ruleId": " "}, {"ruleId": 2}):
+            with self.subTest(record=record):
+                with self.assertRaisesRegex(AssertionError, "non-empty ruleId"):
+                    rule_quality_harness.ast_grep_json_stream_rule_ids(json.dumps(record), "fixture")
+
+    def test_generated_config_is_distinct_from_rules_but_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rule_path = root / "expect.yml"
+            rule_path.write_text("id: rust.ast.expect\nlanguage: rust\n", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "missing generated ast-grep config"):
+                rule_quality_harness.generated_rule_paths(root, "sgconfig-rust.yml")
+            (root / "sgconfig-rust.yml").write_text("ruleDirs:\n  - ./expect.yml\n", encoding="utf-8")
+            self.assertEqual(
+                rule_quality_harness.generated_rule_paths(root, "sgconfig-rust.yml"), [rule_path]
+            )
+            malformed = root / "malformed.yaml"
+            malformed.write_text("language: rust\n", encoding="utf-8")
+            paths = rule_quality_harness.generated_rule_paths(root, "sgconfig-rust.yml")
+            self.assertIn(malformed, paths, "only the explicitly declared config is excluded")
+            with self.assertRaisesRegex(AssertionError, "missing 'id'"):
+                for path in paths:
+                    rule_quality_harness.read_yaml_scalar(path.read_text(encoding="utf-8"), "id")
+
+    def test_nested_rule_inventory_requires_declared_configs_and_keeps_invalid_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            nested = root / "rules"
+            nested.mkdir()
+            rule = nested / "thread.yml"
+            rule.write_text("id: ruby.async.thread-no-rescue\nlanguage: ruby\n", encoding="utf-8")
+            configs = ("sgconfig-ruby.yml", "sgbase-ruby.yml")
+            (root / configs[0]).write_text("ruleDirs:\n  - rules\n", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "sgbase-ruby.yml"):
+                rule_quality_harness.generated_rule_paths(root, None, configs)
+            (root / configs[1]).write_text("ruleDirs:\n  - rules\n", encoding="utf-8")
+            self.assertEqual(rule_quality_harness.generated_rule_paths(root, None, configs), [rule])
+            invalid = nested / "sgconfig-unexpected.yml"
+            invalid.write_text("language: ruby\n", encoding="utf-8")
+            paths = rule_quality_harness.generated_rule_paths(root, None, configs)
+            self.assertIn(invalid, paths)
+            with self.assertRaisesRegex(AssertionError, "missing 'id'"):
+                rule_quality_harness.read_yaml_scalar(invalid.read_text(encoding="utf-8"), "id")
 
     def test_accepts_only_expected_ast_grep_diagnostic_stderr(self) -> None:
         self.assertTrue(rule_quality_harness.is_ast_grep_diagnostic_stderr(""))
@@ -418,6 +873,49 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
 
 
 class SarifShapeTest(unittest.TestCase):
+    def test_grouped_sarif_requires_the_exact_source_site_and_level(self) -> None:
+        spec = next(
+            spec for spec in rule_quality_harness.AST_GREP_SARIF_CHECKS
+            if spec["label"] == "rust-rule-pack"
+        )
+        fixture = rule_quality_harness.REPO_ROOT / spec["fixture"]
+        lines = fixture.read_text(encoding="utf-8").splitlines()
+        payload = {"runs": [{"results": []}]}
+        for rule_id, anchor, offset, level in spec["expected_sites"]:
+            line = next(i + 1 for i, text in enumerate(lines) if anchor in text) + offset
+            payload["runs"][0]["results"].append({
+                "ruleId": rule_id, "level": level,
+                "locations": [{"physicalLocation": {
+                    "artifactLocation": {"uri": fixture.as_uri()},
+                    "region": {"startLine": line},
+                }}],
+            })
+        sites = rule_quality_harness.validate_sarif_expected_sites(payload, spec, "fixture")
+        self.assertEqual(len(sites), 4)
+        # Corpus mode must still check the original file, not try reading a directory.
+        self.assertEqual(
+            rule_quality_harness.validate_sarif_expected_sites(
+                payload, rule_quality_harness.corpus_sarif_spec(spec), "corpus"
+            ), sites,
+        )
+        unchecked = payload["runs"][0]["results"][1]
+        location = unchecked["locations"][0]["physicalLocation"]
+        actual_line = location["region"]["startLine"]
+        other_site = next(i + 1 for i, text in enumerate(lines) if "std::hint::unreachable_unchecked()" in text)
+        location["region"]["startLine"] = other_site
+        with self.assertRaisesRegex(AssertionError, "missing error rust.panic.unchecked-ub"):
+            rule_quality_harness.validate_sarif_expected_sites(payload, spec, "fixture")
+        location["region"]["startLine"] = actual_line
+        location["artifactLocation"]["uri"] = "different.rs"
+        with self.assertRaisesRegex(AssertionError, "missing error rust.panic.unchecked-ub"):
+            rule_quality_harness.validate_sarif_expected_sites(payload, spec, "fixture")
+        location["artifactLocation"]["uri"] = spec["fixture"]
+        unchecked["level"] = "note"
+        with self.assertRaisesRegex(AssertionError, "missing error rust.panic.unchecked-ub"):
+            rule_quality_harness.validate_sarif_expected_sites(payload, spec, "fixture")
+        unchecked["level"] = "error"
+        self.assertEqual(rule_quality_harness.validate_sarif_expected_sites(payload, spec, "fixture"), sites)
+
     @staticmethod
     def valid_payload() -> dict[str, Any]:
         return {
@@ -1184,4 +1682,3 @@ class DetectorsRegistryAuditTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

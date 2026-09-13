@@ -23,6 +23,7 @@ def run_ubs(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess
         text=True,
         env=merged_env,
         check=False,
+        timeout=180,
     )
 
 
@@ -101,6 +102,7 @@ def check_rust_cargo_phases(tmpdir: Path) -> None:
             text=True,
             env=merged,
             check=False,
+            timeout=180,
         )
         calls = log.read_text() if log.exists() else ""
         return result, calls
@@ -185,7 +187,13 @@ def check_no_supported_languages(tmpdir: Path) -> None:
     res = run_ubs([str(dart_dir), "--format=json"], env)
     assert res.returncode == 3, res.stdout + res.stderr
     assert res.stdout.strip(), "json no-langs result must not be empty stdout"
-    payload = json.loads(res.stdout)
+    try:
+        payload = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"Unsupported-language JSON response is invalid: {exc}\n"
+            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+        ) from exc
     assert payload["result"] == "no-supported-languages", payload
     assert payload["exit_code"] == 3, payload
     assert payload["detected_languages"] == [], payload
@@ -195,7 +203,13 @@ def check_no_supported_languages(tmpdir: Path) -> None:
     # SARIF: valid log whose invocation carries the no-supported-languages marker.
     res = run_ubs([str(dart_dir), "--format=sarif"], env)
     assert res.returncode == 3, res.stdout + res.stderr
-    sarif = json.loads(res.stdout)
+    try:
+        sarif = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"Unsupported-language SARIF response is invalid JSON: {exc}\n"
+            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+        ) from exc
     inv = sarif["runs"][0]["invocations"][0]
     assert inv["properties"]["result"] == "no-supported-languages", sarif
     assert inv["exitCode"] == 3, sarif
@@ -211,7 +225,13 @@ def check_no_supported_languages(tmpdir: Path) -> None:
     legacy_env = dict(env, UBS_ALLOW_NO_SCAN="1")
     res = run_ubs([str(dart_dir), "--format=json"], legacy_env)
     assert res.returncode == 0, res.stdout + res.stderr
-    payload = json.loads(res.stdout)
+    try:
+        payload = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"Legacy unsupported-language JSON response is invalid: {exc}\n"
+            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+        ) from exc
     assert payload["result"] == "no-supported-languages", payload
     assert payload["exit_code"] == 0, payload
 
@@ -237,19 +257,21 @@ def check_version_identity(tmpdir: Path) -> None:
         "-C",
         str(foreign),
     ]
-    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True)
+    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True, timeout=30)
     (foreign / "README.md").write_text("unrelated project\n")
-    subprocess.run([*git_base, "add", "README.md"], check=True, capture_output=True)
+    subprocess.run([*git_base, "add", "README.md"], check=True, capture_output=True, timeout=30)
     subprocess.run(
         [*git_base, "commit", "--quiet", "-m", "unrelated commit"],
         check=True,
         capture_output=True,
+        timeout=30,
     )
     foreign_sha = subprocess.run(
         [*git_base, "rev-parse", "--short", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     ).stdout.strip()
     assert foreign_sha, "could not create a foreign commit to test against"
 
@@ -265,6 +287,7 @@ def check_version_identity(tmpdir: Path) -> None:
             text=True,
             env={**os.environ, **env},
             check=False,
+            timeout=30,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         outputs[label] = result.stdout.strip()
@@ -302,10 +325,10 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
         "-C",
         str(repo),
     ]
-    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True)
+    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True, timeout=30)
     mount_unit = repo / "var-tmp-ai\\x2dmachine.mount"
     mount_unit.write_text("[Mount]\nWhere=/var/tmp/ai-machine\n")
-    subprocess.run([*git_base, "add", "-A"], check=True, capture_output=True)
+    subprocess.run([*git_base, "add", "-A"], check=True, capture_output=True, timeout=30)
 
     def run_staged() -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -315,6 +338,7 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
             text=True,
             env={**os.environ, **env},
             check=False,
+            timeout=180,
         )
 
     # (a) Backslash-named staged file: the C-quoted git record used to poison
@@ -324,19 +348,31 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
     assert "Failed to prepare shadow workspace" not in output, output
     assert "Scanning shadow workspace" in output, output
 
-    # (b) Planted-negative: an unreadable staged file forces a genuine rsync
-    # failure. The run must fail loudly with rsync's real diagnostic instead
-    # of only the generic context line.
+    def require_copy_failure(result: subprocess.CompletedProcess[str]) -> None:
+        output = result.stdout + result.stderr
+        assert result.returncode != 0, output
+        assert "Failed to prepare shadow workspace" in output, output
+        assert "rsync exited with status" in output, output
+        assert "rsync:" in output, output
+
+    # (b) A staged path missing from the worktree forces a real rsync failure
+    # even when the suite runs as root (which can read chmod(0) files).
+    # Preserve the fixture under another name and restore it after the run.
+    parked_unit = repo / "parked-mount-unit"
+    mount_unit.rename(parked_unit)
+    try:
+        require_copy_failure(run_staged())
+    finally:
+        parked_unit.rename(mount_unit)
+
+    # Also retain the permission-error case wherever the OS enforces it for
+    # this user. The missing-path negative above is required on every host.
     mount_unit.chmod(0)
     try:
-        res = run_staged()
+        if not os.access(mount_unit, os.R_OK):
+            require_copy_failure(run_staged())
     finally:
         mount_unit.chmod(0o644)
-    output = res.stdout + res.stderr
-    assert res.returncode != 0, output
-    assert "Failed to prepare shadow workspace" in output, output
-    assert "rsync exited with status" in output, output
-    assert "rsync:" in output, output
 
 
 def check_self_update_dev_checkout_guard(tmpdir: Path) -> None:
@@ -376,16 +412,16 @@ def check_self_update_dev_checkout_guard(tmpdir: Path) -> None:
     repo = root / "repo"
     repo.mkdir()
     subprocess.run([*git_base, "-C", str(repo), "init", "--quiet", "-b", "main"],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, timeout=30)
     shutil.copy2(UBS_BIN, repo / "ubs")
     shutil.copy2(REPO_ROOT / "VERSION", repo / "VERSION")
     subprocess.run([*git_base, "-C", str(repo), "add", "ubs", "VERSION"],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, timeout=30)
     subprocess.run([*git_base, "-C", str(repo), "commit", "--quiet", "-m", "fixture"],
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, timeout=30)
     worktree = root / "worktree"
     subprocess.run([*git_base, "-C", str(repo), "worktree", "add", "--quiet",
-                    "--detach", str(worktree)], check=True, capture_output=True)
+                    "--detach", str(worktree)], check=True, capture_output=True, timeout=30)
     assert (worktree / ".git").is_file(), "fixture: linked worktree must have a .git FILE"
     assert not (worktree / ".git").is_dir(), "fixture: linked worktree .git must not be a dir"
 
@@ -416,6 +452,7 @@ def check_self_update_dev_checkout_guard(tmpdir: Path) -> None:
         return subprocess.run(
             ["bash", str(path), "--update", *extra_args],
             cwd=root, capture_output=True, text=True, env=env, check=False,
+            timeout=180,
         )
 
     try:
@@ -489,6 +526,7 @@ def main() -> None:
             text=True,
             env={**os.environ, "NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0"},
             check=False,
+            timeout=180,
         )
         # Function order is the failure mode being guarded against;
         # a non-zero exit from a downstream module is allowed (we don't

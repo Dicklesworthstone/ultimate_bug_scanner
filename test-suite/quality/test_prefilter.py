@@ -12,6 +12,7 @@ Verifies:
 from __future__ import annotations
 
 import importlib  # ubs:ignore[py.deprecations.deprecated-api]
+import json
 import os
 import re
 import sys
@@ -99,6 +100,89 @@ class RuleLiteralExtractionTests(unittest.TestCase):
         """Every rule listed in ALLOWED_EMPTY_RULES must be a recognized language."""
         for lang in ALLOWED_EMPTY_RULES:
             self.assertIn(lang, self.PACK_LANGUAGES)
+
+
+    def test_generated_rust_async_rules_require_async(self) -> None:
+        from ubs_core.rust_rules import generate
+
+        slugs = (
+            "std_lock_async_lock", "std_lock_async_read", "std_lock_async_write",
+            "std_guard_await_unwrap", "std_guard_await_expect",
+            "tokio_guard_lock", "tokio_guard_read", "tokio_guard_write",
+        )
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            manifest = generate(root)
+            for slug in slugs:
+                with self.subTest(slug=slug):
+                    rule_id = f"rust.ast.{slug}"
+                    text = (root / f"{slug}.yml").read_text(encoding="utf-8")
+                    self.assertEqual(
+                        extract_ast_rule_literals(rule_id, text, lang="rust"),
+                        {"async"},
+                    )
+                    self.assertEqual(
+                        extract_ast_rule_literals(rule_id, manifest[rule_id], lang="rust"),
+                        {"async"},
+                    )
+
+    def test_structured_positive_relations_extract_required_literals(self) -> None:
+        for relation in ("has", "inside", "precedes", "follows"):
+            rule = {relation: {"regex": r"\basync\b", "stopBy": {"regex": "unrequired_stop"}}}
+            for text in (
+                rule,
+                json.dumps({"rule": rule}),
+                f"id: test.rule\nrule: {json.dumps(rule)}\n",
+            ):
+                with self.subTest(relation=relation, text=text):
+                    self.assertEqual(extract_ast_rule_literals("test.rule", text), {"async"})
+
+    def test_unquoted_yaml_flow_mapping_keeps_existing_extraction(self) -> None:
+        for text in (
+            "rule: { pattern: 'console.log($X)' }\n",
+            "{ pattern: 'console.log($X)' }\n",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("console.log", extract_ast_rule_literals("test.rule", text))
+
+    def test_structured_negative_context_and_unknown_regexes_fall_back(self) -> None:
+        rules = (
+            {"not": {"regex": "negative_only"}},
+            {"stopBy": {"regex": "stop_only"}},
+            {"has": {"kind": "identifier", "stopBy": {"regex": "stop_only"}}},
+            {"pattern": {"context": "fn synthetic_context() { $X }", "selector": "identifier"}},
+            {"regex": "async|sync"},
+            {"regex": "async?"},
+            {"regex": "(?:async)?"},
+            {"regex": "(?i)async"},
+            {"regex": "[async]"},
+        )
+        for rule in rules:
+            for text in (rule, f"rule: {json.dumps(rule)}\n"):
+                with self.subTest(text=text):
+                    self.assertEqual(extract_ast_rule_literals("test.rule", text), set())
+        self.assertEqual(extract_ast_rule_literals("test.rule", 'rule: {"regex":'), set())
+
+    def test_structured_any_needs_literals_in_every_branch(self) -> None:
+        for unknown in (
+            {"kind": "identifier"},
+            {"not": {"regex": "negative_only"}},
+            {"pattern": {"context": "fn scaffold() { $X }", "selector": "identifier"}},
+        ):
+            rule = {"any": [{"regex": r"\basync\b"}, unknown]}
+            with self.subTest(unknown=unknown):
+                self.assertEqual(extract_ast_rule_literals("test.rule", rule), set())
+        rule = {"any": [{"regex": r"\basync\b"}, {"has": {"regex": "spawn"}}]}
+        self.assertEqual(extract_ast_rule_literals("test.rule", rule), {"async", "spawn"})
+
+    def test_structured_all_retains_a_required_literal(self) -> None:
+        rule = {"all": [
+            {"inside": {"has": {"regex": r"\basync\b"}}},
+            {"any": [{"regex": "optional_word"}, {"kind": "identifier"}]},
+            {"not": {"regex": "negative_only"}},
+            {"pattern": {"context": "fn scaffold() { $X }", "selector": "identifier"}},
+        ]}
+        self.assertEqual(extract_ast_rule_literals("test.rule", rule), {"async"})
 
 
 class PatternLiteralExtractionTests(unittest.TestCase):

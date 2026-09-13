@@ -189,3 +189,173 @@ fn container_type_hazards() {
     let _shared: Option<Arc<Mutex<Vec<String>>>> = None;
     let _local: Option<Rc<RefCell<Vec<String>>>> = None;
 }
+
+// Additional concrete spellings for the consolidated counter-rule pack.
+// Keep these examples after the original fixture so its SARIF sites stay stable.
+fn shell_command_spelling_hazards(user_command: &str) {
+    use std::process::Command;
+
+    let _ = Command::new("sh").arg("-c").arg(user_command);
+    let _ = std::process::Command::new("sh").arg("-lc").arg(user_command);
+    let _ = Command::new("sh").arg("-lc").arg(user_command);
+    let _ = std::process::Command::new("cmd.exe").arg("/C").arg(user_command);
+    let _ = Command::new("cmd.exe").arg("/C").arg(user_command);
+    let _ = std::process::Command::new("cmd.exe").arg("/c").arg(user_command);
+    let _ = Command::new("cmd.exe").arg("/c").arg(user_command);
+
+    let _ = Command::new("sh").args(["-c", user_command]);
+    let _ = std::process::Command::new("sh").args(["-lc", user_command]);
+    let _ = Command::new("sh").args(["-lc", user_command]);
+    let _ = std::process::Command::new("cmd.exe").args(["/C", user_command]);
+    let _ = Command::new("cmd.exe").args(["/C", user_command]);
+    let _ = std::process::Command::new("cmd.exe").args(["/c", user_command]);
+    let _ = Command::new("cmd.exe").args(["/c", user_command]);
+
+    let _ = std::process::Command::new("sh").args(&["-c", user_command]);
+    let _ = Command::new("sh").args(&["-c", user_command]);
+    let _ = std::process::Command::new("sh").args(&["-lc", user_command]);
+    let _ = Command::new("sh").args(&["-lc", user_command]);
+    let _ = std::process::Command::new("cmd.exe").args(&["/C", user_command]);
+    let _ = Command::new("cmd.exe").args(&["/C", user_command]);
+    let _ = std::process::Command::new("cmd.exe").args(&["/c", user_command]);
+    let _ = Command::new("cmd.exe").args(&["/c", user_command]);
+}
+
+fn unsafe_memory_spelling_hazards(bytes: &[u8], pointer: *mut u8) {
+    use std::mem::{transmute, zeroed};
+    use std::slice;
+
+    unsafe {
+        let _: usize = mem::transmute(pointer);
+        let _: usize = transmute(pointer);
+        let _ = mem::uninitialized::<String>();
+        let _ = mem::zeroed::<String>();
+        let _: String = std::mem::zeroed();
+        let _: String = mem::zeroed();
+        let _: String = zeroed();
+        let _ = std::ffi::CStr::from_bytes_with_nul_unchecked(bytes);
+        let _ = std::str::from_utf8_unchecked(bytes);
+        let _ = std::string::String::from_utf8_unchecked(bytes.to_vec());
+        let _ = slice::from_raw_parts(pointer, bytes.len());
+        let _ = slice::from_raw_parts_mut(pointer, bytes.len());
+        core::hint::unreachable_unchecked();
+    }
+    std::mem::forget(bytes.to_vec());
+}
+
+async fn std_mutex_lock_spelling_hazards(lock: &Mutex<i32>) {
+    let _before = 0;
+    lock.lock();
+    let _guard = lock.lock().unwrap();
+    async_work().await;
+    let _after = 1;
+}
+
+async fn std_mutex_expect_spelling_hazards(lock: &Mutex<i32>) {
+    let _before = 0;
+    let _guard = lock.lock().expect("mutex acquisition");
+    async_work().await;
+    let _after = 1;
+}
+
+async fn std_rwlock_read_spelling_hazards(lock: &RwLock<i32>) {
+    let _before = 0;
+    lock.read();
+    async_work().await;
+    let _after = 1;
+}
+
+async fn std_rwlock_write_spelling_hazards(lock: &RwLock<i32>) {
+    let _before = 0;
+    lock.write();
+    async_work().await;
+    let _after = 1;
+}
+
+async fn tokio_mutex_lock_spelling_hazards(lock: &tokio::sync::Mutex<i32>) {
+    let _before = 0;
+    let _guard = lock.lock().await;
+    async_work().await;
+    let _after = 1;
+}
+
+async fn tokio_rwlock_read_spelling_hazards(lock: &tokio::sync::RwLock<i32>) {
+    let _before = 0;
+    let _guard = lock.read().await;
+    async_work().await;
+    let _after = 1;
+}
+
+async fn tokio_rwlock_write_spelling_hazards(lock: &tokio::sync::RwLock<i32>) {
+    let _before = 0;
+    let _guard = lock.write().await;
+    async_work().await;
+    let _after = 1;
+}
+
+fn cast_and_conversion_spelling_hazards(value: u64, values: &[u64]) {
+    let _ = value as u8;
+    let _ = value as u16;
+    let _ = value as u32;
+    let _ = value as u64;
+    let _ = value as usize;
+    let _ = value as i8;
+    let _ = value as i16;
+    let _ = value as i32;
+    let _ = value as i64;
+    let _ = value as isize;
+    let _ = value as f32;
+    let _ = value as f64;
+
+    let _ = values.len() as u8;
+    let _ = values.len() as u16;
+    let _ = values.len() as u32;
+    let _ = values.len() as i8;
+    let _ = values.len() as i16;
+    let _ = values.len() as i32;
+    let _ = values.iter().count() as u8;
+    let _ = values.iter().count() as u16;
+    let _ = values.iter().count() as u32;
+    let _ = values.iter().count() as i8;
+    let _ = values.iter().count() as i16;
+    let _ = values.iter().count() as i32;
+
+    let _: [u64; 4] = values.try_into().expect("four elements");
+    let _ = values[0];
+}
+
+fn parse_and_serde_spelling_hazards(text: &str, bytes: &[u8], value: serde_json::Value) {
+    let _: u64 = text.parse().unwrap();
+    let _: u64 = text.parse().expect("unsigned integer");
+    let _: serde_json::Value = serde_json::from_str(text).unwrap();
+    let _: serde_json::Value = serde_json::from_str(text).expect("JSON document");
+    let _: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let _: serde_json::Value = serde_json::from_slice(bytes).expect("JSON bytes");
+    let _: serde_json::Value = serde_json::from_value(value.clone()).unwrap();
+    let _: serde_json::Value = serde_json::from_value(value).expect("JSON value");
+    let _: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+    let _: serde_yaml::Value = serde_yaml::from_str(text).expect("YAML document");
+    let _: toml::Value = toml::from_str(text).unwrap();
+    let _: toml::Value = toml::from_str(text).expect("TOML document");
+}
+
+fn environment_spelling_hazards() {
+    use std::env;
+
+    let _ = std::env::var("UBS_FIXTURE_VALUE").unwrap();
+    let _ = std::env::var("UBS_FIXTURE_VALUE").expect("configured value");
+    let _ = env::var("UBS_FIXTURE_VALUE").unwrap();
+    let _ = env::var("UBS_FIXTURE_VALUE").expect("configured value");
+    let _ = std::env::var_os("UBS_FIXTURE_VALUE").unwrap();
+    let _ = std::env::var_os("UBS_FIXTURE_VALUE").expect("configured value");
+    let _ = env::var_os("UBS_FIXTURE_VALUE").unwrap();
+    let _ = env::var_os("UBS_FIXTURE_VALUE").expect("configured value");
+}
+
+fn regex_hash_and_iterator_spelling_hazards(bytes: &[u8], text: &str) {
+    use regex::Regex;
+
+    let _ = Regex::new(text);
+    let _ = text.chars().nth_back(1);
+    let _ = sha1::digest(bytes);
+}

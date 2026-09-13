@@ -20,6 +20,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TEST_ROOT = REPO_ROOT / "test-suite"
@@ -264,13 +265,19 @@ def is_case_clean(case: dict[str, Any]) -> bool:
 def load_detectors_yaml(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8").strip()
     if text.startswith("{") and text.endswith("}"):
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"invalid detector JSON in {path}: {exc}") from exc
     try:
         import yaml
         with path.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     except ImportError:
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"{path} requires valid JSON or the YAML parser: {exc}") from exc
 
 
 def audit_detectors_registry(manifest: dict[str, Any]) -> None:
@@ -1041,6 +1048,9 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-js.sh",
         "args": ("--format=sarif",),
         "dump_args": ("--dump-rules={rules_dir}",),
+        "dump_configs": ("sgconfig-javascript.yml", "sgconfig-typescript.yml", "sgconfig-tsx.yml",
+                         "sgbase-javascript.yml", "sgbase-typescript.yml", "sgbase-tsx.yml"),
+        "generated_configs": ("sgconfig-javascript.yml", "sgconfig-typescript.yml", "sgconfig-tsx.yml"),
         "list_args": ("--list-rules",),
         "fixture": "test-suite/js/buggy/security.js",
         "corpus_fixture": "test-suite/js",
@@ -1051,6 +1061,7 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-golang.sh",
         "args": ("--format=sarif",),
         "dump_args": ("--dump-rules={rules_dir}",),
+        "dump_configs": ("sgconfig-go.yml", "sgconfig-go-async.yml"),
         "list_args": ("--list-rules",),
         "fixture": "test-suite/golang/buggy/security_sql.go",
         "corpus_fixture": "test-suite/golang",
@@ -1095,17 +1106,34 @@ AST_GREP_SARIF_CHECKS = (
         "label": "rust-rule-pack",
         "module": "ubs-rust.sh",
         "args": ("--no-cargo", "--format=sarif"),
-        "dump_args": ("--no-cargo", "--dump-rules={rules_dir}"),
+        "dump_args": ("--no-cargo", "--dump-rules={rules_dir}", "--list-rules"),
         "list_args": ("--no-cargo", "--list-rules"),
+        "generated_config": "sgconfig-rust.yml",
         "fixture": "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs",
         "corpus_fixture": "test-suite/rust",
-        "expected_rule_ids": ("rust.unwrap-call", "rust.unwrap-unchecked"),
+        "expected_rule_ids": (
+            "rust.ownership.unwrap-expect",
+            "rust.panic.unchecked-ub",
+            "rust.unsafe-memory.unsafe-blocks",
+            "rust.casts.as-casts",
+        ),
+        # Public v2 SARIF groups several AST patterns under one rule ID.
+        # Require the actual source sites, including the three run-mode
+        # patterns that intentionally do not belong to the generated config.
+        "expected_sites": (
+            ("rust.ownership.unwrap-expect", "let _ = self.value.take().unwrap();", 0, "warning"),
+            ("rust.panic.unchecked-ub", "let _ = Some(1).unwrap_unchecked();", 0, "error"),
+            ("rust.unsafe-memory.unsafe-blocks", "fn unsafe_memory_hazards(", 1, "note"),
+            ("rust.casts.as-casts", "let _ = 1_u64.wrapping_add(values.len() as u64);", 0, "note"),
+        ),
     },
     {
         "label": "swift-rule-pack",
         "module": "ubs-swift.sh",
         "args": ("--format=sarif",),
         "dump_args": ("--dump-rules={rules_dir}",),
+        "dump_configs": ("sgconfig-swift.yml",),
+        "generated_config": "sgconfig-swift.yml",
         "list_args": ("--list-rules",),
         "fixture": "test-suite/swift/ast_grep_rule_pack_coverage.swift",
         "corpus_fixture": "test-suite/swift",
@@ -1139,6 +1167,7 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-ruby.sh",
         "args": ("--format=sarif",),
         "dump_args": ("--dump-rules={rules_dir}",),
+        "dump_configs": ("sgconfig-ruby.yml",),
         "list_args": ("--list-rules",),
         "fixture": "test-suite/ruby/ast_grep_rule_pack_coverage.rb",
         "corpus_fixture": "test-suite/ruby",
@@ -1178,6 +1207,7 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-java.sh",
         "args": ("--format=sarif", "--no-build"),
         "dump_args": ("--dump-rules={rules_dir}", "--no-build"),
+        "dump_configs": ("sgconfig-java.yml", "sgbase-java.yml"),
         "list_args": ("--list-rules",),
         "fixture": "test-suite/java/ast_grep_rule_pack_coverage.java",
         "corpus_fixture": "test-suite/java",
@@ -1223,6 +1253,8 @@ AST_GREP_SARIF_CHECKS = (
         "module": "ubs-elixir.sh",
         "args": ("--format=sarif", "--no-mix"),
         "dump_args": ("--dump-rules={rules_dir}", "--no-mix"),
+        "dump_configs": ("sgconfig-elixir.yml",),
+        "generated_config": "sgconfig-elixir.yml",
         "list_args": ("--list-rules",),
         "fixture": "test-suite/elixir/ast_grep_rule_pack_coverage.ex",
         "corpus_fixture": "test-suite/elixir",
@@ -1299,17 +1331,19 @@ def ast_grep_command() -> list[str]:
     raise AssertionError("ast-grep CLI is required for per-rule validation")
 
 
-def count_json_stream_objects(stdout: str, label: str) -> int:
-    count = 0
+def ast_grep_json_stream_rule_ids(stdout: str, label: str) -> list[str]:
+    rule_ids: list[str] = []
     for line in stdout.splitlines():
         if not line.strip():
             continue
         try:
-            JSON_DECODER.decode(line)
+            record = JSON_DECODER.decode(line)
         except json.JSONDecodeError as exc:
             raise AssertionError(f"{label} emitted invalid JSON stream output: {exc}") from exc
-        count += 1
-    return count
+        if not isinstance(record, dict) or not is_nonempty_string(record.get("ruleId")):
+            raise AssertionError(f"{label} JSON stream record lacks a non-empty ruleId")
+        rule_ids.append(record["ruleId"])
+    return rule_ids
 
 
 def parse_list_rule_ids(stdout: str, label: str) -> list[str]:
@@ -1403,6 +1437,47 @@ def validate_sarif_payload_shape(payload: Any, label: str) -> None:
                 )
 
 
+def validate_sarif_expected_sites(
+    payload: dict[str, Any], spec: dict[str, Any], label: str
+) -> list[dict[str, Any]]:
+    expected = spec.get("expected_sites", ())
+    if not expected:
+        return []
+    fixture = (REPO_ROOT / spec.get("site_fixture", spec["fixture"])).resolve()
+    lines = fixture.read_text(encoding="utf-8").splitlines()
+    sites: list[dict[str, Any]] = []
+    for rule_id, anchor, offset, level in expected:
+        anchors = [index + 1 for index, line in enumerate(lines) if anchor in line]
+        if len(anchors) != 1:
+            raise AssertionError(f"{label} requires one source anchor for {rule_id}: {anchor!r}")
+        start_line = anchors[0] + offset
+        if not 1 <= start_line <= len(lines):
+            raise AssertionError(f"{label} source anchor offset is outside the fixture")
+        matched = False
+        for run in payload["runs"]:
+            for result in run.get("results", []) or []:
+                if result.get("ruleId") != rule_id or result.get("level") != level:
+                    continue
+                for location in result.get("locations", []):
+                    physical = location.get("physicalLocation", {})
+                    if physical.get("region", {}).get("startLine") != start_line:
+                        continue
+                    uri = urlparse(physical.get("artifactLocation", {}).get("uri", ""))
+                    if uri.scheme not in ("", "file") or uri.netloc not in ("", "localhost"):
+                        continue
+                    path = Path(unquote(uri.path))
+                    # Module output may be repo-relative, or relative to the
+                    # single input file's parent. Absolute file URIs also work.
+                    if fixture in ((REPO_ROOT / path).resolve(), (fixture.parent / path).resolve()):
+                        matched = True
+        if not matched:
+            raise AssertionError(
+                f"{label} missing {level} {rule_id} at {fixture.name}:{start_line} ({anchor})"
+            )
+        sites.append({"rule_id": rule_id, "anchor": anchor, "start_line": start_line, "level": level})
+    return sites
+
+
 def sarif_summary_from_process(
     spec: dict[str, Any],
     proc: subprocess.CompletedProcess[str],
@@ -1425,6 +1500,7 @@ def sarif_summary_from_process(
         raise AssertionError(f"{label} did not emit valid SARIF JSON: {exc}") from exc
     try:
         validate_sarif_payload_shape(payload, label)
+        expected_sites = validate_sarif_expected_sites(payload, spec, label)
     except AssertionError:
         write_runtime_artifact(label, proc, payload if isinstance(payload, dict) else None)
         raise
@@ -1485,6 +1561,8 @@ def sarif_summary_from_process(
         "result_rule_ids": sorted(result_rule_ids),
         "sarif_runs": sum(1 for run in payload["runs"] if is_rule_pack_run(run)),
     }
+    if expected_sites:
+        summary["expected_sites"] = expected_sites
     write_runtime_artifact(label, proc, summary)
     return summary
 
@@ -1569,8 +1647,60 @@ def run_list_rule_inventory_check(
 def corpus_sarif_spec(spec: dict[str, Any]) -> dict[str, Any]:
     return {
         **spec,
+        "site_fixture": spec["fixture"],
         "fixture": spec["corpus_fixture"],
     }
+
+
+def generated_rule_paths(
+    rules_dir: Path, config_name: str | None, dump_configs: tuple[str, ...] = (),
+) -> list[Path]:
+    configs = set(dump_configs)
+    if config_name is not None:
+        configs.add(config_name)
+    for name in sorted(configs):
+        if not (rules_dir / name).is_file():
+            raise AssertionError(f"missing generated ast-grep config {name}")
+    return sorted(
+        path
+        for path in [*rules_dir.rglob("*.yml"), *rules_dir.rglob("*.yaml")]
+        if path.relative_to(rules_dir).as_posix() not in configs
+    )
+
+
+def run_generated_corpus_check(
+    spec: dict[str, Any], rules_dir: Path, timeout: int, ast_grep_cmd: list[str]
+) -> dict[str, Any]:
+    label = f"ast-grep-{spec['label']}-generated-corpus"
+    configs = spec.get("generated_configs") or (spec["generated_config"],)
+    rule_ids: list[str] = []
+    for config in configs:
+        config_label = label if len(configs) == 1 else f"{label}-{Path(config).stem}"
+        cmd = [
+            *ast_grep_cmd, "scan", "--config", str(rules_dir / config),
+            str(REPO_ROOT / spec["corpus_fixture"]), "--json=stream",
+        ]
+        start = time.monotonic()
+        try:
+            proc = subprocess.run(  # nosec B603 - actual generated config and checked-in corpus.
+                cmd, cwd=REPO_ROOT, text=True, capture_output=True, timeout=timeout, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            write_timeout_artifact(config_label, cmd, exc, time.monotonic() - start, timeout)
+            raise AssertionError(f"{config_label} timed out after {timeout}s") from exc
+        proc.duration_seconds = round(time.monotonic() - start, 3)  # type: ignore[attr-defined]
+        write_runtime_artifact(config_label, proc, None)
+        if proc.returncode not in (0, 1) or not is_ast_grep_diagnostic_stderr(proc.stderr):
+            raise AssertionError(f"{config_label} failed generated-config corpus validation")
+        rule_ids.extend(ast_grep_json_stream_rule_ids(proc.stdout, config_label))
+    summary = {
+        "fixture": spec["corpus_fixture"],
+        "config": configs[0] if len(configs) == 1 else list(configs),
+        "result_count": len(rule_ids),
+        "result_rule_ids": sorted(set(rule_ids)),
+    }
+    write_runtime_artifact(label, proc, summary)
+    return summary
 
 
 def run_single_ast_grep_rule_inventory_check(
@@ -1615,7 +1745,9 @@ def run_single_ast_grep_rule_inventory_check(
             f"test-suite/artifacts/rule_quality/{label}/"
         )
 
-    rule_paths = sorted([*rules_dir.glob("*.yml"), *rules_dir.glob("*.yaml")])
+    rule_paths = generated_rule_paths(
+        rules_dir, spec.get("generated_config"), spec.get("dump_configs", ()),
+    )
     if not rule_paths:
         write_runtime_artifact(label, proc, None)
         raise AssertionError(f"{label} did not dump any ast-grep YAML rules")
@@ -1666,7 +1798,10 @@ def run_single_ast_grep_rule_inventory_check(
                 f"{rule_label} failed ast-grep validation; stderr is captured under "
                 f"test-suite/artifacts/rule_quality/{rule_label}/"
             )
-        match_count = count_json_stream_objects(scan_proc.stdout, rule_label)
+        matched_ids = ast_grep_json_stream_rule_ids(scan_proc.stdout, rule_label)
+        if set(matched_ids) - {rule_id}:
+            raise AssertionError(f"{rule_label} emitted a hit from a different generated rule")
+        match_count = len(matched_ids)
         if not is_ast_grep_diagnostic_stderr(scan_proc.stderr):
             write_runtime_artifact(
                 rule_label,
@@ -1694,6 +1829,10 @@ def run_single_ast_grep_rule_inventory_check(
         "rule_count": len(rules),
         "rules": rules,
     }
+    if spec.get("generated_config") or spec.get("generated_configs"):
+        summary["generated_corpus_check"] = run_generated_corpus_check(
+            spec, rules_dir, timeout, ast_grep_cmd
+        )
     write_runtime_artifact(label, proc, summary)
     return summary
 
@@ -1711,7 +1850,22 @@ def build_rule_inventory_coverage(
             for rule in inventory.get("rules", [])
             if isinstance(rule, dict) and isinstance(rule.get("id"), str)
         }
-        corpus_rule_ids = set(corpus_by_label.get(label, {}).get("result_rule_ids", []))
+        # Mixed public reports include heuristic IDs that are not generated
+        # AST rules. Validate those inventories against real config execution;
+        # retain public coverage checks wherever public IDs are ungrouped.
+        corpus = inventory.get("generated_corpus_check", corpus_by_label.get(label, {}))
+        raw_required = any(
+            spec["label"] == label and (spec.get("generated_config") or spec.get("generated_configs"))
+            for spec in AST_GREP_SARIF_CHECKS
+        )
+        if raw_required and "generated_corpus_check" not in inventory:
+            raise AssertionError(f"{label} inventory requires actual generated-config corpus evidence")
+        if raw_required and label != "rust-rule-pack":
+            public_ids = set(corpus_by_label.get(label, {}).get("result_rule_ids", []))
+            missing_public_ids = sorted(generated_rule_ids - public_ids)
+            if missing_public_ids:
+                raise AssertionError(f"{label} public report omits generated rules: {missing_public_ids}")
+        corpus_rule_ids = set(corpus.get("result_rule_ids", []))
         covered_rule_ids = generated_rule_ids & corpus_rule_ids
         coverage.append(
             {
@@ -1747,7 +1901,7 @@ def assert_rule_inventory_fully_covered(
     if gaps:
         raise AssertionError(
             "generated ast-grep rules must be exercised by the language corpus "
-            "and corpus SARIF rule ids must come from dumped generated rules: "
+            "and corpus rule ids must come from dumped generated rules: "
             f"{json.dumps(gaps, sort_keys=True)}"
         )
 
@@ -1832,8 +1986,8 @@ def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
     )
     update_or_check_ast_grep_sarif_golden(
         {
-            "version": 4,
-            "scope": "Rust, TypeScript/JavaScript, Go, C#, Swift, Ruby, Java, and Elixir ast-grep SARIF evidence, corpus evidence, list-rules inventory, and per-rule parser validation",
+            "version": 5,
+            "scope": "Rust, TypeScript/JavaScript, Go, C#, Swift, Ruby, Java, and Elixir SARIF evidence, exact Rust source sites, generated corpus coverage, list-rules inventory, and per-rule parser validation",
             "checks": checks,
             "corpus_checks": corpus_checks,
             "list_rule_validation": list_rule_validation,
@@ -1842,16 +1996,18 @@ def run_ast_grep_rule_pack_check(timeout: int, update_golden: bool) -> None:
         },
         update_golden,
     )
-    validated_rules = sum(item["rule_count"] for item in per_rule_validation)
+    validated_rule_files = sum(item["rule_count"] for item in per_rule_validation)
     corpus_results = sum(item["result_count"] for item in corpus_checks)
     covered_generated_rules = sum(
         item["covered_generated_rule_count"] for item in rule_inventory_coverage
     )
+    generated_rules = sum(item["generated_rule_count"] for item in rule_inventory_coverage)
     log_progress(
         "[ast-grep-rule-pack] PASS "
         f"({len(AST_GREP_SARIF_CHECKS)} SARIF checks, "
         f"{corpus_results} corpus SARIF results, "
-        f"{covered_generated_rules}/{validated_rules} generated rules covered by corpora)"
+        f"{covered_generated_rules}/{generated_rules} unique generated rule IDs covered, "
+        f"{validated_rule_files} rule files validated)"
     )
 
 

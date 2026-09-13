@@ -599,7 +599,7 @@ def main(argv: list[str] | None = None) -> int:
             scan_all(
                 Path(args.ast_rule_dir), ast_files, capturing_sink,
                 severity_overrides=dict(SEVERITY_MAP),
-                count_only=set(SEVERITY_MAP),
+                counted_rules=set(SEVERITY_MAP),
                 skip_categories=skip,
                 marker_suppressed_ids=MARKER_SUPPRESSED_IDS,
                 category_for_rule=lambda rule_id: _record_category({"rule": rule_id}),
@@ -622,14 +622,21 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
+    ast_records: list[dict] = []
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
             if recs:
-                for r in recs:
-                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+                for cached_record in recs:
+                    record = dict(cached_record)
+                    is_ast = record.pop("_ast_pack", False)
+                    report_only = record.pop("_report_only", False)
+                    if is_ast:
+                        ast_records.append(record)
+                    if not report_only:
+                        sink_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
@@ -673,7 +680,7 @@ def main(argv: list[str] | None = None) -> int:
             "version": args.version,
             "status": "ok",
             "findings": records,
-            "extras": {"profile": profile_data},
+            "extras": {"profile": profile_data, "ast_findings": ast_records},
         }
         if os.environ.get("UBS_PROFILE") == "1":
             doc["profile"] = profile_data

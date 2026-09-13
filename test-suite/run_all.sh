@@ -134,7 +134,7 @@ check_rule_list() {
   fi
   while IFS= read -r -d '' rule_file; do
     awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rule_file"
-  done < <(find "$dump_dir" -maxdepth 1 -type f -name '*.yml' -print0) | LC_ALL=C sort -u >"$dumped_ids"
+  done < <(find "$dump_dir" -type f -name '*.yml' -print0) | LC_ALL=C sort -u >"$dumped_ids"
   local count
   count="$(wc -l <"$out" | awk '{print $1+0}')"
   if [[ "$count" -lt "$min_count" ]]; then
@@ -170,9 +170,9 @@ run_step rule-inventory-go check_rule_list "ubs-golang.sh" "go" 60 \
   "go.sql.rows-err-not-checked" \
   "go.http-client-without-timeout"
 run_step rule-inventory-rust check_rule_list "ubs-rust.sh" "rust" 70 \
-  "rust.unwrap-call" \
-  "rust.unwrap-unchecked" \
-  "rust.tokio-spawn-no-handle"
+  "rust.ast.expect" \
+  "rust.ast.unwrap_unchecked" \
+  "rust.ast.lock_unwrap"
 run_step rule-inventory-swift check_rule_list "ubs-swift.sh" "swift" 20 \
   "swift.urlsession.task-no-resume" \
   "swift.force-try" \
@@ -201,6 +201,13 @@ run_step rule-inventory-java check_rule_list "ubs-java.sh" "java" 20 \
   "java.optional-get" \
   "java.closeable-no-twr" \
   "java.insecure-random"
+run_step rule-inventory-bash check_rule_list "ubs-bash.sh" "bash" 4 \
+  "bash.security.eval-variable" \
+  "bash.variable.local-command-subst" \
+  "bash.security.mktemp-dry-run" \
+  "bash.syntax.test-compound"
+run_step rule-inventory-kotlin check_rule_list "ubs-kotlin.sh" "kotlin" 1 \
+  "kotlin.security.processbuilder-shell"
 
 if command -v uv >/dev/null 2>&1; then
   PY=(uv run python)

@@ -13,12 +13,13 @@ rule-per-file sgconfig pack (the PortGolang generator precedent, bead 0xjg.6):
                                  400-path batch instead of one spawn per check
     <rule_dir>/manifest.json     rule id -> {pattern, category, check}
 
-``AST_PATTERNS`` below preserves the legacy pattern texts verbatim (byte
-identity matters: ast-grep matching is pattern-exact). A pattern this
-ast-grep build rejects would have produced zero ``run --pattern`` output in
-legacy too (the spawn failed, the count stayed 0) — such rules are kept out
-of the sgconfig in ``_UNPARSEABLE_RULES`` so one bad stem cannot sink the
-consolidated scan, exactly like the go pack.
+``AST_PATTERNS`` retains the legacy check identities. Variadic arguments
+and statement sequences use ast-grep's ``$$$`` syntax; the old unnamed
+``$$`` placeholders parsed but never matched real calls or async bodies.
+HTTP literals use an explicit string-node rule because a metavariable
+embedded inside literal text does not capture a substring. These repairs
+can add findings compared with the original port. The two unsupported type
+patterns stay out of the config so they cannot abort the consolidated scan.
 """
 from __future__ import annotations
 
@@ -78,7 +79,7 @@ AST_PATTERNS: tuple[tuple[int, str, str, str], ...] = (
     _p(3, "rc_refcell", "rc_refcell", "Rc<RefCell<$T>>"),
     _p(3, "lock_unwrap", "lock_unwrap", "$M.lock().unwrap()"),
     _p(3, "lock_unwrap", "lock_expect", "$M.lock().expect($MSG)"),
-    _p(3, "await_in_loop", "await_in_for", "for $P in $I { $$ $F.await $$ }"),
+    _p(3, "await_in_loop", "await_in_for", "for $P in $I { $$$ $F.await; $$$ }"),
     # Category 5 — collections & iterators (8649-8693)
     _p(5, "clone_any", "clone", "$X.clone()"),
     _p(5, "collect_vec", "collect_vec", "$I.collect::<Vec<$T>>()"),
@@ -86,8 +87,8 @@ AST_PATTERNS: tuple[tuple[int, str, str, str], ...] = (
     # Category 6 — string & allocation smells (8698-8720)
     _p(6, "to_owned_to_string", "to_owned_to_string", "$X.to_owned().to_string()"),
     # Category 8 — security (8742-9203)
-    _p(8, "weak_hash", "md5", "md5::$F($$)"),
-    _p(8, "weak_hash", "sha1", "sha1::$F($$)"),
+    _p(8, "weak_hash", "md5", "md5::$F($$$)"),
+    _p(8, "weak_hash", "sha1", "sha1::$F($$$)"),
     _p(8, "tls_insecure", "tls_certs", "reqwest::ClientBuilder::new().danger_accept_invalid_certs(true)"),
     _p(8, "tls_insecure", "tls_hostnames", "reqwest::ClientBuilder::new().danger_accept_invalid_hostnames(true)"),
     _p(8, "shell_command", "shell_std_arg_c", "std::process::Command::new($S).arg(\"-c\").arg($CMD)"),
@@ -116,18 +117,18 @@ AST_PATTERNS: tuple[tuple[int, str, str, str], ...] = (
     _p(8, "shell_command", "shell_argsref_wcl", "Command::new($S).args(&[\"/c\", $CMD])"),
     _p(8, "http_url", "http_url", "\"http://$REST\""),
     # Category 20 — async locking across await (9517-9544)
-    _p(20, "std_lock_async", "std_lock_async_lock", "async fn $N($$) { $$ $M.lock() $$ }"),
-    _p(20, "std_lock_async", "std_lock_async_read", "async fn $N($$) { $$ $M.read() $$ }"),
-    _p(20, "std_lock_async", "std_lock_async_write", "async fn $N($$) { $$ $M.write() $$ }"),
-    _p(20, "std_guard_await", "std_guard_await_unwrap", "async fn $N($$) { $$ let $G = $M.lock().unwrap(); $$ $X.await $$ }"),
-    _p(20, "std_guard_await", "std_guard_await_expect", "async fn $N($$) { $$ let $G = $M.lock().expect($MSG); $$ $X.await $$ }"),
-    _p(20, "tokio_guard_await", "tokio_guard_lock", "async fn $N($$) { $$ let $G = $M.lock().await; $$ $X.await $$ }"),
-    _p(20, "tokio_guard_await", "tokio_guard_read", "async fn $N($$) { $$ let $G = $M.read().await; $$ $X.await $$ }"),
-    _p(20, "tokio_guard_await", "tokio_guard_write", "async fn $N($$) { $$ let $G = $M.write().await; $$ $X.await $$ }"),
+    _p(20, "std_lock_async", "std_lock_async_lock", "$M.lock();"),
+    _p(20, "std_lock_async", "std_lock_async_read", "$M.read();"),
+    _p(20, "std_lock_async", "std_lock_async_write", "$M.write();"),
+    _p(20, "std_guard_await", "std_guard_await_unwrap", "let $G = $M.lock().unwrap();"),
+    _p(20, "std_guard_await", "std_guard_await_expect", "let $G = $M.lock().expect($MSG);"),
+    _p(20, "tokio_guard_await", "tokio_guard_lock", "let $G = $M.lock().await;"),
+    _p(20, "tokio_guard_await", "tokio_guard_read", "let $G = $M.read().await;"),
+    _p(20, "tokio_guard_await", "tokio_guard_write", "let $G = $M.write().await;"),
     # Category 21 — panic surfaces (9549-9593)
-    _p(21, "assert_macros", "assert", "assert!($$)"),
-    _p(21, "assert_macros", "assert_eq", "assert_eq!($$)"),
-    _p(21, "assert_macros", "assert_ne", "assert_ne!($$)"),
+    _p(21, "assert_macros", "assert", "assert!($$$)"),
+    _p(21, "assert_macros", "assert_eq", "assert_eq!($$$)"),
+    _p(21, "assert_macros", "assert_ne", "assert_ne!($$$)"),
     _p(21, "unchecked_ub", "unreachable_unchecked_std", "std::hint::unreachable_unchecked()"),
     _p(21, "unchecked_ub", "unreachable_unchecked_core", "core::hint::unreachable_unchecked()"),
     _p(21, "unchecked_ub", "unwrap_unchecked", "$X.unwrap_unchecked()"),
@@ -233,9 +234,46 @@ def generate(rule_dir: Path) -> dict:
             "rule:\n"
             f"  pattern: {json.dumps(pattern)}\n"
         )
+        metadata = {"pattern": pattern, "category": category, "check": check}
+        if slug == "http_url":
+            rule = {"kind": "string_literal", "regex": '^"http://'}
+            body = (
+                f"id: {rule_id}\nlanguage: rust\nrule:\n"
+                f"  kind: {rule['kind']}\n  regex: {json.dumps(rule['regex'])}\n"
+            )
+            metadata = {"rule": rule, "category": category, "check": check}
+        elif category == 20:
+            # Match real statement nodes instead of wildcard statement lists
+            # that Rust parses but never matches. Only the immediate async
+            # function body qualifies; nested synchronous functions do not.
+            guarded = check != "std_lock_async"
+            acquisition = {
+                "pattern": {
+                    "context": f"fn __ubs_pattern() {{ {pattern} }}",
+                    "selector": "let_declaration" if guarded else "expression_statement",
+                },
+            }
+            if guarded:
+                acquisition["precedes"] = {
+                    "pattern": {
+                        "context": "fn __ubs_pattern() { $X.await; }",
+                        "selector": "expression_statement",
+                    },
+                    "stopBy": "end",
+                }
+            rule = {
+                "kind": "block",
+                "inside": {
+                    "kind": "function_item",
+                    "has": {"kind": "function_modifiers", "regex": r"\basync\b"},
+                },
+                "has": acquisition,
+            }
+            body = f"id: {rule_id}\nlanguage: rust\nrule: {json.dumps(rule)}\n"
+            metadata = {"rule": rule, "category": category, "check": check}
         (rule_dir / filename).write_text(body, encoding="utf-8")
         rule_files.append(filename)
-        manifest[rule_id] = {"pattern": pattern, "category": category, "check": check}
+        manifest[rule_id] = metadata
     sgconfig = (
         "ruleDirs:\n"
         + "".join(f"  - ./{filename}\n" for filename in rule_files)

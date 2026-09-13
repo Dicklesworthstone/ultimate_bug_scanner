@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e58dbe44f2c4a4f052838d494e34372ce3d118c06a581015c911b55d989cea2c"
+UBS_LIB_CHECKSUM="dbebe57aa0e5e416bc3a82a6454b0c71a3589fe9b11e50bf046ff520d2856efc"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -261,16 +261,23 @@ if [[ "${LIST_RULES:-0}" -eq 1 ]]; then
     exit 2
   fi
   helpers_dir=""
-  ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
-  tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-ex-rules.XXXXXX)"
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+  ubs_resolve_helpers_dir helpers_dir || exit 2
+  tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-ex-rules.XXXXXX)" || exit 2
+  if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tmp_rules" "$USER_RULE_DIR" <<'PY'
 from pathlib import Path
+import sys
 from ubs_core.elixir_rules import generate
-generate(Path('$tmp_rules'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
-" 2>/dev/null || true
+generate(Path(sys.argv[1]), Path(sys.argv[2]) if sys.argv[2] else None)
+PY
+  then
+    echo "ERROR: Elixir rule generation failed." >&2
+    exit 2
+  fi
   if [[ -n "$DUMP_RULES_DIR" ]]; then
-    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
-    cp "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+    if ! mkdir -p "$DUMP_RULES_DIR" || ! cp -R "$tmp_rules"/. "$DUMP_RULES_DIR/"; then
+      echo "ERROR: Could not export Elixir rule pack to $DUMP_RULES_DIR" >&2
+      exit 2
+    fi
   fi
   ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | sort -u
   rm -rf "$tmp_rules" 2>/dev/null || true
@@ -617,16 +624,21 @@ run_contract_v2_elixir(){
   local ast_rule_dir=""
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-exv2-rules.XXXXXX)"
-    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$ast_rule_dir" "$USER_RULE_DIR" <<'PY'
 from pathlib import Path
+import sys
 from ubs_core.elixir_rules import generate
-generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
-" 2>/dev/null; then
-      ast_rule_dir=""
+generate(Path(sys.argv[1]), Path(sys.argv[2]) if sys.argv[2] else None)
+PY
+    then
+      echo "ERROR: Elixir rule generation failed." >&2
+      return 2
     fi
     if [[ -n "$DUMP_RULES_DIR" && -n "$ast_rule_dir" ]]; then
-      mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
-      cp "$ast_rule_dir"/rules/*.yml "$ast_rule_dir"/*.yml "$DUMP_RULES_DIR/" 2>/dev/null || true
+      if ! mkdir -p "$DUMP_RULES_DIR" || ! cp -R "$ast_rule_dir"/. "$DUMP_RULES_DIR/"; then
+        echo "ERROR: Could not export Elixir rule pack to $DUMP_RULES_DIR" >&2
+        return 2
+      fi
     fi
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")

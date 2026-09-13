@@ -184,7 +184,8 @@ def has_request_source(expr: str, target_name: str = "") -> bool:
 
 
 def refs_in_expr(expr: str, tainted):
-    return [name for name in tainted if re.search(rf'\b{re.escape(name)}\b', expr)]
+    names = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', expr))
+    return [name for name in tainted if name in names]
 
 
 def taint_from_expr(expr: str, tainted, target_name: str = ""):

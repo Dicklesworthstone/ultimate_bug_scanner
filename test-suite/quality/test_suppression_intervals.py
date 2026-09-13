@@ -2,15 +2,20 @@
 """Unit tests for ubs_core.suppression — statement-interval index (bead A7)."""
 from __future__ import annotations
 
+import json
+import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
 if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
+from ubs_core.csharp_scan import render_text  # noqa: E402
 from ubs_core.suppression import build_index, parse_markers  # noqa: E402
 
 # Line numbers are load-bearing in the assertions below; count carefully.
@@ -67,7 +72,7 @@ class PythonSuppressionTests(unittest.TestCase):
         self.assertTrue(self.idx.is_suppressed(11, "py.taint"))
 
     def test_marker_inside_multiline_statement(self) -> None:
-        # `os.system(` opens on line 16; the marker sits on line 17, a
+        # The multi-line shell call opens on line 16; its marker is on line 17, a
         # physical line of the same logical statement.
         self.assertTrue(self.idx.is_suppressed(16, "py.taint"))
 
@@ -173,6 +178,55 @@ class MarkerParsingTests(unittest.TestCase):
         markers = parse_markers("/* ubs:ignore */\nx()\n", lang="c_like")
         self.assertEqual(len(markers), 1)
         self.assertEqual(markers[0].line, 1)
+
+
+class CSharpRenderedSuppressionTests(unittest.TestCase):
+    def test_ast_samples_resolve_and_keep_unsuppressed_peer(self) -> None:
+        fixtures = REPO_ROOT / "test-suite" / "csharp" / "suppression"
+        marked = fixtures / "suppression_buggy.cs"
+        unmarked = fixtures / "suppression_buggy_nomarkers.cs"
+        records = []
+        for source, anchor in (
+            (marked, '        Process.Start("cmd.exe", "/C " + userInput);'),
+            (marked, '        Process.Start("cmd.exe", "/C " +'),
+            (unmarked, '        Process.Start("cmd.exe", "/C " + userInput);'),
+        ):
+            line = source.read_text(encoding="utf-8").splitlines().index(anchor) + 1
+            records.append({
+                "rule": "cs-process-start",
+                "path": source.name,
+                "line": line,
+                "severity": "warning",
+                "message": "Process.Start invocation requires strict input validation",
+            })
+
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="csharp-suppression-", dir=artifacts) as temp:
+            sink = Path(temp) / "findings.ndjson"
+            output = Path(temp) / "report.txt"
+            sink.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+            for project in (marked, fixtures):
+                with self.subTest(project=project):
+                    render_text(SimpleNamespace(
+                        sink=str(sink), text_out=str(output), project_dir=str(project),
+                        ci=True, detail_limit=5, skip="",
+                    ), ast_ran=True, patterns=[])
+                    samples = [
+                        match for line in output.read_text(encoding="utf-8").splitlines()
+                        if (match := re.match(r"^\s+(.+):(\d+):", line))
+                    ]
+                    self.assertEqual(len(samples), 3, "each hit must be suppressible independently")
+                    suppressed = []
+                    for match in samples:
+                        source = Path(match.group(1))
+                        self.assertTrue(source.is_absolute())
+                        self.assertTrue(source.is_file(), "suppression must resolve the actual source")
+                        index = build_index(source.read_text(encoding="utf-8"), lang="csharp")
+                        suppressed.append(index.is_suppressed(
+                            int(match.group(2)), "cs-process-start",
+                        ))
+                    self.assertEqual(suppressed, [True, True, False])
 
 
 if __name__ == "__main__":

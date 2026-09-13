@@ -24,6 +24,9 @@ skip, exec-sh-c, time-after-in-loop, http-response-body-not-closed,
 sql-rows-not-closed) are NOT emitted here; their matches are returned to the
 caller. Orphan rules (generated but never printed by any category) surface
 only in the category-16 tally, also returned to the caller.
+
+Every generated match also carries a report-only record for JSON/SARIF.
+Those records survive the file cache without changing the legacy counters.
 """
 from __future__ import annotations
 
@@ -67,6 +70,8 @@ def _parse_stream(text: str) -> list[dict]:
             "line": int(rng.get("line", 0)) + 1,  # ast-grep rows are 0-based
             "col": int(rng.get("column", 0)) + 1,
             "text": str(match.get("text", "") or match.get("snippet", "")).strip(),
+            "severity": str(match.get("severity", "warning")),
+            "message": str(match.get("message", "")),
         })
     return matches
 
@@ -110,6 +115,25 @@ def scan_config(
             rule_id = match["rule"]
             counts[rule_id] += 1
             matches.setdefault(rule_id, []).append(match)
+            report_category = 1 if config.name == "sgconfig-go-async.yml" else 16
+            if not skip or report_category not in skip:
+                severity = match["severity"].lower()
+                severity = {"error": "critical", "fatal": "critical", "warn": "warning",
+                            "note": "info"}.get(severity, severity)
+                if severity not in {"critical", "warning", "info"}:
+                    severity = "info"
+                sink.write(json.dumps({
+                    "rule": rule_id,
+                    "category_id": f"golang.{slug(report_category)}",
+                    "path": match["path"],
+                    "line": match["line"],
+                    "col": match["col"],
+                    "severity": severity,
+                    "message": (match["message"] or match["text"] or rule_id)[:300],
+                    "suppressed": False,
+                    "_ast_pack": True,
+                    "_report_only": True,
+                }, ensure_ascii=False) + "\n")
             for entry in consumption.get(rule_id, []):
                 category, severity, title = entry
                 if skip and category in skip:

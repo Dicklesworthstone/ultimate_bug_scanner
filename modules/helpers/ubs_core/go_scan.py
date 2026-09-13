@@ -968,14 +968,21 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
+    ast_records: list[dict] = []
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
             if recs:
-                for r in recs:
-                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+                for cached_record in recs:
+                    record = dict(cached_record)
+                    is_ast = record.pop("_ast_pack", False)
+                    report_only = record.pop("_report_only", False)
+                    if is_ast:
+                        ast_records.append(record)
+                    if not report_only:
+                        sink_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
@@ -1025,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             doc["profile"] = profile_data
         extras = doc.get("extras", {}) if isinstance(doc.get("extras"), dict) else {}
         extras["profile"] = profile_data
+        extras["ast_findings"] = ast_records
         doc["extras"] = extras
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 

@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e58dbe44f2c4a4f052838d494e34372ce3d118c06a581015c911b55d989cea2c"
+UBS_LIB_CHECKSUM="dbebe57aa0e5e416bc3a82a6454b0c71a3589fe9b11e50bf046ff520d2856efc"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -183,11 +183,23 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
   helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-bashv2-rules.XXXXXX)"
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+  if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tmp_rules" "$USER_RULE_DIR" <<'PYRULES'
 from pathlib import Path
+import sys
 from ubs_core.bash_rules import generate
-generate(Path('$tmp_rules'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
-" 2>/dev/null || true
+generate(Path(sys.argv[1]), Path(sys.argv[2]) if sys.argv[2] else None)
+PYRULES
+  then
+    echo "ERROR: failed to generate AST rules" >&2
+    exit 2
+  fi
+  if [[ -n "$DUMP_RULES_DIR" ]]; then
+    mkdir -p -- "$DUMP_RULES_DIR" || exit 2
+    for rule_file in "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml; do
+      [[ -f "$rule_file" ]] || continue
+      cp -- "$rule_file" "$DUMP_RULES_DIR/" || exit 2
+    done
+  fi
   ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | sort -u
   rm -rf "$tmp_rules" 2>/dev/null || true
   exit 0

@@ -6,9 +6,10 @@ replacing the legacy per-rule `scan -r` spawns), parses the stream once, and
 appends normalized records to the same NDJSON findings sink the pattern layer
 uses.
 
-Counting: only the ids in `count_only` are counted and emitted (legacy
-calibration — the pack is informational for every other id). Severity comes
-from the java_rules.SEVERITY_MAP overrides.
+Counting: only the ids in `counted_rules` affect totals. Other pack records
+are retained for SARIF, with internal flags to survive cache replay without
+changing the counted sink. Severity comes from java_rules.SEVERITY_MAP
+overrides for counted rules and the rule configuration for other records.
 
 Suppression: per-id, mirroring the two legacy parsers —
 - java.async.* ids: current + previous-line `ubs:ignore` check
@@ -66,7 +67,7 @@ def scan_config(
     lang: str,
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
-    count_only: set[str] | None = None,
+    counted_rules: set[str] | None = None,
     skip_categories: set[int] | None = None,
     marker_suppressed_ids: frozenset[str] | None = None,
     category_for_rule=None,
@@ -101,10 +102,9 @@ def scan_config(
             file_str = str(match.get("file", "") or match.get("path", ""))
             if not rule_id or not file_str:
                 continue
-            if count_only is not None and rule_id not in count_only:
-                continue  # informational dump in legacy — not counted
+            counted = counted_rules is None or rule_id in counted_rules
             if skip_categories:
-                category = _family_category(rule_id)
+                category = _family_category(rule_id) if counted else 15
                 if category is None and category_for_rule is not None:
                     category = category_for_rule(rule_id)
                 if category is not None and category in skip_categories:
@@ -112,12 +112,15 @@ def scan_config(
             rng = match.get("range", {}).get("start", {})
             path = Path(file_str)
             line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
-            severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
+            raw_severity = str(match.get("severity", "warning")).lower()
+            default_severity = {"error": "critical", "warn": "warning", "note": "info"}.get(raw_severity, raw_severity)
+            severity = (severity_overrides or {}).get(rule_id) or default_severity
             if severity not in counters:
                 severity = "warning"
             if rule_id in suppressed_ids and _has_marker(path, line_no, cache):
                 continue  # legacy async parser marker check only
-            counters[severity] = counters.get(severity, 0) + 1
+            if counted:
+                counters[severity] = counters.get(severity, 0) + 1
             message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
             if category_for_rule is not None:
                 category_id = category_for_rule(rule_id)
@@ -132,6 +135,8 @@ def scan_config(
                 "severity": severity,
                 "message": message[:240],
                 "suppressed": False,
+                "_ast_pack": True,
+                "_report_only": not counted,
             }, ensure_ascii=False) + "\n")
     return counters
 
@@ -142,7 +147,7 @@ def scan_all(
     sink,
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
-    count_only: set[str] | None = None,
+    counted_rules: set[str] | None = None,
     skip_categories: set[int] | None = None,
     marker_suppressed_ids: frozenset[str] | None = None,
     category_for_rule=None,
@@ -153,7 +158,7 @@ def scan_all(
         lang = config.stem.removeprefix("sgbase-")
         counters = scan_config(
             config, paths, sink, lang, severity_overrides, ast_grep_bin,
-            count_only, skip_categories, marker_suppressed_ids, category_for_rule,
+            counted_rules, skip_categories, marker_suppressed_ids, category_for_rule,
         )
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value

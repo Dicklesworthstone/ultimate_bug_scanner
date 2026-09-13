@@ -38,6 +38,17 @@ while IFS='=' read -r key value; do
   fi
 done < <(sed -n '/^declare -A HELPER_CHECKSUMS=/,/^)/p' ubs | grep '^\s*\[')
 
+# Direct module entrypoints authenticate helpers through the shared library's
+# own table, independently of the meta-runner's outer helper table.
+declare -A EXPECTED_COMMON_HELPER_CHECKSUMS
+while IFS='=' read -r key value; do
+  if [[ $key =~ $helper_key_re ]]; then
+    rel="${BASH_REMATCH[1]}"
+    checksum=$(echo "$value" | sed "s/['\"]//g" | tr -d ' ')
+    EXPECTED_COMMON_HELPER_CHECKSUMS[$rel]=$checksum
+  fi
+done < <(sed -n '/^declare -g -A UBS_COMMON_HELPER_CHECKSUMS=/,/^)/p' modules/lib/ubs-common.sh | grep '^\s*\[')
+
 # Verify each module
 FAILED=0
 for module in modules/ubs-*.sh; do
@@ -71,6 +82,24 @@ for module in modules/ubs-*.sh; do
   fi
 done
 
+# Direct module invocations and newly scaffolded modules verify the shared
+# library themselves, before the meta-runner can attest its helper tree.
+# Checking only the outer module digest misses a stale nested library pin.
+echo ""
+echo "Verifying direct-entrypoint library checksums..."
+expected_lib="${EXPECTED_HELPER_CHECKSUMS[lib/ubs-common.sh]:-MISSING}"
+for entrypoint in modules/ubs-*.sh scripts/new-module.sh; do
+  embedded_lib=$(sed -n 's/^UBS_LIB_CHECKSUM="\([0-9a-f]\{64\}\)"$/\1/p' "$entrypoint")
+  if [[ "$expected_lib" == "MISSING" || "$embedded_lib" != "$expected_lib" ]]; then
+    echo -e "${RED}✗ LIBRARY CHECKSUM MISMATCH: $entrypoint${NC}"
+    echo -e "  Expected: $expected_lib"
+    echo -e "  Embedded: ${embedded_lib:-MISSING}"
+    FAILED=1
+  else
+    echo -e "${GREEN}✓ $entrypoint shared-library pin${NC}"
+  fi
+done
+
 echo ""
 echo "Verifying helper checksums..."
 while IFS= read -r -d '' helper; do
@@ -91,6 +120,16 @@ while IFS= read -r -d '' helper; do
   fi
 
   expected="${EXPECTED_HELPER_CHECKSUMS[$rel]:-MISSING}"
+
+  if [[ "$rel" == helpers/* ]]; then
+    embedded_helper="${EXPECTED_COMMON_HELPER_CHECKSUMS[$rel]:-MISSING}"
+    if [[ "$embedded_helper" != "$actual" ]]; then
+      echo -e "${RED}✗ SHARED-LIBRARY HELPER CHECKSUM MISMATCH: $helper${NC}"
+      echo -e "  Expected: $actual"
+      echo -e "  Embedded: $embedded_helper"
+      FAILED=1
+    fi
+  fi
 
   if [[ "$expected" == "MISSING" ]]; then
     echo -e "${RED}✗ CHECKSUM MISSING: ubs HELPER_CHECKSUMS[$rel]${NC}"

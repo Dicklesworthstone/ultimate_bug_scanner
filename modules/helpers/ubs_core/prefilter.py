@@ -200,6 +200,42 @@ class PrefilterResult:
         }
 
 
+def _structured_rule_literals(rule: Any) -> set[str]:
+    """Return a conservative OR-set of literals from required JSON constraints.
+
+    Only simple identifier regexes are interpreted. In particular, pattern
+    contexts, negated rules, and stopBy traversal boundaries are not matched
+    source and must never contribute prefilter requirements.
+    """
+    if not isinstance(rule, dict):
+        return set()
+
+    literals: set[str] = set()
+    regex = rule.get("regex")
+    if isinstance(regex, str):
+        match = re.fullmatch(r"(?:\\b)?([A-Za-z_][A-Za-z0-9_]*)(?:\\b)?", regex)
+        if match:
+            literals.add(match.group(1))
+
+    for relation in ("has", "inside", "precedes", "follows"):
+        literals.update(_structured_rule_literals(rule.get(relation)))
+
+    conjunction = rule.get("all")
+    if isinstance(conjunction, list):
+        for member in conjunction:
+            literals.update(_structured_rule_literals(member))
+
+    alternatives = rule.get("any")
+    if isinstance(alternatives, list) and alternatives:
+        branches = [_structured_rule_literals(member) for member in alternatives]
+        if all(branches):
+            # At least one branch must match. A branch without a proven
+            # literal makes this disjunction unsuitable for prefiltering.
+            for branch in branches:
+                literals.update(branch)
+    return literals
+
+
 def extract_ast_rule_literals(rule_id: str, rule_text: str | dict, lang: str = "") -> set[str]:
     """Extract necessary literal strings from an ast-grep rule definition.
 
@@ -207,14 +243,32 @@ def extract_ast_rule_literals(rule_id: str, rule_text: str | dict, lang: str = "
     If the rule has multiple branches (any:), the rule requires at least one of
     the branch literals. If no necessary literal can be extracted, returns an empty set.
     """
-    if isinstance(rule_text, dict):
-        text = json.dumps(rule_text)
-    else:
-        text = str(rule_text)
-
     # Whitelisted rules that have no keyword literals
     if rule_id in ALLOWED_EMPTY_RULES.get(lang, set()):
         return set()
+
+    if isinstance(rule_text, dict):
+        return _structured_rule_literals(rule_text.get("rule", rule_text))
+
+    text = str(rule_text)
+    if re.match(r'\s*\{\s*(?:"|\})', text):
+        try:
+            document = json.loads(text)
+        except ValueError:
+            return set()
+        if not isinstance(document, dict):
+            return set()
+        return _structured_rule_literals(document.get("rule", document))
+
+    # Rust structural rules are JSON objects embedded under a YAML root key.
+    # Parse that object, never scan its pattern.context scaffolding as YAML.
+    structured = re.search(r'(?m)^rule:[ \t]*(?=\{\s*(?:"|\}))', text)
+    if structured:
+        try:
+            rule, _ = json.JSONDecoder().raw_decode(text[structured.end():])
+        except ValueError:
+            return set()
+        return _structured_rule_literals(rule)
 
     literals: set[str] = set()
     lines = text.splitlines()

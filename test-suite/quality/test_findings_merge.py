@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -49,6 +50,94 @@ SINK_JS = json.dumps({
 
 
 class FindingsMergeTests(unittest.TestCase):
+    def read_report(self, path: Path) -> dict:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            self.fail(f"merged report is not valid JSON: {exc}")
+
+    def test_repeated_findings_read_source_once_and_preserve_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-source-") as tmp:
+            root = Path(tmp)
+            source = root / "source.rs"
+            source.write_bytes(b'let value = 1;\r\n// invalid utf8: \xff\n' + b'// padding\n' * 100_000)
+            records = [{"rule": "rust.test", "path": str(source), "line": 1} for _ in range(128)]
+            (root / "rust.findings.json").write_text(
+                "".join(json.dumps(rec) + "\n" for rec in records), encoding="utf-8",
+            )
+            combined = root / "combined.json"
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            source_reads = 0
+
+            def count_reads(frame, event, arg):
+                nonlocal source_reads
+                if (event == "call" and frame.f_code is Path.read_text.__code__
+                        and frame.f_locals.get("self") == source):
+                    source_reads += 1
+
+            previous_profile = sys.getprofile()
+            sys.setprofile(count_reads)
+            try:
+                self.assertEqual(merge(root, combined, project_dir=root), len(records))
+            finally:
+                sys.setprofile(previous_profile)
+            self.assertEqual(source_reads, 1)
+            findings = self.read_report(combined)["findings"]
+            expected = [hashlib.sha256(
+                f"rust.test\x1fsource.rs\x1flet _ID_ = 1;\x1f{ordinal}".encode()
+            ).hexdigest()[:16] for ordinal in range(len(records))]
+            self.assertEqual([f["fingerprint"] for f in findings], expected)
+
+            # A second merge in the same Python process must observe new bytes.
+            source.write_text("let value = 2;\n", encoding="utf-8")
+            merge(root, combined, project_dir=root)
+            changed = self.read_report(combined)["findings"]
+            self.assertTrue(all(a["fingerprint"] != b["fingerprint"]
+                                for a, b in zip(findings, changed)))
+
+    def test_source_cache_eviction_and_unreadable_line_fallbacks(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-source-") as tmp:
+            root = Path(tmp)
+            for index in range(10):
+                (root / f"source{index}.rs").write_text(f"let value = {index};\n", encoding="utf-8")
+            records = [{"rule": "rust.test", "path": f"source{i}.rs", "line": 1}
+                       for i in [*range(10), 0]]
+            records += [
+                {"rule": "rust.test", "path": "source0.rs", "line": 100, "message": "missing line"},
+                {"rule": "rust.test", "path": "absent.rs", "line": 1, "message": "missing file"},
+                {"rule": "rust.test", "path": "source0.rs", "line": "invalid"},
+                {"rule": "rust.test", "path": "source0.rs", "line": -1},
+            ]
+            (root / "rust.findings.json").write_text(
+                "".join(json.dumps(rec) + "\n" for rec in records), encoding="utf-8",
+            )
+            combined = root / "combined.json"
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            reads = []
+
+            def count_reads(frame, event, arg):
+                if event == "call" and frame.f_code is Path.read_text.__code__:
+                    path = frame.f_locals.get("self")
+                    if isinstance(path, Path) and path.suffix == ".rs":
+                        reads.append(path.name)
+
+            previous_profile = sys.getprofile()
+            sys.setprofile(count_reads)
+            try:
+                self.assertEqual(merge(root, combined, project_dir=root), len(records))
+            finally:
+                sys.setprofile(previous_profile)
+            self.assertEqual(reads, [f"source{i}.rs" for i in [*range(10), 0]])
+            findings = self.read_report(combined)["findings"]
+            self.assertEqual([f["line"] for f in findings[-4:]], [100, 1, 0, -1])
+            expected_statements = ["_ID_ _ID_", "_ID_ _ID_", "_ID_._ID_", "_ID_._ID_"]
+            for finding, statement, ordinal in zip(findings[-4:], expected_statements, [0, 0, 0, 1]):
+                normalized_path = Path(finding["file"]).name
+                expected = hashlib.sha256(
+                    f"rust.test\x1f{normalized_path}\x1f{statement}\x1f{ordinal}".encode()
+                ).hexdigest()[:16]
+                self.assertEqual(finding["fingerprint"], expected)
+
     def test_load_sink_skips_non_findings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-fm-") as tmp:
             sink = Path(tmp) / "s.json"
@@ -68,7 +157,7 @@ class FindingsMergeTests(unittest.TestCase):
             count = merge(tmp_dir, combined)
             self.assertEqual(count, 2)
 
-            doc = json.loads(combined.read_text(encoding="utf-8"))
+            doc = self.read_report(combined)
             findings = doc["findings"]
             self.assertEqual(len(findings), 2)
             py = next(f for f in findings if f["lang"] == "python")
@@ -92,7 +181,7 @@ class FindingsMergeTests(unittest.TestCase):
             combined = tmp_dir / "combined.json"
             combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
             self.assertEqual(merge(tmp_dir, combined), 0)
-            self.assertNotIn("findings", json.loads(combined.read_text(encoding="utf-8")))
+            self.assertNotIn("findings", self.read_report(combined))
 
     def test_merge_missing_combined_raises(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-fm-") as tmp:
@@ -143,6 +232,65 @@ class FindingsMergeTests(unittest.TestCase):
         self.assertEqual(res["level"], "error")
         self.assertEqual(res["locations"][0]["physicalLocation"]["region"]["startLine"], 10)
         self.assertTrue(res["locations"][0]["properties"]["permalink"].startswith("https://github.com/repo/blob/sha/"))
+
+    def test_ast_reports_preserve_counter_totals_locations_and_baseline_filtering(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-ast-report-") as tmp:
+            root = Path(tmp)
+            source = root / "sample.rb"
+            source.write_text("value == nil\n", encoding="utf-8")
+            ast_finding = {
+                "rule": "rb.nil-eq.eq", "path": str(source), "line": 1, "col": 1,
+                "severity": "warning", "message": "Prefer nil?", "suppressed": False,
+            }
+            summary = {
+                "language": "ruby", "files": 1, "critical": 0, "warning": 0, "info": 0,
+                "extras": {"ast_findings": [ast_finding]},
+            }
+            combined = root / "combined.json"
+            original = {"scanners": [summary], "totals": {"files": 1, "critical": 0, "warning": 0, "info": 0}}
+            combined.write_text(json.dumps(original), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=root), 0)
+            doc = self.read_report(combined)
+            self.assertEqual(doc["findings"], [])
+            self.assertEqual(doc["totals"], original["totals"])
+            self.assertEqual(doc["scanners"][0]["warning"], 0)
+            ast_records = doc["scanners"][0]["extras"]["ast_findings"]
+            self.assertEqual(len(ast_records), 1)
+            self.assertTrue(ast_records[0]["fingerprint"])
+            sarif = to_sarif(doc, git_remote="https://example.invalid/repo", git_commit="revision")
+            runs = {run["tool"]["driver"]["name"]: run for run in sarif["runs"]}
+            self.assertEqual(runs["ubs-ruby-heuristics"]["results"], [])
+            result = runs["ubs-ruby-ast"]["results"][0]
+            self.assertEqual(result["ruleId"], "rb.nil-eq.eq")
+            self.assertEqual(result["level"], "warning")
+            location = result["locations"][0]["physicalLocation"]
+            self.assertEqual(location["artifactLocation"]["uri"], str(source))
+            self.assertEqual(location["region"], {"startLine": 1, "startColumn": 1})
+            self.assertEqual(runs["ubs-ruby-ast"]["versionControlProvenance"][0]["revisionId"], "revision")
+
+            baseline = root / "baseline.json"
+            baseline.write_text(json.dumps(doc), encoding="utf-8")
+            combined.write_text(json.dumps(original), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=root, baseline_path=baseline, new_only=True), 0)
+            filtered = self.read_report(combined)
+            self.assertEqual(filtered["scanners"][0]["extras"]["ast_findings"], [])
+            self.assertEqual(sum(len(run["results"]) for run in to_sarif(filtered)["runs"]), 0)
+            original["scanners"][0]["extras"]["ast_findings"].append({**ast_finding, "rule": "rb.new-rule"})
+            combined.write_text(json.dumps(original), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=root, baseline_path=baseline, new_only=True), 0)
+            added = self.read_report(combined)
+            self.assertEqual([r["rule_id"] for r in added["scanners"][0]["extras"]["ast_findings"]], ["rb.new-rule"])
+            self.assertEqual(added["totals"]["warning"], 0)
+
+    def test_direct_ast_report_and_malformed_evidence(self) -> None:
+        record = {"rule": "rb.rule", "path": "sample.rb", "line": 2, "severity": "critical", "message": "hazard"}
+        direct = {"language": "ruby", "extras": {"ast_findings": [record]}}
+        runs = to_sarif(direct)["runs"]
+        self.assertEqual([run["tool"]["driver"]["name"] for run in runs], ["ubs-ruby-heuristics", "ubs-ruby-ast"])
+        self.assertEqual(runs[1]["results"][0]["level"], "error")
+        for invalid in ({}, [None], "findings"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "ast_findings"):
+                to_sarif({"language": "ruby", "extras": {"ast_findings": invalid}})
 
     def test_to_sarif_partial_status_invocations(self) -> None:
         doc = {
@@ -197,7 +345,7 @@ class FindingsMergeTests(unittest.TestCase):
 
             # First merge: save as baseline
             merge(tmp_dir, combined)
-            base_doc = json.loads(combined.read_text(encoding="utf-8"))
+            base_doc = self.read_report(combined)
             base_file = tmp_dir / "baseline.json"
             base_file.write_text(json.dumps(base_doc), encoding="utf-8")
 
@@ -206,7 +354,7 @@ class FindingsMergeTests(unittest.TestCase):
             combined2.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
             count = merge(tmp_dir, combined2, baseline_path=base_file, new_only=True)
             self.assertEqual(count, 0)
-            doc2 = json.loads(combined2.read_text(encoding="utf-8"))
+            doc2 = self.read_report(combined2)
             self.assertEqual(doc2["findings"], [])
             self.assertEqual(doc2["totals"]["critical"], 0)
             self.assertEqual(doc2["totals"]["warning"], 0)
@@ -224,7 +372,7 @@ class FindingsMergeTests(unittest.TestCase):
             combined3.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
             count = merge(tmp_dir, combined3, baseline_path=base_file, new_only=True)
             self.assertEqual(count, 1)
-            doc3 = json.loads(combined3.read_text(encoding="utf-8"))
+            doc3 = self.read_report(combined3)
             self.assertEqual(len(doc3["findings"]), 1)
             self.assertEqual(doc3["findings"][0]["rule_id"], "python.security.eval")
             self.assertEqual(doc3["totals"]["critical"], 1)
@@ -232,4 +380,3 @@ class FindingsMergeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

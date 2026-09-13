@@ -154,7 +154,8 @@ def source_line(lines, line_no):
 
 def refs_in_expr(expr: str, tainted):
     haystack = mask_literals(expr)
-    return [name for name in tainted if re.search(rf'\b{re.escape(name)}\b', haystack)]
+    names = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', haystack))
+    return [name for name in tainted if name in names]
 
 def taint_from_expr(expr: str, tainted):
     if safe_re.search(expr):

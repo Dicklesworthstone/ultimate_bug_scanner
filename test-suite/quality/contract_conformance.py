@@ -12,6 +12,7 @@ Asserts:
     * --help -> exit 0
     * --list-rules -> exit 0 without scanning (modules with rule packs)
     * --dump-rules -> writes YAML and exits 0 (modules with rule packs)
+    * --list-rules + --dump-rules -> identical listed and persisted inventories
     * --list-categories -> exit 0
   - Formats:
     * --format=text -> human-readable output
@@ -199,10 +200,12 @@ class ModuleChecker:
 
     def check_rule_inventory(self, tmp_dir: Path, fixture: Path) -> None:
         extra_flags = self.contract.get("modules", {}).get(self.lang, {}).get("extra_flags", [])
+        standalone_ids: list[str] = []
         if "--list-rules" in extra_flags:
             t0 = time.monotonic()
             proc = run_cmd([str(self.module_path), "--list-rules"])
             elapsed = time.monotonic() - t0
+            standalone_ids = proc.stdout.splitlines()
             ok = proc.returncode == 0 and bool(proc.stdout.strip())
             err = f"exit {proc.returncode} != 0 or empty list-rules" if not ok else ""
             self._record_result("list_rules", ok, elapsed, err, proc if not ok else None)
@@ -217,6 +220,73 @@ class ModuleChecker:
             ok = proc.returncode == 0 and yml_count > 0
             err = f"exit {proc.returncode} != 0 or no yaml dumped (count={yml_count})" if not ok else ""
             self._record_result("dump_rules", ok, elapsed, err, proc if not ok else None)
+
+        if "--list-rules" not in extra_flags or "--dump-rules" not in extra_flags:
+            return
+
+        cases = [("list_and_dump_rules", [], standalone_ids)]
+        if self.lang in {"bash", "cpp", "java", "js", "kotlin", "ruby"}:
+            user_dir = tmp_dir / "operator's custom rules"
+            user_dir.mkdir()
+            user_id = f"{self.lang}.custom-inventory-rule"
+            language = {"js": "javascript", "ruby": "ruby"}.get(self.lang, self.lang)
+            (user_dir / "different filename.yml").write_text(
+                f"id: {user_id}\nlanguage: {language}\nrule:\n  pattern: $X\n",
+                encoding="utf-8",
+            )
+            cases.append((
+                "list_and_dump_user_rules",
+                [f"--rules={user_dir}"],
+                sorted(set(standalone_ids) | {user_id}),
+            ))
+
+        for check_id, rule_args, expected_ids in cases:
+            dump_dir = tmp_dir / f"operator's {check_id}"
+            t0 = time.monotonic()
+            proc = run_cmd([
+                str(self.module_path), *rule_args,
+                f"--dump-rules={dump_dir}", "--list-rules",
+            ])
+            elapsed = time.monotonic() - t0
+            listed_ids = proc.stdout.splitlines()
+            try:
+                dumped_ids = sorted({
+                    line.partition(":")[2].strip()
+                    for rule_file in [*dump_dir.glob("*.yml"), *dump_dir.glob("*.yaml")]
+                    for line in rule_file.read_text(encoding="utf-8").splitlines()
+                    if line.startswith("id:")
+                })
+                ok = (
+                    proc.returncode == 0
+                    and bool(expected_ids)
+                    and listed_ids == sorted(set(listed_ids))
+                    and listed_ids == expected_ids == dumped_ids
+                )
+                err = (
+                    f"exit {proc.returncode}; inventory mismatch "
+                    f"(expected={len(expected_ids)}, listed={len(listed_ids)}, "
+                    f"dumped={len(dumped_ids)})"
+                ) if not ok else ""
+            except OSError as exc:
+                ok = False
+                err = f"could not read dumped rules: {exc}"
+            self._record_result(check_id, ok, elapsed, err, proc if not ok else None)
+
+        if self.lang in {"bash", "cpp", "java", "js", "kotlin", "ruby", "rust"}:
+            blocked_dir = tmp_dir / "not a dump directory"
+            blocked_dir.write_text("preserve me\n", encoding="utf-8")
+            t0 = time.monotonic()
+            proc = run_cmd([
+                str(self.module_path), f"--dump-rules={blocked_dir / 'rules'}", "--list-rules",
+            ])
+            elapsed = time.monotonic() - t0
+            ok = (
+                proc.returncode == 2
+                and not proc.stdout.strip()
+                and blocked_dir.read_text(encoding="utf-8") == "preserve me\n"
+            )
+            err = f"exit {proc.returncode}; invalid dump destination was not rejected cleanly" if not ok else ""
+            self._record_result("list_dump_invalid_destination", ok, elapsed, err, proc if not ok else None)
 
     def check_format_text(self, fixture: Path) -> None:
         t0 = time.monotonic()

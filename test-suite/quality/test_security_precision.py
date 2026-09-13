@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,10 @@ from ubs_core.py_rules import _RULES  # noqa: E402
 from ubs_core.py_scan import iter_matches  # noqa: E402
 from ubs_core.rust_detectors import jwt_verification  # noqa: E402
 from ubs_core.rust_detectors import security_randomness  # noqa: E402
+from ubs_core.rust_detectors import (  # noqa: E402
+    host_header_url, open_redirect, request_regex, request_url,
+    response_header, sql_injection,
+)
 from ubs_core import rust_rules  # noqa: E402
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
@@ -74,16 +79,20 @@ class RustPanicContextTests(unittest.TestCase):
         return target
 
     def scan(self, paths: list[Path], *, fail_on_warning: bool = False,
-             cache: bool = False, without_tomllib: bool = False) -> tuple[int, dict]:
+             cache: bool = False, without_tomllib: bool = False,
+             categories: tuple[int, ...] = (1,), ast: bool = True) -> tuple[int, dict]:
         inputs = self.root / "inputs"
         inputs.write_bytes(b"\0".join(os.fsencode(path) for path in paths) + b"\0")
         output = self.root / "scan.json"
         args = [
             "--files-from", str(inputs), "--sink", str(self.root / "findings.ndjson"),
-            "--project-dir", str(self.root), "--ast-rule-dir", str(self.rules),
-            "--skip", ",".join(map(str, range(2, 25))), "--skip-type-narrowing",
+            "--project-dir", str(self.root),
+            "--skip", ",".join(str(n) for n in range(1, 25) if n not in categories),
+            "--skip-type-narrowing",
             "--quiet", "--json-out", str(output),
         ]
+        if ast:
+            args.extend(["--ast-rule-dir", str(self.rules)])
         if fail_on_warning:
             args.append("--fail-on-warning")
         command = [sys.executable, "-m", "ubs_core.rust_scan"]
@@ -97,7 +106,62 @@ class RustPanicContextTests(unittest.TestCase):
         result = subprocess.run(command + args, cwd=self.root, env=env,
                                 text=True, capture_output=True, timeout=30)
         self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
-        return result.returncode, json.loads(output.read_text(encoding="utf-8"))
+        try:
+            document = json.loads(output.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            self.fail(f"scanner returned invalid JSON: {exc}")
+        return result.returncode, document
+
+    def test_assertion_inventory_counts_each_macro_once(self) -> None:
+        targets = [self.package(name) for name in ("first", "second")]
+        for target in targets:
+            target.write_text(
+                "fn receipt() { assert!(true); assert_eq!(1, 1); }\n"
+                "fn other() { assert_ne!(1, 2); }\n",
+                encoding="utf-8",
+            )
+        code, doc = self.scan(targets, categories=(21,), fail_on_warning=True)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.panic.assert-macros"]
+        self.assertEqual(code, 1)
+        self.assertEqual(len(hits), 6)
+        self.assertEqual(doc["warning"], 6)
+        for target in targets:
+            sites = [hit for hit in hits if Path(hit["path"]) == target]
+            self.assertEqual(sorted(hit["line"] for hit in sites), [1, 1, 2])
+            first_line = [hit["col"] for hit in sites if hit["line"] == 1]
+            self.assertEqual(len(set(first_line)), 2)
+
+    def test_assertion_inventory_retains_line_fallback_without_ast(self) -> None:
+        target = self.package("fallback")
+        target.write_text(
+            "fn receipt() {\n    assert!(true);\n    assert_eq!(1, 1);\n"
+            "    assert_ne!(1, 2);\n}\n",
+            encoding="utf-8",
+        )
+        code, doc = self.scan([target], categories=(21,), ast=False, fail_on_warning=True)
+        hits = [hit for hit in doc["findings"] if hit["rule"] == "rust.panic.assert-macros"]
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(hit["line"] for hit in hits), [2, 3, 4])
+        self.assertEqual(doc["warning"], 3)
+
+    def test_async_lock_inventory_does_not_duplicate_line_fallbacks(self) -> None:
+        for name, acquisition, rule in (
+            ("blocking", "mutex.lock().unwrap()", "rust.async-locking.std-lock-async"),
+            ("async", "mutex.lock().await", "rust.async-locking.tokio-guard-await"),
+        ):
+            with self.subTest(acquisition=acquisition):
+                targets = [self.package(f"{name}_{suffix}") for suffix in ("first", "second")]
+                for target in targets:
+                    target.write_text(
+                        f"async fn receipt() {{ let guard = {acquisition}; pending().await; }}\n",
+                        encoding="utf-8",
+                    )
+                code, doc = self.scan(targets, categories=(20,), fail_on_warning=True)
+                hits = [hit for hit in doc["findings"] if hit["rule"] == rule]
+                self.assertEqual(code, 1)
+                self.assertEqual(len(hits), 2)
+                self.assertEqual({Path(hit["path"]) for hit in hits}, set(targets))
+                self.assertTrue(all(hit["severity"] == "warning" for hit in hits))
 
     def test_integration_panic_stays_visible_and_warning_gate_still_fails(self) -> None:
         target = self.package("native")
@@ -417,7 +481,7 @@ class YamlNoLoaderLayersTests(unittest.TestCase):
             target.write_text(YAML_VARIANTS, encoding="utf-8")
             proc = subprocess.run(
                 [binary, "scan", "-r", str(rule), "--report-style", "short", str(target)],
-                capture_output=True, text=True, check=False,
+                capture_output=True, text=True, check=False, timeout=30,
             )
         lines = sorted(
             int(part.split(":")[1])
@@ -565,4 +629,76 @@ fn unrelated() {
         self.assertEqual(counts[security_randomness.strip_line_comments.__code__], len(self.RANDOM.splitlines()))
 
 
-if __name__
+class RustTaintReferenceTests(unittest.TestCase):
+    DETECTORS = (
+        request_url, open_redirect, request_regex,
+        response_header, host_header_url, sql_injection,
+    )
+    FORMATTED = (response_header, host_header_url, sql_injection)
+
+    @classmethod
+    def original_refs(cls, detector, expression, tainted):
+        # Retain the original algorithm as the independent behavior oracle:
+        # optimize its cost, not its matching, masking or tie-breaking.
+        if detector in cls.FORMATTED:
+            searchable = detector.without_string_literals(expression)
+        elif detector is request_regex:
+            searchable = detector.mask_literals(expression)
+        else:
+            searchable = expression
+        return [
+            name for name in tainted
+            if re.search(rf'\b{re.escape(name)}\b', searchable)
+            or (detector in cls.FORMATTED and re.search(
+                rf'\{{\s*{re.escape(name)}\s*(?::|[}}])', expression
+            ))
+        ]
+
+    def test_reference_boundaries_literals_captures_and_order_match_original(self):
+        # Deliberately different from expression order: the first recorded
+        # taint owns the displayed evidence path when several names match.
+        tainted = dict.fromkeys(["beta", "alpha", "_x", "Alpha", "a1", "x"])
+        expressions = [
+            "alpha + beta + alpha", "alpha_beta alphabeta 1alpha alpha1",
+            "obj.alpha + &beta + r#_x + Alpha + a1", "éalpha alphaé αalpha alpha中",
+            "alpha\u0301 + \u0301beta", '"alpha" + beta', 'r#"alpha // beta"# + _x',
+            'format!("{alpha} { beta :>10} {_x:?}")',
+            'format!("{alpha:{beta}} {{alpha}} {alpha_} {alphaé}")',
+            '"{ alpha\n:10} {beta!} {1alpha}"', "", "αβ_中文",
+        ]
+        for detector in self.DETECTORS:
+            for expression in expressions:
+                with self.subTest(detector=detector.__name__, expression=expression):
+                    self.assertEqual(
+                        detector.refs_in_expr(expression, tainted),
+                        self.original_refs(detector, expression, tainted),
+                    )
+            self.assertEqual(detector.refs_in_expr("alpha + beta", tainted), ["beta", "alpha"])
+            self.assertEqual(detector.refs_in_expr("anything", {}), [])
+
+    def test_large_taint_table_does_not_compile_one_regex_per_name(self):
+        # More identifiers than Python's regex cache can hold reproduces the
+        # CASS timeout's cache thrashing. Observe real compiler calls; no mock
+        # replaces either the regular-expression engine or a detector.
+        tainted = dict.fromkeys(f"value_{i}" for i in range(2048))
+        expression = 'value_2047 + value_0 + format!("{value_1024:?}")'
+        calls = []
+
+        def record(frame, event, arg):
+            if event == "call" and frame.f_code.co_name == "compile" and frame.f_globals.get("__name__") == "re._compiler":
+                calls.append(1)
+
+        previous = sys.getprofile()
+        re.purge()
+        try:
+            sys.setprofile(record)
+            results = [detector.refs_in_expr(expression, tainted) for detector in self.DETECTORS]
+        finally:
+            sys.setprofile(previous)
+        for detector, result in zip(self.DETECTORS, results):
+            self.assertEqual(result, self.original_refs(detector, expression, tainted))
+        self.assertLessEqual(len(calls), 4, f"regex compilations scaled with taint table: {len(calls)}")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -110,6 +110,7 @@ def run_scan(target: Path, bin_dir: Path, args: list[str], env: dict[str, str]) 
     return subprocess.run(
         [str(UBS_BIN), "--only=python,bash", *args, str(target)],
         cwd=REPO_ROOT, capture_output=True, text=True, env=merged, check=False,
+        timeout=180,
     )
 
 
@@ -252,7 +253,10 @@ def check_incomplete_scan_refuses_baseline(tmpdir: Path) -> None:
           "an incomplete scan overwrote a complete saved baseline")
 
     if report.is_file():
-        doc = json.loads(report.read_text(encoding="utf-8"))
+        try:
+            doc = json.loads(report.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"Partial scan wrote invalid JSON to {report}: {exc}") from exc
         comparison = doc.get("comparison") or {}
         check("baseline/comparison-unavailable",
               comparison.get("status") == "unavailable",
@@ -282,7 +286,10 @@ def check_incomplete_scan_refuses_baseline(tmpdir: Path) -> None:
                                f"--report-json={report2}"],
              {"STUB_MODE": "clean", "STUB_EXIT": "0"})
     if report2.is_file():
-        comparison = (json.loads(report2.read_text(encoding="utf-8")).get("comparison") or {})
+        try:
+            comparison = (json.loads(report2.read_text(encoding="utf-8")).get("comparison") or {})
+        except json.JSONDecodeError as exc:
+            raise AssertionError(f"Baseline comparison wrote invalid JSON to {report2}: {exc}") from exc
         check("baseline/incomplete-baseline-rejected",
               comparison.get("status") == "unavailable"
               and comparison.get("reason") == "baseline_incomplete",
@@ -308,23 +315,54 @@ def check_undeliverable_artifact_fails(tmpdir: Path) -> None:
               f"expected 2, got {proc.returncode}\n{proc.stderr[-400:]}")
         check(f"delivery/{label}-not-written", not dest.exists(), f"{dest} should not exist")
 
-    # A stale artifact must survive a failed rewrite rather than be truncated:
-    # the write is staged beside the destination and renamed into place, so a
-    # destination directory that cannot be written to leaves the old file whole.
+    # A stale artifact must survive a failed rewrite rather than be truncated.
+    # A valid basename at NAME_MAX leaves no room for the sibling staging
+    # file's prefix/suffix. That real filesystem failure also applies to root,
+    # which can write into chmod(0555) directories.
+    staging_limit = work / "staging-limit"
+    staging_limit.mkdir(parents=True, exist_ok=True)
+    try:
+        name_max = os.pathconf(staging_limit, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError) as exc:
+        raise AssertionError(f"Cannot determine filesystem NAME_MAX for {staging_limit}: {exc}") from exc
+    suffix = ".json"
+    assert name_max > len(suffix), f"Unsupported filesystem NAME_MAX: {name_max}"
+    stale = staging_limit / ("r" * (name_max - len(suffix)) + suffix)
+    original = '{"kept":true,"note":"previous run"}\n'
+    stale.write_text(original, encoding="utf-8")
+    proc = run_scan(target, bin_dir, ["--format=json", f"--report-json={stale}"],
+                    {"STUB_MODE": "clean", "STUB_EXIT": "0"})
+    check("delivery/staging-failure-exit-2", proc.returncode == 2,
+          f"expected 2, got {proc.returncode}\n{proc.stderr[-400:]}")
+    check("delivery/staging-failure-reported",
+          "could not write requested artifact: report JSON" in proc.stderr
+          and str(stale) in proc.stderr, proc.stderr)
+    check("delivery/stale-artifact-preserved",
+          stale.read_text(encoding="utf-8") == original,
+          "a failed rewrite truncated or replaced the previous artifact")
+
+    # Retain the permission failure where the OS enforces it for this user.
+    # Root's skip is not a pass; the staging failure above is mandatory.
     readonly = work / "readonly"
     readonly.mkdir(parents=True, exist_ok=True)
     stale = readonly / "report.json"
-    original = '{"kept":true,"note":"previous run"}\n'
     stale.write_text(original, encoding="utf-8")
     readonly.chmod(0o555)
     try:
-        proc = run_scan(target, bin_dir, ["--format=json", f"--report-json={stale}"],
-                        {"STUB_MODE": "clean", "STUB_EXIT": "0"})
-        check("delivery/readonly-dir-exit-2", proc.returncode == 2,
-              f"expected 2, got {proc.returncode}\n{proc.stderr[-400:]}")
-        check("delivery/stale-artifact-preserved",
-              stale.read_text(encoding="utf-8") == original,
-              "a failed rewrite truncated or replaced the previous artifact")
+        if os.access(readonly, os.W_OK):
+            print("[status-invariants] SKIP delivery/readonly-dir "
+                  "(this user can write into chmod(0555) directories)")
+        else:
+            proc = run_scan(target, bin_dir, ["--format=json", f"--report-json={stale}"],
+                            {"STUB_MODE": "clean", "STUB_EXIT": "0"})
+            check("delivery/readonly-dir-exit-2", proc.returncode == 2,
+                  f"expected 2, got {proc.returncode}\n{proc.stderr[-400:]}")
+            check("delivery/readonly-dir-failure-reported",
+                  "could not write requested artifact: report JSON" in proc.stderr
+                  and str(stale) in proc.stderr, proc.stderr)
+            check("delivery/readonly-stale-artifact-preserved",
+                  stale.read_text(encoding="utf-8") == original,
+                  "a failed rewrite truncated or replaced the previous artifact")
     finally:
         readonly.chmod(0o755)
 

@@ -446,6 +446,8 @@ def render_text(args, ast_ran: bool, patterns: Sequence) -> None:
     icons = _ICONS_CI if args.ci else _ICONS_UTF8
     detail_cap = args.detail_limit
     skip = _skip_set(args)
+    project_path = Path(args.project_dir).resolve() if args.project_dir else Path.cwd().resolve()
+    base_dir = project_path if project_path.is_dir() else project_path.parent
 
     buckets = []
     for rule, recs in by_rule.items():
@@ -469,11 +471,15 @@ def render_text(args, ast_ran: bool, patterns: Sequence) -> None:
         summary = meta.summary.replace("{n}", str(len(recs))).replace("{msg}", str(recs[0].get("message", "")))
         lines.append(f"{icons.get(severity, icons['info'])} {summary}")
         if meta.style == "ast":
-            samples = ", ".join(
-                f"{rec.get('path', '')}:{int(rec.get('line', 0) or 0)}" for rec in recs[:3]
-            )
-            if samples:
-                lines.append(f"  {samples}")
+            # The runner suppresses samples before restoring display paths.
+            # AST sink paths are relative to base_dir, and each hit needs its
+            # own line so a marked hit cannot hide an unmarked peer.
+            for rec in recs[:3]:
+                path = Path(str(rec.get("path", "")))
+                if not path.is_absolute():
+                    path = base_dir / path
+                sample = {**rec, "path": str(path)}
+                lines.append(_sample_line(meta, sample, str(rec.get("message", ""))))
             continue
         if meta.style == "plain":
             continue  # the inventory summary line IS the legacy text

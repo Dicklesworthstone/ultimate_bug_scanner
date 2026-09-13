@@ -6,8 +6,9 @@ the stream once, and appends normalized records to the same NDJSON findings
 sink the pattern/detector layers use. Mirrors the legacy consolidated
 `run_ast_rules` scan plus run_async_error_checks' per-rule `scan -r` (which
 is the only rule whose findings ever joined the legacy counters — every
-other pack rule was a cat-18 --json-out/--sarif-out passthrough, enforced
-here by the caller passing ``count_only=ruby_rules.CATEGORY_MAP``).
+other pack rule was a cat-18 --json-out/--sarif-out passthrough). Keep all
+AST records in the internal cache sink, marking report-only records so the
+caller can preserve SARIF evidence without changing the counted findings.
 
 Suppression: same-line + previous-line `ubs:ignore` checks (the legacy
 run_async_error_checks parser semantics, ubs-ruby.sh 3377-3391); the A7
@@ -52,15 +53,17 @@ def scan_config(
     sink,
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
-    count_only: set[str] | None = None,
+    counted_rules: set[str] | None = None,
     category_map: dict[str, int] | None = None,
     skip: set[int] | None = None,
 ) -> dict[str, int]:
     """Run one sgconfig over the path list; write sink records; return counters."""
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    if not path_list or not config.is_file():
+    if not path_list:
         return counters
+    if not config.is_file():
+        raise RuntimeError(f"Ruby AST configuration is missing: {config}")
     cache: dict[Path, list[str]] = {}
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
@@ -71,26 +74,30 @@ def scan_config(
                 text=True,
                 timeout=600,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            continue  # legacy: `|| true` per rule-file invocation
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError(f"Ruby AST scan could not run with {config}: {exc}") from exc
+        if proc.returncode not in (0, 1):
+            raise RuntimeError(
+                f"Ruby AST scan failed with {config} (exit {proc.returncode}): {proc.stderr.strip()}"
+            )
         for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
                 match = json.loads(line)
-            except ValueError:
-                continue
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Ruby AST scan returned invalid JSON with {config}: {exc}") from exc
+            if not isinstance(match, dict):
+                raise RuntimeError(f"Ruby AST scan returned a non-object finding with {config}")
             rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
             file_str = str(match.get("file", "") or match.get("path", ""))
             if not rule_id or not file_str:
                 continue
-            if count_only is not None and rule_id not in count_only:
-                continue
-            if skip and category_map:
-                category = category_map.get(rule_id)
-                if category is not None and category in skip:
-                    continue  # --skip: the rule's category is disabled
+            counted = counted_rules is None or rule_id in counted_rules
+            category = (category_map or {}).get(rule_id, 18)
+            if skip and category in skip:
+                continue  # --skip applies to counted and report-only rules.
             rng = match.get("range", {}).get("start", {})
             path = Path(file_str)
             line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
@@ -108,7 +115,8 @@ def scan_config(
                 severity = "warning"
             if _has_marker(path, line_no, cache):
                 continue  # legacy line + previous-line marker check
-            counters[severity] = counters.get(severity, 0) + 1
+            if counted:
+                counters[severity] = counters.get(severity, 0) + 1
             message = str(match.get("message", "")).strip() or rule_id
             sink.write(json.dumps({
                 "rule": rule_id,
@@ -119,6 +127,8 @@ def scan_config(
                 "severity": severity,
                 "message": f"{rule_id}: {message}"[:300],
                 "suppressed": False,
+                "_ast_pack": True,
+                "_report_only": not counted,
             }, ensure_ascii=False) + "\n")
     return counters
 
@@ -129,8 +139,7 @@ def scan_all(
     sink,
     severity_overrides: dict[str, str] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
-    count_only: set[str] | None = None,
-    skip_categories: set[int] | None = None,
+    counted_rules: set[str] | None = None,
     category_map: dict[str, int] | None = None,
     skip: set[int] | None = None,
 ) -> dict[str, int]:
@@ -139,7 +148,7 @@ def scan_all(
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         counters = scan_config(
             config, paths, sink, severity_overrides, ast_grep_bin,
-            count_only, category_map, skip,
+            counted_rules, category_map, skip,
         )
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value

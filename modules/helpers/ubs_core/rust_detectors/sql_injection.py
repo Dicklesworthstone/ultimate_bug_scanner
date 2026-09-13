@@ -212,13 +212,9 @@ def source_line(lines, line_no):
 
 def refs_in_expr(expr: str, table):
     searchable = without_string_literals(expr)
-    refs = []
-    for name in table:
-        if re.search(rf'\b{re.escape(name)}\b', searchable) or re.search(
-            rf'\{{\s*{re.escape(name)}\s*(?::|[}}])', expr
-        ):
-            refs.append(name)
-    return refs
+    names = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', searchable))
+    names.update(re.findall(r'\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::|})', expr))
+    return [name for name in table if name in names]
 
 
 def taint_from_expr(expr: str, tainted):

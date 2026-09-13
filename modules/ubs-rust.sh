@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e58dbe44f2c4a4f052838d494e34372ce3d118c06a581015c911b55d989cea2c"
+UBS_LIB_CHECKSUM="dbebe57aa0e5e416bc3a82a6454b0c71a3589fe9b11e50bf046ff520d2856efc"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -440,15 +440,27 @@ if [[ "$LIST_RULES" -eq 1 ]]; then
   fi
   helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
-  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+  if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$DUMP_RULES_DIR" <<'PYRULES'
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 from ubs_core.rust_rules import generate
 with tempfile.TemporaryDirectory() as td:
-    m = generate(Path(td))
+    rule_dir = Path(td)
+    m = generate(rule_dir)
+    if sys.argv[1]:
+        destination = Path(sys.argv[1])
+        destination.mkdir(parents=True, exist_ok=True)
+        for rule_file in rule_dir.glob('*.yml'):
+            shutil.copy2(rule_file, destination / rule_file.name)
     for k in sorted(m.keys()):
         print(k)
-"
+PYRULES
+  then
+    echo "ERROR: failed to generate or dump AST rules" >&2
+    exit 2
+  fi
   exit 0
 fi
 

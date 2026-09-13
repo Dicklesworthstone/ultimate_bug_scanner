@@ -18,9 +18,11 @@ One process replaces the legacy ~250-400 spawn scan in modules/ubs-ruby.sh:
   ast layer       ubs_core.ruby_rules.generate + ruby_ast.scan_all. Legacy
                   ruby NEVER converted rule-pack output into counters (cat 18
                   only wrote --json-out/--sarif-out passthrough files), so
-                  exactly ONE pack rule reaches the sink: the category-16
+                  exactly ONE pack rule reaches the counted sink: the category-16
                   async rule that run_async_error_checks ran via its own
-                  `scan -r` (CATEGORY_MAP gates it under --skip).
+                  `scan -r` (CATEGORY_MAP gates it under --skip). All AST
+                  records survive in the cache and extras.ast_findings for
+                  separate SARIF reporting, including a warm-cache scan.
 
 Output contract (identical to py_scan/js_scan): NDJSON findings sink records
 {rule, category_id, path, line, col, severity, message, suppressed}; legacy
@@ -640,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
             scan_all(
                 Path(args.ast_rule_dir), ast_files, capturing_sink, overrides,
-                count_only=set(CATEGORY_MAP), skip_categories=None,
+                counted_rules=set(CATEGORY_MAP),
                 category_map=CATEGORY_MAP, skip=skip,
             )
         cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
@@ -660,14 +662,25 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
+    ast_records: list[dict] = []
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
             if recs:
-                for r in recs:
-                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+                for cached_record in recs:
+                    record = dict(cached_record)
+                    # Match the cache replay contract: every layer reports the
+                    # current input spelling, including detectors that emit a
+                    # path relative to their own project root on a cold scan.
+                    record["path"] = str(f)
+                    is_ast = record.pop("_ast_pack", False)
+                    report_only = record.pop("_report_only", False)
+                    if is_ast:
+                        ast_records.append(record)
+                    if not report_only:
+                        sink_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
@@ -714,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
             "report": _legacy_report(records, args.version),
-            "extras": {"profile": profile_data},
+            "extras": {"profile": profile_data, "ast_findings": ast_records},
         }
         if os.environ.get("UBS_PROFILE") == "1":
             doc["profile"] = profile_data

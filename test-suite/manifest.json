@@ -13507,7 +13507,8 @@
         "--format=toon"
       ],
       "env": {
-        "UBS_TEST_FORCE_NO_TOON": "1"
+        "UBS_TEST_FORCE_NO_TOON": "1",
+        "TOON_TRU_BIN": "tru"
       },
       "expect": {
         "exit_code": 2,

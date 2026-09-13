@@ -17,6 +17,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -271,6 +272,14 @@ class ScanCache:
         extra_parts = [f"skip={skip}", f"rules_hash={rules_hash}"]
         if extra:
             extra_parts.append(extra)
+        if self.enabled:
+            try:
+                extra_parts.append(f"helper_sources={self._derive_helper_source_hash()}")
+            except OSError as exc:
+                self.enabled = False
+                sys.stderr.write(
+                    f"ubs: cache disabled: cannot fingerprint helper sources: {exc}\n"
+                )
         self.cache_key = compute_cache_key(
             lang=self.lang,
             engine_version=engine_version,
@@ -291,6 +300,41 @@ class ScanCache:
             "merkle_dir_hits": 0,
             "file_hits": 0,
         }
+
+    def _derive_helper_source_hash(self) -> str:
+        """Fingerprint the installed helper sources, including shared imports.
+
+        Bytecode is excluded so normal imports do not invalidate a warm cache.
+        Source contents are read on every construction; timestamps cannot prove
+        that a helper-only detection fix has already been applied to findings.
+        """
+        helpers_dir = Path(__file__).resolve().parent.parent
+        h = hashlib.blake2b(digest_size=16)
+
+        def report_walk_error(exc: OSError) -> None:
+            raise exc
+
+        for root, directories, names in os.walk(helpers_dir, onerror=report_walk_error):
+            directories[:] = sorted(name for name in directories if name != "__pycache__")
+            for name in directories:
+                directory = Path(root) / name
+                if stat.S_ISLNK(directory.lstat().st_mode):
+                    raise OSError(f"refusing symlink helper directory: {directory}")
+            for name in sorted(names):
+                source = Path(root) / name
+                if source.suffix not in (".py", ".go", ".js"):
+                    continue
+                if not stat.S_ISREG(source.stat().st_mode):
+                    raise OSError(f"helper source is not a regular file: {source}")
+                relative = source.relative_to(helpers_dir).as_posix().encode(
+                    "utf-8", "surrogateescape"
+                )
+                content = source.read_bytes()
+                h.update(len(relative).to_bytes(8, "big"))
+                h.update(relative)
+                h.update(len(content).to_bytes(8, "big"))
+                h.update(content)
+        return h.hexdigest()
 
     def _derive_rulepack_hash(self) -> str:
         """Derive rulepack hash from language rules, patterns, and detectors."""
@@ -376,6 +420,17 @@ class ScanCache:
         except OSError:
             return None
 
+    def _inputs_valid(self, inputs: Any, git_blobs: dict[str, str] | None) -> bool:
+        """Require every recorded external input to retain its content hash."""
+        if not isinstance(inputs, dict):
+            return False
+        for input_path, input_hash in inputs.items():
+            if not isinstance(input_path, str) or not isinstance(input_hash, str):
+                return False
+            if self._get_file_hash(Path(input_path), git_blobs) != input_hash:
+                return False
+        return True
+
     def partition_files(
         self, files: Sequence[Path]
     ) -> tuple[dict[Path, list[dict]], list[Path]]:
@@ -427,9 +482,17 @@ class ScanCache:
             dir_hit = False
             dir_data = lock_free_read_json(dir_cache_file)
             if isinstance(dir_data, dict) and dir_data.get("merkle") == dir_merkle:  # ubs:ignore
-                # Whole directory subtree hit!
                 saved_findings = dir_data.get("findings", {})
-                if isinstance(saved_findings, dict):
+                directory_inputs = dir_data.get("inputs", {})
+                if (
+                    isinstance(saved_findings, dict)
+                    and isinstance(directory_inputs, dict)
+                    and all(
+                        self._inputs_valid(inputs, git_blobs)
+                        for inputs in directory_inputs.values()
+                    )
+                ):
+                    # A matching source subtree cannot bypass changed inputs.
                     dir_hit = True
                     self.stats["merkle_dir_hits"] += 1
                     for f in dir_files:
@@ -452,14 +515,7 @@ class ScanCache:
                     file_cache_file = self.files_dir / fh[:2] / f"{fh}.json"
                     file_data = lock_free_read_json(file_cache_file)
                     if isinstance(file_data, dict) and file_data.get("hash") == fh:
-                        # Validate cross-file input set if recorded
-                        inputs_valid = True
-                        for in_path_str, in_hash in file_data.get("inputs", {}).items():
-                            cur_in_hash = self._get_file_hash(Path(in_path_str), git_blobs)
-                            if cur_in_hash != in_hash:
-                                inputs_valid = False
-                                break
-                        if inputs_valid:
+                        if self._inputs_valid(file_data.get("inputs", {}), git_blobs):
                             recs = file_data.get("findings", [])
                             adapted = []
                             for r in recs:
@@ -563,12 +619,14 @@ class ScanCache:
         for d, dir_files in by_dir.items():
             children: list[tuple[str, str, str]] = []
             dir_findings: dict[str, list[dict]] = {}
+            dir_inputs: dict[str, dict[str, str]] = {}
             for f in dir_files:
                 fh = file_hashes.get(f)
                 if fh:
                     children.append(("file", f.name, fh))
                     recs = self._lookup_findings(f, findings_by_file)
                     dir_findings[f.name] = recs
+                    dir_inputs[f.name] = inputs_by_file.get(str(f), {}) if inputs_by_file else {}
 
             merkle_content = "".join(
                 f"{t}:{n}:{h}\n" for t, n, h in sorted(children)
@@ -578,6 +636,7 @@ class ScanCache:
             atomic_write_json(dir_cache_file, {
                 "merkle": dir_merkle,
                 "findings": dir_findings,
+                "inputs": dir_inputs,
                 "stored_at": time.time(),
             })
 

@@ -101,7 +101,7 @@ def _first_match(pattern: re.Pattern[str], text: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Async rule — verbatim heredoc body of run_async_error_checks (608-628).
+# Async rule — the invoked function's body owns the error and its handler.
 # Scanned in its own pass (``scan --rule``, 632), never in the base sgconfig.
 # ─────────────────────────────────────────────────────────────────────────────
 _ASYNC_RULE: tuple[str, str] = (
@@ -109,20 +109,37 @@ _ASYNC_RULE: tuple[str, str] = (
     r'''id: go.async.goroutine-err-no-check
 language: go
 rule:
-  all:
-    - pattern: |
-        go func($PARAMS) {
-          $$$BODY
-        }()
-    - any:
-        - has: { pattern: err := $CALL }
-        - has: { pattern: $VAL, err := $CALL }
-    - not:
-        has:
-          pattern: |
-            if err != nil {
-              $$$
-            }
+  kind: go_statement
+  has:
+    kind: call_expression
+    has:
+      kind: func_literal
+      field: function
+      has:
+        kind: block
+        field: body
+        any:
+          - has:
+              pattern: $VAL, _ := $CALL
+              stopBy: { kind: func_literal }
+          - all:
+              - has:
+                  any:
+                    - pattern: err := $CALL
+                    - pattern: $VAL, err := $CALL
+                  stopBy: { kind: func_literal }
+              - not:
+                  has:
+                    pattern: |
+                      if err != nil {
+                        $$$
+                      }
+                    stopBy: { kind: func_literal }
+constraints:
+  CALL:
+    kind: expression_list
+    has:
+      kind: call_expression
 severity: warning
 message: "goroutine body ignores returned error; handle it or propagate via channel/errgroup."
 ''',

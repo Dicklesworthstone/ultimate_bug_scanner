@@ -152,7 +152,10 @@ def is_safe_expr(expr: str) -> bool:
 
 
 def refs_in_expr(expr: str, tainted):
-    return [name for name in tainted if re.search(rf'\b{re.escape(name)}\b', expr)]
+    # Assignment names are ASCII identifiers. Keep Unicode word boundaries
+    # and taint insertion order, without compiling a regex for every name.
+    names = set(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', expr))
+    return [name for name in tainted if name in names]
 
 
 def taint_from_expr(expr: str, tainted):

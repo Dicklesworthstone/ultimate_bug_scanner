@@ -146,6 +146,17 @@ class Hit:
     text: str
 
 
+def merge_ast_and_line_hits(ast_hits: list[Hit], line_hits: list[Hit]) -> list[Hit]:
+    """Keep syntax sites, adding line fallbacks only where AST found no site.
+
+    A line detector cannot distinguish two syntax sites on the same line.
+    Preserve both AST sites while preventing the fallback from counting that
+    line again. Unmatched lines and files retain their fallback evidence.
+    """
+    covered = {(hit.path, hit.line) for hit in ast_hits}
+    return ast_hits + [hit for hit in line_hits if (hit.path, hit.line) not in covered]
+
+
 def cargo_integration_test_root(path: Path) -> bool:
     """Recognize only default Cargo tests/name.rs roots, not arbitrary tests/ paths.
 
@@ -1425,8 +1436,10 @@ def cat_19(scan: Scan, r: Renderer) -> None:
 def cat_20(scan: Scan, r: Renderer) -> None:
     r.header(20); r.category(20)
     r.subheader("std::sync lock usage inside async fn (blocking risk)")
-    locks = (scan.ast_hits(["std_lock_async_lock", "std_lock_async_read", "std_lock_async_write"])
-             + scan.rg_lines(r"async\s+fn[^{]*\{[^}]*\.(lock|read|write)\("))
+    locks = merge_ast_and_line_hits(
+        scan.ast_hits(["std_lock_async_lock", "std_lock_async_read", "std_lock_async_write"]),
+        scan.rg_lines(r"async\s+fn[^{]*\{[^}]*\.(lock|read|write)\("),
+    )
     if locks:
         r.finding("warning", len(locks), "Blocking std::sync locks in async functions",
                   "Prefer tokio::sync locks or spawn_blocking; avoid blocking executor threads", locks[:3], 3)
@@ -1442,8 +1455,10 @@ def cat_20(scan: Scan, r: Renderer) -> None:
         scan.emit("rust.async-locking.std-guard-await", 20, "warning", len(std_guard),
                   "Potential lock guard across await (std::sync)", std_guard)
     r.subheader("Potential async lock guard held across await (tokio/async locks heuristic)")
-    tokio_guard = (scan.ast_hits(["tokio_guard_lock", "tokio_guard_read", "tokio_guard_write"])
-                   + scan.rg_lines(r"let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^;]*\.(lock|read|write)\(\)\.await"))
+    tokio_guard = merge_ast_and_line_hits(
+        scan.ast_hits(["tokio_guard_lock", "tokio_guard_read", "tokio_guard_write"]),
+        scan.rg_lines(r"let\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*[^;]*\.(lock|read|write)\(\)\.await"),
+    )
     if tokio_guard:
         r.finding("warning", len(tokio_guard), "Potential async lock guard across await",
                   "Reduce critical section; prefer copying needed data out; explicit drop() before await")
@@ -1454,7 +1469,10 @@ def cat_20(scan: Scan, r: Renderer) -> None:
 def cat_21(scan: Scan, r: Renderer) -> None:
     r.header(21); r.category(21)
     r.subheader("assert!/assert_eq!/assert_ne! inventory")
-    asserts = scan.ast_hits(["assert", "assert_eq", "assert_ne"]) + scan.rg_lines(r"assert(_eq|_ne)?!\(")
+    asserts = merge_ast_and_line_hits(
+        scan.ast_hits(["assert", "assert_eq", "assert_ne"]),
+        scan.rg_lines(r"assert(_eq|_ne)?!\("),
+    )
     if asserts:
         r.finding("warning", len(asserts), "assert! macros present (panic surface)",
                   "If these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input", asserts[:3], 3)

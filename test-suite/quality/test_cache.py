@@ -14,6 +14,7 @@ Verifies:
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import shutil
@@ -78,6 +79,228 @@ class IncrementalCacheTests(unittest.TestCase):
             elapsed = time.perf_counter() - t0
             print(f"[{case_id}] FAIL ({elapsed:.3f}s): {exc}", flush=True)
             raise
+
+    def _copy_helpers(self) -> tuple[Path, dict[str, str]]:
+        helpers = self.test_root / "helpers"
+        shutil.copytree(
+            HELPERS_DIR,
+            helpers,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
+        run_env = dict(os.environ)
+        run_env["PYTHONPATH"] = str(helpers)
+        run_env[ENV_CACHE_DIR] = str(self.cache_dir)
+        run_env.pop(ENV_NO_CACHE, None)
+        run_env["UBS_PROFILE"] = "1"
+        run_env["UBS_CACHE_FILE"] = str(self.test_root / "scan-stats.json")
+        run_env["UBS_PREFILTER_FILE"] = str(self.test_root / "prefilter-stats.json")
+        return helpers, run_env
+
+    def _decode_json(self, payload: str, context: str) -> Any:
+        try:
+            return json.loads(payload)
+        except ValueError as exc:
+            self.fail(f"Invalid JSON: {exc}\n{context}\nJSON payload:\n{payload}")
+
+    def test_helper_source_upgrades_invalidate_real_scanner_cache(self) -> None:
+        helpers, run_env = self._copy_helpers()
+        sources = {
+            "unsafe.py": "value = eval(input())\n",
+            "handles.py": "fh = open('/tmp/cache-test.txt')\nfh.write('test')\n",
+            "clean.py": "def add(x, y):\n    return x + y\n",
+        }
+        files = []
+        for name, source in sources.items():
+            path = self.project_dir / name
+            path.write_text(source, encoding="utf-8")
+            files.append(path)
+        original_inputs = {path: path.read_bytes() for path in files}
+        helper_paths = (
+            "ubs_core/prefilter.py",
+            "ubs_core/lexer.py",
+            "ubs_core/py_detectors/_pathlike.py",
+            "resource_lifecycle_go.go",
+            "type_narrowing_ts.js",
+        )
+        for relative in helper_paths:
+            path = helpers / relative
+            prefix = b"#" if path.suffix == ".py" else b"//"
+            path.write_bytes(path.read_bytes() + b"\n" + prefix + b" cache identity revision A\n")
+
+        sink = self.test_root / "helper-scan.ndjson"
+        summary = self.test_root / "helper-summary.json"
+
+        def run_scan(expected_hits: int, label: str) -> tuple[bytes, dict, str, str]:
+            proc = subprocess.run(
+                [
+                    sys.executable, "-m", "ubs_core.py_scan",
+                    "--sink", str(sink), "--json-out", str(summary),
+                    "--project-dir", str(self.project_dir),
+                ],
+                input="\0".join(str(path) for path in files),
+                capture_output=True,
+                text=True,
+                cwd=str(helpers),
+                env=run_env,
+                timeout=180,
+            )
+            context = f"{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            self.assertEqual(proc.returncode, 1, context)
+            self.assertTrue(sink.is_file(), context)
+            self.assertTrue(summary.is_file(), context)
+            doc = self._decode_json(summary.read_text(encoding="utf-8"), context)
+            self.assertEqual(doc["status"], "ok", context)
+            self.assertEqual(doc["files"], len(files), context)
+            for profile in (doc["profile"], doc["extras"]["profile"]):
+                self.assertEqual(profile["cache_hits"], expected_hits, context)
+                self.assertEqual(profile["cache_misses"], len(files) - expected_hits, context)
+            data = sink.read_bytes()
+            records = [
+                self._decode_json(line, context)
+                for line in data.decode("utf-8").splitlines() if line.strip()
+            ]
+            self.assertIn("py.security.eval-exec-usage", {rec["rule"] for rec in records}, context)
+            for severity in ("critical", "warning", "info"):
+                self.assertEqual(
+                    doc[severity], sum(rec["severity"] == severity for rec in records), context,
+                )
+            stable_summary = {
+                key: doc[key] for key in ("critical", "warning", "info", "findings")
+            }
+            return data, stable_summary, proc.stderr, context
+
+        cold_bytes, cold_summary, _, _ = run_scan(0, "initial cold scan")
+
+        def assert_replay(expected_hits: int, label: str) -> tuple[str, str]:
+            data, summary_doc, stderr, context = run_scan(expected_hits, label)
+            self.assertEqual(data, cold_bytes, context)
+            self.assertEqual(summary_doc, cold_summary, context)
+            return stderr, context
+
+        assert_replay(len(files), "initial warm scan")
+        for relative in helper_paths:
+            with self.subTest(helper=relative):
+                path = helpers / relative
+                before_stat = path.stat()
+                before = path.read_bytes()
+                self.assertTrue(before.endswith(b" cache identity revision A\n"), relative)
+                after = before[:-2] + b"B\n"
+                self.assertEqual(len(after), len(before), relative)
+                self.assertNotEqual(after, before, relative)
+                path.write_bytes(after)
+                os.utime(path, ns=(before_stat.st_atime_ns, before_stat.st_mtime_ns))
+                self.assertEqual(path.stat().st_mtime_ns, before_stat.st_mtime_ns, relative)
+                self.assertEqual(path.stat().st_size, before_stat.st_size, relative)
+                self.assertEqual(path.read_bytes(), after, relative)
+                assert_replay(0, f"helper-only upgrade: {relative}")
+                assert_replay(len(files), f"unchanged upgraded helper: {relative}")
+
+        self.assertEqual({path: path.read_bytes() for path in files}, original_inputs)
+
+        def cache_contents() -> dict[str, bytes]:
+            return {
+                path.relative_to(self.cache_dir).as_posix(): path.read_bytes()
+                for path in self.cache_dir.rglob("*") if path.is_file()
+            }
+
+        before_cache = cache_contents()
+        self.assertTrue(before_cache, "the positive scans must populate actual cache entries")
+        unreadable = helpers / "ubs_core" / "_cache_identity_unreadable.py"
+        missing_target = self.test_root / "missing-helper-source.py"
+        self.assertFalse(missing_target.exists())
+        unreadable.symlink_to(missing_target)
+        self.assertTrue(unreadable.is_symlink())
+        for attempt in (1, 2):
+            stderr, context = assert_replay(0, f"unreadable helper attempt {attempt}")
+            self.assertIn("ubs: cache disabled: cannot fingerprint helper sources:", stderr, context)
+            self.assertIn(unreadable.name, stderr, context)
+            self.assertEqual(cache_contents(), before_cache, context)
+        run_env[ENV_NO_CACHE] = "1"
+        stderr, context = assert_replay(0, "explicitly disabled cache with unreadable helper")
+        self.assertNotIn("cannot fingerprint helper sources:", stderr, context)
+        self.assertEqual(cache_contents(), before_cache, context)
+
+    def test_helper_identity_applies_to_explicit_keys_for_all_languages(self) -> None:
+        helpers, run_env = self._copy_helpers()
+        languages = (
+            "python", "js", "golang", "rust", "java", "kotlin",
+            "ruby", "swift", "csharp", "cpp", "elixir", "bash",
+        )
+        code = (
+            "import json, sys\n"
+            "from ubs_core.cache import ScanCache\n"
+            "keys = {lang: ScanCache(lang, sys.argv[1], "
+            "module_checksum='fixed-module', rulepack_hash='fixed-rulepack').cache_key "
+            "for lang in sys.argv[2:]}\n"
+            "print(json.dumps(keys, sort_keys=True))\n"
+        )
+
+        def keys() -> dict[str, str]:
+            proc = subprocess.run(
+                [sys.executable, "-c", code, str(self.project_dir), *languages],
+                capture_output=True, text=True, cwd=str(helpers), env=run_env, timeout=60,
+            )
+            context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            self.assertEqual(proc.returncode, 0, context)
+            result = self._decode_json(proc.stdout, context)
+            self.assertEqual(set(result), set(languages), context)
+            return result
+
+        path = helpers / "ubs_core" / "prefilter.py"
+        path.write_bytes(path.read_bytes() + b"\n# explicit-key helper revision A\n")
+        before = keys()
+        self.assertEqual(keys(), before, "unchanged explicit keys must be stable")
+        source_stat = path.stat()
+        original = path.read_bytes()
+        changed = original[:-2] + b"B\n"
+        path.write_bytes(changed)
+        os.utime(path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+        self.assertEqual(path.stat().st_size, source_stat.st_size)
+        self.assertEqual(path.stat().st_mtime_ns, source_stat.st_mtime_ns)
+        self.assertNotEqual(path.read_bytes(), original)
+        after = keys()
+        for language in languages:
+            self.assertNotEqual(before[language], after[language], language)
+        self.assertEqual(keys(), after, "upgraded explicit keys must be stable")
+
+    def test_directory_hit_revalidates_external_input_dependencies(self) -> None:
+        dependent = self.project_dir / "dependent.py"
+        independent = self.project_dir / "independent.py"
+        dependency = self.test_root / "settings.json"
+        dependent.write_text("VALUE = 1\n", encoding="utf-8")
+        independent.write_text("VALUE = 2\n", encoding="utf-8")
+        dependency.write_text('{"mode":"before"}\n', encoding="utf-8")
+        files = [dependent, independent]
+        input_bytes = {path: path.read_bytes() for path in files}
+        dependency_hash = hashlib.blake2b(dependency.read_bytes(), digest_size=16).hexdigest()
+        cache = ScanCache("python", self.project_dir, rulepack_hash="dependency-regression")
+        cache.store_scanned_files(
+            files,
+            {str(path): [] for path in files},
+            inputs_by_file={str(dependent): {str(dependency): dependency_hash}},
+        )
+        cached, misses = cache.partition_files(files)
+        self.assertEqual(set(cached), set(files))
+        self.assertEqual(misses, [])
+        self.assertEqual(cache.stats["merkle_dir_hits"], 1, "the directory path must be exercised")
+        directory_entries = {path: path.read_bytes() for path in cache.dirs_dir.rglob("*.json")}
+        self.assertTrue(directory_entries)
+
+        dependency.write_text('{"mode":"after-upgrade"}\n', encoding="utf-8")
+        self.assertNotEqual(
+            hashlib.blake2b(dependency.read_bytes(), digest_size=16).hexdigest(), dependency_hash,
+        )
+        self.assertEqual({path: path.read_bytes() for path in files}, input_bytes)
+        refreshed = ScanCache("python", self.project_dir, rulepack_hash="dependency-regression")
+        cached, misses = refreshed.partition_files(files)
+        self.assertEqual(misses, [dependent], "changed external input must invalidate its consumer")
+        self.assertEqual(set(cached), {independent}, "independent source must remain cached")
+        self.assertEqual(refreshed.stats["hits"], 1)
+        self.assertEqual(refreshed.stats["misses"], 1)
+        self.assertEqual(
+            {path: path.read_bytes() for path in cache.dirs_dir.rglob("*.json")}, directory_entries,
+            "dependency validation must not rely on deleting the directory cache",
+        )
 
     def test_replay_is_byte_identical_to_cold_scan(self) -> None:
         case_id = "cache-byte-identical-replay"

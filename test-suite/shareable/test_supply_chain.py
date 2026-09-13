@@ -18,6 +18,7 @@ output so the log alone is enough to diagnose them.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import re
@@ -136,7 +137,7 @@ class Sandbox:
         })
         env.update(dict(extra_env))
         cmd = [str(self.bin_dir / "ubs"), f"--module-dir={self.module_dir}", "--only=python", "--ci", "--format=json", str(PY_FIXTURE)]
-        return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)
+        return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied UBS argv scans the fixed Python fixture using a local raw tree.
 
 
 def check_healthy_cache_scans() -> None:
@@ -236,12 +237,24 @@ def setup_module_sandbox(dest: Path) -> None:
         shutil.copy2(core_file, dest / rel)
 
 
+def standalone_scan_completed(proc: subprocess.CompletedProcess) -> bool:
+    if proc.returncode not in (0, 1):
+        return False
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError:
+        return False
+    return isinstance(doc, dict) and doc.get("language") == "python" and doc.get("files") == 1 and doc.get("status") == "ok"
+
+
 def test_tampered_helper_refused() -> None:
-    """Modify a byte in a cached helper -> module exits 2 with remediation."""
+    """Tamper the standalone v2 scanner's core helper -> exit 2 with remediation."""
     with tempfile.TemporaryDirectory(prefix="ubs-sc-standalone-") as tmp:
         mod_dir = Path(tmp)
         setup_module_sandbox(mod_dir)
-        target = mod_dir / TAMPERED_HELPER
+        # resource_lifecycle_py.py belongs to the legacy meta-runner helper
+        # inventory; the standalone v2 scanner imports ubs_core.io instead.
+        target = mod_dir / CORE_ASSET
         target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
 
         env = os.environ.copy()
@@ -253,11 +266,13 @@ def test_tampered_helper_refused() -> None:
         env.pop("UBS_VERIFIED_ASSET_DIR", None)
 
         cmd = [str(mod_dir / "ubs-python.sh"), "--ci", "--format=json", str(PY_FIXTURE)]
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied module argv and fixed fixture exercise tampered-core refusal.
         combined = proc.stdout + proc.stderr
         ok = (
             proc.returncode == 2
             and "failed checksum verification" in combined
+            and CORE_ASSET in combined
+            and "doctor --fix" in combined
             and "UBS_ALLOW_UNVERIFIED_HELPERS=1" in combined
         )
         report("test_tampered_helper_refused", ok, f"exit={proc.returncode}", proc)
@@ -280,17 +295,20 @@ def test_standalone_module_verifies() -> None:
         cmd = [str(mod_dir / "ubs-python.sh"), "--ci", "--format=json", str(PY_FIXTURE)]
 
         # 1. Clean standalone run succeeds (verifies embedded checksum table)
-        proc_clean = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
-        clean_ok = proc_clean.returncode in (0, 1) and "failed checksum verification" not in (proc_clean.stdout + proc_clean.stderr)
+        proc_clean = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)  # ubs:ignore[python.taint.command] - trusted test-runner env; pristine copied module argv scans the fixed Python fixture.
+        clean_ok = (
+            standalone_scan_completed(proc_clean)
+            and "failed checksum verification" not in (proc_clean.stdout + proc_clean.stderr)
+        )
 
         # 2. Tampered helper + UBS_ALLOW_UNVERIFIED_HELPERS=1 warns and proceeds
-        target = mod_dir / TAMPERED_HELPER
+        target = mod_dir / CORE_ASSET
         target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
         env["UBS_ALLOW_UNVERIFIED_HELPERS"] = "1"
-        proc_override = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        proc_override = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied module argv tests the explicit override for a test-owned comment mutation.
         override_ok = (
-            proc_override.returncode in (0, 1)
-            and "UBS_ALLOW_UNVERIFIED_HELPERS=1" in (proc_override.stdout + proc_override.stderr)
+            standalone_scan_completed(proc_override)
+            and f"warning: UBS_ALLOW_UNVERIFIED_HELPERS=1: using unverified helpers dir at {mod_dir / 'helpers'}" in proc_override.stderr
         )
 
         # 3. UBS_VERIFIED_ASSET_DIR set to empty dir refuses unverified fallback
@@ -298,7 +316,7 @@ def test_standalone_module_verifies() -> None:
         empty_dir.mkdir()
         env["UBS_ALLOW_UNVERIFIED_HELPERS"] = "0"
         env["UBS_VERIFIED_ASSET_DIR"] = str(empty_dir)
-        proc_refuse = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        proc_refuse = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)  # ubs:ignore[python.taint.command] - trusted test-runner env; fixed module argv tests refusal with a test-owned empty verified directory.
         refuse_ok = proc_refuse.returncode == 2 and (
             "unverified location" in (proc_refuse.stdout + proc_refuse.stderr)
             or "refusing" in (proc_refuse.stdout + proc_refuse.stderr)
@@ -371,7 +389,7 @@ def test_corrupted_ast_grep_zip_refused() -> None:
         env["UBS_ALLOW_UNVERIFIED_HELPERS"] = "1"
 
         cmd = [str(bin_dir / "ubs"), f"--module-dir={cache_dir}", "--only=js", "--ci", "--format=json", str(js_fixture)]
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=60)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied UBS argv checks a test-owned corrupt archive served through file://.
         combined = proc.stdout + proc.stderr
         ok = (
             proc.returncode == 2
@@ -406,7 +424,7 @@ def test_self_update_bad_signature_refused() -> None:
         env["FORCE_SELF_UPDATE"] = "1"
         env["NO_COLOR"] = "1"
 
-        proc = subprocess.run([str(installed_ubs), "--update"], cwd=p, env=env, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run([str(installed_ubs), "--update"], cwd=p, env=env, capture_output=True, text=True, timeout=60)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied UBS --update checks a test-owned local release with a bad signature.
         new_sha = hashlib.sha256(installed_ubs.read_bytes()).hexdigest()
 
         combined = proc.stdout + proc.stderr

@@ -6,8 +6,8 @@ Ruby port of the runtime ast-grep rule GENERATION in modules/ubs-ruby.sh:
 
 ``generate(rule_dir, user_rules_dir=None)`` writes::
 
-    <rule_dir>/rules/*.yml        the 29 base rules (byte-identical to the
-                                  legacy heredocs)
+    <rule_dir>/rules/*.yml        the 29 base rules (legacy pack plus the
+                                  corrected thread/rescue matcher)
     <rule_dir>/sgconfig-ruby.yml  single-grammar config listing every rule
                                   file (one ``scan -c`` invocation total)
     <rule_dir>/manifest.json      rule_id -> {severity, language, file}; also
@@ -20,7 +20,8 @@ that legacy counted into totals (``ruby.async.thread-no-rescue`` ran inside
 category 16 via run_async_error_checks with an undeclared severity array,
 so its effective tier is the parser's warning default); every other pack
 rule was a cat-18 --json-out/--sarif-out passthrough with zero counter
-impact, and ruby_ast consumes exactly the CATEGORY_MAP keys.
+impact. ruby_ast counts exactly the CATEGORY_MAP keys while retaining the
+remaining records for the separate SARIF rule-pack report.
 """
 from __future__ import annotations
 
@@ -82,9 +83,9 @@ def _first_match(pattern: re.Pattern[str], text: str) -> str:
     return match.group(1) if match else ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Base rule pack — verbatim heredoc bodies of write_ast_rules (2119-2471)
-# plus the run_async_error_checks rule (3337-3352). Raw strings keep the
-# YAML byte-identical to the heredocs.
+# Base rule pack from write_ast_rules (2119-2471), plus the corrected
+# run_async_error_checks rule. Its legacy `contains` key and rescue node
+# name were invalid and prevented the entire consolidated pack from loading.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _RULES: tuple[tuple[str, str], ...] = (
@@ -442,13 +443,69 @@ message: "Ensure bounded retries with backoff."
         r'''id: ruby.async.thread-no-rescue
 language: ruby
 rule:
-  pattern: |
-    Thread.new($ARGS) do
-      $$
-    end
+  kind: call
+  all:
+    - has:
+        field: receiver
+        pattern: Thread
+    - has:
+        field: method
+        pattern: new
+    - has:
+        field: block
+        any:
+          - kind: block
+          - kind: do_block
   not:
-    contains:
-      kind: rescue_clause
+    any:
+      - has:
+          kind: rescue
+          stopBy: end
+      - inside:
+          kind: call
+          field: receiver
+          has:
+            field: method
+            regex: '^(join|value)$'
+      - inside:
+          kind: assignment
+          has:
+            field: left
+            pattern: $HANDLE
+          precedes:
+            any:
+              - pattern: $HANDLE.join
+              - pattern: $HANDLE.value
+            stopBy:
+              kind: assignment
+      - inside:
+          pattern: $HANDLES << $THREAD
+          any:
+            - precedes:
+                any:
+                  - pattern: $HANDLES.each(&:join)
+                  - pattern: $HANDLES.each(&:value)
+                stopBy:
+                  kind: assignment
+            - inside:
+                kind: call
+                has:
+                  field: block
+                  any:
+                    - kind: block
+                    - kind: do_block
+                precedes:
+                  any:
+                    - pattern: $HANDLES.each(&:join)
+                    - pattern: $HANDLES.each(&:value)
+                  stopBy:
+                    kind: assignment
+                stopBy:
+                  any:
+                    - kind: method
+                    - kind: singleton_method
+severity: warning
+message: "Rescue thread errors or observe them with join/value"
 ''',
     ),
 )

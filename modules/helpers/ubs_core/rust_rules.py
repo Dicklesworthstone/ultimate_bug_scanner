@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-__all__ = ["AST_PATTERNS", "UNPARSEABLE_RULES", "generate"]
+__all__ = ["AST_PATTERNS", "AST_CHECKS", "UNPARSEABLE_RULES", "generate"]
 
 
 def _p(category: int, check: str, slug: str, pattern: str) -> tuple[int, str, str, str]:
@@ -215,6 +215,80 @@ RUN_MODE_RULES: dict[str, str] = {
 }
 
 
+# These checks formerly existed only in the separate SARIF pack. Keep their
+# syntax rules and diagnostic metadata together so native text, JSON, SARIF,
+# counters, and cached findings all report the same actionable diagnostic.
+# (category, check slug, native severity, message, ast-grep rule)
+AST_CHECKS: tuple[tuple[int, str, str, str, dict], ...] = (
+    (22, "ptr_cast", "info", "Raw pointer cast; verify layouts and lifetimes", {
+        "any": [{"pattern": "$X as *const $T"}, {"pattern": "$X as *mut $T"}],
+    }),
+    (23, "parse_float_no_finite_check", "info",
+     "parse::<f64>() can produce INFINITY/NaN; validate with is_finite() after parsing", {
+         "any": [{"pattern": "$X.parse::<f64>().unwrap_or($D)"},
+                 {"pattern": "$X.parse::<f32>().unwrap_or($D)"}],
+     }),
+    (4, "instant_now_elapsed", "warning",
+     "Instant::now().elapsed() is always ~0ns; you likely want elapsed() on a previously-stored Instant", {
+         "pattern": "Instant::now().elapsed()",
+     }),
+    (4, "instant_subtraction", "warning",
+     "Instant subtraction panics if duration exceeds system uptime; use checked_sub()", {
+         "pattern": "Instant::now() - $DUR",
+     }),
+    (21, "from_slice_panic", "warning",
+     "from_slice panics if input length is wrong; validate length first or use try_from", {
+         "any": [{"pattern": "Nonce::from_slice($X)"},
+                 {"pattern": "GenericArray::from_slice($X)"},
+                 {"pattern": "Key::from_slice($X)"}],
+     }),
+    (4, "i64_negate_overflow", "info",
+     "Negating i64::MIN wraps silently to i64::MIN; consider checked_neg() or promote to i128", {
+         "any": [{"pattern": "$X.wrapping_neg()"}, {"pattern": "-($X as i64)"}],
+     }),
+    (4, "wrapping_arithmetic", "info",
+     "wrapping arithmetic silently overflows; verify this is intentional and not masking a bug", {
+         "any": [{"pattern": "$X.wrapping_add($Y)"},
+                 {"pattern": "$X.wrapping_sub($Y)"},
+                 {"pattern": "$X.wrapping_mul($Y)"}],
+     }),
+    (3, "tokio_spawn_no_move", "info",
+     "tokio::spawn without `move`; consider `async move` to avoid borrow across await.", {
+         "pattern": "tokio::spawn(async { $$$BODY })",
+     }),
+    (3, "tokio_block_in_place", "info",
+     "block_in_place inside async; ensure this is truly needed and guarded", {
+         "pattern": "tokio::task::block_in_place($$$)",
+         "inside": {"pattern": "async fn $N($$$ARGS) { $$$BODY }", "stopBy": "end"},
+     }),
+    (7, "write_not_atomic", "info",
+     "fs::write is not atomic (truncates then writes); for durability, write to a temp file and rename", {
+         "any": [{"pattern": "std::fs::write($PATH, $DATA)"},
+                 {"pattern": "fs::write($PATH, $DATA)"}],
+     }),
+    (5, "map_clone", "info", "map(|x| x.clone()) can often be replaced with .cloned()", {
+        "pattern": "$I.map(|$P| $P.clone())",
+    }),
+    (23, "strict_utf8", "warning",
+     "from_utf8().unwrap() panics on invalid UTF-8; consider from_utf8_lossy() for untrusted input", {
+         "any": [{"pattern": "String::from_utf8($X).unwrap()"},
+                 {"pattern": "str::from_utf8($X).unwrap()"},
+                 {"pattern": "String::from_utf8($X).expect($MSG)"},
+                 {"pattern": "str::from_utf8($X).expect($MSG)"}],
+     }),
+    (24, "regex_new_unwrap", "info",
+     "Regex::new(...).unwrap(); consider compile-time regex! or handle error with context", {
+         "pattern": "regex::Regex::new($RE).unwrap()",
+     }),
+    (21, "debug_assert_macros", "info",
+     "debug_assert! present; ensure invariants are also enforced where needed", {
+         "any": [{"pattern": "debug_assert!($$$)"},
+                 {"pattern": "debug_assert_eq!($$$)"},
+                 {"pattern": "debug_assert_ne!($$$)"}],
+     }),
+)
+
+
 def generate(rule_dir: Path) -> dict:
     """Write the consolidated rule pack; return the manifest dict."""
     rule_dir.mkdir(parents=True, exist_ok=True)
@@ -274,6 +348,16 @@ def generate(rule_dir: Path) -> dict:
         (rule_dir / filename).write_text(body, encoding="utf-8")
         rule_files.append(filename)
         manifest[rule_id] = metadata
+    for category, slug, severity, message, rule in AST_CHECKS:
+        rule_id = f"rust.ast.{slug}"
+        filename = f"{slug}.yml"
+        body = f"id: {rule_id}\nlanguage: rust\nrule: {json.dumps(rule)}\n"
+        (rule_dir / filename).write_text(body, encoding="utf-8")
+        rule_files.append(filename)
+        manifest[rule_id] = {
+            "rule": rule, "category": category, "check": slug,
+            "severity": severity, "message": message,
+        }
     sgconfig = (
         "ruleDirs:\n"
         + "".join(f"  - ./{filename}\n" for filename in rule_files)

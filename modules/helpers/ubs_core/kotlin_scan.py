@@ -195,20 +195,8 @@ def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: se
 def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Path | None = None, prefilter: Any = None) -> None:
     from ubs_core.registry import RunContext
 
-    def _rel(path: str) -> str:
-        if project_dir is None or not path:
-            return path
-        try:
-            p = Path(path)
-            if not p.is_absolute():
-                resolved = (Path.cwd() / p).resolve()
-                base = Path(project_dir).resolve()
-                if resolved != base:
-                    return str(resolved.relative_to(base))
-                return path
-            return str(p.resolve().relative_to(Path(project_dir).resolve()))
-        except ValueError:
-            return path
+    def _source_path(path: str) -> str:
+        return str(Path(path).resolve()) if path else path
 
     # 1. Type narrowing (category 1)
     if 1 not in skip:
@@ -224,7 +212,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                 sink.write(json.dumps({
                     "rule": rule_id,
                     "category_id": "kotlin.type-narrowing",
-                    "path": _rel(str(finding.get("path", ""))),
+                    "path": _source_path(str(finding.get("path", ""))),
                     "line": int(finding.get("line", 0) or 0),
                     "col": int(finding.get("col", 1) or 1),
                     "severity": finding.get("severity", "warning"),
@@ -246,7 +234,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                 sink.write(json.dumps({
                     "rule": "kotlin.taint.path_traversal",
                     "category_id": "kotlin.security",
-                    "path": _rel(str(finding.get("path", ""))),
+                    "path": _source_path(str(finding.get("path", ""))),
                     "line": int(finding.get("line", 0) or 0),
                     "col": int(finding.get("col", 1) or 1),
                     "severity": "critical",
@@ -263,7 +251,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                 sink.write(json.dumps({
                     "rule": "kotlin.taint.open_redirect",
                     "category_id": "kotlin.security",
-                    "path": _rel(str(finding.get("path", ""))),
+                    "path": _source_path(str(finding.get("path", ""))),
                     "line": int(finding.get("line", 0) or 0),
                     "col": int(finding.get("col", 1) or 1),
                     "severity": "critical",
@@ -509,7 +497,7 @@ def main(argv: list[str] | None = None) -> int:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+                recs = capturing_sink.get_for_file(f)
             if recs:
                 for r in recs:
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")

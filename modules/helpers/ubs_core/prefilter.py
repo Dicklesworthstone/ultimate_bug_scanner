@@ -200,17 +200,32 @@ class PrefilterResult:
         }
 
 
+def _pattern_identifier_literals(pattern: str) -> set[str]:
+    """Extract fixed identifiers without mistaking metavariable names for code."""
+    cleaned = re.sub(r"[$]+[A-Za-z0-9_]*", " ", pattern)
+    return {word for word in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned)
+            if len(word) >= 2 and word.lower() not in ("true", "false")}
+
+
 def _structured_rule_literals(rule: Any) -> set[str]:
     """Return a conservative OR-set of literals from required JSON constraints.
 
-    Only simple identifier regexes are interpreted. In particular, pattern
-    contexts, negated rules, and stopBy traversal boundaries are not matched
-    source and must never contribute prefilter requirements.
+    Scalar code patterns and simple identifier regexes are interpreted.
+    Pattern contexts, negated rules, and stopBy traversal boundaries are not
+    matched source and must never contribute prefilter requirements.
     """
     if not isinstance(rule, dict):
         return set()
 
     literals: set[str] = set()
+    pattern = rule.get("pattern")
+    if isinstance(pattern, str) and not re.search(r'''["'`#\\]|//|/\*''', pattern):
+        # Scalar patterns use smart matching: fixed identifiers must occur,
+        # while metavariables can match arbitrary nodes (including no nodes).
+        # Do not require punctuation or dotted adjacency, which can vary in
+        # otherwise matching source. Quoted/comment/escaped forms stay on the
+        # fallback path rather than guessing which text belongs to the AST.
+        literals.update(_pattern_identifier_literals(pattern))
     regex = rule.get("regex")
     if isinstance(regex, str):
         match = re.fullmatch(r"(?:\\b)?([A-Za-z_][A-Za-z0-9_]*)(?:\\b)?", regex)
@@ -347,13 +362,7 @@ def extract_ast_rule_literals(rule_id: str, rule_text: str | dict, lang: str = "
         for d in re.findall(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", p):
             literals.add(d)
 
-        # Strip metavariables: $$$ARGS, $VAR, $_
-        cleaned = re.sub(r"[$]+[A-Za-z0-9_]*", " ", p)
-        # Find identifiers
-        words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", cleaned)
-        for w in words:
-            if len(w) >= 2 and w.lower() not in ("true", "false"):
-                literals.add(w)
+        literals.update(_pattern_identifier_literals(p))
 
     return literals
 

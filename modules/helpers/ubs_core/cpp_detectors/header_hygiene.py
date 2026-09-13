@@ -28,7 +28,6 @@ _USING_STD_RE = re.compile(r"using[ \t]+namespace[ \t]+std")
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
-    cwd = Path.cwd()
     for path in files:
         if path.suffix.lower() not in HEADER_SUFFIXES:
             continue
@@ -37,10 +36,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
         except OSError:
             continue
         lines = text.splitlines()
-        try:
-            rel = str(path.resolve().relative_to(cwd))
-        except ValueError:
-            rel = path.name
+        rel = str(path.resolve())
         if not any(_GUARD_RE.search(line) for line in lines[:50]):
             yield "cpp.detector.header-guards", rel, 0, 1, rel
         for idx, line in enumerate(lines, start=1):

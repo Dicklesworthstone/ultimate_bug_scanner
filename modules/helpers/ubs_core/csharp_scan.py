@@ -243,19 +243,9 @@ def load_patterns() -> list:
     return patterns
 
 
-def _relativize(path_str: str, base_dir: Path) -> str:
-    path = Path(path_str)
-    if not path.is_absolute():
-        if (base_dir / path).is_file():
-            path = (base_dir / path).resolve()
-        elif (Path.cwd() / path).is_file():
-            path = (Path.cwd() / path).resolve()
-        else:
-            path = path.resolve()
-    try:
-        return str(path.resolve().relative_to(base_dir.resolve()))
-    except (ValueError, OSError):
-        return str(path)
+def _source_path(path_str: str, base_dir: Path) -> str:
+    """Resolve against the producer's known base, never another existing file."""
+    return str((base_dir / Path(path_str)).resolve()) if path_str else path_str
 
 
 def _rule_meta(rule: str):
@@ -298,7 +288,7 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
             sink.write(json.dumps({
                 "rule": rule_id,
                 "category_id": f"csharp.{slug_for_category(category)}",
-                "path": _relativize(str(path), base_dir),
+                "path": _source_path(str(path), base_dir),
                 "line": int(line_no),
                 "col": int(col),
                 "severity": severity,
@@ -346,7 +336,7 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
             sink.write(json.dumps({
                 "rule": rule,
                 "category_id": f"csharp.{slug_for_category(category)}",
-                "path": _relativize(str(finding.get("path", "")), base_dir),
+                "path": _source_path(str(finding.get("path", "")), Path.cwd()),
                 "line": int(finding.get("line", 0) or 0),
                 "col": int(finding.get("col", 1) or 1),
                 "severity": str(finding.get("severity", "warning")),
@@ -637,7 +627,7 @@ def main(argv: list | None = None) -> int:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f, project_dir=base_dir)
+                recs = capturing_sink.get_for_file(f)
             if recs:
                 for r in recs:
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")

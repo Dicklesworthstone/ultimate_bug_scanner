@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import sys
 import tempfile
 import unittest
@@ -232,6 +233,129 @@ class FindingsMergeTests(unittest.TestCase):
         self.assertEqual(res["level"], "error")
         self.assertEqual(res["locations"][0]["physicalLocation"]["region"]["startLine"], 10)
         self.assertTrue(res["locations"][0]["properties"]["permalink"].startswith("https://github.com/repo/blob/sha/"))
+
+    def test_swift_project_notes_survive_direct_and_merged_sarif(self) -> None:
+        from ubs_core.swift_patterns.foundations import PATTERNS
+        from ubs_core.swift_patterns.misc_cats import _packaging
+        from ubs_core.swift_scan import ScanContext, _write_record, scan_patterns
+
+        task_pattern = next(pattern for pattern in PATTERNS
+                            if pattern.rule_id == "swift.concurrency.task-usages")
+        with tempfile.TemporaryDirectory(prefix="ubs-project-notes-") as tmp:
+            root = Path(tmp)
+            source = root / "sample.swift"
+            source.write_text("let value = 1\n", encoding="utf-8")
+            ctx = ScanContext(files=[source], project_dir=root)
+            sink = root / "swift.findings.json"
+            with sink.open("w", encoding="utf-8") as stream:
+                scan_patterns([task_pattern], ctx, stream, set())
+                for record in _packaging(ctx):
+                    _write_record(stream, record, set())
+            records = load_sink(sink)
+            expected = {
+                "swift.concurrency.task-usages": "Task usages",
+                "swift.packaging.no-manifest": "Package.swift not found in selected files",
+            }
+            self.assertEqual({record["rule"]: record["message"] for record in records}, expected)
+            self.assertEqual(len(records), 2)
+            for record in records:
+                self.assertEqual((record["scope"], record["path"], record["line"],
+                                  record["severity"], record["count"]),
+                                 ("project", "", 0, "info", 0))
+                self.assertIs(type(record["count"]), int)
+
+            direct = to_sarif({"language": "swift", "findings": records})
+            combined = root / "combined.json"
+            totals = {"files": 1, "critical": 0, "warning": 0, "info": 0}
+            combined.write_text(json.dumps({
+                "scanners": [{"language": "swift", **totals, "status": "ok"}],
+                "totals": totals,
+            }), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=root), 2)
+            merged = self.read_report(combined)
+            self.assertEqual(merged["totals"], totals)
+            for finding in merged["findings"]:
+                self.assertEqual((finding["scope"], finding["file"], finding["line"], finding["count"]),
+                                 ("project", "", 0, 0))
+                self.assertIs(type(finding["count"]), int)
+            for sarif in (direct, to_sarif(merged)):
+                results = [result for run in sarif["runs"] for result in run["results"]]
+                self.assertEqual({result["ruleId"]: result["message"]["text"] for result in results},
+                                 expected)
+                self.assertEqual(len(results), 2)
+                for result in results:
+                    self.assertEqual((result["kind"], result["level"]), ("informational", "none"))
+                    self.assertEqual(result["properties"]["scope"], "project")
+                    self.assertIs(type(result["properties"]["count"]), int)
+                    self.assertEqual(result["properties"]["count"], 0)
+                    self.assertNotIn("locations", result)
+
+            # The same rule with a real Task occurrence remains a located
+            # source finding; it must not inherit the zero-count note marker.
+            source.write_text("Task { operation() }\n", encoding="utf-8")
+            ctx = ScanContext(files=[source], project_dir=root)
+            with sink.open("w", encoding="utf-8") as stream:
+                scan_patterns([task_pattern], ctx, stream, set())
+            located = load_sink(sink)
+            self.assertEqual(len(located), 1)
+            self.assertEqual((located[0]["path"], located[0]["line"], located[0]["count"]),
+                             (str(source), 1, 1))
+            self.assertNotIn("scope", located[0])
+            result = to_sarif({"language": "swift", "findings": located})["runs"][0]["results"][0]
+            self.assertEqual(result["level"], "note")
+            self.assertNotIn("kind", result)
+            self.assertNotIn("scope", result["properties"])
+            physical = result["locations"][0]["physicalLocation"]
+            self.assertEqual(physical["artifactLocation"]["uri"], str(source))
+            self.assertEqual(physical["region"], {"startLine": 1, "startColumn": 1})
+
+    def test_project_note_validation_rejects_lossy_or_source_metadata(self) -> None:
+        from ubs_core.swift_scan import _write_record
+
+        valid = {
+            "rule": "swift.packaging.no-manifest", "category": 20,
+            "path": "", "line": 0, "severity": "info", "count": 0,
+            "scope": "project", "message": "Package.swift not found in selected files",
+        }
+        invalid = [
+            (key, value) for key, values in (
+                ("path", ("source.swift", ".", " ", None)),
+                ("file", ("source.swift",)),
+                ("line", (1, -1, "0", "bad", False, 0.0, None)),
+                ("severity", ("warning", "critical", "INFO", None)),
+                ("count", (1, -1, "0", "bad", False, True, 0.0, None)),
+            ) for value in values
+        ]
+        with tempfile.TemporaryDirectory(prefix="ubs-invalid-project-note-") as tmp:
+            root = Path(tmp)
+            combined = root / "combined.json"
+            original = json.dumps({"scanners": [{"language": "swift"}], "totals": {"info": 0}})
+            combined.write_text(original, encoding="utf-8")
+            sink = root / "swift.findings.json"
+            for key, value in [*invalid, ("count", "missing"), ("line", "missing")]:
+                with self.subTest(key=key, value=value):
+                    record = dict(valid)
+                    if value == "missing":
+                        record.pop(key)
+                    else:
+                        record[key] = value
+                    with self.assertRaisesRegex(ValueError, "invalid project note"):
+                        to_sarif({"language": "swift", "findings": [record]})
+                    sink.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "invalid project note"):
+                        merge(root, combined, project_dir=root)
+                    self.assertEqual(combined.read_text(encoding="utf-8"), original)
+
+                    if key in ("line", "count"):
+                        # Swift's shared writer must preserve malformed numeric
+                        # types until validation, rather than coercing them to 0.
+                        stream = io.StringIO()
+                        _write_record(stream, record, set())
+                        sink.write_text(stream.getvalue(), encoding="utf-8")
+                        forwarded = load_sink(sink)
+                        self.assertEqual(len(forwarded), 1)
+                        with self.assertRaisesRegex(ValueError, "invalid project note"):
+                            to_sarif({"language": "swift", "findings": forwarded})
 
     def test_ast_reports_preserve_counter_totals_locations_and_baseline_filtering(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-ast-report-") as tmp:

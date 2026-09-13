@@ -978,6 +978,53 @@ class SarifShapeTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "positive startLine"):
             rule_quality_harness.validate_sarif_payload_shape(payload, "fixture")
 
+    @staticmethod
+    def project_note_payload() -> dict[str, Any]:
+        return {
+            "runs": [{
+                "tool": {"driver": {"name": "ubs-swift"}},
+                "results": [{
+                    "ruleId": "swift.packaging.no-manifest",
+                    "message": {"text": "Package.swift not found in selected files"},
+                    "kind": "informational",
+                    "level": "none",
+                    "properties": {"scope": "project", "count": 0},
+                }],
+            }],
+        }
+
+    def test_accepts_explicit_zero_count_project_note_without_inventing_location(self) -> None:
+        payload = self.project_note_payload()
+        rule_quality_harness.validate_sarif_payload_shape(payload, "project note")
+        self.assertNotIn("locations", payload["runs"][0]["results"][0])
+
+    def test_project_note_marker_cannot_bypass_source_diagnostic_validation(self) -> None:
+        for field, values in (
+            ("kind", (None, "fail", "notApplicable")),
+            ("level", (None, "error", "warning", "note")),
+            ("locations", (None, [], self.valid_payload()["runs"][0]["results"][0]["locations"])),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    payload = self.project_note_payload()
+                    payload["runs"][0]["results"][0][field] = value
+                    with self.assertRaisesRegex(AssertionError, "malformed project note"):
+                        rule_quality_harness.validate_sarif_payload_shape(payload, "project note")
+        for count in (None, False, True, "0", 0.0, -1, 1):
+            with self.subTest(count=count):
+                payload = self.project_note_payload()
+                payload["runs"][0]["results"][0]["properties"]["count"] = count
+                with self.assertRaisesRegex(AssertionError, "malformed project note"):
+                    rule_quality_harness.validate_sarif_payload_shape(payload, "project note")
+
+    def test_source_less_results_require_explicit_project_note_semantics(self) -> None:
+        for properties in (None, {}, {"count": 0}, {"scope": "source", "count": 0}):
+            with self.subTest(properties=properties):
+                payload = self.project_note_payload()
+                payload["runs"][0]["results"][0]["properties"] = properties
+                with self.assertRaisesRegex(AssertionError, "positive startLine"):
+                    rule_quality_harness.validate_sarif_payload_shape(payload, "source result")
+
 
 class RunManifestExpectationTest(unittest.TestCase):
     @staticmethod

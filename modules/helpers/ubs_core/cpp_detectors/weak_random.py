@@ -212,10 +212,7 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
     while len(code_lines) < len(raw_lines):
         code_lines.append('')
     rng_vars = collect_insecure_rng_vars(code_lines)
-    try:
-        rel = str(path.resolve().relative_to(cwd))
-    except ValueError:
-        rel = path.name
+    rel = str(path.resolve())
     seen = set()
     issues = []
     for idx, _ in enumerate(code_lines, start=1):

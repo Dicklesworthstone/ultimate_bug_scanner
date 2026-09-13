@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import has_suppression_marker
+
+_SUPPRESSION_RULE = "rust.security.constant-time-compare"
 
 skip_dirs = {".git", "target", ".cargo", "node_modules"}
 
@@ -226,12 +229,12 @@ def operand_is_nullish_or_shape_check(operand: str) -> bool:
     return False
 
 
-def has_ignore(lines, line_no):
+def has_ignore(lines, line_no, rule=None):
     idx = line_no - 1
     return (
-        0 <= idx < len(lines) and "ubs:ignore" in lines[idx]
+        0 <= idx < len(lines) and has_suppression_marker(lines[idx], rule)
     ) or (
-        0 <= idx - 1 < len(lines) and "ubs:ignore" in lines[idx - 1]
+        0 <= idx - 1 < len(lines) and has_suppression_marker(lines[idx - 1], rule)
     )
 
 
@@ -389,7 +392,7 @@ def operand_is_sensitive(operand: str, sensitive_vars) -> bool:
 
 
 def unsafe_secret_compare(statement: str, sensitive_vars) -> bool:
-    if safe_compare_re.search(statement) or "ubs:ignore" in statement:
+    if safe_compare_re.search(statement) or has_suppression_marker(statement, _SUPPRESSION_RULE):
         return False
     for clause in re.split(r"\s*(?:&&|\|\|)\s*", statement):
         match = compare_re.search(clause)
@@ -435,7 +438,7 @@ def scan_file(text: str) -> list[tuple[int, str]]:
             else collect_sensitive_vars(lines, stripped_lines, statement_at, scope_lines, module_sensitive)
         )
         for line_no in scope_lines:
-            if has_ignore(lines, line_no):
+            if has_ignore(lines, line_no, _SUPPRESSION_RULE):
                 continue
             stripped = stripped_lines[line_no - 1].strip()
             if not stripped or ("==" not in stripped and "!=" not in stripped):

@@ -2,7 +2,7 @@
 
 Provides:
 - Cache root: $XDG_CACHE_HOME/ubs/<H(engine‖module checksum‖rulepack hash)>/
-- Per-file entries keyed by BLAKE2b(file bytes) storing NDJSON findings.
+- Per-file entries keyed by source path and BLAKE2b(file bytes).
 - Per-directory Merkle nodes keyed by hash of child names+hashes
   (from `git ls-files -s` blob ids in clean git tree, else stat+content hash).
 - Whole-subtree skip when directory Merkle nodes match.
@@ -48,7 +48,7 @@ def is_cache_disabled() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
-CACHE_SCHEMA_VERSION = "2"
+CACHE_SCHEMA_VERSION = "3"
 
 
 def compute_cache_key(
@@ -94,7 +94,7 @@ def lock_free_read_json(target_path: Path) -> Any | None:
 
 
 def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
-    """If project_dir is inside a clean git worktree, return {rel_posix_path: blob_sha}."""
+    """Return normal tracked blobs from a clean requested subtree, if any."""
     try:
         cur = project_dir.resolve()
         is_git = False
@@ -108,36 +108,47 @@ def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
         if not is_git:
             return None
 
-        # Check if git is available and tree is clean
-        status_res = subprocess.run(
-            ["git", "-C", str(project_dir), "status", "--porcelain"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=3,
-        )
-        if status_res.returncode != 0:
-            return None
-        # Must have zero modified/untracked files for a clean git tree
-        if status_res.stdout.strip():
-            return None
+        # List the requested subtree first. An ignored/untracked scratch
+        # project has no reusable blobs and must not pay for the containing
+        # repository's status walk just to fall back to reading its own files.
         ls_res = subprocess.run(
-            ["git", "-C", str(project_dir), "ls-files", "-s"],
+            ["git", "-C", str(project_dir), "ls-files", "-v", "-s", "-z", "--", "."],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             timeout=5,
         )
-        if ls_res.returncode != 0:
+        if ls_res.returncode != 0 or not ls_res.stdout:
             return None
+
         blobs: dict[str, str] = {}
-        for line in ls_res.stdout.splitlines():
-            # Format: <mode> <blob_sha> <stage>\t<relpath>
-            parts = line.split(None, 3)
-            if len(parts) >= 4:
-                blob_sha = parts[1]
-                path_str = parts[3].strip()
-                blobs[path_str] = blob_sha
+        for entry in ls_res.stdout.split(b"\0"):
+            if not entry:
+                continue
+            metadata, separator, path_bytes = entry.partition(b"\t")
+            parts = metadata.split()
+            # Lowercase tags mean assume-unchanged; S means skip-worktree.
+            # Git status cannot validate their actual contents. Symlinks and
+            # unmerged entries likewise use the ordinary file-content path.
+            if (
+                separator
+                and len(parts) == 4
+                and parts[0] == b"H"
+                and parts[1] in (b"100644", b"100755")
+                and parts[3] == b"0"
+            ):
+                blobs[os.fsdecode(path_bytes)] = parts[2].decode("ascii")
+        if not blobs:
+            return None
+
+        status_res = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(project_dir), "status",
+             "--porcelain=v1", "--untracked-files=no", "--", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+        )
+        if status_res.returncode != 0 or status_res.stdout.strip():
+            return None
         return blobs
     except (OSError, subprocess.SubprocessError):
         return None
@@ -183,9 +194,8 @@ def hash_rules_dir(rules_dir: Path | str) -> str:
 class CapturingSink:
     """Wraps an underlying file sink to capture findings emitted per file."""
 
-    def __init__(self, target_sink: Any = None, project_dir: Path | str | None = None) -> None:
+    def __init__(self, target_sink: Any = None) -> None:
         self._sink = target_sink
-        self.project_dir = Path(project_dir).resolve() if project_dir else None
         self.by_file: dict[str, list[dict]] = {}
 
     def write(self, s: str) -> int:
@@ -196,46 +206,20 @@ class CapturingSink:
                 rec = json.loads(line)
                 if isinstance(rec, dict) and "path" in rec and "rule" in rec:
                     p = str(rec.get("path", ""))
-                    self.by_file.setdefault(p, []).append(rec)
+                    if p:
+                        self.by_file.setdefault(str(Path(p).resolve()), []).append(rec)
             except ValueError:
                 pass
         return n
 
-    def get_for_file(self, f: Path | str, project_dir: Path | str | None = None) -> list[dict]:
-        """Look up captured findings for a file under relative or absolute path variants."""
-        path_obj = Path(f)
-        str_f = str(f)
-        try:
-            target_res = str(path_obj.resolve())
-        except Exception:
-            target_res = str_f
+    def get_for_file(self, f: Path | str) -> list[dict]:
+        """Associate records by source identity, preserving their display paths.
 
-        p_dir = Path(project_dir).resolve() if project_dir else self.project_dir
-        collected: list[dict] = []
-        seen_ids: set[int] = set()
-
-        for k, v in self.by_file.items():
-            if not k:
-                continue
-            matches = False
-            if k == str_f or k == path_obj.name:
-                matches = True
-            else:
-                try:
-                    k_path = Path(k)
-                    if str(k_path.resolve()) == target_res:
-                        matches = True
-                    elif p_dir and str((p_dir / k_path).resolve()) == target_res:
-                        matches = True
-                except Exception:
-                    pass
-            if matches:
-                for r in v:
-                    r_id = id(r)
-                    if r_id not in seen_ids:
-                        seen_ids.add(r_id)
-                        collected.append(r)
-        return collected
+        Producers emit absolute paths or paths relative to the scan's working
+        directory. A basename or a second project-relative interpretation is
+        never evidence that a record belongs to another source file.
+        """
+        return list(self.by_file.get(str(Path(f).resolve()), ()))
 
     def flush(self) -> None:
         if self._sink is not None and hasattr(self._sink, "flush"):
@@ -270,6 +254,13 @@ class ScanCache:
 
         rules_hash = hash_rules_dir(custom_rules) if custom_rules else ""
         extra_parts = [f"skip={skip}", f"rules_hash={rules_hash}"]
+        # Detectors can use the source location and emit paths relative to
+        # either the project or the working directory. Reusing their records
+        # in another context cannot be made correct by rewriting one field.
+        extra_parts.append("source_context=" + json.dumps(
+            [str(self.project_dir), str(Path.cwd())],
+            separators=(",", ":"),
+        ))
         if extra:
             extra_parts.append(extra)
         if self.enabled:
@@ -316,20 +307,26 @@ class ScanCache:
 
         for root, directories, names in os.walk(helpers_dir, onerror=report_walk_error):
             directories[:] = sorted(name for name in directories if name != "__pycache__")
+            relative_root = Path(root).relative_to(helpers_dir).as_posix()
+            relative_prefix = "" if relative_root == "." else relative_root + "/"
             for name in directories:
-                directory = Path(root) / name
-                if stat.S_ISLNK(directory.lstat().st_mode):
+                directory = os.path.join(root, name)
+                if stat.S_ISLNK(os.lstat(directory).st_mode):
                     raise OSError(f"refusing symlink helper directory: {directory}")
             for name in sorted(names):
-                source = Path(root) / name
-                if source.suffix not in (".py", ".go", ".js"):
+                suffix_start = name.rfind(".")
+                # pathlib's leading-dot semantics vary by Python version.
+                # Preserve them while avoiding Path allocation for normal files.
+                suffix = (Path(name).suffix if name.startswith(".")
+                          else name[suffix_start:] if suffix_start > 0 else "")
+                if suffix not in (".py", ".go", ".js"):
                     continue
-                if not stat.S_ISREG(source.stat().st_mode):
+                source = os.path.join(root, name)
+                if not stat.S_ISREG(os.stat(source).st_mode):
                     raise OSError(f"helper source is not a regular file: {source}")
-                relative = source.relative_to(helpers_dir).as_posix().encode(
-                    "utf-8", "surrogateescape"
-                )
-                content = source.read_bytes()
+                relative = (relative_prefix + name).encode("utf-8", "surrogateescape")
+                with open(source, "rb") as source_file:
+                    content = source_file.read()
                 h.update(len(relative).to_bytes(8, "big"))
                 h.update(relative)
                 h.update(len(content).to_bytes(8, "big"))
@@ -431,6 +428,13 @@ class ScanCache:
                 return False
         return True
 
+    def _file_cache_path(self, source: Path, content_hash: str) -> Path:
+        identity = json.dumps(
+            [str(source), content_hash], separators=(",", ":"),
+        ).encode("utf-8")
+        key = hashlib.blake2b(identity, digest_size=16).hexdigest()
+        return self.files_dir / key[:2] / f"{key}.json"
+
     def partition_files(
         self, files: Sequence[Path]
     ) -> tuple[dict[Path, list[dict]], list[Path]]:
@@ -473,8 +477,8 @@ class ScanCache:
                     dir_file_hashes[f.name] = fh
 
             # Calculate directory Merkle hash
-            merkle_content = "".join(
-                f"{t}:{n}:{h}\n" for t, n, h in sorted(children)
+            merkle_content = json.dumps(
+                [str(d), sorted(children)], separators=(",", ":"),
             ).encode("utf-8")
             dir_merkle = hashlib.blake2b(merkle_content, digest_size=16).hexdigest()
             dir_cache_file = self.dirs_dir / dir_merkle[:2] / f"{dir_merkle}.json"
@@ -497,13 +501,9 @@ class ScanCache:
                     self.stats["merkle_dir_hits"] += 1
                     for f in dir_files:
                         recs = saved_findings.get(f.name, [])
-                        # Ensure finding path reflects current file path
-                        adapted = []
-                        for r in recs:
-                            c = dict(r)
-                            c["path"] = str(f)
-                            adapted.append(c)
-                        cached_findings[f] = adapted
+                        # Source and report context are part of the identity;
+                        # preserve the exact path spelling emitted when cold.
+                        cached_findings[f] = [dict(record) for record in recs]
 
             if not dir_hit:
                 # Fall back to per-file cache
@@ -512,17 +512,12 @@ class ScanCache:
                     if not fh:
                         files_to_scan.append(f)
                         continue
-                    file_cache_file = self.files_dir / fh[:2] / f"{fh}.json"
+                    file_cache_file = self._file_cache_path(f, fh)
                     file_data = lock_free_read_json(file_cache_file)
                     if isinstance(file_data, dict) and file_data.get("hash") == fh:
                         if self._inputs_valid(file_data.get("inputs", {}), git_blobs):
                             recs = file_data.get("findings", [])
-                            adapted = []
-                            for r in recs:
-                                c = dict(r)
-                                c["path"] = str(f)
-                                adapted.append(c)
-                            cached_findings[f] = adapted
+                            cached_findings[f] = [dict(record) for record in recs]
                             self.stats["file_hits"] += 1
                             continue
                     files_to_scan.append(f)
@@ -535,40 +530,6 @@ class ScanCache:
 
         return cached_findings, files_to_scan
 
-    def _lookup_findings(self, f: Path, findings_by_file: dict[str, list[dict]]) -> list[dict]:
-        """Lookup findings for a file across path representations."""
-        str_f = str(f)
-        try:
-            target_res = str(f.resolve())
-        except Exception:
-            target_res = str_f
-
-        collected: list[dict] = []
-        seen_ids: set[int] = set()
-
-        for k, v in findings_by_file.items():
-            if not k:
-                continue
-            matches = False
-            if k == str_f or k == f.name:
-                matches = True
-            else:
-                try:
-                    k_path = Path(k)
-                    if str(k_path.resolve()) == target_res:
-                        matches = True
-                    elif self.project_dir and str((self.project_dir / k_path).resolve()) == target_res:
-                        matches = True
-                except Exception:
-                    pass
-            if matches:
-                for r in v:
-                    r_id = id(r)
-                    if r_id not in seen_ids:
-                        seen_ids.add(r_id)
-                        collected.append(r)
-        return collected
-
     def store_scanned_files(
         self,
         files: Sequence[Path],
@@ -578,6 +539,22 @@ class ScanCache:
         """Store newly scanned files into per-file cache and update directory Merkle nodes."""
         if not self.enabled or not files:
             return
+
+        # Each producer's path has one origin: the scan's working directory.
+        # Canonicalize once, never attribute a finding by basename or by trying
+        # a second base where an unrelated file might also exist.
+        findings_by_source: dict[str, list[dict]] = {}
+        seen_by_source: dict[str, set[int]] = {}
+        for path, records in findings_by_file.items():
+            if not path:
+                continue
+            key = str(Path(path).resolve())
+            grouped = findings_by_source.setdefault(key, [])
+            seen = seen_by_source.setdefault(key, set())
+            for record in records:
+                if id(record) not in seen:
+                    seen.add(id(record))
+                    grouped.append(record)
 
         git_blobs = get_clean_git_blobs(self.project_dir)
         file_hashes: dict[Path, str] = {}
@@ -591,7 +568,7 @@ class ScanCache:
             fh = file_hashes.get(f)
             if not fh:
                 continue
-            recs = self._lookup_findings(f, findings_by_file)
+            recs = findings_by_source.get(str(f.resolve()), [])
             if len(files) > 1:
                 recs = [
                     r for r in recs
@@ -603,7 +580,7 @@ class ScanCache:
                     )
                 ]
             inputs = inputs_by_file.get(str(f), {}) if inputs_by_file else {}
-            target_path = self.files_dir / fh[:2] / f"{fh}.json"
+            target_path = self._file_cache_path(f, fh)
             atomic_write_json(target_path, {
                 "hash": fh,
                 "findings": recs,
@@ -624,12 +601,12 @@ class ScanCache:
                 fh = file_hashes.get(f)
                 if fh:
                     children.append(("file", f.name, fh))
-                    recs = self._lookup_findings(f, findings_by_file)
+                    recs = findings_by_source.get(str(f.resolve()), [])
                     dir_findings[f.name] = recs
                     dir_inputs[f.name] = inputs_by_file.get(str(f), {}) if inputs_by_file else {}
 
-            merkle_content = "".join(
-                f"{t}:{n}:{h}\n" for t, n, h in sorted(children)
+            merkle_content = json.dumps(
+                [str(d), sorted(children)], separators=(",", ":"),
             ).encode("utf-8")
             dir_merkle = hashlib.blake2b(merkle_content, digest_size=16).hexdigest()
             dir_cache_file = self.dirs_dir / dir_merkle[:2] / f"{dir_merkle}.json"

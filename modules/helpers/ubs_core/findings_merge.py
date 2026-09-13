@@ -168,6 +168,22 @@ def load_sink(sink: Path) -> list[dict]:
     return records
 
 
+def _validate_project_note(rec: dict) -> None:
+    """A project note cannot downgrade or invent a location for a source hit."""
+    if (
+        any(rec.get(key, "") != "" for key in ("file", "path"))
+        or type(rec.get("line")) is not int
+        or rec["line"] != 0
+        or rec.get("severity") != "info"
+        or type(rec.get("count")) is not int
+        or rec["count"] != 0
+    ):
+        raise ValueError(
+            "invalid project note: requires no source path, integer line 0, "
+            "severity info and integer count 0"
+        )
+
+
 def _normalize(
     rec: dict,
     lang: str,
@@ -175,6 +191,11 @@ def _normalize(
     project_dir: str | Path = "",
     ordinals: dict | None = None,
 ) -> dict:
+    project_note = rec.get("scope") == "project"
+    if project_note:
+        # Validate original types before ordinary source normalization can
+        # turn malformed line/count metadata into an apparently valid zero.
+        _validate_project_note(rec)
     rule = str(rec.get("rule", ""))
     path = str(rec.get("path", ""))
     try:
@@ -195,7 +216,7 @@ def _normalize(
         ordinal = file_map.get(key, 0)
         file_map[key] = ordinal + 1
     fp = _fingerprint(rule, rel_path, norm_stmt, ordinal)
-    return {
+    normalized = {
         "lang": lang,
         "rule_id": rule,
         "category_id": str(rec.get("category_id", "")),
@@ -210,6 +231,10 @@ def _normalize(
         "fingerprint": fp,
         "suppressed": bool(rec.get("suppressed", False)),
     }
+    if project_note:
+        normalized["scope"] = "project"
+        normalized["count"] = rec["count"]
+    return normalized
 
 
 def merge(
@@ -376,6 +401,9 @@ def to_sarif(
 
         lang_findings = findings_by_lang.get(lang, [])
         for f in lang_findings:
+            project_note = f.get("scope") == "project"
+            if project_note:
+                _validate_project_note(f)
             rule_id = str(f.get("rule_id") or f.get("rule") or "")
             sev = str(f.get("severity") or "warning").lower()
             level = "error" if sev == "critical" else ("warning" if sev == "warning" else "note")
@@ -385,6 +413,11 @@ def to_sarif(
                 "level": level,
                 "message": {"text": msg},
             }
+            if project_note:
+                # SARIF 2.1.0 sections 3.27.9-10: informational results have
+                # level none. Section 3.27.12 permits no source location.
+                res["kind"] = "informational"
+                res["level"] = "none"
             file_path = str(f.get("file") or f.get("path") or "")
             if file_path:
                 try:
@@ -416,6 +449,9 @@ def to_sarif(
                 res["locations"] = [loc]
 
             props: dict = {}
+            if project_note:
+                props["scope"] = "project"
+                props["count"] = f["count"]
             if f.get("category_id"):
                 props["category_id"] = str(f["category_id"])
             if f.get("fingerprint"):

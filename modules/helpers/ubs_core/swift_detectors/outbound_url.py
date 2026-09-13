@@ -2,7 +2,7 @@
 
 Verbatim port of the run_request_outbound_url_checks heredoc in
 modules/ubs-swift.sh. The legacy shell aggregated the heredoc's output into
-ONE critical finding whose description embeds the first three samples.
+ONE critical finding. Structured records retain every selected-file occurrence.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from ubs_core.swift_detectors._common import (
-    SKIP_DIRS, has_ignore, iter_swift_files, logical_statement, rel,
+    SKIP_DIRS, has_ignore, logical_statement, rel, should_skip,
     source_line, strip_line_comments,
 )
 
@@ -115,7 +115,12 @@ def scan(ctx):
     root = project.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
-    for path in iter_swift_files(root, base, SKIP_DIRS):
+    for candidate in ctx.files:
+        path = Path(candidate).resolve()
+        if path.suffix != '.swift':
+            continue
+        if path != root and should_skip(path, base, SKIP_DIRS):
+            continue
         try:
             text = path.read_text(encoding='utf-8', errors='ignore')
         except OSError:
@@ -168,18 +173,17 @@ def scan(ctx):
                 path_desc = ' -> '.join(seq)
             findings.append((rel(path, base), line_no, f"{source_line(lines, line_no)} [{path_desc}]"))
 
-    if not findings:
-        return
-    samples = '; '.join(f'{file}:{line}:{code}' for file, line, code in findings[:3])
     desc = "Validate outbound URLs with URL parsing plus explicit https scheme and host allow-list checks before URLSession, URLRequest, Data(contentsOf:), or HTTP client calls."
-    yield {
-        "rule": RULE_ID,
-        "category": CATEGORY,
-        "path": findings[0][0],
-        "line": findings[0][1],
-        "severity": SEVERITY,
-        "count": len(findings),
-        "title": TITLE,
-        "message": TITLE,
-        "description": f"{desc} Examples: {samples}",
-    }
+    for file_name, line_no, code in findings:
+        yield {
+            "rule": RULE_ID,
+            "category": CATEGORY,
+            "path": file_name,
+            "line": line_no,
+            "severity": SEVERITY,
+            "count": 1,
+            "title": TITLE,
+            "message": TITLE,
+            "description": desc,
+            "samples": [{"path": file_name, "line": line_no, "code": code}],
+        }

@@ -66,26 +66,10 @@ def _entitlement_findings(path: Path):
             yield (sev, str(path), title, f"{key}={val}; {detail}")
 
 
-def _walk_candidates(root: Path, matcher):
-    """The heredocs os.walk the scan root unpruned."""
-    import os
-
-    if root.is_file():
-        if matcher(root.name):
-            yield root
-        return
-    if not root.is_dir():
-        return
-    for dp, _dn, files in os.walk(root):
-        for n in files:
-            if matcher(n):
-                yield Path(dp) / n
-
-
 def scan(ctx):
     """Emit ATS findings (cat 17) and entitlement findings (cat 19)."""
-    root = ctx.project_dir.resolve()
-    for path in _walk_candidates(root, lambda n: n == "Info.plist"):
+    selected = sorted({path.resolve() for path in ctx.files if path.is_file()})
+    for path in (path for path in selected if path.name == "Info.plist"):
         for sev, fp, title, detail in _ats_findings(path):
             yield {
                 "rule": ATS_RULE,
@@ -98,7 +82,7 @@ def scan(ctx):
                 "message": f"{title} [{fp}]",
                 "description": detail,
             }
-    for path in _walk_candidates(root, lambda n: n.endswith(".entitlements")):
+    for path in (path for path in selected if path.suffix == ".entitlements"):
         for sev, fp, title, detail in _entitlement_findings(path):
             yield {
                 "rule": ENTS_RULE,

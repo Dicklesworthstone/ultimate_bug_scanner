@@ -270,10 +270,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
             continue
         if should_skip(path):
             continue
-        try:
-            rel = path.resolve().relative_to(cwd)
-        except ValueError:
-            rel = path.name
+        rel = path.resolve()
         issues = []
         analyze(path, issues)
         for _rel, line_no, code in issues:

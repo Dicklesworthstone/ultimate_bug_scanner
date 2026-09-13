@@ -4,12 +4,11 @@ Runs the single sgconfig produced by `ubs_core.swift_rules.generate` (one
 `ast-grep scan -c <config> --json=stream` per path batch), parses the stream
 once, and feeds BOTH legacy consumers of the shared AG stream:
 
-  ctx.ast_records  raw {rid, file, row, col, severity, message, lines} records
-                   — consumed by swift_detectors.urlsession_correlation (cat 4)
-  sink records     one aggregate record per rule id, exactly the legacy
-                   run_ast_rules bucket (count + up to detail_limit samples,
-                   same-line/previous-line ubs:ignore suppression, severity
-                   from the stream/YAML with the manifest override)
+  ctx.ast_records  source records including expression and METHOD capture
+                   ranges, consumed by URLSession lifecycle correlation
+  sink records     one record per actual occurrence, before report previews
+                   are limited. Same-line/previous-line ubs:ignore suppression
+                   and stream/YAML severity with manifest overrides apply.
 """
 from __future__ import annotations
 
@@ -105,6 +104,8 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
             "file": str(obj.get("file", "") or ""),
             "row": row,
             "col": col,
+            "range": rng,
+            "method": ((obj.get("metaVariables") or {}).get("single") or {}).get("METHOD") or {},
             "severity": str(obj.get("severity") or obj.get("level") or "info"),
             "message": str(obj.get("message") or ""),
             "lines": str(obj.get("lines") or ""),
@@ -113,9 +114,10 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
     if not stream:
         return counters
 
-    # run_ast_rules: bucket by rule id (severity from the stream), suppress
-    # same/prev-line markers, one aggregate finding per rule id
-    buckets: dict[str, dict] = {}
+    # Cache entries must contain only their own source's occurrences. Preview
+    # limits belong to report rendering, after all selected records are joined.
+    from ubs_core.swift_scan import slug_for_category
+
     cache: dict = {}
     for obj in stream:
         rid = str(obj.get("ruleId", "") or obj.get("rule_id", "") or obj.get("id", "") or "unknown")
@@ -124,6 +126,7 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
         start = rng.get("start") or {}
         row = int(start.get("row", start.get("line", 0)) or 0)
         line_no = row + 1
+        col_no = int(start.get("column", 0) or 0) + 1
         message = str(obj.get("message") or rid)
         severity = _sev_map(str(obj.get("severity") or obj.get("level") or "info"))
         override = (manifest.get(rid) or {}).get("severity")
@@ -138,34 +141,23 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
         if _has_marker(Path(file_str), line_no, cache):
             continue
 
-        bucket = buckets.setdefault(rid, {
-            "severity": severity, "message": message, "count": 0,
-            "category": category, "samples": [],
-        })
-        bucket["count"] += 1
-        if len(bucket["samples"]) < detail_limit:
-            lines = (obj.get("lines") or "").strip().splitlines()
-            code = (lines[0] if lines else "").strip()
-            bucket["samples"].append({"path": file_str, "line": line_no, "code": code})
-
-    from ubs_core.swift_scan import AST_PACK_RULE, slug_for_category
-
-    for rid, bucket in sorted(buckets.items()):
-        severity = bucket["severity"]
-        counters[severity] = counters.get(severity, 0) + bucket["count"]
+        source_path = str(Path(file_str).resolve())
+        lines = (obj.get("lines") or "").strip().splitlines()
+        code = (lines[0] if lines else "").strip()
+        counters[severity] = counters.get(severity, 0) + 1
         record = {
             "rule": rid,
-            "category_id": f"swift.{slug_for_category(bucket['category'])}" if bucket["category"] else "",
-            "path": bucket["samples"][0]["path"] if bucket["samples"] else "",
-            "line": bucket["samples"][0]["line"] if bucket["samples"] else 0,
-            "col": 1,
+            "source": "ast-grep",
+            "category_id": f"swift.{slug_for_category(category)}" if category else "",
+            "path": source_path,
+            "line": line_no,
+            "col": col_no,
             "severity": severity,
-            "count": bucket["count"],
-            "title": f"{rid}: {bucket['message']}",
-            "message": f"{rid}: {bucket['message']}",
+            "count": 1,
+            "title": f"{rid}: {message}",
+            "message": f"{rid}: {message}",
             "suppressed": False,
-            "samples": bucket["samples"],
+            "samples": [{"path": source_path, "line": line_no, "col": col_no, "code": code}],
         }
-        _ = AST_PACK_RULE
         sink.write(json.dumps(record, ensure_ascii=False) + "\n")
     return counters

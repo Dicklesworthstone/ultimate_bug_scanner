@@ -12,6 +12,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.allocation.format-literal"
 CATEGORY = 6
 TITLE = "format!(literal) allocates - use .to_string()"
@@ -149,7 +151,7 @@ def iter_format_literal_lines(path: Path, text: str):
                         if rest == close and "{" not in content and "}" not in content:
                             line = line_number(text, idx)
                             code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
-                            if "ubs:ignore" not in code:
+                            if not has_suppression_marker(code, RULE_ID):
                                 yield line, code
                     idx = close + 1
                     continue

@@ -41,6 +41,7 @@ from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import RunContext
 
 MARKER = "ubs:ignore"
+_PATTERN_CACHE_KIND = "_ubs_python_pattern"
 
 # Files whose text is a Python token stream (so string blanking is valid).
 _PY_SUFFIXES = frozenset({".py", ".pyi"})
@@ -196,6 +197,8 @@ def scan_patterns(
     skip: set[int],
     prefilter: Any = None,
     jobs: int = 1,
+    *,
+    defer_global_checks: bool = False,
 ) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
@@ -212,6 +215,9 @@ def scan_patterns(
     snippet reported as if it were live code.
 
     Returns severity counters ({"critical": n, "warning": n, "info": n}).
+    The cache-backed main path sets ``defer_global_checks`` to retain private
+    source-local matches and condition facts instead. Those records have no
+    final severity, and counters remain zero until selected-input reconciliation.
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     active = [p for p in patterns if p.category not in skip]
@@ -259,14 +265,30 @@ def scan_patterns(
         return cached
 
     for pattern in active:
-        if pattern.gate_regex is not None and not any(
-            pattern.gate_regex.search(text) for text in texts.values()
-        ):
-            continue
-        if pattern.suppress_when_regex is not None and any(
-            pattern.suppress_when_regex.search(text) for text in texts.values()
-        ):
-            continue
+        if defer_global_checks:
+            if pattern.gate_regex is not None or pattern.suppress_when_regex is not None:
+                # Global conditions use raw source, including files with no
+                # candidate matches. Keep their evidence with its own source so
+                # adding/removing a selected file can change the final decision.
+                for path, text in texts.items():
+                    sink.write(json.dumps({
+                        "rule": pattern.rule_id,
+                        "path": str(path),
+                        _PATTERN_CACHE_KIND: "context",
+                        "gate": bool(pattern.gate_regex is not None
+                                     and pattern.gate_regex.search(text)),
+                        "suppress": bool(pattern.suppress_when_regex is not None
+                                         and pattern.suppress_when_regex.search(text)),
+                    }, ensure_ascii=False) + "\n")
+        else:
+            if pattern.gate_regex is not None and not any(
+                pattern.gate_regex.search(text) for text in texts.values()
+            ):
+                continue
+            if pattern.suppress_when_regex is not None and any(
+                pattern.suppress_when_regex.search(text) for text in texts.values()
+            ):
+                continue
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
@@ -284,12 +306,13 @@ def scan_patterns(
                 hits.append((path, line_no, line_text))
         if not hits:
             continue
-        severity = resolve_severity(pattern, len(hits))
-        if severity is None:
+        severity = None if defer_global_checks else resolve_severity(pattern, len(hits))
+        if severity is None and not defer_global_checks:
             continue
-        counters[severity] = counters.get(severity, 0) + len(hits)
+        if severity is not None:
+            counters[severity] = counters.get(severity, 0) + len(hits)
         for path, line_no, line_text in hits:
-            sink.write(json.dumps({
+            record = {
                 "rule": pattern.rule_id,
                 "category_id": f"python.{slug_for_category(pattern.category)}",
                 "path": str(path),
@@ -298,8 +321,60 @@ def scan_patterns(
                 "severity": severity,
                 "message": f"{pattern.title} — {line_text}",
                 "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+            }
+            if defer_global_checks:
+                record[_PATTERN_CACHE_KIND] = "match"
+            sink.write(json.dumps(record, ensure_ascii=False) + "\n")
     return counters
+
+
+def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dict]) -> list[dict]:
+    """Resolve private pattern facts over the complete selected input set.
+
+    Cached data stays source-local; neither a threshold nor another file's gate
+    may erase it. Only this public-output boundary decides which hits to report.
+    Records from the detector, analyzer and AST layers pass through unchanged.
+    """
+    pattern_by_id = {pattern.rule_id: pattern for pattern in patterns}
+    counts: dict[str, int] = {}
+    gates: set[str] = set()
+    suppressors: set[str] = set()
+    for record in records:
+        rule = record.get("rule", "")
+        kind = record.get(_PATTERN_CACHE_KIND)
+        if kind == "context":
+            if record.get("gate"):
+                gates.add(rule)
+            if record.get("suppress"):
+                suppressors.add(rule)
+        elif kind == "match":
+            counts[rule] = counts.get(rule, 0) + 1
+
+    severities: dict[str, str | None] = {}
+    for rule, count in counts.items():
+        pattern = pattern_by_id.get(rule)
+        if pattern is None:
+            continue
+        if pattern.gate_regex is not None and rule not in gates:
+            continue
+        if pattern.suppress_when_regex is not None and rule in suppressors:
+            continue
+        severities[rule] = resolve_severity(pattern, count)
+
+    result: list[dict] = []
+    for record in records:
+        kind = record.get(_PATTERN_CACHE_KIND)
+        if kind == "context":
+            continue
+        if kind == "match":
+            severity = severities.get(record.get("rule", ""))
+            if severity is None:
+                continue
+            record = dict(record)
+            record.pop(_PATTERN_CACHE_KIND)
+            record["severity"] = severity
+        result.append(record)
+    return result
 
 
 def load_patterns() -> list[Pattern]:
@@ -655,7 +730,8 @@ def main(argv: list[str] | None = None) -> int:
         prefilter_res = run_prefilter(files_to_scan, prefilter_index)
 
         capturing_sink = CapturingSink()
-        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res, jobs=args.jobs)
+        scan_patterns(patterns, files_to_scan, capturing_sink, skip,
+                      prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True)
         run_detectors(files_to_scan, capturing_sink, skip)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         if args.ast_rule_dir:
@@ -699,29 +775,11 @@ def main(argv: list[str] | None = None) -> int:
     for f in files:
         recs = cached_findings.get(f)
         if recs is None and capturing_sink is not None:
-            recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+            recs = capturing_sink.get_for_file(f)
         if recs:
             all_recs.extend(recs)
 
-    # Reconcile threshold-ladder patterns against current scan counts
-    pattern_by_id = {p.rule_id: p for p in patterns if any(min_count > 0 for min_count, _ in p.thresholds)}
-    if pattern_by_id:
-        counts_by_rule: dict[str, int] = {}
-        for r in all_recs:
-            rid = r.get("rule", "")
-            if rid in pattern_by_id:
-                counts_by_rule[rid] = counts_by_rule.get(rid, 0) + 1
-
-        filtered_recs: list[dict] = []
-        for r in all_recs:
-            rid = r.get("rule", "")
-            if rid in pattern_by_id:
-                sev = resolve_severity(pattern_by_id[rid], counts_by_rule.get(rid, 0))
-                if sev is None:
-                    continue  # Threshold not met in current file set
-                r["severity"] = sev
-            filtered_recs.append(r)
-        all_recs = filtered_recs
+    all_recs = reconcile_pattern_records(patterns, all_recs)
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for r in all_recs:

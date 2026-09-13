@@ -39,14 +39,12 @@ PATTERNS = [
 
 
 def _process_residual(ctx):
-    """Legacy cat 6 tail: rg Process count minus the shell detector criticals."""
+    """Report selected Process/posix lines not already classified as shell use."""
     from ubs_core.swift_detectors import shell_execution
 
     import re
 
-    shell_critical = shell_execution.count_findings(ctx)
-    total = 0
-    samples = []
+    shell_anchors = {(path, line) for path, line, _code, _reason in shell_execution.collect_findings(ctx)}
     regex = re.compile(r"Process\(|posix_spawn|system\(|popen\(")
     for path in ctx.files:
         text = ctx.text_of(path)
@@ -63,22 +61,20 @@ def _process_residual(ctx):
             line_text = text[line_start:line_end]
             if "ubs:ignore" in line_text:
                 continue
-            total += 1
-            if len(samples) < 5:
-                samples.append({"path": str(path), "line": line_no})
-    info_count = total - shell_critical
-    if info_count > 0:
-        yield {
-            "rule": "swift.security.process-other",
-            "category": 6,
-            "path": samples[0]["path"] if samples else "",
-            "line": samples[0]["line"] if samples else 0,
-            "severity": "info",
-            "count": info_count,
-            "title": "Other Process/posix invocations present - validate fixed executables and arguments",
-            "message": "Other Process/posix invocations present - validate fixed executables and arguments",
-            "samples": samples,
-        }
+            source = str(path.resolve())
+            if (source, line_no) in shell_anchors:
+                continue
+            yield {
+                "rule": "swift.security.process-other",
+                "category": 6,
+                "path": source,
+                "line": line_no,
+                "severity": "info",
+                "count": 1,
+                "title": "Other Process/posix invocations present - validate fixed executables and arguments",
+                "message": "Other Process/posix invocations present - validate fixed executables and arguments",
+                "samples": [{"path": source, "line": line_no, "code": line_text.strip()}],
+            }
 
 
 DERIVED = [_process_residual]

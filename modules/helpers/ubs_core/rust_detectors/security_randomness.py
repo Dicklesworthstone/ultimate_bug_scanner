@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import has_suppression_marker
 
 RULE_ID = "rust.security.non-crypto-random"
 CATEGORY = 8
@@ -214,12 +214,12 @@ def has_security_context(statement: str, fn_name: str) -> bool:
     return bool(re.search(r"(?<![A-Za-z0-9_])(?:key|sig)(?![A-Za-z0-9_])", visible, re.IGNORECASE))
 
 
-def has_ignore(lines, line_no):
+def has_ignore(lines, line_no, rule=None):
     idx = line_no - 1
     return (
-        0 <= idx < len(lines) and MARKER in lines[idx]
+        0 <= idx < len(lines) and has_suppression_marker(lines[idx], rule)
     ) or (
-        0 <= idx - 1 < len(lines) and MARKER in lines[idx - 1]
+        0 <= idx - 1 < len(lines) and has_suppression_marker(lines[idx - 1], rule)
     )
 
 
@@ -317,7 +317,7 @@ def analyze(path: Path, issues):
             function_sensitive[current_function] = has_security_context("", current_function)
         sensitive = line_sensitive or function_sensitive[current_function]
         source = unsafe_source(statement, insecure_rng_vars, sensitive)
-        if source and sensitive:
+        if source and sensitive and not has_ignore(lines, line_no, RULE_ID):
             key = (str(path), line_no, source)
             if key not in seen:
                 seen.add(key)

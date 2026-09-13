@@ -291,28 +291,16 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
       ast rule group owns those findings.
     - layer=="guards" (guards_java, bead D3) has no legacy java counterpart —
       it stays off unless ``enable_new``.
-    Analyzer paths are relativized to the project dir, mirroring the legacy
-    heredoc relpath form.
+    Structured analyzer paths retain their source identity independently of
+    the displayed project directory.
     """
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
     allowed_layers = {"java": {"taint"}, "kotlin": {"narrowing"}}
 
-    def _rel(path: str) -> str:
-        if project_dir is None or not path:
-            return path
-        try:
-            p = Path(path)
-            if not p.is_absolute():
-                resolved = (Path.cwd() / p).resolve()
-                base = Path(project_dir).resolve()
-                if resolved != base:
-                    return str(resolved.relative_to(base))
-                return path
-            return str(p.resolve().relative_to(Path(project_dir).resolve()))
-        except ValueError:
-            return path
+    def _source_path(path: str) -> str:
+        return str(Path(path).resolve()) if path else path
 
     for lang in ("java", "kotlin"):
         for analyzer in analyzers_for_lang(lang):
@@ -333,7 +321,7 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                     "rule": finding.get("rule", ""),
                     "category_id": f"java.{_CATEGORY_SLUGS[_record_category(finding)]}"
                     if _record_category(finding) is not None else finding.get("category_id", "java.security"),
-                    "path": _rel(str(finding.get("path", ""))),
+                    "path": _source_path(str(finding.get("path", ""))),
                     "line": int(finding.get("line", 0) or 0),
                     "col": int(finding.get("col", 1) or 1),
                     "severity": finding.get("severity", "warning"),
@@ -627,7 +615,7 @@ def main(argv: list[str] | None = None) -> int:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+                recs = capturing_sink.get_for_file(f)
             if recs:
                 for cached_record in recs:
                     record = dict(cached_record)

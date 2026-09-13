@@ -25,6 +25,8 @@ import re
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from ubs_core.suppression import has_suppression_marker
+
 RULE_ID = "rust.security.command-executable"
 CATEGORY = 8
 TITLE = "Command executable from untrusted-looking value"
@@ -143,7 +145,7 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
                 continue
             line = line_number(masked, hit.start())
             code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
-            if "ubs:ignore" in code:
+            if has_suppression_marker(code, RULE_ID):
                 continue
             key = (str(path), line, code)
             if key in seen:

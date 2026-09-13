@@ -24,9 +24,11 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-MARKER = "ubs:ignore"
+from ubs_core.suppression import has_suppression_marker
 
 RULE_ID = "rust.security.tls-indirect"
+# The scanner combines this detector with direct TLS checks under this public ID.
+PUBLIC_RULE_ID = "rust.security.tls-verification"
 CATEGORY = 8
 TITLE = "TLS certificate or hostname verification disabled"
 SEVERITY = "critical"
@@ -88,7 +90,7 @@ def find(files: Sequence[Path], root: Path | None = None) -> Iterator[tuple[Path
         true_names = set()
         for raw in lines:
             line = code_line(raw)
-            if not line or MARKER in line:
+            if not line or has_suppression_marker(line):
                 continue
             match = true_assignment_re.search(line)
             if match:
@@ -97,7 +99,7 @@ def find(files: Sequence[Path], root: Path | None = None) -> Iterator[tuple[Path
             continue
         for idx, raw in enumerate(lines, start=1):
             line = code_line(raw)
-            if not line or MARKER in line:
+            if not line or has_suppression_marker(line, PUBLIC_RULE_ID):
                 continue
             match = danger_call_re.search(line)
             if match and match.group("name") in true_names:

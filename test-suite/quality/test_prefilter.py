@@ -137,6 +137,54 @@ class RuleLiteralExtractionTests(unittest.TestCase):
                 with self.subTest(relation=relation, text=text):
                     self.assertEqual(extract_ast_rule_literals("test.rule", text), {"async"})
 
+    def test_structured_scalar_patterns_require_fixed_identifiers(self) -> None:
+        cases = (
+            ("$X.parse::<f64>().unwrap_or($DEFAULT)", {"parse", "f64", "unwrap_or"}),
+            ("Instant::now().elapsed()", {"Instant", "now", "elapsed"}),
+            ("$X as *const $TYPE", {"as", "const"}),
+            ("$ITER.map(|$ITEM| $ITEM.clone())", {"map", "clone"}),
+            ("console.log($$$ARGS)", {"console", "log"}),
+            ("$RECEIVER?.method($$$ARGS)", {"method"}),
+            ("async fn $NAME($$$ARGS) { $$$BODY }", {"async", "fn"}),
+        )
+        for pattern, expected in cases:
+            rule = {"pattern": pattern}
+            for text in (rule, json.dumps({"rule": rule}), f"rule: {json.dumps(rule)}\n"):
+                with self.subTest(pattern=pattern, text=text):
+                    self.assertEqual(extract_ast_rule_literals("test.rule", text), expected)
+
+    def test_scalar_unknowns_do_not_require_incidental_text(self) -> None:
+        for pattern in (
+            "$ONLY", "$$OPERATOR", "$$$ARGS", "$X[$INDEX]", "$X ?? $Y",
+            "$RECEIVER?.$METHOD($$$ARGS)", "$X!", "true", "0",
+            '$CALL("incidental string")', "$X // incidental_comment",
+            "$X /* incidental_comment */", "$X # incidental_comment",
+            r"\u0061", "`incidental_template`",
+        ):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(extract_ast_rule_literals("test.rule", {"pattern": pattern}), set())
+        for ignored in ("not", "stopBy"):
+            with self.subTest(ignored=ignored):
+                self.assertEqual(extract_ast_rule_literals(
+                    "test.rule", {ignored: {"pattern": "incidental_name($X)"}},
+                ), set())
+
+    def test_scalar_alternatives_and_relations_keep_conservative_requirements(self) -> None:
+        for unknown in ({"pattern": "$VALUE"}, {"pattern": "$X ?? $Y"}):
+            rule = {"any": [{"pattern": "required_call($X)"}, unknown]}
+            with self.subTest(unknown=unknown):
+                self.assertEqual(extract_ast_rule_literals("test.rule", rule), set())
+        rule = {"any": [{"pattern": "$X.first($$$)"}, {"pattern": "$X.second($$$)"}]}
+        self.assertEqual(extract_ast_rule_literals("test.rule", rule), {"first", "second"})
+        for relation in ("has", "inside", "precedes", "follows"):
+            rule = {relation: {"pattern": "required_call($X)",
+                               "stopBy": {"pattern": "incidental_boundary($Y)"}}}
+            with self.subTest(relation=relation):
+                self.assertEqual(extract_ast_rule_literals("test.rule", rule), {"required_call"})
+        rule = {"all": [{"pattern": "$X.required_call($$$)"},
+                        {"any": [{"pattern": "optional_call($X)"}, {"kind": "identifier"}]}]}
+        self.assertEqual(extract_ast_rule_literals("test.rule", rule), {"required_call"})
+
     def test_unquoted_yaml_flow_mapping_keeps_existing_extraction(self) -> None:
         for text in (
             "rule: { pattern: 'console.log($X)' }\n",
@@ -236,6 +284,98 @@ class PrefilterIndexTests(unittest.TestCase):
 
 class RunPrefilterTests(unittest.TestCase):
     """Test running prefilter over actual files."""
+
+    def test_scalar_candidates_ignore_metavariable_names_and_spacing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "matched.js"
+            target.write_text("console\n  . log();\n", encoding="utf-8")
+            clean = root / "clean.js"
+            clean.write_text("const value = 1;\n", encoding="utf-8")
+            rule = {"pattern": "console.log($$$ARBITRARY_ARGUMENTS)"}
+            text = f"id: test.scalar\nrule: {json.dumps(rule)}\n"
+            index = build_prefilter_index(ast_rules=[("test.scalar", text)])
+            self.assertFalse(index.fallback_rules)
+            result = run_prefilter([target, clean], index)
+            self.assertFalse(result.is_bypass)
+            self.assertEqual(result.ast_files, [target])
+            self.assertIn("test.scalar", result.candidate_rules_for(target))
+            self.assertNotIn("test.scalar", result.candidate_rules_for(clean))
+
+    def test_generated_restored_rust_checks_admit_each_source_variant(self) -> None:
+        from ubs_core.rust_rules import AST_CHECKS, generate
+
+        examples = {
+            "ptr_cast": ("value as *const u8", "value as *mut u8"),
+            "parse_float_no_finite_check": (
+                "input.parse::<f64>().unwrap_or(0.0)", "input.parse::<f32>().unwrap_or(0.0)",
+            ),
+            "instant_now_elapsed": ("Instant::now().elapsed()",),
+            "instant_subtraction": ("Instant::now() - duration",),
+            "from_slice_panic": (
+                "Nonce::from_slice(bytes)", "GenericArray::from_slice(bytes)", "Key::from_slice(bytes)",
+            ),
+            "i64_negate_overflow": ("value.wrapping_neg()", "-(value as i64)"),
+            "wrapping_arithmetic": (
+                "value.wrapping_add(1)", "value.wrapping_sub(1)", "value.wrapping_mul(2)",
+            ),
+            "tokio_spawn_no_move": ("tokio::spawn(async {})",),
+            "tokio_block_in_place": ("tokio::task::block_in_place(|| {})",),
+            "write_not_atomic": ("std::fs::write(path, bytes)", "fs::write(path, bytes)"),
+            "map_clone": ("items.map(|item| item.clone())",),
+            "strict_utf8": (
+                "String::from_utf8(bytes).unwrap()", "str::from_utf8(bytes).unwrap()",
+                'String::from_utf8(bytes).expect("valid")', 'str::from_utf8(bytes).expect("valid")',
+            ),
+            "regex_new_unwrap": ("regex::Regex::new(input).unwrap()",),
+            "debug_assert_macros": ("debug_assert!(true)", "debug_assert_eq!(1, 1)",
+                                    "debug_assert_ne!(1, 2)"),
+        }
+        self.assertEqual(set(examples), {slug for _, slug, _, _, _ in AST_CHECKS})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rules_dir = root / "rules"
+            manifest = generate(rules_dir)
+            clean = root / "clean.rs"
+            clean.write_text("// untouched\n", encoding="utf-8")
+            for slug, sources in examples.items():
+                with self.subTest(slug=slug):
+                    rule_id = f"rust.ast.{slug}"
+                    text = (rules_dir / f"{slug}.yml").read_text(encoding="utf-8")
+                    literals = extract_ast_rule_literals(rule_id, text, lang="rust")
+                    self.assertTrue(literals, rule_id)
+                    self.assertEqual(extract_ast_rule_literals(rule_id, manifest[rule_id], lang="rust"),
+                                     literals)
+                    index = build_prefilter_index(ast_rules=[(rule_id, text)], lang="rust")
+                    self.assertFalse(index.fallback_rules)
+                    positive = []
+                    for branch, source in enumerate(sources):
+                        target = root / f"{slug}_{branch}.rs"
+                        target.write_text(f"async fn example() {{ let _ = {source}; }}\n",
+                                          encoding="utf-8")
+                        positive.append(target)
+                    result = run_prefilter([*positive, clean], index)
+                    self.assertFalse(result.is_bypass)
+                    self.assertEqual(result.files_after_prefilter, len(positive))
+                    self.assertEqual(set(result.ast_files), set(positive))
+                    for target in positive:
+                        self.assertIn(rule_id, result.candidate_rules_for(target))
+                    self.assertNotIn(rule_id, result.candidate_rules_for(clean))
+
+    def test_unknown_scalar_alternative_keeps_files_without_known_literal(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "numeric.rs"
+            target.write_text("0\n", encoding="utf-8")
+            for unknown in ("$VALUE", "0", "$X ?? $Y"):
+                with self.subTest(unknown=unknown):
+                    rule = {"any": [{"pattern": "known_call($X)"}, {"pattern": unknown}]}
+                    text = f"id: test.scalar\nrule: {json.dumps(rule)}\n"
+                    index = build_prefilter_index(ast_rules=[("test.scalar", text)])
+                    self.assertEqual(index.fallback_rules, {"test.scalar"})
+                    result = run_prefilter([target], index)
+                    self.assertEqual(result.ast_files, [target])
+                    self.assertIn("test.scalar", result.candidate_rules_for(target))
 
     def test_run_prefilter_filtering_and_bypass(self) -> None:
         with tempfile.TemporaryDirectory() as td:

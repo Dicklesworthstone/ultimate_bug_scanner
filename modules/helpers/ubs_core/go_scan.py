@@ -973,7 +973,7 @@ def main(argv: list[str] | None = None) -> int:
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+                recs = capturing_sink.get_for_file(f)
             if recs:
                 for cached_record in recs:
                     record = dict(cached_record)

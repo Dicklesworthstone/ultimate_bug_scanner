@@ -131,7 +131,6 @@ _CATEGORY_DETECTED = {
          "Localize strings and use locale-aware formatters."),
 }
 _CORRELATION_PREFIX = "ubs.correlation.urlsession."
-AST_PACK_RULE = "swift.urlsession.task-no-resume"
 
 
 def slug_for_category(category: int) -> str:
@@ -360,6 +359,7 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                 "path": "", "line": 0, "col": 1,
                 "severity": pattern.thresholds[-1][1],
                 "count": 0,
+                "scope": "project",
                 "title": pattern.title,
                 "message": pattern.title,
                 "suppressed": False,
@@ -417,17 +417,8 @@ def load_derived() -> list[Callable]:
 
 
 def rel_for(path: Path, project_dir: Path) -> str:
-    """Legacy rel(): path relative to the scan root, basename when outside.
-
-    The heredoc detectors resolve findings against ``base = root if
-    root.is_dir() else root.parent`` and fall back to the bare name for
-    external paths.
-    """
-    base = project_dir if project_dir.is_dir() else project_dir.parent
-    try:
-        return str(path.resolve().relative_to(base.resolve()))
-    except (ValueError, OSError):
-        return path.name
+    """Resolve structured analyzer paths against their process cwd."""
+    return str(path.resolve())
 
 
 def run_derived(ctx: ScanContext, sink, skip: set[int]) -> None:
@@ -474,19 +465,20 @@ def _write_record(sink, finding: dict, skip: set[int]) -> None:
     category = int(finding.get("category", 0) or 0)
     if category in skip:
         return
+    project_note = finding.get("scope") == "project"
     record = {
         "rule": str(finding.get("rule", "swift.detector")),
         "category_id": finding.get("category_id")
         or (f"swift.{slug_for_category(category)}" if category else ""),
         "path": str(finding.get("path", "")),
-        "line": int(finding.get("line", 0) or 0),
+        "line": finding.get("line") if project_note else int(finding.get("line", 0) or 0),
         "col": int(finding.get("col", 1) or 1),
         "severity": finding.get("severity", "warning"),
-        "count": int(finding.get("count", 1) or 0),
+        "count": finding.get("count") if project_note else int(finding.get("count", 1) or 0),
         "message": str(finding.get("message", "")),
         "suppressed": False,
     }
-    for key in ("title", "description", "samples"):
+    for key in ("title", "description", "samples", "scope"):
         if finding.get(key) is not None:
             record[key] = finding[key]
     sink.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -509,8 +501,7 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
     ``regex_swift`` (ReDoS deep analysis) has no legacy counter impact — the
     legacy cat-12 checks were pure rg pipelines — so it stays off unless
     ``enable_new`` is set, keeping v2 totals at legacy parity. Analyzer
-    record paths are re-expressed relative to the scan root exactly like the
-    legacy heredocs' rel() (project-relative, basename fallback).
+    record paths retain their complete source identity for cache association.
     """
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import RunContext, analyzers_for_lang
@@ -886,10 +877,9 @@ class _Renderer:
             correlation = [r for r in self.buckets if r.startswith(_CORRELATION_PREFIX)]
             if correlation:
                 for rule in correlation:
-                    for rec in self.buckets[rule]:
-                        self.finding(str(rec.get("severity", "info")), int(rec.get("count", 1) or 0),
-                                     str(rec.get("title") or rule), rec.get("description"))
-                        self.embedded_samples([rec], limit=3)
+                    self.finding(self.severity(rule), self.count(rule),
+                                 self.title(rule), self.desc(rule, None))
+                    self.embedded_samples(self.buckets[rule], limit=3)
             elif not self.buckets.get("swift.networking.correlation") and spec.good:
                 self.finding("good", 0, spec.good, None)
             return
@@ -937,23 +927,17 @@ class _Renderer:
             return
         pack = [
             rule for rule in self.buckets
-            if rule == AST_PACK_RULE or (
-                not self.buckets[rule][0].get("category_id")
-                and not rule.startswith(_CORRELATION_PREFIX)
-                and rule not in _SPEC_BY_RULE
-            )
+            if any(rec.get("source") == "ast-grep" for rec in self.buckets[rule])
         ]
         if not pack:
             return
         self.subheader("ast-grep rule-pack summary")
         for rule in sorted(pack):
-            for rec in self.buckets[rule]:
-                count = int(rec.get("count", 1) or 0)
-                if count <= 0:
-                    continue
-                self.finding(str(rec.get("severity", "info")), count,
-                             str(rec.get("title") or f"{rule}: {rec.get('message', '')}"), None)
-                self.embedded_samples([rec], limit=self.args.detail_limit)
+            count = self.count(rule)
+            if count <= 0:
+                continue
+            self.finding(self.severity(rule), count, self.title(rule), None)
+            self.embedded_samples(self.buckets[rule], limit=self.args.detail_limit)
 
     def text(self) -> str:
         return "\n".join(self.lines) + "\n"
@@ -971,15 +955,17 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     findings = []
     for rule, recs in by_rule.items():
         first = recs[0]
+        samples = []
+        for rec in recs:
+            samples.extend(rec.get("samples") or ([{
+                "path": rec["path"], "line": int(rec.get("line", 0) or 0),
+            }] if rec.get("path") else []))
         findings.append({
             "severity": first.get("severity", "info"),
             "count": sum(int(rec.get("count", 1) or 0) for rec in recs),
             "title": str(first.get("title") or first.get("message", ""))[:200],
             "description": str(first.get("description", "")),
-            "samples": [
-                {"path": rec.get("path", ""), "line": int(rec.get("line", 0) or 0)}
-                for rec in recs[:3]
-            ],
+            "samples": samples[:3],
         })
     return {"version": version, "findings": findings}
 
@@ -1061,12 +1047,12 @@ def main(argv: list[str] | None = None) -> int:
 
         scan_ctx = ScanContext(
             files=files_to_scan,
+            texts=ctx.texts,
             project_dir=project_dir,
             skip_narrowing=args.skip_type_narrowing,
             ast_available=args.ast_available,
         )
         capturing_sink = CapturingSink()
-        scan_patterns(patterns, scan_ctx, capturing_sink, skip, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.swift_ast import scan_all
 
@@ -1085,7 +1071,6 @@ def main(argv: list[str] | None = None) -> int:
                 "degraded": True,
             }, skip)
         run_detectors(scan_ctx, capturing_sink, skip)
-        run_derived(scan_ctx, capturing_sink, skip)
         run_analyzers(scan_ctx, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
         cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
@@ -1105,10 +1090,16 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
+        # Thresholds and derived checks depend on the complete selected input,
+        # including cache hits. Recompute these inexpensive report-level facts
+        # here; only source-local AST/detector/analyzer records enter the cache.
+        # Direct emission also preserves genuine pathless aggregate findings.
+        scan_patterns(patterns, ctx, sink_file, skip)
+        run_derived(ctx, sink_file, skip)
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f, project_dir=args.project_dir or args.project)
+                recs = capturing_sink.get_for_file(f)
             if recs:
                 for r in recs:
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")

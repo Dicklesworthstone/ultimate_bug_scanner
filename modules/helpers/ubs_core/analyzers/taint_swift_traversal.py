@@ -247,10 +247,10 @@ def run(ctx: RunContext) -> Iterable[dict]:
             text = path.read_text(encoding='utf-8', errors='ignore')
         except OSError:
             continue
-        for rel_path, line_no, _code in scan_text(path, text, cwd):
+        for _rel_path, line_no, _code in scan_text(path, text, cwd):
             yield {
                 "rule": "swift.taint.request_path_traversal",
-                "path": rel_path,
+                "path": str(path.resolve()),
                 "line": line_no,
                 "col": 1,
                 "layer": "taint",

@@ -8,9 +8,6 @@ storyboard count are filesystem-gated derived checks.
 """
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 from ubs_core.swift_scan import Pattern
 
 PATTERNS = [
@@ -63,25 +60,24 @@ PATTERNS = [
 
 def _packaging(ctx):
     """Legacy cat 20: Package.swift branch/revision + unsafeFlags checks."""
+    root = ctx.project_dir.resolve()
+    if root.is_file():
+        root = root.parent
     manifest = next((p for p in ctx.files if p.name == "Package.swift"
-                     and p.parent == (ctx.project_dir if ctx.project_dir.is_dir()
-                                      else ctx.project_dir)), None)
+                     and p.resolve().parent == root), None)
     if manifest is None:
-        # legacy: a Package.swift directly under the scan root
-        direct = ctx.project_dir / "Package.swift"
-        if not direct.is_file():
-            yield {
-                "rule": "swift.packaging.no-manifest",
-                "category": 20,
-                "path": "", "line": 0,
-                "severity": "info",
-                "count": 0,
-                "title": "Package.swift not found",
-                "message": "Package.swift not found",
-                "description": "Skipping SPM checks",
-            }
-            return
-        manifest = direct
+        yield {
+            "rule": "swift.packaging.no-manifest",
+            "category": 20,
+            "path": "", "line": 0,
+            "severity": "info",
+            "count": 0,
+            "scope": "project",
+            "title": "Package.swift not found in selected files",
+            "message": "Package.swift not found in selected files",
+            "description": "Skipping SPM checks",
+        }
+        return
     import re
 
     def _count(regex: str) -> int:
@@ -127,16 +123,9 @@ def _packaging(ctx):
 
 
 def _storyboards(ctx):
-    """Legacy cat 21: raw find for *.storyboard under the scan root."""
-    root = ctx.project_dir
-    count = 0
-    if root.is_dir():
-        for dp, _dn, fn in os.walk(root):
-            for name in fn:
-                if name.endswith(".storyboard"):
-                    count += 1
-    elif root.is_file() and root.suffix == ".storyboard":
-        count = 1
+    """Count selected storyboard sources without including unselected siblings."""
+    count = len({path.resolve() for path in ctx.files
+                 if path.suffix == ".storyboard" and path.is_file()})
     if count > 5:
         yield {
             "rule": "swift.uisafety.storyboards",

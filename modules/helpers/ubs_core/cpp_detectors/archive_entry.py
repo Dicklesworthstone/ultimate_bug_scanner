@@ -224,10 +224,7 @@ def analyze(path: Path, cwd: Path) -> list[tuple[str, int, str]]:
     lines = text.splitlines()
     entry_aliases = collect_entry_aliases(lines)
     path_aliases = collect_path_aliases(lines, entry_aliases)
-    try:
-        rel = str(path.resolve().relative_to(cwd))
-    except ValueError:
-        rel = path.name
+    rel = str(path.resolve())
     seen = set()
     issues = []
     for idx, _ in enumerate(lines, start=1):

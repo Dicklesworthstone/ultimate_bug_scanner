@@ -44,6 +44,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.io import parse_ndjson_lines, read_ndjson  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
+from ubs_core.py_detectors import missing_returns  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.flow import PATTERNS as FLOW_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.foundations import PATTERNS as FOUNDATION_PATTERNS  # noqa: E402
@@ -66,7 +67,14 @@ class _Sink:
         self.records: list[dict] = []
 
     def write(self, line: str) -> None:
-        self.records.append(json.loads(line))
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"Python precision sink record {len(self.records) + 1} is invalid JSON: "
+                f"{line!r}; decoder error: {exc}"
+            ) from exc
+        self.records.append(record)
 
 
 def run_patterns(rule_id: str, sources: dict[str, str]) -> list[dict]:
@@ -90,6 +98,38 @@ def run_detector(module, sources: dict[str, str]) -> list[tuple]:
             target.write_text(textwrap.dedent(body), encoding="utf-8")
             paths.append(target)
         return list(module.find(paths))
+
+
+class MissingReturnOrderingTests(unittest.TestCase):
+    def test_reversed_inputs_preserve_deficit_and_exact_source_sites(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_missing_returns_") as tmp:
+            first = Path(tmp) / "a.py"
+            last = Path(tmp) / "z.py"
+            first.write_text(
+                "def alpha():\n    pass\n\ndef beta():\n    pass\n",
+                encoding="utf-8",
+            )
+            last.write_text(
+                "def zeta():\n    return 1\n\ndef omega():\n    return 2\n",
+                encoding="utf-8",
+            )
+            expected = [
+                (first, 1, 1, "def alpha():"),
+                (first, 4, 1, "def beta():"),
+            ]
+            for paths in ([first, last], [last, first], [first]):
+                with self.subTest(paths=paths):
+                    self.assertEqual(list(missing_returns.find(paths)), expected)
+            self.assertEqual(list(missing_returns.find([last])), [])
+            self.assertEqual(list(missing_returns.find([])), [])
+
+    def test_cli_corpus_single_deficit_keeps_identity_when_reversed(self) -> None:
+        root = REPO_ROOT / "test-suite" / "python" / "buggy"
+        paths = sorted(root.glob("*.py"))
+        self.assertGreater(len(paths), 1)
+        expected = [(root / "bad_resources.py", 6, 1, "def read_config(path):")]
+        self.assertEqual(list(missing_returns.find(paths)), expected)
+        self.assertEqual(list(missing_returns.find(list(reversed(paths)))), expected)
 
 
 # ────────────────────────────── division ──────────────────────────────

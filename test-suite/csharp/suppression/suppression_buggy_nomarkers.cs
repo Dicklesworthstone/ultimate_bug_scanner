@@ -42,10 +42,10 @@ public static class SuppressionBuggy
         }
     }
 
-    // Arrangement 5: rule-scoped markers (rule id in square brackets). The
-    // csharp code-sample lines carry no rule id, so previous-line scopes
-    // suppress through the runner's flat same-line/previous-line path, while
-    // the trailing scope is honored by the interval engine itself.
+    // Arrangement 5: the marked twin names public diagnostic identifiers.
+    // Pattern and AST diagnostics have separate identities for these calls.
+    // This control omits both scopes and must retain both findings.
+    // The matching code is identical to the marked operations.
     public static void RuleScopedPrevLine()
     {
         Thread.Sleep(5);

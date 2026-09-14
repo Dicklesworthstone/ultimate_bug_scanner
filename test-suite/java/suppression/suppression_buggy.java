@@ -2,7 +2,7 @@
 // suppression_buggy_nomarkers.java (identical buggy code, no markers).
 // Every native java finding below (Statement/PreparedStatement/ResultSet
 // acquired outside try-with-resources, Runtime.exec — the path:line code
-// samples printed by the module) carries an ubs:ignore marker in one of the
+// samples printed by the module) carries a suppression marker in one of the
 // documented arrangements, so scanning this file must report zero findings,
 // while the nomarkers twin reproduces them.
 
@@ -40,9 +40,9 @@ public class SuppressionBuggy {
         }
     }
 
-    // Arrangement 5: rule-scoped markers (ubs:ignore[rule]). Java code-sample
-    // lines carry no rule id, so these suppress through the runner's
-    // same-line/previous-line path.
+    // Arrangement 5: scopes name public diagnostic identifiers explicitly.
+    // Previous-line and trailing placements suppress the named resource rule.
+    // Independent diagnostics must retain their own identities and findings.
     public void ruleScopedPrevLine(Connection conn) throws SQLException {
         // ubs:ignore[java.resource.statement-no-close] -- fixture: rule-scoped marker above the finding
         Statement scoped = conn.createStatement();

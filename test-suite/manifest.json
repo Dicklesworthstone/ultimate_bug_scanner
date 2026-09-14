@@ -13795,7 +13795,12 @@
         "--only=cpp"
       ],
       "expect": {
-        "exit_code": "nonzero",
+        "exit_code": "zero",
+        "totals": {
+          "critical": { "min": 0, "max": 0 },
+          "warning": { "min": 0, "max": 0 },
+          "info": { "min": 0, "max": 0 }
+        },
         "forbid_substrings": [
           "suppression_buggy.cpp:"
         ]
@@ -13933,7 +13938,12 @@
         "--only=java"
       ],
       "expect": {
-        "exit_code": "nonzero",
+        "exit_code": "zero",
+        "totals": {
+          "critical": { "min": 0, "max": 0 },
+          "warning": { "min": 0, "max": 0 },
+          "info": { "min": 0, "max": 0 }
+        },
         "forbid_substrings": [
           "suppression_buggy.java:"
         ]
@@ -14013,7 +14023,7 @@
     },
     {
       "id": "swift-suppression-intervals-markers",
-      "description": "A7 GH #91: all ubs:ignore placements (trailing, previous-line, multi-line statement, formatter-relocated, rule-scoped) suppress every finding line in the swift module.",
+      "description": "A7 GH #91: all marker placements suppress marked Swift crash/cast/lifecycle sites while unmarked print controls remain visible.",
       "path": "test-suite/swift/suppression/suppression_buggy.swift",
       "language": "swift",
       "tags": [
@@ -14022,12 +14032,33 @@
         "regression"
       ],
       "args": [
-        "--only=swift"
+        "--only=swift",
+        "--verbose"
       ],
       "expect": {
         "exit_code": "zero",
+        "totals": {
+          "critical": { "min": 0, "max": 0 },
+          "warning": { "min": 0, "max": 0 },
+          "info": { "min": 2 }
+        },
+        "require_substrings": [
+          "suppression_buggy.swift:19 [rule:",
+          "suppression_buggy.swift:49 [rule:"
+        ],
         "forbid_substrings": [
-          "suppression_buggy.swift:"
+          "suppression_buggy.swift:18 [rule:",
+          "suppression_buggy.swift:18:",
+          "suppression_buggy.swift:24 [rule:",
+          "suppression_buggy.swift:24:",
+          "suppression_buggy.swift:30 [rule:",
+          "suppression_buggy.swift:30:",
+          "suppression_buggy.swift:37 [rule:",
+          "suppression_buggy.swift:37:",
+          "suppression_buggy.swift:48 [rule:",
+          "suppression_buggy.swift:48:",
+          "suppression_buggy.swift:53 [rule:",
+          "suppression_buggy.swift:53:"
         ]
       }
     },
@@ -14071,7 +14102,12 @@
         "--only=csharp"
       ],
       "expect": {
-        "exit_code": "nonzero",
+        "exit_code": "zero",
+        "totals": {
+          "critical": { "min": 0, "max": 0 },
+          "warning": { "min": 0, "max": 0 },
+          "info": { "min": 1, "max": 1 }
+        },
         "forbid_substrings": [
           "suppression_buggy.cs:"
         ]

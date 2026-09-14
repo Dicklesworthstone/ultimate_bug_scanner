@@ -1,10 +1,10 @@
 // GH #91 suppression fixture (bead A7) for the Swift module, twin of
 // suppression_buggy_nomarkers.swift (identical buggy code, no markers).
-// Every native swift finding below (the path:line code samples printed by
-// the module: force-try, force cast, Timer scheduled without invalidate)
-// carries a suppression marker in one of the documented arrangements, so
-// `./ubs test-suite/swift/suppression/suppression_buggy.swift` must report
-// zero finding lines, while the nomarkers twin reproduces them.
+// Force-try, force-cast and Timer lifecycle findings below carry markers
+// in the documented arrangements. The unmarked print calls remain positive
+// informational controls, including the calls after previous-line scopes.
+// Scanning this file must omit the marked hazard sites while retaining
+// those print findings; the nomarkers twin also reproduces the hazards.
 
 import Foundation
 
@@ -40,17 +40,17 @@ final class SuppressionFixture {
         }
     }
 
-    // Arrangement 5: rule-scoped markers (rule id in square brackets). The
-    // swift module's code-sample lines carry no rule id, so these suppress
-    // through the runner's same-line/previous-line path.
+    // Arrangement 5: scopes name public diagnostic identifiers explicitly.
+    // Each scope suppresses only its named force-try or force-cast finding.
+    // Unmarked print calls continue to exercise independent diagnostics.
     func ruleScopedPrevLine(_ payload: Data) throws {
-        // ubs:ignore[swift.force-try] -- fixture: rule-scoped marker above the finding
+        // ubs:ignore[swift.force-try,swift.optionals.try-bang,swift.optionals.force-some] -- fixture: rule-scoped marker above the finding
         let decoded = try! JSONDecoder().decode([String: Int].self, from: payload)
         print(decoded)
     }
 
     func ruleScopedTrailing(_ any: Any) {
-        let flag = any as! Int // ubs:ignore[swift.force-cast] -- fixture: rule-scoped trailing marker
+        let flag = any as! Int // ubs:ignore[swift.force-cast,swift.optionals.as-bang,swift.optionals.force-some] -- fixture: rule-scoped trailing marker
         print(flag)
     }
 }

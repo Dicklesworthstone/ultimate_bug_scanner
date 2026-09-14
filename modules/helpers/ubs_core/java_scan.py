@@ -38,6 +38,7 @@ from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
+from ubs_core.suppression import SourceSuppressions, build_index, may_have_markers
 
 MARKER = "ubs:ignore"
 
@@ -159,13 +160,14 @@ def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for matches, skipping excluded lines.
 
     rg is line-oriented: a match never spans a newline, one line is reported
-    once per pattern, and count_lines drops ubs:ignore lines. Matching
-    per line reproduces exactly that (a whole-text finditer would let
-    ``[^)]``-style classes cross newlines and drift from legacy counts).
+    once per pattern. Exact rule-aware statement markers apply before counts.
+    A whole-text finditer would let ``[^)]``-style classes cross newlines
+    and drift from the actual matching line.
     """
+    suppression = build_index(text, lang="java") if may_have_markers(text) else None
     for line_no, line_text in enumerate(text.splitlines(), 1):
-        if MARKER in line_text:
-            continue  # legacy count_lines drops marker lines from counts
+        if suppression is not None and suppression.is_suppressed(line_no, pattern.rule_id):
+            continue
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
             continue
         if pattern.require_regex is not None and not pattern.require_regex.search(line_text):
@@ -260,7 +262,7 @@ def _record_category(finding: dict) -> int | None:
         return 19
     if rule.startswith("java.async."):
         return 3
-    if rule.startswith("java.optional."):
+    if rule == "java.optional-isPresent-then-get" or rule.startswith("java.optional."):
         return 1
     if rule.startswith("kotlin.narrowing."):
         return 1
@@ -466,7 +468,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int], ast_ran:
             lines.append(f"    {remediation}")
         cap = 25 if rule.endswith("sql-injection") else 5
         for rec in recs[:cap]:
-            lines.append(f"    {rec['path']}:{rec['line']}  {str(rec.get('message', ''))[:180]}")
+            lines.append(f"    {rec['path']}:{rec['line']} [rule:{rule}] {str(rec.get('message', ''))[:180]}")
 
     # Legacy category-15 staging note (info, count 0).
     if ast_ran and 15 not in _skip_set(args):
@@ -560,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         extra=f"new_analyzers={args.enable_new_analyzers}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    suppressions = SourceSuppressions("java")
 
     capturing_sink = None
     ast_ran = False
@@ -581,7 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         run_detectors(files_to_scan, capturing_sink, skip)
         if args.ast_rule_dir:
             from ubs_core.java_ast import scan_all
-            from ubs_core.java_rules import MARKER_SUPPRESSED_IDS, SEVERITY_MAP
+            from ubs_core.java_rules import SEVERITY_MAP
 
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
             scan_all(
@@ -589,11 +592,12 @@ def main(argv: list[str] | None = None) -> int:
                 severity_overrides=dict(SEVERITY_MAP),
                 counted_rules=set(SEVERITY_MAP),
                 skip_categories=skip,
-                marker_suppressed_ids=MARKER_SUPPRESSED_IDS,
                 category_for_rule=lambda rule_id: _record_category({"rule": rule_id}),
             )
             ast_ran = True
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        cache.store_scanned_files(files_to_scan, {
+            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+        })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -617,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for cached_record in recs:
+                for cached_record in suppressions.filter(recs):
                     record = dict(cached_record)
                     is_ast = record.pop("_ast_pack", False)
                     report_only = record.pop("_report_only", False)

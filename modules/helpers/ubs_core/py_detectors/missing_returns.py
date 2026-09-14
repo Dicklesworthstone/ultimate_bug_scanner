@@ -65,5 +65,7 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     diff = def_count - ret_count
     if diff <= 0:
         return
+    # File discovery order must not change which sites represent the deficit.
+    def_hits.sort(key=lambda hit: (hit[0].as_posix(), hit[1]))
     for path, line_no, code in def_hits[:diff]:
         yield path, line_no, 1, code

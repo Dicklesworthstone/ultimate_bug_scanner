@@ -35,18 +35,18 @@ void copy_in_block(char *dst, const char *src, bool ready) {
     }
 }
 
-// Arrangement 5: rule-scoped markers (rule id in square brackets). The cpp
-// module's code-sample lines carry no rule id, so these suppress through the
-// runner's same-line/previous-line path.
+// Arrangement 5: rule-scoped markers list public diagnostic identifiers.
+// Native and AST findings keep independent identities; each intended
+// suppression therefore names every rule that reports the marked operation.
 void rule_scoped_previous_line(char *heap, std::mutex &m) {
-    // ubs:ignore[cpp.raw-delete] -- fixture: rule-scoped marker above the finding
+    // ubs:ignore[cpp.raw-delete,cpp.memory-raii.manual-delete] -- fixture: rule-scoped marker above the finding
     delete[] heap;
-    // ubs:ignore[cpp.manual-mutex-lock] -- fixture: rule-scoped marker above the finding
+    // ubs:ignore[cpp.manual-mutex-lock,cpp.concurrency.manual-lock] -- fixture: rule-scoped marker above the finding
     m.lock();
-    // ubs:ignore[cpp.manual-mutex-lock] -- fixture: rule-scoped marker above the finding
+    // ubs:ignore[cpp.manual-mutex-lock,cpp.concurrency.manual-lock] -- fixture: rule-scoped marker above the finding
     m.unlock();
 }
 
 void rule_scoped_trailing(std::size_t n) {
-    char *buf = new char[n]; // ubs:ignore[cpp.raw-new] -- fixture: rule-scoped trailing marker
+    char *buf = new char[n]; // ubs:ignore[cpp.raw-new,cpp.raw-new-array] -- fixture: rule-scoped trailing marker
 }

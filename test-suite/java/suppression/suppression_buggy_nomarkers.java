@@ -1,5 +1,5 @@
 // GH #91 suppression fixture (bead A7) for the Java module, twin of
-// suppression_buggy.java: identical buggy code with every ubs:ignore marker
+// suppression_buggy.java: identical buggy code with every suppression marker
 // removed, so a scan of this file must reproduce the native java findings
 // (Statement/PreparedStatement/ResultSet acquired outside try-with-resources,
 // Runtime.exec) that the markered twin suppresses.
@@ -37,9 +37,9 @@ public class SuppressionBuggy {
         }
     }
 
-    // Arrangement 5: rule-scoped markers (ubs:ignore[rule]). Java code-sample
-    // lines carry no rule id, so these suppress through the runner's
-    // same-line/previous-line path.
+    // Arrangement 5: the marked twin names public diagnostic identifiers.
+    // This control omits the previous-line and trailing resource scopes.
+    // Independent diagnostics must retain their own identities and findings.
     public void ruleScopedPrevLine(Connection conn) throws SQLException {
         Statement scoped = conn.createStatement();
         scoped.execute("SELECT 1");

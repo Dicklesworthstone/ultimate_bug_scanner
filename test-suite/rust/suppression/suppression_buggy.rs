@@ -2,7 +2,7 @@
 //! suppression_buggy_nomarkers.rs (identical buggy code, no markers).
 //! Every native rust finding below (the path:line code samples printed by
 //! the module: parse().unwrap()/expect() panics, unsafe blocks, raw mutex
-//! lock handling) carries an ubs:ignore marker in one of the documented
+//! lock handling) carries a suppression marker in one of the documented
 //! arrangements, so `./ubs test-suite/rust/suppression/suppression_buggy.rs`
 //! must report zero findings, while the nomarkers twin reproduces them.
 
@@ -37,19 +37,19 @@ fn relocated_in_block(flag: bool, raw: &str) -> i32 {
     0
 }
 
-// Arrangement 5: rule-scoped markers (ubs:ignore[rule]). The rust module's
-// code-sample lines carry no rule id, so these suppress through the runner's
-// same-line/previous-line path.
+// Arrangement 5: rule-scoped markers list public diagnostic identifiers.
+// Generic unwrap and specialized lock/parse diagnostics are independent;
+// each scope names all intended findings without hiding unrelated rules.
 fn poisoned_lock(shared: &Arc<Mutex<u32>>) -> u32 {
-    // ubs:ignore[rs.mutex-lock-unwrap] -- fixture: rule-scoped marker above the finding
+    // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- fixture: rule-scoped marker above the finding
     let mut guard = shared.lock().unwrap();
     *guard += 1;
-    // ubs:ignore[rs.mutex-lock-expect] -- fixture: rule-scoped marker above the finding
+    // ubs:ignore[rust.ownership.unwrap-expect,rust.async.lock-unwrap] -- fixture: rule-scoped marker above the finding
     let again = shared.lock().expect("poisoned mutex");
     *again
 }
 
 fn rule_scoped_trailing(raw: &str) -> i32 {
-    let flagged: i32 = raw.parse().unwrap(); // ubs:ignore[rs.parse-unwrap] -- fixture: rule-scoped trailing marker
+    let flagged: i32 = raw.parse().unwrap(); // ubs:ignore[rust.ownership.unwrap-expect,rust.parsing.parse-unwrap] -- fixture: rule-scoped trailing marker
     flagged
 }

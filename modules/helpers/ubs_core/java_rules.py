@@ -1,7 +1,8 @@
 """ubs_core.java_rules — ast-grep rule pack for the java/kotlin module (bead 0xjg.8).
 
-Verbatim port of `write_ast_rules` (modules/ubs-java.sh 2609-3071) plus the two
-async rules staged by `run_async_error_checks` (2401-2423). `generate` writes
+Port of `write_ast_rules` (modules/ubs-java.sh 2609-3071) plus the two
+async rules staged by `run_async_error_checks` (2401-2423), with explicit
+secret and Future receiver constraints. `generate` writes
 every rule, one sgconfig-java.yml, one sgbase-java.yml and a manifest.json into
 the rule dir so `ubs_core.java_ast.scan_all` can run the whole pack with a
 single `ast-grep scan -c` invocation.
@@ -59,7 +60,7 @@ REMEDIATION_MAP: dict[str, str] = {
     "java.resource.jdbc-no-close": "Use try-with-resources or explicitly close java.sql.Connection objects",
     "java.resource.resultset-no-close": "Close java.sql.ResultSet objects or wrap them in try-with-resources",
     "java.resource.statement-no-close": "Close Statement/PreparedStatement handles or wrap them in try-with-resources",
-    "java.async.future-get-no-try": "Wrap blocking future.get()/join() calls in try/catch to handle ExecutionException",
+    "java.async.future-get-no-try": "Handle ExecutionException from get() or CompletionException from join() with try/catch or a recovery stage",
     "java.async.then-no-exceptionally": "Attach .exceptionally(...) or .handle(...) to promise chains to surface errors",
 }
 
@@ -116,12 +117,17 @@ rule:
 severity: info
 message: "Prefer isPresent() to !isEmpty() for clarity or use ifPresent(...)"
 """),
-    # Cat-21 conjunct of the secrets check: legacy `ast_search
-    # 'String $K = $V;'` counts every constrained String declaration.
+    # The legacy cat-21 probe matched every String declaration. Only literal
+    # values bound to secret-like names provide hardcoded-secret evidence.
     ("java-secrets-string-decl", """id: java.secrets.string-decl
 language: java
 rule:
   pattern: String $K = $V;
+constraints:
+  K:
+    regex: (?i).*(password|passwd|pwd|secret|token|api[-_]?key|auth|credential).*
+  V:
+    kind: string_literal
 severity: warning
 message: "Hardcoded secret-like identifier"
 """),
@@ -443,14 +449,288 @@ severity: info
 message: "Closeable created outside try-with-resources; ensure it is closed"
 """),
     # ── Async rules (run_async_error_checks, ubs-java.sh 2401-2423) ─────────
-    ("java.async.future-get-no-try", """id: java.async.future-get-no-try
+    # Binding lookup crosses lambdas to resolve captures, but handler lookup
+    # stops there: a surrounding try does not catch a later lambda invocation.
+    # Locals/parameters/loop variables shadow fields; unrelated methods and
+    # nested class bodies cannot supply receiver-type evidence.
+    ("java.async.future-get-no-try", r"""id: java.async.future-get-no-try
 language: java
 rule:
-  pattern: $F.get()
-  not:
+  all:
+    - any:
+        - all:
+            - pattern: $RECEIVER.get($$$ARGS)
+            - not:
+                matches: caught-get
+        - all:
+            - pattern: $RECEIVER.join()
+            - not:
+                matches: caught-join
+    - has:
+        field: object
+        matches: future-receiver
+    - not:
+        has:
+          field: object
+          kind: method_invocation
+          has:
+            field: name
+            regex: '^(handle|handleAsync|exceptionally|exceptionallyAsync|exceptionallyCompose|exceptionallyComposeAsync)$'
+utils:
+  get-try:
+    any:
+      - kind: try_statement
+      - kind: try_with_resources_statement
+    has:
+      kind: catch_clause
+      has:
+        kind: catch_formal_parameter
+        has:
+          kind: catch_type
+          regex: '(^|\|)\s*((java\.lang\.)?(Exception|Throwable)|(java\.util\.concurrent\.)?ExecutionException)\s*(\||$)'
+  join-try:
+    any:
+      - kind: try_statement
+      - kind: try_with_resources_statement
+    has:
+      kind: catch_clause
+      has:
+        kind: catch_formal_parameter
+        has:
+          kind: catch_type
+          regex: '(^|\|)\s*((java\.lang\.)?(Exception|RuntimeException|Throwable)|(java\.util\.concurrent\.)?CompletionException)\s*(\||$)'
+  caught-get:
+    any:
+      - inside:
+          matches: get-try
+          field: body
+          stopBy:
+            matches: callable-boundary
+      - inside:
+          matches: get-try
+          field: resources
+          stopBy:
+            matches: callable-boundary
+  caught-join:
+    any:
+      - inside:
+          matches: join-try
+          field: body
+          stopBy:
+            matches: callable-boundary
+      - inside:
+          matches: join-try
+          field: resources
+          stopBy:
+            matches: callable-boundary
+  future-type:
+    regex: '^(java\.util\.concurrent\.)?(CompletableFuture|Future)\s*(<[^;]*>)?$'
+  binding-boundary:
+    any:
+      - kind: method_declaration
+      - kind: constructor_declaration
+      - kind: class_body
+  callable-boundary:
+    any:
+      - kind: method_declaration
+      - kind: constructor_declaration
+      - kind: lambda_expression
+      - kind: class_body
+  binding-name:
+    kind: variable_declarator
+    has:
+      field: name
+      pattern: $F
+  preceding-local:
     inside:
-      pattern: try { $$$BODY } catch ($E $EX) { $$$CATCH }
-      stopBy: end
+      follows:
+        kind: local_variable_declaration
+        has:
+          matches: binding-name
+        stopBy: end
+      stopBy:
+        matches: binding-boundary
+  enclosing-parameter:
+    inside:
+      any:
+        - kind: method_declaration
+        - kind: constructor_declaration
+        - kind: lambda_expression
+      has:
+        field: parameters
+        any:
+          - pattern: $F
+          - has:
+              any:
+                - kind: identifier
+                  pattern: $F
+                - kind: formal_parameter
+                  has:
+                    field: name
+                    pattern: $F
+      stopBy:
+        matches: binding-boundary
+  typed-local:
+    inside:
+      follows:
+        kind: local_variable_declaration
+        all:
+          - has:
+              field: type
+              matches: future-type
+          - has:
+              matches: binding-name
+        stopBy: end
+      stopBy:
+        matches: binding-boundary
+  typed-parameter:
+    inside:
+      any:
+        - kind: method_declaration
+        - kind: constructor_declaration
+        - kind: lambda_expression
+      has:
+        kind: formal_parameters
+        has:
+          kind: formal_parameter
+          all:
+            - has:
+                field: name
+                pattern: $F
+            - has:
+                field: type
+                matches: future-type
+      stopBy:
+        matches: binding-boundary
+  typed-field:
+    inside:
+      kind: class_body
+      has:
+        kind: field_declaration
+        all:
+          - has:
+              field: type
+              matches: future-type
+          - has:
+              matches: binding-name
+      stopBy:
+        kind: class_body
+  loop-binding:
+    inside:
+      any:
+        - all:
+            - kind: enhanced_for_statement
+            - has:
+                field: name
+                pattern: $F
+        - all:
+            - kind: for_statement
+            - has:
+                field: init
+                kind: local_variable_declaration
+                has:
+                  matches: binding-name
+      stopBy:
+        matches: binding-boundary
+  typed-loop:
+    inside:
+      any:
+        - all:
+            - kind: enhanced_for_statement
+            - has:
+                field: name
+                pattern: $F
+            - has:
+                field: type
+                matches: future-type
+        - all:
+            - kind: for_statement
+            - has:
+                field: init
+                kind: local_variable_declaration
+                all:
+                  - has:
+                      matches: binding-name
+                  - has:
+                      field: type
+                      matches: future-type
+      stopBy:
+        matches: binding-boundary
+  future-factory:
+    any:
+      - all:
+          - kind: object_creation_expression
+          - has:
+              field: type
+              matches: future-type
+      - all:
+          - kind: method_invocation
+          - has:
+              field: object
+              regex: '^(java\.util\.concurrent\.)?CompletableFuture$'
+          - has:
+              field: name
+              regex: '^(supplyAsync|runAsync|completedFuture|failedFuture|allOf|anyOf)$'
+  future-chain-method:
+    regex: '^(thenApply|thenAccept|thenRun|thenCombine|thenAcceptBoth|runAfterBoth|applyToEither|acceptEither|runAfterEither|thenCompose|whenComplete|handle|exceptionally|exceptionallyCompose)(Async)?$|^(toCompletableFuture|copy|orTimeout|completeOnTimeout)$'
+  known-future-expression:
+    any:
+      - matches: future-factory
+      - all:
+          - kind: method_invocation
+          - has:
+              field: name
+              matches: future-chain-method
+          - has:
+              field: object
+              matches: known-future-expression
+  inferred-local:
+    inside:
+      follows:
+        kind: local_variable_declaration
+        all:
+          - has:
+              field: type
+              regex: '^var$'
+          - has:
+              all:
+                - matches: binding-name
+                - has:
+                    field: value
+                    matches: known-future-expression
+        stopBy: end
+      stopBy:
+        matches: binding-boundary
+  future-receiver:
+    any:
+      - matches: known-future-expression
+      - all:
+          - kind: identifier
+          - pattern: $F
+          - any:
+              - matches: typed-local
+              - matches: inferred-local
+              - matches: typed-parameter
+              - matches: typed-loop
+              - all:
+                  - not:
+                      matches: preceding-local
+                  - not:
+                      matches: enclosing-parameter
+                  - not:
+                      matches: loop-binding
+                  - matches: typed-field
+      - all:
+          - pattern: this.$F
+          - matches: typed-field
+      - all:
+          - kind: method_invocation
+          - has:
+              field: name
+              matches: future-chain-method
+          - has:
+              field: object
+              matches: future-receiver
 severity: warning
 message: "CompletableFuture get()/join() without try/catch"
 """),

@@ -555,11 +555,102 @@ def check_rust_scoped_marker_keeps_other_finding(tmpdir: Path) -> None:
             *common, str(source),
         ])
         require_sample(module)
-        fallback_result = run([sys.executable, str(fallback_path)], module.stdout)
+        fallback_result = run([
+            sys.executable, str(fallback_path), str(REPO_ROOT / "modules" / "helpers"), "rust",
+        ], module.stdout)
         assert fallback_result.returncode == 0, fallback_result.stdout + fallback_result.stderr
         visible = re.sub(r"\x1b\[[0-9;]*m", "", fallback_result.stdout)
         assert re.search(r"verify\.rs:2(?::|\s)", visible), fallback_result.stdout
         assert "provided_signature == expected_signature" in visible, fallback_result.stdout
+
+
+def check_inline_suppression_alias_shell_guard(tmpdir: Path) -> None:
+    """Exercise the actual shell fast path and source index on real module output."""
+    root = tmpdir / "inline-alias-shell"
+    root.mkdir()
+    source = root / "source.rs"
+    ownership = "rust.ownership.unwrap-expect"
+    parsing = "rust.parsing.parse-unwrap"
+    skip = ",".join(str(n) for n in range(1, 25) if n not in (1, 23))
+    env = {
+        **os.environ, "NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0",
+        "UBS_NO_CACHE": "1", "UBS_SKIP_RUST_BUILD": "1",
+    }
+
+    def write_source(*, trailing: str = "", above: str = "", literal: str = "") -> None:
+        source.write_text(
+            "fn parse(raw: &'static str) {\n"
+            + (f"    // {above}" if above else "") + "\n"
+            + '    raw.parse::<i32>().unwrap(); let note = "' + literal + '";'
+            + (f" // {trailing}" if trailing else "") + "\n"
+            "    raw.parse::<i32>().unwrap();\n}\n",
+            encoding="utf-8",
+        )
+
+    def samples(text: str) -> list[tuple[str, int, str]]:
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        return sorted((str((root / path).resolve()), int(line), rule)
+                      for path, line, rule in re.findall(
+                          r"^\s+(.+):(\d+):\d+ \[rule:([^\]]+)\]", plain, re.MULTILINE,
+                      ))
+
+    write_source()
+    module = subprocess.run(
+        ["bash", str(REPO_ROOT / "modules" / "ubs-rust.sh"), "--no-cargo",
+         f"--skip={skip}", "--ci", "--fail-on-warning", str(source)],
+        cwd=root, env=env, capture_output=True, text=True, check=False, timeout=180,
+    )
+    details = f"module exit={module.returncode}\nstdout:\n{module.stdout}\nstderr:\n{module.stderr}"
+    assert module.returncode == 1, details
+    expected = sorted((str(source), line, rule) for line in (3, 4) for rule in (ownership, parsing))
+    assert samples(module.stdout) == expected, details
+
+    # Keep the whole production function, including its SINGLE_FILE_TARGET
+    # grep optimization. Only need_cmd's command lookup is supplied by this
+    # wrapper; the actual helper import, Rust language, stdin and filesystem
+    # source all reach the production path.
+    runner_source = UBS_BIN.read_text(encoding="utf-8")
+    function = "apply_inline_suppressions(){" + runner_source.split(
+        "apply_inline_suppressions(){", 1,
+    )[1].split("\nshould_verify_module_path(){", 1)[0]
+    wrapper = root / "inline_wrapper.sh"
+    wrapper.write_text(
+        'set -e\nneed_cmd(){ command -v "$1" >/dev/null; }\n'
+        + function
+        + '\nMODULE_DIR="$1"\nSINGLE_FILE_TARGET="$2"\napply_inline_suppressions rust\n',
+        encoding="utf-8",
+    )
+    cases = [("baseline", {}, {ownership, parsing})]
+    for name, alias in (("compact", "ubs:disable"), ("spaced", "ubs: disable"),
+                        ("tabbed", "ubs:\tdisable"), ("nolint", "nolint"), ("noqa", "noqa")):
+        cases.extend([
+            (name + "_trailing", {"trailing": alias}, set()),
+            (name + "_above", {"above": alias}, set()),
+            (name + "_literal", {"literal": alias}, {ownership, parsing}),
+            (name + "_qualified", {"trailing": alias + "[other.rule]"}, {ownership, parsing}),
+        ])
+    cases.extend([
+        ("selective", {"trailing": f"ubs:ignore[{parsing}]"}, {ownership}),
+        ("unknown", {"trailing": "ubs:ignore[rust.unknown]"}, {ownership, parsing}),
+        ("alias_in_scope", {"trailing": "ubs:ignore[noqa]"}, {ownership, parsing}),
+    ])
+    for label, edit, retained in cases:
+        write_source(**edit)
+        # Reuse genuine pre-suppression module output: only annotation bytes
+        # change, both hazard expressions and their physical sites stay fixed.
+        # This makes a missing helper import or premature shell passthrough
+        # fail the positive suppression controls rather than pass vacuously.
+        result = subprocess.run(
+            ["bash", str(wrapper), str(REPO_ROOT / "modules"), str(source)],
+            input=module.stdout, cwd=root, env=env, capture_output=True, text=True,
+            check=False, timeout=30,
+        )
+        context = f"{label}: exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        assert result.returncode == 0, context
+        assert "passthrough enabled" not in result.stderr, context
+        wanted = sorted((str(source), line, rule) for line in (3, 4) for rule in (ownership, parsing)
+                        if line == 4 or rule in retained)
+        assert samples(result.stdout) == wanted, context
 
 
 def main() -> None:
@@ -623,6 +714,7 @@ def main() -> None:
         check_rust_cargo_phases(tmpdir)
 
         check_rust_scoped_marker_keeps_other_finding(tmpdir)
+        check_inline_suppression_alias_shell_guard(tmpdir)
 
         # Issue #107: linked Git worktrees are development checkouts too.
         check_self_update_dev_checkout_guard(tmpdir)

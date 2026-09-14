@@ -891,7 +891,7 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                 self.assertEqual(lines[index].strip(), findings[0]["title"], report)
                 self.assertEqual(lines[index - 1].strip(), f"⚠ Warning ({len(expected)} found)", report)
                 for path, line in expected:
-                    self.assertIn(f" {path}:{line}\n", report)
+                    self.assertIn(f" {path}:{line} [rule:swift.force-try]\n", report)
                 self.assertEqual(report.count("  try! risky()"), len(expected), report)
 
             selected = [first, second, clean]
@@ -916,6 +916,39 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                                                detail_limit=5, text_out=clean_text)
             assert_visible(clean_records, clean_text.read_text(encoding="utf-8"), [])
 
+    def _swift_module_report(self, root, project, paths, cache, output_format, *, hits, categories):
+        outside = root / "outside"
+        outside.mkdir(exist_ok=True)
+        artifacts = Path(tempfile.mkdtemp(prefix="module-", dir=root))
+        selected, summary = artifacts / "files.txt", artifacts / "summary.json"
+        selected.write_text("\n".join(str(path) for path in paths) + "\n", encoding="utf-8")
+        command = [
+            "bash", str(REPO_ROOT / "modules" / "ubs-swift.sh"),
+            f"--format={output_format}", "--only=" + ",".join(map(str, categories)),
+            "--ci", "--no-color", "--fail-on-warning", f"--files-from={selected}",
+            f"--summary-json={summary}", str(project),
+        ]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                   UBS_CACHE_DIR=str(cache), UBS_PROFILE="1", UBS_SKIP_TYPE_NARROWING="1",
+                   UBS_TEST_FORCE_NO_AST_GREP="0", UBS_ALLOW_UNVERIFIED_HELPERS="0")
+        proc = subprocess.run(command, cwd=outside, env=env, text=True, capture_output=True, timeout=180)  # ubs:ignore[python.taint.command] - fixed repository module and selected local Swift fixtures, bounded CLI regression
+        context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        self.assertTrue(summary.is_file(), context)
+        try:
+            doc = json.loads(summary.read_text(encoding="utf-8"))
+            rendered = json.loads(proc.stdout)
+        except ValueError as exc:
+            self.fail(f"Swift module JSON/SARIF decode failed: {exc}\n{context}")
+        self.assertEqual(doc["status"], "ok", context)
+        self.assertEqual(doc["files"], len(paths), context)
+        self.assertEqual(doc["profile"]["cache_hits"], hits, context)
+        self.assertEqual(doc["profile"]["cache_misses"], len(paths) - hits, context)
+        for severity in ("critical", "warning", "info"):
+            self.assertEqual(doc[severity], sum(record.get("count", 1) for record in doc["findings"]
+                                                if record["severity"] == severity), context)
+        self.assertEqual(proc.returncode, int(bool(doc["critical"] or doc["warning"])), context)
+        return doc, rendered, context
+
     def test_real_swift_module_project_notes_preserve_json_sarif_scope(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-swift-project-notes-") as temp:
             root = Path(temp).resolve()
@@ -930,35 +963,10 @@ class StructuredSourceIdentityTests(unittest.TestCase):
             force_rule = "swift.force-try"
 
             def run_module(paths, output_format, *, hits, task_source=None):
-                artifacts = Path(tempfile.mkdtemp(prefix="module-", dir=root))
-                selected, summary = artifacts / "files.txt", artifacts / "summary.json"
-                selected.write_text("\n".join(str(path) for path in paths) + "\n", encoding="utf-8")
-                command = [
-                    "bash", str(REPO_ROOT / "modules" / "ubs-swift.sh"),
-                    f"--format={output_format}", "--only=2,20", "--ci", "--no-color",
-                    "--fail-on-warning", f"--files-from={selected}",
-                    f"--summary-json={summary}", str(project),
-                ]
-                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
-                           UBS_CACHE_DIR=str(cache), UBS_PROFILE="1", UBS_SKIP_TYPE_NARROWING="1",
-                           UBS_TEST_FORCE_NO_AST_GREP="0", UBS_ALLOW_UNVERIFIED_HELPERS="0")
-                proc = subprocess.run(command, cwd=outside, env=env, text=True, capture_output=True, timeout=180)  # ubs:ignore[python.taint.command] - fixed repository module and selected local Swift fixtures, bounded CLI regression
-                context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-                self.assertTrue(summary.is_file(), context)
-                try:
-                    doc = json.loads(summary.read_text(encoding="utf-8"))
-                    rendered = json.loads(proc.stdout)
-                except ValueError as exc:
-                    self.fail(f"Swift module JSON/SARIF decode failed: {exc}\n{context}")
-                self.assertEqual(doc["status"], "ok", context)
-                self.assertEqual(doc["files"], len(paths), context)
-                self.assertEqual(doc["profile"]["cache_hits"], hits, context)
-                self.assertEqual(doc["profile"]["cache_misses"], len(paths) - hits, context)
+                doc, rendered, context = self._swift_module_report(
+                    root, project, paths, cache, output_format, hits=hits, categories=(2, 20),
+                )
                 records = doc["findings"]
-                for severity in ("critical", "warning", "info"):
-                    self.assertEqual(doc[severity], sum(record.get("count", 1) for record in records
-                                                        if record["severity"] == severity), context)
-                self.assertEqual(proc.returncode, int(bool(doc["critical"] or doc["warning"])), context)
                 expected_notes = {package_rule} if task_source else {package_rule, task_rule}
                 notes = [record for record in records if record.get("scope") == "project"]
                 self.assertEqual({record["rule"] for record in notes}, expected_notes, context)
@@ -1018,6 +1026,270 @@ class StructuredSourceIdentityTests(unittest.TestCase):
             self.assertEqual(run_module(full, "sarif", hits=2, task_source=control), partial)
             run_module([danger], "sarif", hits=1)
             run_module([control], "json", hits=1, task_source=control)
+
+    def test_real_swift_module_project_aggregates_recompute_counts_and_warning_exit(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-project-aggregates-") as temp:
+            root = Path(temp).resolve()
+            project, cache = root / "project", root / "cache"
+            project.mkdir()
+            first, second, balance = (project / name for name in ("first.swift", "second.swift", "balance.swift"))
+            first.write_text(
+                "import UIKit\nfunc first() async throws {\n"
+                "  let first = try FileHandle(forReadingFrom: firstURL)\n}\n"
+                "func second() async throws {\n"
+                "  let second = try FileHandle(forReadingFrom: secondURL)\n}\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "import SwiftUI\nfunc third() async throws {\n"
+                "  let third = try FileHandle(forReadingFrom: thirdURL)\n}\n",
+                encoding="utf-8",
+            )
+            balance.write_text("Task {\n  await work()\n}\nhandle.close()\n", encoding="utf-8")
+            storyboards = [project / f"view-{index}.storyboard" for index in range(6)]
+            for path in storyboards:
+                path.write_text("<document/>\n", encoding="utf-8")
+            async_rule = "swift.concurrency.unawaited-async"
+            actor_rule = "swift.threading.main-actor"
+            handle_rule = "swift.files.filehandle"
+            storyboard_rule = "swift.uisafety.storyboards"
+            task_rule = "swift.concurrency.task-usages"
+            package_rule = "swift.packaging.no-manifest"
+
+            def run_aggregates(paths, output_format, expected, *, hits, task_line=None):
+                doc, rendered, context = self._swift_module_report(
+                    root, project, paths, cache, output_format, hits=hits, categories=(2, 8, 9, 20, 21),
+                )
+                records = doc["findings"]
+                aggregates = [record for record in records if record.get("scope") == "project_aggregate"]
+                self.assertEqual({record["rule"]: record["count"] for record in aggregates}, expected, context)
+                self.assertEqual(len(aggregates), len(expected), context)
+                for record in aggregates:
+                    self.assertIs(type(record["count"]), int, record)
+                    self.assertGreater(record["count"], 0, record)
+                    self.assertEqual((record["path"], record["line"]), ("", 0), record)
+                    self.assertFalse(record.get("samples"), record)
+                    self.assertEqual(record["severity"], "warning" if record["rule"] == handle_rule else "info", record)
+                # No independent source warning may hide loss/demotion of the
+                # aggregate warning in either the summary or the CLI exit gate.
+                self.assertEqual(doc["critical"], 0, context)
+                self.assertEqual(doc["warning"], expected.get(handle_rule, 0), context)
+                self.assertEqual(doc["info"], sum(count for rule, count in expected.items() if rule != handle_rule)
+                                 + int(task_line is not None), context)
+                notes = [record for record in records if record.get("scope") == "project"]
+                expected_notes = {package_rule} if task_line is not None else {package_rule, task_rule}
+                self.assertEqual({record["rule"] for record in notes}, expected_notes, context)
+                self.assertEqual(len(notes), len(expected_notes), context)
+                for note in notes:
+                    self.assertEqual((note["path"], note["line"], note["count"], note["severity"]),
+                                     ("", 0, 0, "info"), note)
+                task_findings = [record for record in records if record["rule"] == task_rule
+                                 and record.get("scope") != "project"]
+                self.assertEqual([(record["path"], record["line"], record["col"], record["count"])
+                                  for record in task_findings],
+                                 [(str(balance), task_line, 1, 1)] if task_line is not None else [], context)
+                for finding in task_findings:
+                    self.assertNotIn("scope", finding, finding)
+                if output_format == "json":
+                    self.assertEqual(rendered, doc, context)
+                else:
+                    self.assertEqual(rendered["version"], "2.1.0", context)
+                    results = [result for run in rendered["runs"] for result in run["results"]]
+                    aggregate_results = [result for result in results
+                                         if result.get("properties", {}).get("scope") == "project_aggregate"]
+                    self.assertEqual({result["ruleId"]: result["properties"]["count"]
+                                      for result in aggregate_results}, expected, context)
+                    self.assertEqual(len(aggregate_results), len(expected), context)
+                    for result in aggregate_results:
+                        self.assertEqual(result["kind"], "fail", result)
+                        self.assertEqual(result["level"], "warning" if result["ruleId"] == handle_rule else "note", result)
+                        self.assertIs(type(result["properties"]["count"]), int, result)
+                        self.assertGreater(result["properties"]["count"], 0, result)
+                        self.assertNotIn("locations", result, result)
+                    project_results = [result for result in results
+                                       if result.get("properties", {}).get("scope") == "project"]
+                    self.assertEqual({result["ruleId"] for result in project_results}, expected_notes, context)
+                    self.assertEqual(len(project_results), len(expected_notes), context)
+                    for result in project_results:
+                        self.assertEqual((result["kind"], result["level"], result["properties"]["count"]),
+                                         ("informational", "none", 0), result)
+                        self.assertNotIn("locations", result, result)
+                    task_results = [result for result in results if result["ruleId"] == task_rule
+                                    and result.get("properties", {}).get("scope") != "project"]
+                    self.assertEqual(len(task_results), int(task_line is not None), context)
+                    for result in task_results:
+                        self.assertNotIn("scope", result.get("properties", {}), result)
+                        self.assertEqual(result["level"], "note", result)
+                        self.assertEqual(len(result["locations"]), 1, result)
+                        location = result["locations"][0]["physicalLocation"]
+                        self.assertEqual(location["artifactLocation"]["uri"], str(balance), result)
+                        self.assertEqual((location["region"]["startLine"], location["region"]["startColumn"]),
+                                         (task_line, 1), result)
+                return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
+
+            full = [first, second, balance, *storyboards]
+            expected = {async_rule: 2, actor_rule: 2, handle_rule: 2, storyboard_rule: 6}
+            cold = run_aggregates(full, "json", expected, hits=0, task_line=1)
+            self.assertEqual(run_aggregates(full, "sarif", expected, hits=9, task_line=1), cold)
+            run_aggregates([first, balance, *storyboards[:5]], "sarif",
+                           {async_rule: 1, actor_rule: 1, handle_rule: 1}, hits=7, task_line=1)
+            run_aggregates([first, second, *storyboards], "json",
+                           {async_rule: 3, actor_rule: 2, handle_rule: 3, storyboard_rule: 6}, hits=8)
+            balance.write_text(
+                "@MainActor\nfunc settle() {\n  Task {\n"
+                "    await work()\n    await moreWork()\n    await finalWork()\n  }\n"
+                "  handle.close()\n  other.close()\n  third.close()\n}\n",
+                encoding="utf-8",
+            )
+            partial = run_aggregates(full, "json", {storyboard_rule: 6}, hits=8, task_line=3)
+            self.assertEqual(run_aggregates(full, "sarif", {storyboard_rule: 6}, hits=9, task_line=3), partial)
+            run_aggregates([balance, *storyboards[:5]], "sarif", {}, hits=6, task_line=3)
+
+
+class RustSqlSourceTests(unittest.TestCase):
+    RULE = "rust.security.sql-injection"
+
+    def _fixtures(self, root: Path):
+        project = root / "project"
+        project.mkdir()
+        sources = {}
+        expected = {}
+        expressions = {
+            "constructor": "Path(route_param()).0",
+            "qualified-constructor": "axum::extract::Path(route_param()).0",
+            "request": "req.path()",
+            "query": 'query.get("tenant").cloned().unwrap_or_default()',
+            "arguments": "std::env::args().nth(1).unwrap_or_default()",
+        }
+        for name, expression in expressions.items():
+            path = project / f"{name}.rs"
+            sources[path] = (
+                "fn route(conn: &Connection, req: Request, query: QueryMap) {\n"
+                f"    let tenant = {expression};\n"
+                "    let alias = tenant;\n"
+                '    let sql = format!("SELECT id FROM tenants WHERE name = \'{}\'", alias);\n'
+                "    conn.execute(&sql, []);\n}\n"
+            )
+            expected[path] = 5
+        extracted = project / "extractor.rs"
+        sources[extracted] = (
+            "fn route(Path(tenant): Path<String>, conn: &Connection) {\n"
+            "    let alias = tenant;\n"
+            '    let sql = format!("SELECT id FROM tenants WHERE name = \'{}\'", alias);\n'
+            "    conn.execute(&sql, []);\n}\n"
+        )
+        expected[extracted] = 4
+        for name, expression in (("filesystem", "temp.path()"),
+                                 ("filesystem-spaced", "temp . path ()")):
+            sources[project / f"{name}.rs"] = (
+                # Keep a real request source in this same file, so rejecting
+                # the filesystem case cannot rely on the file prefilter alone.
+                "fn bound(Path(tenant): Path<String>, conn: &Connection) {\n"
+                '    sqlx::query("SELECT id FROM tenants WHERE name = $1").bind(tenant);\n}\n'
+                "fn inventory(conn: &Connection) {\n"
+                '    let temp = tempfile::TempDir::new().expect("tempdir");\n'
+                f'    let source_path = {expression}.join("session.jsonl");\n'
+                "    let alias = source_path.display();\n"
+                "    conn.execute_batch(&format!(\n"
+                '        "CREATE TABLE sources (path TEXT); INSERT INTO sources VALUES (\'{}\');",\n'
+                "        alias,\n    ));\n}\n"
+            )
+        sources[project / "parameterized-request.rs"] = (
+            "fn bound(req: Request, conn: &Connection) {\n"
+            "    let tenant = req.path();\n    let alias = tenant;\n"
+            '    sqlx::query("SELECT id FROM tenants WHERE name = $1").bind(alias);\n}\n'
+        )
+        sources[project / "checked-query.rs"] = (
+            "fn checked(query: QueryMap) {\n"
+            '    let tenant = query.get("tenant");\n'
+            '    sqlx::query!("SELECT id FROM tenants WHERE name = $1", tenant);\n}\n'
+        )
+        for path, source in sources.items():
+            path.write_text(source, encoding="utf-8")
+        return project, list(sources), expected
+
+    def test_real_sql_detector_distinguishes_request_path_from_filesystem_path(self) -> None:
+        from ubs_core.rust_detectors import sql_injection
+
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-sql-sources-") as temp:
+            _project, paths, expected = self._fixtures(Path(temp).resolve())
+            for selected in (paths, list(reversed(paths)), [p for p in paths if p not in expected]):
+                with self.subTest(selected=selected):
+                    findings = list(sql_injection.find(selected))
+                    self.assertCountEqual(
+                        [(path, line, col) for path, line, col, _text in findings],
+                        [(path, expected[path], 1) for path in selected if path in expected],
+                    )
+                    for path, line, _col, text in findings:
+                        self.assertIn(path.read_text(encoding="utf-8").splitlines()[line - 1].strip(), text)
+                        self.assertIn("SQL execution", text)
+
+    def test_public_rust_sql_sources_preserve_cold_warm_and_partial_findings(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-sql-public-") as temp:
+            root = Path(temp).resolve()
+            project, paths, expected = self._fixtures(root)
+            cache = root / "cache"
+
+            def scan(selected, output_format, expected_sites, hits):
+                artifacts = Path(tempfile.mkdtemp(prefix="report-", dir=root))
+                inputs, sink, stats = (artifacts / name for name in ("files.txt", "findings.ndjson", "cache.json"))
+                inputs.write_text("\n".join(str(path) for path in selected) + "\n", encoding="utf-8")
+                command = [
+                    "bash", str(REPO_ROOT / "modules" / "ubs-rust.sh"),
+                    "--ci", "--no-color", "--no-cargo", "--fail-on-warning", "--only=8",
+                    f"--format={output_format}", f"--files-from={inputs}", f"--report-json={sink}", str(project),
+                ]
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                           UBS_CACHE_DIR=str(cache), UBS_CACHE_FILE=str(stats), UBS_PROFILE="1",
+                           UBS_SKIP_TYPE_NARROWING="1", UBS_TEST_FORCE_NO_AST_GREP="0",
+                           UBS_ALLOW_UNVERIFIED_HELPERS="0", UBS_NO_AUTO_UPDATE="1")
+                proc = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True, timeout=180)  # ubs:ignore[python.taint.command] - fixed repository scanner and local Rust source fixtures; bounded real CLI regression
+                context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                self.assertEqual(proc.returncode, int(bool(expected_sites)), context)
+                try:
+                    payload = json.loads(proc.stdout)
+                    records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+                    cache_stats = json.loads(stats.read_text(encoding="utf-8"))
+                except (ValueError, OSError) as exc:
+                    self.fail(f"Invalid Rust SQL report: {exc}\n{context}")
+                self.assertEqual((cache_stats["hits"], cache_stats["misses"]),
+                                 (hits, len(selected) - hits), context)
+                wanted = [(self.RULE, str(path), line, 1, "critical")
+                          for path, line in expected_sites.items()]
+                self.assertCountEqual(
+                    [(record["rule"], record["path"], record["line"], record["col"], record["severity"])
+                     for record in records], wanted, context,
+                )
+                self.assertTrue(all(record.get("count", 1) == 1 for record in records), context)
+                if output_format == "json":
+                    self.assertEqual(payload["status"], "ok", context)
+                    self.assertEqual(payload["files"], len(selected), context)
+                    self.assertEqual((payload["critical"], payload["warning"], payload["info"]),
+                                     (len(wanted), 0, 0), context)
+                else:
+                    self.assertEqual(payload["version"], "2.1.0", context)
+                    results = [result for run in payload["runs"] for result in run["results"]]
+                    actual = []
+                    for result in results:
+                        self.assertEqual(len(result["locations"]), 1, result)
+                        physical = result["locations"][0]["physicalLocation"]
+                        actual.append((result["ruleId"], physical["artifactLocation"]["uri"],
+                                       physical["region"]["startLine"], physical["region"]["startColumn"], result["level"]))
+                    self.assertCountEqual(actual, [(rule, path, line, col, "error")
+                                                   for rule, path, line, col, _severity in wanted], context)
+                return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
+
+            cold = scan(paths, "json", expected, 0)
+            self.assertEqual(scan(paths, "sarif", expected, len(paths)), cold)
+            clean = [path for path in paths if path not in expected]
+            self.assertEqual(scan(clean, "json", {}, len(clean)), [])
+            changed = project / "constructor.rs"
+            changed.write_text(changed.read_text(encoding="utf-8").replace(
+                "Path(route_param()).0", 'std::path::Path::new("local.db").display()'), encoding="utf-8")
+            remaining = {path: line for path, line in expected.items() if path != changed}
+            partial = scan(paths, "json", remaining, len(paths) - 1)
+            self.assertEqual(partial, [record for record in cold if record["path"] != str(changed)])
+            self.assertEqual(scan(paths, "sarif", remaining, len(paths)), partial)
 
 
 if __name__ == "__main__":

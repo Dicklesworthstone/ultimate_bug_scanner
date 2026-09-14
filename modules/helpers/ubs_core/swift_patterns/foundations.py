@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 from ubs_core.swift_scan import Pattern
+from ubs_core.suppression import SourceSuppressions
 
 FORCE_UNWRAP = r"!(\s|\.|\(|\)|\[|\]|\{|\}|,|;|:|\?|$)"
 
@@ -38,19 +39,17 @@ PATTERNS = [
 
 def _count_lines(ctx, regex: re.Pattern[str]) -> int:
     total = 0
+    suppressions = SourceSuppressions("swift")
     for path in ctx.files:
         text = ctx.text_of(path)
+        suppressions.index(path, text)
         seen = set()
         for match in regex.finditer(text):
             line_no = text.count("\n", 0, match.start()) + 1
             if line_no in seen:
                 continue
             seen.add(line_no)
-            line_start = text.rfind("\n", 0, match.start()) + 1
-            line_end = text.find("\n", match.start())
-            if line_end == -1:
-                line_end = len(text)
-            if "ubs:ignore" in text[line_start:line_end]:
+            if suppressions.is_suppressed(path, line_no, "swift.concurrency.unawaited-async"):
                 continue
             total += 1
     return total
@@ -66,6 +65,7 @@ def _unawaited_async(ctx):
     yield {
         "rule": "swift.concurrency.unawaited-async",
         "category": 2,
+        "scope": "project_aggregate",
         "path": "", "line": 0,
         "severity": "info",
         "count": diff,

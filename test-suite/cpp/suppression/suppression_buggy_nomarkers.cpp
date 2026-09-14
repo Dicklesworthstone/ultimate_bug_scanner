@@ -32,9 +32,9 @@ void copy_in_block(char *dst, const char *src, bool ready) {
     }
 }
 
-// Arrangement 5: rule-scoped markers (rule id in square brackets). The cpp
-// code-sample lines carry no rule id, so these suppress through the runner's
-// same-line/previous-line path.
+// Arrangement 5: the marked twin lists public diagnostic identifiers.
+// Native and AST findings keep independent identities; this control retains
+// every finding by omitting all scopes from the same operations.
 void rule_scoped_previous_line(char *heap, std::mutex &m) {
     delete[] heap;
     m.lock();

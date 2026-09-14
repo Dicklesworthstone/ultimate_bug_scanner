@@ -290,6 +290,58 @@ class FindingsMergeTests(unittest.TestCase):
                     self.assertEqual(result["properties"]["count"], 0)
                     self.assertNotIn("locations", result)
 
+            baseline = root / "baseline.json"
+
+            def check_new_only(label, baseline_records, expected_findings, expected_info):
+                baseline.write_text(json.dumps({"findings": baseline_records}), encoding="utf-8")
+                expected_totals = {**totals, "info": expected_info}
+                for has_scanner in (True, False):
+                    with self.subTest(baseline=label, has_scanner=has_scanner):
+                        combined.write_text(json.dumps({
+                            "scanners": [{"language": "swift", **totals, "status": "ok"}]
+                            if has_scanner else [],
+                            "totals": totals,
+                            "status": "ok",
+                        }), encoding="utf-8")
+                        self.assertEqual(merge(root, combined, project_dir=root,
+                                               baseline_path=baseline, new_only=True),
+                                         len(expected_findings))
+                        filtered = self.read_report(combined)
+                        self.assertEqual(filtered["findings"], expected_findings)
+                        self.assertEqual(filtered["totals"], expected_totals)
+                        self.assertEqual(filtered["status"], "ok")
+                        if has_scanner:
+                            scanner = filtered["scanners"][0]
+                            self.assertEqual({key: scanner[key] for key in expected_totals},
+                                             expected_totals)
+                        results = [result for run in to_sarif(filtered)["runs"]
+                                   for result in run["results"]]
+                        self.assertEqual([result["ruleId"] for result in results],
+                                         [finding["rule_id"] for finding in expected_findings])
+                        for finding, result in zip(expected_findings, results):
+                            if finding.get("scope") == "project":
+                                self.assertEqual((result["kind"], result["level"]),
+                                                 ("informational", "none"))
+                                self.assertEqual((result["properties"]["scope"],
+                                                  result["properties"]["count"]), ("project", 0))
+                                self.assertNotIn("locations", result)
+                            else:
+                                self.assertEqual(result["level"], "note")
+                                self.assertNotIn("scope", result["properties"])
+                                physical = result["locations"][0]["physicalLocation"]
+                                self.assertEqual(physical["artifactLocation"]["uri"], str(source))
+                                self.assertEqual(physical["region"],
+                                                 {"startLine": 1, "startColumn": 1})
+
+            note_findings = merged["findings"]
+            nonmatching = [{"fingerprint": "0000000000000000"}]
+            self.assertNotIn(nonmatching[0]["fingerprint"],
+                             {finding["fingerprint"] for finding in note_findings})
+            check_new_only("empty", [], note_findings, 0)
+            check_new_only("nonmatching", nonmatching, note_findings, 0)
+            check_new_only("one note", note_findings[:1], note_findings[1:], 0)
+            check_new_only("both notes", note_findings, [], 0)
+
             # The same rule with a real Task occurrence remains a located
             # source finding; it must not inherit the zero-count note marker.
             source.write_text("Task { operation() }\n", encoding="utf-8")
@@ -308,6 +360,143 @@ class FindingsMergeTests(unittest.TestCase):
             physical = result["locations"][0]["physicalLocation"]
             self.assertEqual(physical["artifactLocation"]["uri"], str(source))
             self.assertEqual(physical["region"], {"startLine": 1, "startColumn": 1})
+
+            # A retained source info occurrence still counts when a zero-count
+            # project note survives beside it, or the baseline removes that note.
+            with sink.open("a", encoding="utf-8") as stream:
+                for record in _packaging(ctx):
+                    _write_record(stream, record, set())
+            totals = {**totals, "info": 1}
+            combined.write_text(json.dumps({"scanners": [], "totals": totals}), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=root), 2)
+            source_findings = self.read_report(combined)["findings"]
+            self.assertEqual([finding["rule_id"] for finding in source_findings],
+                             ["swift.concurrency.task-usages", "swift.packaging.no-manifest"])
+            self.assertNotIn(nonmatching[0]["fingerprint"],
+                             {finding["fingerprint"] for finding in source_findings})
+            check_new_only("source plus note, empty", [], source_findings, 1)
+            check_new_only("source plus note, nonmatching", nonmatching, source_findings, 1)
+            check_new_only("old notes, new Task", note_findings, source_findings[:1], 1)
+            check_new_only("known Task, new note", source_findings[:1], source_findings[1:], 0)
+
+    def test_real_swift_project_aggregates_preserve_severity_and_new_only_counts(self) -> None:
+        from ubs_core.swift_patterns.foundations import PATTERNS, _unawaited_async
+        from ubs_core.swift_patterns.misc_cats import _packaging, _storyboards
+        from ubs_core.swift_patterns.threading_perf import _filehandle_imbalance, _main_actor_presence
+        from ubs_core.swift_scan import ScanContext, _write_record, scan_patterns
+
+        task_pattern = next(pattern for pattern in PATTERNS
+                            if pattern.rule_id == "swift.concurrency.task-usages")
+        with tempfile.TemporaryDirectory(prefix="ubs-project-aggregates-") as tmp:
+            root = Path(tmp)
+            first = root / "first.swift"
+            first.write_text(
+                "import SwiftUI\nfunc first() async {}\nfunc second() async {}\n"
+                "let firstHandle = try FileHandle(forReadingFrom: url)\n"
+                "let secondHandle = try FileHandle(forReadingFrom: url)\n"
+                "Task { operation() }\n", encoding="utf-8",
+            )
+            second = root / "second.swift"
+            second.write_text(
+                "import UIKit\nfunc third() async {}\n"
+                "let thirdHandle = try FileHandle(forReadingFrom: url)\n"
+                "firstHandle.close()\n", encoding="utf-8",
+            )
+            storyboards = [root / f"screen-{index}.storyboard" for index in range(6)]
+            for storyboard in storyboards:
+                storyboard.write_text("<document/>\n", encoding="utf-8")
+            ctx = ScanContext(files=[first, second, *storyboards], project_dir=root)
+            sink = root / "swift.findings.json"
+            with sink.open("w", encoding="utf-8") as stream:
+                scan_patterns([task_pattern], ctx, stream, set())
+                for producer in (_unawaited_async, _filehandle_imbalance,
+                                 _main_actor_presence, _storyboards, _packaging):
+                    for record in producer(ctx):
+                        _write_record(stream, record, set())
+            records = load_sink(sink)
+            expected = {
+                "swift.concurrency.unawaited-async": ("info", 3, "Possible un-awaited async paths"),
+                "swift.files.filehandle": ("warning", 2, "FileHandle open without matching close"),
+                "swift.threading.main-actor": ("info", 2, "UI frameworks used but no @MainActor annotations found"),
+                "swift.uisafety.storyboards": ("info", 6, "Many storyboards - consider modularization"),
+            }
+            aggregates = [record for record in records if record.get("scope") == "project_aggregate"]
+            self.assertEqual(len(records), 6)
+            self.assertEqual({record["rule"]: (record["severity"], record["count"], record["message"])
+                              for record in aggregates}, expected)
+            for record in aggregates:
+                self.assertEqual((record["path"], record["line"]), ("", 0))
+                self.assertIs(type(record["count"]), int)
+
+            def check_sarif(document, expected_rules):
+                results = [result for run in to_sarif(document)["runs"] for result in run["results"]]
+                self.assertEqual([result["ruleId"] for result in results], expected_rules)
+                for result in results:
+                    rule = result["ruleId"]
+                    if rule in expected:
+                        severity, count, message = expected[rule]
+                        self.assertEqual((result["kind"], result["level"]),
+                                         ("fail", "warning" if severity == "warning" else "note"))
+                        self.assertEqual(result["message"]["text"], message)
+                        self.assertEqual((result["properties"]["scope"], result["properties"]["count"]),
+                                         ("project_aggregate", count))
+                        self.assertIs(type(result["properties"]["count"]), int)
+                        self.assertNotIn("locations", result)
+                    elif rule == "swift.packaging.no-manifest":
+                        self.assertEqual((result["kind"], result["level"]), ("informational", "none"))
+                        self.assertEqual((result["properties"]["scope"], result["properties"]["count"]),
+                                         ("project", 0))
+                        self.assertNotIn("locations", result)
+                    else:
+                        self.assertEqual(rule, "swift.concurrency.task-usages")
+                        self.assertEqual(result["level"], "note")
+                        self.assertNotIn("scope", result["properties"])
+                        physical = result["locations"][0]["physicalLocation"]
+                        self.assertEqual(physical["artifactLocation"]["uri"], str(first))
+                        self.assertEqual(physical["region"], {"startLine": 6, "startColumn": 1})
+
+            check_sarif({"language": "swift", "findings": records}, [record["rule"] for record in records])
+            totals = {"files": 8, "critical": 0, "warning": 2, "info": 12}
+            combined = root / "combined.json"
+            combined.write_text(json.dumps({"scanners": [], "totals": totals}), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=root), 6)
+            merged = self.read_report(combined)
+            self.assertEqual(merged["totals"], totals)
+            all_findings = merged["findings"]
+            baseline = root / "baseline.json"
+            cases = [
+                ("empty", [], all_findings, 2, 12),
+                ("nonmatching", [{"fingerprint": "0000000000000000"}], all_findings, 2, 12),
+            ]
+            self.assertNotIn("0000000000000000", {finding["fingerprint"] for finding in all_findings})
+            for rule, warning, info in (("swift.concurrency.unawaited-async", 2, 9),
+                                        ("swift.files.filehandle", 0, 12)):
+                known = [finding for finding in all_findings if finding["rule_id"] == rule]
+                remaining = [finding for finding in all_findings if finding["rule_id"] != rule]
+                cases.append((rule, known, remaining, warning, info))
+            cases.append(("all aggregates", [finding for finding in all_findings
+                                              if finding.get("scope") == "project_aggregate"],
+                          [finding for finding in all_findings
+                           if finding.get("scope") != "project_aggregate"], 0, 1))
+            cases.append(("all findings", all_findings, [], 0, 0))
+            for label, known, remaining, warning, info in cases:
+                baseline.write_text(json.dumps({"findings": known}), encoding="utf-8")
+                expected_totals = {**totals, "warning": warning, "info": info}
+                for has_scanner in (True, False):
+                    with self.subTest(baseline=label, has_scanner=has_scanner):
+                        combined.write_text(json.dumps({
+                            "scanners": [{"language": "swift", **totals}] if has_scanner else [],
+                            "totals": totals,
+                        }), encoding="utf-8")
+                        self.assertEqual(merge(root, combined, project_dir=root,
+                                               baseline_path=baseline, new_only=True), len(remaining))
+                        filtered = self.read_report(combined)
+                        self.assertEqual(filtered["findings"], remaining)
+                        self.assertEqual(filtered["totals"], expected_totals)
+                        if has_scanner:
+                            scanner = filtered["scanners"][0]
+                            self.assertEqual({key: scanner[key] for key in expected_totals}, expected_totals)
+                        check_sarif(filtered, [finding["rule_id"] for finding in remaining])
 
     def test_project_note_validation_rejects_lossy_or_source_metadata(self) -> None:
         from ubs_core.swift_scan import _write_record
@@ -355,6 +544,84 @@ class FindingsMergeTests(unittest.TestCase):
                         forwarded = load_sink(sink)
                         self.assertEqual(len(forwarded), 1)
                         with self.assertRaisesRegex(ValueError, "invalid project note"):
+                            to_sarif({"language": "swift", "findings": forwarded})
+
+    def test_project_aggregate_contract_rejects_invalid_metadata_and_preserves_levels(self) -> None:
+        from ubs_core.swift_scan import _write_record
+
+        # Exercise the converter's three allowed severities, including critical
+        # even though the current Swift aggregate producers emit info/warning.
+        valid = {
+            "rule": "swift.files.filehandle", "category": 8,
+            "scope": "project_aggregate", "path": "", "line": 0,
+            "severity": "warning", "count": 3, "message": "FileHandle open without matching close",
+        }
+        with tempfile.TemporaryDirectory(prefix="ubs-aggregate-contract-") as tmp:
+            root = Path(tmp)
+            sink = root / "swift.findings.json"
+            combined = root / "combined.json"
+            baseline = root / "baseline.json"
+            baseline.write_text("[]", encoding="utf-8")
+            for severity, level in (("info", "note"), ("warning", "warning"), ("critical", "error")):
+                for suppressed in (False, True):
+                    record = {**valid, "severity": severity, "suppressed": suppressed}
+                    sink.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                    for has_scanner in (True, False):
+                        with self.subTest(severity=severity, suppressed=suppressed, has_scanner=has_scanner):
+                            original_totals = {"files": 1, "critical": 0, "warning": 0, "info": 0}
+                            original_totals[severity] = 3
+                            combined.write_text(json.dumps({
+                                "scanners": [{"language": "swift", **original_totals}] if has_scanner else [],
+                                "totals": original_totals,
+                            }), encoding="utf-8")
+                            self.assertEqual(merge(root, combined, baseline_path=baseline, new_only=True), 1)
+                            merged = self.read_report(combined)
+                            expected_totals = {**original_totals, severity: 0 if suppressed else 3}
+                            self.assertEqual(merged["totals"], expected_totals)
+                            if has_scanner:
+                                scanner = merged["scanners"][0]
+                                self.assertEqual({key: scanner[key] for key in expected_totals}, expected_totals)
+                            for document in ({"language": "swift", "findings": [record]}, merged):
+                                result = to_sarif(document)["runs"][0]["results"][0]
+                                self.assertEqual((result["kind"], result["level"]), ("fail", level))
+                                self.assertEqual((result["properties"]["scope"], result["properties"]["count"]),
+                                                 ("project_aggregate", 3))
+                                self.assertIs(type(result["properties"]["count"]), int)
+                                self.assertEqual(result["properties"]["suppressed"], suppressed)
+                                self.assertNotIn("locations", result)
+
+            invalid = [
+                (key, value) for key, values in (
+                    ("path", ("source.swift", ".", " ", None)),
+                    ("file", ("source.swift", ".", " ", None)),
+                    ("line", (1, -1, "0", False, 0.0, None)),
+                    ("severity", ("none", "INFO", "error", None)),
+                    ("count", (0, -1, "3", "bad", False, True, 3.0, None)),
+                ) for value in values
+            ]
+            original = json.dumps({"scanners": [{"language": "swift"}], "totals": {"warning": 3}})
+            for key, value in [*invalid, ("count", "missing"), ("line", "missing")]:
+                with self.subTest(key=key, value=value):
+                    record = dict(valid)
+                    if value == "missing":
+                        record.pop(key)
+                    else:
+                        record[key] = value
+                    with self.assertRaisesRegex(ValueError, "invalid project aggregate"):
+                        to_sarif({"language": "swift", "findings": [record]})
+                    sink.write_text(json.dumps(record) + "\n", encoding="utf-8")
+                    for new_only in (False, True):
+                        combined.write_text(original, encoding="utf-8")
+                        with self.assertRaisesRegex(ValueError, "invalid project aggregate"):
+                            merge(root, combined, baseline_path=baseline, new_only=new_only)
+                        self.assertEqual(combined.read_text(encoding="utf-8"), original)
+                    if key in ("line", "count"):
+                        stream = io.StringIO()
+                        _write_record(stream, record, set())
+                        sink.write_text(stream.getvalue(), encoding="utf-8")
+                        forwarded = load_sink(sink)
+                        self.assertEqual(len(forwarded), 1)
+                        with self.assertRaisesRegex(ValueError, "invalid project aggregate"):
                             to_sarif({"language": "swift", "findings": forwarded})
 
     def test_ast_reports_preserve_counter_totals_locations_and_baseline_filtering(self) -> None:

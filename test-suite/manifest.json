@@ -8735,7 +8735,7 @@
     },
     {
       "id": "rust-security-randomness-buggy",
-      "description": "Rust security tokens, session secrets, CSRF nonces, API keys, password resets, and OTPs should not use rand, fastrand, deterministic seeds, timestamps, hashes, or process IDs.",
+      "description": "Rust security tokens, session secrets, CSRF nonces, API keys, password resets, and OTPs should not use non-cryptographic generators, deterministic seeds, timestamps, hashes, or process IDs. Rand ThreadRng is cryptographic and remains an unflagged control.",
       "path": "test-suite/rust/buggy/security_randomness.rs",
       "language": "rust",
       "tags": [

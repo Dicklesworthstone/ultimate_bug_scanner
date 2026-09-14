@@ -1292,5 +1292,244 @@ class RustSqlSourceTests(unittest.TestCase):
             self.assertEqual(scan(paths, "sarif", remaining, len(paths)), partial)
 
 
+class RustInputBoundaryTests(unittest.TestCase):
+    URL_RULE = "rust.security.request-url"
+    COMMAND_RULE = "rust.security.command-executable"
+
+    def _fixtures(self, root: Path):
+        project = root / "project"
+        project.mkdir()
+        sources = {}
+        expected = []
+
+        def add(name, source, url_lines=(), command_lines=(), companions=()):
+            path = project / name
+            sources[path] = source
+            expected.extend((path, line, self.URL_RULE) for line in url_lines)
+            expected.extend((path, line, self.COMMAND_RULE) for line in command_lines)
+            expected.extend((path, line, rule) for line, rule in companions)
+
+        add("cass-release-probes.rs", '''fn old_fixture() {
+    let data_dir = std::env::args().nth(1);
+    let db_path = data_dir;
+    let build = reconstruct(db_path);
+}
+fn gather_live_release_observations() {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("cass/test")
+        .build().ok();
+    client.get("https://api.github.com/repos/example/example/releases/latest");
+}
+fn probe_json_version(client: &Client, url: &str) {
+    let response = client.get(url).send().ok();
+}
+fn probe_text_version(client: &Client, url: &str) {
+    let response = client.get(url).send().ok();
+}
+''')
+        add("url-shadow.rs", '''fn route(req: Request, client: Client) {
+    let url = req.query_string();
+    {
+        let url = "https://example.com/fixed";
+        client.get(url);
+    }
+    client.get(url);
+    fn independent(client: Client, url: &str) { client.get(url); }
+    client.get(url);
+    let callback = |url: &str| { client.get(url); };
+    let captured = || { client.get(url); };
+}
+''', url_lines=(7, 9, 11))
+        add("url-reassign.rs", '''fn route(req: Request, client: Client, flag: bool) {
+    let mut url = req.query_string();
+    url = "https://example.com/fixed";
+    client.get(url);
+    url = req.query_string();
+    client.get(url);
+    if flag { url = "https://example.com/branch"; }
+    client.get(url);
+}
+''', url_lines=(6, 8))
+        add("url-arguments.rs", '''fn route(req: Request, client: Client) {
+    let method = req.query_string();
+    client.request(method, "https://example.com/fixed");
+    client.request(Method::GET, req.query_string());
+    let host = req.host();
+    client.get(format!("https://{host}/resource"));
+    client.get("https://example.com/host");
+}
+''', url_lines=(4, 6), companions=((6, "rust.security.host-header-url"),))
+        add("url-multiline.rs", '''fn route(req: Request, client: Client) {
+    let url: String = req
+        .query_string();
+    let alias = url;
+    client
+        .get(
+            alias
+        );
+}
+''', url_lines=(5,))
+        add("url-markers.rs", '''fn route(req: Request, client: Client) {
+    let url = req.query_string(); // ubs:ignore[rust.security.request-url]
+
+    client.get(url);
+    client.get(url); // ubs:ignore[rust.other]
+    client.get(url); // ubs:ignore[rust.security.request-url]
+    client.get(url); // ubs:ignore
+    client.get(url); let note = "ubs:ignore";
+}
+''', url_lines=(4, 5, 8))
+        add("url-bare-source.rs", '''fn route(req: Request, client: Client) {
+    let url = req.query_string(); // ubs:ignore
+
+    client.get(url);
+}
+''')
+        add("url-same-line-functions.rs", '''fn earlier(req: Request) { let url = req.query_string(); } fn later(url: &str, client: Client) { client.get(url); }
+''')
+        add("url-callee-collision.rs", '''fn route(req: Request, client: Client) {
+    let build = req.query_string();
+    let fixed = make_client().build();
+    client.get(fixed);
+    let url = req.query_string();
+    client.get(normalize(url));
+}
+''', url_lines=(6,))
+        add("url-validated.rs", '''fn route(req: Request, client: Client) {
+    let url = req.query_string();
+    let safe_url = validate_outbound_url(url);
+    client.get(safe_url);
+}
+''')
+        add("cass-cargo-binary.rs", '''fn robot_backfill_process(data_dir: &Path, db_path: &Path) {
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("cass"));
+    command.arg("--db").arg(db_path).arg(data_dir);
+    Command::new(std::path::Path::new("fixed-program"));
+    Command::new(command::fixed_program());
+    Command::new(format!("tool-{{user_program}}"));
+}
+''')
+        add("command-values.rs", '''fn execute(user: User, command: String, path: PathBuf) {
+    Command::new(user.program);
+    std::process::Command::new(&command.as_str());
+    Command::new(std::path::Path::new(&path));
+    Command::new(command::normalize(user.program));
+    Command::new(make_command!(user.program));
+    Command::new(std::env::args().nth(1));
+    Command::new(format!("tool-{command}"));
+}
+''', command_lines=(2, 3, 4, 5, 6, 7, 8))
+        add("command-multiline.rs", '''fn execute(user: User) {
+    std::process::Command::new(
+        command::normalize(
+            user.program
+        )
+    );
+}
+''', command_lines=(2,))
+        add("command-markers.rs", '''fn execute(user: User) {
+    Command::new(user.program); // ubs:ignore[rust.other]
+    Command::new(user.program); // ubs:ignore[rust.security.command-executable]
+    Command::new(user.program); // ubs:ignore
+    Command::new(user.program); let note = "ubs:ignore";
+    // ubs:ignore[rust.security.command-executable]
+    Command::new(user.program);
+}
+''', command_lines=(2, 5))
+        add("literal-source.rs", '''fn example() {
+    let example = r#"std::env::args(); client.get(url); Command::new(user.program); // ubs:ignore"#;
+}
+''')
+        for path, source in sources.items():
+            path.write_text(source, encoding="utf-8")
+        return project, sources, expected
+
+    def test_real_request_url_bindings_and_command_operands(self) -> None:
+        from ubs_core.rust_detectors import command_executable, request_url
+
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-input-boundary-") as temp:
+            _project, sources, expected = self._fixtures(Path(temp).resolve())
+            for detector, rule in ((request_url, self.URL_RULE),
+                                   (command_executable, self.COMMAND_RULE)):
+                for selected in (list(sources), list(reversed(sources))):
+                    with self.subTest(detector=rule, reverse=selected != list(sources)):
+                        findings = list(detector.find(selected))
+                        self.assertCountEqual(
+                            [(path, line, col) for path, line, col, _text in findings],
+                            [(path, line, 1) for path, line, hit_rule in expected if hit_rule == rule],
+                        )
+                        for path, line, _col, code in findings:
+                            self.assertIn(sources[path].splitlines()[line - 1].strip(), code)
+                            self.assertEqual(code.count("outbound HTTP"), int(rule == self.URL_RULE))
+
+    def test_public_input_boundaries_preserve_json_sarif_and_cache(self) -> None:
+        for no_ast in ("0", "1"):
+            with self.subTest(no_ast=no_ast), tempfile.TemporaryDirectory(prefix="ubs-rust-input-public-") as temp:
+                root = Path(temp).resolve()
+                project, sources, expected = self._fixtures(root)
+                paths = list(sources)
+                cache = root / "cache"
+
+                def scan(selected, output_format, expected_sites, hits):
+                    artifacts = Path(tempfile.mkdtemp(prefix="report-", dir=root))
+                    listing, sink, stats = (artifacts / name for name in ("files.txt", "findings.ndjson", "cache.json"))
+                    listing.write_text("\n".join(str(path) for path in selected) + "\n", encoding="utf-8")
+                    command = [
+                        "bash", str(REPO_ROOT / "modules" / "ubs-rust.sh"),
+                        "--ci", "--no-color", "--no-cargo", "--fail-on-warning", "--only=8",
+                        f"--format={output_format}", f"--files-from={listing}", f"--report-json={sink}", str(project),
+                    ]
+                    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                               UBS_CACHE_DIR=str(cache), UBS_CACHE_FILE=str(stats), UBS_PROFILE="1",
+                               UBS_SKIP_TYPE_NARROWING="1", UBS_TEST_FORCE_NO_AST_GREP=no_ast,
+                               UBS_ALLOW_UNVERIFIED_HELPERS="0", UBS_NO_AUTO_UPDATE="1")
+                    proc = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True, timeout=180)  # ubs:ignore[python.taint.command] - fixed repository scanner with local Rust source fixtures and bounded execution
+                    context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                    self.assertEqual(proc.returncode, int(bool(expected_sites)), context)
+                    try:
+                        payload = json.loads(proc.stdout)
+                        records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
+                        cache_stats = json.loads(stats.read_text(encoding="utf-8"))
+                    except (ValueError, OSError) as exc:
+                        self.fail(f"Invalid Rust input report: {exc}\n{context}")
+                    self.assertEqual((cache_stats["hits"], cache_stats["misses"]),
+                                     (hits, len(selected) - hits), context)
+                    wanted = [(rule, str(path), line, 1, "critical") for path, line, rule in expected_sites]
+                    self.assertCountEqual(
+                        [(record["rule"], record["path"], record["line"], record["col"], record["severity"])
+                         for record in records], wanted, context,
+                    )
+                    self.assertTrue(all(record.get("count", 1) == 1 for record in records), context)
+                    if output_format == "json":
+                        self.assertEqual(payload["status"], "ok", context)
+                        self.assertEqual(payload["files"], len(selected), context)
+                        self.assertEqual((payload["critical"], payload["warning"], payload["info"]),
+                                         (len(wanted), 0, 0), context)
+                    else:
+                        self.assertEqual(payload["version"], "2.1.0", context)
+                        results = [result for run in payload["runs"] for result in run["results"]]
+                        actual = []
+                        for result in results:
+                            self.assertEqual(len(result["locations"]), 1, result)
+                            physical = result["locations"][0]["physicalLocation"]
+                            actual.append((result["ruleId"], physical["artifactLocation"]["uri"],
+                                           physical["region"]["startLine"], physical["region"]["startColumn"], result["level"]))
+                        self.assertCountEqual(actual, [(rule, path, line, col, "error")
+                                                       for rule, path, line, col, _severity in wanted], context)
+                    return sorted(records, key=lambda record: json.dumps(record, sort_keys=True))
+
+                cold = scan(paths, "json", expected, 0)
+                self.assertEqual(scan(paths, "sarif", expected, len(paths)), cold)
+                positive = {path for path, _line, _rule in expected}
+                clean = [path for path in paths if path not in positive]
+                self.assertEqual(scan(clean, "json", [], len(clean)), [])
+                changed = project / "url-multiline.rs"
+                changed.write_text('fn safe(client: Client) { client.get("https://example.com/fixed"); }\n', encoding="utf-8")
+                remaining = [site for site in expected if site[0] != changed]
+                partial = scan(paths, "json", remaining, len(paths) - 1)
+                self.assertEqual(partial, [record for record in cold if record["path"] != str(changed)])
+                self.assertEqual(scan(paths, "sarif", remaining, len(paths)), partial)
+
+
 if __name__ == "__main__":
     unittest.main()

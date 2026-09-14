@@ -2,6 +2,11 @@
 
 Port of rust_request_url_matches (modules/ubs-rust.sh 3442-3695).
 
+Bindings are tracked through lexical blocks and reset at function boundaries.
+Only URL operands contribute value references; callable names and literal text
+cannot inherit an unrelated binding's taint. Source suppression keeps bare and
+rule-scoped markers distinct so a diagnostic marker cannot erase propagation.
+
 The legacy heredoc consumed UBS_RUST_FILE_LIST (GH #70) or rglob'd the tree;
 `find(files)` instead iterates the orchestrator's already-filtered file list in
 order. The legacy code never called .resolve() on list entries, so neither does
@@ -10,10 +15,13 @@ this port; the local skip_dirs set is kept for documentation only.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from pathlib import Path
 from typing import Iterator
 
-from ubs_core.suppression import has_suppression_marker
+from ubs_core.io import find_block_end
+from ubs_core.lexer import strip_comments_and_strings
+from ubs_core.suppression import SourceSuppressions, has_suppression_marker
 
 RULE_ID = "rust.security.request-url"
 CATEGORY = 8
@@ -46,8 +54,8 @@ sink_re = re.compile(
     re.IGNORECASE,
 )
 assign_re = re.compile(
-    r'^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?'
-    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)$'
+    r'(?<![A-Za-z0-9_:.])(?:(?P<declaration>let|const|static)\s+(?:(?:ref|mut)\s+)*)?'
+    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::(?!:)[^=;{}]+)?=(?![=>])\s*'
 )
 safe_expr_re = re.compile(
     r'\b(?:safe(?:URL|Url|Uri|URI|OutboundURL|OutboundUrl|OutboundURI|WebhookURL|CallbackURL|HttpURL)|'
@@ -177,10 +185,10 @@ def taint_from_expr(expr: str, tainted):
     return {"path": path}
 
 
-def has_allowlist_context(lines, line_no, refs):
+def has_allowlist_context(lines, line_no, refs, scope_start=1):
     if not refs:
         return False
-    start = max(0, line_no - 24)
+    start = max(scope_start - 1, line_no - 24)
     context = "\n".join(strip_line_comments(line) for line in lines[start:line_no + 1])
     if not any(re.search(rf'\b{re.escape(ref)}\b', context) for ref in refs):
         return False
@@ -197,6 +205,81 @@ def source_line(lines, line_no):
     return ""
 
 
+def value_references(expr):
+    """Retain value names, not literal text, field labels or callable paths."""
+    masked = strip_comments_and_strings(expr, lang="rust")
+    chars = list(masked)
+    for match in re.finditer(r'\b[A-Za-z_][A-Za-z0-9_]*\b', masked):
+        before = masked[:match.start()].rstrip()
+        after = masked[match.end():].lstrip()
+        if (before.endswith((".", "::")) or after.startswith(("::", "(", "!"))
+                or (after.startswith(":") and not after.startswith("::"))):
+            chars[match.start():match.end()] = " " * len(match.group())
+    # Rust format! can capture a variable without a separate argument. Other
+    # string contents (including documented Rust code) are not value references.
+    captures = []
+    if re.search(r'\bformat\s*!', masked):
+        captures = re.findall(r'(?<!\{)\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^{}]*)?\}(?!\})', expr)
+    return "".join(chars) + " " + " ".join(captures)
+
+
+def value_taint(expr, bindings):
+    masked = strip_comments_and_strings(expr, lang="rust")
+    if is_safe_expr(masked):
+        return None
+    for source in source_re.finditer(expr):
+        if masked[source.start():source.start() + 1].strip():
+            return {"path": [source.group(0).strip()]}
+    return taint_from_expr(value_references(expr), bindings)
+
+
+def expression_end(masked, start):
+    """Find the end of an initializer without crossing its containing block."""
+    stack = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for pos in range(start, len(masked)):
+        char = masked[pos]
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        elif not stack and char in ";}":
+            return pos
+    return len(masked)
+
+
+def call_arguments(masked, opening):
+    closing = find_block_end(masked, opening, "(", ")")
+    if closing <= opening or masked[closing] != ")":
+        return []
+    args = []
+    start = opening + 1
+    stack = []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for pos in range(start, closing):
+        char = masked[pos]
+        if char in pairs:
+            stack.append(pairs[char])
+        elif stack and char == stack[-1]:
+            stack.pop()
+        elif char == "," and not stack:
+            args.append((start, pos))
+            start = pos + 1
+    args.append((start, closing))
+    return args
+
+
+def function_bodies(masked):
+    bodies = {}
+    for declaration in re.finditer(r'\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:<[^{};]*>)?\s*\(', masked):
+        closing = find_block_end(masked, declaration.end() - 1, "(", ")")
+        opening = masked.find("{", closing + 1)
+        terminator = masked.find(";", closing + 1)
+        if opening >= 0 and (terminator < 0 or opening < terminator):
+            bodies[opening] = declaration.start()
+    return bodies
+
+
 def analyze(path: Path, issues):
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -205,51 +288,101 @@ def analyze(path: Path, issues):
     if not (source_re.search(text) and sink_re.search(text)):
         return
     lines = text.splitlines()
-    tainted = {}
+    line_starts = [0] + [match.end() for match in re.finditer("\n", text)]
+    source = strip_comments_and_strings(text, lang="rust", strip_strings=False)
+    masked = strip_comments_and_strings(text, lang="rust")
+    suppressions = SourceSuppressions("rust")
+    suppressions.index(path, text)
+    bodies = function_bodies(masked)
+    # A function item cannot capture enclosing local variables. Ordinary
+    # blocks and closures can, but their declarations must shadow outer names.
+    scopes = [{"bindings": {}, "function": True, "start": 1}]
+    events = [(match.start(), "brace", match.group())
+              for match in re.finditer(r'[{}]', masked)]
+    events.extend((match.start(), "assignment", match) for match in assign_re.finditer(masked))
+    events.extend((match.start(), "sink", match) for match in sink_re.finditer(masked))
     seen = set()
-    for line_no, _ in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
+    for offset, kind, event in sorted(events, key=lambda item: item[0]):
+        line_no = bisect_right(line_starts, offset)
+        if kind == "brace":
+            if event == "}":
+                if len(scopes) > 1:
+                    scopes.pop()
+            else:
+                boundary = offset in bodies
+                frame = {"bindings": {}, "function": boundary,
+                         "start": bisect_right(line_starts, bodies.get(offset, offset))}
+                if not boundary:
+                    previous = max(masked.rfind(";", 0, offset), masked.rfind("{", 0, offset),
+                                   masked.rfind("}", 0, offset))
+                    header = masked[previous + 1:offset]
+                    closure = re.search(r'\|([^|]*)\|\s*(?:->[^{}]+)?$', header)
+                    if closure:
+                        for parameter in closure.group(1).split(","):
+                            name = re.match(r'\s*(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)', parameter)
+                            if name:
+                                frame["bindings"][name.group(1)] = None
+                    loop = re.search(r'\bfor\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s+in\b', header)
+                    if loop:
+                        frame["bindings"][loop.group(1)] = None
+                scopes.append(frame)
             continue
-        raw_line = strip_line_comments(lines[line_no - 1]).strip()
-        if not raw_line:
+
+        visible = {}
+        function_start = 1
+        for scope in reversed(scopes):
+            for name, binding in scope["bindings"].items():
+                visible.setdefault(name, binding)
+            if scope["function"]:
+                function_start = scope["start"]
+                break
+        tainted = {name: binding for name, binding in visible.items() if binding is not None}
+        if kind == "assignment":
+            name = event.group("lhs")
+            rhs = source[event.end():expression_end(masked, event.end())]
+            taint = None if suppressions.is_suppressed(path, line_no, None) else value_taint(rhs, tainted)
+            if taint is not None:
+                taint["line"] = line_no
+            target = scopes[-1]
+            if not event.group("declaration"):
+                for scope in reversed(scopes):
+                    if name in scope["bindings"]:
+                        target = scope
+                        break
+                    if scope["function"]:
+                        break
+                # A conditional block/closure may not run. Do not erase a
+                # tainted outer binding merely because one branch assigns clean.
+                if target is not scopes[-1] and taint is None:
+                    taint = target["bindings"].get(name)
+            target["bindings"][name] = taint
             continue
-        statement = logical_statement(lines, line_no).strip()
-        if not statement:
+
+        args = call_arguments(masked, event.end() - 1)
+        method = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*\($', event.group())
+        index = 1 if method and method.group(1).lower() == "request" else 0
+        if len(args) <= index:
             continue
-        assign = assign_re.match(statement)
-        if assign:
-            name = assign.group("lhs")
-            rhs = assign.group("rhs")
-            taint = taint_from_expr(rhs, tainted)
-            if taint:
-                tainted[name] = taint
-            elif name in tainted and is_safe_expr(rhs):
-                tainted.pop(name, None)
-        if not sink_re.search(statement):
+        start, end = args[index]
+        argument = source[start:end]
+        taint = value_taint(argument, tainted)
+        if taint is None:
             continue
-        if is_safe_expr(statement):
+        refs = refs_in_expr(value_references(argument), tainted)
+        scope_start = max([function_start] + [tainted[ref].get("line", 1) for ref in refs])
+        if has_allowlist_context(lines, line_no, refs, scope_start):
             continue
-        direct = source_re.search(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_allowlist_context(lines, line_no, refs):
-            continue
-        if has_ignore(lines, line_no, RULE_ID):
+        if suppressions.is_suppressed(path, line_no, RULE_ID):
             continue
         key = (path, line_no)
         if key in seen:
             continue
         seen.add(key)
-        if direct:
-            path_desc = f"{direct.group(0).strip()} -> outbound HTTP"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get("path", [ref]))
-            if len(seq) >= path_limit:
-                seq = seq[-(path_limit - 1):]
-            seq.append("outbound HTTP")
-            path_desc = " -> ".join(seq)
+        seq = list(taint["path"])
+        if len(seq) >= path_limit:
+            seq = seq[-(path_limit - 1):]
+        seq.append("outbound HTTP")
+        path_desc = " -> ".join(seq)
         issues.append((path, line_no, f"{source_line(lines, line_no)}  [{path_desc}]"))
 
 

@@ -27,6 +27,14 @@ pub fn request_id_for_logs() -> u32 {
     rand::thread_rng().gen_range(0..100)
 }
 
+pub fn token_from_thread_rng() -> [u8; 32] {
+    rand::rng().random()
+}
+
+pub fn token_from_random() -> [u8; 32] {
+    rand::random()
+}
+
 pub fn doc_comment_mentions_only() -> &'static str {
-    "A token should not use rand::random::<u64>(), but this is documentation text."
+    "A token should not use fastrand::u64(..), but this is documentation text."
 }

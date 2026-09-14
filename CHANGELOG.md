@@ -10,6 +10,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Select Python JSON previews in stable source order before applying the sample cap, so file discovery, parallel work and cache replay preserve the displayed finding sites.
 - Preserve finding paths, source locations, and rule-scoped suppressions when merging AST and pattern reports. Restore 14 Rust diagnostics lost during grouped-report conversion, with exact source-site regression coverage.
 - Recompute Python thresholds, suppression, and project conditions from cached raw matches for the selected files. Missing-return findings select stable source sites regardless of file discovery order. Swift cache replay also recomputes project conditions after file selections or contents change.
 - Preserve Swift project notes and aggregate findings in SARIF without inventing source locations. Baseline comparisons count zero-occurrence notes as zero and positive aggregates by their reported count, retaining warning severity.
@@ -19,6 +20,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 - Assemble release files before hashing and signing them, using the flat asset names consumed by installers. Decode the configured signing key into a private temporary file outside the published payload.
 - Keep verified installs on the selected release when handing off to the downloaded installer. Previously, selecting an older release could verify its installer but then install the latest runner.
 - Keep Rust namespace match arms and boolean result bindings out of secret-comparison operands. Distinguish request `Path(...)` extractors from filesystem `.path()` calls when tracking SQL inputs.
+- Recognize Rand's cryptographic thread generator and separate ordinary clocks, deadlines and PID-based filenames from secret generation. Keep predictable token values and weak generators actionable. Bind outbound-URL findings to actual URL arguments and lexical variable scopes; parse complete command arguments so a fixed Cargo test executable is not mistaken for user input.
 
 ---
 

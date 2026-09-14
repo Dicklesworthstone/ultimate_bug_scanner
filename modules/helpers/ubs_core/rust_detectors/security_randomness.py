@@ -4,8 +4,7 @@ Port of rust_security_randomness_matches (modules/ubs-rust.sh 5540-5857;
 counted by count_security_randomness_matches at 5859): flags security-
 sensitive generation statements (token/session/cookie/csrf/otp/salt/
 password/auth/... names, or a security-flavored enclosing function) that
-draw from non-cryptographic sources — ``rand::random``, ``thread_rng()``/
-``rng()`` method chains, seeded ``StdRng``/``SmallRng``/``Pcg*``/``XorShiftRng``/
+draw from non-cryptographic sources — seeded ``StdRng``/``SmallRng``/``Pcg*``/``XorShiftRng``/
 ``ChaCha*Rng``/``WyRand`` constructors, ``fastrand``/``nanorand`` — or
 predictable seeds (``SystemTime::now``, ``Instant::now``, ``process::id``,
 ``.finish()``) when the statement is sensitive. ``OsRng``/``getrandom``/
@@ -15,6 +14,10 @@ comments stripped; a statement is accumulated over up to 10 lookahead
 lines until parens balance. A line is suppressed when its own line or the
 previous line carries ``ubs:ignore``. Findings dedupe per
 (file, line, matched source) and keep file order.
+
+Rand's ``ThreadRng`` (including ``rand::rng``, ``thread_rng`` and
+``rand::random``) is a cryptographic generator. Its use alone is not evidence
+for this rule; entropy length and post-fork reseeding are separate concerns.
 
 The legacy UBS_RUST_FILE_LIST branch yielded entries unresolved and
 printed them as-is; ``find(files)`` therefore iterates the entries
@@ -65,6 +68,9 @@ fn_re = re.compile(
 )
 safe_random_re = re.compile(
     r"\b(?:rand_core::)?OsRng\b"
+    r"|\b(?:rand\s*::\s*)?(?:thread_rng|rng)\s*\("
+    r"|\b(?:rand\s*::\s*rngs\s*::\s*)?ThreadRng\s*::\s*default\s*\("
+    r"|\b(?:rand\s*::\s*rngs\s*::\s*)?StdRng\s*::\s*(?:from_entropy|from_os_rng|try_from_os_rng)\s*\("
     r"|\bgetrandom(?:::getrandom|::fill)?\s*\("
     r"|\bring::rand::(?:SystemRandom|generate)\b"
     r"|\baws_lc_rs::rand::(?:SystemRandom|generate)\b"
@@ -72,17 +78,12 @@ safe_random_re = re.compile(
     r"|\b(?:uuid::)?Uuid::new_v4\s*\(",
 )
 unsafe_rng_init_re = re.compile(
-    r"\b(?:rand\s*::\s*)?(?:thread_rng|rng)\s*\("
-    r"|\b(?:rand\s*::\s*rngs\s*::\s*)?(?:StdRng|SmallRng)\s*::\s*(?:seed_from_u64|from_seed|from_rng|from_entropy)\s*\("
+    r"\b(?:rand\s*::\s*rngs\s*::\s*)?StdRng\s*::\s*(?:seed_from_u64|from_seed|from_rng)\s*\("
+    r"|\b(?:rand\s*::\s*rngs\s*::\s*)?SmallRng\s*::\s*(?:seed_from_u64|from_seed|from_rng|from_entropy|from_os_rng|try_from_os_rng)\s*\("
     r"|\b(?:Pcg[A-Za-z0-9_]*|XorShiftRng|ChaCha[0-9]*Rng|WyRng|WyRand)\s*::\s*(?:seed_from_u64|from_seed|from_rng|new)\s*\(",
 )
 direct_unsafe_re = re.compile(
-    r"\brand\s*::\s*random\s*(?:::<[^>]+>)?\s*\("
-    r"|\brandom\s*::<[^>]+>\s*\("
-    r"|\b(?:rand\s*::\s*)?(?:thread_rng|rng)\s*\(\s*\)\s*\.\s*(?:"
-    + "|".join(rng_methods)
-    + r")\s*(?:::<[^>]+>)?\s*\("
-    r"|\bfastrand\s*::\s*(?:u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|bool|alphanumeric|bytes|fill|shuffle|choice)\s*\("
+    r"\bfastrand\s*::\s*(?:u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|bool|alphanumeric|bytes|fill|shuffle|choice)\s*\("
     r"|\bnanorand\s*::",
 )
 predictable_source_re = re.compile(
@@ -214,6 +215,41 @@ def has_security_context(statement: str, fn_name: str) -> bool:
     return bool(re.search(r"(?<![A-Za-z0-9_])(?:key|sig)(?![A-Za-z0-9_])", visible, re.IGNORECASE))
 
 
+def has_secret_value_name(name: str) -> bool:
+    # A clock in count_sessions(), or a PID in a recovery filename, is not
+    # secret generation. Require value-oriented names rather than ambient
+    # words such as auth/authority, verify, recovery or session.
+    words = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name).lower().split("_")
+    terms = set(words) | {left + right for left, right in zip(words, words[1:])}
+    return bool(terms & {
+        "apikey", "accesskey", "privatekey", "clientsecret", "secret", "token",
+        "cookie", "csrf", "xsrf", "otp", "totp", "nonce", "salt", "password",
+        "passwd", "pwd", "bearer", "credential", "magiclink", "signature",
+    })
+
+
+def predictable_generation_context(statement: str, fn_name: str) -> bool:
+    visible = without_string_literals(statement).strip()
+    assignment = assign_re.match(visible)
+    if assignment:
+        name = assignment.group("lhs")
+        return has_secret_value_name(name) or (
+            name in {"seed", "key", "sig"} and has_secret_value_name(fn_name)
+        )
+    if not has_secret_value_name(fn_name):
+        return False
+    # Returning clock/hash/PID material from a token factory is actionable.
+    # Ordinary timed work, comparisons and control headers inside it are not.
+    if visible.startswith("return "):
+        return True
+    # The bounded statement reader includes the following closing brace when
+    # a Rust tail expression has no semicolon.
+    tail = visible.removesuffix("}").rstrip()
+    return (bool(tail) and not any(char in tail for char in ";{}")
+            and not re.match(r"(?:if|while|for|match|let)\b", tail)
+            and not re.search(r"(?:==|!=|<=|>=)", tail))
+
+
 def has_ignore(lines, line_no, rule=None):
     idx = line_no - 1
     return (
@@ -316,7 +352,10 @@ def analyze(path: Path, issues):
         if not line_sensitive and current_function not in function_sensitive:
             function_sensitive[current_function] = has_security_context("", current_function)
         sensitive = line_sensitive or function_sensitive[current_function]
-        source = unsafe_source(statement, insecure_rng_vars, sensitive)
+        source = unsafe_source(
+            statement, insecure_rng_vars,
+            predictable_generation_context(statement, current_function),
+        )
         if source and sensitive and not has_ignore(lines, line_no, RULE_ID):
             key = (str(path), line_no, source)
             if key not in seen:

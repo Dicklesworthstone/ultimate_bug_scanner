@@ -873,7 +873,7 @@
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 687,
+      "result_count": 685,
       "result_rule_ids": [
         "rust.allocation.format-literal",
         "rust.allocation.to-owned-to-string",

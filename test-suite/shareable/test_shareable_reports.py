@@ -40,7 +40,7 @@ def run(args: list[str], *, origin: str = GITHUB_ORIGIN) -> subprocess.Completed
         "GIT_CONFIG_KEY_0": "remote.origin.url",
         "GIT_CONFIG_VALUE_0": origin,
     })
-    return subprocess.run([str(UBS_BIN), *args], capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=600)
+    return subprocess.run([str(UBS_BIN), *args], capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=600)  # ubs:ignore[python.taint.command] - fixed repository scanner and local fixtures; inherited environment configures Git provenance, with no shell and a bounded timeout
 
 
 def report(name: str, ok: bool, detail: str = "", proc: subprocess.CompletedProcess | None = None) -> None:
@@ -143,7 +143,11 @@ def main() -> int:
         # 3. Baseline report, then comparison via --comparison and the --baseline alias.
         baseline = tmpdir / "baseline.json"
         proc = run([*common, f"--report-json={baseline}", str(TARGET)])
-        base_doc = json.loads(baseline.read_text()) if baseline.exists() else {}
+        try:
+            base_doc = json.loads(baseline.read_text()) if baseline.exists() else {}
+        except (json.JSONDecodeError, OSError) as exc:
+            report("report_json_baseline", False, f"cannot read baseline report: {exc}", proc)
+            return 1
         ok = baseline.exists() and "comparison" not in base_doc and bool(base_doc.get("git", {}).get("repository"))
         report("report_json_baseline", ok, f"exists={baseline.exists()} keys={sorted(base_doc)[:8]}", proc if not ok else None)
 

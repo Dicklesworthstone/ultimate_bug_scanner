@@ -11,13 +11,8 @@ are retained for SARIF, with internal flags to survive cache replay without
 changing the counted sink. Severity comes from java_rules.SEVERITY_MAP
 overrides for counted rules and the rule configuration for other records.
 
-Suppression: per-id, mirroring the two legacy parsers —
-- java.async.* ids: current + previous-line `ubs:ignore` check
-  (run_async_error_checks parser, ubs-java.sh 2462-2475);
-- java.resource.* ids and java.optional-isPresent-then-get: NO marker check
-  (emit_ast_rule_group's PYRULE parser and the cat-1 ast_search probe never
-  checked markers — the A7 statement-interval engine in the meta-runner
-  postprocess layers the richer placements on top).
+Suppression uses the source statement interval and exact public rule ID before
+counting or emitting either counted or report-only AST records.
 """
 from __future__ import annotations
 
@@ -26,7 +21,7 @@ import subprocess
 from pathlib import Path
 from typing import Sequence
 
-from ubs_core.java_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -36,21 +31,6 @@ _FAMILY_CATEGORY = {
     "java.resource": 19,
 }
 _BATCH = 400  # paths per scan invocation (argv length safety)
-
-
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
-    if path not in cache:
-        try:
-            cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            cache[path] = []
-    return cache[path]
-
-
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return any(0 <= i < len(lines) and MARKER in lines[i].lower() for i in (idx, idx - 1))
 
 
 def _family_category(rule_id: str) -> int | None:
@@ -69,7 +49,6 @@ def scan_config(
     ast_grep_bin: str = _ASTGREP_BIN,
     counted_rules: set[str] | None = None,
     skip_categories: set[int] | None = None,
-    marker_suppressed_ids: frozenset[str] | None = None,
     category_for_rule=None,
 ) -> dict[str, int]:
     """Run one sgconfig over the path list; write sink records; return counters."""
@@ -77,8 +56,7 @@ def scan_config(
     path_list = [Path(p) for p in paths]
     if not path_list or not config.is_file():
         return counters
-    cache: dict[Path, list[str]] = {}
-    suppressed_ids = marker_suppressed_ids or frozenset()
+    suppressions = SourceSuppressions("kotlin" if lang == "kotlin" else "java")
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
         try:
@@ -117,8 +95,8 @@ def scan_config(
             severity = (severity_overrides or {}).get(rule_id) or default_severity
             if severity not in counters:
                 severity = "warning"
-            if rule_id in suppressed_ids and _has_marker(path, line_no, cache):
-                continue  # legacy async parser marker check only
+            if suppressions.is_suppressed(path, line_no, rule_id):
+                continue
             if counted:
                 counters[severity] = counters.get(severity, 0) + 1
             message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
@@ -149,7 +127,6 @@ def scan_all(
     ast_grep_bin: str = _ASTGREP_BIN,
     counted_rules: set[str] | None = None,
     skip_categories: set[int] | None = None,
-    marker_suppressed_ids: frozenset[str] | None = None,
     category_for_rule=None,
 ) -> dict[str, int]:
     """Run every sgbase-*.yml in rule_dir; aggregate counters."""
@@ -158,7 +135,7 @@ def scan_all(
         lang = config.stem.removeprefix("sgbase-")
         counters = scan_config(
             config, paths, sink, lang, severity_overrides, ast_grep_bin,
-            counted_rules, skip_categories, marker_suppressed_ids, category_for_rule,
+            counted_rules, skip_categories, category_for_rule,
         )
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value

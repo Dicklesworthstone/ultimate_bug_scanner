@@ -130,6 +130,7 @@ def _storyboards(ctx):
         yield {
             "rule": "swift.uisafety.storyboards",
             "category": 21,
+            "scope": "project_aggregate",
             "path": "", "line": 0,
             "severity": "info",
             "count": count,

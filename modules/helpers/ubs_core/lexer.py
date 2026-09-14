@@ -6,6 +6,7 @@ offsets and newlines so that (line, col) calculations match original sources.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 
@@ -48,6 +49,9 @@ class Interval:
 
 _HASH_COMMENT_LANGS = frozenset({"ruby", "rb", "python", "py", "elixir", "ex", "exs", "sh", "bash"})
 _NO_SINGLE_QUOTE_STRING_LANGS = frozenset({"swift"})
+_RUST_CHAR_RE = re.compile(
+    r"'(?:[^'\\\r\n\t]|\\(?:['\"\\nrt0]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}))'"
+)
 
 
 def strip_comments_and_strings(
@@ -65,10 +69,14 @@ def strip_comments_and_strings(
     comment text is emitted verbatim instead of blanked. This lets marker
     parsers see `ubs:ignore` in comments while staying immune to apostrophes.
 
+    String boundaries are recognized even with ``strip_strings=False`` so
+    literal comment delimiters remain string contents when comments are masked.
+
     Ensures that (line, column) coordinates and string offsets in the returned text
     match the original text byte-for-byte.
     """
     lang_norm = lang.lower().strip()
+    is_rust = lang_norm in {"rust", "rs"}
     is_hash_comment = lang_norm in _HASH_COMMENT_LANGS
     supports_single_quote_strings = lang_norm not in _NO_SINGLE_QUOTE_STRING_LANGS
 
@@ -112,10 +120,10 @@ def strip_comments_and_strings(
 
         # Inside triple-quoted string
         if in_triple_string:
-            result.append(mask_char(ch))
+            result.append(mask_char(ch) if strip_strings else ch)
             if not escaped and ch == string_quote and nxt == string_quote and nxt2 == string_quote:
-                result.append(" ")
-                result.append(" ")
+                result.append(" " if strip_strings else nxt)
+                result.append(" " if strip_strings else nxt2)
                 in_triple_string = False
                 i += 3
             else:
@@ -128,7 +136,7 @@ def strip_comments_and_strings(
 
         # Inside regular string
         if in_string:
-            result.append(mask_char(ch))
+            result.append(mask_char(ch) if strip_strings else ch)
             if escaped:
                 escaped = False
             elif ch == "\\":
@@ -159,13 +167,48 @@ def strip_comments_and_strings(
                 continue
 
         # Check string start
-        if strip_strings:
+        if strip_strings or strip_comments:
+            # Rust raw strings use an exact hash-delimited closer. Quotes,
+            # escapes, and comment delimiters inside them are literal bytes.
+            # Recognize the byte/C-string prefixes at the same token boundary.
+            if is_rust and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+                raw_start = i + 1 if ch == "r" else i + 2 if ch in {"b", "c"} and nxt == "r" else 0
+                if raw_start:
+                    quote = raw_start
+                    while quote < n and text[quote] == "#":
+                        quote += 1
+                    if quote < n and text[quote] == '"':
+                        closer = '"' + text[raw_start:quote]
+                        end = text.find(closer, quote + 1)
+                        end = n if end < 0 else end + len(closer)
+                        literal = text[i:end]
+                        if strip_strings:
+                            result.extend(mask_char(char) for char in literal)
+                        else:
+                            result.append(literal)
+                        i = end
+                        continue
+
+            # A Rust apostrophe starts a character only when a complete
+            # one-character/escape literal follows. Lifetimes and loop labels
+            # must not open a string that hides subsequent real comments.
+            if is_rust and ch == "'":
+                character = _RUST_CHAR_RE.match(text, i)
+                if character is not None:
+                    literal = character.group()
+                    result.append(" " * len(literal) if strip_strings else literal)
+                    i = character.end()
+                    continue
+                result.append(ch)
+                i += 1
+                continue
+
             # Triple quotes (""" or ''')
-            if ch in {'"', "'"} and nxt == ch and nxt2 == ch:
+            if not is_rust and ch in {'"', "'"} and nxt == ch and nxt2 == ch:
                 if ch == '"' or supports_single_quote_strings:
                     in_triple_string = True
                     string_quote = ch
-                    result.extend("   ")
+                    result.extend("   " if strip_strings else ch * 3)
                     i += 3
                     continue
 
@@ -173,7 +216,7 @@ def strip_comments_and_strings(
             if ch == '"' or (supports_single_quote_strings and ch == "'"):
                 in_string = True
                 string_quote = ch
-                result.append(mask_char(ch))
+                result.append(mask_char(ch) if strip_strings else ch)
                 i += 1
                 continue
 

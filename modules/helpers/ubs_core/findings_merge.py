@@ -168,20 +168,34 @@ def load_sink(sink: Path) -> list[dict]:
     return records
 
 
-def _validate_project_note(rec: dict) -> None:
-    """A project note cannot downgrade or invent a location for a source hit."""
+def _validate_project_record(rec: dict) -> None:
+    """Explicit project records preserve counts without inventing source sites."""
+    note = rec.get("scope") == "project"
+    count = rec.get("count")
+    valid_count = type(count) is int and (count == 0 if note else count > 0)  # ubs:ignore[py.comparison.type-equality,py.type-equality] - JSON counts must reject bool and int subclasses.
+    valid_severity = (rec.get("severity") == "info" if note
+                      else rec.get("severity") in ("info", "warning", "critical"))
     if (
-        any(rec.get(key, "") != "" for key in ("file", "path"))
+        rec.get("scope") not in ("project", "project_aggregate")
+        or any(rec.get(key, "") != "" for key in ("file", "path"))
         or type(rec.get("line")) is not int
         or rec["line"] != 0
-        or rec.get("severity") != "info"
-        or type(rec.get("count")) is not int
-        or rec["count"] != 0
+        or not valid_severity
+        or not valid_count
     ):
+        label = "project note" if note else "project aggregate"
+        expected = ("severity info and integer count 0" if note else
+                    "severity info/warning/critical and positive integer count")
         raise ValueError(
-            "invalid project note: requires no source path, integer line 0, "
-            "severity info and integer count 0"
+            f"invalid {label}: requires no source path, integer line 0, {expected}"
         )
+
+
+def _occurrence_count(finding: dict) -> int:
+    """Use validated project weights; ordinary source records count once."""
+    if finding.get("scope") in ("project", "project_aggregate"):
+        return finding["count"]
+    return 1
 
 
 def _normalize(
@@ -191,11 +205,11 @@ def _normalize(
     project_dir: str | Path = "",
     ordinals: dict | None = None,
 ) -> dict:
-    project_note = rec.get("scope") == "project"
-    if project_note:
+    project_scoped = rec.get("scope") in ("project", "project_aggregate")
+    if project_scoped:
         # Validate original types before ordinary source normalization can
         # turn malformed line/count metadata into an apparently valid zero.
-        _validate_project_note(rec)
+        _validate_project_record(rec)
     rule = str(rec.get("rule", ""))
     path = str(rec.get("path", ""))
     try:
@@ -231,8 +245,8 @@ def _normalize(
         "fingerprint": fp,
         "suppressed": bool(rec.get("suppressed", False)),
     }
-    if project_note:
-        normalized["scope"] = "project"
+    if project_scoped:
+        normalized["scope"] = rec["scope"]
         normalized["count"] = rec["count"]
     return normalized
 
@@ -306,16 +320,16 @@ def merge(
             if isinstance(scanner, dict):
                 slang = str(scanner.get("language") or "")
                 s_list = findings_by_lang.get(slang, [])
-                scanner["critical"] = sum(1 for f in s_list if f.get("severity") == "critical" and not f.get("suppressed"))
-                scanner["warning"] = sum(1 for f in s_list if f.get("severity") == "warning" and not f.get("suppressed"))
-                scanner["info"] = sum(1 for f in s_list if f.get("severity") == "info" and not f.get("suppressed"))
+                scanner["critical"] = sum(_occurrence_count(f) for f in s_list if f.get("severity") == "critical" and not f.get("suppressed"))
+                scanner["warning"] = sum(_occurrence_count(f) for f in s_list if f.get("severity") == "warning" and not f.get("suppressed"))
+                scanner["info"] = sum(_occurrence_count(f) for f in s_list if f.get("severity") == "info" and not f.get("suppressed"))
         tot_crit = sum(int(s.get("critical", 0) or 0) for s in doc.get("scanners", []))
         tot_warn = sum(int(s.get("warning", 0) or 0) for s in doc.get("scanners", []))
         tot_info = sum(int(s.get("info", 0) or 0) for s in doc.get("scanners", []))
         if not doc.get("scanners"):
-            tot_crit = sum(1 for f in findings if f.get("severity") == "critical" and not f.get("suppressed"))
-            tot_warn = sum(1 for f in findings if f.get("severity") == "warning" and not f.get("suppressed"))
-            tot_info = sum(1 for f in findings if f.get("severity") == "info" and not f.get("suppressed"))
+            tot_crit = sum(_occurrence_count(f) for f in findings if f.get("severity") == "critical" and not f.get("suppressed"))
+            tot_warn = sum(_occurrence_count(f) for f in findings if f.get("severity") == "warning" and not f.get("suppressed"))
+            tot_info = sum(_occurrence_count(f) for f in findings if f.get("severity") == "info" and not f.get("suppressed"))
         if "totals" not in doc or not isinstance(doc["totals"], dict):
             doc["totals"] = {}
         doc["totals"]["critical"] = tot_crit
@@ -401,9 +415,9 @@ def to_sarif(
 
         lang_findings = findings_by_lang.get(lang, [])
         for f in lang_findings:
-            project_note = f.get("scope") == "project"
-            if project_note:
-                _validate_project_note(f)
+            project_scoped = f.get("scope") in ("project", "project_aggregate")
+            if project_scoped:
+                _validate_project_record(f)
             rule_id = str(f.get("rule_id") or f.get("rule") or "")
             sev = str(f.get("severity") or "warning").lower()
             level = "error" if sev == "critical" else ("warning" if sev == "warning" else "note")
@@ -413,11 +427,15 @@ def to_sarif(
                 "level": level,
                 "message": {"text": msg},
             }
-            if project_note:
+            if f.get("scope") == "project":
                 # SARIF 2.1.0 sections 3.27.9-10: informational results have
                 # level none. Section 3.27.12 permits no source location.
                 res["kind"] = "informational"
                 res["level"] = "none"
+            elif f.get("scope") == "project_aggregate":
+                # A positive aggregate retains its diagnostic level. SARIF
+                # requires kind fail for results whose level is not none.
+                res["kind"] = "fail"
             file_path = str(f.get("file") or f.get("path") or "")
             if file_path:
                 try:
@@ -449,8 +467,8 @@ def to_sarif(
                 res["locations"] = [loc]
 
             props: dict = {}
-            if project_note:
-                props["scope"] = "project"
+            if project_scoped:
+                props["scope"] = f["scope"]
                 props["count"] = f["count"]
             if f.get("category_id"):
                 props["category_id"] = str(f["category_id"])

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 from ubs_core.io import read_ndjson
+from ubs_core.suppression import SourceSuppressions
 
 MARKER = "ubs:ignore"
 
@@ -177,10 +178,13 @@ def scan_patterns(
     itself only ran when the ast-grep pack had NOT covered await-in-lock.
 
     rg parity: matching is LINE-anchored (one hit per matching line), the
-    `ubs:ignore` marker drops the line (count_lines parity), exclude_regex
+    exact rule-aware statement markers exclude findings, exclude_regex
     re-applies `grep -v` over the rg output form `path:line:content`, and
     gate_regex is a project-wide precondition over the whole file list.
     """
+    suppressions = SourceSuppressions("csharp")
+    for path, text in texts.items():
+        suppressions.index(path, text)
     for pattern in patterns:
         if bool(pattern.needs_no_ast) != (phase == 1):
             continue
@@ -197,7 +201,7 @@ def scan_patterns(
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue
             for line_no, line_text in enumerate(text.splitlines(), start=1):
-                if MARKER in line_text:
+                if suppressions.is_suppressed(path, line_no, pattern.rule_id):
                     continue
                 if not pattern.regex.search(line_text):
                     continue
@@ -419,11 +423,12 @@ def _bucket_meta(rule: str, patterns: Sequence) -> CheckMeta:
 def _sample_line(meta: CheckMeta, rec: dict, detail: str) -> str:
     path = rec.get("path", "")
     line = int(rec.get("line", 0) or 0)
+    rule = rec["rule"]
     if meta.style == "tsv":
-        return f"  {path}:{line}:{int(rec.get('col', 1) or 1)} - {detail}"
+        return f"  {path}:{line}:{int(rec.get('col', 1) or 1)} [rule:{rule}] - {detail}"
     if detail:
-        return f"  {path}:{line}:{detail}"
-    return f"  {path}:{line}"
+        return f"  {path}:{line} [rule:{rule}] {detail}"
+    return f"  {path}:{line} [rule:{rule}]"
 
 
 def render_text(args, ast_ran: bool, patterns: Sequence) -> None:
@@ -543,6 +548,7 @@ def main(argv: list | None = None) -> int:
         extra=f"new_analyzers={args.enable_new_analyzers}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    suppressions = SourceSuppressions("csharp")
 
     capturing_sink = None
     ast_ran = False
@@ -595,7 +601,9 @@ def main(argv: list | None = None) -> int:
             )
             ast_ran = True
         scan_patterns(patterns, texts, capturing_sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        cache.store_scanned_files(files_to_scan, {
+            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+        })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -629,7 +637,7 @@ def main(argv: list | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for r in recs:
+                for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
         for r in inventory_records:
             sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")

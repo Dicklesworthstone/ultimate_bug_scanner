@@ -9,8 +9,7 @@ sink the pattern/detector layers use. Mirrors the legacy cat-17 ingestion
 
 - dedup by (rule_id, display path, line, col) — the legacy parser's ``seen``
   set, applied across the whole scan (all batches);
-- marker check on the CURRENT line only (legacy ``is_ignored`` never looked
-  at the previous line, unlike the ruby pack);
+- exact public rule suppression at the source statement interval;
 - severity from the module's AST_RULE_SEVERITY table (passed as
   ``severity_overrides``) normalized through the legacy tier map;
 - every pack rule counted (no ``count_only`` gate — legacy cat 17 ingested
@@ -23,7 +22,7 @@ import subprocess
 from pathlib import Path
 from typing import Callable, Sequence
 
-from ubs_core.csharp_scan import MARKER
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
@@ -37,21 +36,6 @@ def _map_severity(raw: str) -> str:
     if raw in ("info", "note", "hint"):
         return "info"
     return "warning"
-
-
-def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
-    if path not in cache:
-        try:
-            cache[path] = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            cache[path] = []
-    return cache[path]
-
-
-def _has_marker(path: Path, line_no: int, cache: dict[Path, list[str]]) -> bool:
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return 0 <= idx < len(lines) and MARKER in lines[idx]
 
 
 def scan_config(
@@ -71,7 +55,7 @@ def scan_config(
     path_list = [Path(p) for p in paths]
     if not path_list or not config.is_file():
         return counters
-    cache: dict[Path, list[str]] = {}
+    suppressions = SourceSuppressions("csharp")
     seen: set[tuple[str, str, int, int]] = set()
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
@@ -111,8 +95,8 @@ def scan_config(
             category = rule_category.get(rule_id) if rule_category else None
             if skip and category is not None and category in skip:
                 continue  # --skip: the rule's category is disabled
-            if _has_marker(path, line_no, cache):
-                continue  # legacy current-line-only marker check
+            if suppressions.is_suppressed(path, line_no, rule_id):
+                continue
             raw_severity = str(match.get("severity", "")).lower().strip()
             default_severity = _map_severity(raw_severity)
             severity = (severity_overrides or {}).get(rule_id) or default_severity

@@ -1025,6 +1025,45 @@ class SarifShapeTest(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, "positive startLine"):
                     rule_quality_harness.validate_sarif_payload_shape(payload, "source result")
 
+    def test_project_aggregates_preserve_positive_counts_and_failure_levels(self) -> None:
+        for level in ("note", "warning", "error"):
+            for count in (1, 7):
+                with self.subTest(level=level, count=count):
+                    payload = self.project_note_payload()
+                    result = payload["runs"][0]["results"][0]
+                    result.update({
+                        "ruleId": "swift.files.filehandle",
+                        "message": {"text": "FileHandle open without matching close"},
+                        "kind": "fail", "level": level,
+                        "properties": {"scope": "project_aggregate", "count": count},
+                    })
+                    rule_quality_harness.validate_sarif_payload_shape(payload, "aggregate")
+                    self.assertEqual(result["level"], level)
+                    self.assertEqual(result["properties"]["count"], count)
+                    self.assertNotIn("locations", result)
+
+    def test_project_aggregates_reject_downgrades_bad_counts_and_invented_sites(self) -> None:
+        for field, values in (
+            ("kind", (None, "informational", "pass", "review")),
+            ("level", (None, "none", "invalid")),
+            ("locations", (None, [], self.valid_payload()["runs"][0]["results"][0]["locations"])),
+            ("count", (None, False, True, "1", 1.0, -1, 0)),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    payload = self.project_note_payload()
+                    result = payload["runs"][0]["results"][0]
+                    result.update({
+                        "kind": "fail", "level": "warning",
+                        "properties": {"scope": "project_aggregate", "count": 2},
+                    })
+                    if field == "count":
+                        result["properties"][field] = value
+                    else:
+                        result[field] = value
+                    with self.assertRaisesRegex(AssertionError, "malformed project aggregate"):
+                        rule_quality_harness.validate_sarif_payload_shape(payload, "aggregate")
+
 
 class RunManifestExpectationTest(unittest.TestCase):
     @staticmethod

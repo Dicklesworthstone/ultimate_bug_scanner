@@ -25,7 +25,9 @@ skip_dirs = {".git", "target", ".cargo", "node_modules"}
 compare_re = re.compile(r"(?<![=!<>])(?P<left>.+?)\s*(?P<op>==|!=)\s*(?!=)\s*(?P<right>.+)")
 assign_re = re.compile(
     r"^\s*(?:let\s+(?:mut\s+)?|const\s+|static\s+)?"
-    r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?=\s*(?P<rhs>.+)"
+    # A type annotation begins with one colon, not a qualified match-arm
+    # path; neither equality nor a match arrow is an assignment operator.
+    r"(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*(?::(?!:)[^=;]+)?=(?![=>])\s*(?P<rhs>.+)"
 )
 identifier_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # A `fn` ITEM declaration (`pub async fn verify`), not a function-pointer type
@@ -210,6 +212,12 @@ def operand_identifiers(operand: str):
 def clean_operand_text(operand: str) -> str:
     clean = operand.strip()
     clean = re.sub(r"^(?:if|while|match)\s*\(?\s*", "", clean)
+    # In `let secret_matches = actual == expected`, the destination is a
+    # boolean binding, not part of the equality's left operand. This also
+    # keeps a previously tainted discard binding (`let _ = ...`) out of it.
+    assignment = assign_re.match(clean)
+    if assignment:
+        clean = assignment.group("rhs").strip()
     clean = re.split(r"\s*(?:&&|\|\||[;{])", clean, maxsplit=1)[0].strip()
     while clean and clean[-1] in ";{}){":
         clean = clean[:-1].strip()

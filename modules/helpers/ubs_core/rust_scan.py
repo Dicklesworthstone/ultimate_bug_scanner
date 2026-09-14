@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ubs_core.suppression import has_suppression_marker
+from ubs_core.suppression import SourceSuppressions
 
 # Meta-runner category_slug_for rust (ubs ~4961) and the module's
 # CATEGORY_NAME table (ubs-rust.sh 520-543). Category 17 has a slug
@@ -259,6 +259,7 @@ class Scan:
         self.allowed: set[str] = set()
         self.texts: dict[Path, str] = {}
         self.lines_map: dict[Path, list[str]] = {}
+        self.suppressions = SourceSuppressions("rust")
 
         def _read_entry(p: Path) -> tuple[Path, str, list[str]]:
             try:
@@ -289,6 +290,8 @@ class Scan:
                     self.texts[p] = t
                     self.lines_map[p] = lines
 
+        for path, text in self.texts.items():
+            self.suppressions.index(path, text)
         self.test_only: set[str] = set()
         self.integration_test_roots = {
             str(path) for path in self.files if cargo_integration_test_root(path)
@@ -342,7 +345,7 @@ class Scan:
     # ── legacy count_lines stage (grep -v marker | filter_test_lines) ──────
     def stream_line_allowed(self, path_str: str, line_no: int, code: str,
                             rule_id: str | None = None) -> bool:
-        if has_suppression_marker(code, rule_id):
+        if self.suppressions.is_suppressed(path_str, line_no, rule_id):
             return False
         return not self._is_test_line(path_str, line_no)
 
@@ -361,8 +364,8 @@ class Scan:
                 stream = f"{path_str}:{line_no}:{line}"
                 if exclude is not None and exclude.search(stream):
                     continue
-                if has_suppression_marker(line, rule_id):
-                    continue  # count_lines drops marker lines
+                if self.suppressions.is_suppressed(path_str, line_no, rule_id):
+                    continue
                 if self._is_test_line(path_str, line_no):
                     continue
                 hits.append(Hit(path_str, line_no, 1, line))
@@ -383,7 +386,7 @@ class Scan:
             for line_no, line in enumerate(lines, start=1):
                 if not regex.search(line):
                     continue
-                if has_suppression_marker(line, rule_id) or self._is_test_line(path_str, line_no):
+                if self.suppressions.is_suppressed(path_str, line_no, rule_id) or self._is_test_line(path_str, line_no):
                     continue
                 code = line.split("//", 1)[0]
                 if not regex.search(code):
@@ -440,10 +443,11 @@ class Scan:
 
         Internal AST IDs can feed several public checks. Keep their hits until
         the owning public rule is known, retaining each original source site.
-        This preserves the scanner's existing same-line marker anchor.
+        Full source intervals preserve multiline markers without treating
+        an unrelated rule's annotation or a string literal as a bare marker.
         """
-        return [hit for hit in hits if not has_suppression_marker(
-            self._source_line(hit.path, hit.line), rule_id,
+        return [hit for hit in hits if not self.suppressions.is_suppressed(
+            hit.path, hit.line, rule_id,
         )]
 
     # ── detectors (heredoc ports) ──────────────────────────────────────────
@@ -476,7 +480,7 @@ class Scan:
             path_str, line_no, col, code = hit[0], hit[1], hit[2], hit[3]
             path_str = str((detector_base / Path(path_str)).resolve())
             # legacy: heredoc stdout -> count_lines (marker + test filter)
-            if has_suppression_marker(code) or self._is_test_line(path_str, int(line_no)):
+            if self.suppressions.is_suppressed(path_str, int(line_no), None) or self._is_test_line(path_str, int(line_no)):
                 continue
             hits.append(Hit(path_str, int(line_no), int(col), code))
         self._detector_cache[key] = hits
@@ -592,7 +596,7 @@ def _sub(scan: Scan, r: Renderer, hits: Sequence[Hit], rule_id: str, category: i
          good: str | None = None) -> int:
     hits = scan.unsuppressed_hits(hits, rule_id)
     if hits:
-        r.finding(severity, len(hits), title, desc, hits, sample_limit)
+        r.finding(severity, len(hits), title, desc, hits, sample_limit, rule_id=rule_id)
         scan.emit(rule_id, category, severity, len(hits), title, hits,
                   desc=desc, sample_limit=sample_limit or scan.detail_limit or 3)
         return len(hits)
@@ -640,7 +644,15 @@ class Renderer:
         self.say(f"{YELLOW}{BOLD}{BULLET} {text}{RESET}")
 
     def finding(self, severity: str, count: int, title: str, desc: str = "",
-                samples: Sequence[Hit] | None = None, sample_limit: int = 0) -> None:
+                samples: Sequence[Hit] | None = None, sample_limit: int = 0,
+                *, rule_id: str = "") -> None:
+        if samples and not rule_id:
+            raise ValueError("source samples require their public rule ID")
+        narrowing = rule_id == "rust.ownership.guarded-later-unwrap"
+        if narrowing and samples:
+            # Keep the structured description intact, but emit every preview
+            # on its own suppressible line in both cold and cached reports.
+            desc = "Examples:"
         if severity == "good":
             self.say(f"  {GREEN}{CHECK} OK{RESET} {DIM}{title}{RESET}")
             return
@@ -660,8 +672,10 @@ class Renderer:
             if desc:
                 self.say(f"    {DIM}{desc}{RESET}")
         for hit in (samples or [])[:sample_limit or self.scan.detail_limit]:
-            self.say(f"{GRAY}      {hit.path}:{hit.line}{RESET}")
+            self.say(f"{GRAY}      {hit.path}:{hit.line}:{hit.col} [rule:{rule_id}]{RESET}")
             self.say(f"{WHITE}      {hit.text}{RESET}")
+        if narrowing and samples and count > 3:
+            self.say(f"    (and {count - 3} more)")
 
     def text(self) -> str:
         return "\n".join(self.lines) + ("\n" if self.lines else "")
@@ -715,7 +729,7 @@ def replay_findings(scan: Scan, r: Renderer, cached_records: Sequence[dict]) -> 
                     hits.append(Hit(p, int(rec.get("line", 1) or 1), int(rec.get("col", 1) or 1), text or ""))
             sample_limit = recs[0].get("sample_limit", 0)
             if sample_limit > 0 and hits:
-                r.finding(sev, total_count, title, desc, hits, sample_limit=sample_limit)
+                r.finding(sev, total_count, title, desc, hits, sample_limit=sample_limit, rule_id=rule)
             else:
                 r.finding(sev, total_count, title, desc)
             samples = [f"{h.path}:{h.line}:{h.text}" for h in hits[:5]]
@@ -961,9 +975,10 @@ def cat_1(scan: Scan, r: Renderer, narrowing: list[Hit], narrowing_skip_note: st
     r.subheader("unwrap()/expect() usage")
     if u or e:
         r.finding("warning", len(u) + len(e), "Potential panics via unwrap/expect",
-                  "Prefer `?` or match to propagate/handle errors", u + e, 5)
+                  "Prefer `?` or match to propagate/handle errors", u + e, 5,
+                  rule_id="rust.ownership.unwrap-expect")
         scan.emit("rust.ownership.unwrap-expect", 1, "warning", len(u) + len(e),
-                  "Potential panics via unwrap/expect", u + e)
+                  "Potential panics via unwrap/expect", u + e, sample_limit=5)
     else:
         r.finding("good", 0, "No unwrap/expect detected")
     r.subheader("panic!/unreachable!/todo!/unimplemented!")
@@ -1001,10 +1016,11 @@ def cat_1(scan: Scan, r: Renderer, narrowing: list[Hit], narrowing_skip_note: st
         desc = "Examples: " + " ".join(previews)
         if len(narrowing) > len(previews):
             desc += f" (and {len(narrowing) - len(previews)} more)"
-        r.finding("warning", len(narrowing), "Guarded Option/Result later unwrap", desc)
+        r.finding("warning", len(narrowing), "Guarded Option/Result later unwrap", desc,
+                  narrowing, 3, rule_id="rust.ownership.guarded-later-unwrap")
         scan.emit("rust.ownership.guarded-later-unwrap", 1, "warning", len(narrowing),
                   "Guarded Option/Result later unwrap", narrowing, desc=desc,
-                  subheader="Guard clauses that still unwrap later")
+                  subheader="Guard clauses that still unwrap later", sample_limit=3)
     else:
         r.finding("good", 0, "No guard/unwrap mismatches detected")
 
@@ -1061,8 +1077,10 @@ def cat_3(scan: Scan, r: Renderer) -> None:
     mu = scan.ast_hits(["lock_unwrap", "lock_expect"]) + scan.rg_lines(r"\.lock\(\)\.(unwrap|expect)\(")
     mu = scan.unsuppressed_hits(mu, "rust.async.lock-unwrap")
     if mu:
-        r.finding("warning", len(mu), "Poisoned lock handling via unwrap/expect", "", mu[:5], 5)
-        scan.emit("rust.async.lock-unwrap", 3, "warning", len(mu), "Poisoned lock handling via unwrap/expect", mu)
+        r.finding("warning", len(mu), "Poisoned lock handling via unwrap/expect", "", mu[:5], 5,
+                  rule_id="rust.async.lock-unwrap")
+        scan.emit("rust.async.lock-unwrap", 3, "warning", len(mu), "Poisoned lock handling via unwrap/expect", mu,
+                  sample_limit=5)
     r.subheader("await inside loops (sequentialism)")
     al = scan.ast_hits(["await_in_for"]) + scan.rg_lines(r"for[^(]*\{[^}]*\.[0-9A-Za-z_]+\.await")
     al = scan.unsuppressed_hits(al, "rust.async.await-in-loop")
@@ -1116,9 +1134,10 @@ def cat_4(scan: Scan, r: Renderer) -> None:
     fp = scan.rg_lines(r"([0-9A-Za-z_]\s*(==|!=)\s*[0-9A-Za-z_]*\.[0-9A-Za-z_]+)|((==|!=)[\s]*[0-9]+\.[0-9]+)")
     fp = scan.unsuppressed_hits(fp, "rust.numeric.float-equality")
     if fp:
-        r.finding("info", len(fp), "Float equality/inequality check", "Consider epsilon comparisons", fp[:3], 3)
+        r.finding("info", len(fp), "Float equality/inequality check", "Consider epsilon comparisons", fp[:3], 3,
+                  rule_id="rust.numeric.float-equality")
         scan.emit("rust.numeric.float-equality", 4, "info", len(fp),
-                  "Float equality/inequality check", fp)
+                  "Float equality/inequality check", fp, sample_limit=3)
     else:
         r.finding("good", 0, "No direct float equality checks detected")
     r.subheader("Division/modulo by variable (verify non-zero)")
@@ -1139,14 +1158,16 @@ def cat_5(scan: Scan, r: Renderer) -> None:
     r.subheader("clone() occurrences & clone() in loops")
     clone = scan.unsuppressed_hits(scan.ast_hits(["clone"]), "rust.collections.clone-any")
     if clone:
-        r.finding("info", len(clone), "clone() usages - audit for necessity", "", clone[:3], 3)
+        r.finding("info", len(clone), "clone() usages - audit for necessity", "", clone[:3], 3,
+                  rule_id="rust.collections.clone-any")
         scan.emit("rust.collections.clone-any", 5, "info", len(clone),
-                  "clone() usages - audit for necessity", clone)
+                  "clone() usages - audit for necessity", clone, sample_limit=3)
     clone_loop = scan.unsuppressed_hits(scan.detector_hits("loop_context", "clone"), "rust.collections.clone-in-loop")
     if clone_loop:
-        r.finding("warning", len(clone_loop), "clone() inside loops - potential perf hit", "", clone_loop[:3], 3)
+        r.finding("warning", len(clone_loop), "clone() inside loops - potential perf hit", "", clone_loop[:3], 3,
+                  rule_id="rust.collections.clone-in-loop")
         scan.emit("rust.collections.clone-in-loop", 5, "warning", len(clone_loop),
-                  "clone() inside loops - potential perf hit", clone_loop)
+                  "clone() inside loops - potential perf hit", clone_loop, sample_limit=3)
     r.subheader("collect::<Vec<_>>() then for")
     _sub(scan, r, scan.ast_hits(["collect_vec"]), "rust.collections.collect-vec", 5,
          "info", "collect::<Vec<_>>() usage - consider streaming", "", 3)
@@ -1176,9 +1197,10 @@ def cat_7(scan: Scan, r: Renderer) -> None:
     r.subheader("std::process::Command usage")
     cmd = scan.rg_lines(r"std::process::Command::new\(", rule_id="rust.filesystem.command-new")
     if cmd:
-        r.finding("info", len(cmd), "Command::new detected - ensure args are sanitized and errors handled", "", cmd[:3], 3)
+        r.finding("info", len(cmd), "Command::new detected - ensure args are sanitized and errors handled", "", cmd[:3], 3,
+                  rule_id="rust.filesystem.command-new")
         scan.emit("rust.filesystem.command-new", 7, "info", len(cmd),
-                  "Command::new detected - ensure args are sanitized and errors handled", cmd)
+                  "Command::new detected - ensure args are sanitized and errors handled", cmd, sample_limit=3)
 
 
 def cat_8(scan: Scan, r: Renderer) -> None:
@@ -1188,8 +1210,10 @@ def cat_8(scan: Scan, r: Renderer) -> None:
         r"SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)\(")
     weak = scan.unsuppressed_hits(weak, "rust.security.weak-hash")
     if weak:
-        r.finding("warning", len(weak), "Weak hash algorithm usage (MD5/SHA1)", "", weak[:5], 5)
-        scan.emit("rust.security.weak-hash", 8, "warning", len(weak), "Weak hash algorithm usage (MD5/SHA1)", weak)
+        r.finding("warning", len(weak), "Weak hash algorithm usage (MD5/SHA1)", "", weak[:5], 5,
+                  rule_id="rust.security.weak-hash")
+        scan.emit("rust.security.weak-hash", 8, "warning", len(weak), "Weak hash algorithm usage (MD5/SHA1)", weak,
+                  sample_limit=5)
     else:
         r.finding("good", 0, "No MD5/SHA1 found")
     r.subheader("TLS verification disabled")
@@ -1231,9 +1255,10 @@ def cat_8(scan: Scan, r: Renderer) -> None:
     shell = scan.unsuppressed_hits(shell, "rust.security.shell-command")
     if shell:
         r.finding("critical", len(shell), "Shell command execution via -c/-lc",
-                  "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input", shell[:5], 5)
+                  "Avoid shell interpreters; pass argv directly or strictly validate/allowlist input", shell[:5], 5,
+                  rule_id="rust.security.shell-command")
         scan.emit("rust.security.shell-command", 8, "critical", len(shell),
-                  "Shell command execution via -c/-lc", shell)
+                  "Shell command execution via -c/-lc", shell, sample_limit=5)
     else:
         r.finding("good", 0, "No shell -c/-lc Command usage detected")
     r.subheader("Command::new executable from untrusted-looking value")
@@ -1303,7 +1328,8 @@ def cat_8(scan: Scan, r: Renderer) -> None:
     secrets = scan.unsuppressed_hits(secrets, "rust.security.hardcoded-secrets")
     if secrets:
         r.finding("critical", len(secrets), "Possible hardcoded secrets",
-                  "Use secret managers or required environment variables; do not keep literal fallbacks for secret env vars", secrets[:3], 3)
+                  "Use secret managers or required environment variables; do not keep literal fallbacks for secret env vars", secrets[:3], 3,
+                  rule_id="rust.security.hardcoded-secrets")
         scan.emit("rust.security.hardcoded-secrets", 8, "critical", len(secrets),
                   "Possible hardcoded secrets", secrets,
                   desc="Use secret managers or required environment variables; do not keep literal fallbacks for secret env vars",
@@ -1341,9 +1367,10 @@ def cat_10(scan: Scan, r: Renderer) -> None:
     r.subheader("Wildcard imports (use crate::* or ::*)")
     globs = scan.rg_lines(r"use\s+[a-zA-Z0-9_:]+::\*\s*;", rule_id="rust.modules.wildcard-imports")
     if globs:
-        r.finding("info", len(globs), "Wildcard imports found; prefer explicit names", "", globs[:3], 3)
+        r.finding("info", len(globs), "Wildcard imports found; prefer explicit names", "", globs[:3], 3,
+                  rule_id="rust.modules.wildcard-imports")
         scan.emit("rust.modules.wildcard-imports", 10, "info", len(globs),
-                  "Wildcard imports found; prefer explicit names", globs)
+                  "Wildcard imports found; prefer explicit names", globs, sample_limit=3)
     else:
         r.finding("good", 0, "No wildcard imports detected")
     r.subheader("pub use re-exports (inventory)")
@@ -1478,9 +1505,10 @@ def cat_20(scan: Scan, r: Renderer) -> None:
     locks = scan.unsuppressed_hits(locks, "rust.async-locking.std-lock-async")
     if locks:
         r.finding("warning", len(locks), "Blocking std::sync locks in async functions",
-                  "Prefer tokio::sync locks or spawn_blocking; avoid blocking executor threads", locks[:3], 3)
+                  "Prefer tokio::sync locks or spawn_blocking; avoid blocking executor threads", locks[:3], 3,
+                  rule_id="rust.async-locking.std-lock-async")
         scan.emit("rust.async-locking.std-lock-async", 20, "warning", len(locks),
-                  "Blocking std::sync locks in async functions", locks)
+                  "Blocking std::sync locks in async functions", locks, sample_limit=3)
     else:
         r.finding("good", 0, "No obvious std::sync lock usage inside async fns")
     r.subheader("Potential std::sync guard held across await (heuristic)")
@@ -1514,9 +1542,10 @@ def cat_21(scan: Scan, r: Renderer) -> None:
     asserts = scan.unsuppressed_hits(asserts, "rust.panic.assert-macros")
     if asserts:
         r.finding("warning", len(asserts), "assert! macros present (panic surface)",
-                  "If these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input", asserts[:3], 3)
+                  "If these are runtime invariants, consider explicit error handling; ensure not reachable by untrusted input", asserts[:3], 3,
+                  rule_id="rust.panic.assert-macros")
         scan.emit("rust.panic.assert-macros", 21, "warning", len(asserts),
-                  "assert! macros present (panic surface)", asserts)
+                  "assert! macros present (panic surface)", asserts, sample_limit=3)
     else:
         r.finding("good", 0, "No assert! macros detected")
     r.subheader("unreachable_unchecked / unwrap_unchecked")
@@ -1542,9 +1571,10 @@ def cat_22(scan: Scan, r: Renderer) -> None:
     casts = scan.unsuppressed_hits(casts, "rust.casts.as-casts")
     if casts:
         r.finding("info", len(casts), "`as` casts present (possible truncation/sign bugs)",
-                  "Prefer TryFrom/TryInto for correctness or document invariants", casts[:3], 3)
+                  "Prefer TryFrom/TryInto for correctness or document invariants", casts[:3], 3,
+                  rule_id="rust.casts.as-casts")
         scan.emit("rust.casts.as-casts", 22, "info", len(casts),
-                  "`as` casts present (possible truncation/sign bugs)", casts)
+                  "`as` casts present (possible truncation/sign bugs)", casts, sample_limit=3)
     else:
         r.finding("good", 0, "No obvious `as` casts detected")
     r.subheader("len()/count() narrowed via `as`")
@@ -1591,13 +1621,16 @@ def cat_24(scan: Scan, r: Renderer) -> None:
     regex_new = scan.unsuppressed_hits(regex_new, "rust.perf.regex-new")
     if regex_in_loop:
         r.finding("warning", len(regex_in_loop), "Regex::new compiled inside loop",
-                  "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation", regex_in_loop[:3], 3)
+                  "Precompile regex once (lazy_static/once_cell) to avoid repeated compilation", regex_in_loop[:3], 3,
+                  rule_id="rust.perf.regex-in-loop")
         scan.emit("rust.perf.regex-in-loop", 24, "warning", len(regex_in_loop),
-                  "Regex::new compiled inside loop", regex_in_loop)
+                  "Regex::new compiled inside loop", regex_in_loop, sample_limit=3)
     elif regex_new:
         r.finding("info", len(regex_new), "Regex::new present",
-                  "Ensure regex is not compiled per request or per iteration", regex_new[:3], 3)
-        scan.emit("rust.perf.regex-new", 24, "info", len(regex_new), "Regex::new present", regex_new)
+                  "Ensure regex is not compiled per request or per iteration", regex_new[:3], 3,
+                  rule_id="rust.perf.regex-new")
+        scan.emit("rust.perf.regex-new", 24, "info", len(regex_new), "Regex::new present", regex_new,
+                  sample_limit=3)
     else:
         r.finding("good", 0, "No regex::Regex::new detected")
     r.subheader("chars().nth(n)/nth_back(n) (O(n))")

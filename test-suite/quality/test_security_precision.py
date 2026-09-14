@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GH #102 precision regressions for three security detectors.
+"""Precision regressions for security detectors and native rule packs.
 
 Each false positive from the report is pinned by a clean fixture and paired
 with the true positives the rule exists for:
@@ -18,6 +18,8 @@ with the true positives the rule exists for:
   hashes of secrets, secret-fed hash objects and unresolved receivers stay
   reported. The clean fixture's runtime contract (accept intact, reject
   modified) is executed here so it cannot be weakened to please the scanner.
+* Java hardcoded secrets require literal assignments; blocking Future calls
+  require scoped receiver evidence and an applicable exception handler.
 """
 from __future__ import annotations
 
@@ -54,6 +56,606 @@ from ubs_core import rust_rules  # noqa: E402
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
+
+
+class JavaRulePrecisionTests(unittest.TestCase):
+    """Exercise generated Java rules and the public module on real sources."""
+
+    FUTURE_RULE = "java.async.future-get-no-try"
+    SECRET_RULE = "java.secrets.string-decl"  # ubs:ignore[py.security.hardcoded-secrets] — public diagnostic rule ID, not a secret
+    LITERAL_RULE = "java.secrets.hardcoded"
+    POSITIVE = """import java.util.concurrent.*;
+import java.util.*;
+class Positive {
+    Future<String> fieldFuture;
+    void secrets() {
+        String apiToken = "literal-credential-value"; // secret:token
+        String PASSWORD = "literal-password-value"; // secret:password
+    }
+    void local() throws Exception {
+        Future<String> pending = CompletableFuture.completedFuture("ready");
+        pending.get(); // future:local
+        pending.get(1, TimeUnit.SECONDS); // future:timed
+    }
+    void parameter(Future<String> pending) throws Exception {
+        pending.get(); // future:parameter
+    }
+    void qualified(java.util.concurrent.CompletableFuture<String> pending) {
+        pending.join(); // future:qualified
+    }
+    void fields() throws Exception {
+        fieldFuture.get(); // future:field
+        this.fieldFuture.get(); // future:explicit_field
+    }
+    void factories() throws Exception {
+        CompletableFuture.supplyAsync(() -> "ready").get(); // future:factory
+        CompletableFuture.completedFuture("ready").copy().join(); // future:factory_chain
+        new CompletableFuture<String>().get(); // future:constructor
+        var inferred = CompletableFuture.completedFuture("ready");
+        inferred.get(); // future:inferred
+        CompletableFuture<String> typed = CompletableFuture.completedFuture("ready");
+        typed.copy().join(); // future:typed_chain
+    }
+    void capturedParameter(Future<String> pending) {
+        Callable<String> work = () -> pending.get(); // future:captured_parameter
+    }
+    void capturedLocal() {
+        Future<String> pending = CompletableFuture.completedFuture("ready");
+        Callable<String> work = () -> pending.get(); // future:captured_local
+    }
+    void delayed(CompletableFuture<String> pending) {
+        try {
+            Runnable work = () -> pending.join(); // future:delayed
+        } catch (Exception error) {}
+    }
+    void wrongGetCatch(Future<String> pending) throws ExecutionException {
+        try {
+            pending.get(); // future:wrong_get_catch
+        } catch (InterruptedException error) {}
+    }
+    void wrongJoinCatch(CompletableFuture<String> pending) {
+        try {
+            pending.join(); // future:wrong_join_catch
+        } catch (IllegalArgumentException error) {}
+    }
+    void catchBody(Future<String> pending) throws Exception {
+        try { throw new IllegalArgumentException(); }
+        catch (Exception error) {
+            pending.get(); // future:catch_body
+        }
+    }
+    void loops(List<Future<String>> tasks) throws Exception {
+        for (Future<String> pending : tasks) {
+            pending.get(); // future:enhanced_loop
+        }
+        for (Future<String> pending = tasks.get(0); pending != null; pending = null) {
+            pending.get(); // future:basic_loop
+        }
+    }
+}
+"""
+    NEGATIVE = """import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+import java.io.*;
+class Negative {
+    Future<String> fieldFuture;
+    void ordinary(Optional<String> maybe, String configured) {
+        String greeting = "hello";
+        String url = "https://example.invalid";
+        String apiToken = System.getenv("API_TOKEN");
+        String PASSWORD = configured;
+        if (maybe.isPresent()) {
+            String present = maybe.get();
+        }
+    }
+    void unrelated(Supplier<String> pending, Map<String, String> lookup) {
+        pending.get();
+        lookup.get("key");
+    }
+    void otherMethod(Future<String> pending) {}
+    void localShadow() {
+        Supplier<String> fieldFuture = () -> "ready";
+        fieldFuture.get();
+    }
+    void parameterShadow(Supplier<String> fieldFuture) {
+        fieldFuture.get();
+        Runnable work = () -> { fieldFuture.get(); };
+    }
+    void mapCapture(Map<String, String> fieldFuture) {
+        Runnable work = () -> { fieldFuture.get("key"); };
+    }
+    void lambdaShadow() {
+        Function<Supplier<String>, String> first = fieldFuture -> fieldFuture.get();
+        Function<Supplier<String>, String> second = (fieldFuture) -> fieldFuture.get();
+        Function<Supplier<String>, String> third = (Supplier<String> fieldFuture) -> fieldFuture.get();
+    }
+    void loopShadow(List<Supplier<String>> sources) {
+        for (Supplier<String> fieldFuture : sources) { fieldFuture.get(); }
+        for (Supplier<String> fieldFuture = sources.get(0); fieldFuture != null; fieldFuture = null) {
+            fieldFuture.get();
+        }
+    }
+    void expiredLocal() {
+        { Future<String> pending = CompletableFuture.completedFuture("ready"); }
+        Supplier<String> pending = () -> "ready";
+        pending.get();
+    }
+    void nestedClass() {
+        class Inner {
+            Supplier<String> fieldFuture;
+            void run() { fieldFuture.get(); }
+        }
+    }
+    void handled(Future<String> pending, CompletableFuture<String> complete) throws Exception {
+        try { pending.get(); } catch (ExecutionException error) {}
+        try { pending.get(); } catch (InterruptedException | ExecutionException error) {}
+        try { complete.join(); } catch (CompletionException error) {}
+        try { complete.join(); } catch (RuntimeException error) {}
+        try { complete.join(); } catch (java.lang.Exception error) {}
+        complete.handle((value, error) -> "recovered").join();
+        complete.exceptionally(error -> "recovered").get();
+    }
+    void handledResource(Future<InputStream> pending) {
+        try (InputStream stream = pending.get()) {} catch (Exception error) {}
+    }
+}
+"""
+    FUTURE_ANCHORS = {
+        "local": "pending.get()", "timed": "pending.get(1, TimeUnit.SECONDS)",
+        "parameter": "pending.get()", "qualified": "pending.join()",
+        "field": "fieldFuture.get()", "explicit_field": "this.fieldFuture.get()",
+        "factory": 'CompletableFuture.supplyAsync(() -> "ready").get()',
+        "factory_chain": 'CompletableFuture.completedFuture("ready").copy().join()',
+        "constructor": "new CompletableFuture<String>().get()", "inferred": "inferred.get()",
+        "typed_chain": "typed.copy().join()", "captured_parameter": "pending.get()",
+        "captured_local": "pending.get()", "delayed": "pending.join()",
+        "wrong_get_catch": "pending.get()", "wrong_join_catch": "pending.join()",
+        "catch_body": "pending.get()", "enhanced_loop": "pending.get()",
+        "basic_loop": "pending.get()",
+    }
+
+    def setUp(self) -> None:
+        from ubs_core import java_rules
+
+        self.assertIsNotNone(shutil.which("ast-grep"), "Java precision regression requires real ast-grep")
+        self.temp = tempfile.TemporaryDirectory(prefix="ubs_java_precision_")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.positive = self.project / "Positive.java"
+        self.negative = self.project / "Negative.java"
+        self.positive.write_text(self.POSITIVE, encoding="utf-8")
+        self.negative.write_text(self.NEGATIVE, encoding="utf-8")
+        self.rules = self.root / "rules"
+        self.manifest = java_rules.generate(self.rules)
+
+    def _process(self, command: list[str], *, no_ast: bool = False) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                   UBS_CACHE_DIR=str(self.root / ("fallback-cache" if no_ast else "cache")),
+                   UBS_CACHE_FILE=str(self.root / "cache-stats.json"), UBS_PROFILE="1",
+                   UBS_TEST_FORCE_NO_AST_GREP=str(int(no_ast)), NO_COLOR="1")
+        proc = subprocess.run(command, cwd=self.root, env=env, text=True,
+                              capture_output=True, timeout=180)
+        self.assertIn(proc.returncode, (0, 1), f"{command!r}; stdout={proc.stdout!r}; stderr={proc.stderr!r}")
+        return proc
+
+    def _json(self, proc: subprocess.CompletedProcess[str]) -> dict | list:
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f"invalid Java scanner JSON: {exc}; stdout={proc.stdout!r}; stderr={proc.stderr!r}")
+
+    def _cache_counts(self, proc: subprocess.CompletedProcess[str], hits: int, misses: int) -> None:
+        context = f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+        try:
+            stats = json.loads((self.root / "cache-stats.json").read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            self.fail(f"invalid Java scanner cache statistics: {exc}; {context}")
+        self.assertEqual((stats["hits"], stats["misses"]), (hits, misses), context)
+
+    def _expected(self, rule: str) -> list[tuple[str, int, int]]:
+        if rule == self.FUTURE_RULE:
+            anchors = {f"future:{tag}": code for tag, code in self.FUTURE_ANCHORS.items()}
+        else:
+            anchors = {"secret:token": "String apiToken", "secret:password": "String PASSWORD"}
+        sites = []
+        for tag, code in anchors.items():
+            matches = [(number, line) for number, line in enumerate(self.POSITIVE.splitlines(), 1)
+                       if line.endswith(f"// {tag}")]
+            self.assertEqual(len(matches), 1, tag)
+            number, line = matches[0]
+            sites.append((str(self.positive), number, 1 if rule == self.LITERAL_RULE else line.index(code) + 1))
+        return sorted(sites)
+
+    def test_generated_rules_require_literals_and_scoped_future_evidence(self) -> None:
+        for rule in (self.SECRET_RULE, "java.hardcoded-secrets", self.FUTURE_RULE):
+            with self.subTest(rule=rule):
+                proc = self._process(["ast-grep", "scan", "--rule",
+                                      str(self.rules / self.manifest[rule]["file"]),
+                                      "--json", str(self.positive), str(self.negative)])
+                records = self._json(proc)
+                actual = []
+                for record in records:
+                    self.assertEqual(record["ruleId"], rule)
+                    self.assertEqual(record["severity"], "warning")
+                    start = record["range"]["start"]
+                    actual.append((str((self.root / record["file"]).resolve()),
+                                   start["line"] + 1, start["column"] + 1))
+                self.assertEqual(sorted(actual), self._expected(rule), proc.stdout + proc.stderr)
+
+    def test_public_module_json_sarif_cache_and_literal_fallback_precision(self) -> None:
+        rules = (self.SECRET_RULE, self.LITERAL_RULE, self.FUTURE_RULE)
+
+        def scan(paths: list[Path], output_format: str, hits: int, *, positive: bool,
+                 no_ast: bool = False) -> list[tuple]:
+            inputs = self.root / "inputs"
+            inputs.write_bytes(b"\0".join(os.fsencode(path) for path in paths) + b"\0")
+            proc = self._process([str(REPO_ROOT / "modules/ubs-java.sh"), "--no-build", "--ci",
+                                  "--no-color", "--fail-on-warning", "--only=3,21",
+                                  f"--format={output_format}", "--files-from", str(inputs),
+                                  str(self.project)], no_ast=no_ast)
+            context = f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+            self.assertEqual(proc.returncode, int(positive), context)
+            payload = self._json(proc)
+            self._cache_counts(proc, hits, len(paths) - hits)
+            expected = sorted((rule, *site, "warning") for rule in rules
+                              if positive and (not no_ast or rule == self.LITERAL_RULE)
+                              for site in self._expected(rule))
+            expected_ast = [site for site in expected if site[0] != self.LITERAL_RULE]
+            actual = []
+            if output_format == "json":
+                self.assertEqual(payload["status"], "ok", context)
+                self.assertEqual(payload["critical"], 0, context)
+                self.assertEqual(payload["warning"], len(expected), context)
+                self.assertEqual(payload["info"], 0, context)
+                for record in payload["findings"]:
+                    actual.append((record["rule"], str((self.root / record["path"]).resolve()),
+                                   record["line"], record["col"], record["severity"]))
+                self.assertEqual(sorted((record["rule"], str((self.root / record["path"]).resolve()),
+                                         record["line"], record["col"], record["severity"])
+                                        for record in payload["extras"]["ast_findings"]), expected_ast, context)
+            else:
+                self.assertEqual(payload["version"], "2.1.0", context)
+                by_driver = {}
+                for run in payload["runs"]:
+                    driver = run["tool"]["driver"]["name"]
+                    self.assertNotIn(driver, by_driver, context)
+                    run_sites = []
+                    for result in run.get("results", []):
+                        self.assertEqual(result["level"], "warning", context)
+                        self.assertEqual(len(result["locations"]), 1, context)
+                        location = result["locations"][0]["physicalLocation"]
+                        region = location["region"]
+                        run_sites.append((result["ruleId"], str((self.root / location["artifactLocation"]["uri"]).resolve()),
+                                          region["startLine"], region["startColumn"], "warning"))
+                    by_driver[driver] = sorted(run_sites)
+                # SARIF keeps the original AST evidence in a separate run,
+                # including counted AST sites already present in heuristics.
+                self.assertEqual(by_driver, {"ubs-java-heuristics": expected,
+                                             "ubs-java-ast": expected_ast}, context)
+                actual = by_driver["ubs-java-heuristics"]
+            self.assertEqual(sorted(actual), expected, context)
+            return sorted(actual)
+
+        paths = [self.positive, self.negative]
+        cold = scan(paths, "json", 0, positive=True)
+        self.assertEqual(scan(paths, "sarif", 2, positive=True), cold)
+        scan([self.negative], "json", 1, positive=False)
+        self.positive.write_text(self.NEGATIVE.replace("class Negative", "class Positive"), encoding="utf-8")
+        scan(paths, "json", 1, positive=False)
+        scan(paths, "sarif", 2, positive=False)
+        self.positive.write_text(self.POSITIVE, encoding="utf-8")
+        scan(paths, "json", 0, positive=True, no_ast=True)
+        scan([self.negative], "json", 1, positive=False, no_ast=True)
+
+    def test_optional_category_filter_preserves_enabled_json_sarif_and_text(self) -> None:
+        optional_rule = "java.optional-isPresent-then-get"
+        detector_rule = "java.null-optional.optional-get"
+        inputs = self.root / "inputs"
+        inputs.write_bytes(os.fsencode(self.negative) + b"\0")
+        for categories, enabled in (("1", True), ("3,21", False)):
+            for index, output_format in enumerate(("json", "sarif", "text")):
+                with self.subTest(categories=categories, output_format=output_format):
+                    proc = self._process([
+                        str(REPO_ROOT / "modules/ubs-java.sh"), "--no-build", "--ci", "--no-color",
+                        "--fail-on-warning", f"--only={categories}", f"--format={output_format}",
+                        "--files-from", str(inputs), str(self.project),
+                    ])
+                    context = f"stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                    self.assertEqual(proc.returncode, int(enabled), context)
+                    self._cache_counts(proc, int(index > 0), int(index == 0))
+                    expected_info = [(optional_rule, str(self.negative), 12, 9, "info")] if enabled else []
+                    # The separate legacy Optional.get detector remains a
+                    # warning even for this guarded call; retain its exact
+                    # source alongside the AST style recommendation.
+                    expected = sorted(expected_info + (
+                        [(detector_rule, str(self.negative), 13, 1, "warning")] if enabled else []))
+                    if output_format == "text":
+                        self.assertIn("Critical issues: 0", proc.stdout, context)
+                        self.assertIn(f"Warning issues: {int(enabled)}", proc.stdout, context)
+                        self.assertIn(f"Info items: {int(enabled)}", proc.stdout, context)
+                        if enabled:
+                            self.assertEqual(proc.stdout.count("1. NULL & OPTIONAL PITFALLS"), 1, context)
+                            self.assertIn(f"{self.negative}:12", proc.stdout, context)
+                            self.assertIn(f"{self.negative}:13", proc.stdout, context)
+                            self.assertIn(optional_rule, proc.stdout, context)
+                            self.assertIn(detector_rule, proc.stdout, context)
+                            self.assertLess(proc.stdout.index("1. NULL & OPTIONAL PITFALLS"),
+                                            proc.stdout.index(optional_rule), context)
+                        else:
+                            self.assertNotIn("1. NULL & OPTIONAL PITFALLS", proc.stdout, context)
+                            self.assertNotIn(optional_rule, proc.stdout, context)
+                            self.assertNotIn(detector_rule, proc.stdout, context)
+                        self.assertNotIn("15. AST-GREP RULE PACK FINDINGS", proc.stdout.upper(), context)
+                        continue
+                    payload = self._json(proc)
+                    if output_format == "json":
+                        self.assertEqual(payload["status"], "ok", context)
+                        self.assertEqual((payload["critical"], payload["warning"], payload["info"]),
+                                         (0, int(enabled), int(enabled)), context)
+                        self.assertEqual(sorted((record["rule"], record["path"], record["line"],
+                                                 record["col"], record["severity"])
+                                                for record in payload["findings"]), expected, context)
+                        self.assertEqual([(record["rule"], record["path"], record["line"],
+                                           record["col"], record["severity"])
+                                          for record in payload["extras"]["ast_findings"]], expected_info, context)
+                        for record in payload["extras"]["ast_findings"]:
+                            self.assertEqual(record["category_id"], 1, context)
+                    else:
+                        self.assertEqual(payload["version"], "2.1.0", context)
+                        by_driver = {}
+                        for run in payload["runs"]:
+                            driver = run["tool"]["driver"]["name"]
+                            self.assertNotIn(driver, by_driver, context)
+                            sites = []
+                            for result in run.get("results", []):
+                                self.assertEqual(len(result["locations"]), 1, context)
+                                location = result["locations"][0]["physicalLocation"]
+                                region = location["region"]
+                                self.assertIn(result["level"], ("note", "warning"), context)
+                                sites.append((result["ruleId"], location["artifactLocation"]["uri"],
+                                              region["startLine"], region["startColumn"],
+                                              "info" if result["level"] == "note" else "warning"))
+                            by_driver[driver] = sorted(sites)
+                        self.assertEqual(by_driver, {"ubs-java-heuristics": expected,
+                                                     "ubs-java-ast": expected_info}, context)
+
+
+class PublicScopedSuppressionTests(unittest.TestCase):
+    """Real module reports must agree on scoped sites, counts, and exit status."""
+
+    CASES = {
+        "cpp": ("cpp", "3", [], "#include <mutex>\nvoid check(std::mutex &m) {\n", "}\n",
+                "m.lock();", 'const char *note = "{marker}"; ',
+                (("cpp.concurrency.manual-lock", "warning"),), "cpp.raw-new"),
+        "rust": ("rs", "1,23", [], "fn check(raw: &str) {\n", "}\n",
+                 "let parsed: i32 = raw.parse().unwrap();", 'let note = "{marker}"; ',
+                 (("rust.ownership.unwrap-expect", "warning"),
+                  ("rust.parsing.parse-unwrap", "warning")), "rust.panic.assert-macros"),
+        "java": ("java", "19", ["--no-build"],
+                 "import java.sql.*;\nclass Case {\n void check(Connection conn) throws SQLException {\n",
+                 " }\n}\n", "Statement handle{index} = conn.createStatement();",
+                 'String note = "{marker}"; ',
+                 (("java.resource.statement-no-close", "warning"),), "java.optional-isPresent-then-get"),
+        "swift": ("swift", "1,11", [], "func check() throws {\n", "}\n",
+                  "let value{index} = try! operation()", 'let note = "{marker}"; ',
+                  (("swift.force-try", "warning"), ("swift.optionals.try-bang", "warning"),
+                   ("swift.optionals.force-some", "info")), "swift.force-cast"),
+        "csharp": ("cs", "3,17", ["--no-dotnet"],
+                   "using System.Threading;\nclass Case {\n void Check() {\n", " }\n}\n",
+                   "Thread.Sleep(5);", 'string note = "{marker}"; ',
+                   (("cs.pattern.thread-sleep", "warning"), ("cs-thread-sleep", "warning")),
+                   "cs-md5-create"),
+    }
+
+    def _exercise(self, language: str) -> None:
+        self.assertIsNotNone(shutil.which("ast-grep"), "public suppression regression requires real ast-grep")
+        suffix, categories, flags, opening, closing, statement, literal, rules, wrong = self.CASES[language]
+        with tempfile.TemporaryDirectory(prefix=f"ubs_{language}_public_scope_") as td:
+            root = Path(td)
+            project = root / "project"
+            project.mkdir()
+            marker = "ubs:ignore"
+            all_scope = marker + "[" + ",".join(rule for rule, _ in rules) + "]"
+            variants = ("wrong", "unknown", "literal", "baseline", "above", "trailing", "bare", "selective")
+            expected: list[tuple[str, str, int, str]] = []
+            paths = []
+            sources = {}
+            for index, variant in enumerate(variants):
+                path = project / f"{index:02d}_{variant}.{suffix}"
+                paths.append(path)
+                body = []
+                if variant == "above":
+                    body.append("    // " + all_scope)
+                code = statement.format(index=index)
+                if variant == "literal":
+                    # Both a bare token and a valid matching scope are ordinary
+                    # string contents on the actual hazardous source line.
+                    code = literal.format(marker=marker + " " + all_scope) + code
+                scope = {
+                    "wrong": marker + "[" + wrong + "]",
+                    "unknown": marker + "[unknown.public.rule]",
+                    "trailing": all_scope,
+                    "bare": marker,
+                    "selective": marker + "[" + rules[0][0] + "]",
+                }.get(variant)
+                body.append("    " + code + (" // " + scope if scope else ""))
+                line = len(opening.splitlines()) + len(body)
+                retained = rules if variant in ("wrong", "unknown", "literal", "baseline") else (
+                    rules[1:] if variant == "selective" else ())
+                expected.extend((rule, str(path), line, severity) for rule, severity in retained)
+                if variant == "above":
+                    # The comment belongs to the first statement. A following
+                    # unmarked statement remains a real positive control.
+                    body.append("    " + statement.format(index="adjacent"))
+                    expected.extend((rule, str(path), line + 1, severity) for rule, severity in rules)
+                header = opening.replace("class Case", f"class Case{index}")
+                if language == "swift":
+                    header = header.replace("func check", f"func check{index}")
+                source = header + "\n".join(body) + "\n" + closing
+                path.write_text(source, encoding="utf-8")
+                sources[variant] = source
+            if language == "swift":
+                control = project / "08_print.swift"
+                control.write_text('func trace() {\n    print("retained control")\n}\n', encoding="utf-8")
+                paths.append(control)
+                expected.extend((rule, str(control), 2, "info")
+                                for rule in ("swift.print-call", "swift.debug.print-minimal"))
+
+            scan_sequence = 0
+
+            def scan(selected: list[Path], output_format: str,
+                     sites: list[tuple[str, str, int, str]], hits: int, *, meta: bool = False) -> list[tuple]:
+                nonlocal scan_sequence
+                scan_sequence += 1
+                inputs = root / "inputs"
+                inputs.write_bytes(b"\0".join(os.fsencode(path) for path in selected) + b"\0")
+                stats_file = root / "cache-stats.json"
+                records_file = root / f"findings-{scan_sequence}.ndjson"
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                           UBS_CACHE_DIR=str(root / "cache"), UBS_CACHE_FILE=str(stats_file),
+                           UBS_PROFILE="1", UBS_SKIP_TYPE_NARROWING="1",
+                           UBS_TEST_FORCE_NO_AST_GREP="0", NO_COLOR="1")
+                command = [str(REPO_ROOT / "modules" / f"ubs-{language}.sh"), "--ci", "--no-color",
+                           "--fail-on-warning", f"--only={categories}", f"--format={output_format}",
+                           "--files-from", str(inputs), *flags, str(project)]
+                if language == "rust" and output_format == "json":
+                    # Rust's public JSON stdout is a summary; this public
+                    # option retains the actual source findings separately.
+                    command.insert(-1, f"--report-json={records_file}")
+                if meta:
+                    self.assertEqual(output_format, "text")
+                    self.assertTrue(selected == paths or len(selected) == 1)
+                    skip = ",".join(str(category) for category in range(1, 25)
+                                    if str(category) not in categories.split(","))
+                    command = [str(REPO_ROOT / "ubs"), "--ci", "--no-color", "--no-auto-update",
+                               "--fail-on-warning", f"--only={language}", f"--skip-{language}={skip}",
+                               "--format=text", *flags,
+                               str(selected[0] if len(selected) == 1 else project)]
+                proc = subprocess.run(command, cwd=root, env=env, text=True,
+                                      capture_output=True, timeout=180)
+                context = f"{command!r}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                totals = {severity: sum(site[3] == severity for site in sites)
+                          for severity in ("critical", "warning", "info")}
+                self.assertEqual(proc.returncode, int(totals["critical"] + totals["warning"] > 0), context)
+                if not meta:
+                    try:
+                        stats = json.loads(stats_file.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError) as exc:
+                        self.fail(f"invalid public suppression cache statistics: {exc}; {context}")
+                    self.assertEqual((stats["hits"], stats["misses"]), (hits, len(selected) - hits), context)
+                if output_format == "text":
+                    text = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+                    for severity, label in (("critical", "Critical issues"),
+                                            ("warning", "Warning issues"), ("info", "Info items")):
+                        self.assertRegex(text, rf"{label}:\s+{totals[severity]}\b", context)
+                    # Renderers deliberately cap previews. Every preview must
+                    # still identify a retained finding using trusted metadata.
+                    printed = []
+                    location = (rf"(?P<path>\S+\.{suffix}):(?P<line>\d+)(?::\d+)?:?\s+"
+                                r"\[rule:(?P<rule>[A-Za-z0-9_.:-]+)\]")
+                    for match in re.finditer(location, text):
+                        site = (match["rule"], str((root / match["path"]).resolve()), int(match["line"]))
+                        self.assertIn(site, [item[:3] for item in sites], context)
+                        printed.append(site)
+                    if sites:
+                        self.assertTrue(printed, context)
+                        self.assertIn(rules[0][0], {site[0] for site in printed}, context)
+                        if meta and (language != "swift" or len(selected) == 1):
+                            # Swift's AST traversal order is independent of
+                            # input order. Its three preview controls each get
+                            # a separate real meta scan below, so a preview cap
+                            # cannot hide lost wrong/unknown/literal findings.
+                            controls = {str(paths[variants.index(name)])
+                                        for name in ("wrong", "unknown", "literal")}
+                            for site in sites:
+                                if site[0] == rules[0][0] and site[1] in controls:
+                                    self.assertIn(site[:3], printed, context)
+                    else:
+                        self.assertEqual(printed, [], context)
+                        for path in selected:
+                            self.assertNotRegex(text, re.escape(path.name) + r":\d+", context)
+                    return printed
+                try:
+                    payload = json.loads(proc.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"invalid public suppression report: {exc}; {context}")
+                if output_format == "json":
+                    self.assertEqual(payload["status"], "ok", context)
+                    self.assertEqual({severity: payload[severity] for severity in totals}, totals, context)
+                    if language == "rust":
+                        try:
+                            records = [json.loads(line) for line in
+                                       records_file.read_text(encoding="utf-8").splitlines()]
+                        except (json.JSONDecodeError, OSError) as exc:
+                            self.fail(f"invalid Rust public source findings: {exc}; {context}")
+                    else:
+                        records = payload["findings"]
+                    actual = []
+                    for record in records:
+                        self.assertIs(type(record["col"]), int, context)
+                        self.assertGreaterEqual(record["col"], 1, context)
+                        self.assertEqual(record.get("count", 1), 1, context)
+                        actual.append((record["rule"], str((root / record["path"]).resolve()),
+                                       record["line"], record["severity"], record["col"]))
+                    self.assertEqual(sorted(item[:4] for item in actual), sorted(sites), context)
+                    return sorted(actual)
+                self.assertEqual(payload["version"], "2.1.0", context)
+                by_driver = {}
+                for run in payload["runs"]:
+                    driver = run["tool"]["driver"]["name"]
+                    self.assertNotIn(driver, by_driver, context)
+                    actual = []
+                    for record in run.get("results", []):
+                        self.assertEqual(len(record["locations"]), 1, context)
+                        loc = record["locations"][0]["physicalLocation"]
+                        actual.append((record["ruleId"], str((root / loc["artifactLocation"]["uri"]).resolve()),
+                                       loc["region"]["startLine"],
+                                       "info" if record["level"] == "note" else record["level"],
+                                       loc["region"]["startColumn"]))
+                    self.assertEqual(sorted(item[:4] for item in actual), sorted(sites), context)
+                    by_driver[driver] = sorted(actual)
+                drivers = {f"ubs-{language}"} if language != "java" else {
+                    "ubs-java-heuristics", "ubs-java-ast"}
+                self.assertEqual(set(by_driver), drivers, context)
+                return next(iter(by_driver.values()))
+
+            cold = scan(paths, "json", expected, 0)
+            self.assertEqual(scan(paths, "json", expected, len(paths)), cold)
+            self.assertEqual(scan(paths, "sarif", expected, len(paths)), cold)
+            scan(paths, "text", expected, len(paths))
+            scan(paths, "text", expected, len(paths), meta=True)
+            if language == "swift":
+                for name in ("wrong", "unknown", "literal"):
+                    selected = paths[variants.index(name)]
+                    sites = [site for site in expected if site[1] == str(selected)]
+                    scan([selected], "text", sites, 1, meta=True)
+            suppressed = [paths[variants.index(name)] for name in ("trailing", "bare")]
+            for output_format in ("json", "sarif", "text"):
+                scan(suppressed, output_format, [], len(suppressed))
+            wrong_path = paths[variants.index("wrong")]
+            wrong_path.write_text(sources["wrong"].replace(marker + "[" + wrong + "]", all_scope),
+                                  encoding="utf-8")
+            partial_sites = [site for site in expected if site[1] != str(wrong_path)]
+            partial = scan(paths, "json", partial_sites, len(paths) - 1)
+            self.assertEqual(scan(paths, "sarif", partial_sites, len(paths)), partial)
+
+    def test_cpp_public_rule_scopes(self) -> None:
+        self._exercise("cpp")
+
+    def test_rust_public_rule_scopes(self) -> None:
+        self._exercise("rust")
+
+    def test_java_public_rule_scopes(self) -> None:
+        self._exercise("java")
+
+    def test_swift_public_rule_scopes_and_unmarked_prints(self) -> None:
+        self._exercise("swift")
+
+    def test_csharp_public_rule_scopes_preserve_independent_ast_findings(self) -> None:
+        self._exercise("csharp")
 
 
 class NativeSourceIdentityTests(unittest.TestCase):
@@ -1007,6 +1609,177 @@ class ConstantTimeCompareDigestRoleTests(unittest.TestCase):
             (root / "article.html").write_bytes(b"public article BYTES")
             with self.assertRaises(RuntimeError):
                 fixture.verify_public_fixture(root)
+
+
+class RustComparisonBoundaryTests(unittest.TestCase):
+    """Namespace arms and boolean destinations are not secret operands."""
+
+    RULE = "rust.security.constant-time-compare"
+    # Preserve the actual CASS ordering: a later diagnostic match arm used to
+    # taint `doctor` in the fixpoint pass, corrupting both earlier comparisons.
+    RESTORE = '''fn restore(command: doctor::DoctorBackupCommand,
+           execution_mode: doctor::DoctorExecutionMode) {
+    if command == doctor::DoctorBackupCommand::Restore {
+        let apply_requested = execution_mode == doctor::DoctorExecutionMode::RestoreApply;
+        let (restore_plan, plan_fingerprint) = doctor_restore_plan_payload(
+            &data_dir,
+            &db_path,
+            &backup_id_text,
+            &verification,
+            apply_requested,
+            requested_plan_fingerprint.clone(),
+        );
+        consume(restore_plan, plan_fingerprint);
+    }
+    match command {
+        doctor::DoctorBackupCommand::Verify => {
+            println!(
+                "doctor backup {} verification: {}",
+                backup_id_text,
+                payload["backup_verification"]["status"]
+            );
+        }
+        doctor::DoctorBackupCommand::Restore => {}
+    }
+}
+'''
+    COMPARISONS = '''fn verify(expected_signature: &str, provided: &str, ordinary: &str, expected: &str) {
+    let alias: &str = expected_signature;
+    alias != provided; // expect: typed-alias
+    let mut value = ordinary;
+    value = expected_signature;
+    value == provided; // expect: assigned-alias
+    expected_signature == (
+        provided); // multiline right operand
+    let password_matches = ordinary == expected;
+    let _ = expected_signature == provided; // expect: discard-positive
+    let _ = ordinary == expected;
+    // ubs:ignore[unknown.public.rule]
+    alias == provided; // expect: unrelated-scope
+    // ubs:ignore[rust.security.constant-time-compare]
+    alias == provided;
+    alias == provided; // expect: adjacent-unmarked
+}
+fn comparison_is_not_assignment(candidate: &str, expected_signature: &str, ordinary: &str) {
+    candidate == expected_signature; // expect: direct-positive
+    candidate == ordinary;
+}
+fn local_namespace_shadow(provided: &str) {
+    let doctor: &str = load_secret();
+    doctor == provided; // expect: namespace-shadow
+}
+fn unrelated_function(doctor: &str, ordinary: &str) {
+    doctor == ordinary;
+}
+fn branch_neighbors(mode: Mode, expected_signature: &str, provided: &str) {
+    if mode == Mode::Restore {
+        expected_signature == provided; // expect: branch-body
+    }
+    if expected_signature != provided { // expect: branch-condition
+        consume(provided);
+    }
+    mode == Mode::Restore;
+}
+fn timing_safe(expected_signature: &[u8], provided: &[u8]) -> bool {
+    expected_signature.ct_eq(provided).into()
+}
+'''
+
+    def expected_sites(self, source: str) -> list[tuple[int, str]]:
+        return [(number, line.strip()) for number, line in enumerate(source.splitlines(), 1)
+                if "// expect:" in line or line.strip() == "expected_signature == ("]
+
+    def test_real_restore_match_arm_does_not_taint_namespace(self) -> None:
+        self.assertEqual(ctcompare_rust.scan_file(self.RESTORE), [])
+
+    def test_real_aliases_operands_neighbors_and_function_shadowing(self) -> None:
+        expected = self.expected_sites(self.COMPARISONS)
+        self.assertEqual(len(expected), 10)
+        self.assertEqual(ctcompare_rust.scan_file(self.COMPARISONS), expected)
+        # Existing positive/clean source pairs also protect the original
+        # detector's secret vocabulary, constant-time APIs, and function scopes.
+        fixtures = REPO_ROOT / "test-suite/rust"
+        for name, count in (("constant_time_compare.rs", 8),
+                            ("secret_compare_function_scope.rs", 4)):
+            with self.subTest(fixture=name):
+                self.assertEqual(len(ctcompare_rust.scan_file(
+                    (fixtures / "buggy" / name).read_text(encoding="utf-8"))), count)
+                self.assertEqual(ctcompare_rust.scan_file(
+                    (fixtures / "clean" / name).read_text(encoding="utf-8")), [])
+
+    def test_public_generated_and_fallback_reports_preserve_exact_cached_sites(self) -> None:
+        self.assertIsNotNone(shutil.which("ast-grep"), "generated public scan requires real ast-grep")
+        for ast in (True, False):
+            with self.subTest(ast=ast), tempfile.TemporaryDirectory(prefix="ubs_rust_comparison_") as td:
+                root = Path(td)
+                project = root / "project"
+                project.mkdir()
+                clean = project / "restore.rs"
+                positive = project / "compare.rs"
+                clean.write_text(self.RESTORE, encoding="utf-8")
+                positive.write_text(self.COMPARISONS, encoding="utf-8")
+                inputs = root / "inputs"
+                report = root / "findings.ndjson"
+                statistics = root / "cache-stats.json"
+                env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_CACHE="0",
+                           UBS_CACHE_DIR=str(root / "cache"), UBS_CACHE_FILE=str(statistics),
+                           UBS_PROFILE="1", UBS_SKIP_TYPE_NARROWING="1", NO_COLOR="1",
+                           UBS_TEST_FORCE_NO_AST_GREP="0" if ast else "1")
+
+                def scan(selected: list[Path], source: str, output_format: str, hits: int) -> list[tuple]:
+                    inputs.write_bytes(b"\0".join(os.fsencode(path) for path in selected) + b"\0")
+                    command = [str(REPO_ROOT / "modules/ubs-rust.sh"), "--no-cargo", "--ci",
+                               "--no-color", "--only=8", f"--format={output_format}",
+                               f"--report-json={report}", "--files-from", str(inputs), str(project)]
+                    proc = subprocess.run(command, cwd=root, env=env, text=True,
+                                          capture_output=True, timeout=180)
+                    context = f"{command!r}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                    expected = [(self.RULE, str(positive), line, 1, "critical")
+                                for line, _ in self.expected_sites(source)] if positive in selected else []
+                    self.assertEqual(proc.returncode, int(bool(expected)), context)
+                    try:
+                        payload = json.loads(proc.stdout)
+                        stats = json.loads(statistics.read_text(encoding="utf-8"))
+                        records = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+                    except (json.JSONDecodeError, OSError) as exc:
+                        self.fail(f"invalid Rust comparison report/statistics: {exc}; {context}")
+                    self.assertEqual((stats["hits"], stats["misses"]),
+                                     (hits, len(selected) - hits), context)
+                    actual = []
+                    for record in records:
+                        self.assertEqual(record.get("count", 1), 1, context)
+                        actual.append((record["rule"], str((root / record["path"]).resolve()),
+                                       record["line"], record["col"], record["severity"]))
+                    self.assertEqual(sorted(actual), sorted(expected), context)
+                    if output_format == "json":
+                        self.assertEqual(payload["status"], "ok", context)
+                        self.assertEqual((payload["critical"], payload["warning"], payload["info"]),
+                                         (len(expected), 0, 0), context)
+                    else:
+                        self.assertEqual(payload["version"], "2.1.0", context)
+                        self.assertEqual(len(payload["runs"]), 1, context)
+                        run = payload["runs"][0]
+                        self.assertEqual(run["tool"]["driver"]["name"], "ubs-rust", context)
+                        sarif = []
+                        for record in run["results"]:
+                            self.assertEqual(record["level"], "error", context)
+                            self.assertEqual(len(record["locations"]), 1, context)
+                            location = record["locations"][0]["physicalLocation"]
+                            sarif.append((record["ruleId"], str((root / location["artifactLocation"]["uri"]).resolve()),
+                                          location["region"]["startLine"], location["region"]["startColumn"], "critical"))
+                        self.assertEqual(sorted(sarif), sorted(expected), context)
+                    return sorted(records, key=lambda record: (record["path"], record["line"], record["col"]))
+
+                cold = scan([clean, positive], self.COMPARISONS, "json", 0)
+                self.assertEqual(scan([clean, positive], self.COMPARISONS, "json", 2), cold)
+                self.assertEqual(scan([clean, positive], self.COMPARISONS, "sarif", 2), cold)
+                self.assertEqual(scan([clean], self.RESTORE, "json", 1), [])
+                repaired = self.COMPARISONS.replace(
+                    "alias != provided; // expect: typed-alias", "consume(alias); // repaired typed-alias")
+                positive.write_text(repaired, encoding="utf-8")
+                partial = scan([clean, positive], repaired, "json", 1)
+                self.assertEqual(len(partial), len(cold) - 1)
+                self.assertEqual(scan([clean, positive], repaired, "sarif", 2), partial)
 
 
 class RustPreparedSourceTests(unittest.TestCase):

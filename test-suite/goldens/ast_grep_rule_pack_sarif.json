@@ -13,10 +13,15 @@
       "fixture": "test-suite/js/buggy/security.js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 2,
+      "result_count": 7,
       "result_rule_ids": [
+        "js.dom.queries",
         "js.eval-call",
-        "js.innerHTML-assign"
+        "js.innerHTML-assign",
+        "js.security.eval",
+        "js.security.fetch-abort",
+        "js.security.hardcoded-secrets",
+        "js.security.innerhtml-unsanitized"
       ],
       "sarif_runs": 1
     },
@@ -56,17 +61,57 @@
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",
         "cs-await-in-lock",
-        "cs-parallel-foreach-async-lambda"
+        "cs-binary-formatter",
+        "cs-console-writeline",
+        "cs-des-crypto",
+        "cs-empty-catch",
+        "cs-gc-collect",
+        "cs-goto-statement",
+        "cs-httpclient-instantiation",
+        "cs-md5-create",
+        "cs-new-thread",
+        "cs-parallel-foreach-async-lambda",
+        "cs-process-start",
+        "cs-rethrow-ex",
+        "cs-sha1-create",
+        "cs-task-delay-no-await",
+        "cs-task-getawaiter-getresult",
+        "cs-task-result-deadlock",
+        "cs-task-wait-blocking",
+        "cs-threadpool-queue",
+        "cs-thread-sleep",
+        "cs-weak-random",
+        "cs-xml-document"
       ],
       "fixture": "test-suite/csharp/buggy/AstRulePackBuggy.cs",
       "label": "csharp-rule-pack",
       "module": "ubs-csharp.sh",
-      "result_count": 4,
+      "result_count": 24,
       "result_rule_ids": [
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",
         "cs-await-in-lock",
-        "cs-parallel-foreach-async-lambda"
+        "cs-binary-formatter",
+        "cs-console-writeline",
+        "cs-des-crypto",
+        "cs-empty-catch",
+        "cs-gc-collect",
+        "cs-goto-statement",
+        "cs-httpclient-instantiation",
+        "cs-md5-create",
+        "cs-new-thread",
+        "cs-parallel-foreach-async-lambda",
+        "cs-process-start",
+        "cs-rethrow-ex",
+        "cs-sha1-create",
+        "cs-task-delay-no-await",
+        "cs-task-getawaiter-getresult",
+        "cs-task-result-deadlock",
+        "cs-task-wait-blocking",
+        "cs-thread-sleep",
+        "cs-threadpool-queue",
+        "cs-weak-random",
+        "cs-xml-document"
       ],
       "sarif_runs": 1
     },
@@ -78,91 +123,117 @@
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
-        "rust.unwrap-call",
-        "rust.unwrap-unchecked"
+        "rust.ownership.unwrap-expect",
+        "rust.panic.unchecked-ub",
+        "rust.unsafe-memory.unsafe-blocks",
+        "rust.casts.as-casts"
+      ],
+      "expected_sites": [
+        {
+          "anchor": "let _ = self.value.take().unwrap();",
+          "level": "warning",
+          "rule_id": "rust.ownership.unwrap-expect",
+          "start_line": 20
+        },
+        {
+          "anchor": "let _ = Some(1).unwrap_unchecked();",
+          "level": "error",
+          "rule_id": "rust.panic.unchecked-ub",
+          "start_line": 136
+        },
+        {
+          "anchor": "fn unsafe_memory_hazards(",
+          "level": "note",
+          "rule_id": "rust.unsafe-memory.unsafe-blocks",
+          "start_line": 122
+        },
+        {
+          "anchor": "let _ = 1_u64.wrapping_add(values.len() as u64);",
+          "level": "note",
+          "rule_id": "rust.casts.as-casts",
+          "start_line": 156
+        }
       ],
       "fixture": "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 143,
+      "result_count": 339,
       "result_rule_ids": [
-        "rust.arc-mutex",
-        "rust.assert-macros",
-        "rust.async.std-guard-across-await",
-        "rust.async.std-lock-in-async",
-        "rust.async.tokio-guard-across-await",
-        "rust.await-in-for",
-        "rust.block-on-in-async",
-        "rust.blocking-fs-in-async",
-        "rust.chars-nth",
-        "rust.clone-call",
-        "rust.clone-in-loop",
-        "rust.collect-then-for",
-        "rust.command.shell-c",
-        "rust.cstr-from-bytes-unchecked",
-        "rust.dbg-macro",
-        "rust.debug-assert-macros",
-        "rust.env-var-unwrap",
-        "rust.eprintln-macro",
-        "rust.expect-call",
-        "rust.fixme-comment",
-        "rust.format-literal-no-vars",
-        "rust.from-slice-panic",
-        "rust.from-utf8-unchecked",
-        "rust.get-unchecked",
-        "rust.i64-negate-overflow",
-        "rust.insecure-hash",
-        "rust.instant-now-elapsed",
-        "rust.instant-subtraction",
-        "rust.iter-nth-zero",
-        "rust.len-count-narrow-as",
-        "rust.map-clone",
-        "rust.maybeuninit-assume-init",
-        "rust.mem-forget",
-        "rust.mem-transmute",
-        "rust.mem-uninitialized",
-        "rust.mem-zeroed",
-        "rust.mutex-lock-expect",
-        "rust.mutex-lock-unwrap",
-        "rust.native-tls-danger",
-        "rust.openssl-no-verify",
-        "rust.panic-in-drop",
-        "rust.panic-macro",
-        "rust.parse-float-no-finite-check",
-        "rust.parse-unwrap",
-        "rust.plain-http-url",
-        "rust.println-macro",
-        "rust.ptr-cast",
-        "rust.rc-refcell",
-        "rust.regex-new-in-loop",
-        "rust.regex-new-unwrap",
-        "rust.reqwest-danger-accept",
-        "rust.resource.thread-no-join",
-        "rust.resource.tokio-task-no-await",
-        "rust.serde-json-unwrap",
-        "rust.slice-from-raw-parts",
-        "rust.strict-utf8",
-        "rust.suspicious-as-cast",
-        "rust.thread-sleep-in-async",
-        "rust.thread-spawn-in-async",
-        "rust.thread-spawn-no-join",
-        "rust.to-owned-to-string",
-        "rust.todo-comment",
-        "rust.todo-macro",
-        "rust.tokio-block-in-place",
-        "rust.tokio-spawn-no-handle",
-        "rust.tokio.spawn-no-move",
-        "rust.try-into-unwrap",
-        "rust.unimplemented-macro",
-        "rust.unreachable-macro",
-        "rust.unreachable-unchecked",
-        "rust.unsafe-auto-traits",
-        "rust.unsafe-block",
-        "rust.unwrap-call",
-        "rust.unwrap-in-drop",
-        "rust.unwrap-unchecked",
-        "rust.wrapping-arithmetic",
-        "rust.write-not-atomic"
+        "rust.allocation.format-literal",
+        "rust.allocation.to-owned-to-string",
+        "rust.async-locking.std-guard-await",
+        "rust.async-locking.std-lock-async",
+        "rust.async-locking.tokio-guard-await",
+        "rust.async.arc-mutex",
+        "rust.async.await-in-loop",
+        "rust.async.block-on-in-async",
+        "rust.async.fs-in-async",
+        "rust.async.lock-unwrap",
+        "rust.async.rc-refcell",
+        "rust.async.rwlock",
+        "rust.async.sleep-in-async",
+        "rust.async.thread-spawn-in-async",
+        "rust.async.tokio-block-in-place",
+        "rust.async.tokio-spawn-no-move",
+        "rust.async.tokio-task-no-await",
+        "rust.casts.as-casts",
+        "rust.casts.len-count-narrow",
+        "rust.casts.ptr-cast",
+        "rust.casts.try-into-unwrap",
+        "rust.code-quality.tech-debt",
+        "rust.collections.clone-any",
+        "rust.collections.clone-in-loop",
+        "rust.collections.collect-vec",
+        "rust.collections.map-clone",
+        "rust.collections.nth0",
+        "rust.domain.from-str",
+        "rust.domain.reqwest-builder",
+        "rust.filesystem.command-new",
+        "rust.filesystem.fs-usage",
+        "rust.filesystem.write-not-atomic",
+        "rust.numeric.division-by-var",
+        "rust.numeric.i64-negate-overflow",
+        "rust.numeric.instant-now-elapsed",
+        "rust.numeric.instant-subtraction",
+        "rust.numeric.wrapping-arithmetic",
+        "rust.ownership.dbg-macro",
+        "rust.ownership.eprintln-macro",
+        "rust.ownership.panic-macro",
+        "rust.ownership.println-macro",
+        "rust.ownership.todo-macro",
+        "rust.ownership.unimplemented-macro",
+        "rust.ownership.unreachable-macro",
+        "rust.ownership.unwrap-expect",
+        "rust.panic.assert-macros",
+        "rust.panic.debug-assert-macros",
+        "rust.panic.direct-indexing",
+        "rust.panic.drop",
+        "rust.panic.from-slice-panic",
+        "rust.panic.unchecked-ub",
+        "rust.parsing.env-var-unwrap",
+        "rust.parsing.parse-float-no-finite-check",
+        "rust.parsing.parse-unwrap",
+        "rust.parsing.serde-unwrap",
+        "rust.parsing.strict-utf8",
+        "rust.perf.chars-nth",
+        "rust.perf.regex-in-loop",
+        "rust.perf.regex-new-unwrap",
+        "rust.resource-lifecycle.thread_join",
+        "rust.security.http-url",
+        "rust.security.shell-command",
+        "rust.security.tls-verification",
+        "rust.security.weak-hash",
+        "rust.unsafe-memory.assume-init",
+        "rust.unsafe-memory.cstr-unchecked",
+        "rust.unsafe-memory.forget",
+        "rust.unsafe-memory.from-raw-parts",
+        "rust.unsafe-memory.transmute",
+        "rust.unsafe-memory.unchecked-indexing",
+        "rust.unsafe-memory.uninitialized",
+        "rust.unsafe-memory.unsafe-blocks",
+        "rust.unsafe-memory.unsafe-impl-send-sync",
+        "rust.unsafe-memory.utf8-unchecked",
+        "rust.unsafe-memory.zeroed"
       ],
       "sarif_runs": 1
     },
@@ -173,14 +244,73 @@
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
+        "swift.abort-call",
+        "swift.assertion-failure",
+        "swift.debug-print",
+        "swift.dispatch-sync-main",
+        "swift.exit-call",
+        "swift.fatal-error",
+        "swift.force-cast",
+        "swift.force-try",
+        "swift.keyed-unarchiver",
+        "swift.md5-digest",
+        "swift.ns-assert",
+        "swift.precondition-failure",
+        "swift.print-call",
+        "swift.process-run",
+        "swift.sha1-digest",
+        "swift.task-sleep-blocking",
+        "swift.thread-sleep",
+        "swift.timer-scheduled",
+        "swift.unmanaged-pass-unretained",
+        "swift.unmanaged-take-unretained",
+        "swift.unsafe-bitcast",
         "swift.urlsession.task-no-resume"
       ],
-      "fixture": "test-suite/swift/ssrf_buggy",
+      "fixture": "test-suite/swift/ast_grep_rule_pack_coverage.swift",
       "label": "swift-rule-pack",
       "module": "ubs-swift.sh",
-      "result_count": 2,
+      "result_count": 43,
       "result_rule_ids": [
-        "swift.urlsession.task-no-resume"
+        "swift.abort-call",
+        "swift.assertion-failure",
+        "swift.concurrency.task-usages",
+        "swift.crypto.insecure",
+        "swift.debug-print",
+        "swift.debug.failing-asserts",
+        "swift.debug.print-minimal",
+        "swift.dispatch-sync-main",
+        "swift.errors.crash-sites",
+        "swift.exit-call",
+        "swift.fatal-error",
+        "swift.files.string-contents",
+        "swift.force-cast",
+        "swift.force-try",
+        "swift.keyed-unarchiver",
+        "swift.lifecycle.timer",
+        "swift.lifecycle.urlsession_task",
+        "swift.md5-digest",
+        "swift.memory.timers",
+        "swift.networking.task-sites",
+        "swift.ns-assert",
+        "swift.optionals.as-bang",
+        "swift.optionals.force-some",
+        "swift.optionals.try-bang",
+        "swift.packaging.no-manifest",
+        "swift.precondition-failure",
+        "swift.print-call",
+        "swift.process-run",
+        "swift.security.unarchiving",
+        "swift.sha1-digest",
+        "swift.task-sleep-blocking",
+        "swift.thread-sleep",
+        "swift.threading.main-sync",
+        "swift.timer-scheduled",
+        "swift.unmanaged-pass-unretained",
+        "swift.unmanaged-take-unretained",
+        "swift.unsafe-bitcast",
+        "swift.urlsession.task-no-resume",
+        "ubs.correlation.urlsession.unassigned-no-resume"
       ],
       "sarif_runs": 1
     },
@@ -223,7 +353,7 @@
       "fixture": "test-suite/ruby/ast_grep_rule_pack_coverage.rb",
       "label": "ruby-rule-pack",
       "module": "ubs-ruby.sh",
-      "result_count": 29,
+      "result_count": 30,
       "result_rule_ids": [
         "rails.constantize",
         "rails.csrf-skip",
@@ -252,6 +382,7 @@
         "rb.system-single-string",
         "rb.tempfile-no-block",
         "rb.yaml-unsafe",
+        "ruby.async.thread-no-rescue",
         "ruby.resource.thread-no-join"
       ],
       "sarif_runs": 1
@@ -302,7 +433,7 @@
       "fixture": "test-suite/java/ast_grep_rule_pack_coverage.java",
       "label": "java-rule-pack",
       "module": "ubs-java.sh",
-      "result_count": 48,
+      "result_count": 49,
       "result_rule_ids": [
         "java.bigdecimal-equals",
         "java.closeable-no-twr",
@@ -330,6 +461,7 @@
         "java.resource.resultset-no-close",
         "java.resource.statement-no-close",
         "java.resource.thread-no-join",
+        "java.secrets.string-decl",
         "java.string-bytes-no-charset",
         "java.string-eq-operator",
         "java.synchronized-this",
@@ -338,6 +470,83 @@
         "java.thread-start",
         "java.virtual-threads",
         "java.weak-hash"
+      ],
+      "sarif_runs": 1
+    },
+    {
+      "args": [
+        "--format=sarif",
+        "--no-mix"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "elixir.binary-to-term-unsafe",
+        "elixir.code-eval-file",
+        "elixir.code-eval-string",
+        "elixir.crypto-md5",
+        "elixir.crypto-sha1",
+        "elixir.file-rm-rf",
+        "elixir.file-rm-rf-bang",
+        "elixir.io-inspect",
+        "elixir.io-puts",
+        "elixir.jason-decode-bang",
+        "elixir.kernel-exit",
+        "elixir.kernel-throw",
+        "elixir.node-spawn",
+        "elixir.poison-decode-bang",
+        "elixir.process-exit",
+        "elixir.process-sleep",
+        "elixir.repo-query",
+        "elixir.repo-query-bang",
+        "elixir.send-unhandled",
+        "elixir.spawn-link",
+        "elixir.spawn-unlinked",
+        "elixir.string-to-atom",
+        "elixir.string-to-existing-atom",
+        "elixir.system-cmd-shell",
+        "elixir.system-halt",
+        "elixir.system-shell"
+      ],
+      "fixture": "test-suite/elixir/ast_grep_rule_pack_coverage.ex",
+      "label": "elixir-rule-pack",
+      "module": "ubs-elixir.sh",
+      "result_count": 40,
+      "result_rule_ids": [
+        "elixir.binary-to-term-unsafe",
+        "elixir.code-eval-file",
+        "elixir.code-eval-string",
+        "elixir.crypto-md5",
+        "elixir.crypto-sha1",
+        "elixir.file-rm-rf",
+        "elixir.file-rm-rf-bang",
+        "elixir.io-inspect",
+        "elixir.io-puts",
+        "elixir.jason-decode-bang",
+        "elixir.kernel-exit",
+        "elixir.kernel-throw",
+        "elixir.node-spawn",
+        "elixir.poison-decode-bang",
+        "elixir.process-exit",
+        "elixir.process-sleep",
+        "elixir.repo-query",
+        "elixir.repo-query-bang",
+        "elixir.send-unhandled",
+        "elixir.spawn-link",
+        "elixir.spawn-unlinked",
+        "elixir.string-to-atom",
+        "elixir.string-to-existing-atom",
+        "elixir.system-cmd-shell",
+        "elixir.system-halt",
+        "elixir.system-shell",
+        "ex.debug.io-inspect",
+        "ex.otp.process-exit-kill",
+        "ex.otp.spawn-usage",
+        "ex.security.binary-to-term-unsafe",
+        "ex.security.code-eval",
+        "ex.security.shell-exec-critical",
+        "ex.security.string-to-atom",
+        "ex.security.weak-hash"
       ],
       "sarif_runs": 1
     }
@@ -356,33 +565,109 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 200,
+      "result_count": 1007,
       "result_rule_ids": [
+        "javascript.ctcompare.unsafe_secret_compare",
+        "javascript.guards.deep_unguarded_chain",
+        "javascript.taint.command",
+        "javascript.taint.sql",
+        "javascript.taint.xss",
         "js.async.await-no-try",
         "js.async.dangling-promise",
+        "js.async.event-emitter",
+        "js.async.event-listener",
+        "js.async.flatmap",
+        "js.async.foreach",
+        "js.async.jsx-handler",
+        "js.async.map-awaited",
+        "js.async.map-ignored",
+        "js.async.predicate",
+        "js.async.promise-all-foreach",
+        "js.async.promise-all-map",
+        "js.async.promise-executor",
         "js.async.promiseall-no-try",
+        "js.async.react-effect",
+        "js.async.reduce",
+        "js.async.sort-comparator",
         "js.async.then-no-catch",
+        "js.async.timer",
+        "js.control-flow.switch-fallthrough",
+        "js.debug.console",
         "js.document-write",
         "js.dom.innerText-outerHTML",
+        "js.dom.queries",
+        "js.equality.bitwise-ops",
+        "js.equality.division-denominator",
         "js.error.empty-catch",
         "js.error.throw-string",
         "js.eval-call",
         "js.fetch.no-catch",
         "js.fs.writeFileSync-not-atomic",
+        "js.function-scope.arrow-implicit-return",
+        "js.function-scope.block-function",
+        "js.function-scope.callback-density",
+        "js.hooks.missing-critical",
+        "js.hooks.missing-warning",
         "js.innerHTML-assign",
         "js.json-parse-without-try",
+        "js.markers.todo-family",
         "js.nan-direct-compare",
         "js.new-function",
+        "js.node.fs-sync",
+        "js.null-undefined.dom-query-unguarded",
         "js.nullish-coalescing-chain",
         "js.operator-precedence-ternary-nullish",
         "js.parseInt-no-radix",
+        "js.parsing.parseint-no-radix",
+        "js.perf.interval-leak",
+        "js.perf.listener-imbalance",
+        "js.perf.listeners-attached",
+        "js.perf.listeners-removed",
+        "js.perf.object-url-leak",
+        "js.perf.timeout-uncleaned",
         "js.react.useMemo-empty-deps",
+        "js.regex.dynamic-regexp",
+        "js.regex.replace-escaping",
+        "js.resource-lifecycle.interval-delta",
+        "js.resource-lifecycle.listener-delta",
+        "js.resource-lifecycle.observer-delta",
         "js.resource.interval-no-clear",
         "js.resource.listener-no-remove",
         "js.resource.observer-no-disconnect",
+        "js.security.archive-entry",
+        "js.security.cookies",
+        "js.security.cors",
+        "js.security.dangerous-html",
+        "js.security.document-write",
+        "js.security.eval",
+        "js.security.fetch-abort",
+        "js.security.hardcoded-secrets",
+        "js.security.header-injection",
+        "js.security.host-header",
+        "js.security.innerhtml-unsanitized",
+        "js.security.jsx-target-blank",
+        "js.security.jwt",
+        "js.security.message-origin",
+        "js.security.new-function",
+        "js.security.open-redirect",
+        "js.security.path-traversal",
+        "js.security.post-message",
+        "js.security.prototype-pollution",
+        "js.security.request-body",
+        "js.security.request-regex",
+        "js.security.reverse-proxy",
+        "js.security.sql-injection",
+        "js.security.ssrf-fetch",
+        "js.security.tls",
+        "js.security.weak-random",
+        "js.security.window-open-blank",
         "js.taint.header-injection",
         "js.tanstack.sortUndefined-direction",
         "js.then-without-catch",
+        "js.type-coercion.different-types",
+        "js.type-coercion.loose-equality",
+        "js.type-coercion.string-concat",
+        "js.typescript.non-null-assertion",
         "node.child-process-exec",
         "react.dangerously-set-html",
         "react.list-missing-key",
@@ -410,8 +695,9 @@
       "fixture": "test-suite/golang",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
-      "result_count": 259,
+      "result_count": 260,
       "result_rule_ids": [
+        "go.async.goroutine-err-no-check",
         "go.blank-import",
         "go.close-error-ignored",
         "go.content-type-prefix-match",
@@ -491,17 +777,57 @@
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",
         "cs-await-in-lock",
-        "cs-parallel-foreach-async-lambda"
+        "cs-binary-formatter",
+        "cs-console-writeline",
+        "cs-des-crypto",
+        "cs-empty-catch",
+        "cs-gc-collect",
+        "cs-goto-statement",
+        "cs-httpclient-instantiation",
+        "cs-md5-create",
+        "cs-new-thread",
+        "cs-parallel-foreach-async-lambda",
+        "cs-process-start",
+        "cs-rethrow-ex",
+        "cs-sha1-create",
+        "cs-task-delay-no-await",
+        "cs-task-getawaiter-getresult",
+        "cs-task-result-deadlock",
+        "cs-task-wait-blocking",
+        "cs-threadpool-queue",
+        "cs-thread-sleep",
+        "cs-weak-random",
+        "cs-xml-document"
       ],
       "fixture": "test-suite/csharp",
       "label": "csharp-rule-pack",
       "module": "ubs-csharp.sh",
-      "result_count": 4,
+      "result_count": 50,
       "result_rule_ids": [
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",
         "cs-await-in-lock",
-        "cs-parallel-foreach-async-lambda"
+        "cs-binary-formatter",
+        "cs-console-writeline",
+        "cs-des-crypto",
+        "cs-empty-catch",
+        "cs-gc-collect",
+        "cs-goto-statement",
+        "cs-httpclient-instantiation",
+        "cs-md5-create",
+        "cs-new-thread",
+        "cs-parallel-foreach-async-lambda",
+        "cs-process-start",
+        "cs-rethrow-ex",
+        "cs-sha1-create",
+        "cs-task-delay-no-await",
+        "cs-task-getawaiter-getresult",
+        "cs-task-result-deadlock",
+        "cs-task-wait-blocking",
+        "cs-thread-sleep",
+        "cs-threadpool-queue",
+        "cs-weak-random",
+        "cs-xml-document"
       ],
       "sarif_runs": 1
     },
@@ -513,91 +839,140 @@
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
-        "rust.unwrap-call",
-        "rust.unwrap-unchecked"
+        "rust.ownership.unwrap-expect",
+        "rust.panic.unchecked-ub",
+        "rust.unsafe-memory.unsafe-blocks",
+        "rust.casts.as-casts"
+      ],
+      "expected_sites": [
+        {
+          "anchor": "let _ = self.value.take().unwrap();",
+          "level": "warning",
+          "rule_id": "rust.ownership.unwrap-expect",
+          "start_line": 20
+        },
+        {
+          "anchor": "let _ = Some(1).unwrap_unchecked();",
+          "level": "error",
+          "rule_id": "rust.panic.unchecked-ub",
+          "start_line": 136
+        },
+        {
+          "anchor": "fn unsafe_memory_hazards(",
+          "level": "note",
+          "rule_id": "rust.unsafe-memory.unsafe-blocks",
+          "start_line": 122
+        },
+        {
+          "anchor": "let _ = 1_u64.wrapping_add(values.len() as u64);",
+          "level": "note",
+          "rule_id": "rust.casts.as-casts",
+          "start_line": 156
+        }
       ],
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 547,
+      "result_count": 687,
       "result_rule_ids": [
-        "rust.arc-mutex",
-        "rust.assert-macros",
-        "rust.async.std-guard-across-await",
-        "rust.async.std-lock-in-async",
-        "rust.async.tokio-guard-across-await",
-        "rust.await-in-for",
-        "rust.block-on-in-async",
-        "rust.blocking-fs-in-async",
-        "rust.chars-nth",
-        "rust.clone-call",
-        "rust.clone-in-loop",
-        "rust.collect-then-for",
-        "rust.command.shell-c",
-        "rust.cstr-from-bytes-unchecked",
-        "rust.dbg-macro",
-        "rust.debug-assert-macros",
-        "rust.env-var-unwrap",
-        "rust.eprintln-macro",
-        "rust.expect-call",
-        "rust.fixme-comment",
-        "rust.format-literal-no-vars",
-        "rust.from-slice-panic",
-        "rust.from-utf8-unchecked",
-        "rust.get-unchecked",
-        "rust.i64-negate-overflow",
-        "rust.insecure-hash",
-        "rust.instant-now-elapsed",
-        "rust.instant-subtraction",
-        "rust.iter-nth-zero",
-        "rust.len-count-narrow-as",
-        "rust.map-clone",
-        "rust.maybeuninit-assume-init",
-        "rust.mem-forget",
-        "rust.mem-transmute",
-        "rust.mem-uninitialized",
-        "rust.mem-zeroed",
-        "rust.mutex-lock-expect",
-        "rust.mutex-lock-unwrap",
-        "rust.native-tls-danger",
-        "rust.openssl-no-verify",
-        "rust.panic-in-drop",
-        "rust.panic-macro",
-        "rust.parse-float-no-finite-check",
-        "rust.parse-unwrap",
-        "rust.plain-http-url",
-        "rust.println-macro",
-        "rust.ptr-cast",
-        "rust.rc-refcell",
-        "rust.regex-new-in-loop",
-        "rust.regex-new-unwrap",
-        "rust.reqwest-danger-accept",
-        "rust.resource.thread-no-join",
-        "rust.resource.tokio-task-no-await",
-        "rust.serde-json-unwrap",
-        "rust.slice-from-raw-parts",
-        "rust.strict-utf8",
-        "rust.suspicious-as-cast",
-        "rust.thread-sleep-in-async",
-        "rust.thread-spawn-in-async",
-        "rust.thread-spawn-no-join",
-        "rust.to-owned-to-string",
-        "rust.todo-comment",
-        "rust.todo-macro",
-        "rust.tokio-block-in-place",
-        "rust.tokio-spawn-no-handle",
-        "rust.tokio.spawn-no-move",
-        "rust.try-into-unwrap",
-        "rust.unimplemented-macro",
-        "rust.unreachable-macro",
-        "rust.unreachable-unchecked",
-        "rust.unsafe-auto-traits",
-        "rust.unsafe-block",
-        "rust.unwrap-call",
-        "rust.unwrap-in-drop",
-        "rust.unwrap-unchecked",
-        "rust.wrapping-arithmetic",
-        "rust.write-not-atomic"
+        "rust.allocation.format-literal",
+        "rust.allocation.to-owned-to-string",
+        "rust.api-misuse.default-hasher",
+        "rust.api-misuse.unwrap-or-default",
+        "rust.async-locking.std-guard-await",
+        "rust.async-locking.std-lock-async",
+        "rust.async-locking.tokio-guard-await",
+        "rust.async.arc-mutex",
+        "rust.async.await-in-loop",
+        "rust.async.block-on-in-async",
+        "rust.async.fs-in-async",
+        "rust.async.lock-unwrap",
+        "rust.async.rc-refcell",
+        "rust.async.rwlock",
+        "rust.async.sleep-in-async",
+        "rust.async.thread-spawn-in-async",
+        "rust.async.tokio-block-in-place",
+        "rust.async.tokio-spawn-no-move",
+        "rust.async.tokio-task-no-await",
+        "rust.casts.as-casts",
+        "rust.casts.len-count-narrow",
+        "rust.casts.ptr-cast",
+        "rust.casts.try-into-unwrap",
+        "rust.code-quality.tech-debt",
+        "rust.collections.clone-any",
+        "rust.collections.clone-in-loop",
+        "rust.collections.collect-vec",
+        "rust.collections.map-clone",
+        "rust.collections.nth0",
+        "rust.domain.from-str",
+        "rust.domain.reqwest-builder",
+        "rust.filesystem.command-new",
+        "rust.filesystem.fs-usage",
+        "rust.filesystem.write-not-atomic",
+        "rust.modules.wildcard-imports",
+        "rust.numeric.division-by-var",
+        "rust.numeric.float-equality",
+        "rust.numeric.i64-negate-overflow",
+        "rust.numeric.instant-now-elapsed",
+        "rust.numeric.instant-subtraction",
+        "rust.numeric.wrapping-arithmetic",
+        "rust.ownership.dbg-macro",
+        "rust.ownership.eprintln-macro",
+        "rust.ownership.guarded-later-unwrap",
+        "rust.ownership.panic-macro",
+        "rust.ownership.println-macro",
+        "rust.ownership.todo-macro",
+        "rust.ownership.unimplemented-macro",
+        "rust.ownership.unreachable-macro",
+        "rust.ownership.unwrap-expect",
+        "rust.panic.assert-macros",
+        "rust.panic.debug-assert-macros",
+        "rust.panic.direct-indexing",
+        "rust.panic.drop",
+        "rust.panic.from-slice-panic",
+        "rust.panic.unchecked-ub",
+        "rust.parsing.env-var-unwrap",
+        "rust.parsing.parse-float-no-finite-check",
+        "rust.parsing.parse-unwrap",
+        "rust.parsing.serde-unwrap",
+        "rust.parsing.strict-utf8",
+        "rust.perf.chars-nth",
+        "rust.perf.regex-in-loop",
+        "rust.perf.regex-new-unwrap",
+        "rust.perf.string-alloc-in-loop",
+        "rust.resource-lifecycle.thread_join",
+        "rust.resource-lifecycle.tokio_spawn",
+        "rust.security.archive-entry-path",
+        "rust.security.command-executable",
+        "rust.security.constant-time-compare",
+        "rust.security.cors-credentials",
+        "rust.security.hardcoded-secrets",
+        "rust.security.host-header-url",
+        "rust.security.http-url",
+        "rust.security.jwt-verification",
+        "rust.security.non-crypto-random",
+        "rust.security.open-redirect",
+        "rust.security.path-traversal",
+        "rust.security.request-body-limit",
+        "rust.security.request-regex",
+        "rust.security.request-url",
+        "rust.security.response-header",
+        "rust.security.shell-command",
+        "rust.security.sql-injection",
+        "rust.security.temp-file-race",
+        "rust.security.tls-verification",
+        "rust.security.weak-hash",
+        "rust.unsafe-memory.assume-init",
+        "rust.unsafe-memory.cstr-unchecked",
+        "rust.unsafe-memory.forget",
+        "rust.unsafe-memory.from-raw-parts",
+        "rust.unsafe-memory.transmute",
+        "rust.unsafe-memory.unchecked-indexing",
+        "rust.unsafe-memory.uninitialized",
+        "rust.unsafe-memory.unsafe-blocks",
+        "rust.unsafe-memory.unsafe-impl-send-sync",
+        "rust.unsafe-memory.utf8-unchecked",
+        "rust.unsafe-memory.zeroed"
       ],
       "sarif_runs": 1
     },
@@ -608,14 +983,88 @@
       "driver_rule_count": 0,
       "driver_rule_ids": [],
       "expected_rule_ids": [
+        "swift.abort-call",
+        "swift.assertion-failure",
+        "swift.debug-print",
+        "swift.dispatch-sync-main",
+        "swift.exit-call",
+        "swift.fatal-error",
+        "swift.force-cast",
+        "swift.force-try",
+        "swift.keyed-unarchiver",
+        "swift.md5-digest",
+        "swift.ns-assert",
+        "swift.precondition-failure",
+        "swift.print-call",
+        "swift.process-run",
+        "swift.sha1-digest",
+        "swift.task-sleep-blocking",
+        "swift.thread-sleep",
+        "swift.timer-scheduled",
+        "swift.unmanaged-pass-unretained",
+        "swift.unmanaged-take-unretained",
+        "swift.unsafe-bitcast",
         "swift.urlsession.task-no-resume"
       ],
       "fixture": "test-suite/swift",
       "label": "swift-rule-pack",
       "module": "ubs-swift.sh",
-      "result_count": 4,
+      "result_count": 195,
       "result_rule_ids": [
-        "swift.urlsession.task-no-resume"
+        "swift.abort-call",
+        "swift.assertion-failure",
+        "swift.concurrency.task-usages",
+        "swift.concurrency.unawaited-async",
+        "swift.crypto.insecure",
+        "swift.crypto.weak-randomness",
+        "swift.debug-print",
+        "swift.debug.failing-asserts",
+        "swift.debug.print-some",
+        "swift.dispatch-sync-main",
+        "swift.errors.crash-sites",
+        "swift.exit-call",
+        "swift.fatal-error",
+        "swift.files.string-contents",
+        "swift.force-cast",
+        "swift.force-try",
+        "swift.keyed-unarchiver",
+        "swift.l10n.ui-strings",
+        "swift.lifecycle.timer",
+        "swift.lifecycle.urlsession_task",
+        "swift.md5-digest",
+        "swift.memory.timers",
+        "swift.narrowing.guard_let_no_exit",
+        "swift.narrowing.optional_chain_guard",
+        "swift.narrowing.positive_nil_guard",
+        "swift.networking.data-contents",
+        "swift.networking.task-sites",
+        "swift.ns-assert",
+        "swift.optionals.as-bang",
+        "swift.optionals.force-some",
+        "swift.optionals.try-bang",
+        "swift.packaging.no-manifest",
+        "swift.precondition-failure",
+        "swift.print-call",
+        "swift.process-run",
+        "swift.security.archive-extraction",
+        "swift.security.process-other",
+        "swift.security.shell-exec",
+        "swift.security.unarchiving",
+        "swift.sha1-digest",
+        "swift.taint.header-injection",
+        "swift.taint.outbound-url",
+        "swift.taint.request_open_redirect",
+        "swift.taint.request_path_traversal",
+        "swift.task-sleep-blocking",
+        "swift.thread-sleep",
+        "swift.threading.main-actor",
+        "swift.threading.main-sync",
+        "swift.timer-scheduled",
+        "swift.unmanaged-pass-unretained",
+        "swift.unmanaged-take-unretained",
+        "swift.unsafe-bitcast",
+        "swift.urlsession.task-no-resume",
+        "ubs.correlation.urlsession.unassigned-no-resume"
       ],
       "sarif_runs": 1
     },
@@ -658,7 +1107,7 @@
       "fixture": "test-suite/ruby",
       "label": "ruby-rule-pack",
       "module": "ubs-ruby.sh",
-      "result_count": 49,
+      "result_count": 52,
       "result_rule_ids": [
         "rails.constantize",
         "rails.csrf-skip",
@@ -687,6 +1136,7 @@
         "rb.system-single-string",
         "rb.tempfile-no-block",
         "rb.yaml-unsafe",
+        "ruby.async.thread-no-rescue",
         "ruby.resource.thread-no-join"
       ],
       "sarif_runs": 1
@@ -737,8 +1187,10 @@
       "fixture": "test-suite/java",
       "label": "java-rule-pack",
       "module": "ubs-java.sh",
-      "result_count": 89,
+      "result_count": 87,
       "result_rule_ids": [
+        "java.async.future-get-no-try",
+        "java.async.then-no-exceptionally",
         "java.bigdecimal-equals",
         "java.closeable-no-twr",
         "java.executors-cached",
@@ -765,6 +1217,7 @@
         "java.resource.resultset-no-close",
         "java.resource.statement-no-close",
         "java.resource.thread-no-join",
+        "java.secrets.string-decl",
         "java.string-bytes-no-charset",
         "java.string-eq-operator",
         "java.synchronized-this",
@@ -773,6 +1226,94 @@
         "java.thread-start",
         "java.virtual-threads",
         "java.weak-hash"
+      ],
+      "sarif_runs": 1
+    },
+    {
+      "args": [
+        "--format=sarif",
+        "--no-mix"
+      ],
+      "driver_rule_count": 0,
+      "driver_rule_ids": [],
+      "expected_rule_ids": [
+        "elixir.binary-to-term-unsafe",
+        "elixir.code-eval-file",
+        "elixir.code-eval-string",
+        "elixir.crypto-md5",
+        "elixir.crypto-sha1",
+        "elixir.file-rm-rf",
+        "elixir.file-rm-rf-bang",
+        "elixir.io-inspect",
+        "elixir.io-puts",
+        "elixir.jason-decode-bang",
+        "elixir.kernel-exit",
+        "elixir.kernel-throw",
+        "elixir.node-spawn",
+        "elixir.poison-decode-bang",
+        "elixir.process-exit",
+        "elixir.process-sleep",
+        "elixir.repo-query",
+        "elixir.repo-query-bang",
+        "elixir.send-unhandled",
+        "elixir.spawn-link",
+        "elixir.spawn-unlinked",
+        "elixir.string-to-atom",
+        "elixir.string-to-existing-atom",
+        "elixir.system-cmd-shell",
+        "elixir.system-halt",
+        "elixir.system-shell"
+      ],
+      "fixture": "test-suite/elixir",
+      "label": "elixir-rule-pack",
+      "module": "ubs-elixir.sh",
+      "result_count": 299,
+      "result_rule_ids": [
+        "elixir.binary-to-term-unsafe",
+        "elixir.code-eval-file",
+        "elixir.code-eval-string",
+        "elixir.crypto-md5",
+        "elixir.crypto-sha1",
+        "elixir.file-rm-rf",
+        "elixir.file-rm-rf-bang",
+        "elixir.io-inspect",
+        "elixir.io-puts",
+        "elixir.jason-decode-bang",
+        "elixir.kernel-exit",
+        "elixir.kernel-throw",
+        "elixir.node-spawn",
+        "elixir.poison-decode-bang",
+        "elixir.process-exit",
+        "elixir.process-sleep",
+        "elixir.repo-query",
+        "elixir.repo-query-bang",
+        "elixir.send-unhandled",
+        "elixir.spawn-link",
+        "elixir.spawn-unlinked",
+        "elixir.string-to-atom",
+        "elixir.string-to-existing-atom",
+        "elixir.system-cmd-shell",
+        "elixir.system-halt",
+        "elixir.system-shell",
+        "elixir.taint.open_redirect",
+        "elixir.taint.request_path_traversal",
+        "ex.archive-extraction.path",
+        "ex.debug.io-inspect",
+        "ex.header-injection.response",
+        "ex.io.port-open-unmatched",
+        "ex.match.unguarded-heads",
+        "ex.otp.process-exit-kill",
+        "ex.otp.spawn-usage",
+        "ex.quality.missing-spec",
+        "ex.randomness.security-token",
+        "ex.secrets.hardcoded",
+        "ex.security.binary-to-term-unsafe",
+        "ex.security.code-eval",
+        "ex.security.shell-exec-critical",
+        "ex.security.shell-exec-review",
+        "ex.security.string-to-atom",
+        "ex.security.weak-hash",
+        "ex.ssrf.outbound-url"
       ],
       "sarif_runs": 1
     }
@@ -831,8 +1372,9 @@
         "--list-rules"
       ],
       "module": "ubs-golang.sh",
-      "rule_count": 64,
+      "rule_count": 65,
       "rule_ids": [
+        "go.async.goroutine-err-no-check",
         "go.blank-import",
         "go.close-error-ignored",
         "go.content-type-prefix-match",
@@ -905,12 +1447,32 @@
         "--list-rules"
       ],
       "module": "ubs-csharp.sh",
-      "rule_count": 4,
+      "rule_count": 24,
       "rule_ids": [
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",
         "cs-await-in-lock",
-        "cs-parallel-foreach-async-lambda"
+        "cs-binary-formatter",
+        "cs-console-writeline",
+        "cs-des-crypto",
+        "cs-empty-catch",
+        "cs-gc-collect",
+        "cs-goto-statement",
+        "cs-httpclient-instantiation",
+        "cs-md5-create",
+        "cs-new-thread",
+        "cs-parallel-foreach-async-lambda",
+        "cs-process-start",
+        "cs-rethrow-ex",
+        "cs-sha1-create",
+        "cs-task-delay-no-await",
+        "cs-task-getawaiter-getresult",
+        "cs-task-result-deadlock",
+        "cs-task-wait-blocking",
+        "cs-thread-sleep",
+        "cs-threadpool-queue",
+        "cs-weak-random",
+        "cs-xml-document"
       ]
     },
     {
@@ -920,85 +1482,159 @@
         "--list-rules"
       ],
       "module": "ubs-rust.sh",
-      "rule_count": 77,
+      "rule_count": 151,
       "rule_ids": [
-        "rust.arc-mutex",
-        "rust.assert-macros",
-        "rust.async.std-guard-across-await",
-        "rust.async.std-lock-in-async",
-        "rust.async.tokio-guard-across-await",
-        "rust.await-in-for",
-        "rust.block-on-in-async",
-        "rust.blocking-fs-in-async",
-        "rust.chars-nth",
-        "rust.clone-call",
-        "rust.clone-in-loop",
-        "rust.collect-then-for",
-        "rust.command.shell-c",
-        "rust.cstr-from-bytes-unchecked",
-        "rust.dbg-macro",
-        "rust.debug-assert-macros",
-        "rust.env-var-unwrap",
-        "rust.eprintln-macro",
-        "rust.expect-call",
-        "rust.fixme-comment",
-        "rust.format-literal-no-vars",
-        "rust.from-slice-panic",
-        "rust.from-utf8-unchecked",
-        "rust.get-unchecked",
-        "rust.i64-negate-overflow",
-        "rust.insecure-hash",
-        "rust.instant-now-elapsed",
-        "rust.instant-subtraction",
-        "rust.iter-nth-zero",
-        "rust.len-count-narrow-as",
-        "rust.map-clone",
-        "rust.maybeuninit-assume-init",
-        "rust.mem-forget",
-        "rust.mem-transmute",
-        "rust.mem-uninitialized",
-        "rust.mem-zeroed",
-        "rust.mutex-lock-expect",
-        "rust.mutex-lock-unwrap",
-        "rust.native-tls-danger",
-        "rust.openssl-no-verify",
-        "rust.panic-in-drop",
-        "rust.panic-macro",
-        "rust.parse-float-no-finite-check",
-        "rust.parse-unwrap",
-        "rust.plain-http-url",
-        "rust.println-macro",
-        "rust.ptr-cast",
-        "rust.rc-refcell",
-        "rust.regex-new-in-loop",
-        "rust.regex-new-unwrap",
-        "rust.reqwest-danger-accept",
-        "rust.resource.thread-no-join",
-        "rust.resource.tokio-task-no-await",
-        "rust.serde-json-unwrap",
-        "rust.slice-from-raw-parts",
-        "rust.strict-utf8",
-        "rust.suspicious-as-cast",
-        "rust.thread-sleep-in-async",
-        "rust.thread-spawn-in-async",
-        "rust.thread-spawn-no-join",
-        "rust.to-owned-to-string",
-        "rust.todo-comment",
-        "rust.todo-macro",
-        "rust.tokio-block-in-place",
-        "rust.tokio-spawn-no-handle",
-        "rust.tokio.spawn-no-move",
-        "rust.try-into-unwrap",
-        "rust.unimplemented-macro",
-        "rust.unreachable-macro",
-        "rust.unreachable-unchecked",
-        "rust.unsafe-auto-traits",
-        "rust.unsafe-block",
-        "rust.unwrap-call",
-        "rust.unwrap-in-drop",
-        "rust.unwrap-unchecked",
-        "rust.wrapping-arithmetic",
-        "rust.write-not-atomic"
+        "rust.ast.as_f32",
+        "rust.ast.as_f64",
+        "rust.ast.as_i16",
+        "rust.ast.as_i32",
+        "rust.ast.as_i64",
+        "rust.ast.as_i8",
+        "rust.ast.as_isize",
+        "rust.ast.as_u16",
+        "rust.ast.as_u32",
+        "rust.ast.as_u8",
+        "rust.ast.as_usize",
+        "rust.ast.assert",
+        "rust.ast.assert_eq",
+        "rust.ast.assert_ne",
+        "rust.ast.assume_init",
+        "rust.ast.await_in_for",
+        "rust.ast.chars_nth",
+        "rust.ast.chars_nth_back",
+        "rust.ast.clone",
+        "rust.ast.collect_vec",
+        "rust.ast.count_as_i16",
+        "rust.ast.count_as_i32",
+        "rust.ast.count_as_i8",
+        "rust.ast.count_as_u16",
+        "rust.ast.count_as_u32",
+        "rust.ast.count_as_u8",
+        "rust.ast.cstr_bare",
+        "rust.ast.cstr_std",
+        "rust.ast.dbg",
+        "rust.ast.debug_assert_macros",
+        "rust.ast.direct_index",
+        "rust.ast.env_std_var_expect",
+        "rust.ast.env_std_var_os_expect",
+        "rust.ast.env_std_var_os_unwrap",
+        "rust.ast.env_std_var_unwrap",
+        "rust.ast.env_var_expect",
+        "rust.ast.env_var_os_expect",
+        "rust.ast.env_var_os_unwrap",
+        "rust.ast.env_var_unwrap",
+        "rust.ast.eprintln",
+        "rust.ast.expect",
+        "rust.ast.forget_mem",
+        "rust.ast.forget_std",
+        "rust.ast.from_slice_panic",
+        "rust.ast.get_unchecked",
+        "rust.ast.get_unchecked_mut",
+        "rust.ast.http_url",
+        "rust.ast.i64_negate_overflow",
+        "rust.ast.instant_now_elapsed",
+        "rust.ast.instant_subtraction",
+        "rust.ast.len_as_i16",
+        "rust.ast.len_as_i32",
+        "rust.ast.len_as_i8",
+        "rust.ast.len_as_u16",
+        "rust.ast.len_as_u32",
+        "rust.ast.len_as_u8",
+        "rust.ast.lock_expect",
+        "rust.ast.lock_unwrap",
+        "rust.ast.map_clone",
+        "rust.ast.md5",
+        "rust.ast.nth0",
+        "rust.ast.panic",
+        "rust.ast.parse_expect",
+        "rust.ast.parse_float_no_finite_check",
+        "rust.ast.parse_tf_expect",
+        "rust.ast.parse_tf_unwrap",
+        "rust.ast.parse_unwrap",
+        "rust.ast.println",
+        "rust.ast.ptr_cast",
+        "rust.ast.raw_parts_slice",
+        "rust.ast.raw_parts_slice_mut",
+        "rust.ast.raw_parts_std",
+        "rust.ast.raw_parts_std_mut",
+        "rust.ast.regex_new_bare",
+        "rust.ast.regex_new_full",
+        "rust.ast.regex_new_unwrap",
+        "rust.ast.serde_json_from_slice_expect",
+        "rust.ast.serde_json_from_slice_unwrap",
+        "rust.ast.serde_json_from_str_expect",
+        "rust.ast.serde_json_from_str_unwrap",
+        "rust.ast.serde_json_from_value_expect",
+        "rust.ast.serde_json_from_value_unwrap",
+        "rust.ast.serde_yaml_from_str_expect",
+        "rust.ast.serde_yaml_from_str_unwrap",
+        "rust.ast.sha1",
+        "rust.ast.shell_arg_c",
+        "rust.ast.shell_arg_lc",
+        "rust.ast.shell_arg_wc",
+        "rust.ast.shell_arg_wcl",
+        "rust.ast.shell_args_c",
+        "rust.ast.shell_args_lc",
+        "rust.ast.shell_args_wc",
+        "rust.ast.shell_args_wcl",
+        "rust.ast.shell_argsref_c",
+        "rust.ast.shell_argsref_lc",
+        "rust.ast.shell_argsref_wc",
+        "rust.ast.shell_argsref_wcl",
+        "rust.ast.shell_std_arg_c",
+        "rust.ast.shell_std_arg_lc",
+        "rust.ast.shell_std_arg_wc",
+        "rust.ast.shell_std_arg_wcl",
+        "rust.ast.shell_std_args_c",
+        "rust.ast.shell_std_args_lc",
+        "rust.ast.shell_std_args_wc",
+        "rust.ast.shell_std_args_wcl",
+        "rust.ast.shell_std_argsref_c",
+        "rust.ast.shell_std_argsref_lc",
+        "rust.ast.shell_std_argsref_wc",
+        "rust.ast.shell_std_argsref_wcl",
+        "rust.ast.std_guard_await_expect",
+        "rust.ast.std_guard_await_unwrap",
+        "rust.ast.std_lock_async_lock",
+        "rust.ast.std_lock_async_read",
+        "rust.ast.std_lock_async_write",
+        "rust.ast.strict_utf8",
+        "rust.ast.tls_certs",
+        "rust.ast.tls_hostnames",
+        "rust.ast.to_owned_to_string",
+        "rust.ast.todo",
+        "rust.ast.tokio_block_in_place",
+        "rust.ast.tokio_guard_lock",
+        "rust.ast.tokio_guard_read",
+        "rust.ast.tokio_guard_write",
+        "rust.ast.tokio_spawn_no_move",
+        "rust.ast.toml_from_str_expect",
+        "rust.ast.toml_from_str_unwrap",
+        "rust.ast.transmute_bare",
+        "rust.ast.transmute_mem",
+        "rust.ast.transmute_std",
+        "rust.ast.try_into_expect",
+        "rust.ast.try_into_unwrap",
+        "rust.ast.unimplemented",
+        "rust.ast.uninit_mem",
+        "rust.ast.uninit_std",
+        "rust.ast.unreachable",
+        "rust.ast.unreachable_unchecked_core",
+        "rust.ast.unreachable_unchecked_std",
+        "rust.ast.unsafe_impl_send",
+        "rust.ast.unsafe_impl_sync",
+        "rust.ast.unwrap_unchecked",
+        "rust.ast.utf8_std",
+        "rust.ast.utf8_str",
+        "rust.ast.utf8_string",
+        "rust.ast.utf8_string_std",
+        "rust.ast.wrapping_arithmetic",
+        "rust.ast.write_not_atomic",
+        "rust.ast.zeroed_bare",
+        "rust.ast.zeroed_mem",
+        "rust.ast.zeroed_mem_t",
+        "rust.ast.zeroed_std",
+        "rust.ast.zeroed_std_t"
       ]
     },
     {
@@ -1007,8 +1643,29 @@
         "--list-rules"
       ],
       "module": "ubs-swift.sh",
-      "rule_count": 1,
+      "rule_count": 22,
       "rule_ids": [
+        "swift.abort-call",
+        "swift.assertion-failure",
+        "swift.debug-print",
+        "swift.dispatch-sync-main",
+        "swift.exit-call",
+        "swift.fatal-error",
+        "swift.force-cast",
+        "swift.force-try",
+        "swift.keyed-unarchiver",
+        "swift.md5-digest",
+        "swift.ns-assert",
+        "swift.precondition-failure",
+        "swift.print-call",
+        "swift.process-run",
+        "swift.sha1-digest",
+        "swift.task-sleep-blocking",
+        "swift.thread-sleep",
+        "swift.timer-scheduled",
+        "swift.unmanaged-pass-unretained",
+        "swift.unmanaged-take-unretained",
+        "swift.unsafe-bitcast",
         "swift.urlsession.task-no-resume"
       ]
     },
@@ -1018,7 +1675,7 @@
         "--list-rules"
       ],
       "module": "ubs-ruby.sh",
-      "rule_count": 28,
+      "rule_count": 29,
       "rule_ids": [
         "rails.constantize",
         "rails.csrf-skip",
@@ -1047,6 +1704,7 @@
         "rb.system-single-string",
         "rb.tempfile-no-block",
         "rb.yaml-unsafe",
+        "ruby.async.thread-no-rescue",
         "ruby.resource.thread-no-join"
       ]
     },
@@ -1056,8 +1714,10 @@
         "--list-rules"
       ],
       "module": "ubs-java.sh",
-      "rule_count": 34,
+      "rule_count": 37,
       "rule_ids": [
+        "java.async.future-get-no-try",
+        "java.async.then-no-exceptionally",
         "java.bigdecimal-equals",
         "java.closeable-no-twr",
         "java.executors-cached",
@@ -1084,6 +1744,7 @@
         "java.resource.resultset-no-close",
         "java.resource.statement-no-close",
         "java.resource.thread-no-join",
+        "java.secrets.string-decl",
         "java.string-bytes-no-charset",
         "java.string-eq-operator",
         "java.synchronized-this",
@@ -1093,6 +1754,42 @@
         "java.virtual-threads",
         "java.weak-hash"
       ]
+    },
+    {
+      "label": "elixir-rule-pack",
+      "list_args": [
+        "--list-rules"
+      ],
+      "module": "ubs-elixir.sh",
+      "rule_count": 26,
+      "rule_ids": [
+        "elixir.binary-to-term-unsafe",
+        "elixir.code-eval-file",
+        "elixir.code-eval-string",
+        "elixir.crypto-md5",
+        "elixir.crypto-sha1",
+        "elixir.file-rm-rf",
+        "elixir.file-rm-rf-bang",
+        "elixir.io-inspect",
+        "elixir.io-puts",
+        "elixir.jason-decode-bang",
+        "elixir.kernel-exit",
+        "elixir.kernel-throw",
+        "elixir.node-spawn",
+        "elixir.poison-decode-bang",
+        "elixir.process-exit",
+        "elixir.process-sleep",
+        "elixir.repo-query",
+        "elixir.repo-query-bang",
+        "elixir.send-unhandled",
+        "elixir.spawn-link",
+        "elixir.spawn-unlinked",
+        "elixir.string-to-atom",
+        "elixir.string-to-existing-atom",
+        "elixir.system-cmd-shell",
+        "elixir.system-halt",
+        "elixir.system-shell"
+      ]
     }
   ],
   "per_rule_validation": [
@@ -1101,24 +1798,66 @@
         "--dump-rules={rules_dir}"
       ],
       "fixture": "test-suite/js/buggy/security.js",
+      "generated_corpus_check": {
+        "config": [
+          "sgconfig-javascript.yml",
+          "sgconfig-typescript.yml",
+          "sgconfig-tsx.yml"
+        ],
+        "fixture": "test-suite/js",
+        "result_count": 202,
+        "result_rule_ids": [
+          "js.async.await-no-try",
+          "js.async.dangling-promise",
+          "js.async.promiseall-no-try",
+          "js.async.then-no-catch",
+          "js.document-write",
+          "js.dom.innerText-outerHTML",
+          "js.error.empty-catch",
+          "js.error.throw-string",
+          "js.eval-call",
+          "js.fetch.no-catch",
+          "js.fs.writeFileSync-not-atomic",
+          "js.innerHTML-assign",
+          "js.json-parse-without-try",
+          "js.nan-direct-compare",
+          "js.new-function",
+          "js.nullish-coalescing-chain",
+          "js.operator-precedence-ternary-nullish",
+          "js.parseInt-no-radix",
+          "js.react.useMemo-empty-deps",
+          "js.resource.interval-no-clear",
+          "js.resource.listener-no-remove",
+          "js.resource.observer-no-disconnect",
+          "js.taint.header-injection",
+          "js.tanstack.sortUndefined-direction",
+          "js.then-without-catch",
+          "node.child-process-exec",
+          "react.dangerously-set-html",
+          "react.list-missing-key",
+          "react.setstate-in-render",
+          "react.useeffect-missing-cleanup",
+          "security.cookie-insecure",
+          "security.env-in-client",
+          "security.http-url",
+          "security.insecure-crypto",
+          "security.insecure-crypto-params",
+          "security.insecure-random",
+          "ts.non-null-assertion-chain"
+        ]
+      },
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "rule_count": 40,
+      "rule_count": 107,
       "rules": [
         {
-          "file": "__variants-javascript.yml",
-          "id": "security.cookie-insecure",
-          "language": "javascript",
-          "match_count": 0
-        },
-        {
-          "file": "__variants-tsx.yml",
+          "file": "async-await-no-try.tsx.yml",
           "id": "js.async.await-no-try",
           "language": "tsx",
           "match_count": 0
         },
         {
-          "file": "__variants-typescript.yml",
+          "file": "async-await-no-try.typescript.yml",
           "id": "js.async.await-no-try",
           "language": "typescript",
           "match_count": 0
@@ -1130,9 +1869,33 @@
           "match_count": 0
         },
         {
+          "file": "async-dangling-promise.tsx.yml",
+          "id": "js.async.dangling-promise",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "async-dangling-promise.typescript.yml",
+          "id": "js.async.dangling-promise",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "async-dangling-promise.yml",
           "id": "js.async.dangling-promise",
           "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "async-promiseall-no-try.tsx.yml",
+          "id": "js.async.promiseall-no-try",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "async-promiseall-no-try.typescript.yml",
+          "id": "js.async.promiseall-no-try",
+          "language": "typescript",
           "match_count": 0
         },
         {
@@ -1142,14 +1905,50 @@
           "match_count": 0
         },
         {
+          "file": "async-then-no-catch.tsx.yml",
+          "id": "js.async.then-no-catch",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "async-then-no-catch.typescript.yml",
+          "id": "js.async.then-no-catch",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "async-then-no-catch.yml",
           "id": "js.async.then-no-catch",
           "language": "javascript",
           "match_count": 0
         },
         {
+          "file": "cookie-insecure.javascript.yml",
+          "id": "security.cookie-insecure",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "cookie-insecure.tsx.yml",
+          "id": "security.cookie-insecure",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "cookie-insecure.yml",
           "id": "security.cookie-insecure",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "document-write.tsx.yml",
+          "id": "js.document-write",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "document-write.typescript.yml",
+          "id": "js.document-write",
           "language": "typescript",
           "match_count": 0
         },
@@ -1160,8 +1959,32 @@
           "match_count": 0
         },
         {
+          "file": "env-leak.javascript.yml",
+          "id": "security.env-in-client",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "env-leak.tsx.yml",
+          "id": "security.env-in-client",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "env-leak.yml",
           "id": "security.env-in-client",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "error-empty-catch.tsx.yml",
+          "id": "js.error.empty-catch",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "error-empty-catch.typescript.yml",
+          "id": "js.error.empty-catch",
           "language": "typescript",
           "match_count": 0
         },
@@ -1172,9 +1995,33 @@
           "match_count": 0
         },
         {
+          "file": "error-throw-string.tsx.yml",
+          "id": "js.error.throw-string",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "error-throw-string.typescript.yml",
+          "id": "js.error.throw-string",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "error-throw-string.yml",
           "id": "js.error.throw-string",
           "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "eval-call.tsx.yml",
+          "id": "js.eval-call",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "eval-call.typescript.yml",
+          "id": "js.eval-call",
+          "language": "typescript",
           "match_count": 0
         },
         {
@@ -1184,9 +2031,33 @@
           "match_count": 1
         },
         {
+          "file": "fetch-no-catch.tsx.yml",
+          "id": "js.fetch.no-catch",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "fetch-no-catch.typescript.yml",
+          "id": "js.fetch.no-catch",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "fetch-no-catch.yml",
           "id": "js.fetch.no-catch",
           "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "header-taint.javascript.yml",
+          "id": "js.taint.header-injection",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "header-taint.tsx.yml",
+          "id": "js.taint.header-injection",
+          "language": "tsx",
           "match_count": 0
         },
         {
@@ -1196,8 +2067,32 @@
           "match_count": 0
         },
         {
+          "file": "http-url.javascript.yml",
+          "id": "security.http-url",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "http-url.tsx.yml",
+          "id": "security.http-url",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "http-url.yml",
           "id": "security.http-url",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "innerHTML-assign.tsx.yml",
+          "id": "js.innerHTML-assign",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "innerHTML-assign.typescript.yml",
+          "id": "js.innerHTML-assign",
           "language": "typescript",
           "match_count": 0
         },
@@ -1208,9 +2103,33 @@
           "match_count": 1
         },
         {
+          "file": "innerText-outerHTML.javascript.yml",
+          "id": "js.dom.innerText-outerHTML",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "innerText-outerHTML.tsx.yml",
+          "id": "js.dom.innerText-outerHTML",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "innerText-outerHTML.yml",
           "id": "js.dom.innerText-outerHTML",
           "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "insecure-crypto-params.javascript.yml",
+          "id": "security.insecure-crypto-params",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "insecure-crypto-params.tsx.yml",
+          "id": "security.insecure-crypto-params",
+          "language": "tsx",
           "match_count": 0
         },
         {
@@ -1220,9 +2139,33 @@
           "match_count": 0
         },
         {
+          "file": "insecure-crypto.javascript.yml",
+          "id": "security.insecure-crypto",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "insecure-crypto.tsx.yml",
+          "id": "security.insecure-crypto",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "insecure-crypto.yml",
           "id": "security.insecure-crypto",
           "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "insecure-random.javascript.yml",
+          "id": "security.insecure-random",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "insecure-random.tsx.yml",
+          "id": "security.insecure-random",
+          "language": "tsx",
           "match_count": 0
         },
         {
@@ -1232,9 +2175,33 @@
           "match_count": 0
         },
         {
+          "file": "js-non-atomic-write.javascript.yml",
+          "id": "js.fs.writeFileSync-not-atomic",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "js-non-atomic-write.tsx.yml",
+          "id": "js.fs.writeFileSync-not-atomic",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "js-non-atomic-write.yml",
           "id": "js.fs.writeFileSync-not-atomic",
           "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "js-nullish-chain.javascript.yml",
+          "id": "js.nullish-coalescing-chain",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "js-nullish-chain.tsx.yml",
+          "id": "js.nullish-coalescing-chain",
+          "language": "tsx",
           "match_count": 0
         },
         {
@@ -1244,8 +2211,32 @@
           "match_count": 0
         },
         {
+          "file": "js-operator-precedence-nullish.javascript.yml",
+          "id": "js.operator-precedence-ternary-nullish",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "js-operator-precedence-nullish.tsx.yml",
+          "id": "js.operator-precedence-ternary-nullish",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "js-operator-precedence-nullish.yml",
           "id": "js.operator-precedence-ternary-nullish",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "js-resource-add-listener.tsx.yml",
+          "id": "js.resource.listener-no-remove",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "js-resource-add-listener.typescript.yml",
+          "id": "js.resource.listener-no-remove",
           "language": "typescript",
           "match_count": 0
         },
@@ -1256,9 +2247,33 @@
           "match_count": 0
         },
         {
+          "file": "js-resource-interval.tsx.yml",
+          "id": "js.resource.interval-no-clear",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "js-resource-interval.typescript.yml",
+          "id": "js.resource.interval-no-clear",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "js-resource-interval.yml",
           "id": "js.resource.interval-no-clear",
           "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "js-resource-observer.tsx.yml",
+          "id": "js.resource.observer-no-disconnect",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "js-resource-observer.typescript.yml",
+          "id": "js.resource.observer-no-disconnect",
+          "language": "typescript",
           "match_count": 0
         },
         {
@@ -1268,14 +2283,50 @@
           "match_count": 0
         },
         {
+          "file": "js-sort-undefined.javascript.yml",
+          "id": "js.tanstack.sortUndefined-direction",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "js-sort-undefined.tsx.yml",
+          "id": "js.tanstack.sortUndefined-direction",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "js-sort-undefined.yml",
           "id": "js.tanstack.sortUndefined-direction",
           "language": "typescript",
           "match_count": 0
         },
         {
+          "file": "js-usememo-empty-deps.javascript.yml",
+          "id": "js.react.useMemo-empty-deps",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "js-usememo-empty-deps.tsx.yml",
+          "id": "js.react.useMemo-empty-deps",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "js-usememo-empty-deps.yml",
           "id": "js.react.useMemo-empty-deps",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "json-parse-without-try.tsx.yml",
+          "id": "js.json-parse-without-try",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "json-parse-without-try.typescript.yml",
+          "id": "js.json-parse-without-try",
           "language": "typescript",
           "match_count": 0
         },
@@ -1286,9 +2337,33 @@
           "match_count": 0
         },
         {
+          "file": "nan-direct-compare.tsx.yml",
+          "id": "js.nan-direct-compare",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "nan-direct-compare.typescript.yml",
+          "id": "js.nan-direct-compare",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "nan-direct-compare.yml",
           "id": "js.nan-direct-compare",
           "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "new-function.tsx.yml",
+          "id": "js.new-function",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "new-function.typescript.yml",
+          "id": "js.new-function",
+          "language": "typescript",
           "match_count": 0
         },
         {
@@ -1298,8 +2373,32 @@
           "match_count": 0
         },
         {
+          "file": "node-child-process.javascript.yml",
+          "id": "node.child-process-exec",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "node-child-process.tsx.yml",
+          "id": "node.child-process-exec",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
           "file": "node-child-process.yml",
           "id": "node.child-process-exec",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
+          "file": "parseInt-no-radix.tsx.yml",
+          "id": "js.parseInt-no-radix",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "parseInt-no-radix.typescript.yml",
+          "id": "js.parseInt-no-radix",
           "language": "typescript",
           "match_count": 0
         },
@@ -1310,9 +2409,21 @@
           "match_count": 0
         },
         {
+          "file": "react-dangerously-set-html.javascript.yml",
+          "id": "react.dangerously-set-html",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
           "file": "react-dangerously-set-html.yml",
           "id": "react.dangerously-set-html",
           "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "react-missing-key.javascript.yml",
+          "id": "react.list-missing-key",
+          "language": "javascript",
           "match_count": 0
         },
         {
@@ -1322,8 +2433,26 @@
           "match_count": 0
         },
         {
+          "file": "react-setstate-in-render.javascript.yml",
+          "id": "react.setstate-in-render",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
           "file": "react-setstate-in-render.yml",
           "id": "react.setstate-in-render",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "react-useeffect-cleanup.javascript.yml",
+          "id": "react.useeffect-missing-cleanup",
+          "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "react-useeffect-cleanup.tsx.yml",
+          "id": "react.useeffect-missing-cleanup",
           "language": "tsx",
           "match_count": 0
         },
@@ -1334,9 +2463,27 @@
           "match_count": 0
         },
         {
+          "file": "then-without-catch.tsx.yml",
+          "id": "js.then-without-catch",
+          "language": "tsx",
+          "match_count": 0
+        },
+        {
+          "file": "then-without-catch.typescript.yml",
+          "id": "js.then-without-catch",
+          "language": "typescript",
+          "match_count": 0
+        },
+        {
           "file": "then-without-catch.yml",
           "id": "js.then-without-catch",
           "language": "javascript",
+          "match_count": 0
+        },
+        {
+          "file": "ts-non-null-chain.tsx.yml",
+          "id": "ts.non-null-assertion-chain",
+          "language": "tsx",
           "match_count": 0
         },
         {
@@ -1354,7 +2501,7 @@
       "fixture": "test-suite/golang/buggy/security_sql.go",
       "label": "go-rule-pack",
       "module": "ubs-golang.sh",
-      "rule_count": 64,
+      "rule_count": 130,
       "rules": [
         {
           "file": "go-blank-import.yml",
@@ -1515,6 +2662,402 @@
         {
           "file": "go-tls-insecure-skip.yml",
           "id": "go.tls-insecure-skip",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.async.goroutine-err-no-check.yml",
+          "id": "go.async.goroutine-err-no-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.close-error-ignored.yml",
+          "id": "go.close-error-ignored",
+          "language": "go",
+          "match_count": 1
+        },
+        {
+          "file": "go.context.cancel-defer-before-err-check.yml",
+          "id": "go.context.cancel-defer-before-err-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.context.cancel-defer-in-if.yml",
+          "id": "go.context.cancel-defer-in-if",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.defer-close-before-err-check.yml",
+          "id": "go.defer-close-before-err-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.err-shadow.yml",
+          "id": "go.err-shadow",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.exec-command-without-context.yml",
+          "id": "go.exec-command-without-context",
+          "language": "go",
+          "match_count": 5
+        },
+        {
+          "file": "go.exec-strings-fields.yml",
+          "id": "go.exec-strings-fields",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.fmt.fprintf-error-ignored.yml",
+          "id": "go.fmt.fprintf-error-ignored",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http-client-close-idle-missing.yml",
+          "id": "go.http-client-close-idle-missing",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http-client-without-transport.yml",
+          "id": "go.http-client-without-transport",
+          "language": "go",
+          "match_count": 1
+        },
+        {
+          "file": "go.http-handler-background.yml",
+          "id": "go.http-handler-background",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http-newrequest-without-context.yml",
+          "id": "go.http-newrequest-without-context",
+          "language": "go",
+          "match_count": 1
+        },
+        {
+          "file": "go.http-response-body-not-closed.yml",
+          "id": "go.http-response-body-not-closed",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http-transport-missing-timeouts.yml",
+          "id": "go.http-transport-missing-timeouts",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http.defer-body-before-err-check.yml",
+          "id": "go.http.defer-body-before-err-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http.defer-body-close-delayed.yml",
+          "id": "go.http.defer-body-close-delayed",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.http.responsewriter-write-ignored.yml",
+          "id": "go.http.responsewriter-write-ignored",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.iferr-empty.yml",
+          "id": "go.iferr-empty",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.iferr-return-nil.yml",
+          "id": "go.iferr-return-nil",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.json.decoder-unbounded-body.yml",
+          "id": "go.json.decoder-unbounded-body",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.json.encode-error-ignored.yml",
+          "id": "go.json.encode-error-ignored",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.loop-var-capture-for.yml",
+          "id": "go.loop-var-capture-for",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.loop-var-capture.yml",
+          "id": "go.loop-var-capture",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.resource.timer-not-drained.yml",
+          "id": "go.resource.timer-not-drained",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.select-no-default.yml",
+          "id": "go.select-no-default",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql-dynamic-string.yml",
+          "id": "go.sql-dynamic-string",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.begin-without-defer-rollback.yml",
+          "id": "go.sql.begin-without-defer-rollback",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.defer-rollback-before-err-check.yml",
+          "id": "go.sql.defer-rollback-before-err-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.defer-rollback-delayed.yml",
+          "id": "go.sql.defer-rollback-delayed",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.defer-rows-close-before-err-check.yml",
+          "id": "go.sql.defer-rows-close-before-err-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.defer-rows-close-delayed.yml",
+          "id": "go.sql.defer-rows-close-delayed",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.rows-err-not-checked.yml",
+          "id": "go.sql.rows-err-not-checked",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.sql.rows-not-closed.yml",
+          "id": "go.sql.rows-not-closed",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.template.execute-error-ignored.yml",
+          "id": "go.template.execute-error-ignored",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.tls-minversion-missing.yml",
+          "id": "go.tls-minversion-missing",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.waitgroup-add-no-done.yml",
+          "id": "go.waitgroup-add-no-done",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.write-error-ignored.yml",
+          "id": "go.write-error-ignored",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-blank-import.yml",
+          "id": "go.blank-import",
+          "language": "go",
+          "match_count": 1
+        },
+        {
+          "file": "go-content-type-prefix.yml",
+          "id": "go.content-type-prefix-match",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-context-todo.yml",
+          "id": "go.context-todo",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-context-without-cancel.yml",
+          "id": "go.context-without-cancel",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-defer-in-loop.yml",
+          "id": "go.defer-in-loop",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-dot-import.yml",
+          "id": "go.dot-import",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-exec-sh-c.yml",
+          "id": "go.exec-sh-c",
+          "language": "go",
+          "match_count": 3
+        },
+        {
+          "file": "go-fmt-errorf-no-w.yml",
+          "id": "go.fmt-errorf-no-wrap",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-go-in-loop.yml",
+          "id": "go.goroutine-in-loop",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-http-client-without-timeout.yml",
+          "id": "go.http-client-without-timeout",
+          "language": "go",
+          "match_count": 1
+        },
+        {
+          "file": "go-http-default-client.yml",
+          "id": "go.http-default-client",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-http-server-no-timeouts.yml",
+          "id": "go.http-server-no-timeouts",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-interface-empty.yml",
+          "id": "go.interface-empty",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-ioutil.yml",
+          "id": "go.ioutil-deprecated",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-json-decode-no-limit.yml",
+          "id": "go.json-decode-no-limit",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-json-decode-without-disallow.yml",
+          "id": "go.json-decode-without-disallow",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-panic-call.yml",
+          "id": "go.panic-call",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-pgrep-unanchored.yml",
+          "id": "go.exec-pgrep-unanchored",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-recover-not-in-defer.yml",
+          "id": "go.recover-not-in-defer",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-remove-no-err.yml",
+          "id": "go.os-remove-no-error-check",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-resource-ticker.yml",
+          "id": "go.resource.ticker-no-stop",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-resource-timer.yml",
+          "id": "go.resource.timer-no-stop",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-sort-slice-param.yml",
+          "id": "go.sort-slice-mutates",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-sync-before-remove.yml",
+          "id": "go.missing-sync-before-remove",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-time-after-in-loop.yml",
+          "id": "go.time-after-in-loop",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-time-tick.yml",
+          "id": "go.time-tick",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go-tls-insecure-skip.yml",
+          "id": "go.tls-insecure-skip",
+          "language": "go",
+          "match_count": 0
+        },
+        {
+          "file": "go.async.goroutine-err-no-check.yml",
+          "id": "go.async.goroutine-err-no-check",
           "language": "go",
           "match_count": 0
         },
@@ -1750,7 +3293,7 @@
       "fixture": "test-suite/csharp/buggy/AstRulePackBuggy.cs",
       "label": "csharp-rule-pack",
       "module": "ubs-csharp.sh",
-      "rule_count": 4,
+      "rule_count": 24,
       "rules": [
         {
           "file": "cs-async-discarded-startnew.yml",
@@ -1771,8 +3314,128 @@
           "match_count": 1
         },
         {
+          "file": "cs-binary-formatter.yml",
+          "id": "cs-binary-formatter",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-console-writeline.yml",
+          "id": "cs-console-writeline",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-des-crypto.yml",
+          "id": "cs-des-crypto",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-empty-catch.yml",
+          "id": "cs-empty-catch",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-gc-collect.yml",
+          "id": "cs-gc-collect",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-goto-statement.yml",
+          "id": "cs-goto-statement",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-httpclient-instantiation.yml",
+          "id": "cs-httpclient-instantiation",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-md5-create.yml",
+          "id": "cs-md5-create",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-new-thread.yml",
+          "id": "cs-new-thread",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
           "file": "cs-parallel-foreach-async-lambda.yml",
           "id": "cs-parallel-foreach-async-lambda",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-process-start.yml",
+          "id": "cs-process-start",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-rethrow-ex.yml",
+          "id": "cs-rethrow-ex",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-sha1-create.yml",
+          "id": "cs-sha1-create",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-task-delay-no-await.yml",
+          "id": "cs-task-delay-no-await",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-task-getawaiter-getresult.yml",
+          "id": "cs-task-getawaiter-getresult",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-task-result-deadlock.yml",
+          "id": "cs-task-result-deadlock",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-task-wait-blocking.yml",
+          "id": "cs-task-wait-blocking",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-thread-sleep.yml",
+          "id": "cs-thread-sleep",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-threadpool-queue.yml",
+          "id": "cs-threadpool-queue",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-weak-random.yml",
+          "id": "cs-weak-random",
+          "language": "csharp",
+          "match_count": 1
+        },
+        {
+          "file": "cs-xml-document.yml",
+          "id": "cs-xml-document",
           "language": "csharp",
           "match_count": 1
         }
@@ -1781,472 +3444,1075 @@
     {
       "dump_args": [
         "--no-cargo",
-        "--dump-rules={rules_dir}"
+        "--dump-rules={rules_dir}",
+        "--list-rules"
       ],
       "fixture": "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs",
+      "generated_corpus_check": {
+        "config": "sgconfig-rust.yml",
+        "fixture": "test-suite/rust",
+        "result_count": 326,
+        "result_rule_ids": [
+          "rust.ast.as_f32",
+          "rust.ast.as_f64",
+          "rust.ast.as_i16",
+          "rust.ast.as_i32",
+          "rust.ast.as_i64",
+          "rust.ast.as_i8",
+          "rust.ast.as_isize",
+          "rust.ast.as_u16",
+          "rust.ast.as_u32",
+          "rust.ast.as_u8",
+          "rust.ast.as_usize",
+          "rust.ast.assert",
+          "rust.ast.assert_eq",
+          "rust.ast.assert_ne",
+          "rust.ast.assume_init",
+          "rust.ast.await_in_for",
+          "rust.ast.chars_nth",
+          "rust.ast.chars_nth_back",
+          "rust.ast.clone",
+          "rust.ast.collect_vec",
+          "rust.ast.count_as_i16",
+          "rust.ast.count_as_i32",
+          "rust.ast.count_as_i8",
+          "rust.ast.count_as_u16",
+          "rust.ast.count_as_u32",
+          "rust.ast.count_as_u8",
+          "rust.ast.cstr_bare",
+          "rust.ast.cstr_std",
+          "rust.ast.dbg",
+          "rust.ast.debug_assert_macros",
+          "rust.ast.direct_index",
+          "rust.ast.env_std_var_expect",
+          "rust.ast.env_std_var_os_expect",
+          "rust.ast.env_std_var_os_unwrap",
+          "rust.ast.env_std_var_unwrap",
+          "rust.ast.env_var_expect",
+          "rust.ast.env_var_os_expect",
+          "rust.ast.env_var_os_unwrap",
+          "rust.ast.env_var_unwrap",
+          "rust.ast.eprintln",
+          "rust.ast.expect",
+          "rust.ast.forget_mem",
+          "rust.ast.forget_std",
+          "rust.ast.from_slice_panic",
+          "rust.ast.get_unchecked",
+          "rust.ast.get_unchecked_mut",
+          "rust.ast.http_url",
+          "rust.ast.i64_negate_overflow",
+          "rust.ast.instant_now_elapsed",
+          "rust.ast.instant_subtraction",
+          "rust.ast.len_as_i16",
+          "rust.ast.len_as_i32",
+          "rust.ast.len_as_i8",
+          "rust.ast.len_as_u16",
+          "rust.ast.len_as_u32",
+          "rust.ast.len_as_u8",
+          "rust.ast.lock_expect",
+          "rust.ast.lock_unwrap",
+          "rust.ast.map_clone",
+          "rust.ast.md5",
+          "rust.ast.nth0",
+          "rust.ast.panic",
+          "rust.ast.parse_expect",
+          "rust.ast.parse_float_no_finite_check",
+          "rust.ast.parse_tf_expect",
+          "rust.ast.parse_tf_unwrap",
+          "rust.ast.parse_unwrap",
+          "rust.ast.println",
+          "rust.ast.ptr_cast",
+          "rust.ast.raw_parts_slice",
+          "rust.ast.raw_parts_slice_mut",
+          "rust.ast.raw_parts_std",
+          "rust.ast.raw_parts_std_mut",
+          "rust.ast.regex_new_bare",
+          "rust.ast.regex_new_full",
+          "rust.ast.regex_new_unwrap",
+          "rust.ast.serde_json_from_slice_expect",
+          "rust.ast.serde_json_from_slice_unwrap",
+          "rust.ast.serde_json_from_str_expect",
+          "rust.ast.serde_json_from_str_unwrap",
+          "rust.ast.serde_json_from_value_expect",
+          "rust.ast.serde_json_from_value_unwrap",
+          "rust.ast.serde_yaml_from_str_expect",
+          "rust.ast.serde_yaml_from_str_unwrap",
+          "rust.ast.sha1",
+          "rust.ast.shell_arg_c",
+          "rust.ast.shell_arg_lc",
+          "rust.ast.shell_arg_wc",
+          "rust.ast.shell_arg_wcl",
+          "rust.ast.shell_args_c",
+          "rust.ast.shell_args_lc",
+          "rust.ast.shell_args_wc",
+          "rust.ast.shell_args_wcl",
+          "rust.ast.shell_argsref_c",
+          "rust.ast.shell_argsref_lc",
+          "rust.ast.shell_argsref_wc",
+          "rust.ast.shell_argsref_wcl",
+          "rust.ast.shell_std_arg_c",
+          "rust.ast.shell_std_arg_lc",
+          "rust.ast.shell_std_arg_wc",
+          "rust.ast.shell_std_arg_wcl",
+          "rust.ast.shell_std_args_c",
+          "rust.ast.shell_std_args_lc",
+          "rust.ast.shell_std_args_wc",
+          "rust.ast.shell_std_args_wcl",
+          "rust.ast.shell_std_argsref_c",
+          "rust.ast.shell_std_argsref_lc",
+          "rust.ast.shell_std_argsref_wc",
+          "rust.ast.shell_std_argsref_wcl",
+          "rust.ast.std_guard_await_expect",
+          "rust.ast.std_guard_await_unwrap",
+          "rust.ast.std_lock_async_lock",
+          "rust.ast.std_lock_async_read",
+          "rust.ast.std_lock_async_write",
+          "rust.ast.strict_utf8",
+          "rust.ast.tls_certs",
+          "rust.ast.tls_hostnames",
+          "rust.ast.to_owned_to_string",
+          "rust.ast.todo",
+          "rust.ast.tokio_block_in_place",
+          "rust.ast.tokio_guard_lock",
+          "rust.ast.tokio_guard_read",
+          "rust.ast.tokio_guard_write",
+          "rust.ast.tokio_spawn_no_move",
+          "rust.ast.toml_from_str_expect",
+          "rust.ast.toml_from_str_unwrap",
+          "rust.ast.transmute_bare",
+          "rust.ast.transmute_mem",
+          "rust.ast.transmute_std",
+          "rust.ast.try_into_expect",
+          "rust.ast.try_into_unwrap",
+          "rust.ast.unimplemented",
+          "rust.ast.uninit_mem",
+          "rust.ast.uninit_std",
+          "rust.ast.unreachable",
+          "rust.ast.unreachable_unchecked_core",
+          "rust.ast.unreachable_unchecked_std",
+          "rust.ast.unsafe_impl_send",
+          "rust.ast.unsafe_impl_sync",
+          "rust.ast.unwrap_unchecked",
+          "rust.ast.utf8_std",
+          "rust.ast.utf8_str",
+          "rust.ast.utf8_string",
+          "rust.ast.utf8_string_std",
+          "rust.ast.wrapping_arithmetic",
+          "rust.ast.write_not_atomic",
+          "rust.ast.zeroed_bare",
+          "rust.ast.zeroed_mem",
+          "rust.ast.zeroed_mem_t",
+          "rust.ast.zeroed_std",
+          "rust.ast.zeroed_std_t"
+        ]
+      },
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "rule_count": 77,
+      "rule_count": 151,
       "rules": [
         {
-          "file": "arc-mutex.yml",
-          "id": "rust.arc-mutex",
+          "file": "as_f32.yml",
+          "id": "rust.ast.as_f32",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "assert-macros.yml",
-          "id": "rust.assert-macros",
+          "file": "as_f64.yml",
+          "id": "rust.ast.as_f64",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "as_i16.yml",
+          "id": "rust.ast.as_i16",
+          "language": "rust",
+          "match_count": 4
+        },
+        {
+          "file": "as_i32.yml",
+          "id": "rust.ast.as_i32",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "await-in-for.yml",
-          "id": "rust.await-in-for",
+          "file": "as_i64.yml",
+          "id": "rust.ast.as_i64",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "as_i8.yml",
+          "id": "rust.ast.as_i8",
+          "language": "rust",
+          "match_count": 3
+        },
+        {
+          "file": "as_isize.yml",
+          "id": "rust.ast.as_isize",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "block-on-in-async.yml",
-          "id": "rust.block-on-in-async",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "casts-as.yml",
-          "id": "rust.suspicious-as-cast",
-          "language": "rust",
-          "match_count": 8
-        },
-        {
-          "file": "chars-nth.yml",
-          "id": "rust.chars-nth",
+          "file": "as_u16.yml",
+          "id": "rust.ast.as_u16",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "clone-any.yml",
-          "id": "rust.clone-call",
+          "file": "as_u32.yml",
+          "id": "rust.ast.as_u32",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "clone-in-loop.yml",
-          "id": "rust.clone-in-loop",
+          "file": "as_u8.yml",
+          "id": "rust.ast.as_u8",
           "language": "rust",
-          "match_count": 2
+          "match_count": 5
         },
         {
-          "file": "collect-vec-for.yml",
-          "id": "rust.collect-then-for",
+          "file": "as_usize.yml",
+          "id": "rust.ast.as_usize",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "command-shell-c.yml",
-          "id": "rust.command.shell-c",
+          "file": "assert.yml",
+          "id": "rust.ast.assert",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "assert_eq.yml",
+          "id": "rust.ast.assert_eq",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "assert_ne.yml",
+          "id": "rust.ast.assert_ne",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "assume_init.yml",
+          "id": "rust.ast.assume_init",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "await_in_for.yml",
+          "id": "rust.ast.await_in_for",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "chars_nth.yml",
+          "id": "rust.ast.chars_nth",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "cstr-unchecked.yml",
-          "id": "rust.cstr-from-bytes-unchecked",
+          "file": "chars_nth_back.yml",
+          "id": "rust.ast.chars_nth_back",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "clone.yml",
+          "id": "rust.ast.clone",
+          "language": "rust",
+          "match_count": 4
+        },
+        {
+          "file": "collect_vec.yml",
+          "id": "rust.ast.collect_vec",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "count_as_i16.yml",
+          "id": "rust.ast.count_as_i16",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "count_as_i32.yml",
+          "id": "rust.ast.count_as_i32",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "count_as_i8.yml",
+          "id": "rust.ast.count_as_i8",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "count_as_u16.yml",
+          "id": "rust.ast.count_as_u16",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "count_as_u32.yml",
+          "id": "rust.ast.count_as_u32",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "count_as_u8.yml",
+          "id": "rust.ast.count_as_u8",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "cstr_bare.yml",
+          "id": "rust.ast.cstr_bare",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "cstr_std.yml",
+          "id": "rust.ast.cstr_std",
           "language": "rust",
           "match_count": 1
         },
         {
           "file": "dbg.yml",
-          "id": "rust.dbg-macro",
+          "id": "rust.ast.dbg",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "debug-assert-macros.yml",
-          "id": "rust.debug-assert-macros",
+          "file": "debug_assert_macros.yml",
+          "id": "rust.ast.debug_assert_macros",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "env-var-unwrap.yml",
-          "id": "rust.env-var-unwrap",
+          "file": "direct_index.yml",
+          "id": "rust.ast.direct_index",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_std_var_expect.yml",
+          "id": "rust.ast.env_std_var_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_std_var_os_expect.yml",
+          "id": "rust.ast.env_std_var_os_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_std_var_os_unwrap.yml",
+          "id": "rust.ast.env_std_var_os_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_std_var_unwrap.yml",
+          "id": "rust.ast.env_std_var_unwrap",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "env_var_expect.yml",
+          "id": "rust.ast.env_var_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_var_os_expect.yml",
+          "id": "rust.ast.env_var_os_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_var_os_unwrap.yml",
+          "id": "rust.ast.env_var_os_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "env_var_unwrap.yml",
+          "id": "rust.ast.env_var_unwrap",
           "language": "rust",
           "match_count": 1
         },
         {
           "file": "eprintln.yml",
-          "id": "rust.eprintln-macro",
+          "id": "rust.ast.eprintln",
           "language": "rust",
           "match_count": 1
         },
         {
           "file": "expect.yml",
-          "id": "rust.expect-call",
+          "id": "rust.ast.expect",
+          "language": "rust",
+          "match_count": 15
+        },
+        {
+          "file": "forget_mem.yml",
+          "id": "rust.ast.forget_mem",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "forget_std.yml",
+          "id": "rust.ast.forget_std",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "from_slice_panic.yml",
+          "id": "rust.ast.from_slice_panic",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "fixme-comment.yml",
-          "id": "rust.fixme-comment",
-          "language": "rust",
-          "match_count": 3
-        },
-        {
-          "file": "forget.yml",
-          "id": "rust.mem-forget",
+          "file": "get_unchecked.yml",
+          "id": "rust.ast.get_unchecked",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "format-literal.yml",
-          "id": "rust.format-literal-no-vars",
+          "file": "get_unchecked_mut.yml",
+          "id": "rust.ast.get_unchecked_mut",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "from-slice-panic.yml",
-          "id": "rust.from-slice-panic",
+          "file": "http_url.yml",
+          "id": "rust.ast.http_url",
           "language": "rust",
-          "match_count": 3
+          "match_count": 1
         },
         {
-          "file": "fs-in-async.yml",
-          "id": "rust.blocking-fs-in-async",
+          "file": "i64_negate_overflow.yml",
+          "id": "rust.ast.i64_negate_overflow",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "get-unchecked.yml",
-          "id": "rust.get-unchecked",
+          "file": "instant_now_elapsed.yml",
+          "id": "rust.ast.instant_now_elapsed",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "instant_subtraction.yml",
+          "id": "rust.ast.instant_subtraction",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "len_as_i16.yml",
+          "id": "rust.ast.len_as_i16",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "len_as_i32.yml",
+          "id": "rust.ast.len_as_i32",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "len_as_i8.yml",
+          "id": "rust.ast.len_as_i8",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "len_as_u16.yml",
+          "id": "rust.ast.len_as_u16",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "len_as_u32.yml",
+          "id": "rust.ast.len_as_u32",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "len_as_u8.yml",
+          "id": "rust.ast.len_as_u8",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "http-url.yml",
-          "id": "rust.plain-http-url",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "i64-negate-overflow.yml",
-          "id": "rust.i64-negate-overflow",
+          "file": "lock_expect.yml",
+          "id": "rust.ast.lock_expect",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "instant-now-elapsed.yml",
-          "id": "rust.instant-now-elapsed",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "instant-subtraction-panic.yml",
-          "id": "rust.instant-subtraction",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "len-count-narrow-as.yml",
-          "id": "rust.len-count-narrow-as",
+          "file": "lock_unwrap.yml",
+          "id": "rust.ast.lock_unwrap",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "lock-expect.yml",
-          "id": "rust.mutex-lock-expect",
+          "file": "map_clone.yml",
+          "id": "rust.ast.map_clone",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "lock-unwrap.yml",
-          "id": "rust.mutex-lock-unwrap",
+          "file": "md5.yml",
+          "id": "rust.ast.md5",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "map-clone.yml",
-          "id": "rust.map-clone",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "maybeuninit-assume-init.yml",
-          "id": "rust.maybeuninit-assume-init",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "md5-sha1.yml",
-          "id": "rust.insecure-hash",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "native-tls-danger.yml",
-          "id": "rust.native-tls-danger",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "nth-zero.yml",
-          "id": "rust.iter-nth-zero",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "openssl-no-verify.yml",
-          "id": "rust.openssl-no-verify",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "panic-in-drop.yml",
-          "id": "rust.panic-in-drop",
+          "file": "nth0.yml",
+          "id": "rust.ast.nth0",
           "language": "rust",
           "match_count": 1
         },
         {
           "file": "panic.yml",
-          "id": "rust.panic-macro",
+          "id": "rust.ast.panic",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "parse-float-no-finite-check.yml",
-          "id": "rust.parse-float-no-finite-check",
+          "file": "parse_expect.yml",
+          "id": "rust.ast.parse_expect",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "parse-unwrap.yml",
-          "id": "rust.parse-unwrap",
+          "file": "parse_float_no_finite_check.yml",
+          "id": "rust.ast.parse_float_no_finite_check",
           "language": "rust",
-          "match_count": 2
+          "match_count": 1
+        },
+        {
+          "file": "parse_tf_expect.yml",
+          "id": "rust.ast.parse_tf_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "parse_tf_unwrap.yml",
+          "id": "rust.ast.parse_tf_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "parse_unwrap.yml",
+          "id": "rust.ast.parse_unwrap",
+          "language": "rust",
+          "match_count": 1
         },
         {
           "file": "println.yml",
-          "id": "rust.println-macro",
+          "id": "rust.ast.println",
           "language": "rust",
           "match_count": 4
         },
         {
-          "file": "ptr-cast.yml",
-          "id": "rust.ptr-cast",
+          "file": "ptr_cast.yml",
+          "id": "rust.ast.ptr_cast",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "raw-parts.yml",
-          "id": "rust.slice-from-raw-parts",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "rc-refcell.yml",
-          "id": "rust.rc-refcell",
+          "file": "raw_parts_slice.yml",
+          "id": "rust.ast.raw_parts_slice",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "regex-new-in-loop.yml",
-          "id": "rust.regex-new-in-loop",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "regex-new-unwrap.yml",
-          "id": "rust.regex-new-unwrap",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "reqwest-insecure.yml",
-          "id": "rust.reqwest-danger-accept",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "rust.resource-thread.yml",
-          "id": "rust.resource.thread-no-join",
+          "file": "raw_parts_slice_mut.yml",
+          "id": "rust.ast.raw_parts_slice_mut",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "rust.resource-tokio-task.yml",
-          "id": "rust.resource.tokio-task-no-await",
+          "file": "raw_parts_std.yml",
+          "id": "rust.ast.raw_parts_std",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "serde-json-unwrap.yml",
-          "id": "rust.serde-json-unwrap",
+          "file": "raw_parts_std_mut.yml",
+          "id": "rust.ast.raw_parts_std_mut",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "sleep-in-async.yml",
-          "id": "rust.thread-sleep-in-async",
+          "file": "regex_new_bare.yml",
+          "id": "rust.ast.regex_new_bare",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "spawn-no-join.yml",
-          "id": "rust.thread-spawn-no-join",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "std-guard-across-await.yml",
-          "id": "rust.async.std-guard-across-await",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "std-lock-in-async.yml",
-          "id": "rust.async.std-lock-in-async",
-          "language": "rust",
-          "match_count": 5
-        },
-        {
-          "file": "strict-utf8.yml",
-          "id": "rust.strict-utf8",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "thread-spawn-in-async.yml",
-          "id": "rust.thread-spawn-in-async",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "to-owned-to-string.yml",
-          "id": "rust.to-owned-to-string",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "todo-comment.yml",
-          "id": "rust.todo-comment",
+          "file": "regex_new_full.yml",
+          "id": "rust.ast.regex_new_full",
           "language": "rust",
           "match_count": 3
+        },
+        {
+          "file": "regex_new_unwrap.yml",
+          "id": "rust.ast.regex_new_unwrap",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "serde_json_from_slice_expect.yml",
+          "id": "rust.ast.serde_json_from_slice_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_json_from_slice_unwrap.yml",
+          "id": "rust.ast.serde_json_from_slice_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_json_from_str_expect.yml",
+          "id": "rust.ast.serde_json_from_str_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_json_from_str_unwrap.yml",
+          "id": "rust.ast.serde_json_from_str_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_json_from_value_expect.yml",
+          "id": "rust.ast.serde_json_from_value_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_json_from_value_unwrap.yml",
+          "id": "rust.ast.serde_json_from_value_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_yaml_from_str_expect.yml",
+          "id": "rust.ast.serde_yaml_from_str_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "serde_yaml_from_str_unwrap.yml",
+          "id": "rust.ast.serde_yaml_from_str_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "sha1.yml",
+          "id": "rust.ast.sha1",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_arg_c.yml",
+          "id": "rust.ast.shell_arg_c",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_arg_lc.yml",
+          "id": "rust.ast.shell_arg_lc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_arg_wc.yml",
+          "id": "rust.ast.shell_arg_wc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_arg_wcl.yml",
+          "id": "rust.ast.shell_arg_wcl",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_args_c.yml",
+          "id": "rust.ast.shell_args_c",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_args_lc.yml",
+          "id": "rust.ast.shell_args_lc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_args_wc.yml",
+          "id": "rust.ast.shell_args_wc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_args_wcl.yml",
+          "id": "rust.ast.shell_args_wcl",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_argsref_c.yml",
+          "id": "rust.ast.shell_argsref_c",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_argsref_lc.yml",
+          "id": "rust.ast.shell_argsref_lc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_argsref_wc.yml",
+          "id": "rust.ast.shell_argsref_wc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_argsref_wcl.yml",
+          "id": "rust.ast.shell_argsref_wcl",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_arg_c.yml",
+          "id": "rust.ast.shell_std_arg_c",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_arg_lc.yml",
+          "id": "rust.ast.shell_std_arg_lc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_arg_wc.yml",
+          "id": "rust.ast.shell_std_arg_wc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_arg_wcl.yml",
+          "id": "rust.ast.shell_std_arg_wcl",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_args_c.yml",
+          "id": "rust.ast.shell_std_args_c",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_args_lc.yml",
+          "id": "rust.ast.shell_std_args_lc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_args_wc.yml",
+          "id": "rust.ast.shell_std_args_wc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_args_wcl.yml",
+          "id": "rust.ast.shell_std_args_wcl",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_argsref_c.yml",
+          "id": "rust.ast.shell_std_argsref_c",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_argsref_lc.yml",
+          "id": "rust.ast.shell_std_argsref_lc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_argsref_wc.yml",
+          "id": "rust.ast.shell_std_argsref_wc",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "shell_std_argsref_wcl.yml",
+          "id": "rust.ast.shell_std_argsref_wcl",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "std_guard_await_expect.yml",
+          "id": "rust.ast.std_guard_await_expect",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "std_guard_await_unwrap.yml",
+          "id": "rust.ast.std_guard_await_unwrap",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "std_lock_async_lock.yml",
+          "id": "rust.ast.std_lock_async_lock",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "std_lock_async_read.yml",
+          "id": "rust.ast.std_lock_async_read",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "std_lock_async_write.yml",
+          "id": "rust.ast.std_lock_async_write",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "strict_utf8.yml",
+          "id": "rust.ast.strict_utf8",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "tls_certs.yml",
+          "id": "rust.ast.tls_certs",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "tls_hostnames.yml",
+          "id": "rust.ast.tls_hostnames",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "to_owned_to_string.yml",
+          "id": "rust.ast.to_owned_to_string",
+          "language": "rust",
+          "match_count": 1
         },
         {
           "file": "todo.yml",
-          "id": "rust.todo-macro",
+          "id": "rust.ast.todo",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "tokio-blocking.yml",
-          "id": "rust.tokio-block-in-place",
+          "file": "tokio_block_in_place.yml",
+          "id": "rust.ast.tokio_block_in_place",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "tokio-guard-across-await.yml",
-          "id": "rust.async.tokio-guard-across-await",
-          "language": "rust",
-          "match_count": 1
-        },
-        {
-          "file": "tokio-spawn-no-handle.yml",
-          "id": "rust.tokio-spawn-no-handle",
+          "file": "tokio_guard_lock.yml",
+          "id": "rust.ast.tokio_guard_lock",
           "language": "rust",
           "match_count": 2
         },
         {
-          "file": "tokio-spawn-no-move.yml",
-          "id": "rust.tokio.spawn-no-move",
+          "file": "tokio_guard_read.yml",
+          "id": "rust.ast.tokio_guard_read",
+          "language": "rust",
+          "match_count": 2
+        },
+        {
+          "file": "tokio_guard_write.yml",
+          "id": "rust.ast.tokio_guard_write",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "transmute.yml",
-          "id": "rust.mem-transmute",
+          "file": "tokio_spawn_no_move.yml",
+          "id": "rust.ast.tokio_spawn_no_move",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "try-into-unwrap.yml",
-          "id": "rust.try-into-unwrap",
+          "file": "toml_from_str_expect.yml",
+          "id": "rust.ast.toml_from_str_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "toml_from_str_unwrap.yml",
+          "id": "rust.ast.toml_from_str_unwrap",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "transmute_bare.yml",
+          "id": "rust.ast.transmute_bare",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "transmute_mem.yml",
+          "id": "rust.ast.transmute_mem",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "transmute_std.yml",
+          "id": "rust.ast.transmute_std",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "try_into_expect.yml",
+          "id": "rust.ast.try_into_expect",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "try_into_unwrap.yml",
+          "id": "rust.ast.try_into_unwrap",
           "language": "rust",
           "match_count": 1
         },
         {
           "file": "unimplemented.yml",
-          "id": "rust.unimplemented-macro",
+          "id": "rust.ast.unimplemented",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "uninitialized.yml",
-          "id": "rust.mem-uninitialized",
+          "file": "uninit_mem.yml",
+          "id": "rust.ast.uninit_mem",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "unreachable-unchecked.yml",
-          "id": "rust.unreachable-unchecked",
+          "file": "uninit_std.yml",
+          "id": "rust.ast.uninit_std",
           "language": "rust",
           "match_count": 1
         },
         {
           "file": "unreachable.yml",
-          "id": "rust.unreachable-macro",
+          "id": "rust.ast.unreachable",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "unsafe-block.yml",
-          "id": "rust.unsafe-block",
+          "file": "unreachable_unchecked_core.yml",
+          "id": "rust.ast.unreachable_unchecked_core",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "unsafe-send-sync.yml",
-          "id": "rust.unsafe-auto-traits",
-          "language": "rust",
-          "match_count": 2
-        },
-        {
-          "file": "unwrap-in-drop.yml",
-          "id": "rust.unwrap-in-drop",
+          "file": "unreachable_unchecked_std.yml",
+          "id": "rust.ast.unreachable_unchecked_std",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "unwrap-unchecked.yml",
-          "id": "rust.unwrap-unchecked",
+          "file": "unsafe_impl_send.yml",
+          "id": "rust.ast.unsafe_impl_send",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "unwrap.yml",
-          "id": "rust.unwrap-call",
+          "file": "unsafe_impl_sync.yml",
+          "id": "rust.ast.unsafe_impl_sync",
           "language": "rust",
-          "match_count": 14
+          "match_count": 1
         },
         {
-          "file": "utf8-unchecked.yml",
-          "id": "rust.from-utf8-unchecked",
+          "file": "unwrap_unchecked.yml",
+          "id": "rust.ast.unwrap_unchecked",
           "language": "rust",
-          "match_count": 2
+          "match_count": 1
         },
         {
-          "file": "wrapping-arithmetic.yml",
-          "id": "rust.wrapping-arithmetic",
+          "file": "utf8_std.yml",
+          "id": "rust.ast.utf8_std",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "utf8_str.yml",
+          "id": "rust.ast.utf8_str",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "utf8_string.yml",
+          "id": "rust.ast.utf8_string",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "utf8_string_std.yml",
+          "id": "rust.ast.utf8_string_std",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "wrapping_arithmetic.yml",
+          "id": "rust.ast.wrapping_arithmetic",
           "language": "rust",
           "match_count": 3
         },
         {
-          "file": "write-not-atomic.yml",
-          "id": "rust.write-not-atomic",
+          "file": "write_not_atomic.yml",
+          "id": "rust.ast.write_not_atomic",
           "language": "rust",
           "match_count": 1
         },
         {
-          "file": "zeroed.yml",
-          "id": "rust.mem-zeroed",
+          "file": "zeroed_bare.yml",
+          "id": "rust.ast.zeroed_bare",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "zeroed_mem.yml",
+          "id": "rust.ast.zeroed_mem",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "zeroed_mem_t.yml",
+          "id": "rust.ast.zeroed_mem_t",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "zeroed_std.yml",
+          "id": "rust.ast.zeroed_std",
+          "language": "rust",
+          "match_count": 1
+        },
+        {
+          "file": "zeroed_std_t.yml",
+          "id": "rust.ast.zeroed_std_t",
           "language": "rust",
           "match_count": 1
         }
@@ -2256,16 +4522,171 @@
       "dump_args": [
         "--dump-rules={rules_dir}"
       ],
-      "fixture": "test-suite/swift/ssrf_buggy",
+      "fixture": "test-suite/swift/ast_grep_rule_pack_coverage.swift",
+      "generated_corpus_check": {
+        "config": "sgconfig-swift.yml",
+        "fixture": "test-suite/swift",
+        "result_count": 61,
+        "result_rule_ids": [
+          "swift.abort-call",
+          "swift.assertion-failure",
+          "swift.debug-print",
+          "swift.dispatch-sync-main",
+          "swift.exit-call",
+          "swift.fatal-error",
+          "swift.force-cast",
+          "swift.force-try",
+          "swift.keyed-unarchiver",
+          "swift.md5-digest",
+          "swift.ns-assert",
+          "swift.precondition-failure",
+          "swift.print-call",
+          "swift.process-run",
+          "swift.sha1-digest",
+          "swift.task-sleep-blocking",
+          "swift.thread-sleep",
+          "swift.timer-scheduled",
+          "swift.unmanaged-pass-unretained",
+          "swift.unmanaged-take-unretained",
+          "swift.unsafe-bitcast",
+          "swift.urlsession.task-no-resume"
+        ]
+      },
       "label": "swift-rule-pack",
       "module": "ubs-swift.sh",
-      "rule_count": 1,
+      "rule_count": 22,
       "rules": [
+        {
+          "file": "c01-force-cast.yml",
+          "id": "swift.force-cast",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c01-force-try.yml",
+          "id": "swift.force-try",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c02-task-sleep-blocking.yml",
+          "id": "swift.task-sleep-blocking",
+          "language": "swift",
+          "match_count": 1
+        },
         {
           "file": "c04-urlsession-task-no-resume.yml",
           "id": "swift.urlsession.task-no-resume",
           "language": "swift",
-          "match_count": 2
+          "match_count": 1
+        },
+        {
+          "file": "c05-assertion-failure.yml",
+          "id": "swift.assertion-failure",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c05-fatal-error.yml",
+          "id": "swift.fatal-error",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c05-precondition-failure.yml",
+          "id": "swift.precondition-failure",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c06-keyed-unarchiver.yml",
+          "id": "swift.keyed-unarchiver",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c07-md5-digest.yml",
+          "id": "swift.md5-digest",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c07-sha1-digest.yml",
+          "id": "swift.sha1-digest",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c08-process-run.yml",
+          "id": "swift.process-run",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c09-dispatch-sync-main.yml",
+          "id": "swift.dispatch-sync-main",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c09-thread-sleep.yml",
+          "id": "swift.thread-sleep",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c10-timer-scheduled.yml",
+          "id": "swift.timer-scheduled",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c11-debug-print.yml",
+          "id": "swift.debug-print",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c11-print-call.yml",
+          "id": "swift.print-call",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c14-unmanaged-pass-unretained.yml",
+          "id": "swift.unmanaged-pass-unretained",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c14-unmanaged-take-unretained.yml",
+          "id": "swift.unmanaged-take-unretained",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c14-unsafe-bitcast.yml",
+          "id": "swift.unsafe-bitcast",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c15-abort-call.yml",
+          "id": "swift.abort-call",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c15-exit-call.yml",
+          "id": "swift.exit-call",
+          "language": "swift",
+          "match_count": 1
+        },
+        {
+          "file": "c22-ns-assert.yml",
+          "id": "swift.ns-assert",
+          "language": "swift",
+          "match_count": 1
         }
       ]
     },
@@ -2276,7 +4697,7 @@
       "fixture": "test-suite/ruby/ast_grep_rule_pack_coverage.rb",
       "label": "ruby-rule-pack",
       "module": "ubs-ruby.sh",
-      "rule_count": 28,
+      "rule_count": 29,
       "rules": [
         {
           "file": "and-or.yml",
@@ -2411,6 +4832,12 @@
           "match_count": 1
         },
         {
+          "file": "ruby-async-thread-no-rescue.yml",
+          "id": "ruby.async.thread-no-rescue",
+          "language": "ruby",
+          "match_count": 1
+        },
+        {
           "file": "ruby-resource-thread.yml",
           "id": "ruby.resource.thread-no-join",
           "language": "ruby",
@@ -2456,7 +4883,7 @@
       "fixture": "test-suite/java/ast_grep_rule_pack_coverage.java",
       "label": "java-rule-pack",
       "module": "ubs-java.sh",
-      "rule_count": 34,
+      "rule_count": 37,
       "rules": [
         {
           "file": "bigdecimal-equals.yml",
@@ -2529,6 +4956,24 @@
           "id": "java.resource.thread-no-join",
           "language": "java",
           "match_count": 2
+        },
+        {
+          "file": "java-secrets-string-decl.yml",
+          "id": "java.secrets.string-decl",
+          "language": "java",
+          "match_count": 1
+        },
+        {
+          "file": "java.async.future-get-no-try.yml",
+          "id": "java.async.future-get-no-try",
+          "language": "java",
+          "match_count": 0
+        },
+        {
+          "file": "java.async.then-no-exceptionally.yml",
+          "id": "java.async.then-no-exceptionally",
+          "language": "java",
+          "match_count": 0
         },
         {
           "file": "legacy-collections.yml",
@@ -2663,6 +5108,207 @@
           "match_count": 1
         }
       ]
+    },
+    {
+      "dump_args": [
+        "--dump-rules={rules_dir}",
+        "--no-mix"
+      ],
+      "fixture": "test-suite/elixir/ast_grep_rule_pack_coverage.ex",
+      "generated_corpus_check": {
+        "config": "sgconfig-elixir.yml",
+        "fixture": "test-suite/elixir",
+        "result_count": 31,
+        "result_rule_ids": [
+          "elixir.binary-to-term-unsafe",
+          "elixir.code-eval-file",
+          "elixir.code-eval-string",
+          "elixir.crypto-md5",
+          "elixir.crypto-sha1",
+          "elixir.file-rm-rf",
+          "elixir.file-rm-rf-bang",
+          "elixir.io-inspect",
+          "elixir.io-puts",
+          "elixir.jason-decode-bang",
+          "elixir.kernel-exit",
+          "elixir.kernel-throw",
+          "elixir.node-spawn",
+          "elixir.poison-decode-bang",
+          "elixir.process-exit",
+          "elixir.process-sleep",
+          "elixir.repo-query",
+          "elixir.repo-query-bang",
+          "elixir.send-unhandled",
+          "elixir.spawn-link",
+          "elixir.spawn-unlinked",
+          "elixir.string-to-atom",
+          "elixir.string-to-existing-atom",
+          "elixir.system-cmd-shell",
+          "elixir.system-halt",
+          "elixir.system-shell"
+        ]
+      },
+      "label": "elixir-rule-pack",
+      "module": "ubs-elixir.sh",
+      "rule_count": 26,
+      "rules": [
+        {
+          "file": "c02-kernel-exit.yml",
+          "id": "elixir.kernel-exit",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c02-kernel-throw.yml",
+          "id": "elixir.kernel-throw",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c03-node-spawn.yml",
+          "id": "elixir.node-spawn",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c03-process-exit.yml",
+          "id": "elixir.process-exit",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c03-process-sleep.yml",
+          "id": "elixir.process-sleep",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c03-spawn-link.yml",
+          "id": "elixir.spawn-link",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c03-spawn-unlinked.yml",
+          "id": "elixir.spawn-unlinked",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-binary-to-term-unsafe.yml",
+          "id": "elixir.binary-to-term-unsafe",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-code-eval-file.yml",
+          "id": "elixir.code-eval-file",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-code-eval-string.yml",
+          "id": "elixir.code-eval-string",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-crypto-md5.yml",
+          "id": "elixir.crypto-md5",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-crypto-sha1.yml",
+          "id": "elixir.crypto-sha1",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-system-cmd-shell.yml",
+          "id": "elixir.system-cmd-shell",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-system-halt.yml",
+          "id": "elixir.system-halt",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c04-system-shell.yml",
+          "id": "elixir.system-shell",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c06-repo-query-bang.yml",
+          "id": "elixir.repo-query-bang",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c06-repo-query.yml",
+          "id": "elixir.repo-query",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c07-send-unhandled.yml",
+          "id": "elixir.send-unhandled",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c08-file-rm-rf-bang.yml",
+          "id": "elixir.file-rm-rf-bang",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c08-file-rm-rf.yml",
+          "id": "elixir.file-rm-rf",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c09-io-inspect.yml",
+          "id": "elixir.io-inspect",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c09-io-puts.yml",
+          "id": "elixir.io-puts",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c10-string-to-atom.yml",
+          "id": "elixir.string-to-atom",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c10-string-to-existing-atom.yml",
+          "id": "elixir.string-to-existing-atom",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c15-jason-decode-bang.yml",
+          "id": "elixir.jason-decode-bang",
+          "language": "elixir",
+          "match_count": 1
+        },
+        {
+          "file": "c15-poison-decode-bang.yml",
+          "id": "elixir.poison-decode-bang",
+          "language": "elixir",
+          "match_count": 1
+        }
+      ]
     }
   ],
   "rule_inventory_coverage": [
@@ -2715,8 +5361,9 @@
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 64,
+      "covered_generated_rule_count": 65,
       "covered_generated_rule_ids": [
+        "go.async.goroutine-err-no-check",
         "go.blank-import",
         "go.close-error-ignored",
         "go.content-type-prefix-match",
@@ -2782,126 +5429,241 @@
         "go.waitgroup-add-no-done",
         "go.write-error-ignored"
       ],
-      "generated_rule_count": 64,
+      "generated_rule_count": 65,
       "label": "go-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 4,
+      "covered_generated_rule_count": 24,
       "covered_generated_rule_ids": [
         "cs-async-discarded-startnew",
         "cs-async-discarded-task-run",
         "cs-await-in-lock",
-        "cs-parallel-foreach-async-lambda"
+        "cs-binary-formatter",
+        "cs-console-writeline",
+        "cs-des-crypto",
+        "cs-empty-catch",
+        "cs-gc-collect",
+        "cs-goto-statement",
+        "cs-httpclient-instantiation",
+        "cs-md5-create",
+        "cs-new-thread",
+        "cs-parallel-foreach-async-lambda",
+        "cs-process-start",
+        "cs-rethrow-ex",
+        "cs-sha1-create",
+        "cs-task-delay-no-await",
+        "cs-task-getawaiter-getresult",
+        "cs-task-result-deadlock",
+        "cs-task-wait-blocking",
+        "cs-thread-sleep",
+        "cs-threadpool-queue",
+        "cs-weak-random",
+        "cs-xml-document"
       ],
-      "generated_rule_count": 4,
+      "generated_rule_count": 24,
       "label": "csharp-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 77,
+      "covered_generated_rule_count": 151,
       "covered_generated_rule_ids": [
-        "rust.arc-mutex",
-        "rust.assert-macros",
-        "rust.async.std-guard-across-await",
-        "rust.async.std-lock-in-async",
-        "rust.async.tokio-guard-across-await",
-        "rust.await-in-for",
-        "rust.block-on-in-async",
-        "rust.blocking-fs-in-async",
-        "rust.chars-nth",
-        "rust.clone-call",
-        "rust.clone-in-loop",
-        "rust.collect-then-for",
-        "rust.command.shell-c",
-        "rust.cstr-from-bytes-unchecked",
-        "rust.dbg-macro",
-        "rust.debug-assert-macros",
-        "rust.env-var-unwrap",
-        "rust.eprintln-macro",
-        "rust.expect-call",
-        "rust.fixme-comment",
-        "rust.format-literal-no-vars",
-        "rust.from-slice-panic",
-        "rust.from-utf8-unchecked",
-        "rust.get-unchecked",
-        "rust.i64-negate-overflow",
-        "rust.insecure-hash",
-        "rust.instant-now-elapsed",
-        "rust.instant-subtraction",
-        "rust.iter-nth-zero",
-        "rust.len-count-narrow-as",
-        "rust.map-clone",
-        "rust.maybeuninit-assume-init",
-        "rust.mem-forget",
-        "rust.mem-transmute",
-        "rust.mem-uninitialized",
-        "rust.mem-zeroed",
-        "rust.mutex-lock-expect",
-        "rust.mutex-lock-unwrap",
-        "rust.native-tls-danger",
-        "rust.openssl-no-verify",
-        "rust.panic-in-drop",
-        "rust.panic-macro",
-        "rust.parse-float-no-finite-check",
-        "rust.parse-unwrap",
-        "rust.plain-http-url",
-        "rust.println-macro",
-        "rust.ptr-cast",
-        "rust.rc-refcell",
-        "rust.regex-new-in-loop",
-        "rust.regex-new-unwrap",
-        "rust.reqwest-danger-accept",
-        "rust.resource.thread-no-join",
-        "rust.resource.tokio-task-no-await",
-        "rust.serde-json-unwrap",
-        "rust.slice-from-raw-parts",
-        "rust.strict-utf8",
-        "rust.suspicious-as-cast",
-        "rust.thread-sleep-in-async",
-        "rust.thread-spawn-in-async",
-        "rust.thread-spawn-no-join",
-        "rust.to-owned-to-string",
-        "rust.todo-comment",
-        "rust.todo-macro",
-        "rust.tokio-block-in-place",
-        "rust.tokio-spawn-no-handle",
-        "rust.tokio.spawn-no-move",
-        "rust.try-into-unwrap",
-        "rust.unimplemented-macro",
-        "rust.unreachable-macro",
-        "rust.unreachable-unchecked",
-        "rust.unsafe-auto-traits",
-        "rust.unsafe-block",
-        "rust.unwrap-call",
-        "rust.unwrap-in-drop",
-        "rust.unwrap-unchecked",
-        "rust.wrapping-arithmetic",
-        "rust.write-not-atomic"
+        "rust.ast.as_f32",
+        "rust.ast.as_f64",
+        "rust.ast.as_i16",
+        "rust.ast.as_i32",
+        "rust.ast.as_i64",
+        "rust.ast.as_i8",
+        "rust.ast.as_isize",
+        "rust.ast.as_u16",
+        "rust.ast.as_u32",
+        "rust.ast.as_u8",
+        "rust.ast.as_usize",
+        "rust.ast.assert",
+        "rust.ast.assert_eq",
+        "rust.ast.assert_ne",
+        "rust.ast.assume_init",
+        "rust.ast.await_in_for",
+        "rust.ast.chars_nth",
+        "rust.ast.chars_nth_back",
+        "rust.ast.clone",
+        "rust.ast.collect_vec",
+        "rust.ast.count_as_i16",
+        "rust.ast.count_as_i32",
+        "rust.ast.count_as_i8",
+        "rust.ast.count_as_u16",
+        "rust.ast.count_as_u32",
+        "rust.ast.count_as_u8",
+        "rust.ast.cstr_bare",
+        "rust.ast.cstr_std",
+        "rust.ast.dbg",
+        "rust.ast.debug_assert_macros",
+        "rust.ast.direct_index",
+        "rust.ast.env_std_var_expect",
+        "rust.ast.env_std_var_os_expect",
+        "rust.ast.env_std_var_os_unwrap",
+        "rust.ast.env_std_var_unwrap",
+        "rust.ast.env_var_expect",
+        "rust.ast.env_var_os_expect",
+        "rust.ast.env_var_os_unwrap",
+        "rust.ast.env_var_unwrap",
+        "rust.ast.eprintln",
+        "rust.ast.expect",
+        "rust.ast.forget_mem",
+        "rust.ast.forget_std",
+        "rust.ast.from_slice_panic",
+        "rust.ast.get_unchecked",
+        "rust.ast.get_unchecked_mut",
+        "rust.ast.http_url",
+        "rust.ast.i64_negate_overflow",
+        "rust.ast.instant_now_elapsed",
+        "rust.ast.instant_subtraction",
+        "rust.ast.len_as_i16",
+        "rust.ast.len_as_i32",
+        "rust.ast.len_as_i8",
+        "rust.ast.len_as_u16",
+        "rust.ast.len_as_u32",
+        "rust.ast.len_as_u8",
+        "rust.ast.lock_expect",
+        "rust.ast.lock_unwrap",
+        "rust.ast.map_clone",
+        "rust.ast.md5",
+        "rust.ast.nth0",
+        "rust.ast.panic",
+        "rust.ast.parse_expect",
+        "rust.ast.parse_float_no_finite_check",
+        "rust.ast.parse_tf_expect",
+        "rust.ast.parse_tf_unwrap",
+        "rust.ast.parse_unwrap",
+        "rust.ast.println",
+        "rust.ast.ptr_cast",
+        "rust.ast.raw_parts_slice",
+        "rust.ast.raw_parts_slice_mut",
+        "rust.ast.raw_parts_std",
+        "rust.ast.raw_parts_std_mut",
+        "rust.ast.regex_new_bare",
+        "rust.ast.regex_new_full",
+        "rust.ast.regex_new_unwrap",
+        "rust.ast.serde_json_from_slice_expect",
+        "rust.ast.serde_json_from_slice_unwrap",
+        "rust.ast.serde_json_from_str_expect",
+        "rust.ast.serde_json_from_str_unwrap",
+        "rust.ast.serde_json_from_value_expect",
+        "rust.ast.serde_json_from_value_unwrap",
+        "rust.ast.serde_yaml_from_str_expect",
+        "rust.ast.serde_yaml_from_str_unwrap",
+        "rust.ast.sha1",
+        "rust.ast.shell_arg_c",
+        "rust.ast.shell_arg_lc",
+        "rust.ast.shell_arg_wc",
+        "rust.ast.shell_arg_wcl",
+        "rust.ast.shell_args_c",
+        "rust.ast.shell_args_lc",
+        "rust.ast.shell_args_wc",
+        "rust.ast.shell_args_wcl",
+        "rust.ast.shell_argsref_c",
+        "rust.ast.shell_argsref_lc",
+        "rust.ast.shell_argsref_wc",
+        "rust.ast.shell_argsref_wcl",
+        "rust.ast.shell_std_arg_c",
+        "rust.ast.shell_std_arg_lc",
+        "rust.ast.shell_std_arg_wc",
+        "rust.ast.shell_std_arg_wcl",
+        "rust.ast.shell_std_args_c",
+        "rust.ast.shell_std_args_lc",
+        "rust.ast.shell_std_args_wc",
+        "rust.ast.shell_std_args_wcl",
+        "rust.ast.shell_std_argsref_c",
+        "rust.ast.shell_std_argsref_lc",
+        "rust.ast.shell_std_argsref_wc",
+        "rust.ast.shell_std_argsref_wcl",
+        "rust.ast.std_guard_await_expect",
+        "rust.ast.std_guard_await_unwrap",
+        "rust.ast.std_lock_async_lock",
+        "rust.ast.std_lock_async_read",
+        "rust.ast.std_lock_async_write",
+        "rust.ast.strict_utf8",
+        "rust.ast.tls_certs",
+        "rust.ast.tls_hostnames",
+        "rust.ast.to_owned_to_string",
+        "rust.ast.todo",
+        "rust.ast.tokio_block_in_place",
+        "rust.ast.tokio_guard_lock",
+        "rust.ast.tokio_guard_read",
+        "rust.ast.tokio_guard_write",
+        "rust.ast.tokio_spawn_no_move",
+        "rust.ast.toml_from_str_expect",
+        "rust.ast.toml_from_str_unwrap",
+        "rust.ast.transmute_bare",
+        "rust.ast.transmute_mem",
+        "rust.ast.transmute_std",
+        "rust.ast.try_into_expect",
+        "rust.ast.try_into_unwrap",
+        "rust.ast.unimplemented",
+        "rust.ast.uninit_mem",
+        "rust.ast.uninit_std",
+        "rust.ast.unreachable",
+        "rust.ast.unreachable_unchecked_core",
+        "rust.ast.unreachable_unchecked_std",
+        "rust.ast.unsafe_impl_send",
+        "rust.ast.unsafe_impl_sync",
+        "rust.ast.unwrap_unchecked",
+        "rust.ast.utf8_std",
+        "rust.ast.utf8_str",
+        "rust.ast.utf8_string",
+        "rust.ast.utf8_string_std",
+        "rust.ast.wrapping_arithmetic",
+        "rust.ast.write_not_atomic",
+        "rust.ast.zeroed_bare",
+        "rust.ast.zeroed_mem",
+        "rust.ast.zeroed_mem_t",
+        "rust.ast.zeroed_std",
+        "rust.ast.zeroed_std_t"
       ],
-      "generated_rule_count": 77,
+      "generated_rule_count": 151,
       "label": "rust-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 1,
+      "covered_generated_rule_count": 22,
       "covered_generated_rule_ids": [
+        "swift.abort-call",
+        "swift.assertion-failure",
+        "swift.debug-print",
+        "swift.dispatch-sync-main",
+        "swift.exit-call",
+        "swift.fatal-error",
+        "swift.force-cast",
+        "swift.force-try",
+        "swift.keyed-unarchiver",
+        "swift.md5-digest",
+        "swift.ns-assert",
+        "swift.precondition-failure",
+        "swift.print-call",
+        "swift.process-run",
+        "swift.sha1-digest",
+        "swift.task-sleep-blocking",
+        "swift.thread-sleep",
+        "swift.timer-scheduled",
+        "swift.unmanaged-pass-unretained",
+        "swift.unmanaged-take-unretained",
+        "swift.unsafe-bitcast",
         "swift.urlsession.task-no-resume"
       ],
-      "generated_rule_count": 1,
+      "generated_rule_count": 22,
       "label": "swift-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 28,
+      "covered_generated_rule_count": 29,
       "covered_generated_rule_ids": [
         "rails.constantize",
         "rails.csrf-skip",
@@ -2930,17 +5692,20 @@
         "rb.system-single-string",
         "rb.tempfile-no-block",
         "rb.yaml-unsafe",
+        "ruby.async.thread-no-rescue",
         "ruby.resource.thread-no-join"
       ],
-      "generated_rule_count": 28,
+      "generated_rule_count": 29,
       "label": "ruby-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
     },
     {
       "corpus_result_rule_ids_without_generated_rule": [],
-      "covered_generated_rule_count": 34,
+      "covered_generated_rule_count": 37,
       "covered_generated_rule_ids": [
+        "java.async.future-get-no-try",
+        "java.async.then-no-exceptionally",
         "java.bigdecimal-equals",
         "java.closeable-no-twr",
         "java.executors-cached",
@@ -2967,6 +5732,7 @@
         "java.resource.resultset-no-close",
         "java.resource.statement-no-close",
         "java.resource.thread-no-join",
+        "java.secrets.string-decl",
         "java.string-bytes-no-charset",
         "java.string-eq-operator",
         "java.synchronized-this",
@@ -2976,12 +5742,48 @@
         "java.virtual-threads",
         "java.weak-hash"
       ],
-      "generated_rule_count": 34,
+      "generated_rule_count": 37,
       "label": "java-rule-pack",
+      "uncovered_generated_rule_count": 0,
+      "uncovered_generated_rule_ids": []
+    },
+    {
+      "corpus_result_rule_ids_without_generated_rule": [],
+      "covered_generated_rule_count": 26,
+      "covered_generated_rule_ids": [
+        "elixir.binary-to-term-unsafe",
+        "elixir.code-eval-file",
+        "elixir.code-eval-string",
+        "elixir.crypto-md5",
+        "elixir.crypto-sha1",
+        "elixir.file-rm-rf",
+        "elixir.file-rm-rf-bang",
+        "elixir.io-inspect",
+        "elixir.io-puts",
+        "elixir.jason-decode-bang",
+        "elixir.kernel-exit",
+        "elixir.kernel-throw",
+        "elixir.node-spawn",
+        "elixir.poison-decode-bang",
+        "elixir.process-exit",
+        "elixir.process-sleep",
+        "elixir.repo-query",
+        "elixir.repo-query-bang",
+        "elixir.send-unhandled",
+        "elixir.spawn-link",
+        "elixir.spawn-unlinked",
+        "elixir.string-to-atom",
+        "elixir.string-to-existing-atom",
+        "elixir.system-cmd-shell",
+        "elixir.system-halt",
+        "elixir.system-shell"
+      ],
+      "generated_rule_count": 26,
+      "label": "elixir-rule-pack",
       "uncovered_generated_rule_count": 0,
       "uncovered_generated_rule_ids": []
     }
   ],
-  "scope": "Rust, TypeScript/JavaScript, Go, C#, Swift, Ruby, and Java ast-grep SARIF evidence, corpus evidence, list-rules inventory, and per-rule parser validation",
-  "version": 4
+  "scope": "Rust, TypeScript/JavaScript, Go, C#, Swift, Ruby, Java, and Elixir SARIF evidence, exact Rust source sites, generated corpus coverage, list-rules inventory, and per-rule parser validation",
+  "version": 5
 }

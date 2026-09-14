@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +35,24 @@ def run(args: list[str], *, cwd: Path = REPO_ROOT, env: dict | None = None, time
         for key, value in env.items():
             if value is None:
                 full_env.pop(key, None)
-    return subprocess.run([str(UBS), *args], cwd=cwd, env=full_env, capture_output=True, text=True, timeout=timeout)
+    # The fixture controls argv; inherited environment exercises the real CLI.
+    return subprocess.run([str(UBS), *args], cwd=cwd, env=full_env, capture_output=True, text=True, timeout=timeout)  # ubs:ignore[python.taint.command]
+
+
+def run_git(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess:
+    # Only literal fixture operations reach this helper; disable external hooks.
+    return subprocess.run(  # ubs:ignore[python.taint.command]
+        ["git", "-c", f"core.hooksPath={cwd / '.git' / 'ubs-empty-hooks'}", *args],
+        cwd=cwd, capture_output=True, check=True, timeout=30,
+    )
+
+
+def parse_json_document(text: str):
+    """Malformed CLI output must fail the current contract check with context."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"Invalid JSON at line {exc.lineno}, column {exc.colno}: {exc.msg}") from exc
 
 
 def report(name: str, ok: bool, detail: str = "", proc: subprocess.CompletedProcess | None = None) -> None:
@@ -217,7 +235,8 @@ def check_env_ci_disables_auto_update() -> None:
                     env.pop(k, None)
                 else:
                     env[k] = v
-            return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)
+            # Fixed fixture executable/argv; only the update-policy environment varies.
+            return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)  # ubs:ignore[python.taint.command]
 
         # --ci sets CI_MODE which already disables the check; drop it to isolate the env var.
         cmd = [str(bin_dir / "ubs"), "--only=python", str(PY_CLEAN)]
@@ -532,11 +551,11 @@ def check_language_scoped_ignores() -> None:
     (tmp / "bin").mkdir()
     (tmp / "bin" / "main.go").write_text("package main\n\nimport \"os/exec\"\n\nfunc main() { exec.Command(\"sh\", \"-c\", os.Args[1]).Run() }\n")
     (tmp / "env").mkdir()
-    (tmp / "env" / "config.py").write_text("import os\nos.system(input())\n")
+    (tmp / "env" / "config.py").write_text("import os\nos.system(input())\n")  # ubs:ignore[python.taint.command] Intentional scanned fixture, never executed.
     (tmp / "venvlike").mkdir()
     (tmp / "venvlike" / "env").mkdir()
     (tmp / "venvlike" / "env" / "pyvenv.cfg").write_text("home = /usr\n")
-    (tmp / "venvlike" / "env" / "site.py").write_text("import os\nos.system(input())\n")
+    (tmp / "venvlike" / "env" / "site.py").write_text("import os\nos.system(input())\n")  # ubs:ignore[python.taint.command] Intentional scanned fixture, never executed.
     (tmp / "obj").mkdir()
     (tmp / "obj" / "project.assets.json").write_text("{}\n")
     (tmp / "obj" / "Generated.cs").write_text("class G { static void M() { System.Diagnostics.Process.Start(\"cmd\", \"/c \" + System.Console.ReadLine()); } }\n")
@@ -705,8 +724,16 @@ def check_single_file_fast_path() -> None:
         shim_env = {
             "PATH": f"{shim_dir}:{os.environ.get('PATH', '')}",
             "UBS_PROFILE": "1",
+            # Child-only Git configuration makes links independent of whether
+            # this checkout was cloned from GitHub or another local checkout.
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "remote.origin.url",
+            "GIT_CONFIG_VALUE_0": "https://github.com/ubs-test/single-file.git",
         }
+        commit = run_git(["rev-parse", "HEAD"], cwd=REPO_ROOT).stdout.decode().strip()
+        blob_base = f"https://github.com/ubs-test/single-file/blob/{commit}"
         proc = run([str(target), "--ci", "--format=json"], env=shim_env)
+        write_case_artifacts("single_file_fast_path", proc)
         ok = False
         detail = f"exit={proc.returncode}"
         try:
@@ -716,9 +743,10 @@ def check_single_file_fast_path() -> None:
             rel = "test-suite/python/security/parser_token_compare_buggy.py"
             shim_log_content = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
             no_shims_spawned = len(shim_log_content.strip()) == 0
-            ok = langs == ["python"] and doc["scanners"][0]["files"] == 1 and bool(samples) \
+            ok = proc.returncode == 1 and langs == ["python"] and doc["scanners"][0]["files"] == 1 and bool(samples) \
                 and all(s["file"] == rel for s in samples) \
-                and all(s.get("permalink", "").endswith(f"{rel}#L{s['line']}") for s in samples if isinstance(s.get("line"), int)) \
+                and all(isinstance(s.get("line"), int) and s["line"] > 0 for s in samples) \
+                and all(s.get("permalink") == f"{blob_base}/{rel}#L{s['line']}" for s in samples) \
                 and "Scanning one file directly (no workspace)" in proc.stderr \
                 and "Preparing shadow workspace" not in proc.stderr \
                 and "copy_ms" not in doc["profile"] \
@@ -727,9 +755,31 @@ def check_single_file_fast_path() -> None:
             detail += f" langs={langs} samples={len(samples)} no_shims={no_shims_spawned}"
         except Exception as exc:  # noqa: BLE001
             detail += f" {exc}"
+        local_proc = run([str(target), "--ci", "--format=json"], env={
+            **shim_env, "GIT_CONFIG_VALUE_0": str(REPO_ROOT),
+        })
+        write_case_artifacts("single_file_local_origin", local_proc)
+        local_ok = False
+        local_detail = f"exit={local_proc.returncode}"
+        try:
+            local_doc = json.loads(local_proc.stdout)
+            local_samples = [s for sc in local_doc["scanners"] for f in sc.get("findings", []) for s in f.get("samples", []) if s.get("file")]
+            local_ok = local_proc.returncode == 1 and local_doc["totals"] == doc["totals"] \
+                and [s["language"] for s in local_doc["scanners"]] == ["python"] \
+                and bool(local_samples) and all(s["file"] == rel and "permalink" not in s for s in local_samples) \
+                and local_samples == [{k: v for k, v in s.items() if k != "permalink"} for s in samples] \
+                and "Scanning one file directly (no workspace)" in local_proc.stderr \
+                and "Preparing shadow workspace" not in local_proc.stderr \
+                and "copy_ms" not in local_doc["profile"] \
+                and isinstance(local_doc["profile"].get("total_ms"), int) \
+                and (not log_file.exists() or not log_file.read_text(encoding="utf-8").strip())
+            local_detail += f" samples={len(local_samples)}"
+        except Exception as exc:  # noqa: BLE001
+            local_detail += f" {exc}"
     finally:
         shutil.rmtree(shim_dir, ignore_errors=True)
     report("single_file_fast_path", ok, detail, proc if not ok else None)
+    report("single_file_local_origin", local_ok, local_detail, local_proc if not local_ok else None)
     # Two files, or a file with an extension no module owns, keep the workspace path.
     proc2 = run([str(target), str(PY_CLEAN), "--ci", "--only=python", "--format=json"])
     ok2 = proc2.returncode in (0, 1) and "Preparing shadow workspace for 2 file(s)" in proc2.stderr
@@ -842,7 +892,7 @@ def check_robot_docs_flags_parse() -> None:
     # documented example form. Flags that change what runs (update, help,
     # version, list-categories, staged/diff/files, suggest-ignore) are exercised
     # for acceptance only.
-    doc = json.loads(run(["robot-docs", "commands"]).stdout)
+    doc = parse_json_document(run(["robot-docs", "commands"]).stdout)
     bad = []
     # Examples such as --output=report.json write relative paths: run from a
     # scratch directory so nothing lands in the repository root.
@@ -876,7 +926,7 @@ def check_schema_validates_outputs() -> None:
     except ImportError:
         report("schema_validates_outputs", False, "jsonschema not installed (uv sync installs the dev group)")
         return
-    schemas = {fmt: json.loads(run([f"--schema={fmt}"]).stdout) for fmt in ("json", "jsonl", "sarif", "error")}
+    schemas = {fmt: parse_json_document(run([f"--schema={fmt}"]).stdout) for fmt in ("json", "jsonl", "sarif", "error")}
     problems: list[str] = []
 
     def validate(fmt: str, label: str, instance) -> None:
@@ -905,7 +955,7 @@ def check_schema_validates_outputs() -> None:
         except json.JSONDecodeError as exc:
             problems.append(f"json:no-scan: stdout is not JSON ({exc})")
     for label, instance in (
-        ("error:env", json.loads(samples["json:env-error"].stdout)),
+        ("error:env", parse_json_document(samples["json:env-error"].stdout)),
     ):
         validate("error", label, instance)
     jsonl = run(["--only=python", "--ci", "--format=jsonl", str(PY_CLEAN.parent / "parser_token_compare_buggy.py")])
@@ -946,7 +996,7 @@ def check_profile_block() -> None:
         detail += f" ({exc})"
     report("profile_block", ok, detail, proc if not ok else None)
     plain = run(["--only=python", "--ci", "--format=json", str(PY_CLEAN)], env={"UBS_PROFILE": None})
-    ok2 = "profile" not in json.loads(plain.stdout)
+    ok2 = "profile" not in parse_json_document(plain.stdout)
     report("profile_absent_by_default", ok2, "", plain if not ok2 else None)
 
 
@@ -1007,43 +1057,43 @@ def test_ubsignore_precedence() -> None:
     try:
         (tmp / "clean.py").write_text("print('clean')\n", encoding="utf-8")
         (tmp / "node_modules").mkdir()
-        (tmp / "node_modules" / "mod.py").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "node_modules" / "mod.py").write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
         (tmp / "custom_ignored").mkdir()
-        (tmp / "custom_ignored" / "cust.py").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "custom_ignored" / "cust.py").write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
         (tmp / "cli_excluded").mkdir()
-        (tmp / "cli_excluded" / "excl.py").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "cli_excluded" / "excl.py").write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
         (tmp / "custom_ext").mkdir()
-        (tmp / "custom_ext" / "file.pyw").write_text("eval(input())\n", encoding="utf-8")
-        (tmp / "custom_ext" / "file.other_ext").write_text("eval(input())\n", encoding="utf-8")
+        (tmp / "custom_ext" / "file.pyw").write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
+        (tmp / "custom_ext" / "file.other_ext").write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
         (tmp / ".ubsignore").write_text("custom_ignored\n", encoding="utf-8")
 
         # 1. Directory scan: default ignore, .ubsignore, and --exclude must be skipped
         proc1 = run(["--only=python", "--ci", "--format=json", "--exclude=cli_excluded", str(tmp)])
-        doc1 = json.loads(proc1.stdout)
+        doc1 = parse_json_document(proc1.stdout)
         files1 = doc1.get("totals", {}).get("files", 0)
         crit1 = doc1.get("totals", {}).get("critical", 0)
 
         # 2. Explicitly named file in .ubsignore must WIN
         proc2 = run(["--only=python", "--ci", "--format=json", str(tmp / "custom_ignored" / "cust.py")])
-        doc2 = json.loads(proc2.stdout)
+        doc2 = parse_json_document(proc2.stdout)
         files2 = doc2.get("totals", {}).get("files", 0)
         crit2 = doc2.get("totals", {}).get("critical", 0)
 
         # 3. Explicitly named file in default ignore must WIN
         proc3 = run(["--only=python", "--ci", "--format=json", str(tmp / "node_modules" / "mod.py")])
-        doc3 = json.loads(proc3.stdout)
+        doc3 = parse_json_document(proc3.stdout)
         files3 = doc3.get("totals", {}).get("files", 0)
         crit3 = doc3.get("totals", {}).get("critical", 0)
 
         # 4. Explicitly named file matching --exclude must WIN
         proc4 = run(["--only=python", "--ci", "--format=json", "--exclude=cli_excluded", str(tmp / "cli_excluded" / "excl.py")])
-        doc4 = json.loads(proc4.stdout)
+        doc4 = parse_json_document(proc4.stdout)
         files4 = doc4.get("totals", {}).get("files", 0)
         crit4 = doc4.get("totals", {}).get("critical", 0)
 
         # 5. --include-ext includes extra extensions matching the scanner (pyw is not in default INCLUDE_EXT)
         proc5 = run(["--only=python", "--ci", "--format=json", "--include-ext=py,pyw", "--exclude=cli_excluded", str(tmp)])
-        doc5 = json.loads(proc5.stdout)
+        doc5 = parse_json_document(proc5.stdout)
         files5 = doc5.get("totals", {}).get("files", 0)
 
         ok = (
@@ -1117,27 +1167,27 @@ def test_staged_scans_index_only() -> None:
     # --staged scans only files in the git index, ignoring unstaged edits and untracked files (bead B8).
     tmp = Path(tempfile.mkdtemp(prefix="ubs-staged-"))
     try:
-        subprocess.run(["git", "init"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.name", "UBS Test"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.email", "ubs-test@example.com"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp, capture_output=True, check=True)
+        run_git(["init"], cwd=tmp)
+        run_git(["config", "user.name", "UBS Test"], cwd=tmp)
+        run_git(["config", "user.email", "ubs-test@example.com"], cwd=tmp)
+        run_git(["config", "commit.gpgsign", "false"], cwd=tmp)
 
         base_file = tmp / "base.py"
         base_file.write_text("print('committed base')\n", encoding="utf-8")
-        subprocess.run(["git", "add", "base.py"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp, capture_output=True, check=True)
+        run_git(["add", "base.py"], cwd=tmp)
+        run_git(["commit", "-m", "init"], cwd=tmp)
 
         # Staged buggy file
         staged_file = tmp / "staged_buggy.py"
-        staged_file.write_text("eval(input())\n", encoding="utf-8")
-        subprocess.run(["git", "add", "staged_buggy.py"], cwd=tmp, capture_output=True, check=True)
+        staged_file.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
+        run_git(["add", "staged_buggy.py"], cwd=tmp)
 
         # Unstaged modification to base.py
-        base_file.write_text("eval(input())\n", encoding="utf-8")
+        base_file.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
 
         # Untracked buggy file
         untracked_file = tmp / "untracked_buggy.py"
-        untracked_file.write_text("eval(input())\n", encoding="utf-8")
+        untracked_file.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
 
         proc = run(["--staged", "--only=python", "--ci", "--format=json"], cwd=tmp)
         ok = False
@@ -1179,24 +1229,24 @@ def test_diff_scans_modified_only() -> None:
     # --diff scans only working-tree files modified vs HEAD, excluding untouched and untracked (bead B8).
     tmp = Path(tempfile.mkdtemp(prefix="ubs-diff-"))
     try:
-        subprocess.run(["git", "init"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.name", "UBS Test"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.email", "ubs-test@example.com"], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=tmp, capture_output=True, check=True)
+        run_git(["init"], cwd=tmp)
+        run_git(["config", "user.name", "UBS Test"], cwd=tmp)
+        run_git(["config", "user.email", "ubs-test@example.com"], cwd=tmp)
+        run_git(["config", "commit.gpgsign", "false"], cwd=tmp)
 
         unchanged = tmp / "unchanged.py"
         unchanged.write_text("print('clean')\n", encoding="utf-8")
         to_modify = tmp / "mod_buggy.py"
         to_modify.write_text("print('clean')\n", encoding="utf-8")
-        subprocess.run(["git", "add", "."], cwd=tmp, capture_output=True, check=True)
-        subprocess.run(["git", "commit", "-m", "init"], cwd=tmp, capture_output=True, check=True)
+        run_git(["add", "."], cwd=tmp)
+        run_git(["commit", "-m", "init"], cwd=tmp)
 
         # Working tree modified vs HEAD
-        to_modify.write_text("eval(input())\n", encoding="utf-8")
+        to_modify.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
 
         # Untracked file
         untracked = tmp / "untracked_buggy.py"
-        untracked.write_text("eval(input())\n", encoding="utf-8")
+        untracked.write_text("eval(input())\n", encoding="utf-8")  # ubs:ignore[python.taint.eval] Intentional scanned fixture, never executed.
 
         proc = run(["--diff", "--only=python", "--ci", "--format=json"], cwd=tmp)
         ok = False
@@ -1288,10 +1338,10 @@ check_skip_polyglot_mapping = test_skip_polyglot_mapping
 
 def test_findings_parity_all_langs() -> None:
     # K2: findings parity — meta-runner --format=json includes per-finding records
-    # for every module; jsonl, toon, and sarif derive from them.
+    # for every module. SARIF also retains the separate AST evidence exposed
+    # by scanners[].extras.ast_findings, without adding it to counter findings.
     manifest_file = REPO_ROOT / "test-suite" / "manifest.json"
-    with manifest_file.open(encoding="utf-8") as f:
-        data = json.load(f)
+    data = parse_json_document(manifest_file.read_text(encoding="utf-8"))
 
     langs = ["js", "python", "cpp", "rust", "golang", "java", "ruby", "swift", "csharp", "elixir"]
     failures = []
@@ -1310,11 +1360,15 @@ def test_findings_parity_all_langs() -> None:
 
         # 1. JSON
         pj = run([*common, "--format=json"])
+        write_case_artifacts(f"findings-parity-{lang}-json", pj)
         last_proc = pj
         try:
             doc = json.loads(pj.stdout)
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{lang}: JSON parse error {exc}")
+            continue
+        if pj.returncode not in (0, 1) or doc.get("status") != "ok" or doc.get("failed_modules"):
+            failures.append(f"{lang}: incomplete JSON scan (exit={pj.returncode})")
             continue
 
         findings = doc.get("findings", [])
@@ -1331,36 +1385,98 @@ def test_findings_parity_all_langs() -> None:
 
         # 2. JSONL
         pjl = run([*common, "--format=jsonl"])
+        write_case_artifacts(f"findings-parity-{lang}-jsonl", pjl)
         last_proc = pjl
-        jl_lines = [json.loads(line) for line in pjl.stdout.splitlines() if line.strip()]
+        jl_lines = [parse_json_document(line) for line in pjl.stdout.splitlines() if line.strip()]
         jl_findings = [line for line in jl_lines if line.get("type") == "finding"]
-        if len(jl_findings) != expected_count:
+        if pjl.returncode != pj.returncode or len(jl_findings) != expected_count:
             failures.append(f"{lang}: JSONL finding count {len(jl_findings)} != expected {expected_count}")
             continue
 
         # 3. TOON
         pt = run([*common, "--format=toon"])
+        write_case_artifacts(f"findings-parity-{lang}-toon", pt)
         last_proc = pt
-        pt_dec = subprocess.run(["toon", "--decode"], input=pt.stdout, capture_output=True, text=True)
+        # CLI output is decoder stdin, never a command or shell argument.
+        pt_dec = subprocess.run(["toon", "--decode"], input=pt.stdout, capture_output=True, text=True, timeout=30)  # ubs:ignore[python.taint.command]
         try:
             tdoc = json.loads(pt_dec.stdout)
             t_findings = tdoc.get("findings", [])
-            if len(t_findings) != expected_count:
+            if pt.returncode != pj.returncode or pt_dec.returncode != 0 or len(t_findings) != expected_count:
                 failures.append(f"{lang}: TOON finding count {len(t_findings)} != expected {expected_count}")
                 continue
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{lang}: TOON decode error {exc}")
             continue
 
-        # 4. SARIF
+        # 4. SARIF: preserve both provenance runs and every diagnostic identity.
         ps = run([*common, "--format=sarif"])
+        write_case_artifacts(f"findings-parity-{lang}-sarif", ps)
         last_proc = ps
         try:
             sdoc = json.loads(ps.stdout)
-            s_results = [r for run_ in sdoc.get("runs", []) for r in run_.get("results", [])]
-            if len(s_results) != expected_count:
-                failures.append(f"{lang}: SARIF result count {len(s_results)} != expected {expected_count}")
+            if ps.returncode != pj.returncode:
+                failures.append(f"{lang}: SARIF exit {ps.returncode} != JSON exit {pj.returncode}")
                 continue
+            ast_sources = [
+                source["extras"]["ast_findings"]
+                for source in [doc, *doc.get("scanners", [])]
+                if "ast_findings" in source.get("extras", {})
+            ]
+            expected_runs = {
+                f"ubs-{lang}-heuristics" if ast_sources else f"ubs-{lang}": findings,
+            }
+            if ast_sources:
+                expected_runs[f"ubs-{lang}-ast"] = [
+                    record for records in ast_sources for record in records
+                ]
+            runs = sdoc.get("runs", [])
+            drivers = [item["tool"]["driver"]["name"] for item in runs]
+            if len(drivers) != len(set(drivers)) or set(drivers) != set(expected_runs):
+                failures.append(f"{lang}: SARIF drivers {drivers} != expected {list(expected_runs)}")
+                continue
+            s_results = [result for item in runs for result in item.get("results", [])]
+            for item in runs:
+                driver = item["tool"]["driver"]["name"]
+                expected = Counter()
+                actual = Counter()
+                for finding in expected_runs[driver]:
+                    scope = finding.get("scope", "")
+                    level = {"critical": "error", "warning": "warning", "info": "note"}[
+                        finding["severity"]
+                    ]
+                    if scope == "project":
+                        level = "none"
+                    path = finding.get("file", finding.get("path", ""))
+                    expected[(
+                        finding.get("rule_id", finding.get("rule", "")), path,
+                        max(1, finding.get("line", 1) or 1) if path else 0,
+                        max(1, finding.get("col", 1) or 1) if path else 0,
+                        level, finding.get("message", ""), scope, finding.get("count")
+                        if scope in {"project", "project_aggregate"} else None,
+                    )] += 1
+                for result in item.get("results", []):
+                    locations = result.get("locations", [])
+                    if len(locations) > 1:
+                        raise ValueError(f"{driver}: unexpected multiple source locations")
+                    location = locations[0]["physicalLocation"] if locations else {}
+                    region = location.get("region", {})
+                    properties = result.get("properties", {})
+                    actual[(
+                        result["ruleId"], location.get("artifactLocation", {}).get("uri", ""),
+                        region.get("startLine", 0), region.get("startColumn", 0),
+                        result["level"], result["message"]["text"],
+                        properties.get("scope", ""), properties.get("count"),
+                    )] += 1
+                if actual != expected:
+                    missing = expected - actual
+                    extra = actual - expected
+                    failures.append(
+                        f"{driver}: SARIF identity mismatch "
+                        f"(missing={sum(missing.values())}, extra={sum(extra.values())}); "
+                        f"missing samples={list(missing.items())[:3]!r}; "
+                        f"extra samples={list(extra.items())[:3]!r}"
+                    )
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{lang}: SARIF parse error {exc}")
             continue
@@ -1404,7 +1520,7 @@ def test_baseline_new_only() -> None:
         if not base_file.is_file():
             report("test_baseline_new_only", False, f"baseline file not created; exit={p1.returncode}", p1)
             return
-        bdoc = json.loads(base_file.read_text(encoding="utf-8"))
+        bdoc = parse_json_document(base_file.read_text(encoding="utf-8"))
         b_findings = bdoc.get("findings", [])
         if len(b_findings) != 1:
             report("test_baseline_new_only", False, f"baseline finding count {len(b_findings)} != 1", p1)
@@ -1420,7 +1536,7 @@ def test_baseline_new_only() -> None:
         if p2.returncode != 0:
             report("test_baseline_new_only", False, f"p2 (rename/insert) exit {p2.returncode} != 0", p2)
             return
-        doc2 = json.loads(p2.stdout)
+        doc2 = parse_json_document(p2.stdout)
         findings2 = doc2.get("findings", [])
         if len(findings2) != 0:
             report("test_baseline_new_only", False, f"p2 finding count {len(findings2)} != 0", p2)
@@ -1437,7 +1553,7 @@ def test_baseline_new_only() -> None:
         if p3.returncode != 1:
             report("test_baseline_new_only", False, f"p3 (new bug) exit {p3.returncode} != 1", p3)
             return
-        doc3 = json.loads(p3.stdout)
+        doc3 = parse_json_document(p3.stdout)
         findings3 = doc3.get("findings", [])
         if len(findings3) != 1:
             report("test_baseline_new_only", False, f"p3 finding count {len(findings3)} != 1", p3)

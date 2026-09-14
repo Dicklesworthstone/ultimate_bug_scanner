@@ -46,20 +46,20 @@ public static class SuppressionBuggy
         }
     }
 
-    // Arrangement 5: rule-scoped markers (rule id in square brackets). The
-    // csharp module code-sample lines carry no rule id, so a previous-line
-    // scope suppresses through the runner flat same-line/previous-line path,
-    // while the trailing scope is honored by the interval engine itself (the
-    // bracketed rule id shows up in the printed sample line).
+    // Arrangement 5: scopes name public diagnostic identifiers explicitly.
+    // Pattern and AST diagnostics have separate identities for these calls.
+    // Both identifiers are required when both findings are intentional.
+    // Placement above or after the call must preserve the same rule scope.
+    // Neither location permits an unrelated rule to disappear.
     public static void RuleScopedPrevLine()
     {
-        // ubs:ignore[cs.thread-sleep-blocks] -- fixture: rule-scoped marker above the finding
+        // ubs:ignore[cs.pattern.thread-sleep,cs-thread-sleep] -- fixture: rule-scoped marker above the finding
         Thread.Sleep(5);
     }
 
     public static void RuleScopedTrailing()
     {
-        var client = new HttpClient(); // ubs:ignore[cs.httpclient-per-call] -- fixture: rule-scoped trailing marker
+        var client = new HttpClient(); // ubs:ignore[cs.pattern.new-httpclient,cs-httpclient-instantiation] -- fixture: rule-scoped trailing marker
         _ = client;
     }
 }

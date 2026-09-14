@@ -69,6 +69,7 @@ def _filehandle_imbalance(ctx):
     yield {
         "rule": "swift.files.filehandle",
         "category": 8,
+        "scope": "project_aggregate",
         "path": "", "line": 0,
         "severity": "warning",
         "count": opens - closes,
@@ -89,6 +90,7 @@ def _main_actor_presence(ctx):
         yield {
             "rule": "swift.threading.main-actor",
             "category": 9,
+            "scope": "project_aggregate",
             "path": "", "line": 0,
             "severity": "info",
             "count": len(ui_files),

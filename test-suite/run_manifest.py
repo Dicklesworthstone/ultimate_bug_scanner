@@ -472,22 +472,43 @@ def parse_sarif_summary(stdout: str, project_label: str) -> Optional[Dict[str, A
 def parse_toon_summary(stdout: str, project_label: str) -> Optional[Dict[str, Any]]:
     """Parse UBS --format=toon output to extract aggregate totals.
 
-    TOON output is YAML-like with a top-level ``scanners[N]:`` array whose
-    entries each expose ``critical``, ``warning``, ``info``, and ``files``
-    keys. Totals are the sum across scanners so the manifest's min/max
-    assertions continue to work regardless of format.
+    Prefer the top-level ``totals:`` mapping when present. Summing every
+    indented ``critical``/``warning``/``info``/``files`` line would count
+    per-scanner fields and the aggregate block twice (issue #115).
+    Fixtures that only list per-scanner fields still sum those values.
     """
     if "scanners[" not in stdout or "findings[" not in stdout:
         return None
-    totals = {"critical": 0, "warning": 0, "info": 0, "files": 0}
-    found_any = False
+    totals_keys = ("critical", "warning", "info", "files")
     pattern = re.compile(r"^\s+(critical|warning|info|files):\s*(\d+)\s*$")
+    header = re.compile(r"^totals:\s*$")
+    block: Dict[str, int] = {}
+    in_totals = False
     for line in stdout.splitlines():
-        m = pattern.match(line)
-        if not m:
+        if header.match(line):
+            in_totals = True
             continue
-        key = m.group(1)
-        totals[key] += int(m.group(2))
+        if in_totals:
+            if line and not line[:1].isspace():
+                break
+            match = pattern.match(line)
+            if match:
+                block[match.group(1)] = int(match.group(2))
+    if block:
+        totals = {key: 0 for key in totals_keys}
+        totals.update(block)
+        return {
+            "project": project_label,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "totals": totals,
+        }
+    totals = {key: 0 for key in totals_keys}
+    found_any = False
+    for line in stdout.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        totals[match.group(1)] += int(match.group(2))
         found_any = True
     if not found_any:
         return None

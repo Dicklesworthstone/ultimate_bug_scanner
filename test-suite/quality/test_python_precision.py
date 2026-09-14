@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,6 +36,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -656,6 +658,71 @@ class NdjsonReaderTests(unittest.TestCase):
                 read_ndjson(sink),
                 [{"rule": "r", "line": 1}, {"rule": "s", "line": 2}],
             )
+
+
+class PythonPreviewOrderTests(unittest.TestCase):
+    def test_real_scan_preview_sites_survive_input_order_and_parallelism(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_python_previews_") as tmp:
+            root = Path(tmp)
+            paths = []
+            for name in ("alpha", "bravo", "charlie", "delta", "echo"):
+                source = root / f"{name}.py"
+                source.write_text('handle = open("input.txt", encoding="utf-8")\n', encoding="utf-8")
+                paths.append(source)
+            baseline_report = None
+            baseline_records = None
+            env = os.environ.copy()
+            env.update({"PYTHONPATH": str(HELPERS_DIR), "UBS_NO_CACHE": "1"})
+            for index, (selected, jobs) in enumerate((
+                (paths, 1),
+                (list(reversed(paths)), 4),
+                (paths[::2] + paths[1::2], 4),
+            )):
+                sink = root / f"findings-{index}.ndjson"
+                report = root / f"report-{index}.json"
+                proc = subprocess.run(
+                    [sys.executable, "-m", "ubs_core.py_scan", "--files-from", "-",
+                     "--sink", str(sink), "--json-out", str(report),
+                     "--project-dir", str(root), "--project", str(root), "--jobs", str(jobs)],
+                    input="\0".join(map(str, selected)) + "\0",
+                    capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=90,
+                )
+                self.assertIn(proc.returncode, (0, 1), proc.stderr)
+                try:
+                    doc = json.loads(report.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    self.fail(f"scanner did not emit valid JSON: {exc}; stderr={proc.stderr}")
+                self.assertEqual(doc["status"], "ok")
+                records = read_ndjson(sink)
+                signatures = Counter(json.dumps(record, sort_keys=True) for record in records)
+                findings = doc["findings"]
+                open_finding = next(f for f in findings if f["rule_id"] == "py.io.open-missing-with")
+                self.assertEqual(open_finding["count"], 5)
+                self.assertEqual(open_finding["severity"], "warning")
+                self.assertEqual(open_finding["samples"], [
+                    {"file": str(path), "line": 1,
+                     "code": 'handle = open("input.txt", encoding="utf-8")'}
+                    for path in paths[:3]
+                ])
+                comparable = {
+                    key: doc[key]
+                    for key in ("files", "critical", "warning", "info", "findings", "report")
+                }
+                if baseline_report is None:
+                    baseline_report, baseline_records = comparable, signatures
+                else:
+                    self.assertEqual(comparable, baseline_report)
+                    self.assertEqual(signatures, baseline_records)
+
+                # Duplicate evidence retains its multiplicity, while sample
+                # choice is independent of its arrival order as well.
+                from ubs_core.py_scan import _legacy_report
+
+                duplicated = records + records
+                forward = _legacy_report(duplicated, "test")
+                backward = _legacy_report(list(reversed(duplicated)), "test")
+                self.assertEqual(forward, backward)
+                self.assertEqual(sum(f["count"] for f in forward["findings"]), len(duplicated))
 
 
 class TrailingRootFlagTests(unittest.TestCase):

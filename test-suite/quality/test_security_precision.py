@@ -1782,6 +1782,185 @@ fn timing_safe(expected_signature: &[u8], provided: &[u8]) -> bool {
                 self.assertEqual(scan([clean, positive], repaired, "sarif", 2), partial)
 
 
+class RustCryptographicRandomnessTests(unittest.TestCase):
+    RULE = "rust.security.non-crypto-random"
+    SECURE = '''use rand::{Rng, RngCore};
+fn create_session_token() {
+    let mut rng = rand::rng();
+    let token: [u8; 32] = rng.random();
+    let mut salt = [0_u8; 32];
+    rand::rng().fill_bytes(&mut salt);
+    let token: [u8; 32] = rand::random();
+    let token = rand::random::<[u8; 32]>();
+    let token = rand::thread_rng().gen::<[u8; 32]>();
+    let mut thread = rand::rngs::ThreadRng::default();
+    let token: [u8; 32] = thread.random();
+    let mut standard = rand::rngs::StdRng::from_entropy();
+    let token: [u8; 32] = standard.random();
+    let mut standard = rand::rngs::StdRng::from_os_rng();
+    let token: [u8; 32] = standard.random();
+}
+fn csrf_nonce() {
+    let token = rand::random::<
+        [u8; 32]>();
+    let mut rng = rand::rng();
+    let salt: [u8; 32] = rng.random();
+}
+fn count_sessions_bounded() {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    if std::time::Instant::now() >= deadline {
+        return;
+    }
+}
+fn doctor_source_authority() {
+    let source_authority_started = Instant::now();
+}
+fn api_key_timeout() {
+    let started = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    if Instant::now() >= deadline {
+        return;
+    }
+}
+fn verify_pack_source_citations() {
+    verify_citations(
+        &mut plan,
+        Instant::now() + Duration::from_millis(500),
+    );
+}
+fn unique_failed_seed_backup_root() {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH);
+    let nonce = NEXT_NONCE.fetch_add(1, Ordering::Relaxed);
+    backups_dir.join(format!("{timestamp}.{}.{}.bak", std::process::id(), nonce))
+}
+fn doctor_lock_metadata_pid_is_current_process(pid: u32) -> bool {
+    pid == std::process::id()
+}
+'''
+    WEAK = '''fn create_session_token() {
+    let nonce = fastrand::u64(..); // expect: weak
+    let mut small = rand::rngs::SmallRng::seed_from_u64(7);
+    let token = small.next_u64(); // expect: weak
+    let mut small = rand::rngs::SmallRng::from_os_rng();
+    let token = small.next_u64(); // expect: weak
+    let mut seeded = rand::rngs::StdRng::seed_from_u64(7);
+    let token = seeded.next_u64(); // expect: weak
+    let token = std::time::SystemTime::now(); // expect: weak
+    let token = std::process::id(); // expect: weak
+    let token = hasher.finish(); // expect: weak
+    let token = fastrand::u64(..); // ubs:ignore[rust.security.non-crypto-random]
+
+    let token = fastrand::u64(..); // ubs:ignore[rust.panic.assert-macros] expect: weak
+    let token = fastrand::u64( // expect: weak
+        ..); // multiline ends here
+    let text = "token fastrand::u64(..)";
+}
+fn display_jitter() {
+    let number = fastrand::u64(..);
+}
+fn api_key_from_seed() {
+    let seed = SystemTime::now().duration_since(UNIX_EPOCH); // expect: weak
+}
+fn csrf_nonce_from_clock() {
+    SystemTime::now().duration_since(UNIX_EPOCH) // expect: weak
+}
+fn password_reset_token() {
+    return format!("{}", std::process::id()); // expect: weak
+}
+'''
+
+    @staticmethod
+    def weak_lines(source: str) -> list[int]:
+        return [line for line, text in enumerate(source.splitlines(), 1)
+                if "expect: weak" in text]
+
+    def test_crypto_generators_and_insecure_sources_remain_distinct(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_rust_random_") as tmp:
+            root = Path(tmp)
+            secure = root / "secure.rs"
+            weak = root / "weak.rs"
+            secure.write_text(self.SECURE, encoding="utf-8")
+            weak.write_text(self.WEAK, encoding="utf-8")
+            self.assertEqual(list(security_randomness.find([secure])), [])
+            findings = list(security_randomness.find([weak]))
+            self.assertEqual([(path, line, col) for path, line, col, _ in findings],
+                             [(weak, line, 1) for line in self.weak_lines(self.WEAK)])
+            # Keep the formerly flagged original ThreadRng/random examples as
+            # explicit controls, while the other real fixture hazards survive.
+            original = REPO_ROOT / "test-suite/rust/buggy/security_randomness.rs"
+            original_hits = list(security_randomness.find([original]))
+            self.assertFalse(any(line in (8, 9, 13) for _, line, _, _ in original_hits))
+            self.assertGreaterEqual(len(original_hits), 5)
+
+    def test_public_reports_and_cache_preserve_crypto_controls_and_weak_sites(self) -> None:
+        self.assertIsNotNone(shutil.which("ast-grep"), "real generated Rust scan required")
+        for ast in (True, False):
+            with self.subTest(ast=ast), tempfile.TemporaryDirectory(prefix="ubs_rust_random_cli_") as tmp:
+                root = Path(tmp)
+                project = root / "project"
+                project.mkdir()
+                secure = project / "secure.rs"
+                weak = project / "weak.rs"
+                secure.write_text(self.SECURE, encoding="utf-8")
+                weak.write_text(self.WEAK, encoding="utf-8")
+                inputs = root / "inputs"
+                report = root / "findings.ndjson"
+                statistics = root / "cache-stats.json"
+                env = dict(os.environ, UBS_NO_CACHE="0", UBS_CACHE_DIR=str(root / "cache"),
+                           UBS_CACHE_FILE=str(statistics), UBS_PROFILE="1", NO_COLOR="1",
+                           UBS_SKIP_TYPE_NARROWING="1", UBS_TEST_FORCE_NO_AST_GREP="0" if ast else "1")
+
+                def scan(selected: list[Path], source: str, output_format: str, hits: int) -> list[dict]:
+                    inputs.write_bytes(b"\0".join(os.fsencode(path) for path in selected) + b"\0")
+                    command = [str(REPO_ROOT / "modules/ubs-rust.sh"), "--no-cargo", "--ci",
+                               "--no-color", "--only=8", f"--format={output_format}",
+                               f"--report-json={report}", "--files-from", str(inputs), str(project)]
+                    proc = subprocess.run(command, cwd=root, env=env, text=True,
+                                          capture_output=True, timeout=180)
+                    context = f"{command!r}; exit={proc.returncode}; stdout={proc.stdout!r}; stderr={proc.stderr!r}"
+                    expected = [(self.RULE, str(weak), line, 1, "critical")
+                                for line in self.weak_lines(source)] if weak in selected else []
+                    self.assertEqual(proc.returncode, int(bool(expected)), context)
+                    try:
+                        payload = json.loads(proc.stdout)
+                        stats = json.loads(statistics.read_text(encoding="utf-8"))
+                        records = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
+                    except (json.JSONDecodeError, OSError) as exc:
+                        self.fail(f"invalid Rust randomness report/statistics: {exc}; {context}")
+                    self.assertEqual((stats["hits"], stats["misses"]), (hits, len(selected) - hits), context)
+                    actual = [(record["rule"], str((root / record["path"]).resolve()),
+                               record["line"], record["col"], record["severity"]) for record in records]
+                    self.assertEqual(sorted(actual), sorted(expected), context)
+                    self.assertTrue(all(record.get("count", 1) == 1 for record in records), context)
+                    if output_format == "json":
+                        self.assertEqual(payload["status"], "ok", context)
+                        self.assertEqual((payload["critical"], payload["warning"], payload["info"]),
+                                         (len(expected), 0, 0), context)
+                    else:
+                        self.assertEqual(payload["version"], "2.1.0", context)
+                        self.assertEqual(len(payload["runs"]), 1, context)
+                        sarif = []
+                        for record in payload["runs"][0]["results"]:
+                            self.assertEqual(record["level"], "error", context)
+                            self.assertEqual(len(record["locations"]), 1, context)
+                            loc = record["locations"][0]["physicalLocation"]
+                            sarif.append((record["ruleId"], str((root / loc["artifactLocation"]["uri"]).resolve()),
+                                          loc["region"]["startLine"], loc["region"]["startColumn"], "critical"))
+                        self.assertEqual(sorted(sarif), sorted(expected), context)
+                    return sorted(records, key=lambda record: (record["path"], record["line"], record["col"]))
+
+                cold = scan([secure, weak], self.WEAK, "json", 0)
+                self.assertEqual(scan([secure, weak], self.WEAK, "json", 2), cold)
+                self.assertEqual(scan([secure, weak], self.WEAK, "sarif", 2), cold)
+                self.assertEqual(scan([secure], self.WEAK, "json", 1), [])
+                repaired = self.WEAK.replace("let nonce = fastrand::u64(..); // expect: weak",
+                                             "let nonce = rand::random::<[u8; 32]>();")
+                weak.write_text(repaired, encoding="utf-8")
+                partial = scan([secure, weak], repaired, "json", 1)
+                self.assertEqual(len(partial), len(cold) - 1)
+                self.assertEqual(scan([secure, weak], repaired, "sarif", 2), partial)
+
+
 class RustPreparedSourceTests(unittest.TestCase):
     COMPARE = '''const API_SECRET: &str = "secret";
 fn verify(provided: &str) {
@@ -1804,20 +1983,20 @@ fn other(provided: &str) {
 }
 '''
     RANDOM = '''fn create_session_token() {
-    let token = rand::random::<u64>();
-    let token = rand::random::<u64>(); // ubs:ignore
+    let token = fastrand::u64(..);
+    let token = fastrand::u64(..); // ubs:ignore
     // ubs:ignore
-    let token = rand::random::<u64>();
+    let token = fastrand::u64(..);
 }
 fn doc() {
-    let text = "token rand::random::<u64>() // literal";
+    let text = "token fastrand::u64(..) // literal";
 }
 fn csrf_nonce() {
-    let nonce = rand::random::<
-        u64>();
+    let nonce = fastrand::u64(
+        ..);
 }
 fn unrelated() {
-    let number = rand::random::<u64>();
+    let number = fastrand::u64(..);
 }
 '''
 

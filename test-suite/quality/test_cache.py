@@ -17,6 +17,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,7 +96,10 @@ class IncrementalCacheTests(unittest.TestCase):
         nested.mkdir()
         # NUL-delimited Git output must retain quoted, tab/newline and trailing
         # whitespace filenames exactly; none are shell-interpolated.
-        names = ["plain.py", 'quoted".py', "tab\tname.py", "line\nname.py", "trailing.py "]
+        names = ["plain.py", 'quoted".py', "tab\tname.py", "line\nname.py",
+                 "carriage\rname.py", "trailing.py "]
+        if os.name == "posix":
+            names.append(os.fsdecode(b"raw-\xff.py"))
         for name in names:
             (nested / name).write_text("VALUE = 1\n", encoding="utf-8")
         outside = self.project_dir / "outside.py"
@@ -116,6 +120,10 @@ class IncrementalCacheTests(unittest.TestCase):
         (self.project_dir / ".gitignore").write_text("scratch/\n", encoding="utf-8")
         (ignored / "fresh.py").write_text("VALUE = 2\n", encoding="utf-8")
         self.assertIsNone(get_clean_git_blobs(ignored))
+        if os.name == "posix":
+            self._git("config", "core.quotePath", "false")
+            (nested / os.fsdecode(b"raw-\xff.py")).write_text("VALUE = 4\n", encoding="utf-8")
+            self.assertIsNone(get_clean_git_blobs(nested))
         (nested / "plain.py").write_text("VALUE = 3\n", encoding="utf-8")
         self.assertIsNone(get_clean_git_blobs(nested))
 
@@ -169,6 +177,196 @@ class IncrementalCacheTests(unittest.TestCase):
             return json.loads(payload)
         except ValueError as exc:
             self.fail(f"Invalid JSON: {exc}\n{context}\nJSON payload:\n{payload}")
+
+    def _python_pattern_selection(
+        self, files: list[Path], cache_dir: Path, hits: int, label: str, skip: str = "",
+    ) -> tuple[bytes, dict, list[dict]]:
+        sink = self.test_root / "pattern-selection.ndjson"
+        summary = self.test_root / "pattern-selection.json"
+        text_report = self.test_root / "pattern-selection.txt"
+        run_env = dict(os.environ)
+        run_env["PYTHONPATH"] = str(HELPERS_DIR)
+        run_env[ENV_CACHE_DIR] = str(cache_dir)
+        run_env.pop(ENV_NO_CACHE, None)
+        run_env["UBS_PROFILE"] = "1"
+        run_env["UBS_CACHE_FILE"] = str(self.test_root / "pattern-cache-stats.json")
+        run_env["UBS_PREFILTER_FILE"] = str(self.test_root / "pattern-prefilter-stats.json")
+        proc = subprocess.run(
+            [sys.executable, "-m", "ubs_core.py_scan", "--sink", str(sink),
+             "--json-out", str(summary), "--text-out", str(text_report),
+             "--project-dir", str(self.project_dir), "--fail-on-warning", "--skip", skip],
+            input="\0".join(str(path) for path in files),
+            capture_output=True, text=True, cwd=HELPERS_DIR, env=run_env, timeout=180,
+        )
+        context = f"{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        self.assertIn(proc.returncode, (0, 1), context)
+        self.assertNotIn("_ubs_python_pattern", proc.stdout + proc.stderr, context)
+        for output in (sink, summary, text_report):
+            self.assertTrue(output.is_file(), context)
+            self.assertNotIn("_ubs_python_pattern", output.read_text(encoding="utf-8"), context)
+        doc = self._decode_json(summary.read_text(encoding="utf-8"), context)
+        data = sink.read_bytes()
+        records = [self._decode_json(line, context)
+                   for line in data.decode("utf-8").splitlines() if line.strip()]
+        self.assertEqual(doc["status"], "ok", context)
+        self.assertEqual(doc["files"], len(files), context)
+        self.assertEqual(proc.returncode, int(doc["critical"] + doc["warning"] > 0), context)
+        for profile in (doc["profile"], doc["extras"]["profile"]):
+            self.assertEqual(profile["cache_hits"], hits, context)
+            self.assertEqual(profile["cache_misses"], len(files) - hits, context)
+        for record in records:
+            self.assertIn(record["severity"], ("critical", "warning", "info"), context)
+            self.assertFalse(any(key.startswith("_ubs_") for key in record), context)
+            self.assertIn(Path(record["path"]), files, context)
+        for severity in ("critical", "warning", "info"):
+            self.assertEqual(doc[severity], sum(record["severity"] == severity
+                                               for record in records), context)
+        stable = {key: doc[key] for key in ("critical", "warning", "info", "findings", "report")}
+        return data, stable, records
+
+    def _python_pattern_selection_with_oracle(
+        self, files: list[Path], hits: int, label: str, skip: str = "",
+    ) -> list[dict]:
+        actual = self._python_pattern_selection(files, self.cache_dir, hits, label, skip)
+        with tempfile.TemporaryDirectory(prefix="pattern-oracle-", dir=self.test_root) as oracle:
+            fresh = self._python_pattern_selection(files, Path(oracle), 0, label + " fresh", skip)
+        self.assertEqual(actual[:2], fresh[:2], label)
+        return actual[2]
+
+    def test_python_pattern_thresholds_reconcile_selected_cached_matches(self) -> None:
+        a = self.project_dir / "a.py"
+        b = self.project_dir / "b.py"
+        c = self.project_dir / "c.py"
+        lengths = {a: 20, b: 1, c: 30}
+        for path, count in lengths.items():
+            path.write_text("print(value)\n" * count, encoding="utf-8")
+
+        def check(files: list[Path], hits: int, severity: str | None, label: str) -> None:
+            records = self._python_pattern_selection_with_oracle(files, hits, label)
+            expected = [
+                ("py.debug.print", str(path), line, 1, severity)
+                for path in files for line in range(1, lengths[path] + 1)
+            ] if severity else []
+            self.assertEqual(
+                [(record["rule"], record["path"], record["line"], record["col"], record["severity"])
+                 for record in records], expected, label,
+            )
+
+        # Prime silent sub-threshold files independently. Their matches must
+        # still contribute when an entirely cached selection crosses a tier.
+        check([a], 0, None, "prime 20")
+        check([b], 0, None, "prime 1")
+        check([c], 0, "info", "prime 30")
+        check([a, b, c], 3, "warning", "51 all cached")
+        check([a], 1, None, "20 cached")
+        check([a, b], 2, "info", "21 cached")
+        check([a, c], 2, "info", "50 cached")
+        check([a, b, c], 3, "warning", "51 cached again")
+        lengths[c] = 29
+        c.write_text("print(value)\n" * lengths[c], encoding="utf-8")
+        check([a, b, c], 2, "info", "50 partial")
+        check([a, b, c], 3, "info", "50 warm")
+        lengths[c] = 31
+        c.write_text("print(value)\n" * lengths[c], encoding="utf-8")
+        check([a, b, c], 2, "warning", "52 partial")
+        check([a, b, c], 3, "warning", "52 warm")
+        skipped = self._python_pattern_selection_with_oracle([a, b, c], 0, "skip debug", "11")
+        self.assertEqual(skipped, [])
+        self.assertEqual(
+            self._python_pattern_selection_with_oracle([a, b, c], 3, "skip debug warm", "11"), [],
+        )
+
+    def test_python_pattern_suppressors_reconcile_selected_cached_matches(self) -> None:
+        idle = self.project_dir / "idle.py"
+        context = self.project_dir / "context.py"
+        active = self.project_dir / "active.py"
+        idle.write_text("async def idle():\n    return 1\n", encoding="utf-8")
+        # A raw-text suppressor with no async match and no candidate async
+        # rule must survive caching too; this is the existing rule contract.
+        context.write_text("# await completion\nVALUE = 1\n", encoding="utf-8")
+        active.write_text("async def active():\n    await operation()\n", encoding="utf-8")
+
+        def check(files: list[Path], hits: int, warning: bool, label: str,
+                  idle_lines: tuple[int, ...] = (1,)) -> None:
+            records = self._python_pattern_selection_with_oracle(files, hits, label)
+            async_sites = [(str(path), line) for path in files
+                           for line in (idle_lines if path == idle else (1,) if path == active else ())]
+            for rule, severity, sites in (
+                ("py.async.census", "info", async_sites),
+                ("py.async.un-awaited-paths", "warning", async_sites if warning else []),
+            ):
+                found = [record for record in records if record["rule"] == rule]
+                self.assertEqual(
+                    [(record["path"], record["line"], record["col"], record["severity"])
+                     for record in found],
+                    [(path, line, 1, severity) for path, line in sites], label,
+                )
+            self.assertEqual(
+                {record["rule"] for record in records},
+                {"py.async.census", "py.async.un-awaited-paths"} if warning
+                else {"py.async.census"} if async_sites else set(), label,
+            )
+
+        check([idle, context], 0, False, "cold suppressed")
+        check([idle, context], 2, False, "warm suppressed")
+        check([idle], 1, True, "cached suppressor removed")
+        check([context], 1, False, "context only")
+        check([idle, active], 1, False, "new actual await suppresses cached idle")
+        check([idle, active], 2, False, "actual await warm")
+        check([idle], 1, True, "actual await removed")
+        context.write_text("VALUE = 2\n", encoding="utf-8")
+        check([idle, context], 1, True, "partial suppressor removed")
+        check([idle, context], 2, True, "warm unsuppressed")
+        context.write_text("NOTE = 'await completion'\n", encoding="utf-8")
+        check([idle, context], 1, False, "partial literal suppressor added")
+        check([idle, context], 2, False, "literal suppressor warm")
+        idle.write_text("async def idle():\n    return 1\nasync def other():\n    return 2\n",
+                        encoding="utf-8")
+        check([idle, context], 1, False, "cached suppressor with fresh matches", (1, 3))
+        check([idle], 1, True, "recover both cached matches", (1, 3))
+
+    def test_python_pattern_gate_direct_api_and_cached_facts_agree(self) -> None:
+        from ubs_core.py_scan import Pattern, reconcile_pattern_records, scan_patterns
+
+        # Pattern exposes configurable gates even though no built-in Python
+        # rule currently sets one. Exercise that real API with actual files.
+        pattern = Pattern(
+            category=11, rule_id="py.debug.gated-print", title="Gated prints",
+            regex=re.compile(r"print\("), thresholds=((1, "warning"),),
+            gate_regex=re.compile(r"\bfeature_enabled\b"),
+            suppress_when_regex=re.compile(r"\bpaused\b"),
+        )
+        source = self.project_dir / "source.py"
+        gate = self.project_dir / "gate.py"
+        suppressor = self.project_dir / "suppressor.py"
+        source.write_text("print(value)\nprint(other)\n", encoding="utf-8")
+        gate.write_text("FEATURE = 'feature_enabled'\n", encoding="utf-8")
+        suppressor.write_text("# paused\n", encoding="utf-8")
+        cache = ScanCache("python", self.project_dir, rulepack_hash="configured-gate")
+        for path in (source, gate, suppressor):
+            sink = CapturingSink()
+            scan_patterns([pattern], [path], sink, set(), defer_global_checks=True)
+            cache.store_scanned_files([path], sink.by_file)
+        for selected, count in (([source], 0), ([source, gate], 2),
+                                ([source, gate, suppressor], 0), ([gate], 0)):
+            with self.subTest(selected=selected):
+                direct = CapturingSink()
+                counters = scan_patterns([pattern], selected, direct, set())
+                expected = [record for path in selected for record in direct.get_for_file(path)]
+                self.assertEqual(counters, {"critical": 0, "warning": count, "info": 0})
+                self.assertEqual(
+                    [(record["rule"], record["path"], record["line"], record["col"], record["severity"])
+                     for record in expected],
+                    [(pattern.rule_id, str(source), line, 1, "warning")
+                     for line in range(1, count + 1)],
+                )
+                cached, misses = cache.partition_files(selected)
+                self.assertEqual(misses, [])
+                self.assertEqual(set(cached), set(selected))
+                reconciled = reconcile_pattern_records(
+                    [pattern], [record for path in selected for record in cached[path]],
+                )
+                self.assertEqual(reconciled, expected)
 
     def test_helper_source_upgrades_invalidate_real_scanner_cache(self) -> None:
         helpers, run_env = self._copy_helpers()

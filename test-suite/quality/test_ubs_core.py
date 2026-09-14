@@ -2,9 +2,11 @@
 """Unit tests for ubs_core stdlib helper library (bead A2)."""
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +30,192 @@ from ubs_core.lexer import (
     Span,
     strip_comments_and_strings,
 )
+
+
+class UbsCorePackageImportTests(unittest.TestCase):
+    def _isolated_python(self, script: str, *arguments: str) -> dict:
+        command = [sys.executable, "-I", "-S", "-B", "-c", script, *arguments]
+        proc = subprocess.run(command, cwd=REPO_ROOT, text=True, capture_output=True, timeout=60)  # ubs:ignore[python.taint.command] - fixed isolated Python probes and local fixture paths, no external command source
+        self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        try:
+            return json.loads(proc.stdout)
+        except ValueError as exc:
+            self.fail(f"probe JSON failed: {exc}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
+    def test_lazy_package_exports_preserve_real_objects_and_import_forms(self) -> None:
+        script = r'''
+import importlib
+import json
+import sys
+sys.path.insert(0, sys.argv[1])
+import ubs_core
+
+expected = {
+    "CostModel": "scheduler", "ScheduleResult": "scheduler",
+    "calculate_slot_utilization": "scheduler", "schedule_lpt": "scheduler",
+    "ShardQueue": "shards", "make_shards": "shards",
+    "parallel_file_map": "shards", "run_work_stealing": "shards",
+    "extract_statement_region": "io", "find_block_end": "io",
+    "format_location": "io", "line_col": "io", "skip_ws": "io",
+    "Interval": "lexer", "Span": "lexer", "strip_comments_and_strings": "lexer",
+}
+deferred = {"ubs_core.scheduler", "ubs_core.shards"}
+assert deferred.isdisjoint(sys.modules), sorted(deferred.intersection(sys.modules))
+assert {"ubs_core.io", "ubs_core.lexer"}.issubset(sys.modules)
+assert set(ubs_core.__all__) == set(expected)
+assert len(ubs_core.__all__) == len(expected)
+assert set(expected).issubset(dir(ubs_core))
+assert deferred.isdisjoint(sys.modules), "dir must not load deferred modules"
+try:
+    getattr(ubs_core, "unknown_package_export")
+except AttributeError as exc:
+    assert "ubs_core" in str(exc) and "unknown_package_export" in str(exc)
+else:
+    raise AssertionError("unknown exports must raise AttributeError")
+sentinel = object()
+assert getattr(ubs_core, "unknown_package_export", sentinel) is sentinel
+assert not hasattr(ubs_core, "unknown_package_export")
+assert deferred.isdisjoint(sys.modules), "missing attributes must not load helpers"
+
+mode = sys.argv[2]
+if mode == "attribute":
+    first = ubs_core.CostModel
+    assert "ubs_core.scheduler" in sys.modules
+    assert "ubs_core.shards" not in sys.modules
+    assert first is ubs_core.CostModel
+elif mode == "named":
+    from ubs_core import (
+        CostModel, ScheduleResult, calculate_slot_utilization, schedule_lpt,
+        ShardQueue, make_shards, parallel_file_map, run_work_stealing,
+        extract_statement_region, find_block_end, format_location, line_col,
+        skip_ws, Interval, Span, strip_comments_and_strings,
+    )
+elif mode == "star":
+    before_star = set(globals())
+    from ubs_core import *
+    assert set(globals()) - before_star - {"before_star"} == set(expected)
+elif mode == "submodule":
+    import ubs_core.scheduler
+    assert "ubs_core.shards" not in sys.modules
+    from ubs_core import shards
+    assert ubs_core.scheduler is importlib.import_module("ubs_core.scheduler")
+    assert shards is importlib.import_module("ubs_core.shards")
+    assert ubs_core.shards is shards
+else:
+    raise AssertionError(mode)
+
+for name, module_name in expected.items():
+    exported = getattr(ubs_core, name)
+    module = importlib.import_module("ubs_core." + module_name)
+    assert exported is getattr(module, name), (mode, name)
+    assert vars(ubs_core)[name] is exported, (mode, name, "not memoized")
+    if mode in ("named", "star"):
+        assert globals()[name] is exported, (mode, name)
+assert ubs_core.line_col("first\nsecond", 6) == (2, 1)
+assert len(ubs_core.make_shards(["one", "two", "three"], 2)) == 2
+print(json.dumps({"mode": mode, "exports": sorted(expected),
+                  "loaded": sorted(deferred.intersection(sys.modules))}))
+'''
+        for mode in ("attribute", "named", "star", "submodule"):
+            with self.subTest(mode=mode):
+                result = self._isolated_python(script, str(HELPERS_DIR), mode)
+                self.assertEqual(result["mode"], mode)
+                self.assertEqual(len(result["exports"]), 16)
+                self.assertEqual(result["loaded"], ["ubs_core.scheduler", "ubs_core.shards"])
+
+    def test_installed_helper_fingerprint_preserves_paths_extensions_and_full_bytes(self) -> None:
+        script = r'''
+import json
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+os.environ["UBS_NO_CACHE"] = "0"
+os.environ["UBS_CACHE_DIR"] = sys.argv[2]
+from ubs_core.cache import ScanCache
+cache = ScanCache("python", project_dir=sys.argv[3], rulepack_hash="fixture-rules",
+                  module_checksum="fixture-module", engine_version="fixture-engine")
+assert cache.enabled
+print(json.dumps({"source_hash": cache._derive_helper_source_hash(), "cache_key": cache.cache_key}))
+'''
+        with tempfile.TemporaryDirectory(prefix="ubs-helper-paths-") as temp:
+            root = Path(temp)
+            helpers = root / "helpers"
+            package = helpers / "ubs_core"
+            package.mkdir(parents=True)
+            copied_names = ("__init__.py", "cache.py", "io.py", "lexer.py")
+            for name in copied_names:
+                shutil.copy2(HELPERS_DIR / "ubs_core" / name, package / name)
+            nested = helpers / "nested λ"
+            deeper = nested / "deeper"
+            deeper.mkdir(parents=True)
+            fixtures = {
+                "...go": b"package fixture\n",
+                "..py": b"VALUE = 1\n",
+                ".js": b"ignored bare dotfile\n",
+                "edge.js": b"const edge = 1;\r\n",
+                "nested λ/Ω.js": b"header\x00" + b"x" * 8192 + b"\xff",
+                "nested λ/deeper/worker.go": "package fixture // 雪\n".encode("utf-8"),
+            }
+            for relative, content in fixtures.items():
+                (helpers / relative).write_bytes(content)
+            bytecode = package / "__pycache__"
+            bytecode.mkdir()
+            (bytecode / "ignored.py").write_text("ignored cache source\n", encoding="utf-8")
+            (helpers / "ignored.pyc").write_bytes(b"ignored bytecode")
+
+            # Explicit traversal order is the installed-helper fingerprint
+            # contract: root files, then sorted directory subtrees. Path.suffix
+            # supplies the original interpreter's dotfile semantics (3.14
+            # changed them), independently of the optimized classifier.
+            ordered_paths = [
+                name for name in ("...go", "..py", ".js", "edge.js")
+                if Path(name).suffix in (".py", ".go", ".js")
+            ] + ["nested λ/Ω.js", "nested λ/deeper/worker.go"] + [
+                "ubs_core/" + name for name in copied_names
+            ]
+
+            def reference_hash() -> str:
+                digest = hashlib.blake2b(digest_size=16)
+                for relative in ordered_paths:
+                    encoded = relative.encode("utf-8", "surrogateescape")
+                    content = (helpers / relative).read_bytes()
+                    digest.update(len(encoded).to_bytes(8, "big"))
+                    digest.update(encoded)
+                    digest.update(len(content).to_bytes(8, "big"))
+                    digest.update(content)
+                return digest.hexdigest()
+
+            def actual_hash() -> dict:
+                result = self._isolated_python(
+                    script, str(helpers), str(root / "cache"), str(root),
+                )
+                self.assertEqual(result["source_hash"], reference_hash())
+                return result
+
+            baseline = actual_hash()
+            for name in ("...go", "..py", ".js"):
+                with self.subTest(filename=name, suffix=Path(name).suffix):
+                    path = helpers / name
+                    path.write_bytes(path.read_bytes() + b"changed\n")
+                    changed = actual_hash()
+                    if name in ordered_paths:
+                        self.assertNotEqual(changed["source_hash"], baseline["source_hash"])
+                        self.assertNotEqual(changed["cache_key"], baseline["cache_key"])
+                    else:
+                        self.assertEqual(changed, baseline)
+                    baseline = changed
+            source = nested / "Ω.js"
+            original_stat = source.stat()
+            source.write_bytes(fixtures["nested λ/Ω.js"][:-1] + b"\xfe")
+            os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            changed = actual_hash()
+            self.assertNotEqual(changed["source_hash"], baseline["source_hash"])
+            self.assertNotEqual(changed["cache_key"], baseline["cache_key"])
+            source.rename(nested / "雪.js")
+            ordered_paths[ordered_paths.index("nested λ/Ω.js")] = "nested λ/雪.js"
+            renamed = actual_hash()
+            self.assertNotEqual(renamed["source_hash"], changed["source_hash"])
+            self.assertNotEqual(renamed["cache_key"], changed["cache_key"])
 
 
 class UbsCoreIoTests(unittest.TestCase):
@@ -336,26 +524,33 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                             else:
                                 cold = ordered
 
-    def _native_swift(self, root, project, paths, cache, *, rules=None, hits=0, detail_limit=1):
+    def _native_swift(self, root, project, paths, cache, *, rules=None, hits=0, detail_limit=1,
+                      categories=(4, 6, 7), text_out=None):
         """Exercise the real scanner from outside the project with relative inputs."""
         outside = root / "outside"
         outside.mkdir(exist_ok=True)
-        files_from, sink, output = root / "files.txt", root / "findings.ndjson", root / "report.json"
+        # A failed child must never reuse an earlier invocation's report.
+        artifacts = Path(tempfile.mkdtemp(prefix="scan-", dir=root))
+        files_from, sink, output = artifacts / "files.txt", artifacts / "findings.ndjson", artifacts / "report.json"
         files_from.write_text("\n".join(os.path.relpath(path, outside) for path in paths) + "\n", encoding="utf-8")
         command = [
             sys.executable, "-m", "ubs_core.swift_scan", "--files-from", str(files_from),
             "--sink", str(sink), "--json-out", str(output), "--project-dir", str(project),
             "--skip-type-narrowing", "--detail-limit", str(detail_limit), "--fail-on-warning",
-            "--skip", ",".join(str(n) for n in range(1, 24) if n not in (4, 6, 7)),
+            "--skip", ",".join(str(n) for n in range(1, 24) if n not in categories),
         ]
         if rules is not None:
             command.extend(("--ast-rule-dir", str(rules), "--ast-available"))
+        if text_out is not None:
+            command.extend(("--text-out", str(text_out)))
         env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
                    UBS_NO_CACHE="0", UBS_CACHE_DIR=str(cache), UBS_PROFILE="1")
         proc = subprocess.run(command, cwd=outside, env=env, text=True, capture_output=True, timeout=180)  # ubs:ignore[python.taint.command] - fixed scanner argv and local Swift fixtures; bounded real subprocess
         context = f"exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
         self.assertTrue(output.is_file(), context)
         self.assertTrue(sink.is_file(), context)
+        if text_out is not None:
+            self.assertTrue(text_out.is_file(), context)
         try:
             doc = json.loads(output.read_text(encoding="utf-8"))
             records = [json.loads(line) for line in sink.read_text(encoding="utf-8").splitlines()]
@@ -378,7 +573,7 @@ class StructuredSourceIdentityTests(unittest.TestCase):
         cases = (
             ("archive_extraction", 2,
              "let archive = Archive()\nlet output = destination.appendingPathComponent(entry.path)\n",
-             "let archive = Archive()\nlet output = safeArchiveURL(entry.path)\n"),
+             "let archive = Archive()\nlet output = destination.appendingPathComponent(entry.path)\nensureInsideDestination(output)\n"),
             ("header_injection", 1,
              'response.headers["X-Name"] = req.query["name"]\n',
              'response.headers["X-Name"] = safeHeaderValue(req.query["name"])\n'),
@@ -447,6 +642,279 @@ class StructuredSourceIdentityTests(unittest.TestCase):
             subset = self._native_swift(root, project, [fixed], cache, hits=1)
             self.assertEqual([r for r in subset if r["rule"] == "swift.security.process-other"], residual)
             self.assertFalse(any(r["rule"] == "swift.security.shell-exec" for r in subset), subset)
+
+    def test_real_swift_ast_cache_subsets_partial_edits_and_preview_overflow(self) -> None:
+        from ubs_core import swift_rules
+
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-partial-") as temp:
+            root = Path(temp).resolve()
+            project = root / "project"
+            project.mkdir()
+            paths = [project / "same.swift", project / "nested" / "same.swift",
+                     project / "peer.swift", project / "fourth.swift", project / "fifth.swift"]
+            paths[1].parent.mkdir()
+            clean = project / "clean.swift"
+            source = ("func start(session: URLSession, url: URL) {\n"
+                      "  let task =\n    session.dataTask(with: url)\n}\n"
+                      "func force() {\n  try! risky()\n}\n")
+            safe = source.replace("\n}", "\n  task.resume()\n}", 1).replace("try! risky()", "try? risky()")
+            for path in paths:
+                path.write_text(source, encoding="utf-8")
+            clean.write_text(safe, encoding="utf-8")
+            selected = paths + [clean]
+            rules = root / "rules"
+            swift_rules.generate(rules)
+            cache = root / "cache"
+
+            def assert_sites(records, expected):
+                for rule, base_line, col in (("ubs.correlation.urlsession.assigned-no-resume", 3, 5),
+                                              ("swift.force-try", 6, 3)):
+                    actual = [r for r in records if r["rule"] == rule]
+                    wanted = [(str(path), base_line + offset, col)
+                              for path, offsets in expected.items() for offset in offsets]
+                    self.assertCountEqual([(r["path"], r["line"], r["col"]) for r in actual], wanted, actual)
+                    self.assertEqual(sum(r["count"] for r in actual), len(wanted), actual)
+                    for record in actual:
+                        self.assertEqual(record["count"], 1)
+                        self.assertEqual(len(record["samples"]), 1)
+                        sample = record["samples"][0]
+                        self.assertEqual((sample["path"], sample["line"], sample["col"]),
+                                         (record["path"], record["line"], record["col"]))
+
+            cold = self._native_swift(root, project, selected, cache, rules=rules)
+            assert_sites(cold, {path: [0] for path in paths})
+            self.assertEqual(self._native_swift(root, project, selected, cache, rules=rules, hits=6), cold)
+            self.assertEqual(self._native_swift(root, project, selected, cache, rules=rules, hits=6, detail_limit=5), cold)
+            # Five positive sources exceed both the requested one-sample
+            # preview and the former hard-coded three-sample correlation cap.
+            for path in selected:
+                with self.subTest(subset=path):
+                    subset = self._native_swift(root, project, [path], cache, rules=rules, hits=1)
+                    assert_sites(subset, {} if path == clean else {path: [0]})
+                    reference = self._native_swift(root, project, [path], root / f"reference-{path.parent.name}-{path.name}", rules=rules)
+                    self.assertEqual(subset, reference)
+
+            paths[1].write_text(safe, encoding="utf-8")
+            partial = self._native_swift(root, project, selected, cache, rules=rules, hits=5)
+            assert_sites(partial, {path: [0] for path in paths if path != paths[1]})
+            self.assertEqual(partial, self._native_swift(root, project, selected, root / "reference-partial-1", rules=rules))
+
+            paths[0].write_text(safe, encoding="utf-8")
+            # New unsafe bytes exercise two misses; restoring the exact old
+            # content would correctly reuse its earlier content-addressed entry.
+            paths[1].write_text(source + "// restored unsafe source\n", encoding="utf-8")
+            partial = self._native_swift(root, project, selected, cache, rules=rules, hits=4)
+            assert_sites(partial, {path: [0] for path in paths if path != paths[0]})
+            self.assertEqual(partial, self._native_swift(root, project, selected, root / "reference-partial-2", rules=rules))
+
+            paths[1].write_text(source + source, encoding="utf-8")
+            partial = self._native_swift(root, project, selected, cache, rules=rules, hits=5)
+            expected = {path: [0] for path in paths if path != paths[0]}
+            expected[paths[1]] = [0, source.count("\n")]
+            assert_sites(partial, expected)
+            self.assertEqual(partial, self._native_swift(root, project, selected, root / "reference-partial-3", rules=rules))
+
+    def test_real_swift_inline_and_split_task_lifecycle(self) -> None:
+        from ubs_core import swift_rules
+
+        cases = (
+            ("inline-unused", "  let task = session.dataTask(with: url)\n", "assigned-no-resume", 2, 14),
+            ("split-assignment", "  let task =\n    session.dataTask(with: url)\n", "assigned-no-resume", 3, 5),
+            ("split-method", "  let task = session\n    .dataTask(with: url)\n", "assigned-no-resume", 2, 14),
+            ("inline-resumed", "  let task = session.dataTask(with: url)\n  task.resume()\n", None, 0, 0),
+            ("inline-cancelled", "  let task = session.dataTask(with: url)\n  task.cancel()\n", "assigned-cancel-no-resume", 2, 14),
+            ("inline-returned", "  let task = session.dataTask(with: url)\n  return task\n", None, 0, 0),
+            ("direct-return", "  return session.dataTask(with: url)\n", None, 0, 0),
+            ("direct-unused", "  session.dataTask(with: url)\n", "unassigned-no-resume", 2, 3),
+            ("discarded", "  _ = session.dataTask(with: url)\n", "unassigned-no-resume", 2, 7),
+            ("chained-resume", "  session.dataTask(with: url).resume()\n", None, 0, 0),
+            ("factory-unused", "  let task = makeSession().dataTask(with: url)\n", "assigned-no-resume", 2, 14),
+            ("factory-resumed", "  let task = makeSession().dataTask(with: url)\n  task.resume()\n", None, 0, 0),
+            ("member-resumed", "  self.task = session.dataTask(with: url)\n  self.task.resume()\n", None, 0, 0),
+            ("utf8-crlf-unused", "  // café\r\n  let task = session.dataTask(with: url)\r\n", "assigned-no-resume", 3, 14),
+            ("utf8-crlf-resumed", "  // café\r\n  let task = session.dataTask(with: url)\r\n  task.resume()\r\n", None, 0, 0),
+        )
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-inline-") as temp:
+            root = Path(temp).resolve()
+            project = root / "project"
+            project.mkdir()
+            paths, expected = [], []
+            for name, body, suffix, line, col in cases:
+                path = project / f"{name}.swift"
+                # Preserve CRLF and UTF-8 bytes for the actual ast-grep ranges.
+                path.write_bytes(("func start(session: URLSession, url: URL) {\n" + body + "}\n").encode("utf-8"))
+                paths.append(path)
+                if suffix is not None:
+                    expected.append(("ubs.correlation.urlsession." + suffix, str(path), line, col,
+                                     "info" if suffix == "assigned-cancel-no-resume" else "warning"))
+            rules = root / "rules"
+            swift_rules.generate(rules)
+            cache = root / "cache"
+            cold = self._native_swift(root, project, paths, cache, rules=rules)
+            correlation = [r for r in cold if r["rule"].startswith("ubs.correlation.urlsession.")]
+            self.assertCountEqual([(r["rule"], r["path"], r["line"], r["col"], r["severity"])
+                                   for r in correlation], expected, correlation)
+            self.assertEqual(sum(r["count"] for r in correlation), len(expected), correlation)
+            for record in correlation:
+                self.assertEqual(record["count"], 1)
+                self.assertEqual(len(record["samples"]), 1)
+                sample = record["samples"][0]
+                self.assertEqual((sample["path"], sample["line"], sample["col"]),
+                                 (record["path"], record["line"], record["col"]))
+            self.assertEqual(self._native_swift(root, project, paths, cache, rules=rules, hits=len(paths)), cold)
+
+    def test_real_swift_global_thresholds_and_pathless_facts_recompute(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-global-") as temp:
+            root = Path(temp).resolve()
+            project = root / "project"
+            project.mkdir()
+            first, second = project / "first.swift", project / "second.swift"
+            first.write_text("let value = optional!\n" * 20 + "let handle = FileHandle(forReadingFrom: url)\n", encoding="utf-8")
+            second.write_text("let value = optional!\n" * 11 + "handle.close()\n", encoding="utf-8")
+            cache = root / "cache"
+
+            def assert_global(records, force_rule, count, imbalance):
+                force = [r for r in records if r["rule"] in ("swift.optionals.force-heavy", "swift.optionals.force-some")]
+                self.assertEqual(len(force), count, records)
+                self.assertEqual(sum(r["count"] for r in force), count, records)
+                self.assertEqual({r["rule"] for r in force}, {force_rule})
+                expected_severity = "warning" if force_rule.endswith("heavy") else "info"
+                self.assertEqual({r["severity"] for r in force}, {expected_severity})
+                handles = [r for r in records if r["rule"] == "swift.files.filehandle"]
+                self.assertEqual([(r["path"], r["line"], r["count"]) for r in handles],
+                                 [("", 0, imbalance)] if imbalance else [], records)
+
+            cold = self._native_swift(root, project, [first, second], cache, categories=(1, 8))
+            assert_global(cold, "swift.optionals.force-heavy", 31, 0)
+            self.assertEqual(self._native_swift(root, project, [first, second], cache, hits=2, categories=(1, 8)), cold)
+            subset = self._native_swift(root, project, [first], cache, hits=1, categories=(1, 8))
+            assert_global(subset, "swift.optionals.force-some", 20, 1)
+            self.assertEqual(subset, self._native_swift(root, project, [first], root / "reference-subset", categories=(1, 8)))
+
+            second.write_text("let value = optional!\n" * 10, encoding="utf-8")
+            partial = self._native_swift(root, project, [first, second], cache, hits=1, categories=(1, 8))
+            assert_global(partial, "swift.optionals.force-some", 30, 1)
+            self.assertEqual(partial, self._native_swift(root, project, [first, second], root / "reference-partial", categories=(1, 8)))
+            first.write_text("let value = optional!\n" * 21 + "let handle = FileHandle(forReadingFrom: url)\nhandle.close()\n", encoding="utf-8")
+            partial = self._native_swift(root, project, [first, second], cache, hits=1, categories=(1, 8))
+            assert_global(partial, "swift.optionals.force-heavy", 31, 0)
+            self.assertEqual(partial, self._native_swift(root, project, [first, second], root / "reference-restored", categories=(1, 8)))
+
+    def test_real_swift_ancillary_findings_require_selected_sources(self) -> None:
+        import plistlib
+
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-ancillary-") as temp:
+            root = Path(temp).resolve()
+            project = root / "project"
+            project.mkdir()
+            swift = project / "clean.swift"
+            swift.write_text("let value = 1\n", encoding="utf-8")
+            package = project / "Package.swift"
+            package.write_text('.package(url: "https://example.invalid/dependency", .branch("main"))\n'
+                               'swiftSettings: [.unsafeFlags(["-Ounchecked"])]\n', encoding="utf-8")
+            storyboards = [project / f"Scene-{i}.storyboard" for i in range(6)]
+            for path in storyboards:
+                path.write_text('<?xml version="1.0"?><document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB"/>\n', encoding="utf-8")
+            info, entitlements = project / "Info.plist", project / "App.entitlements"
+            info.write_bytes(plistlib.dumps({"NSAppTransportSecurity": {"NSAllowsArbitraryLoads": True}}))
+            entitlements.write_bytes(plistlib.dumps({"get-task-allow": True}))
+            categories = (17, 19, 20, 21)
+            cache = root / "cache"
+            ancillary_rules = {
+                "swift.packaging.branch-pins", "swift.packaging.unsafe-flags",
+                "swift.uisafety.storyboards", "swift.infoplist.ats-parse", "swift.build.entitlements",
+            }
+
+            def assert_ancillary(records, expected):
+                actual = []
+                for record in records:
+                    if record["rule"] not in ancillary_rules:
+                        continue
+                    path = record["path"]
+                    source = str((root / "outside" / path).resolve()) if path else ""
+                    actual.append((record["rule"], source, record["line"], record["severity"], record["count"]))
+                self.assertCountEqual(actual, expected, records)
+
+            clean = self._native_swift(root, project, [swift], cache, categories=categories)
+            assert_ancillary(clean, [])
+            self.assertEqual(self._native_swift(root, project, [swift], cache, hits=1, categories=categories), clean)
+
+            selected = [swift, package, *storyboards, info, entitlements]
+            expected = [
+                ("swift.packaging.branch-pins", str(package), 0, "info", 1),
+                ("swift.packaging.unsafe-flags", str(package), 0, "warning", 1),
+                ("swift.uisafety.storyboards", "", 0, "info", 6),
+                ("swift.infoplist.ats-parse", str(info), 0, "warning", 1),
+                ("swift.build.entitlements", str(entitlements), 0, "warning", 1),
+            ]
+            full = self._native_swift(root, project, selected, cache, hits=1, categories=categories)
+            assert_ancillary(full, expected)
+            self.assertEqual(self._native_swift(root, project, selected, cache, hits=len(selected), categories=categories), full)
+            for subset, wanted in (([package], expected[:2]), ([info], [expected[3]]),
+                                   ([entitlements], [expected[4]]), (storyboards, [expected[2]]),
+                                   (storyboards[:5], []), ([swift], [])):
+                with self.subTest(selected=subset):
+                    records = self._native_swift(root, project, subset, cache, hits=len(subset), categories=categories)
+                    assert_ancillary(records, wanted)
+
+    def test_real_swift_generated_ast_findings_remain_visible_in_text(self) -> None:
+        from ubs_core import swift_rules
+
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-ast-text-") as temp:
+            root = Path(temp).resolve()
+            project = root / "project"
+            project.mkdir()
+            first, second, clean = project / "first.swift", project / "second.swift", project / "clean.swift"
+            source = "func dangerous() {\n  try! risky()\n}\n"
+            first.write_text(source, encoding="utf-8")
+            second.write_text("\n" + source, encoding="utf-8")
+            clean.write_text(source.replace("try!", "try?"), encoding="utf-8")
+            rules = root / "rules"
+            swift_rules.generate(rules)
+            cache = root / "cache"
+
+            def assert_visible(records, report, expected):
+                findings = [r for r in records if r["rule"] == "swift.force-try"]
+                self.assertCountEqual([(r["path"], r["line"], r["col"], r["count"], r["severity"])
+                                       for r in findings],
+                                      [(str(path), line, 3, 1, "warning") for path, line in expected], records)
+                for finding in findings:
+                    self.assertEqual(finding["source"], "ast-grep", finding)
+                self.assertIn("AST-GREP RULE PACK FINDINGS", report)
+                lines = report.splitlines()
+                titles = [index for index, line in enumerate(lines) if line.strip().startswith("swift.force-try:")]
+                if not expected:
+                    self.assertEqual(titles, [], report)
+                    return
+                self.assertEqual(len(titles), 1, report)
+                index = titles[0]
+                self.assertEqual(lines[index].strip(), findings[0]["title"], report)
+                self.assertEqual(lines[index - 1].strip(), f"⚠ Warning ({len(expected)} found)", report)
+                for path, line in expected:
+                    self.assertIn(f" {path}:{line}\n", report)
+                self.assertEqual(report.count("  try! risky()"), len(expected), report)
+
+            selected = [first, second, clean]
+            cold_text = root / "cold.txt"
+            cold = self._native_swift(root, project, selected, cache, rules=rules, categories=(),
+                                      detail_limit=5, text_out=cold_text)
+            report = cold_text.read_text(encoding="utf-8")
+            assert_visible(cold, report, [(first, 2), (second, 3)])
+            warm_text = root / "warm.txt"
+            warm = self._native_swift(root, project, selected, cache, rules=rules, categories=(), hits=3,
+                                      detail_limit=5, text_out=warm_text)
+            self.assertEqual(warm, cold)
+            self.assertEqual(warm_text.read_text(encoding="utf-8"), report)
+            subset_text = root / "subset.txt"
+            subset = self._native_swift(root, project, [second], cache, rules=rules, categories=(), hits=1,
+                                        detail_limit=5, text_out=subset_text)
+            subset_report = subset_text.read_text(encoding="utf-8")
+            assert_visible(subset, subset_report, [(second, 3)])
+            self.assertNotIn(str(first), subset_report)
+            clean_text = root / "clean.txt"
+            clean_records = self._native_swift(root, project, [clean], cache, rules=rules, categories=(), hits=1,
+                                               detail_limit=5, text_out=clean_text)
+            assert_visible(clean_records, clean_text.read_text(encoding="utf-8"), [])
 
 
 if __name__ == "__main__":

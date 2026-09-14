@@ -115,17 +115,16 @@ def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
             ["git", "-C", str(project_dir), "ls-files", "-v", "-s", "-z", "--", "."],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             timeout=5,
         )
         if ls_res.returncode != 0 or not ls_res.stdout:
             return None
 
         blobs: dict[str, str] = {}
-        for entry in ls_res.stdout.split("\0"):
+        for entry in ls_res.stdout.split(b"\0"):
             if not entry:
                 continue
-            metadata, separator, path_str = entry.partition("\t")
+            metadata, separator, path_bytes = entry.partition(b"\t")
             parts = metadata.split()
             # Lowercase tags mean assume-unchanged; S means skip-worktree.
             # Git status cannot validate their actual contents. Symlinks and
@@ -133,11 +132,11 @@ def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
             if (
                 separator
                 and len(parts) == 4
-                and parts[0] == "H"
-                and parts[1] in ("100644", "100755")
-                and parts[3] == "0"
+                and parts[0] == b"H"
+                and parts[1] in (b"100644", b"100755")
+                and parts[3] == b"0"
             ):
-                blobs[path_str] = parts[2]
+                blobs[os.fsdecode(path_bytes)] = parts[2].decode("ascii")
         if not blobs:
             return None
 
@@ -146,7 +145,6 @@ def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
              "--porcelain=v1", "--untracked-files=no", "--", "."],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             timeout=3,
         )
         if status_res.returncode != 0 or status_res.stdout.strip():
@@ -309,21 +307,26 @@ class ScanCache:
 
         for root, directories, names in os.walk(helpers_dir, onerror=report_walk_error):
             directories[:] = sorted(name for name in directories if name != "__pycache__")
-            relative_root = Path(root).relative_to(helpers_dir)
+            relative_root = Path(root).relative_to(helpers_dir).as_posix()
+            relative_prefix = "" if relative_root == "." else relative_root + "/"
             for name in directories:
-                directory = Path(root) / name
-                if stat.S_ISLNK(directory.lstat().st_mode):
+                directory = os.path.join(root, name)
+                if stat.S_ISLNK(os.lstat(directory).st_mode):
                     raise OSError(f"refusing symlink helper directory: {directory}")
             for name in sorted(names):
-                source = Path(root) / name
-                if source.suffix not in (".py", ".go", ".js"):
+                suffix_start = name.rfind(".")
+                # pathlib's leading-dot semantics vary by Python version.
+                # Preserve them while avoiding Path allocation for normal files.
+                suffix = (Path(name).suffix if name.startswith(".")
+                          else name[suffix_start:] if suffix_start > 0 else "")
+                if suffix not in (".py", ".go", ".js"):
                     continue
-                if not stat.S_ISREG(source.stat().st_mode):
+                source = os.path.join(root, name)
+                if not stat.S_ISREG(os.stat(source).st_mode):
                     raise OSError(f"helper source is not a regular file: {source}")
-                relative = (relative_root / name).as_posix().encode(
-                    "utf-8", "surrogateescape"
-                )
-                content = source.read_bytes()
+                relative = (relative_prefix + name).encode("utf-8", "surrogateescape")
+                with open(source, "rb") as source_file:
+                    content = source_file.read()
                 h.update(len(relative).to_bytes(8, "big"))
                 h.update(relative)
                 h.update(len(content).to_bytes(8, "big"))

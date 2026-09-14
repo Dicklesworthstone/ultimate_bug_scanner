@@ -8,10 +8,8 @@ Faithful ports of the single-regex legacy rg pipelines:
 - cat 13 (3780): string-concatenated SQL, warning when >0.
 - cat 14 (3814-3818): @Nullable / @Deprecated annotations, info.
 - cat 20 (3964-3969): Paths.get with '+' and unchecked File.delete().
-- cat 21 (3982): secret-like identifier assignments, warning (case-insensitive
-  GREP_RNI). The legacy `ast_search 'String $K = $V;'` conjunct only ever
-  matched .java files with the java grammar; on every manifest fixture it
-  contributes 0, so the v2 keeps the rg half (documented divergence).
+- cat 21 (3982): secret-like identifier assignments with literal values,
+  warning. Runtime-loaded values are not evidence of hardcoded secrets.
 """
 from __future__ import annotations
 
@@ -107,8 +105,9 @@ PATTERNS: list[Pattern] = [
         category=21,
         rule_id="java.secrets.hardcoded",
         title="Potential hard-coded secrets found",
-        # legacy GREP_RNI — case-insensitive.
-        regex=re.compile(r"(password|passwd|pwd|secret|token|api[_-]?key|auth|credential)[ \t]*=", re.IGNORECASE),
+        # Require the literal at this assignment, not another quoted value on
+        # the line (for example the environment key passed to System.getenv).
+        regex=re.compile(r'(password|passwd|pwd|secret|token|api[_-]?key|auth|credential)[ \t]*=[ \t]*"', re.IGNORECASE),
         thresholds=((0, "warning"),),
     ),
 ]

@@ -1431,6 +1431,34 @@ def validate_sarif_payload_shape(payload: Any, label: str) -> None:
                 raise AssertionError(f"{result_label} lacks a non-empty ruleId")
             if not sarif_result_has_message(result):
                 raise AssertionError(f"{result_label} lacks non-empty message text")
+            properties = result.get("properties")
+            if isinstance(properties, dict) and properties.get("scope") == "project":
+                # Zero-count project notes have no source site. SARIF 2.1.0
+                # 3.27.9-12 permits informational results without locations,
+                # and requires level=none for a non-fail kind. An explicit,
+                # checked marker keeps ordinary source diagnostics strict.
+                if (
+                    result.get("kind") != "informational"
+                    or result.get("level") != "none"
+                    or type(properties.get("count")) is not int
+                    or properties["count"] != 0
+                    or "locations" in result
+                ):
+                    raise AssertionError(f"{result_label} has a malformed project note")
+                continue
+            if isinstance(properties, dict) and properties.get("scope") == "project_aggregate":
+                # Cross-file counts do not identify one offending source
+                # location. Preserve their positive count and severity;
+                # they remain failures, distinct from zero-count notes.
+                if (
+                    result.get("kind") != "fail"
+                    or result.get("level") not in ("note", "warning", "error")
+                    or type(properties.get("count")) is not int
+                    or properties["count"] <= 0
+                    or "locations" in result
+                ):
+                    raise AssertionError(f"{result_label} has a malformed project aggregate")
+                continue
             if not sarif_result_has_usable_location(result):
                 raise AssertionError(
                     f"{result_label} lacks a physical location with URI and positive startLine"

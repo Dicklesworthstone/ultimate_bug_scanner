@@ -10,7 +10,17 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+- Select Python JSON previews in stable source order before applying the sample cap, so file discovery, parallel work and cache replay preserve the displayed finding sites.
+- Preserve finding paths, source locations, and rule-scoped suppressions when merging AST and pattern reports. Restore 14 Rust diagnostics lost during grouped-report conversion, with exact source-site regression coverage.
+- Recompute Python thresholds, suppression, and project conditions from cached raw matches for the selected files. Missing-return findings select stable source sites regardless of file discovery order. Swift cache replay also recomputes project conditions after file selections or contents change.
+- Preserve Swift project notes and aggregate findings in SARIF without inventing source locations. Baseline comparisons count zero-occurrence notes as zero and positive aggregates by their reported count, retaining warning severity.
+- Reduce warm-cache startup work through lazy scheduler imports and fewer path allocations while retaining full helper-content hashing for cache invalidation.
+- Require literal credentials for Java secret rules and scoped Future receiver evidence for blocking `get()`/`join()` checks. Ordinary strings, Optional/Map/Supplier receivers, shadowed names, and calls with applicable exception handlers no longer trigger those rules. Honor category selection for the Optional `isPresent()`/`get()` diagnostic across reports and cache replay.
+- Apply exact rule scopes before native C++, Rust, Java, Swift, and C# report counts and rendering. Recognize suppression aliases only in actual comments, distinguish Rust lifetimes from character and raw-string literals, and keep trailing or formatter-moved comments within their statement or control header. Text samples carry their public rule IDs, including cached samples, so unrelated diagnostics survive. Validate both SARIF provenance runs and nested exported rule packs against their complete inventories.
+- Assemble release files before hashing and signing them, using the flat asset names consumed by installers. Decode the configured signing key into a private temporary file outside the published payload.
+- Keep verified installs on the selected release when handing off to the downloaded installer. Previously, selecting an older release could verify its installer but then install the latest runner.
+- Keep Rust namespace match arms and boolean result bindings out of secret-comparison operands. Distinguish request `Path(...)` extractors from filesystem `.path()` calls when tracking SQL inputs.
+- Recognize Rand's cryptographic thread generator and separate ordinary clocks, deadlines and PID-based filenames from secret generation. Keep predictable token values and weak generators actionable. Bind outbound-URL findings to actual URL arguments and lexical variable scopes; parse complete command arguments so a fixed Cargo test executable is not mistaken for user input.
 
 ---
 

@@ -8,9 +8,8 @@ process:
 
 Layers, in order:
 1. Pattern layer — regex categories aggregated from ubs_core.cpp_patterns.*
-   (one Pattern per legacy rg pipeline; flat same-line ubs:ignore exclusion
-   preserves the legacy count_lines semantics; the A7 statement-interval
-   engine in the meta-runner postprocess adds the richer placements).
+   (one Pattern per legacy rg pipeline; exact rule-aware statement suppression
+   is applied before threshold counts).
 2. Detector layer — ubs_core.cpp_detectors.* ports of the legacy heredoc
    detectors (archive entry, weak randomness, header injection, outbound
    URL, async error coverage, header hygiene, quality markers, perf
@@ -40,6 +39,7 @@ from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
+from ubs_core.suppression import SourceSuppressions, build_index, may_have_markers
 
 MARKER = "ubs:ignore"
 
@@ -125,9 +125,10 @@ def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
     previous line and misattribute (or marker-suppress) the hit, so match
     line by line — exact count_lines/rg parity.
     """
+    suppression = build_index(text, lang="cpp") if may_have_markers(text) else None
     for line_no, line_text in enumerate(text.splitlines(), start=1):
-        if MARKER in line_text:
-            continue  # legacy count_lines drops marker lines from counts
+        if suppression is not None and suppression.is_suppressed(line_no, pattern.rule_id):
+            continue
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
             continue
         if pattern.regex.search(line_text):
@@ -395,7 +396,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
             path = str(rec.get("path", ""))
             line_no = int(rec.get("line", 0) or 0)
             if path and line_no:
-                lines.append(f"    {path}:{line_no}  {str(rec.get('message', ''))[:180]}")
+                lines.append(f"    {path}:{line_no} [rule:{rule}] {str(rec.get('message', ''))[:180]}")
             else:
                 lines.append(f"    {str(rec.get('message', ''))[:180]}")
 
@@ -464,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         extra=f"new_analyzers={args.enable_new_analyzers}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    suppressions = SourceSuppressions("cpp")
 
     capturing_sink = None
     if files_to_scan:
@@ -480,7 +482,9 @@ def main(argv: list[str] | None = None) -> int:
         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        cache.store_scanned_files(files_to_scan, {
+            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+        })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -503,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for r in recs:
+                for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")

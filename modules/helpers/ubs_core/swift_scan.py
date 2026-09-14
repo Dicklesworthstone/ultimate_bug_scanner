@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from ubs_core.io import read_ndjson
+from ubs_core.suppression import SourceSuppressions
 
 MARKER = "ubs:ignore"
 
@@ -278,8 +279,6 @@ def grep_after_emulation(
     out = []
     for entry in expanded:
         _path, _line_no, display, line_text = entry
-        if MARKER in display:
-            continue
         if include_regex is not None and not include_regex.search(line_text):
             continue
         if exclude_regex is not None:
@@ -311,6 +310,9 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
     active = [p for p in patterns if p.category not in skip]
     if not active:
         return
+    suppressions = SourceSuppressions("swift")
+    for path in ctx.files:
+        suppressions.index(path, ctx.text_of(path))
     for pattern in active:
         files = ctx.files
         if pattern.swift_only:
@@ -328,9 +330,6 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                     if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                         continue
                     for entry in file_match_entries(cregex, path, ctx.text_of(path)):
-                        # count_lines drops rg output lines carrying a marker
-                        if MARKER in entry[2] or MARKER in entry[3]:
-                            continue
                         hits.append(entry)
         else:
             for path in files:
@@ -342,14 +341,14 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                 else:
                     for entry in file_hits:
                         line_text = entry[3]
-                        # count_lines drops rg output lines carrying a marker
-                        if MARKER in entry[2] or MARKER in line_text:
-                            continue
                         if include is not None and not include.search(line_text):
                             continue
                         if exclude is not None and exclude.search(line_text):
                             continue
                         hits.append(entry)
+        hits = [entry for entry in hits if not suppressions.is_suppressed(
+            entry[0], entry[1], pattern.rule_id,
+        )]
         count = len(hits)
         if count == 0 and pattern.always:
             # legacy print_finding with a literal 0 (e.g. "Task usages")
@@ -359,6 +358,7 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
                 "path": "", "line": 0, "col": 1,
                 "severity": pattern.thresholds[-1][1],
                 "count": 0,
+                "scope": "project",
                 "title": pattern.title,
                 "message": pattern.title,
                 "suppressed": False,
@@ -422,13 +422,14 @@ def rel_for(path: Path, project_dir: Path) -> str:
 
 def run_derived(ctx: ScanContext, sink, skip: set[int]) -> None:
     """Run the cross-count derived checks contributed by pattern modules."""
+    suppressions = SourceSuppressions("swift")
     for fn in load_derived():
         try:
             findings = list(fn(ctx))
         except Exception as exc:
             sys.stderr.write(f"[ubs_core.swift_scan] derived check {getattr(fn, '__name__', fn)} failed: {exc}\n")
             continue
-        for finding in findings:
+        for finding in suppressions.filter(findings):
             _write_record(sink, finding, skip)
 
 
@@ -464,19 +465,20 @@ def _write_record(sink, finding: dict, skip: set[int]) -> None:
     category = int(finding.get("category", 0) or 0)
     if category in skip:
         return
+    project_scoped = finding.get("scope") in ("project", "project_aggregate")
     record = {
         "rule": str(finding.get("rule", "swift.detector")),
         "category_id": finding.get("category_id")
         or (f"swift.{slug_for_category(category)}" if category else ""),
         "path": str(finding.get("path", "")),
-        "line": int(finding.get("line", 0) or 0),
+        "line": finding.get("line") if project_scoped else int(finding.get("line", 0) or 0),
         "col": int(finding.get("col", 1) or 1),
         "severity": finding.get("severity", "warning"),
-        "count": int(finding.get("count", 1) or 0),
+        "count": finding.get("count") if project_scoped else int(finding.get("count", 1) or 0),
         "message": str(finding.get("message", "")),
         "suppressed": False,
     }
-    for key in ("title", "description", "samples"):
+    for key in ("title", "description", "samples", "scope"):
         if finding.get(key) is not None:
             record[key] = finding[key]
     sink.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -805,22 +807,22 @@ class _Renderer:
         idx = line_no - 1
         return lines[idx].rstrip("\n") if 0 <= idx < len(lines) else ""
 
-    def samples(self, items: list[tuple[str, int]]) -> None:
-        for path, line_no in items:
+    def samples(self, items: list[tuple[str, int, str]]) -> None:
+        for path, line_no, rule in items:
             if self.detailed >= self.args.max_detailed:
                 self.lines.append("(max detailed samples reached; increase --max-detailed to see more)")
                 return
             self.detailed += 1
-            self.lines.append(f" {path}:{line_no}")
+            self.lines.append(f" {path}:{line_no} [rule:{rule}]")
             code = self._code(path, line_no)
             if code:
                 self.lines.append(f" {code}")
 
     def embedded_samples(self, recs: list[dict], limit: int = 5) -> None:
-        items: list[tuple[str, int]] = []
+        items: list[tuple[str, int, str]] = []
         for rec in recs:
             for s in rec.get("samples") or []:
-                items.append((str(s.get("path", "")), int(s.get("line", 0) or 0)))
+                items.append((str(s.get("path", "")), int(s.get("line", 0) or 0), rec["rule"]))
         self.samples(items[:limit])
 
     # ── bucket accessors ──
@@ -846,9 +848,9 @@ class _Renderer:
                 return str(rec["description"])
         return spec.desc if spec else None
 
-    def per_line_samples(self, rule: str, limit: int = 5) -> list[tuple[str, int]]:
+    def per_line_samples(self, rule: str, limit: int = 5) -> list[tuple[str, int, str]]:
         return [
-            (str(rec.get("path", "")), int(rec.get("line", 0) or 0))
+            (str(rec.get("path", "")), int(rec.get("line", 0) or 0), rec["rule"])
             for rec in self.buckets.get(rule, [])
             if rec.get("path") and int(rec.get("line", 0) or 0) > 0
         ][:limit]
@@ -888,15 +890,15 @@ class _Renderer:
             degraded = [r for r in recs if r.get("degraded")]
             if findings:
                 count = sum(int(r.get("count", 1) or 0) for r in findings)
-                previews = [
-                    f"{r.get('path', '')}:{r.get('line', 0)}:{r.get('col', 1)} → {r.get('message', '')}"
-                    for r in findings[:3]
-                ]
-                desc = f"Examples: {' '.join(previews)}"
-                if count > len(previews):
-                    desc += f" (and {count - len(previews)} more)"
                 self.finding(str(findings[0].get("severity", "warning")), count,
-                             "Swift guard let else-block may continue", desc)
+                             "Swift guard let else-block may continue", "Examples:")
+                for rec in findings[:3]:
+                    self.lines.append(
+                        f" {rec.get('path', '')}:{rec.get('line', 0)}:{rec.get('col', 1)} "
+                        f"[rule:{rec['rule']}] → {rec.get('message', '')}"
+                    )
+                if count > 3:
+                    self.lines.append(f" (and {count - 3} more)")
             elif degraded:
                 for rec in degraded:
                     self.finding(str(rec.get("severity", "info")), int(rec.get("count", 0) or 0),
@@ -1013,6 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
         extra=f"ast_available={args.ast_available};skip_narrowing={args.skip_type_narrowing};new_analyzers={args.enable_new_analyzers}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    suppressions = SourceSuppressions("swift")
 
     capturing_sink = None
     if files_to_scan:
@@ -1070,7 +1073,9 @@ def main(argv: list[str] | None = None) -> int:
             }, skip)
         run_detectors(scan_ctx, capturing_sink, skip)
         run_analyzers(scan_ctx, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        cache.store_scanned_files(files_to_scan, {
+            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+        })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -1099,7 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
             if recs is None and capturing_sink is not None:
                 recs = capturing_sink.get_for_file(f)
             if recs:
-                for r in recs:
+                for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")

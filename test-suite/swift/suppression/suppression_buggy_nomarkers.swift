@@ -40,9 +40,9 @@ final class SuppressionFixture {
         }
     }
 
-    // Arrangement 5: rule-scoped markers (rule id in square brackets). The
-    // swift module's code-sample lines carry no rule id, so these suppress
-    // through the runner's same-line/previous-line path.
+    // Arrangement 5: the marked twin names public diagnostic identifiers.
+    // This control retains both force-try and force-cast findings.
+    // Unmarked print calls continue to exercise independent diagnostics.
     func ruleScopedPrevLine(_ payload: Data) throws {
         // fixture: marker removed in the nomarkers twin
         let decoded = try! JSONDecoder().decode([String: Int].self, from: payload)

@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='2d08d55677763826b0d6b202b84edc567de73b736c5c4c356657ab7130a284f9'
-  [cpp]='428c0a84e34d2fac806631d6d5f58eeb3888d5fa231b9c61b09af4f5a9867476'
-  [csharp]='928063cc80788ad249b4ad1895e668b18a0dd56ee3f267de99898b54739b72d1'
-  [elixir]='57a82664bfe33599685fc5e96f6b4668b618a44a16eede584160d765bc79a401'
-  [golang]='13db79785da52aa13591529459b6e2168d4fb7e65a071df55625007c42c5c675'
-  [java]='10e8d9e2c7b312e168a55e9435a90318efa2f2dbd1072490a265d7ef9185e4f1'
-  [js]='0820e6ec5975cc623a7e6372b446f42a6d4a41e57cf2a1c6f3f92281f047e1be'
-  [kotlin]='1fb045adb8ae9442bf9c3932c116294a38160a6ba8f89507d671a52474b05176'
-  [python]='5154256635ba5e1ea5f2ba28b4af01e195965ab333e012d2547ba3508e242caa'
-  [ruby]='b3ca500b959232746b97b86e0af9533388dbb6ddf2b682aba9318be1f572c223'
-  [rust]='9e0fc7aabf8b72a6ac5fedd894d29ccd4a829523f5700791f67e99ce47c52782'
-  [swift]='7275d02ab1f52d9c35a8d46ef85192321030a21adf83335154c3d3ca6dfcb83b'
+  [bash]='e0011e513d51c70dba2c7ec64aa90ea6b138e783bf6703cc50391efc5d88b1ee'
+  [cpp]='63d344e57abcb9b8d9025cf6b40fd7f75964f81b7ec401738db3706071f7dc8f'
+  [csharp]='99695965d3b4920fe48d4094c5593e78f1bce851152a71f70e15f9e1fd5889d5'
+  [elixir]='2583353c79c01aaa1d66d67e6b604b9510ff3b24c511a4152f7e19355fd2db32'
+  [golang]='1116f5b75240f5c387921ab581beef51fa41a731fad9e13f0592e6fb5c7c069e'
+  [java]='9af7f5344fd7e6d20c280ac8038935fe2d5654e13e73d8f6665d2a2065f667ec'
+  [js]='2eae99842054911dcb9795165784aa29b0d22f5a667d9127786eb896d5aa994c'
+  [kotlin]='79b192f6e197238e4d60f610b98d53b266895cfa08152516d571e06ef490c952'
+  [python]='d94f1e173b97573e528d625540612f4dea04df04f6e3db65f07d9ad88acadf56'
+  [ruby]='9db4936a75cc5dc05b3018895d71905272669f55d6131d9bc8c68f15a68f484d'
+  [rust]='e157247715f968a5df3b5c24a66e1daa7431dadda637ef854473a2ad56ddd3b6'
+  [swift]='68ce3edf4cfefd31622d8334f3b7f94d566267343370c6e249e613eb2bf8fceb'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -102,7 +102,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/ctcompare_go.py']='67b66f44a697628c36dc5499aa40e9bfd737391d72f6940a623ef427d7a4e64d'
   ['helpers/ubs_core/analyzers/ctcompare_js.py']='43695373ce47cbe3ff6810d3f1dfdb748d8a104247415ba214d3bee9c225135a'
   ['helpers/ubs_core/analyzers/ctcompare_py.py']='720fcd492c865ac3b947a7917037207907b79c99e752bed5da21435a0e375c50'
-  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='6f2c833dd381775a6d4971c1fac479b40e3fa7ec71e4040db4c536286a24cbe3'
+  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='64e19bbfabeff7ee4f0d08f58a5540da78236e32654a188af7b5a5138f09a7d9'
   ['helpers/ubs_core/analyzers/guards_generic.py']='61ef81e6255aa3c09ed175648f8cbd99ee2bff9a98ed3c968781533beb91b4a5'
   ['helpers/ubs_core/analyzers/guards_js.py']='4a27ccb62965a474c40de644f15cf2e4018642f42971501c480d7015c399eafa'
   ['helpers/ubs_core/analyzers/guards_py.py']='beb7d42b8b34a27b28107b7f557e206aed6a6ad26454c8b0dfe6b7271dd4d1de'
@@ -190,8 +190,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/cpp_patterns/numeric.py']='fc04ecf9b703ab8f5aadd435fa5a137c7541028b1c92e74b6d2dc5448fb58444'
   ['helpers/ubs_core/cpp_patterns/ub_zone.py']='61b92efa13a0c9876ef657d9e56c600ef15f8e3486ad0b64ff4f4ad4c26327aa'
   ['helpers/ubs_core/cpp_rules.py']='c624f73f3ddab13aafb6026875fd9211d2fef4efe71b866e46c1dc6023049255'
-  ['helpers/ubs_core/cpp_scan.py']='c1e9c8b86ec0f132507dfc0f2476bb8f1cfd862ad577fc093ac5cfde5f18b39c'
-  ['helpers/ubs_core/csharp_ast.py']='b4d1a005103a550d99c4c952b6ede2da76b5de2fe2f574d25cdf2b8b11f86bf7'
+  ['helpers/ubs_core/cpp_scan.py']='80ed4d85824f0ef27ac9393124183864b3c877938aa9f6315f0b823b66596fa9'
+  ['helpers/ubs_core/csharp_ast.py']='051838a7524a21193949ca5940bccbdb96422768e747d047debb0e755dbc7888'
   ['helpers/ubs_core/csharp_detectors/__init__.py']='bf8a8383f6143a5e585e78fec84580e86c40ee180f05a7bbce386c496d420063'
   ['helpers/ubs_core/csharp_detectors/_common.py']='19c996f1744588d23085e986e50a461089af0c8d350fdd4e950d6f71074e4dac'
   ['helpers/ubs_core/csharp_detectors/archive_extraction.py']='a231403de45648699d14169d97a12eb671551ee4dada8de30fcb5c3d8525793f'
@@ -207,7 +207,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/csharp_patterns/quality.py']='eac32fcf8ce9ce593f19c2089abf89916b72cbd6ea1005ac056d23a178bb69cc'
   ['helpers/ubs_core/csharp_patterns/security_rg.py']='456a7b2ad7855b36376dfa8daa34c1d6449eb7b07d86a2b5b654180307665ec1'
   ['helpers/ubs_core/csharp_rules.py']='a18537e24ade02da86fcae82e8f92d1e7e702ea63a0c77b6fd2ea865cbb27a9e'
-  ['helpers/ubs_core/csharp_scan.py']='1da667fc9bea617910066bf2641aa731565a41fbbff9ba529e53ea7662717821'
+  ['helpers/ubs_core/csharp_scan.py']='2486ae58a152dc6a6eb7e5e4ab5d7af70eb1504d1e07f888840e34e3bbf6565a'
   ['helpers/ubs_core/elixir_ast.py']='62198c83012333f9011300965c139d14bdd27a65822910f47e766a0ca802474a'
   ['helpers/ubs_core/elixir_detectors/__init__.py']='9e08cda01f060bb0e804ad7276b680e12f8f7451158b2ba443bc001d2f086faa'
   ['helpers/ubs_core/elixir_detectors/_common.py']='ffedf7e7db651bb0738e999fa2cb6f175cd97b52fa3bc857a809be54ac887eee'
@@ -229,7 +229,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='5f1e1156135afc41a5ae511adc8086b4bd8a65701df681fdacb76e75529eb914'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
-  ['helpers/ubs_core/findings_merge.py']='03ff28940f72f7ed35ff6f6b1e491751f8abc1ed1e82f9cbf1389149968a2925'
+  ['helpers/ubs_core/findings_merge.py']='a5b718082d9a67f586388273eafa589db653c8497801d96be3a4d168a32a35a6'
   ['helpers/ubs_core/go_ast.py']='918218722ba2023701dcc0477f356466db5274c9cbc642f27d175cf6fcb6e0f7'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -254,7 +254,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/go_rules.py']='a11e1036d06d313c102fda792f9842af7af69ad6250ec9dcb0c21ceaddc00ce1'
   ['helpers/ubs_core/go_scan.py']='e2a6a4822c2557d4cd76cac886a1aa961887b2b8c4bfcd4b44ddee990424638d'
   ['helpers/ubs_core/io.py']='3f0415f899245019ae6cdecbd8a0558c6e5d16ca43f8856e960fa3ca26d7d320'
-  ['helpers/ubs_core/java_ast.py']='c9806b5cf48781155e9443bb7d1a4e91df53c278e298c13b54d8587ae729f543'
+  ['helpers/ubs_core/java_ast.py']='e3b438037bcec7421fa9f47b8e3f493c5bc109c5c5d64c8daec8f71e81835591'
   ['helpers/ubs_core/java_detectors/__init__.py']='ef52ffa7d353633e7bb1d1caa697c3b3bf83c6d7dc1ec111a3a4b71e2aa2d8f0'
   ['helpers/ubs_core/java_detectors/_common.py']='658ef921d7248ee9e95e3dff0887092e1133debe67c2b2b62aa21b7447584c73'
   ['helpers/ubs_core/java_detectors/archive_extraction.py']='d55d79ba241f0ba037c0033b5f18bef7a06cc71865f899508004655091c926ab'
@@ -273,12 +273,12 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/java_detectors/tech_debt.py']='6fa5702a073d08656b72f9673ba5299770f8f56277d0f942ab7cbc99bcabc873'
   ['helpers/ubs_core/java_patterns/__init__.py']='8b7de6cca7d1b61a2884216d2756adabf3ad7d2a08bea8defe3e8d305452e9c2'
   ['helpers/ubs_core/java_patterns/concurrency_io.py']='9bee9f2911a23993806d3e367339b99af70eaf4946cc979b21d18bc8a35e383d'
-  ['helpers/ubs_core/java_patterns/foundations.py']='65cb1a81bc8903742814216430eed68705cde6474f7112e07206753d5cf5827b'
+  ['helpers/ubs_core/java_patterns/foundations.py']='64b5f87535eaadf3be0ba10e3f7ac8b05e8c114f17ac1bf25596d71c1078b1b5'
   ['helpers/ubs_core/java_patterns/quality.py']='2e037fbc04bd6d9e0896357612fd6e195ca9aecc1b0ab38934335b297eba0475'
   ['helpers/ubs_core/java_patterns/resource_lifecycle.py']='0a8f38417321c16bbcae6bdf42aa68c15d6f6e3ca6d70a84e3aa29c6f6ac5d1c'
   ['helpers/ubs_core/java_patterns/security_rg.py']='d1ddb0626ec8729133b915dd27401ea2823df452acd18920c2efd919119864fa'
-  ['helpers/ubs_core/java_rules.py']='2ded3f1e04858d63ef984ae9c1810f3c83fab36932addca902ca58773eb242c8'
-  ['helpers/ubs_core/java_scan.py']='4a710180ca2960fdadf97abacbf45c53ff5ba490306dcac03d9c5c85437ab23e'
+  ['helpers/ubs_core/java_rules.py']='25646798a89ca69b7a101901456ab0970ad28abdffef5fab33458ff8b900a9cf'
+  ['helpers/ubs_core/java_scan.py']='d718b4621c8e400169826398d227c80675ede4e30fbfccfd773ed2bdda39d448'
   ['helpers/ubs_core/js_ast.py']='bbab950335228160ddde9344b6fd1e807085474456de9f33fd7d755d2cc375bd'
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
   ['helpers/ubs_core/js_patterns/debug_quality.py']='de6e0c36dfb9e06691b65ec5e8fd7739ec22840ebf5c487801f998218bb78172'
@@ -291,7 +291,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_scan.py']='443a36e2940f4410ec894635e383112a8bb82063a4266c9949f401f6b9ca1a15'
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='2ea25fa756000235c64be1b02dad721d5e5d57284522648de73dcec36be14fde'
-  ['helpers/ubs_core/lexer.py']='5fee42966b78805e287addaa7bb61ddad24e9dc21e4467d0b891ad60fa412396'
+  ['helpers/ubs_core/lexer.py']='12c6db052e94728b110b2cd551311ba88ef815a3839eb565a4d6f2eb1256bfa5'
   ['helpers/ubs_core/prefilter.py']='0c6c75c4e0e24eb9b6d03ba213f9d558f18b2672640d42cdaef33076f807d635'
   ['helpers/ubs_core/py_ast.py']='ab9239b606c0c06f7d9ea4d1e7dbcaaf73cb86ca40445cdbf56d286e73339cc2'
   ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
@@ -318,7 +318,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_detectors/jwt_verification.py']='f384d77bd82df1bea21037b7c47fca4be4d1cff9b41185a1b2746513dbf16e19'
   ['helpers/ubs_core/py_detectors/ldap_injection.py']='31cd80955c932680e5d71e89a3f8d83cfa4de0ef6eb5311b5d4aa7a287d2097f'
   ['helpers/ubs_core/py_detectors/mass_assignment.py']='ad2d9926f406a461fc16591e6f2d9731bdd48f5d0d3a69f4d355a2ddd410469c'
-  ['helpers/ubs_core/py_detectors/missing_returns.py']='1aee6c57b5b95af3161e75d8b9cd33e1bdd3422ceaf8e47e4adc33d7e104be2b'
+  ['helpers/ubs_core/py_detectors/missing_returns.py']='fd2f71d6a23f8441c2edd3a076f441dd520e18d91628b673c4619a29ef892570'
   ['helpers/ubs_core/py_detectors/mutation_during_iteration.py']='50831c50c1536773aeb27481beb2d632e9ce3f906379f592e22e8d27a44a73bd'
   ['helpers/ubs_core/py_detectors/nosql_injection.py']='5117d571e16db684b8dd6d582ac19a9c811baf889d7ed1cc32eece2a35f2197a'
   ['helpers/ubs_core/py_detectors/open_redirect.py']='e8286bdc691f56c657011c66ba3af4a98e5c5709f8e74617b0d63d639c3f6f64'
@@ -343,7 +343,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='3b5a137fa381424e2d01eefcc2622985063d810fab2898ac198c722226ff5887'
   ['helpers/ubs_core/py_patterns/security_rg.py']='6b1651db78b6190bfff6a54c8663daba3a80a274a5ad113dfe69955de61d341a'
   ['helpers/ubs_core/py_rules.py']='806e5362ab07a0d15c14203533293c3acdbd8b6c056dd1d11f366c9c96c16a0a'
-  ['helpers/ubs_core/py_scan.py']='c74d31f9c500b3c7da4a4d91303ae9089406e2c61bfb36eaded1fe9425814f7e'
+  ['helpers/ubs_core/py_scan.py']='0a19d51116e75636c7c5f71c4768ac915890a345df5d40debf142d4da480a6c8'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/ruby_ast.py']='ca2d0ac7f0f06198ec49114eb5f234f25a0c7fa8381ed521d722f88191256045'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -370,7 +370,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/__init__.py']='b238f38c0768683ea44b5bfd8e4e4c8a94e2bbbe98ddd77de32230a47bdd7799'
   ['helpers/ubs_core/rust_detectors/archive_entry_path.py']='fcedd0f3194b08ee4fc09ed71d81a97fa289d3399feeef71a19f4235945f014d'
   ['helpers/ubs_core/rust_detectors/async_context.py']='d093a071c2a8c3b6603b4abec38d8e5bb8dd3f8f6aa0840386b9d0b39b3dd380'
-  ['helpers/ubs_core/rust_detectors/command_executable.py']='dec10c6f24728cf8b21c7ca700a86e3edd8f8da61e9cdd58d754563cb3f2fe6d'
+  ['helpers/ubs_core/rust_detectors/command_executable.py']='8016691d5600ff52e2a1310b2238e3a88cf49ce98ed0ff147a43d86944b95357'
   ['helpers/ubs_core/rust_detectors/cors_credential.py']='ab31c4dd1cde153bd72e22e30bdcbcbd23156e4d6f8e7c9138b6c84b52ac1031'
   ['helpers/ubs_core/rust_detectors/drop_panic.py']='c9ee9b6455b6a034bb968ef572a4d63973a58458f7b7344226e95bd4bb53cf35'
   ['helpers/ubs_core/rust_detectors/format_literal.py']='3f4aaa7d3edf18bcbaf285bbca8adfd37f7e3cad1678e3353070a932df05ca5a'
@@ -381,20 +381,20 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/open_redirect.py']='b0f332c77ef07ecc3bfe8e01cddeaa8da5bd14a61e62aff60ec22e6e0b03789d'
   ['helpers/ubs_core/rust_detectors/path_traversal.py']='349f549442c72df06cbac9f1bf7815c7ca72bdc92803a0479827a4c04422c32e'
   ['helpers/ubs_core/rust_detectors/request_regex.py']='01b1ee7756d78a0f079cb785b69ac34ad655dc966fb9797ff9b13aa4962295e9'
-  ['helpers/ubs_core/rust_detectors/request_url.py']='9167a462e515db7dc16d6fed05a7417898af1144f9fb8b53e059131d879b39a6'
+  ['helpers/ubs_core/rust_detectors/request_url.py']='ec7351e3c5d4a1657a31bb1940f0ca4f4d6d785ae32f358b0462d73e1419a3b1'
   ['helpers/ubs_core/rust_detectors/response_header.py']='15ff23c265c318c0bd2b782c4b48e15332e07ffffbb1688955bac0700db6104f'
-  ['helpers/ubs_core/rust_detectors/security_randomness.py']='50aec3b2eb024630e824b5dd43b84143dde7b4feaa2e54e8066d01bfa57971ac'
-  ['helpers/ubs_core/rust_detectors/sql_injection.py']='d98ab0a707373ffd91891b9a852627f5ecfec25da07afc9d54340d5b496a86be'
+  ['helpers/ubs_core/rust_detectors/security_randomness.py']='cfd219ed421fc4211e30e77e2789e40ffc0e44ea80ae274e1c9ead013dcfe581'
+  ['helpers/ubs_core/rust_detectors/sql_injection.py']='1b43a7cf3c766468ce2f99093b0561ed11f569137ea6f01dab9244429d9f1f18'
   ['helpers/ubs_core/rust_detectors/temp_file_race.py']='1138d832a284bd37151eb81fd01aff7f81e987bf9710eb7bfd5409046a5536bf'
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='ca9b0387c873e551ef43a8403b86725c43326976f0aa33c9457d8f2ce8d04f6b'
+  ['helpers/ubs_core/rust_scan.py']='e710e3f0eff56cb900a5f3077d69935b9f27d7606106f55fe6177c9fd2e9e0de'
   ['helpers/ubs_core/scheduler.py']='9d4d936984f308c82d80d108b006a65ccd2eeb1d41e07325b621fc39147a94ed'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
-  ['helpers/ubs_core/suppression.py']='fba6ef1e4b17ffad392c30fbc10bc53d5f77f2f51ac8de5bb2b2b3e8237275ce'
-  ['helpers/ubs_core/swift_ast.py']='d1f42e63e06803691e0159edb0be9cea2f428e486602bed41895c8bfa142c54c'
+  ['helpers/ubs_core/suppression.py']='42919fee6fcc125bdfd69e4129deb06942c28052f875e76e87e9b4bb45cdd5f7'
+  ['helpers/ubs_core/swift_ast.py']='5dd385c88429b9ac3e04a6253cd44d406a24ad31f91a5d415cdb9b7e7b7e08e4'
   ['helpers/ubs_core/swift_detectors/__init__.py']='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
   ['helpers/ubs_core/swift_detectors/_common.py']='601e0f4ef42f5d007e26068f206c3dc8258de7939e642a84da248b26715ffe91'
   ['helpers/ubs_core/swift_detectors/archive_extraction.py']='2e3fa0b1977e25813a79ccc59796cbb3b7abe0c4073f2d93f2b165889bd885a7'
@@ -408,12 +408,12 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/closures_networking.py']='e9a53395a2ebcce3a6fa6b2271efdd67db47d489eee0457802ca1e874a27db7d'
   ['helpers/ubs_core/swift_patterns/debug_quality.py']='467066b5d51d8e0a523b6271407d36e9c44e2cfa5f15d597159011c81eb3137f'
   ['helpers/ubs_core/swift_patterns/errors_security.py']='37a306981cbb5c60c502f84e24a3ff60b3803eed958d1fe0561270a7ea0d5f69'
-  ['helpers/ubs_core/swift_patterns/foundations.py']='448939e787da3152b3c883164280d14d5d82c1864092427d73553ee69dd53bba'
-  ['helpers/ubs_core/swift_patterns/misc_cats.py']='0ac370b3424029eaacfc02392452dd9425b9c79bec1ccee0790b7cad910187a7'
-  ['helpers/ubs_core/swift_patterns/threading_perf.py']='edd87e4319828ef70f9e458e8d709cb305750a357479920c9a69aed1e17a20d4'
+  ['helpers/ubs_core/swift_patterns/foundations.py']='c04908fa89c5bec54d1f88fd55c00da87114d7526b2f3a5e80aec288e52e125f'
+  ['helpers/ubs_core/swift_patterns/misc_cats.py']='6be76fa36414b6de28a0414a122549eade5a84f16686440e58d94079d1293d99'
+  ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
-  ['helpers/ubs_core/swift_scan.py']='7be6d910855fd006bc77123af72c6d11e84d3261f35d2ae5058eea0d39aa4c5e'
-  ['lib/ubs-common.sh']='4fa83197b0e2cf24a44c5e646dae2984b0d85d51b9d5f7dc4729e6103078c3df'
+  ['helpers/ubs_core/swift_scan.py']='9588ae712c5d65265d85f7894fd4b56dd7a7fb28a4de24294b54ca8a423fbc8b'
+  ['lib/ubs-common.sh']='73b44957d040c3975eea116d8a9d5063dedc30dac1013d83ba1e1ecdf13cbfc3'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3728,7 +3728,7 @@ apply_inline_suppressions(){
   # is the target itself, so when it carries no suppression marker the python
   # pass (a temp script plus interpreter start-up) has nothing to do.
   if [[ -n "${SINGLE_FILE_TARGET:-}" && -f "$SINGLE_FILE_TARGET" ]] \
-     && ! grep -q -i -E 'ubs:ignore|ubs: disable|nolint|noqa' "$SINGLE_FILE_TARGET" 2>/dev/null; then
+     && ! grep -q -i -E 'ubs:ignore|ubs:[[:space:]]*disable|nolint|noqa' "$SINGLE_FILE_TARGET" 2>/dev/null; then
     cat
     return 0
   fi
@@ -3748,18 +3748,19 @@ except Exception:
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 FINDING_PATTERN = re.compile(r'^\s*((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?')
-SUPPRESSION_MARKERS = ["ubs: disable", "nolint", "noqa"]
-# A rendered sample has no reliable rule ID. Never turn a bracketed marker
-# into an all-rule fallback; the scanner qualifies scoped markers itself.
-BARE_IGNORE = re.compile(r"ubs:ignore(?:\[[, ]*\])?(?!\[)")
+RULE_METADATA = re.compile(r"^\s+\[rule:([A-Za-z][A-Za-z0-9_.-]*)\](?:\s|$)")
+build_index = None
+lang = sys.argv[2] if len(sys.argv) > 2 else ""
+if len(sys.argv) > 1 and sys.argv[1]:
+    sys.path.insert(0, sys.argv[1])
+    try:
+        from ubs_core.suppression import build_index
+    except Exception:
+        # Without a trusted source parser, preserve the module's diagnostics.
+        build_index = None
 
 def strip_ansi(text):
     return ANSI_ESCAPE.sub('', text)
-
-def has_suppression(line_content):
-    if not line_content: return False
-    lower = line_content.lower()
-    return bool(BARE_IGNORE.search(lower)) or any(m in lower for m in SUPPRESSION_MARKERS)
 
 def main():
     lines = []
@@ -3787,23 +3788,19 @@ def main():
             if file_path_str not in file_cache:
                 try:
                     p = Path(file_path_str)
-                    # Check existence relative to CWD
-                    if p.is_file():
-                        file_cache[file_path_str] = p.read_text(encoding='utf-8', errors='replace').splitlines()
+                    if build_index is not None and lang and p.is_file():
+                        file_cache[file_path_str] = build_index(
+                            p.read_text(encoding='utf-8', errors='replace'), lang=lang
+                        )
                     else:
                         file_cache[file_path_str] = None
                 except:
                     file_cache[file_path_str] = None
             
-            content = file_cache[file_path_str]
-            suppressed = False
-            if content:
-                idx = line_no - 1
-                # Check line itself (idx) and previous line (idx-1) for comments
-                if 0 <= idx < len(content) and has_suppression(content[idx]):
-                    suppressed = True
-                elif 0 <= idx-1 < len(content) and has_suppression(content[idx-1]):
-                    suppressed = True
+            index = file_cache[file_path_str]
+            metadata = RULE_METADATA.match(clean_line[match.end():])
+            rule_id = metadata.group(1) if metadata else ""
+            suppressed = index is not None and index.is_suppressed(line_no, rule_id)
             
             if not suppressed:
                 output_stream.write(line)
@@ -3821,7 +3818,7 @@ def main():
 if __name__ == "__main__":
     main()
 PY
-  python3 "$py_script"
+  python3 "$py_script" "$MODULE_DIR/helpers" "${1:-}"
   rm -f "$py_script"
 }
 
@@ -6063,8 +6060,6 @@ from pathlib import Path
 
 ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 FINDING = re.compile(r"^\s*((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?")
-MARKERS = ("ubs: disable", "nolint", "noqa")
-BARE_IGNORE = re.compile(r"ubs:ignore(?:\[[, ]*\])?(?!\[)")
 PARTIAL = re.compile(r"^\s*Partial:\s*(?:\[([A-Z_]+)\]\s*)?(.*)$")
 
 
@@ -6082,6 +6077,7 @@ def _load_ubs_core(helpers_dir: str):
 
 
 _RULE_HINT = re.compile(r"\b(?:js|ts|py|rs|rust|go|java|kt|kotlin|rb|swift|cs|cpp|c|ex|elixir)\.[a-z0-9_.-]+")
+_RULE_METADATA = re.compile(r"^\s+\[rule:([A-Za-z][A-Za-z0-9_.-]*)\](?:\s|$)")
 
 
 def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
@@ -6091,14 +6087,12 @@ def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
     against a statement-interval index: trailing markers, previous-line
     markers, markers on any physical line of a multi-line statement,
     formatter-relocated markers (first line inside a block), and rule-scoped
-    markers (`ubs:ignore[rule]`) all suppress. The legacy flat
-    same-line/previous-line match still applies to nolint/noqa-style markers,
-    and bare markers fall back to it if ubs_core is unavailable. Scoped
-    markers are never reinterpreted as bare when their rule is unknown.
+    markers (`ubs:ignore[rule]`) all suppress. Bare aliases use the same
+    actual-comment and statement ownership rules. Preserve findings when
+    the source index is unavailable; raw source text cannot prove suppression.
     """
     core = _load_ubs_core(helpers_dir)
     indexes: dict = {}
-    cache: dict = {}
     out = []
     for line in raw.splitlines(keepends=True):
         m = FINDING.match(ANSI.sub("", line))
@@ -6112,6 +6106,7 @@ def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
             out.append(line)
             continue
         suppressed = False
+        index = None
         if core is not None and path not in indexes:
             try:
                 p = Path(path)
@@ -6123,28 +6118,18 @@ def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
         if core is not None:
             index = indexes.get(path)
             if index is not None:
-                # Rust sample lines contain source code, including marker
-                # text, rather than a public rule field. A token in that
-                # source cannot identify which finding produced the sample.
-                rule_m = None if lang == "rust" else _RULE_HINT.search(ANSI.sub("", line)[m.end():])
-                if index.is_suppressed(lineno, rule_m.group(0) if rule_m else ""):
+                suffix = ANSI.sub("", line)[m.end():]
+                if lang in {"cpp", "rust", "java", "swift", "csharp"}:
+                    # These renderers emit producer-owned metadata before
+                    # source/message text. Never infer identity from a rule
+                    # token in the source or from a preceding sample/header.
+                    rule_m = _RULE_METADATA.match(suffix)
+                    rule_id = rule_m.group(1) if rule_m else ""
+                else:
+                    rule_m = _RULE_HINT.search(suffix)
+                    rule_id = rule_m.group(0) if rule_m else ""
+                if index.is_suppressed(lineno, rule_id):
                     suppressed = True
-        if not suppressed:
-            if path not in cache:
-                try:
-                    p = Path(path)
-                    cache[path] = p.read_text(encoding="utf-8", errors="replace").splitlines() if p.is_file() else None
-                except Exception:
-                    cache[path] = None
-            content = cache[path]
-            if content:
-                idx = lineno - 1
-                for i in (idx, idx - 1):
-                    if 0 <= i < len(content):
-                        lower = content[i].lower()
-                        if BARE_IGNORE.search(lower) or any(mk in lower for mk in MARKERS):
-                            suppressed = True
-                            break
         if not suppressed:
             out.append(line)
     return "".join(out)
@@ -6394,7 +6379,7 @@ legacy_postprocess(){
 JSON
     return 2
   fi
-  apply_inline_suppressions <"$raw" >"$txt" 2>>"$err"
+  apply_inline_suppressions "$lang" <"$raw" >"$txt" 2>>"$err"
   if [[ "$is_v2" -eq 0 ]]; then
     restore_original_paths "$txt"
   fi

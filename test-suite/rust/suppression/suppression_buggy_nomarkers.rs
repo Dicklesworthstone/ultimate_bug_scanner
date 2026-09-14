@@ -1,5 +1,5 @@
 //! GH #91 suppression fixture (bead A7) for the Rust module, twin of
-//! suppression_buggy.rs: identical buggy code with every ubs:ignore marker
+//! suppression_buggy.rs: identical buggy code with every suppression marker
 //! removed, so a scan of this file must reproduce the native rust findings
 //! (parse().unwrap()/expect() panics, unsafe blocks, raw mutex lock
 //! handling) that the markered twin suppresses.
@@ -33,9 +33,9 @@ fn relocated_in_block(flag: bool, raw: &str) -> i32 {
     0
 }
 
-// Arrangement 5: rule-scoped marker positions (bracketed rule form). The rust
-// module's code-sample lines carry no rule id, so the markered twin suppresses
-// these through the runner's same-line/previous-line path.
+// Arrangement 5: the marked twin lists public diagnostic identifiers.
+// Generic unwrap and specialized lock/parse diagnostics are independent;
+// this control retains every finding by omitting all scopes.
 fn poisoned_lock(shared: &Arc<Mutex<u32>>) -> u32 {
     let mut guard = shared.lock().unwrap();
     *guard += 1;

@@ -7,7 +7,7 @@ once, and feeds BOTH legacy consumers of the shared AG stream:
   ctx.ast_records  source records including expression and METHOD capture
                    ranges, consumed by URLSession lifecycle correlation
   sink records     one record per actual occurrence, before report previews
-                   are limited. Same-line/previous-line ubs:ignore suppression
+                   are limited. Exact rule-aware statement suppression
                    and stream/YAML severity with manifest overrides apply.
 """
 from __future__ import annotations
@@ -16,30 +16,10 @@ import json
 import subprocess
 from pathlib import Path
 from typing import Sequence
+from ubs_core.suppression import SourceSuppressions
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
-
-
-def _file_lines(path: Path, cache: dict) -> list[str]:
-    key = str(path)
-    if key not in cache:
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                cache[key] = fh.readlines()
-        except OSError:
-            cache[key] = []
-    return cache[key]
-
-
-def _has_marker(path: Path, line_no: int, cache: dict) -> bool:
-    """Legacy check_suppression: same line or the line above."""
-    lines = _file_lines(path, cache)
-    idx = line_no - 1
-    return any(
-        0 <= i < len(lines) and "ubs:ignore" in lines[i]
-        for i in (idx, idx - 1)
-    )
 
 
 def _sev_map(raw: str) -> str:
@@ -118,7 +98,7 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
     # limits belong to report rendering, after all selected records are joined.
     from ubs_core.swift_scan import slug_for_category
 
-    cache: dict = {}
+    suppressions = SourceSuppressions("swift")
     for obj in stream:
         rid = str(obj.get("ruleId", "") or obj.get("rule_id", "") or obj.get("id", "") or "unknown")
         file_str = str(obj.get("file", "?") or "?")
@@ -138,7 +118,7 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
         # legacy parity: the AST RULE PACK FINDINGS section is NOT gated by
         # --skip (it sits outside categories 1..23); only marker suppression
         # applies
-        if _has_marker(Path(file_str), line_no, cache):
+        if suppressions.is_suppressed(file_str, line_no, rid):
             continue
 
         source_path = str(Path(file_str).resolve())

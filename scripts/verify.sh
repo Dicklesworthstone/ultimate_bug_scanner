@@ -197,4 +197,6 @@ else
 fi
 
 ok "Executing installer"
+# The downloaded installer has no VERSION file beside it; retain this release.
+export UBS_ARTIFACT_BASE="$ARTIFACT_BASE"
 exec bash "$INSTALL_FILE" "${INSTALL_ARGS[@]}"

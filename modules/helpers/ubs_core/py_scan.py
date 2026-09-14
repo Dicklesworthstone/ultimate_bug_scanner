@@ -554,7 +554,16 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     """Legacy --report-json payload (issue-64): per-rule aggregated findings
     with severity/count/title/description and up to 3 code samples."""
     by_rule: dict[str, list[dict]] = {}
-    for rec in records:
+    # File discovery and parallel detectors need not finish in source order.
+    # Select previews from a stable ordering before the three-sample cap;
+    # changing Git provenance or cache warmth must not change their sites.
+    for rec in sorted(records, key=lambda record: (
+        str(record.get("rule", "")),
+        str(record.get("path", "")),
+        int(record.get("line", 0) or 0),
+        int(record.get("col", 0) or 0),
+        json.dumps(record, sort_keys=True),
+    )):
         by_rule.setdefault(rec.get("rule", ""), []).append(rec)
     findings = []
     for rule, recs in by_rule.items():

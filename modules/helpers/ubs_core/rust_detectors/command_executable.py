@@ -2,11 +2,12 @@
 
 Port of rust_command_executable_matches (modules/ubs-rust.sh 5020-5170):
 flags `Command::new(<expr>)` calls whose executable expression looks
-untrusted — any dotted-path segment matching the untrusted-name pattern
+untrusted — value names matching the untrusted-name pattern
 (user/input/cmd/command/program/exe/binary/tool/shell/path/request/
-req/param/name/key), after stripping as_str/as_ref/to_string/
-into_string adapters. Comments and strings are masked before matching;
-`ubs:ignore` on the hit line suppresses it. The `seen` dedup key is
+req/param/name/key) or direct environment/argument sources. Balanced operands
+preserve nested arguments while excluding namespace and callable names.
+Comments and strings are masked; implicit format captures remain values.
+Source suppression honors exact rule scopes and bare markers. The `seen` dedup key is
 (path, line, code) across the whole file list, as in the legacy script.
 
 Legacy outcome:
@@ -25,7 +26,9 @@ import re
 from pathlib import Path
 from typing import Iterator, Sequence
 
-from ubs_core.suppression import has_suppression_marker
+from ubs_core.io import find_block_end
+from ubs_core.lexer import strip_comments_and_strings
+from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "rust.security.command-executable"
 CATEGORY = 8
@@ -37,86 +40,12 @@ DESCRIPTION = (
 
 identifier = r"[A-Za-z_][A-Za-z0-9_]*"
 call = re.compile(
-    rf"\b(?:std::process::)?Command\s*::\s*new\s*\(\s*&?\s*"
-    rf"(?P<expr>{identifier}(?:\s*\.\s*{identifier})*)"
+    r"\b(?:std\s*::\s*process\s*::\s*)?Command\s*::\s*new\s*\("
 )
 untrusted = re.compile(
     r"(?:^|_)(?:user|input|cmd|command|program|exe|binary|tool|shell|path|request|req|param|name|key)(?:$|_)"
 )
-adapter_methods = {"as_str", "as_ref", "to_string", "into_string"}
-
-
-def mask_range(chars, start, end):
-    for pos in range(start, min(end, len(chars))):
-        if chars[pos] != "\n":
-            chars[pos] = " "
-
-
-def mask_comments_and_strings(text: str) -> str:
-    chars = list(text)
-    i = 0
-    n = len(chars)
-    state = "code"
-    while i < n:
-        ch = chars[i]
-        nxt = chars[i + 1] if i + 1 < n else ""
-        if state == "code":
-            if ch == "/" and nxt == "/":
-                start = i
-                i += 2
-                while i < n and chars[i] != "\n":
-                    i += 1
-                mask_range(chars, start, i)
-                continue
-            if ch == "/" and nxt == "*":
-                chars[i] = chars[i + 1] = " "
-                i += 2
-                state = "block"
-                continue
-            if ch == "r":
-                j = i + 1
-                while j < n and chars[j] == "#":
-                    j += 1
-                if j < n and chars[j] == '"':
-                    hashes = j - i - 1
-                    close = '"' + ("#" * hashes)
-                    end = text.find(close, j + 1)
-                    if end == -1:
-                        end = n - 1
-                    else:
-                        end += len(close)
-                    mask_range(chars, i, end)
-                    i = end
-                    continue
-            if ch == '"':
-                chars[i] = " "
-                i += 1
-                state = "string"
-                continue
-        elif state == "block":
-            if ch == "*" and nxt == "/":
-                chars[i] = chars[i + 1] = " "
-                i += 2
-                state = "code"
-                continue
-            if ch != "\n":
-                chars[i] = " "
-        elif state == "string":
-            if ch == "\\":
-                chars[i] = " "
-                if i + 1 < n and chars[i + 1] != "\n":
-                    chars[i + 1] = " "
-                    i += 2
-                    continue
-            if ch == '"':
-                chars[i] = " "
-                i += 1
-                state = "code"
-                continue
-            if ch != "\n":
-                chars[i] = " "
-        i += 1
-    return "".join(chars)
+input_source = re.compile(r'\b(?:std\s*::\s*)?env\s*::\s*(?:args(?:_os)?|var(?:_os)?)\s*\(')
 
 
 def line_number(text: str, offset: int) -> int:
@@ -124,28 +53,46 @@ def line_number(text: str, offset: int) -> int:
 
 
 def suspicious_expr(expr: str) -> bool:
-    parts = [part.strip().lower() for part in expr.split(".") if part.strip()]
-    while parts and parts[-1] in adapter_methods:
-        parts.pop()
-    return any(untrusted.search(part) for part in parts)
+    masked = strip_comments_and_strings(expr, lang="rust")
+    if input_source.search(masked):
+        return True
+    for match in re.finditer(rf'\b{identifier}\b', masked):
+        before = masked[:match.start()].rstrip()
+        after = masked[match.end():].lstrip()
+        # Qualified type/module/callee names are not executable values. Keep
+        # examining their arguments: resolve(user.command) is still untrusted.
+        if before.endswith("::") or after.startswith(("::", "(", "!")):
+            continue
+        if untrusted.search(match.group().lower()):
+            return True
+    if re.search(r'\bformat\s*!', masked):
+        captures = re.findall(r'(?<!\{)\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^{}]*)?\}(?!\})', expr)
+        return any(untrusted.search(name.lower()) for name in captures)
+    return False
 
 
 def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
     seen = set()
+    suppressions = SourceSuppressions("rust")
     for path in files:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        masked = mask_comments_and_strings(text)
+        masked = strip_comments_and_strings(text, lang="rust")
+        source = strip_comments_and_strings(text, lang="rust", strip_strings=False)
+        suppressions.index(path, text)
         lines = text.splitlines()
         for hit in call.finditer(masked):
-            expr = hit.group("expr")
+            closing = find_block_end(masked, hit.end() - 1, "(", ")")
+            if closing < hit.end() or masked[closing] != ")":
+                continue
+            expr = source[hit.end():closing]
             if not suspicious_expr(expr):
                 continue
             line = line_number(masked, hit.start())
             code = lines[line - 1].strip() if 0 < line <= len(lines) else ""
-            if has_suppression_marker(code, RULE_ID):
+            if suppressions.is_suppressed(path, line, RULE_ID):
                 continue
             key = (str(path), line, code)
             if key in seen:

@@ -216,7 +216,7 @@ class ModuleChecker:
             t0 = time.monotonic()
             proc = run_cmd([str(self.module_path), f"--dump-rules={dump_dir}", str(fixture)])
             elapsed = time.monotonic() - t0
-            yml_count = len(list(dump_dir.glob("*.yml"))) + len(list(dump_dir.glob("*.yaml")))
+            yml_count = len(list(dump_dir.rglob("*.yml"))) + len(list(dump_dir.rglob("*.yaml")))
             ok = proc.returncode == 0 and yml_count > 0
             err = f"exit {proc.returncode} != 0 or no yaml dumped (count={yml_count})" if not ok else ""
             self._record_result("dump_rules", ok, elapsed, err, proc if not ok else None)
@@ -252,7 +252,7 @@ class ModuleChecker:
             try:
                 dumped_ids = sorted({
                     line.partition(":")[2].strip()
-                    for rule_file in [*dump_dir.glob("*.yml"), *dump_dir.glob("*.yaml")]
+                    for rule_file in [*dump_dir.rglob("*.yml"), *dump_dir.rglob("*.yaml")]
                     for line in rule_file.read_text(encoding="utf-8").splitlines()
                     if line.startswith("id:")
                 })

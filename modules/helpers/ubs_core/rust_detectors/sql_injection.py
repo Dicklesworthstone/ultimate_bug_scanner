@@ -33,7 +33,9 @@ source_re = re.compile(
     r'(?:user|username|email|name|status|tenant|account|id|role|filter|search|sort|limit|offset|where|order|table|column)\b'
     r'|\b(?:req|request|http_request)\s*\.\s*(?:query_string|uri|headers|header|param|query|path|match_info)\s*\('
     r'|\b(?:headers|header_map)\s*\.\s*get\s*\('
-    r'|\bPath\s*\('
+    # Rust's request extractor constructor is case-sensitive: a filesystem
+    # receiver's `.path()` method does not introduce request-derived taint.
+    r'|(?-i:\bPath)\s*\('
     r'|\b(?:std::)?env::args(?:_os)?\s*\(',
     re.IGNORECASE,
 )

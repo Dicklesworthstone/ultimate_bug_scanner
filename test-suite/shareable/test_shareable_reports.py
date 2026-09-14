@@ -21,18 +21,26 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS_BIN = REPO_ROOT / "ubs"
 TARGET = REPO_ROOT / "test-suite" / "python" / "buggy"
+GITHUB_ORIGIN = "https://github.com/ubs-test/shareable-reports.git"
 FAILURES: list[str] = []
 
 
-def run(args: list[str]) -> subprocess.CompletedProcess:
+def run(args: list[str], *, origin: str = GITHUB_ORIGIN) -> subprocess.CompletedProcess:
     env = os.environ.copy()
-    env.update({"NO_COLOR": "1", "UBS_NO_AUTO_UPDATE": "1"})
-    return subprocess.run([str(UBS_BIN), *args], capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=600)
+    env.update({
+        "NO_COLOR": "1",
+        "UBS_NO_AUTO_UPDATE": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "remote.origin.url",
+        "GIT_CONFIG_VALUE_0": origin,
+    })
+    return subprocess.run([str(UBS_BIN), *args], capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=600)  # ubs:ignore[python.taint.command] - fixed repository scanner and local fixtures; inherited environment configures Git provenance, with no shell and a bounded timeout
 
 
 def report(name: str, ok: bool, detail: str = "", proc: subprocess.CompletedProcess | None = None) -> None:
@@ -46,6 +54,12 @@ def report(name: str, ok: bool, detail: str = "", proc: subprocess.CompletedProc
 def totals_of(doc: dict) -> dict:
     t = doc.get("totals", {})
     return {k: int(t.get(k, 0) or 0) for k in ("critical", "warning", "info", "files")}
+
+
+def record_counts(records: list[dict]) -> Counter:
+    # Parallel detectors may emit records in a different order. Retain every
+    # field and duplicate when comparing the same scan across Git origins.
+    return Counter(json.dumps(record, sort_keys=True) for record in records)
 
 
 def main() -> int:
@@ -62,7 +76,12 @@ def main() -> int:
             return 1
         git = doc.get("git") or {}
         blob = git.get("blob_base", "")
-        ok = bool(git.get("repository")) and bool(git.get("commit")) and blob.startswith("https://github.com/") and git["commit"] in blob
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            cwd=REPO_ROOT, check=True, timeout=10,
+        ).stdout.strip()
+        expected_blob = f"https://github.com/ubs-test/shareable-reports/blob/{commit}"
+        ok = bool(git.get("repository")) and git.get("commit") == commit and blob == expected_blob
         report("stdout_json_git_block", ok, f"git={git}", proc if not ok else None)
         samples = [s for sc in doc.get("scanners", []) for f in sc.get("findings", []) for s in f.get("samples", []) if isinstance(s.get("line"), int) and s.get("file")]
         linked = [s for s in samples if s.get("permalink", "").startswith(blob + "/") and s["permalink"].endswith(f"#L{s['line']}")]
@@ -71,6 +90,7 @@ def main() -> int:
 
         # 2. SARIF locations carry properties.permalink.
         proc = run([*common, "--format=sarif", str(TARGET)])
+        locs = []
         try:
             sarif = json.loads(proc.stdout)
             locs = [loc for r in sarif["runs"] for res in r.get("results", []) for loc in res.get("locations", []) if loc.get("physicalLocation", {}).get("region", {}).get("startLine")]
@@ -80,10 +100,54 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             report("sarif_location_permalinks", False, f"{exc}", proc)
 
+        # A local clone has no GitHub provenance. Preserve findings and counts
+        # without inventing links, and never change the checkout's Git config.
+        proc = run([*common, "--format=json", str(TARGET)], origin=str(REPO_ROOT))
+        try:
+            local_doc = json.loads(proc.stdout)
+            local_samples = [s for sc in local_doc.get("scanners", []) for f in sc.get("findings", []) for s in f.get("samples", []) if isinstance(s.get("line"), int) and s.get("file")]
+            without_links = lambda records: [
+                {key: value for key, value in sample.items() if key != "permalink"}
+                for sample in records
+            ]
+            expected_samples = record_counts(without_links(samples))
+            actual_samples = record_counts(without_links(local_samples))
+            ok = (
+                not local_doc.get("git")
+                and totals_of(local_doc) == totals_of(doc)
+                and actual_samples == expected_samples
+                and all("permalink" not in sample for sample in local_samples)
+            )
+            missing_samples = expected_samples - actual_samples
+            extra_samples = actual_samples - expected_samples
+            report("local_origin_preserves_findings_without_links", ok, f"samples={len(local_samples)} missing={dict(missing_samples)} extra={dict(extra_samples)}", proc if not ok else None)
+        except json.JSONDecodeError as exc:
+            report("local_origin_preserves_findings_without_links", False, f"stdout is not JSON: {exc}", proc)
+
+        proc = run([*common, "--format=sarif", str(TARGET)], origin=str(REPO_ROOT))
+        try:
+            local_sarif = json.loads(proc.stdout)
+            local_locs = [loc for r in local_sarif["runs"] for res in r.get("results", []) for loc in res.get("locations", []) if loc.get("physicalLocation", {}).get("region", {}).get("startLine")]
+            expected_locations = record_counts([loc["physicalLocation"] for loc in locs])
+            actual_locations = record_counts([loc["physicalLocation"] for loc in local_locs])
+            ok = (
+                actual_locations == expected_locations
+                and all("permalink" not in loc.get("properties", {}) for loc in local_locs)
+            )
+            missing_locations = expected_locations - actual_locations
+            extra_locations = actual_locations - expected_locations
+            report("local_origin_sarif_preserves_locations_without_links", ok, f"locations={len(local_locs)} missing={dict(missing_locations)} extra={dict(extra_locations)}", proc if not ok else None)
+        except (json.JSONDecodeError, KeyError) as exc:
+            report("local_origin_sarif_preserves_locations_without_links", False, f"{exc}", proc)
+
         # 3. Baseline report, then comparison via --comparison and the --baseline alias.
         baseline = tmpdir / "baseline.json"
         proc = run([*common, f"--report-json={baseline}", str(TARGET)])
-        base_doc = json.loads(baseline.read_text()) if baseline.exists() else {}
+        try:
+            base_doc = json.loads(baseline.read_text()) if baseline.exists() else {}
+        except (json.JSONDecodeError, OSError) as exc:
+            report("report_json_baseline", False, f"cannot read baseline report: {exc}", proc)
+            return 1
         ok = baseline.exists() and "comparison" not in base_doc and bool(base_doc.get("git", {}).get("repository"))
         report("report_json_baseline", ok, f"exists={baseline.exists()} keys={sorted(base_doc)[:8]}", proc if not ok else None)
 

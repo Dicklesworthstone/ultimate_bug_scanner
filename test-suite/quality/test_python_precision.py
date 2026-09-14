@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import subprocess
 import sys
@@ -35,6 +36,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -44,6 +46,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.io import parse_ndjson_lines, read_ndjson  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
+from ubs_core.py_detectors import missing_returns  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.flow import PATTERNS as FLOW_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.foundations import PATTERNS as FOUNDATION_PATTERNS  # noqa: E402
@@ -66,7 +69,14 @@ class _Sink:
         self.records: list[dict] = []
 
     def write(self, line: str) -> None:
-        self.records.append(json.loads(line))
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise AssertionError(
+                f"Python precision sink record {len(self.records) + 1} is invalid JSON: "
+                f"{line!r}; decoder error: {exc}"
+            ) from exc
+        self.records.append(record)
 
 
 def run_patterns(rule_id: str, sources: dict[str, str]) -> list[dict]:
@@ -90,6 +100,38 @@ def run_detector(module, sources: dict[str, str]) -> list[tuple]:
             target.write_text(textwrap.dedent(body), encoding="utf-8")
             paths.append(target)
         return list(module.find(paths))
+
+
+class MissingReturnOrderingTests(unittest.TestCase):
+    def test_reversed_inputs_preserve_deficit_and_exact_source_sites(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_missing_returns_") as tmp:
+            first = Path(tmp) / "a.py"
+            last = Path(tmp) / "z.py"
+            first.write_text(
+                "def alpha():\n    pass\n\ndef beta():\n    pass\n",
+                encoding="utf-8",
+            )
+            last.write_text(
+                "def zeta():\n    return 1\n\ndef omega():\n    return 2\n",
+                encoding="utf-8",
+            )
+            expected = [
+                (first, 1, 1, "def alpha():"),
+                (first, 4, 1, "def beta():"),
+            ]
+            for paths in ([first, last], [last, first], [first]):
+                with self.subTest(paths=paths):
+                    self.assertEqual(list(missing_returns.find(paths)), expected)
+            self.assertEqual(list(missing_returns.find([last])), [])
+            self.assertEqual(list(missing_returns.find([])), [])
+
+    def test_cli_corpus_single_deficit_keeps_identity_when_reversed(self) -> None:
+        root = REPO_ROOT / "test-suite" / "python" / "buggy"
+        paths = sorted(root.glob("*.py"))
+        self.assertGreater(len(paths), 1)
+        expected = [(root / "bad_resources.py", 6, 1, "def read_config(path):")]
+        self.assertEqual(list(missing_returns.find(paths)), expected)
+        self.assertEqual(list(missing_returns.find(list(reversed(paths)))), expected)
 
 
 # ────────────────────────────── division ──────────────────────────────
@@ -616,6 +658,71 @@ class NdjsonReaderTests(unittest.TestCase):
                 read_ndjson(sink),
                 [{"rule": "r", "line": 1}, {"rule": "s", "line": 2}],
             )
+
+
+class PythonPreviewOrderTests(unittest.TestCase):
+    def test_real_scan_preview_sites_survive_input_order_and_parallelism(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_python_previews_") as tmp:
+            root = Path(tmp)
+            paths = []
+            for name in ("alpha", "bravo", "charlie", "delta", "echo"):
+                source = root / f"{name}.py"
+                source.write_text('handle = open("input.txt", encoding="utf-8")\n', encoding="utf-8")
+                paths.append(source)
+            baseline_report = None
+            baseline_records = None
+            env = os.environ.copy()
+            env.update({"PYTHONPATH": str(HELPERS_DIR), "UBS_NO_CACHE": "1"})
+            for index, (selected, jobs) in enumerate((
+                (paths, 1),
+                (list(reversed(paths)), 4),
+                (paths[::2] + paths[1::2], 4),
+            )):
+                sink = root / f"findings-{index}.ndjson"
+                report = root / f"report-{index}.json"
+                proc = subprocess.run(
+                    [sys.executable, "-m", "ubs_core.py_scan", "--files-from", "-",
+                     "--sink", str(sink), "--json-out", str(report),
+                     "--project-dir", str(root), "--project", str(root), "--jobs", str(jobs)],
+                    input="\0".join(map(str, selected)) + "\0",
+                    capture_output=True, text=True, env=env, cwd=REPO_ROOT, timeout=90,
+                )
+                self.assertIn(proc.returncode, (0, 1), proc.stderr)
+                try:
+                    doc = json.loads(report.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    self.fail(f"scanner did not emit valid JSON: {exc}; stderr={proc.stderr}")
+                self.assertEqual(doc["status"], "ok")
+                records = read_ndjson(sink)
+                signatures = Counter(json.dumps(record, sort_keys=True) for record in records)
+                findings = doc["findings"]
+                open_finding = next(f for f in findings if f["rule_id"] == "py.io.open-missing-with")
+                self.assertEqual(open_finding["count"], 5)
+                self.assertEqual(open_finding["severity"], "warning")
+                self.assertEqual(open_finding["samples"], [
+                    {"file": str(path), "line": 1,
+                     "code": 'handle = open("input.txt", encoding="utf-8")'}
+                    for path in paths[:3]
+                ])
+                comparable = {
+                    key: doc[key]
+                    for key in ("files", "critical", "warning", "info", "findings", "report")
+                }
+                if baseline_report is None:
+                    baseline_report, baseline_records = comparable, signatures
+                else:
+                    self.assertEqual(comparable, baseline_report)
+                    self.assertEqual(signatures, baseline_records)
+
+                # Duplicate evidence retains its multiplicity, while sample
+                # choice is independent of its arrival order as well.
+                from ubs_core.py_scan import _legacy_report
+
+                duplicated = records + records
+                forward = _legacy_report(duplicated, "test")
+                backward = _legacy_report(list(reversed(duplicated)), "test")
+                self.assertEqual(forward, backward)
+                self.assertEqual(sum(f["count"] for f in forward["findings"]), len(duplicated))
 
 
 class TrailingRootFlagTests(unittest.TestCase):

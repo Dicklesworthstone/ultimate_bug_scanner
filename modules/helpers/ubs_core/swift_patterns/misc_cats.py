@@ -72,6 +72,7 @@ def _packaging(ctx):
             "path": "", "line": 0,
             "severity": "info",
             "count": 0,
+            "scope": "project",
             "title": "Package.swift not found in selected files",
             "message": "Package.swift not found in selected files",
             "description": "Skipping SPM checks",
@@ -129,6 +130,7 @@ def _storyboards(ctx):
         yield {
             "rule": "swift.uisafety.storyboards",
             "category": 21,
+            "scope": "project_aggregate",
             "path": "", "line": 0,
             "severity": "info",
             "count": count,

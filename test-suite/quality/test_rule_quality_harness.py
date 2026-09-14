@@ -978,6 +978,92 @@ class SarifShapeTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "positive startLine"):
             rule_quality_harness.validate_sarif_payload_shape(payload, "fixture")
 
+    @staticmethod
+    def project_note_payload() -> dict[str, Any]:
+        return {
+            "runs": [{
+                "tool": {"driver": {"name": "ubs-swift"}},
+                "results": [{
+                    "ruleId": "swift.packaging.no-manifest",
+                    "message": {"text": "Package.swift not found in selected files"},
+                    "kind": "informational",
+                    "level": "none",
+                    "properties": {"scope": "project", "count": 0},
+                }],
+            }],
+        }
+
+    def test_accepts_explicit_zero_count_project_note_without_inventing_location(self) -> None:
+        payload = self.project_note_payload()
+        rule_quality_harness.validate_sarif_payload_shape(payload, "project note")
+        self.assertNotIn("locations", payload["runs"][0]["results"][0])
+
+    def test_project_note_marker_cannot_bypass_source_diagnostic_validation(self) -> None:
+        for field, values in (
+            ("kind", (None, "fail", "notApplicable")),
+            ("level", (None, "error", "warning", "note")),
+            ("locations", (None, [], self.valid_payload()["runs"][0]["results"][0]["locations"])),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    payload = self.project_note_payload()
+                    payload["runs"][0]["results"][0][field] = value
+                    with self.assertRaisesRegex(AssertionError, "malformed project note"):
+                        rule_quality_harness.validate_sarif_payload_shape(payload, "project note")
+        for count in (None, False, True, "0", 0.0, -1, 1):
+            with self.subTest(count=count):
+                payload = self.project_note_payload()
+                payload["runs"][0]["results"][0]["properties"]["count"] = count
+                with self.assertRaisesRegex(AssertionError, "malformed project note"):
+                    rule_quality_harness.validate_sarif_payload_shape(payload, "project note")
+
+    def test_source_less_results_require_explicit_project_note_semantics(self) -> None:
+        for properties in (None, {}, {"count": 0}, {"scope": "source", "count": 0}):
+            with self.subTest(properties=properties):
+                payload = self.project_note_payload()
+                payload["runs"][0]["results"][0]["properties"] = properties
+                with self.assertRaisesRegex(AssertionError, "positive startLine"):
+                    rule_quality_harness.validate_sarif_payload_shape(payload, "source result")
+
+    def test_project_aggregates_preserve_positive_counts_and_failure_levels(self) -> None:
+        for level in ("note", "warning", "error"):
+            for count in (1, 7):
+                with self.subTest(level=level, count=count):
+                    payload = self.project_note_payload()
+                    result = payload["runs"][0]["results"][0]
+                    result.update({
+                        "ruleId": "swift.files.filehandle",
+                        "message": {"text": "FileHandle open without matching close"},
+                        "kind": "fail", "level": level,
+                        "properties": {"scope": "project_aggregate", "count": count},
+                    })
+                    rule_quality_harness.validate_sarif_payload_shape(payload, "aggregate")
+                    self.assertEqual(result["level"], level)
+                    self.assertEqual(result["properties"]["count"], count)
+                    self.assertNotIn("locations", result)
+
+    def test_project_aggregates_reject_downgrades_bad_counts_and_invented_sites(self) -> None:
+        for field, values in (
+            ("kind", (None, "informational", "pass", "review")),
+            ("level", (None, "none", "invalid")),
+            ("locations", (None, [], self.valid_payload()["runs"][0]["results"][0]["locations"])),
+            ("count", (None, False, True, "1", 1.0, -1, 0)),
+        ):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    payload = self.project_note_payload()
+                    result = payload["runs"][0]["results"][0]
+                    result.update({
+                        "kind": "fail", "level": "warning",
+                        "properties": {"scope": "project_aggregate", "count": 2},
+                    })
+                    if field == "count":
+                        result["properties"][field] = value
+                    else:
+                        result[field] = value
+                    with self.assertRaisesRegex(AssertionError, "malformed project aggregate"):
+                        rule_quality_harness.validate_sarif_payload_shape(payload, "aggregate")
+
 
 class RunManifestExpectationTest(unittest.TestCase):
     @staticmethod

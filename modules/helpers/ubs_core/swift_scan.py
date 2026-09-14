@@ -131,7 +131,6 @@ _CATEGORY_DETECTED = {
          "Localize strings and use locale-aware formatters."),
 }
 _CORRELATION_PREFIX = "ubs.correlation.urlsession."
-AST_PACK_RULE = "swift.urlsession.task-no-resume"
 
 
 def slug_for_category(category: int) -> str:
@@ -926,11 +925,7 @@ class _Renderer:
             return
         pack = [
             rule for rule in self.buckets
-            if rule == AST_PACK_RULE or (
-                not self.buckets[rule][0].get("category_id")
-                and not rule.startswith(_CORRELATION_PREFIX)
-                and rule not in _SPEC_BY_RULE
-            )
+            if any(rec.get("source") == "ast-grep" for rec in self.buckets[rule])
         ]
         if not pack:
             return
@@ -1050,6 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
 
         scan_ctx = ScanContext(
             files=files_to_scan,
+            texts=ctx.texts,
             project_dir=project_dir,
             skip_narrowing=args.skip_type_narrowing,
             ast_available=args.ast_available,

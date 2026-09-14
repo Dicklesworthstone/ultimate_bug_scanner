@@ -147,6 +147,7 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
         counters[severity] = counters.get(severity, 0) + 1
         record = {
             "rule": rid,
+            "source": "ast-grep",
             "category_id": f"swift.{slug_for_category(category)}" if category else "",
             "path": source_path,
             "line": line_no,

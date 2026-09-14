@@ -8,6 +8,7 @@ the actual source anchors so shell calls cannot consume another file's count.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from ubs_core.swift_detectors._common import rel, should_skip
 
@@ -53,8 +54,11 @@ def collect_findings(ctx):
     root = ctx.project_dir.resolve()
     base = root if root.is_dir() else root.parent
     findings = []
-    for path in ctx.files:
-        if path.suffix != '.swift' or (root.is_dir() and should_skip(path.resolve(), base, SKIP_DIRS)):
+    for candidate in ctx.files:
+        path = Path(candidate).resolve()
+        if path.suffix != '.swift':
+            continue
+        if path != root and should_skip(path, base, SKIP_DIRS):
             continue
         try:
             lines = path.read_text(encoding='utf-8').splitlines()
@@ -112,4 +116,3 @@ def scan(ctx):
             "description": f"{desc} {reason}.",
             "samples": [{"path": path, "line": line, "code": code}],
         }
-

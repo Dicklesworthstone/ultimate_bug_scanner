@@ -120,3 +120,14 @@ storage.sqlite3-wal.corrupt-*
 .beads/*.repair_candidate_*
 .beads/*.bak-corrupt
 tmp-rel-*
+
+# === agent ephemeral residue 2026-09-15 ===
+# Root-level UBS scan dumps (not fixtures; regenerate with `ubs`).
+/findings.jsonl
+/report.html
+/report.json
+/summary.json
+/ubs_trace.log
+rustc-ice-*.txt
+/.gate_*.sh
+/.verify_*.sh

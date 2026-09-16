@@ -20,7 +20,9 @@ or ordinary source tokens.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from dataclasses import dataclass, field
+from heapq import heappop, heappush
 from pathlib import Path
 
 from ubs_core.lexer import strip_comments_and_strings
@@ -82,14 +84,70 @@ class Marker:
     standalone: bool = False
 
 
+@dataclass(frozen=True)
+class _IntervalLookup:
+    intervals: tuple[Interval, ...]
+    statements: tuple[Interval, ...]
+    boundaries: tuple[int, ...]
+    winners: tuple[Interval | None, ...]
+    statement_set: frozenset[Interval]
+    block_openings: frozenset[int]
+
+
 @dataclass
 class SuppressionIndex:
-    intervals: list[Interval] = field(default_factory=list)
+    intervals: list[Interval] | tuple[Interval, ...] = field(default_factory=list)
     markers: list[Marker] = field(default_factory=list)
-    statements: list[Interval] = field(default_factory=list)
+    statements: list[Interval] | tuple[Interval, ...] = field(default_factory=list)
     formatter_headers: dict[int, Interval] = field(default_factory=dict)
+    _lookup: _IntervalLookup | None = field(default=None, init=False, repr=False, compare=False)
+
+    def _finalize(self) -> None:
+        """Freeze parsed intervals and index their exact first-shortest winner.
+
+        Sweep only interval endpoints, not every source line. Original ordinal
+        breaks equal-span ties just as the linear lookup does. Generic mutable
+        indexes remain supported; replacing either tuple invalidates this view.
+        """
+        intervals = tuple(self.intervals)
+        statements = tuple(self.statements)
+        events: dict[int, list[int]] = {}
+        for ordinal, interval in enumerate(intervals):
+            if interval.end_line < interval.start_line:
+                continue
+            events.setdefault(interval.start_line, []).append(ordinal)
+            events.setdefault(interval.end_line + 1, [])
+        boundaries = tuple(sorted(events))
+        heap: list[tuple[int, int, int]] = []
+        winners: list[Interval | None] = []
+        for line in boundaries:
+            for ordinal in events[line]:
+                interval = intervals[ordinal]
+                heappush(heap, (interval.end_line - interval.start_line, ordinal, interval.end_line))
+            while heap and heap[0][2] < line:
+                heappop(heap)
+            winners.append(intervals[heap[0][1]] if heap else None)
+        statement_set = frozenset(statements)
+        self.intervals = intervals
+        self.statements = statements
+        self._lookup = _IntervalLookup(
+            intervals, statements, boundaries, tuple(winners), statement_set,
+            frozenset(interval.start_line for interval in intervals
+                      if interval.end_line > interval.start_line and interval not in statement_set),
+        )
+
+    def _current_lookup(self) -> _IntervalLookup | None:
+        lookup = self._lookup
+        if (lookup is not None and self.intervals is lookup.intervals
+                and self.statements is lookup.statements):
+            return lookup
+        return None
 
     def _interval_for(self, line: int) -> Interval | None:
+        lookup = self._current_lookup()
+        if lookup is not None:
+            position = bisect_right(lookup.boundaries, line) - 1
+            return lookup.winners[position] if position >= 0 else None
         best: Interval | None = None
         for interval in self.intervals:
             if interval.contains(line):
@@ -100,7 +158,9 @@ class SuppressionIndex:
 
     def is_suppressed(self, line: int, rule: str) -> bool:
         interval = self._interval_for(line)
-        statement = interval if interval in self.statements else None
+        lookup = self._current_lookup()
+        statements = lookup.statement_set if lookup is not None else self.statements
+        statement = interval if interval in statements else None
         return any(
             (marker.rules is None or rule in marker.rules) and (
                 marker.line == line
@@ -109,11 +169,12 @@ class SuppressionIndex:
                     and self.formatter_headers[marker.line].contains(line))
                 or (marker.standalone and interval is not None and (
                     marker.line == interval.start_line - 1
-                    or (marker.line == line + 1 and any(
+                    or (marker.line == line + 1 and (line in lookup.block_openings
+                        if lookup is not None else any(
                         block.start_line == line and block.contains(marker.line)
                         and block not in self.statements
                         for block in self.intervals
-                    ))
+                    )))
                 ))
             )
             for marker in self.markers
@@ -345,4 +406,5 @@ def build_index(text: str, lang: str = "python") -> SuppressionIndex:
                     header_code) and not header_code.endswith(";"):
             index.formatter_headers[block.start_line] = header
 
+    index._finalize()
     return index

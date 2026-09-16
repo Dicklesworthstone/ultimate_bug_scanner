@@ -607,6 +607,66 @@ class RustDetectorSuppressionTests(unittest.TestCase):
                 self.assertEqual(self.lines(tls_indirect, source), expected)
 
 
+class RustRcRefCellSourceTests(unittest.TestCase):
+    def test_type_documentation_and_literals_do_not_hide_real_code(self) -> None:
+        source = '''//! Rc<RefCell<State>> is discussed here.
+/* Rc<RefCell<State>>
+   still documentation: Rc<RefCell<State>> */
+fn production() {
+    let note = "Rc<RefCell<State>>";
+    let raw = r##"Rc<RefCell<State>>
+        Rc<RefCell<State>>"##;
+    let escaped = "quoted \\\" Rc<RefCell<State>>";
+    let live: Rc<RefCell<State>> = make_state();
+    let note = "Rc<RefCell<State>>"; let second: Rc<RefCell<State>> = make_state();
+    /* Rc<RefCell<State>> */ let third: Rc<RefCell<State>> = make_state();
+}
+'''
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-refcell-") as temp:
+            root = Path(temp)
+            path = root / "source.rs"
+            path.write_text(source, encoding="utf-8")
+            scan = rust_scan.Scan([path], root, False, set(), 3)
+            renderer = rust_scan.Renderer(scan)
+            rust_scan.cat_3(scan, renderer)
+            records = [record for record in scan.records if record["rule"] == "rust.async.rc-refcell"]
+            self.assertEqual([record["line"] for record in records], [9, 10, 11])
+            self.assertTrue(all(record["severity"] == "warning" for record in records))
+            self.assertEqual(scan.counters["warning"], 3)
+            self.assertEqual([record["text"] for record in records], source.splitlines()[8:11])
+            replay = rust_scan.Scan([path], root, False, set(), 3)
+            rust_scan.replay_findings(replay, rust_scan.Renderer(replay), scan.records)
+            self.assertEqual(replay.records, scan.records)
+            self.assertEqual(replay.counters, scan.counters)
+
+    def test_type_use_respects_only_its_public_suppression_scope(self) -> None:
+        rule = "rust.async.rc-refcell"
+        for prefix, suffix, expected in (
+            ("", "", [3, 4]),
+            ("", " // ubs:ignore[rust.panic.assert-macros]", [3, 4]),
+            ("", f" // ubs:ignore[{rule}]", [4]),
+            (f"// ubs:ignore[{rule}]", "", [4]),
+            ("// ubs:ignore[rust.panic.assert-macros]", "", [3, 4]),
+            ("", ' let note = "ubs:ignore";', [3, 4]),
+            ("", f' let note = r#"ubs:ignore[{rule}]"#;', [3, 4]),
+        ):
+            with self.subTest(prefix=prefix, suffix=suffix):
+                with tempfile.TemporaryDirectory(prefix="ubs-rust-refcell-scope-") as temp:
+                    root = Path(temp)
+                    path = root / "source.rs"
+                    path.write_text(
+                        "fn production() {\n    " + prefix + "\n"
+                        "    let first: Rc<RefCell<State>> = make_state();" + suffix + "\n"
+                        "    let second: Rc<RefCell<State>> = make_state();\n}\n",
+                        encoding="utf-8",
+                    )
+                    scan = rust_scan.Scan([path], root, False, set(), 3)
+                    rust_scan.cat_3(scan, rust_scan.Renderer(scan))
+                    records = [record for record in scan.records if record["rule"] == rule]
+                    self.assertEqual([record["line"] for record in records], expected)
+                    self.assertEqual(scan.counters["warning"], len(expected))
+
+
 class RustNativeSuppressionTests(unittest.TestCase):
     """Real ast-grep, line fallback, and cache replay must agree on rule scope."""
 

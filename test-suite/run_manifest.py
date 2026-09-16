@@ -469,28 +469,59 @@ def parse_sarif_summary(stdout: str, project_label: str) -> Optional[Dict[str, A
     }
 
 
+TOON_TOTALS_KEYS = ("critical", "warning", "info", "files")
+TOON_TOTALS_FIELD_RE = re.compile(r"^\s+(critical|warning|info|files):\s*(\d+)\s*$")
+
+
+def toon_totals_block(stdout: str) -> Optional[Dict[str, int]]:
+    """Read the top-level ``totals:`` mapping out of a TOON document.
+
+    Only fields at the block's own indentation count, so neither the
+    per-scanner summaries nor anything nested inside ``totals`` can leak into
+    the aggregate. Returns None when the document carries no such block.
+    """
+    lines = stdout.splitlines()
+    for index, line in enumerate(lines):
+        if line.rstrip() != "totals:":
+            continue
+        block: Dict[str, int] = {}
+        depth: Optional[int] = None
+        for candidate in lines[index + 1:]:
+            if not candidate.strip():
+                continue
+            indent = len(candidate) - len(candidate.lstrip())
+            if indent == 0:
+                break
+            if depth is None:
+                depth = indent
+            elif indent < depth:
+                break
+            if indent != depth:
+                continue
+            match = TOON_TOTALS_FIELD_RE.match(candidate)
+            if match:
+                block[match.group(1)] = int(match.group(2))
+        if block:
+            return block
+    return None
+
+
 def parse_toon_summary(stdout: str, project_label: str) -> Optional[Dict[str, Any]]:
     """Parse UBS --format=toon output to extract aggregate totals.
 
-    TOON output is YAML-like with a top-level ``scanners[N]:`` array whose
-    entries each expose ``critical``, ``warning``, ``info``, and ``files``
-    keys. Totals are the sum across scanners so the manifest's min/max
-    assertions continue to work regardless of format.
+    ``--format=toon`` encodes the same document ``--format=json`` emits, so the
+    authoritative aggregate is its top-level ``totals`` mapping. Summing every
+    indented ``critical``/``warning``/``info``/``files`` line instead would add
+    each scanner's per-language fields to that aggregate and double the counts
+    (issue #115), which silently breaks the manifest's min/max assertions.
     """
     if "scanners[" not in stdout or "findings[" not in stdout:
         return None
-    totals = {"critical": 0, "warning": 0, "info": 0, "files": 0}
-    found_any = False
-    pattern = re.compile(r"^\s+(critical|warning|info|files):\s*(\d+)\s*$")
-    for line in stdout.splitlines():
-        m = pattern.match(line)
-        if not m:
-            continue
-        key = m.group(1)
-        totals[key] += int(m.group(2))
-        found_any = True
-    if not found_any:
+    block = toon_totals_block(stdout)
+    if block is None:
         return None
+    totals = {key: 0 for key in TOON_TOTALS_KEYS}
+    totals.update(block)
     return {
         "project": project_label,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

@@ -4466,6 +4466,11 @@ record_workspace_mirror(){
   printf '%s\0%s\0' "$1" "$2" >> "$WORKSPACE_MIRROR_MAP"
 }
 
+# Only legacy_postprocess calls this, and legacy_postprocess only runs when
+# $TMPDIR_RUN/postprocess.py was never written — which happens only when python3
+# is absent, the one case this function itself declines. It is therefore inert
+# today; the live path is postprocess.py's restore_workspace, which is where the
+# mirror map is consumed.
 restore_original_paths(){
   local file="$1"
   [[ -f "$file" ]] || return 0
@@ -4475,28 +4480,15 @@ restore_original_paths(){
   fi
   [[ -n "$FILTERED_PROJECT_DIR" ]] || return 0
   if ! need_cmd python3; then return 0; fi
-  python3 - "$FILTERED_PROJECT_DIR" "$SOURCE_PROJECT_DIR" "$file" "$WORKSPACE_MIRROR_MAP" <<'PY' 2>/dev/null || true
+  python3 - "$FILTERED_PROJECT_DIR" "$SOURCE_PROJECT_DIR" "$file" <<'PY' 2>/dev/null || true
 import sys, pathlib
 src = sys.argv[1]
 dst = sys.argv[2]
 path = pathlib.Path(sys.argv[3])
-mirror_map = sys.argv[4]
 try:
     data = path.read_text()
 except OSError:
     sys.exit(0)
-pairs = []
-if mirror_map:
-    try:
-        fields = pathlib.Path(mirror_map).read_text(errors="replace").split("\0")
-    except OSError:
-        fields = []
-    pairs = [(fields[i], fields[i + 1])
-             for i in range(0, len(fields) - 1, 2) if fields[i]]
-    # Longest workspace path first, so a nested mirror wins over its parent.
-    pairs.sort(key=lambda kv: len(kv[0]), reverse=True)
-for workspace_path, real_path in pairs:
-    data = data.replace(workspace_path, real_path)
 path.write_text(data.replace(src, dst))
 PY
 }

@@ -142,6 +142,9 @@ class IgnoreMatcherParityTest(unittest.TestCase):
         # Bracket expressions, including the two spellings where a `]` directly
         # after `[` or `[!` is a member rather than the terminator.
         "[a-z]*.py", "keep[.]py", "[!k]eep.py", "[]]", "[!]]",
+        # `**` that is not surrounded by separators, and the bare wildcards.
+        "a**b", "**.py", "deep**foo.py", "a/**b", "**", "*", "a/**/c.py",
+        "**/a/**", "/**/foo.py", "?eep.py", "deep/*/foo.py",
     )
 
     @classmethod

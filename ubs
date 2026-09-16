@@ -423,6 +423,12 @@ need_cmd(){
   # Test seam (bead B11): pretend rsync is absent, as on Git for Windows, so the
   # tar/python workspace tiers can be exercised on a box that has rsync.
   if [[ "${1:-}" == "rsync" && "${UBS_TEST_NO_RSYNC:-0}" == "1" ]]; then return 1; fi
+  # A tar that exists but fails is a real error, so stubbing it out cannot
+  # reach the python copy tier below it; this seam can.
+  if [[ "${1:-}" == "tar" && "${UBS_TEST_NO_TAR:-0}" == "1" ]]; then return 1; fi
+  # Same idea for rg: the python walk is the file-selection path on hosts
+  # without ripgrep, and it has to select exactly what rg would (issue #114).
+  if [[ "${1:-}" == "rg" && "${UBS_TEST_NO_RG:-0}" == "1" ]]; then return 1; fi
   command -v "$1" >/dev/null 2>&1
 }
 
@@ -1262,6 +1268,11 @@ SCAN_LIST_COUNT=0; SCAN_LIST_BYTES=0; SCAN_LIST_SKIPPED_BIG=0; SCAN_LIST_SKIPPED
 REFUSE_HOME_ROOT="${UBS_REFUSE_HOME_ROOT:-1}"  # 1 = refuse, 0 = allow
 GLOBAL_EXCLUDE_PATTERNS="$DEFAULT_IGNORES"
 FILTERED_PROJECT_DIR=""
+# NUL-delimited (workspace path, real path) pairs for targets mirrored into the
+# shadow workspace from outside the project. restore_original_paths consumes
+# them so findings name the file the user actually passed, not the mirror.
+WORKSPACE_MIRROR_MAP=""
+IGNORE_MATCHER_DIR=""   # holds the generated ubs_ignore.py (ensure_ignore_matcher)
 MODULE_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
 MODULE_DIR="$MODULE_DIR_DEFAULT"
 declare -A MODULE_PATHS=()
@@ -2514,6 +2525,118 @@ ignore_globs_for_rg(){
   done
 }
 
+# The python half of the same grammar (issue #114). rg is the primary listing
+# path, but two selection paths cannot use it — the no-rg directory walk and the
+# git shadow-list filter — and both used to test the raw pattern with fnmatch,
+# so a root-anchored `/ignored/**` matched in rg and matched nothing in either
+# of them. This writes one module they both import, defined as "reproduce the
+# glob ignore_globs_for_rg emits", so all three paths select the same files.
+# Written on demand (list_scan_files runs long before the other generated
+# helpers) and idempotent.
+ensure_ignore_matcher(){
+  ensure_tmpdir_run
+  IGNORE_MATCHER_DIR="$TMPDIR_RUN"
+  [[ -s "$TMPDIR_RUN/ubs_ignore.py" ]] && return 0
+  cat > "$TMPDIR_RUN/ubs_ignore.py" <<'PY'
+"""The one ignore-pattern matcher shared by every file-selection path.
+
+The ignore spec is a comma-separated list of patterns. ignore_globs_for_rg
+turns each one into a ripgrep glob; this module reproduces that glob's meaning
+so paths selected without rg agree exactly. Per pattern:
+
+    /a/b     root-anchored
+    **/a     any depth, including the root
+    a/b      any depth (rg is given `**/a/b`)
+    a        any single path component, at any depth
+
+Inside a glob, `*` and `?` never cross `/`; `**` does.
+"""
+
+import re
+
+
+def rg_glob(pattern):
+    """The glob ignore_globs_for_rg emits for `pattern`, without the `!`."""
+    if pattern.startswith("/"):
+        return pattern[1:]
+    if pattern.startswith("**/"):
+        return pattern
+    if "/" in pattern:
+        return "**/" + pattern
+    return pattern
+
+
+def glob_to_regex(glob):
+    """Translate one glob to regex source, with `*` stopping at `/`."""
+    out = []
+    index, end = 0, len(glob)
+    while index < end:
+        char = glob[index]
+        if char == "*":
+            if glob.startswith("**", index):
+                index += 2
+                if index < end and glob[index] == "/":
+                    # `a/**/b` matches `a/b` as well as `a/x/b`.
+                    out.append("(?:[^/]+/)*")
+                    index += 1
+                else:
+                    out.append(".*")
+            else:
+                out.append("[^/]*")
+                index += 1
+        elif char == "?":
+            out.append("[^/]")
+            index += 1
+        elif char == "[":
+            close = glob.find("]", index + 1)
+            if close == -1:
+                out.append(re.escape(char))
+                index += 1
+            else:
+                body = glob[index + 1:close]
+                out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
+                index = close + 1
+        else:
+            out.append(re.escape(char))
+            index += 1
+    return "".join(out)
+
+
+class IgnoreMatcher:
+    """A compiled ignore spec. `excluded()` takes a relative POSIX path."""
+
+    def __init__(self, spec):
+        paths, components = [], []
+        for pattern in spec.split(","):
+            if not pattern:
+                continue
+            glob = rg_glob(pattern)
+            # A glob with a separator is matched against the whole relative
+            # path; one without is matched against each path component, which
+            # is how rg treats a slashless glob.
+            (paths if "/" in glob else components).append(glob_to_regex(glob))
+        # rg prunes a directory its glob matched, so a path glob also excludes
+        # everything below it: `a/b` must drop `a/b/c.py`, not just `a/b`.
+        self.path_re = self._compile(paths, r"(?:/.*)?")
+        self.component_re = self._compile(components)
+
+    @staticmethod
+    def _compile(sources, tail=""):
+        if not sources:
+            return None
+        return re.compile("(?:" + "|".join(sources) + ")" + tail + r"\Z")
+
+    def excluded(self, rel):
+        if self.path_re is not None and self.path_re.match(rel):
+            return True
+        if self.component_re is not None:
+            for part in rel.split("/"):
+                if self.component_re.match(part):
+                    return True
+        return False
+PY
+}
+
 # List the files to scan under ROOT into OUT (NUL-separated, relative to ROOT):
 # rg --files with the ignore globs when rg is present, else a Python walk with
 # fnmatch on the same patterns; then the Python filter drops binary/data
@@ -2523,6 +2646,7 @@ list_scan_files(){
   local root="$1" out="$2" raw rg_rc=0 mode="list"
   local contract_file="${3:-}" per_lang_dir="${4:-}" only_langs="${5:-}" exclude_langs="${6:-}" include_ext="${7:-}"
   need_cmd python3 || return 1
+  ensure_ignore_matcher
   raw="$out.raw"
   if need_cmd rg; then
     local -a rg_args=(--files -0 --hidden --no-ignore --no-messages) globs
@@ -2537,17 +2661,20 @@ list_scan_files(){
     : > "$raw"
   fi
   local stats
-  if ! stats="$(python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" "$contract_file" "$per_lang_dir" "$only_langs" "$exclude_langs" "$include_ext" <<'PY'
+  if ! stats="$(UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 - "$root" "$raw" "$out" "$MAX_FILE_SIZE_MB" "$SCAN_DATA_EXTENSIONS" "$mode" "$GLOBAL_EXCLUDE_PATTERNS" "$SCOPED_IGNORE_DIRS" "$SOURCE_EXTENSIONS" "$contract_file" "$per_lang_dir" "$only_langs" "$exclude_langs" "$include_ext" <<'PY'
 import fnmatch
 import json
 import os
 import sys
 import time
 
+sys.path.insert(0, os.environ["UBS_IGNORE_MATCHER_DIR"])
+from ubs_ignore import IgnoreMatcher
+
 root = os.fsencode(sys.argv[1])
 raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
 data_exts = {ext for ext in sys.argv[5].split(",") if ext}
-mode, patterns = sys.argv[6], [p for p in sys.argv[7].split(",") if p]
+mode, ignore_matcher = sys.argv[6], IgnoreMatcher(sys.argv[7])
 scoped = set(sys.argv[8].split(",")) if len(sys.argv) > 8 and sys.argv[8] else set()
 source_exts = set(sys.argv[9].split(",")) if len(sys.argv) > 9 else set()
 contract_path = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
@@ -2689,14 +2816,8 @@ def scoped_skip(dirpath: bytes, name: bytes, files_under: set[bytes]) -> bool:
     return verdict
 
 
-def excluded(rel, name):
-    for pat in patterns:
-        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat):
-            return True
-        for part in rel.split("/"):
-            if fnmatch.fnmatch(part, pat):
-                return True
-    return False
+def excluded(rel):
+    return ignore_matcher.excluded(os.fsdecode(rel).replace(os.sep, "/"))
 
 
 entries = []
@@ -2706,12 +2827,12 @@ if mode == "walk":
         keep = []
         for d in dirs:
             rel = d if rel_root == "." else os.path.join(rel_root, d)
-            if not excluded(os.fsdecode(rel), os.fsdecode(d)):
+            if not excluded(rel):
                 keep.append(d)
         dirs[:] = keep
         for f in files:
             rel = f if rel_root == "." else os.path.join(rel_root, f)
-            if not excluded(os.fsdecode(rel), os.fsdecode(f)):
+            if not excluded(rel):
                 entries.append(rel)
 else:
     with open(raw, "rb") as fh:
@@ -2850,6 +2971,14 @@ failed = 0
 with open(sys.argv[3], "rb") as fh:
     for rel in fh.read().split(b"\0"):
         if not rel:
+            continue
+        # os.path.join would happily resolve an absolute or `..`-bearing entry
+        # to somewhere outside dst. Callers always pass names relative to src,
+        # so anything else is a bug worth failing on, not silently copying.
+        if os.path.isabs(rel) or b".." in rel.split(b"/"):
+            failed += 1
+            print(f"{os.fsdecode(rel)}: not relative to the source root",
+                  file=sys.stderr)
             continue
         target = os.path.join(dst, rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -3233,28 +3362,15 @@ prepare_git_workspace(){
   # so that ignored paths are never copied into the shadow workspace.
   if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#files[@]} -gt 0 ]] && need_cmd python3; then
     local filtered_csv
-    filtered_csv=$(printf '%s\n' "${files[@]}" | python3 -c "
-import sys, fnmatch, pathlib
-patterns = sys.argv[1].split(',')
+    ensure_ignore_matcher
+    filtered_csv=$(printf '%s\n' "${files[@]}" | UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 -c "
+import os, sys
+sys.path.insert(0, os.environ['UBS_IGNORE_MATCHER_DIR'])
+from ubs_ignore import IgnoreMatcher
+matcher = IgnoreMatcher(sys.argv[1])
 for line in sys.stdin:
     f = line.rstrip('\n')
-    if not f:
-        continue
-    name = pathlib.PurePosixPath(f).name
-    excluded = False
-    for pat in patterns:
-        if not pat:
-            continue
-        if fnmatch.fnmatch(f, pat) or fnmatch.fnmatch(name, pat):
-            excluded = True
-            break
-        for part in pathlib.PurePosixPath(f).parts:
-            if fnmatch.fnmatch(part, pat):
-                excluded = True
-                break
-        if excluded:
-            break
-    if not excluded:
+    if f and not matcher.excluded(f):
         print(f)
 " "$GLOBAL_EXCLUDE_PATTERNS" 2>/dev/null) || true
     if [[ -n "$filtered_csv" ]]; then
@@ -3305,27 +3421,24 @@ prepare_files_workspace(){
     scan_root="$(dirname "$scan_root")"
   fi
 
-  # Resolve each path relative to scan_root; reject missing targets
-  local resolved_files=() dir_src=() dir_rel=()
-  local f rel abs
+  # Resolve each path relative to scan_root; reject missing targets. Both
+  # branches below canonicalize before deriving any destination-relative name,
+  # so neither an absolute target nor a `..` segment can escape the workspace.
+  local resolved_files=() dir_src=() dir_rel=() dir_ext=() ext_parents=()
+  local -A ext_list_of=()
+  local f rel abs parent base
   for f in "${SCAN_FILES[@]}"; do
     [[ -z "$f" ]] && continue
     if [[ "$f" == /* ]]; then
-      # Absolute path — make it relative to scan_root
-      if [[ -e "$f" ]]; then
-        rel="${f#"$scan_root"/}"
-      else
+      if [[ ! -e "$f" ]]; then
         say "${RED}$X scan target not found${RESET}: $f"
         exit 2
       fi
     elif [[ -e "$scan_root/$f" ]]; then
-      rel="$f"
       f="$scan_root/$f"
     elif [[ -e "$f" ]]; then
-      # Relative to cwd, convert to relative to scan_root
-      abs="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"
-      rel="${abs#"$scan_root"/}"
-      f="$abs"
+      # Relative to cwd; absolutize now and canonicalize below.
+      f="$PWD/$f"
     else
       say "${RED}$X scan target not found${RESET}: $f"
       exit 2
@@ -3359,12 +3472,35 @@ prepare_files_workspace(){
       dir_src+=("$f")
       rel="${rel%/}"
       dir_rel+=("${rel#/}")
+      # A directory outside the project is mirrored by absolute path too, so
+      # its findings need the same remapping as external files.
+      if [[ "$f" == "$scan_root"/* ]]; then dir_ext+=(0); else dir_ext+=(1); fi
     else
-      resolved_files+=("$rel")
+      # Canonicalize the parent the same way, then name the file relative to a
+      # root that actually contains it. A file outside scan_root has no such
+      # name (`../x` is sanitized away by rsync and would join outside the
+      # destination in the python tier, issue #113), so it is mirrored under
+      # dest by absolute path and copied from its own parent directory.
+      if ! parent="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)"; then
+        say "${RED}$X cannot access file target${RESET}: $f"
+        exit 2
+      fi
+      base="$(basename "$f")"
+      abs="$parent/$base"
+      if [[ "$abs" == "$scan_root"/* ]]; then
+        resolved_files+=("${abs#"$scan_root"/}")
+      else
+        if [[ -z "${ext_list_of[$parent]+set}" ]]; then
+          ext_list_of["$parent"]="$TMPDIR_RUN/external_files.${#ext_parents[@]}.0"
+          ext_parents+=("$parent")
+          : > "${ext_list_of[$parent]}"
+        fi
+        printf '%s\0' "$base" >> "${ext_list_of[$parent]}"
+      fi
     fi
   done
 
-  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} )) -eq 0 ]]; then
+  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} + ${#ext_parents[@]} )) -eq 0 ]]; then
     say "${RED}$X no valid scan targets specified${RESET}"
     exit 2
   fi
@@ -3373,7 +3509,7 @@ prepare_files_workspace(){
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
 
-  say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved_files[@]} file(s) and ${#dir_src[@]} directory target(s)${RESET}"
+  say "${BLUE}${INFO} Preparing shadow workspace for $(( ${#resolved_files[@]} + ${#ext_parents[@]} )) file(s) and ${#dir_src[@]} directory target(s)${RESET}"
 
   if [[ ${#resolved_files[@]} -gt 0 ]]; then
     local file_list="$TMPDIR_RUN/explicit_files.0"
@@ -3382,6 +3518,20 @@ prepare_files_workspace(){
       say "${RED}$X Failed to prepare files workspace${RESET}"
       exit 1
     fi
+  fi
+
+  if [[ ${#ext_parents[@]} -gt 0 ]]; then
+    # One copy per external parent directory, each named by basenames only, so
+    # every destination stays under dest (mirrored at dest/<abs path minus />).
+    local ep
+    for ep in "${ext_parents[@]}"; do
+      ensure_dir "$dest/${ep#/}"
+      if ! copy_file_list "$ep" "${ext_list_of[$ep]}" "$dest/${ep#/}" "external file target"; then
+        say "${RED}$X Failed to copy external file target${RESET}: $ep"
+        exit 1
+      fi
+      record_workspace_mirror "$dest/${ep#/}" "$ep"
+    done
   fi
 
   if [[ ${#dir_src[@]} -gt 0 ]]; then
@@ -3399,6 +3549,9 @@ prepare_files_workspace(){
       if [[ -s "$dir_list" ]] && ! copy_file_list "${dir_src[$i]}" "$dir_list" "$dest/${dir_rel[$i]}" "directory target"; then
         say "${RED}$X Failed to copy directory target${RESET}: ${dir_src[$i]}"
         exit 1
+      fi
+      if [[ "${dir_ext[$i]}" -eq 1 ]]; then
+        record_workspace_mirror "$dest/${dir_rel[$i]}" "${dir_src[$i]}"
       fi
     done
   fi
@@ -4262,6 +4415,15 @@ PY
   esac
 }
 
+# Record that <workspace path> holds the copy of <real path>, for targets that
+# live outside the project and are therefore mirrored under the workspace by
+# absolute path. Without this, the blanket workspace->project rewrite below
+# would report them under a project-relative path that does not exist.
+record_workspace_mirror(){
+  [[ -n "$WORKSPACE_MIRROR_MAP" ]] || WORKSPACE_MIRROR_MAP="$TMPDIR_RUN/workspace_mirror_map.0"
+  printf '%s\0%s\0' "$1" "$2" >> "$WORKSPACE_MIRROR_MAP"
+}
+
 restore_original_paths(){
   local file="$1"
   [[ -f "$file" ]] || return 0
@@ -4271,15 +4433,28 @@ restore_original_paths(){
   fi
   [[ -n "$FILTERED_PROJECT_DIR" ]] || return 0
   if ! need_cmd python3; then return 0; fi
-  python3 - "$FILTERED_PROJECT_DIR" "$SOURCE_PROJECT_DIR" "$file" <<'PY' 2>/dev/null || true
+  python3 - "$FILTERED_PROJECT_DIR" "$SOURCE_PROJECT_DIR" "$file" "$WORKSPACE_MIRROR_MAP" <<'PY' 2>/dev/null || true
 import sys, pathlib
 src = sys.argv[1]
 dst = sys.argv[2]
 path = pathlib.Path(sys.argv[3])
+mirror_map = sys.argv[4]
 try:
     data = path.read_text()
 except OSError:
     sys.exit(0)
+pairs = []
+if mirror_map:
+    try:
+        fields = pathlib.Path(mirror_map).read_text(errors="replace").split("\0")
+    except OSError:
+        fields = []
+    pairs = [(fields[i], fields[i + 1])
+             for i in range(0, len(fields) - 1, 2) if fields[i]]
+    # Longest workspace path first, so a nested mirror wins over its parent.
+    pairs.sort(key=lambda kv: len(kv[0]), reverse=True)
+for workspace_path, real_path in pairs:
+    data = data.replace(workspace_path, real_path)
 path.write_text(data.replace(src, dst))
 PY
 }
@@ -6135,6 +6310,40 @@ def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
     return "".join(out)
 
 
+_MIRROR_PAIRS = None
+
+
+def mirror_pairs(a):
+    """(workspace path, real path) pairs for targets mirrored from outside."""
+    global _MIRROR_PAIRS
+    if _MIRROR_PAIRS is None:
+        pairs = []
+        if a.mirror_map and os.path.isfile(a.mirror_map):
+            fields = Path(a.mirror_map).read_text(
+                encoding="utf-8", errors="replace").split("\0")
+            pairs = [(fields[i], fields[i + 1])
+                     for i in range(0, len(fields) - 1, 2) if fields[i]]
+            # Longest workspace path first, so a nested mirror wins over its parent.
+            pairs.sort(key=lambda kv: len(kv[0]), reverse=True)
+        _MIRROR_PAIRS = pairs
+    return _MIRROR_PAIRS
+
+
+def restore_workspace(text: str, a) -> str:
+    """Rewrite workspace paths back to the paths the user actually named.
+
+    Targets outside the project are mirrored under the workspace by absolute
+    path, so those prefixes have to be rewritten before the blanket
+    workspace -> project substitution claims them and reports a path that does
+    not exist.
+    """
+    for workspace_path, real_path in mirror_pairs(a):
+        text = text.replace(workspace_path, real_path)
+    if a.workspace:
+        text = text.replace(a.workspace, a.source)
+    return text
+
+
 def restore_text(text: str, a) -> str:
     if a.single_file:
         base = os.path.basename(a.single_file)
@@ -6143,9 +6352,7 @@ def restore_text(text: str, a) -> str:
             text = re.sub(r"(?<![\w/.\-])" + re.escape(base) + r"(?=:\d)", rel, text)
             text = text.replace(a.single_file, rel)
         return text
-    if a.workspace:
-        text = text.replace(a.workspace, a.source)
-    return text
+    return restore_workspace(text, a)
 
 
 def restore_json_doc(doc, a):
@@ -6183,8 +6390,9 @@ def restore_json_file(path: str, a):
         doc = restore_json_doc(doc, a)
         Path(path).write_text(json.dumps(doc), encoding="utf-8")
         return doc
-    if a.workspace and a.workspace in text:
-        text = text.replace(a.workspace, a.source)
+    restored = restore_workspace(text, a)
+    if restored != text:
+        text = restored
         Path(path).write_text(text, encoding="utf-8")
     try:
         return json.loads(text)
@@ -6285,7 +6493,7 @@ def is_summary(doc) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress", "blob_base", "toplevel", "helpers_dir"):
+    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress", "blob_base", "toplevel", "helpers_dir", "mirror_map"):
         ap.add_argument("--" + name.replace("_", "-"), default="")
     a = ap.parse_args()
     if a.mode == "text":
@@ -6335,7 +6543,8 @@ postprocess_module(){
     --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "$ws" \
     --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
     --no-suppress "$no_suppress" --blob-base "${GIT_BLOB_BASE:-}" --toplevel "${GIT_TOPLEVEL:-}" \
-    --helpers-dir "${UBS_HELPERS_DIR:-$(dirname "${BASH_SOURCE[0]}")/modules/helpers}"
+    --helpers-dir "${UBS_HELPERS_DIR:-$(dirname "${BASH_SOURCE[0]}")/modules/helpers}" \
+    --mirror-map "$WORKSPACE_MIRROR_MAP"
 }
 
 # Text-mode partial marker (bead D10). A module that could not evaluate part of

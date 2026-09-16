@@ -1233,23 +1233,64 @@ class RunManifestExpectationTest(unittest.TestCase):
 
         self.assertIsNone(summary)
 
-    def test_parse_toon_summary_sums_scanner_totals(self) -> None:
+    # The fixtures below are shaped like real toon_rust output: a `scanners[N]:`
+    # array of `- key: value` entries carrying their own per-language counts,
+    # then the authoritative top-level `totals:` mapping.
+    @staticmethod
+    def _toon_document(scanners: list[dict[str, int]], totals: dict[str, int]) -> str:
+        lines = ["project: fixture", "status: ok", "failed_modules[0]:",
+                 f"scanners[{len(scanners)}]:"]
+        for scanner in scanners:
+            lines.append(f"  - language: {scanner['language']}")
+            for key in ("files", "critical", "warning", "info"):
+                lines.append(f"    {key}: {scanner[key]}")
+            lines.append("    findings[0]:")
+        lines.append("totals:")
+        for key in ("files", "critical", "warning", "info"):
+            lines.append(f"  {key}: {totals[key]}")
+        return "\n".join(lines)
+
+    def test_parse_toon_summary_reads_totals_block_once(self) -> None:
+        stdout = self._toon_document(
+            [{"language": "js", "files": 1, "critical": 2, "warning": 3, "info": 4}],
+            {"files": 1, "critical": 2, "warning": 3, "info": 4},
+        )
+
+        summary = rule_quality_harness.parse_toon_summary(stdout, "fixture")
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["totals"],
+            {"files": 1, "critical": 2, "warning": 3, "info": 4},
+        )
+
+    def test_parse_toon_summary_ignores_per_scanner_fields(self) -> None:
+        stdout = self._toon_document(
+            [
+                {"language": "js", "files": 1, "critical": 1, "warning": 2, "info": 3},
+                {"language": "rust", "files": 2, "critical": 5, "warning": 6, "info": 7},
+            ],
+            {"files": 3, "critical": 6, "warning": 8, "info": 10},
+        )
+
+        summary = rule_quality_harness.parse_toon_summary(stdout, "fixture")
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["totals"],
+            {"files": 3, "critical": 6, "warning": 8, "info": 10},
+        )
+
+    def test_parse_toon_summary_ignores_nested_totals_fields(self) -> None:
         stdout = "\n".join(
             [
-                "scanners[",
-                "  scanner: js",
-                "  critical: 1",
-                "  warning: 2",
-                "  info: 3",
-                "  files: 4",
-                "  scanner: rust",
-                "  critical: 5",
-                "  warning: 6",
-                "  info: 7",
-                "  files: 8",
-                "]",
-                "findings[",
-                "]",
+                self._toon_document(
+                    [{"language": "js", "files": 1, "critical": 0, "warning": 0, "info": 0}],
+                    {"files": 1, "critical": 0, "warning": 0, "info": 0},
+                ),
+                "  breakdown:",
+                "    critical: 99",
+                "    files: 99",
             ]
         )
 
@@ -1258,8 +1299,36 @@ class RunManifestExpectationTest(unittest.TestCase):
         self.assertIsNotNone(summary)
         self.assertEqual(
             summary["totals"],
-            {"critical": 6, "warning": 8, "info": 10, "files": 12},
+            {"files": 1, "critical": 0, "warning": 0, "info": 0},
         )
+
+    def test_parse_toon_summary_all_zero_totals_are_reported(self) -> None:
+        stdout = self._toon_document(
+            [{"language": "js", "files": 0, "critical": 0, "warning": 0, "info": 0}],
+            {"files": 0, "critical": 0, "warning": 0, "info": 0},
+        )
+
+        summary = rule_quality_harness.parse_toon_summary(stdout, "fixture")
+
+        self.assertIsNotNone(summary)
+        self.assertEqual(
+            summary["totals"],
+            {"files": 0, "critical": 0, "warning": 0, "info": 0},
+        )
+
+    def test_parse_toon_summary_without_totals_block_is_unparseable(self) -> None:
+        stdout = "\n".join(
+            [
+                "project: fixture",
+                "scanners[1]:",
+                "  - language: js",
+                "    files: 1",
+                "    critical: 2",
+                "    findings[0]:",
+            ]
+        )
+
+        self.assertIsNone(rule_quality_harness.parse_toon_summary(stdout, "fixture"))
 
     def test_parse_meta_runner_text_summary(self) -> None:
         summary = rule_quality_harness.parse_text_summary(

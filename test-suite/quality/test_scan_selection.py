@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Regression tests for which files a scan selects and stages.
 
-Issue #114: the ignore spec had three readers. ``ignore_globs_for_rg`` turned
+Issue #114: the ignore spec had four readers. ``ignore_globs_for_rg`` turned
 ``/ignored/**`` into the ripgrep glob ``!ignored/**``, but the no-rg directory
-walk and the git shadow-list filter tested the raw pattern with ``fnmatch``
-against a relative path, where a leading slash can never match. A root-anchored
-exclude therefore applied on hosts with ripgrep and silently did nothing on
-hosts without it. All three now share the generated ``ubs_ignore`` matcher,
-whose contract is "mean exactly what the rg glob means".
+walk, the git shadow-list filter and the size guard's directory walk each
+tested the raw pattern with ``fnmatch`` against a relative path, where a
+leading slash can never match. A root-anchored exclude therefore applied on
+hosts with ripgrep and silently did nothing on hosts without it, and the size
+guard counted bytes the scan would not read. All four now share the generated
+``ubs_ignore`` matcher, whose contract is "mean exactly what the rg glob
+means".
 
 Issue #113: a regular-file target outside the scan root kept its absolute or
 ``../`` spelling in the NUL-delimited list handed to ``copy_file_list``, whose
@@ -137,6 +139,9 @@ class IgnoreMatcherParityTest(unittest.TestCase):
         "deep/**", "**/ignored/**", "/keep.py", "*.py", "nested",
         "dir.with.dots", "/a/b/c.py", "**/deeper", "ignored/bad.py",
         "", "a,b",
+        # Bracket expressions, including the two spellings where a `]` directly
+        # after `[` or `[!` is a member rather than the terminator.
+        "[a-z]*.py", "keep[.]py", "[!k]eep.py", "[]]", "[!]]",
     )
 
     @classmethod
@@ -210,9 +215,12 @@ class IgnoreMatcherParityTest(unittest.TestCase):
             self.assertFalse(matcher.excluded(rel))
 
     def test_degenerate_patterns_do_not_raise(self) -> None:
-        # rg itself rejects the empty glob these produce, so they are checked
-        # for "does not blow up and does not swallow the tree" only.
-        for spec in ("/", ",", ",,", "["):
+        # rg refuses these outright — an empty glob, or an unclosed character
+        # class ("error parsing glob") — so there is no selection to compare
+        # against and they are checked only for "does not blow up and does not
+        # swallow the tree". An ignore pattern that cannot be translated must
+        # never abort a scan, which an uncompilable regex previously did.
+        for spec in ("/", ",", ",,", "[", "a[b", "[a-", "[]", "[!"):
             with self.subTest(spec=spec):
                 matcher = self.ubs_ignore.IgnoreMatcher(spec)
                 self.assertFalse(matcher.excluded("keep.py"))
@@ -360,3 +368,51 @@ class ExternalTargetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SizeGuardExcludeTest(unittest.TestCase):
+    """The size guard must measure what the scan will actually select.
+
+    `dir_size_mb_filtered` is the fourth reader of the ignore spec, behind the
+    two listing paths and the git filter. It had the same fnmatch mismatch, so
+    a root-anchored exclude left the excluded bytes in the total and a project
+    could be refused as "directory too large" over a directory the user had
+    excluded (issue #114).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="ubs-size-guard-")
+        self.root = Path(self._tmp.name) / "project"
+        (self.root / "ignored").mkdir(parents=True)
+        (self.root / "nested" / "ignored").mkdir(parents=True)
+        (self.root / "keep.py").write_text("x = 1\n", encoding="utf-8")
+        (self.root / "nested" / "ignored" / "keep.py").write_text("y = 2\n", encoding="utf-8")
+        # Large enough that including or excluding it is unambiguous in whole MB.
+        (self.root / "ignored" / "big.py").write_text("x = 1\n" * 900_000, encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def measure(self, spec: str) -> int:
+        script = "".join([
+            "set -uo pipefail\nTMPDIR_RUN=\nIGNORE_MATCHER_DIR=\nEARLY_TMP_PATHS=()\n",
+            bash_function("ensure_tmpdir_run"),
+            bash_function("need_cmd"),
+            bash_function("ensure_ignore_matcher"),
+            bash_function("dir_size_mb_filtered"),
+            f'\ndir_size_mb_filtered "{self.root}" "{spec}"\n',
+        ])
+        out = run_helper(["bash", "-c", script], check=True, text=True).stdout
+        return int(out.strip().splitlines()[-1])
+
+    def test_root_anchored_exclude_removes_those_bytes_from_the_total(self) -> None:
+        unfiltered = self.measure("")
+        self.assertGreaterEqual(unfiltered, 5,
+                                "fixture should be large enough to measure")
+        # `/ignored/**` is root-anchored: the big file goes, the same-named
+        # directory one level down stays (and is tiny either way).
+        self.assertLess(self.measure("/ignored/**"), unfiltered - 4)
+        # A bare name excludes that component at any depth.
+        self.assertLess(self.measure("ignored"), unfiltered - 4)
+        # An unrelated exclude must not remove the big file.
+        self.assertGreaterEqual(self.measure("/nested/**"), unfiltered - 1)

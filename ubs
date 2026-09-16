@@ -2451,24 +2451,24 @@ dir_size_mb_filtered(){
     fi
   fi
   if need_cmd python3; then
-    python3 - "$dir" "$patterns_csv" <<'PY'
-import fnmatch
+    ensure_ignore_matcher
+    UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 - "$dir" "$patterns_csv" <<'PY'
 import os
 import pathlib
 import sys
 
+sys.path.insert(0, os.environ["UBS_IGNORE_MATCHER_DIR"])
+from ubs_ignore import IgnoreMatcher
+
 root = pathlib.Path(sys.argv[1]).resolve()
 patterns_csv = sys.argv[2] if len(sys.argv) > 2 else ""
-patterns = [p for p in patterns_csv.split(",") if p]
+# The size guard has to measure what the scan will select: counting bytes the
+# ignore spec removes can refuse a project for a directory the user excluded.
+# Same matcher as the listing paths (issue #114).
+ignore_matcher = IgnoreMatcher(patterns_csv)
 
-def excluded(rel_path, name):
-    for pat in patterns:
-        if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(name, pat):
-            return True
-        for part in pathlib.Path(rel_path).parts:
-            if fnmatch.fnmatch(part, pat):
-                return True
-    return False
+def excluded(rel_path):
+    return ignore_matcher.excluded(str(rel_path).replace(os.sep, "/"))
 
 total = 0
 for base, dirs, files in os.walk(root, topdown=True):
@@ -2476,14 +2476,14 @@ for base, dirs, files in os.walk(root, topdown=True):
     pruned = []
     for d in dirs:
         rel = os.path.join(rel_root, d) if rel_root != "." else d
-        if excluded(rel, d):
+        if excluded(rel):
             continue
         pruned.append(d)
     dirs[:] = pruned
 
     for f in files:
         rel = os.path.join(rel_root, f) if rel_root != "." else f
-        if excluded(rel, f):
+        if excluded(rel):
             continue
         try:
             total += (pathlib.Path(base) / f).stat().st_size
@@ -2566,8 +2566,33 @@ def rg_glob(pattern):
     return pattern
 
 
-def glob_to_regex(glob):
-    """Translate one glob to regex source, with `*` stopping at `/`."""
+def bracket_expression(glob, index):
+    """Translate the bracket expression starting at `index`.
+
+    Returns (regex source, index after it), or (None, index) when the `[` does
+    not open a complete expression and is therefore a literal. A `]` directly
+    after `[` or `[!` is a member, not the terminator, per glob semantics.
+    """
+    end = len(glob)
+    cursor = index + 1
+    negated = cursor < end and glob[cursor] in "!^"
+    if negated:
+        cursor += 1
+    if cursor < end and glob[cursor] == "]":
+        cursor += 1
+    close = glob.find("]", cursor)
+    if close == -1:
+        return None, index
+    members = glob[index + 1:close]
+    if negated:
+        members = members[1:]
+    # Python's character class needs these escaped even where a glob treats
+    # them as ordinary members; ranges (`a-z`) survive untouched.
+    members = members.replace("\\", "\\\\").replace("]", "\\]").replace("^", "\\^")
+    return "[" + ("^" if negated else "") + members + "]", close + 1
+
+
+def translate_glob(glob):
     out = []
     index, end = 0, len(glob)
     while index < end:
@@ -2588,18 +2613,31 @@ def glob_to_regex(glob):
             out.append("[^/]")
             index += 1
         elif char == "[":
-            close = glob.find("]", index + 1)
-            if close == -1:
+            source, index_after = bracket_expression(glob, index)
+            if source is None:
                 out.append(re.escape(char))
                 index += 1
             else:
-                body = glob[index + 1:close]
-                out.append("[" + ("^" + body[1:] if body.startswith("!") else body) + "]")
-                index = close + 1
+                out.append(source)
+                index = index_after
         else:
             out.append(re.escape(char))
             index += 1
     return "".join(out)
+
+
+def glob_to_regex(glob):
+    """Translate one glob to regex source, with `*` stopping at `/`.
+
+    An ignore pattern must never be able to abort a scan, so a translation that
+    does not compile falls back to matching the pattern literally.
+    """
+    source = translate_glob(glob)
+    try:
+        re.compile(source)
+    except re.error:
+        source = re.escape(glob)
+    return source
 
 
 class IgnoreMatcher:
@@ -2624,7 +2662,9 @@ class IgnoreMatcher:
     def _compile(sources, tail=""):
         if not sources:
             return None
-        return re.compile("(?:" + "|".join(sources) + ")" + tail + r"\Z")
+        # DOTALL because a path component may legally contain a newline, and
+        # `**` (translated to `.*`) has to cross it the way rg's glob does.
+        return re.compile("(?:" + "|".join(sources) + ")" + tail + r"\Z", re.DOTALL)
 
     def excluded(self, rel):
         if self.path_re is not None and self.path_re.match(rel):
@@ -3426,6 +3466,7 @@ prepare_files_workspace(){
   # so neither an absolute target nor a `..` segment can escape the workspace.
   local resolved_files=() dir_src=() dir_rel=() dir_ext=() ext_parents=()
   local -A ext_list_of=()
+  local ext_file_count=0
   local f rel abs parent base
   for f in "${SCAN_FILES[@]}"; do
     [[ -z "$f" ]] && continue
@@ -3496,11 +3537,12 @@ prepare_files_workspace(){
           : > "${ext_list_of[$parent]}"
         fi
         printf '%s\0' "$base" >> "${ext_list_of[$parent]}"
+        ext_file_count=$(( ext_file_count + 1 ))
       fi
     fi
   done
 
-  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} + ${#ext_parents[@]} )) -eq 0 ]]; then
+  if [[ $(( ${#resolved_files[@]} + ${#dir_src[@]} + ext_file_count )) -eq 0 ]]; then
     say "${RED}$X no valid scan targets specified${RESET}"
     exit 2
   fi
@@ -3509,7 +3551,7 @@ prepare_files_workspace(){
   rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
 
-  say "${BLUE}${INFO} Preparing shadow workspace for $(( ${#resolved_files[@]} + ${#ext_parents[@]} )) file(s) and ${#dir_src[@]} directory target(s)${RESET}"
+  say "${BLUE}${INFO} Preparing shadow workspace for $(( ${#resolved_files[@]} + ext_file_count )) file(s) and ${#dir_src[@]} directory target(s)${RESET}"
 
   if [[ ${#resolved_files[@]} -gt 0 ]]; then
     local file_list="$TMPDIR_RUN/explicit_files.0"

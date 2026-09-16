@@ -10,6 +10,9 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+## [v5.4.3] - 2026-09-16 [Tag]
+
+- Restrict Rust `Rc<RefCell>` findings to executable source, excluding documentation, comments, and string literals while preserving live-code findings and exact rule-scoped suppressions.
 - Select Python JSON previews in stable source order before applying the sample cap, so file discovery, parallel work and cache replay preserve the displayed finding sites.
 - Preserve finding paths, source locations, and rule-scoped suppressions when merging AST and pattern reports. Restore 14 Rust diagnostics lost during grouped-report conversion, with exact source-site regression coverage.
 - Recompute Python thresholds, suppression, and project conditions from cached raw matches for the selected files. Missing-return findings select stable source sites regardless of file discovery order. Swift cache replay also recomputes project conditions after file selections or contents change.

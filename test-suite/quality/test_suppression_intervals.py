@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -29,7 +31,8 @@ from ubs_core.rust_detectors import (  # noqa: E402
     security_randomness, sql_injection, tls_indirect,
 )
 from ubs_core.suppression import (  # noqa: E402
-    SourceSuppressions, build_index, has_suppression_marker, may_have_markers, parse_markers,
+    Interval, Marker, SourceSuppressions, SuppressionIndex, build_index,
+    has_suppression_marker, may_have_markers, parse_markers,
 )
 
 # Line numbers are load-bearing in the assertions below; count carefully.
@@ -70,6 +73,98 @@ def string_not_marker(event):
     doc = "never write ubs:ignore in strings"
     os.system(event["cmd"])
 '''
+
+
+class SuppressionLookupScalingTests(unittest.TestCase):
+    @staticmethod
+    def reference(index: SuppressionIndex, line: int, rule: str) -> bool:
+        # Deliberately retain the pre-index algorithm as a differential oracle.
+        matches = [item for item in index.intervals if item.start_line <= line <= item.end_line]
+        interval = min(matches, key=lambda item: item.end_line - item.start_line, default=None)
+        statement = interval if interval in index.statements else None
+        return any(
+            (marker.rules is None or rule in marker.rules) and (
+                marker.line == line
+                or (statement is not None and statement.contains(marker.line))
+                or (marker.line in index.formatter_headers
+                    and index.formatter_headers[marker.line].contains(line))
+                or (marker.standalone and interval is not None and (
+                    marker.line == interval.start_line - 1
+                    or (marker.line == line + 1 and any(
+                        block.start_line == line and block.contains(marker.line)
+                        and block not in index.statements for block in index.intervals
+                    ))
+                ))
+            ) for marker in index.markers
+        )
+
+    def test_randomized_overlaps_match_original_suppression(self) -> None:
+        rng = random.Random(477)
+        for _ in range(100):
+            intervals = [Interval(rng.randrange(-2, 35), rng.randrange(-2, 35)) for _ in range(40)]
+            # Equal values must count as statements even when identities differ.
+            statements = [Interval(item.start_line, item.end_line) for item in intervals[::3]]
+            markers = [Marker(rng.randrange(-3, 38), rng.choice([None, frozenset({"a"})]),
+                              rng.choice([True, False])) for _ in range(10)]
+            index = SuppressionIndex(intervals, markers, statements, {4: Interval(1, 3)})
+            expected = {(line, rule): self.reference(index, line, rule)
+                        for line in range(-4, 40) for rule in ("a", "b")}
+            index._finalize()
+            for (line, rule), suppressed in expected.items():
+                self.assertEqual(index.is_suppressed(line, rule), suppressed, (line, rule))
+
+    def test_equal_span_ties_boundaries_and_large_gaps(self) -> None:
+        first, second = Interval(4, 8), Interval(2, 6)
+        remote = Interval(10**12, 10**12 + 1)
+        index = SuppressionIndex([first, second, remote, Interval(9, 7)])
+        index._finalize()
+        for line, expected in [(1, None), (2, second), (4, first), (6, first),
+                               (8, first), (9, None), (10**12, remote), (10**12 + 2, None)]:
+            self.assertIs(index._interval_for(line), expected)
+        self.assertLessEqual(len(index._lookup.boundaries), 6)
+        empty = SuppressionIndex()
+        empty._finalize()
+        self.assertIsNone(empty._interval_for(1))
+
+    def test_mutable_indexes_and_replaced_snapshots_use_current_values(self) -> None:
+        index = SuppressionIndex([Interval(1, 8)], [Marker(3, None)])
+        self.assertFalse(index.is_suppressed(4, "a"))
+        index.statements.append(Interval(1, 8))
+        self.assertTrue(index.is_suppressed(4, "a"))
+        index._finalize()
+        index.statements = []
+        self.assertFalse(index.is_suppressed(4, "a"))
+        index._finalize()
+        index.intervals = [Interval(4, 4)]
+        self.assertEqual(index._interval_for(4), Interval(4, 4))
+        self.assertIsNone(index._interval_for(3))
+
+    def test_large_parsed_source_does_not_scan_intervals_per_finding(self) -> None:
+        source = "fn run() {\n// ubs:ignore[other.rule]\n" + "call();\n" * 20000 + "}\n"
+        index = build_index(source, lang="rust")
+        calls = 0
+        comparisons = 0
+        original = Interval.contains
+        original_eq = Interval.__eq__
+
+        def count_contains(interval: Interval, line: int) -> bool:
+            nonlocal calls
+            calls += 1
+            return original(interval, line)
+
+        def count_comparisons(interval: Interval, other: object) -> bool:
+            nonlocal comparisons
+            comparisons += 1
+            return original_eq(interval, other)
+
+        with (patch.object(Interval, "contains", count_contains),
+              patch.object(Interval, "__eq__", count_comparisons)):
+            for line in range(3, 20003):
+                self.assertFalse(index.is_suppressed(line, "public.rule"))
+        self.assertEqual(calls, 0)
+        self.assertLessEqual(comparisons, 20000)
+        self.assertTrue(index.is_suppressed(1, "other.rule"))
+        self.assertFalse(index.is_suppressed(20002, "other.rule"))
 
 
 class PythonSuppressionTests(unittest.TestCase):

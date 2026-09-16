@@ -10,6 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+## [v5.4.4] - 2026-09-16 [Tag]
+
+- Index suppression intervals once instead of rescanning every statement for each finding. Preserve shortest-span selection, original tie order, rule scopes, formatter markers, and mutable-index behavior. On the same frozen CASS `src/lib.rs`, one sequential remote comparison took 196.853 seconds with v5.4.3 and 65.014 seconds with this change (3.03× observed); all 10,341 finding records were byte-identical. This single comparison is not a general performance guarantee.
+- Add differential coverage for overlapping and duplicate intervals, boundaries, empty indexes, and mutation fallback, plus deterministic operation-count coverage on 20,000 statements.
+
+---
+
+## [v5.4.3] - 2026-09-16 [Tag]
+
+- Restrict Rust `Rc<RefCell>` findings to executable source, excluding documentation, comments, and string literals while preserving live-code findings and exact rule-scoped suppressions.
 - Select Python JSON previews in stable source order before applying the sample cap, so file discovery, parallel work and cache replay preserve the displayed finding sites.
 - Preserve finding paths, source locations, and rule-scoped suppressions when merging AST and pattern reports. Restore 14 Rust diagnostics lost during grouped-report conversion, with exact source-site regression coverage.
 - Recompute Python thresholds, suppression, and project conditions from cached raw matches for the selected files. Missing-return findings select stable source sites regardless of file discovery order. Swift cache replay also recomputes project conditions after file selections or contents change.

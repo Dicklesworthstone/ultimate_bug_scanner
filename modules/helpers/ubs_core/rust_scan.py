@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.suppression import SourceSuppressions
 
 # Meta-runner category_slug_for rust (ubs ~4961) and the module's
@@ -1066,6 +1067,14 @@ def cat_3(scan: Scan, r: Renderer) -> None:
         r.finding("info", len(arc), "Arc<Mutex<..>> detected - verify contention")
         scan.emit("rust.async.arc-mutex", 3, "info", len(arc), "Arc<Mutex<..>> detected - verify contention", arc)
     rc = scan.rg_lines(r"Rc<\s*RefCell<", rule_id="rust.async.rc-refcell")
+    # Documentation and string literals describe types without instantiating
+    # them. Mask whole sources so multiline comments/raw strings cannot leak
+    # into this type-use check; retain original locations and finding text.
+    rc_code = {
+        path: strip_comments_and_strings(scan.texts[Path(path)], lang="rust").splitlines()
+        for path in {hit.path for hit in rc}
+    }
+    rc = [hit for hit in rc if re.search(r"Rc<\s*RefCell<", rc_code[hit.path][hit.line - 1])]
     if rc:
         r.finding("warning", len(rc), "Rc<RefCell<..>> borrow panics possible")
         scan.emit("rust.async.rc-refcell", 3, "warning", len(rc), "Rc<RefCell<..>> borrow panics possible", rc)

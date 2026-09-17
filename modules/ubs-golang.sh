@@ -256,7 +256,7 @@ if [[ -n "${OUTPUT_FILE}" && "$FORMAT" == "text" ]]; then exec > >(tee "${OUTPUT
 
 list_generated_ast_rule_ids() {
   local rules_dir="$1"
-  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rules_dir"/*.yml 2>/dev/null || true ) | sort -u
+  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$rules_dir"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
 }
 
 if [[ "$LIST_RULES" -eq 1 ]]; then

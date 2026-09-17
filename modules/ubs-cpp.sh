@@ -260,7 +260,7 @@ PYRULES
     cp -- "$tmp_rules/manifest.json" "$DUMP_RULES_DIR/" || exit 2
   fi
   if [[ "${LIST_RULES:-0}" -eq 1 ]]; then
-    ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | sort -u
+    ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
   fi
   rm -rf "$tmp_rules" 2>/dev/null || true
   exit 0

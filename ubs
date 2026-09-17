@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='8959c58a6f6937e31a7dfac297841c25af8df42bc949e8ee88a67223bb398cf9'
-  [cpp]='d73194849b208ca055d81f2ec5731dc53ab0696a5a279f22236621008ef3af38'
-  [csharp]='50fb6caa82a93a7b4fc375d739d5eadd4858029a55a92ec8fe045fb150c06ce8'
-  [elixir]='504303ca1d948c2ca0905e9efb66fc161676fe0ec5b2b78b8f9a36d795756348'
-  [golang]='e159913dfb73bda4a6801a2bf61be61165e22ccd9af876b1b2e44a0c779d3013'
-  [java]='ce0c7bdb8677d55541f0781e8b834fea7a81697ad9dd498d4b46343f9baa2d33'
-  [js]='a880f0a7bcb8daf004d7870f84e0a248cd1bb215a29bb43c77d26ed215c8fda4'
+  [bash]='b88dfccc03d0a3c27c9880f62bb8cacfa9338c702029a6f1d1234dde91dcceb5'
+  [cpp]='530fce33e5978623de18004472ec88ff7738c5975743993a7e6d57e07145610a'
+  [csharp]='778b4b9c69202b24784f6de667f54b13b96c50b05f9e34221ce777011baa0244'
+  [elixir]='ef29307e570b865d47aef066958e3a6c4649174e9eb65c7e2b1d956ae868155f'
+  [golang]='17750d9b0e78e876b10edf64142ff48f20110a3cf589d277da932fbca57e1a87'
+  [java]='d35cf31123d816e320a99e8ef1ab4a56d45f89c5be47838df3150a94c3d37e9c'
+  [js]='a95ea4fa51b574c5fa3b7149a6609c485cfd83ae535a318dd4bcced6ca231da4'
   [kotlin]='e8feeb6d24ef31f3b03b52f6644ce866be70d321b628ea1caea2569fa03fa643'
-  [python]='aea82b59bf9b60e10894e467f43ecf56bd39f277fbe3fe027f9f2e8e4b1bb541'
-  [ruby]='098d6bc4c5147e4ea76edab316791a4dad3c51b9f4b9cf1a1aba840241bf49ea'
+  [python]='cab3a9c443ae5d40a33e05f95cff6cfc642ff304f5ef8179491cc4f31284d87d'
+  [ruby]='3e3a7b1f23bd153b690fb9c64357a2e7dd691eef11b90b8ebedf77fb172bb3e5'
   [rust]='70cc497fb712b34986db337f4e9edcfeb9b33bbd650b5b4dae019d4212486a68'
-  [swift]='ea9f37bd00e2889e7e63e873d1507db9cfbf74214acb7f895ac43b47b086f332'
+  [swift]='c5fb78a8bc756ba427f926b03e17281981014b1571804a1c2aba1531a159d98f'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).

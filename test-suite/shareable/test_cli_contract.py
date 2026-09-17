@@ -1806,6 +1806,19 @@ def test_module_garbage_output_yields_error_envelope() -> None:
                     names.add(str(entry["language"]))
             return names
 
+        def scraped_counts_leaked(doc: dict) -> bool:
+            # The mock prints "Critical issues: 42 ... Warning issues: 99". The
+            # contract is that those numbers never become counts, so check the
+            # counts. Scanning the raw text for the digits instead made this
+            # fail whenever the git commit SHA embedded in the envelope happened
+            # to contain "42" or "99" — a hex SHA does, roughly one commit in
+            # four, which read as a flake but was deterministic per commit.
+            buckets = [doc.get("totals") or {}]
+            buckets.extend(s for s in (doc.get("scanners") or []) if isinstance(s, dict))
+            return any(
+                b.get("critical") == 42 or b.get("warning") == 99 for b in buckets
+            )
+
         try:
             doc_json = json.loads(proc_json.stdout)
             json_ok = (
@@ -1814,8 +1827,7 @@ def test_module_garbage_output_yields_error_envelope() -> None:
                 and doc_json.get("status") == "error"
                 and doc_json.get("reason") == "module-failed"
                 and "python" in named_modules(doc_json)
-                and "42" not in proc_json.stdout
-                and "99" not in proc_json.stdout
+                and not scraped_counts_leaked(doc_json)
             )
         except Exception:
             json_ok = False
@@ -1825,13 +1837,16 @@ def test_module_garbage_output_yields_error_envelope() -> None:
         sarif_ok = False
         try:
             sarif_doc = json.loads(proc_sarif.stdout)
-            inv = sarif_doc.get("runs", [{}])[0].get("invocations", [{}])[0]
+            run0 = sarif_doc.get("runs", [{}])[0]
+            inv = run0.get("invocations", [{}])[0]
+            # A failed module scrapes no findings, so the run carries none.
+            # Asserting on the results is the contract; asserting the digits
+            # are absent from the text tripped over the commit SHA (see above).
             sarif_ok = (
                 proc_sarif.returncode == 2
                 and inv.get("executionSuccessful") is False
                 and inv.get("exitCode") == 2
-                and "42" not in proc_sarif.stdout
-                and "99" not in proc_sarif.stdout
+                and not (run0.get("results") or [])
             )
         except Exception:
             sarif_ok = False

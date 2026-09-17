@@ -1389,7 +1389,34 @@ def test_findings_parity_all_langs() -> None:
         last_proc = pjl
         jl_lines = [parse_json_document(line) for line in pjl.stdout.splitlines() if line.strip()]
         jl_findings = [line for line in jl_lines if line.get("type") == "finding"]
-        if pjl.returncode != pj.returncode or len(jl_findings) != expected_count:
+        # Two independent conditions, reported separately. Folding them into
+        # one message printed "JSONL finding count 619 != expected 619" when
+        # the counts agreed and it was the exit codes that differed, which
+        # sends the reader to the renderer instead of to the scan.
+        #
+        # This check renders each format from its own scan, so a scan that
+        # fails outright (exit 2 = module/tooling error, seen under heavy
+        # load) shows up here as a format disagreement. Name it for what it
+        # is: 0 and 1 are normal completions, anything else is a run that did
+        # not finish, which is not evidence about the renderers at all.
+        incomplete = [
+            f"{label} (exit {proc.returncode})"
+            for label, proc in (("JSON", pj), ("JSONL", pjl))
+            if proc.returncode not in (0, 1)
+        ]
+        if incomplete:
+            failures.append(
+                f"{lang}: scan did not complete: {', '.join(incomplete)}; "
+                f"this is a failed run, not a format mismatch"
+            )
+            continue
+        if pjl.returncode != pj.returncode:
+            failures.append(
+                f"{lang}: JSONL exit {pjl.returncode} != JSON exit {pj.returncode} "
+                f"(findings agreed at {len(jl_findings)})"
+            )
+            continue
+        if len(jl_findings) != expected_count:
             failures.append(f"{lang}: JSONL finding count {len(jl_findings)} != expected {expected_count}")
             continue
 

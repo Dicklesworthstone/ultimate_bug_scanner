@@ -1410,6 +1410,36 @@ def test_findings_parity_all_langs() -> None:
                 f"this is a failed run, not a format mismatch"
             )
             continue
+
+        # The JSON side is already checked for `status: "ok"` and an empty
+        # `failed_modules` above; the JSONL side was not, so a partial JSONL
+        # scan reached the count comparison and was reported as the two
+        # renderers disagreeing. `ubs` says so itself, and JSONL carries the
+        # same fields on its `totals` line that JSON carries at the top level.
+        #
+        # The rust module times out under cargo-lock contention on a busy
+        # machine, exactly as its own message predicts ("a build tool such as
+        # cargo blocking on a locked target/ directory"). The scan itself is
+        # deterministic: eight consecutive runs gave byte-identical finding
+        # sets every time the module completed.
+        # JSONL carries the same fields on its `totals` line as JSON does at
+        # the top level, so both can be read the same way.
+        jl_totals = next(
+            (line for line in jl_lines if line.get("type") == "totals"),
+            {},
+        )
+        if jl_totals.get("status") != "ok" or jl_totals.get("failed_modules"):
+            failed = ",".join(
+                str(m.get("language"))
+                for m in (jl_totals.get("failed_modules") or [])
+                if isinstance(m, dict)
+            )
+            failures.append(
+                f"{lang}: incomplete JSONL scan "
+                f"(status={jl_totals.get('status')!r}{', failed=' + failed if failed else ''}); "
+                f"a module did not run, so the counts are not comparable"
+            )
+            continue
         if pjl.returncode != pj.returncode:
             failures.append(
                 f"{lang}: JSONL exit {pjl.returncode} != JSON exit {pj.returncode} "

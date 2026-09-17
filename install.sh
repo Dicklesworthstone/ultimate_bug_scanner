@@ -202,6 +202,9 @@ AUTO_UPDATE=0
 INSTALL_DIR=""
 FORCE_REINSTALL=0
 SKIP_VERSION_CHECK=0
+# Set by resolve_release_tag when VERSION was pinned to the newest published
+# release rather than read from a checkout (issue #124).
+RESOLVED_FROM_LATEST_RELEASE=0
 RUN_VERIFICATION=1
 DRY_RUN=0
 RUN_SELF_TEST=0
@@ -1093,12 +1096,38 @@ resolve_release_tag() {
   tag="${effective##*/}"
   if [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
     VERSION="${tag#v}"
+    # This installer is now pinned to the newest published release, which is
+    # a different version line from main's unreleased VERSION. Record that so
+    # check_for_updates does not compare the two (issue #124).
+    RESOLVED_FROM_LATEST_RELEASE=1
   fi
   return 0
 }
 
 check_for_updates() {
   [ "$SKIP_VERSION_CHECK" -eq 1 ] && return 0
+
+  # Issue #124: a streamed installer resolves its VERSION from
+  # releases/latest, so it is by construction already running the newest
+  # published release. The check below compares against main's VERSION, which
+  # is the *unreleased* development version and is routinely ahead of the
+  # newest tag. Comparing the two lines reported a phantom update, and with
+  # --easy-mode auto-accepting the prompt the installer re-exec'd another copy
+  # of main/install.sh, which resolved to the same release and did it again —
+  # forever, with no output and no progress.
+  if [ "$RESOLVED_FROM_LATEST_RELEASE" -eq 1 ]; then
+    success "You have the latest release ($VERSION)"
+    return 0
+  fi
+
+  # Second line of defence, independent of the reasoning above: a self-update
+  # replaces this process with `exec`, so a faulty comparison cannot be
+  # escaped by a depth counter in the script. Carry the sentinel in the
+  # environment instead and allow at most one self-update per chain.
+  if [ -n "${UBS_INSTALLER_SELF_UPDATED:-}" ]; then
+    log "Already re-executed once for a self-update; skipping the version check"
+    return 0
+  fi
 
   local current_version="$VERSION"
   local latest_url="$REPO_URL/VERSION"
@@ -1115,6 +1144,7 @@ check_for_updates() {
       if ask "Update to latest version now?"; then
         log "Re-running installer with latest version..."
         release_lock
+        export UBS_INSTALLER_SELF_UPDATED=1
         if [ "${#ORIGINAL_ARGS[@]}" -gt 0 ]; then
           exec bash <(curl -fsSL "$REPO_URL/install.sh") "${ORIGINAL_ARGS[@]}"
         else

@@ -903,7 +903,133 @@ test_bash_guard_precedes_bash4_syntax() {
   echo "[PASS] bash_guard_precedes_bash4_syntax"
 }
 
+test_streamed_easy_mode_does_not_self_relaunch_forever() {
+  # Issue #124: a streamed installer resolves VERSION from releases/latest,
+  # then compared it against main's VERSION — the unreleased development
+  # version, which is routinely ahead of the newest tag. That reported a
+  # phantom update; --easy-mode auto-accepted it; the installer re-exec'd
+  # another copy of main/install.sh, which resolved to the same release and
+  # did it again. 66 relaunches in 25s, no output, no progress.
+  #
+  # Replayed here with no network: a stub curl serves the latest-release
+  # redirect (v5.4.2), main/VERSION (5.4.4, deliberately ahead) and
+  # main/install.sh (the installer under test, so a self-update really does
+  # re-enter it). `timeout` bounds the run; its exit 124 is the loop.
+  echo "[TEST] streamed_easy_mode_does_not_self_relaunch_forever"
+  local ctx
+  ctx="$(mktemp_dir)"
+  if [ -z "$ctx" ]; then
+    echo "[FAIL] could not create temp dir"
+    tests_failed=1
+    return 1
+  fi
+  tmpdirs+=("$ctx")
+  mkdir -p "$ctx/bin" "$ctx/home"
+  cp "$INSTALLER" "$ctx/installer_under_test.sh"
+
+  cat > "$ctx/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+STUB_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "curl $*" >> "$STUB_DIR/../calls.log"
+url=""; out=""; write_out=""; prev=""
+for arg in "$@"; do
+  case "$prev" in -o) out="$arg" ;; -w) write_out="$arg" ;; esac
+  case "$arg" in http*) url="$arg" ;; esac
+  prev="$arg"
+done
+emit() {
+  if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then printf '%s' "$1" > "$out"
+  else printf '%s' "$1"; fi
+}
+case "$url" in
+  *releases/latest)
+    [ "$write_out" = '%{url_effective}' ] && \
+      printf 'https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.4.2'
+    exit 0 ;;
+  */main/VERSION) emit '5.4.4
+'; exit 0 ;;
+  */main/install.sh) cat "$STUB_DIR/../installer_under_test.sh"; exit 0 ;;
+esac
+exit 22
+STUB
+  chmod +x "$ctx/bin/curl"
+  : > "$ctx/calls.log"
+
+  # Process substitution, like `bash <(curl …)`: no adjacent VERSION file, so
+  # VERSION starts as "main" exactly as it does for a streamed install.
+  #
+  # The UBS_* variables are cleared deliberately. This suite also runs nested,
+  # from `install.sh --self-test`, which means the outer installer's own
+  # environment (its workdir, an artifact-base override) would otherwise leak
+  # in and change which branch of the version check is taken — a version
+  # regression test must not depend on ambient configuration.
+  local rc=0
+  timeout 60 env \
+    -u UBS_ARTIFACT_BASE \
+    -u UBS_INSTALLER_SELF_UPDATED \
+    -u UBS_INSTALLER_WORKDIR \
+    -u UBS_INSTALLER_SELF_TEST \
+    PATH="$ctx/bin:$PATH" \
+    HOME="$ctx/home" \
+    XDG_CONFIG_HOME="$ctx/home/.config" \
+    bash <(cat "$ctx/installer_under_test.sh") --easy-mode \
+    > "$ctx/out.log" 2>&1 || rc=$?
+
+  if [ "$rc" -eq 124 ]; then
+    echo "[FAIL] streamed --easy-mode installer did not terminate (self-relaunch loop; log: $ctx/out.log)"
+    grep -c 'main/install.sh' "$ctx/calls.log" | sed 's/^/        self-relaunches: /'
+    tests_failed=1
+    return 1
+  fi
+
+  local relaunches
+  relaunches="$(grep -c 'main/install.sh' "$ctx/calls.log" || true)"
+  if [ "${relaunches:-0}" -ne 0 ]; then
+    echo "[FAIL] streamed installer re-fetched main/install.sh $relaunches time(s); it is already the newest installer"
+    tests_failed=1
+    return 1
+  fi
+
+  if ! grep -q "You have the latest release" "$ctx/out.log"; then
+    echo "[FAIL] streamed installer did not report itself as the latest release (exit $rc; log: $ctx/out.log)"
+    echo "        --- last 20 lines of installer output ---"
+    tail -n 20 "$ctx/out.log" | sed 's/^/        /'
+    echo "        --- curl calls ---"
+    sed 's/^/        /' "$ctx/calls.log"
+    tests_failed=1
+    return 1
+  fi
+
+  # The self-update path that remains (a checkout older than main) must still
+  # fire, and must fire at most once — the environment sentinel is the guard
+  # that holds even if the version comparison is ever wrong again.
+  mkdir -p "$ctx/checkout" "$ctx/home2"
+  cp "$INSTALLER" "$ctx/checkout/install.sh"
+  printf '5.4.2\n' > "$ctx/checkout/VERSION"
+
+  : > "$ctx/calls.log"
+  rc=0
+  timeout 60 env -u UBS_ARTIFACT_BASE -u UBS_INSTALLER_WORKDIR -u UBS_INSTALLER_SELF_TEST \
+    PATH="$ctx/bin:$PATH" HOME="$ctx/home2" \
+    XDG_CONFIG_HOME="$ctx/home2/.config" UBS_INSTALLER_SELF_UPDATED=1 \
+    bash "$ctx/checkout/install.sh" --easy-mode > "$ctx/out_sentinel.log" 2>&1 || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    echo "[FAIL] installer did not terminate with the self-update sentinel set"
+    tests_failed=1
+    return 1
+  fi
+  relaunches="$(grep -c 'main/install.sh' "$ctx/calls.log" || true)"
+  if [ "${relaunches:-0}" -ne 0 ]; then
+    echo "[FAIL] UBS_INSTALLER_SELF_UPDATED did not suppress a second self-update ($relaunches re-fetch(es))"
+    tests_failed=1
+    return 1
+  fi
+
+  echo "[PASS] streamed_easy_mode_does_not_self_relaunch_forever"
+}
+
 test_bash_guard_precedes_bash4_syntax
+test_streamed_easy_mode_does_not_self_relaunch_forever
 test_basic_smoke
 test_no_alias_written_when_no_path_modify
 test_skip_typos_flag

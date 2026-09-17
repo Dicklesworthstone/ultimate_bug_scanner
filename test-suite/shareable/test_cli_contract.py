@@ -1815,8 +1815,12 @@ def test_module_garbage_output_yields_error_envelope() -> None:
             # four, which read as a flake but was deterministic per commit.
             buckets = [doc.get("totals") or {}]
             buckets.extend(s for s in (doc.get("scanners") or []) if isinstance(s, dict))
+            # Compare as text so a scraped value still counts whether it came
+            # back as 42 or "42" — the point is to catch the leak, not to
+            # assume how a regression would type it.
             return any(
-                b.get("critical") == 42 or b.get("warning") == 99 for b in buckets
+                str(b.get("critical")) == "42" or str(b.get("warning")) == "99"
+                for b in buckets
             )
 
         try:

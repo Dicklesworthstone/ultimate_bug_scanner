@@ -975,15 +975,22 @@ STUB
     bash <(cat "$ctx/installer_under_test.sh") --easy-mode \
     > "$ctx/out.log" 2>&1 || rc=$?
 
+  local relaunches
+  relaunches="$(grep -c 'main/install.sh' "$ctx/calls.log" || true)"
+
   if [ "$rc" -eq 124 ]; then
-    echo "[FAIL] streamed --easy-mode installer did not terminate (self-relaunch loop; log: $ctx/out.log)"
-    grep -c 'main/install.sh' "$ctx/calls.log" | sed 's/^/        self-relaunches: /'
+    # Separate the regression from a merely slow host: the loop refetches
+    # main/install.sh every iteration, so a timeout with zero refetches is
+    # something else and should not be reported as this bug.
+    if [ "${relaunches:-0}" -gt 1 ]; then
+      echo "[FAIL] streamed --easy-mode installer self-relaunch loop: ${relaunches} refetches of main/install.sh before the deadline (log: $ctx/out.log)"
+    else
+      echo "[FAIL] streamed --easy-mode installer did not finish within the deadline, with ${relaunches:-0} refetch(es) — not the #124 loop; check the host (log: $ctx/out.log)"
+      tail -n 20 "$ctx/out.log" | sed 's/^/        /'
+    fi
     tests_failed=1
     return 1
   fi
-
-  local relaunches
-  relaunches="$(grep -c 'main/install.sh' "$ctx/calls.log" || true)"
   if [ "${relaunches:-0}" -ne 0 ]; then
     echo "[FAIL] streamed installer re-fetched main/install.sh $relaunches time(s); it is already the newest installer"
     tests_failed=1

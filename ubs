@@ -3449,6 +3449,19 @@ for line in sys.stdin:
   fi
 }
 
+# Abort shadow-workspace staging.
+#
+# Every way of failing to stage the workspace has to end here. `ubs` promises
+# that an unstageable target fails loudly, with the underlying tool's
+# diagnostic, rather than leaving a silently partial workspace that would scan
+# clean and report success (issue #98) — and the CLI contract matches on this
+# banner, so it has to be emitted whichever target kind failed, not only for
+# in-tree files. Callers print the specific cause first.
+fail_files_workspace(){
+  say "${RED}$X Failed to prepare files workspace${RESET}"
+  exit 1
+}
+
 # Copy an explicit list of targets (from --files or multiple positional args)
 # into a shadow workspace so the rest of the pipeline scans only those paths.
 # Targets may be files OR directories (issue #88): files are copied verbatim
@@ -3557,8 +3570,7 @@ prepare_files_workspace(){
     local file_list="$TMPDIR_RUN/explicit_files.0"
     printf '%s\0' "${resolved_files[@]}" > "$file_list"
     if ! copy_file_list "$scan_root" "$file_list" "$dest" "files workspace"; then
-      say "${RED}$X Failed to prepare files workspace${RESET}"
-      exit 1
+      fail_files_workspace
     fi
   fi
 
@@ -3570,7 +3582,7 @@ prepare_files_workspace(){
       ensure_dir "$dest/${ep#/}"
       if ! copy_file_list "$ep" "${ext_list_of[$ep]}" "$dest/${ep#/}" "external file target"; then
         say "${RED}$X Failed to copy external file target${RESET}: $ep"
-        exit 1
+        fail_files_workspace
       fi
       record_workspace_mirror "$dest/${ep#/}" "$ep"
     done
@@ -3586,11 +3598,11 @@ prepare_files_workspace(){
       dir_list="$TMPDIR_RUN/dir_target_$i.0"
       if ! list_scan_files "${dir_src[$i]}" "$dir_list" >/dev/null; then
         say "${RED}$X Failed to list directory target${RESET}: ${dir_src[$i]} (needs python3)"
-        exit 1
+        fail_files_workspace
       fi
       if [[ -s "$dir_list" ]] && ! copy_file_list "${dir_src[$i]}" "$dir_list" "$dest/${dir_rel[$i]}" "directory target"; then
         say "${RED}$X Failed to copy directory target${RESET}: ${dir_src[$i]}"
-        exit 1
+        fail_files_workspace
       fi
       if [[ "${dir_ext[$i]}" -eq 1 ]]; then
         record_workspace_mirror "$dest/${dir_rel[$i]}" "${dir_src[$i]}"

@@ -28,7 +28,19 @@ if [[ -n "${TMPDIR:-}" ]]; then
   export TEMP="${TEMP:-$TMPDIR}"
 fi
 if command -v uv >/dev/null 2>&1 && [[ -z "${UV_PROJECT_ENVIRONMENT:-}" ]]; then
-  UV_PROJECT_ENVIRONMENT="${TMPDIR:-/tmp}/ubs-test-suite-uv"
+  # One environment per run. A single shared path looks like a useful cache,
+  # but two suites running at once is normal here, and the second one's `uv
+  # sync` re-creates the environment out from under the first: every test that
+  # spawns a subprocess then dies with
+  #
+  #   FileNotFoundError: [Errno 2] No such file or directory:
+  #     '<tmp>/ubs-test-suite-uv/bin/python'
+  #
+  # That took out 44 tests in one run here, with a message that points at
+  # Python rather than at the collision. The saving was not real either: uv
+  # keeps its package cache globally, so a fresh environment is a couple of
+  # megabytes of symlinks and installs in well under a second.
+  UV_PROJECT_ENVIRONMENT="${TMPDIR:-/tmp}/ubs-test-suite-uv-$$"
   export UV_PROJECT_ENVIRONMENT
 fi
 

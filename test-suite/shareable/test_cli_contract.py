@@ -1347,6 +1347,28 @@ def is_build_phase_finding(rule_id: object) -> bool:
     return str(rule_id).endswith(".build.phase")
 
 
+def describe_failed_modules(entries: object) -> str:
+    """Render a `failed_modules` list the way `ubs` itself explains a partial run.
+
+    Each entry carries `module_error` and a `message` that already says what
+    went wrong ("cargo could not run, so compilation, tests and lints were not
+    evaluated: ..."). Reporting only the exit code throws that away and sends
+    the reader looking for a renderer bug when the cause was the environment.
+    """
+    if not isinstance(entries, list) or not entries:
+        return "no failed_modules detail"
+    parts = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            parts.append(str(entry))
+            continue
+        lang = entry.get("language", "?")
+        code = entry.get("module_error") or entry.get("status") or "?"
+        message = str(entry.get("message") or "").strip()
+        parts.append(f"{lang}: {code}" + (f" — {message[:300]}" if message else ""))
+    return "; ".join(parts)
+
+
 def test_findings_parity_all_langs() -> None:
     # K2: findings parity — meta-runner --format=json includes per-finding records
     # for every module. SARIF also retains the separate AST evidence exposed
@@ -1378,8 +1400,27 @@ def test_findings_parity_all_langs() -> None:
         except Exception as exc:  # noqa: BLE001
             failures.append(f"{lang}: JSON parse error {exc}")
             continue
-        if pj.returncode not in (0, 1) or doc.get("status") != "ok" or doc.get("failed_modules"):
-            failures.append(f"{lang}: incomplete JSON scan (exit={pj.returncode})")
+        # Three distinct ways a scan can come back unusable, kept apart so the
+        # message names the one that happened. Folded together they all read
+        # "incomplete JSON scan (exit=2)", which points at the renderer even
+        # when the cause was a build tool that could not start.
+        if doc.get("failed_modules"):
+            failures.append(
+                f"{lang}: JSON scan did not run every module "
+                f"({describe_failed_modules(doc.get('failed_modules'))})"
+            )
+            continue
+        if doc.get("status") != "ok":
+            failures.append(
+                f"{lang}: JSON scan status={doc.get('status')!r} (expected 'ok'): "
+                f"{str(doc.get('message') or pj.stderr).strip()[:300]}"
+            )
+            continue
+        if pj.returncode not in (0, 1):
+            failures.append(
+                f"{lang}: JSON scan exit {pj.returncode} (expected 0 or 1): "
+                f"{pj.stderr.strip()[-300:]}"
+            )
             continue
 
         findings = doc.get("findings", [])
@@ -1453,14 +1494,13 @@ def test_findings_parity_all_langs() -> None:
             {},
         )
         if jl_totals.get("status") != "ok" or jl_totals.get("failed_modules"):
-            failed = ",".join(
-                str(m.get("language"))
-                for m in (jl_totals.get("failed_modules") or [])
-                if isinstance(m, dict)
+            detail = (
+                describe_failed_modules(jl_totals.get("failed_modules"))
+                if jl_totals.get("failed_modules")
+                else f"status={jl_totals.get('status')!r}"
             )
             failures.append(
-                f"{lang}: incomplete JSONL scan "
-                f"(status={jl_totals.get('status')!r}{', failed=' + failed if failed else ''}); "
+                f"{lang}: incomplete JSONL scan ({detail}); "
                 f"a module did not run, so the counts are not comparable"
             )
             continue
@@ -1482,8 +1522,27 @@ def test_findings_parity_all_langs() -> None:
         pt_dec = subprocess.run(["toon", "--decode"], input=pt.stdout, capture_output=True, text=True, timeout=30)  # ubs:ignore[python.taint.command]
         try:
             tdoc = json.loads(pt_dec.stdout)
-            t_findings = tdoc.get("findings", [])
-            if pt.returncode != pj.returncode or pt_dec.returncode != 0 or len(t_findings) != expected_count:
+            t_findings = [
+                f
+                for f in tdoc.get("findings", [])
+                if not is_build_phase_finding(f.get("rule_id", f.get("rule", "")))
+            ]
+            # Three separate conditions, reported separately. Folded together
+            # they all printed as a count mismatch, so a failed decode or a
+            # differing exit code read as the TOON renderer losing findings.
+            if pt_dec.returncode != 0:
+                failures.append(
+                    f"{lang}: TOON decode failed (exit {pt_dec.returncode}): "
+                    f"{pt_dec.stderr.strip()[:200]}"
+                )
+                continue
+            if pt.returncode != pj.returncode:
+                failures.append(
+                    f"{lang}: TOON exit {pt.returncode} != JSON exit {pj.returncode} "
+                    f"(findings agreed at {len(t_findings)})"
+                )
+                continue
+            if len(t_findings) != expected_count:
                 failures.append(f"{lang}: TOON finding count {len(t_findings)} != expected {expected_count}")
                 continue
         except Exception as exc:  # noqa: BLE001
@@ -1516,7 +1575,14 @@ def test_findings_parity_all_langs() -> None:
             if len(drivers) != len(set(drivers)) or set(drivers) != set(expected_runs):
                 failures.append(f"{lang}: SARIF drivers {drivers} != expected {list(expected_runs)}")
                 continue
-            s_results = [result for item in runs for result in item.get("results", [])]
+            # Filtered on the same basis as the other three formats, so the
+            # recorded counts describe the same set the comparison used.
+            s_results = [
+                result
+                for item in runs
+                for result in item.get("results", [])
+                if not is_build_phase_finding(result.get("ruleId", ""))
+            ]
             for item in runs:
                 driver = item["tool"]["driver"]["name"]
                 expected = Counter()

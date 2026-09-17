@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.5] - 2026-09-17 [Release]
+
 ### Installer
 
 - Stop the streamed installer relaunching itself forever. A `curl | bash` install resolves its version from `releases/latest`, then compared that release version against `main/VERSION` — the unreleased development version, which is routinely ahead of the newest tag. That reported a phantom update, `--easy-mode` auto-accepted it, and the installer `exec`'d another copy of `main/install.sh`, which resolved to the same release and repeated: 66 relaunches in 25 seconds with no output and no progress. It blocked ACFS 0.9.0's updater at UBS, so DSR, EE, FMD, PI and PFR were never reached. A streamed installer is by construction already the newest installer and now reports that instead of comparing across version lines, and a self-update carries a sentinel in the environment so at most one can occur per chain — `exec` replaces the process, so an in-script counter cannot survive. The legitimate self-update path, a checkout older than `main`, still fires exactly once. (#124)

@@ -10,6 +10,26 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Installer
+
+- Stop the streamed installer relaunching itself forever. A `curl | bash` install resolves its version from `releases/latest`, then compared that release version against `main/VERSION` — the unreleased development version, which is routinely ahead of the newest tag. That reported a phantom update, `--easy-mode` auto-accepted it, and the installer `exec`'d another copy of `main/install.sh`, which resolved to the same release and repeated: 66 relaunches in 25 seconds with no output and no progress. It blocked ACFS 0.9.0's updater at UBS, so DSR, EE, FMD, PI and PFR were never reached. A streamed installer is by construction already the newest installer and now reports that instead of comparing across version lines, and a self-update carries a sentinel in the environment so at most one can occur per chain — `exec` replaces the process, so an in-script counter cannot survive. The legitimate self-update path, a checkout older than `main`, still fires exactly once. (#124)
+
+### Scanners
+
+- Sort generated rule ids in the C locale in all ten language modules. `--list-rules` ended its pipeline with a bare `sort -u`, so the inventory order depended on `LC_COLLATE`; under `en_US.UTF-8` it differs from byte order both on case (`java.optional-isPresent-then-get` against `java.optional-isempty-negation`) and on punctuation (`go.context-todo` against `go.context.cancel-defer-in-if`). Five modules disagreed with the dumped rule ids on a developer machine while passing wherever `LANG` happened to be C; the other five were one camelCase or dotted rule id away from the same break. `--list-rules` is machine-readable output that ACFS and the test suite both diff, so it is now byte-deterministic regardless of environment.
+- Recompute Python and Rust interval suppressions against the selected files, and preserve `rust_scan` context.
+
+### Target selection
+
+- Fail every unstageable target with the same workspace banner. Splitting shadow-workspace staging into in-tree files, external files and directory targets left only the first branch emitting `Failed to prepare files workspace`. An unreadable external target still failed loudly with tar's diagnostic and a non-zero exit, so the behaviour was never unsafe, but the marker the CLI contract matches on was gone — the issue #98 guarantee was no longer actually asserted for external files or directories. All four paths now exit through one place. (#98)
+- Use one ignore matcher for every path, stage external file targets under a mirrored destination, and widen the ripgrep glob parity matrix. Fixes bracket expressions, a fourth ignore reader, and the external-file count.
+
+### Test suite
+
+- Give each suite run its own uv environment. Two concurrent runs shared one path, so the second one's `uv sync` re-created the environment while the first was using it, and every test that spawned a subprocess died reporting a missing Python — 44 tests in one run, across three unrelated modules. Concurrent runs are the normal case, so the shared path was a race by default rather than under load.
+- Measure the work a warm cache skips rather than raw wall clock. The previous assertion required a 5x speedup, which is not reachable: every invocation pays a fixed start-up cost that caching cannot remove and that was counted on both sides of the ratio. On a quiet machine the cache eliminates essentially all work — a 143x reduction in scan time — and the old metric reported that as 5.71x, so the assertion sat within a few percent of a ceiling it could never clear and failed whenever the host was busy. (#125)
+- Report the actual cause when the findings-parity and garbage-envelope checks fail. Between them these reported a renderer disagreement when a scan had errored, a count mismatch when the counts were equal and the exit codes differed, a scraped-value leak when a commit SHA happened to contain the digits being searched for, and an installer self-relaunch loop when the host was merely too slow. Build-tool diagnostics are also excluded from cross-scan comparison: they exist only when the build tool recompiled, so a shared cargo target directory decided whether the check passed. (#126)
+
 ## [v5.4.4] - 2026-09-16 [Tag]
 
 - Index suppression intervals once instead of rescanning every statement for each finding. Preserve shortest-span selection, original tie order, rule scopes, formatter markers, and mutable-index behavior. On the same frozen CASS `src/lib.rs`, one sequential remote comparison took 196.853 seconds with v5.4.3 and 65.014 seconds with this change (3.03× observed); all 10,341 finding records were byte-identical. This single comparison is not a general performance guarantee.

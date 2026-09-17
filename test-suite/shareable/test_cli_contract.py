@@ -1336,6 +1336,17 @@ def test_skip_polyglot_mapping() -> None:
 check_skip_polyglot_mapping = test_skip_polyglot_mapping
 
 
+def is_build_phase_finding(rule_id: object) -> bool:
+    """Whether a finding is a build-tool diagnostic rather than a code finding.
+
+    These are reported with no file and no line, and they exist only when the
+    build tool recompiled — cargo prints its warnings on a fresh compile and
+    nothing on a cached one. Anything comparing two separate scans has to
+    leave them out, or the build cache decides the result.
+    """
+    return str(rule_id).endswith(".build.phase")
+
+
 def test_findings_parity_all_langs() -> None:
     # K2: findings parity — meta-runner --format=json includes per-finding records
     # for every module. SARIF also retains the separate AST evidence exposed
@@ -1375,6 +1386,14 @@ def test_findings_parity_all_langs() -> None:
         if not findings:
             failures.append(f"{lang}: no findings in JSON (findings[] is empty)")
             continue
+        # Same reason as the SARIF identity comparison below: a build-tool
+        # diagnostic exists only when the build tool recompiled, so it is not
+        # stable across the separate scans this check runs per format.
+        findings = [
+            f
+            for f in findings
+            if not is_build_phase_finding(f.get("rule_id", f.get("rule", "")))
+        ]
 
         bad_rules = [f for f in findings if not str(f.get("rule_id", "")).strip()]
         if bad_rules:
@@ -1388,7 +1407,12 @@ def test_findings_parity_all_langs() -> None:
         write_case_artifacts(f"findings-parity-{lang}-jsonl", pjl)
         last_proc = pjl
         jl_lines = [parse_json_document(line) for line in pjl.stdout.splitlines() if line.strip()]
-        jl_findings = [line for line in jl_lines if line.get("type") == "finding"]
+        jl_findings = [
+            line
+            for line in jl_lines
+            if line.get("type") == "finding"
+            and not is_build_phase_finding(line.get("rule_id", line.get("rule", "")))
+        ]
         # Two independent conditions, reported separately. Folding them into
         # one message printed "JSONL finding count 619 != expected 619" when
         # the counts agreed and it was the exit codes that differed, which
@@ -1498,6 +1522,20 @@ def test_findings_parity_all_langs() -> None:
                 expected = Counter()
                 actual = Counter()
                 for finding in expected_runs[driver]:
+                    # Build-phase diagnostics are emitted only when the
+                    # language's build tool actually recompiles: cargo prints
+                    # warnings on a fresh compile and says nothing on a cached
+                    # one. This check runs the scan once per format, and on a
+                    # machine where every repo shares one CARGO_TARGET_DIR the
+                    # cache state flips between those runs, so the same corpus
+                    # yields `rust.build.phase` in one rendering and not
+                    # another. They carry no source location, so they cannot
+                    # be a renderer divergence either — comparing them lets
+                    # cargo's cache decide whether this check passes.
+                    if is_build_phase_finding(
+                        finding.get("rule_id", finding.get("rule", ""))
+                    ):
+                        continue
                     scope = finding.get("scope", "")
                     level = {"critical": "error", "warning": "warning", "info": "note"}[
                         finding["severity"]
@@ -1513,6 +1551,8 @@ def test_findings_parity_all_langs() -> None:
                         if scope in {"project", "project_aggregate"} else None,
                     )] += 1
                 for result in item.get("results", []):
+                    if is_build_phase_finding(result["ruleId"]):
+                        continue
                     locations = result.get("locations", [])
                     if len(locations) > 1:
                         raise ValueError(f"{driver}: unexpected multiple source locations")

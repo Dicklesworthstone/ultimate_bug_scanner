@@ -61,7 +61,23 @@ DEFAULT_SNIPPETS: dict[str, str] = {
 }
 
 
-def run_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None = None, timeout: int = 45) -> subprocess.CompletedProcess[str]:
+# Every conformance probe is a scan of a one-file fixture, which takes a few
+# seconds; the cap is here to stop a hung module wedging the suite, not to
+# assert performance. A fixed wall-clock cap does assert performance whenever
+# the host is busy: on a machine also running a large build, the golang
+# `format_json` and `process_budget` probes reported exit 124 at 45s and
+# finished in 3.7s on the same checkout once the build ended, with the
+# `process_budget` probe having already written its complete JSON before it was
+# killed. Raise it rather than re-run and hope.
+CONFORMANCE_TIMEOUT = int(os.environ.get("UBS_CONFORMANCE_TIMEOUT", "45"))
+
+
+def run_cmd(
+    cmd: list[str],
+    cwd: Path | None = None,
+    env: dict | None = None,
+    timeout: int = CONFORMANCE_TIMEOUT,
+) -> subprocess.CompletedProcess[str]:
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
@@ -77,7 +93,15 @@ def run_cmd(cmd: list[str], cwd: Path | None = None, env: dict | None = None, ti
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return subprocess.CompletedProcess(cmd, returncode=124, stdout=stdout, stderr=f"timed out after {timeout}s: {stderr}")
+        return subprocess.CompletedProcess(
+            cmd,
+            returncode=124,
+            stdout=stdout,
+            stderr=(
+                f"timed out after {timeout}s "
+                f"(raise UBS_CONFORMANCE_TIMEOUT if the host is busy): {stderr}"
+            ),
+        )
 
 
 class ModuleChecker:

@@ -238,6 +238,73 @@ def check_no_supported_languages(tmpdir: Path) -> None:
     assert payload["exit_code"] == 0, payload
 
 
+def check_detection_without_contract(tmpdir: Path) -> None:
+    """An installed runner has no modules/contract.json and must still detect
+    languages.
+
+    `modules/contract.json` carries the per-language extension lists, but it is
+    not a checksum-verified asset, so it is never downloaded or cached: only a
+    repo checkout has one next to the runner. The file listing used the
+    contract as its ONLY source of extensions, so with no contract nothing
+    matched any language, every per-language list came back empty, and
+    detect_lang reads an empty list as "this language is absent". An installed
+    ubs therefore answered `no-supported-languages` (exit 3) for every project
+    — it scanned nothing, on everything — while a checkout of the same version
+    scanned it fine. The inverse of check_no_supported_languages: that one
+    proves "nothing scanned" is never reported as a pass, this one proves it is
+    never reported at all when there is something to scan.
+
+    The installed layout is reproduced exactly: the runner sits in a directory
+    with no `modules/` sibling, and its module directory holds every module and
+    helper but no contract.json. Symlinks keep it hermetic — no download, and
+    the content still matches the runner's checksum tables.
+    """
+    env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_NO_AUTO_UPDATE": "1"}
+    root = tmpdir / "installed_layout"
+    bin_dir = root / "bin"
+    mod_dir = root / "moddir"
+    bin_dir.mkdir(parents=True)
+    mod_dir.mkdir(parents=True)
+
+    runner = bin_dir / "ubs"
+    shutil.copy2(UBS_BIN, runner)
+    runner.chmod(0o755)
+    for entry in sorted((REPO_ROOT / "modules").iterdir()):
+        if entry.name == "contract.json":
+            continue  # the whole point: an installed runner never has it
+        (mod_dir / entry.name).symlink_to(entry)
+    assert not (mod_dir / "contract.json").exists(), "test setup leaked a contract"
+
+    target = root / "project"
+    target.mkdir()
+    (target / "sample.py").write_text("def f(x):\n    return eval(x)\n", encoding="utf-8")
+    (target / "sample.rs").write_text("fn main() { println!(\"hi\"); }\n", encoding="utf-8")
+
+    merged = os.environ.copy()
+    merged.update(env)
+    res = subprocess.run(
+        [str(runner), str(target), f"--module-dir={mod_dir}", "--format=json"],
+        cwd=root, capture_output=True, text=True, env=merged, check=False, timeout=300,
+    )
+    assert res.returncode != 3, (
+        "an installed-layout runner reported 'nothing was scanned' for a project "
+        f"with .py and .rs files\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    try:
+        payload = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"installed-layout scan produced invalid JSON: {exc}\n"
+            f"stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+        ) from exc
+    assert payload.get("result") != "no-supported-languages", payload
+    languages = {s.get("language") for s in (payload.get("scanners") or [])}
+    assert {"python", "rust"} <= languages, (
+        f"expected python and rust scanners, got {languages}\n"
+        f"stderr:\n{res.stderr}"
+    )
+
+
 def check_version_identity(tmpdir: Path) -> None:
     """Issue #79 regression guard: the optional git suffix on --version used to
     come from a bare `git rev-parse --short HEAD`, so it reported whatever
@@ -701,6 +768,10 @@ def main() -> None:
 
         # Issue #53: explicit unsupported-language result for Dart-only scans.
         check_no_supported_languages(tmpdir)
+
+        # An installed runner (no modules/contract.json) must still detect
+        # languages, instead of reporting every project as unsupported.
+        check_detection_without_contract(tmpdir)
 
         # Issue #79: --version identity must belong to UBS, not the caller's cwd.
         check_version_identity(tmpdir)

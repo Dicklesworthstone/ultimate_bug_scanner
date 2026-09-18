@@ -2794,6 +2794,16 @@ else:
 
 def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: str) -> bool:
     exts = spec.get("extensions", [])
+    # An installed runner has no modules/contract.json next to it: the contract
+    # is not a checksum-verified asset, so it is never cached, and every spec
+    # comes back empty. Without this fallback no file matches any language, the
+    # per-language lists are all empty, and detect_lang reads empty as "this
+    # language is absent" — so an installed ubs reported "no supported
+    # languages" (exit 3) for every project while a checkout scanned it fine.
+    # The built-in hint map is the runner's own knowledge that .py is Python;
+    # it is narrower than the contract, which still wins wherever it is present.
+    if ext_str and not exts and LANG_EXT_HINTS.get(ext_str) == lang:
+        return True
     if ext_str and (ext_str in exts or (ext_str in include_ext_set and (LANG_EXT_HINTS.get(ext_str) == lang or (LANG_EXT_HINTS.get(ext_str) is None and lang in target_langs)))):
         return True
     if lang == "bash" and not ext_str:

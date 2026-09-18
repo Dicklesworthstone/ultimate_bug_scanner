@@ -449,7 +449,13 @@ def render_text(args, ast_ran: bool, patterns: Sequence) -> None:
         buckets.append((_bucket_meta(rule, patterns), rule, recs))
     buckets.sort(key=lambda item: (item[0].category, item[0].seq))
 
-    lines: list = []
+    # Contract-v2 text marker (#110): the meta-runner scrapes counts out of a
+    # module's text output, and this line is its proof that the text came from
+    # a conforming module rather than from arbitrary output that happens to
+    # contain "Critical issues:".
+    lines: list = [
+        f"UBS module: csharp (contract v2) — {args.project or args.project_dir}"
+    ]
     current_section = None
     lock_note_emitted = False
     for meta, rule, recs in buckets:

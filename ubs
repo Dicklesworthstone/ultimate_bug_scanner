@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='3785b0b4a50eea5e4038917cb9b570e098568861b5ceef7fd036c7b272f6123b'
-  [cpp]='bb5cddd481263ab6332b6c7f45ed95447b1be371e6a918d68c2a622a9eb32b6e'
-  [csharp]='16ef3d138821b75369ae4ee790c155d6bfdd0a2d8d893df61f7b59bc910ad982'
-  [elixir]='1f8d5dfcd38875df32776cac32917a0f1f33e4304721a1bbd1d41c1b04f0f19f'
-  [golang]='f693a911001a61e65909402a227f1c4e081cd66c27c427360dea9d708c84254b'
-  [java]='654676d5031b53946170c9aaa2492b583f42e91ade6c235b211de8928ea78ecd'
-  [js]='ce4ecb704cff31c74a82b620affe5097ae238c5c548868307c94bd14f3383837'
-  [kotlin]='94331a9729270c9036166babfacae0b6b3fb3a6ca7da0b69bdeeed972eea49c9'
-  [python]='ead31022fa12987addabe24b836cc4c71429a3fd3f33fdbd9fd8194704539dfc'
-  [ruby]='db5ac6e6e09c8a50193229eb2675af283f2fe6aebc25034427ecface4957c3a2'
-  [rust]='a021a4720fd7a80b5b5bb485a80511acd5ce3058f86e78a021eb64eb5b522d71'
-  [swift]='1aa4e3abad11bd745df7d01efc7813802041baef897f770956e561c7ffea6ecf'
+  [bash]='7061a29e8576d0991291f545813f52654fd8998a5e0454524b5379149340b5d4'
+  [cpp]='a42ba8f12d105e5fe9d7ca0251e2b68c94ab3397e7b9a233bee7c8b1d323869c'
+  [csharp]='4c9fe406c30e5d37214d01989395814db3590cebbd8492b8efeba918e65cf8a2'
+  [elixir]='3b5125d5aa7db5c9177a7eab08c98b8d4b94fedf7debaa62bc1ab480a9abc90b'
+  [golang]='f9ec8a8cd405a2c9ef1227809d66f82c0cd9cd608bf87a0815aed308615ec8f5'
+  [java]='1c59041186b1e8c1368a2b036feca85266d6b955e635ce0c4fae7ff7728597c7'
+  [js]='333450dae9ea572725ed171231e35ebb315ba6ebea7b26b8269991ba574cf107'
+  [kotlin]='9c32f1c26269d67ff29cb3dfede03aa4498cc86f8cb74ac7e4b45c762d10c74d'
+  [python]='4431453110e87cb90e9768a544cdbd7832b003f338c2b192906d62d231a72763'
+  [ruby]='5c16e16ff2052399b8242c20794bd51465111191105db9a7aff8ae2f7b11eee9'
+  [rust]='c95ca0bdc17639c5e4b24ad035b981d52092f42c3401963070d8984fc04b2df5'
+  [swift]='e89bfb1fbea7b07898fa1e6a58aca21c3b71936bbd3c5087da9dd1e3fb0c1b80'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -207,7 +207,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/csharp_patterns/quality.py']='eac32fcf8ce9ce593f19c2089abf89916b72cbd6ea1005ac056d23a178bb69cc'
   ['helpers/ubs_core/csharp_patterns/security_rg.py']='456a7b2ad7855b36376dfa8daa34c1d6449eb7b07d86a2b5b654180307665ec1'
   ['helpers/ubs_core/csharp_rules.py']='a18537e24ade02da86fcae82e8f92d1e7e702ea63a0c77b6fd2ea865cbb27a9e'
-  ['helpers/ubs_core/csharp_scan.py']='6dd3feeb7f32a0e63826539de4fc92244384dbbd35b5a9f88545412ed0cb4fa5'
+  ['helpers/ubs_core/csharp_scan.py']='8ca538011653da946629a275dc3cf046e25d373d572ec7882bd9549384bbe2ed'
   ['helpers/ubs_core/elixir_ast.py']='bc561fd2bcdb345cc96159cafaca62c19b9c76d2cb46b37e62a9233ccdf78a52'
   ['helpers/ubs_core/elixir_detectors/__init__.py']='9e08cda01f060bb0e804ad7276b680e12f8f7451158b2ba443bc001d2f086faa'
   ['helpers/ubs_core/elixir_detectors/_common.py']='ffedf7e7db651bb0738e999fa2cb6f175cd97b52fa3bc857a809be54ac887eee'
@@ -389,7 +389,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='3d65dc5923bd2af9d8e190d46fc3c1fbeae17d71bb3f99070a190f7d46624c64'
+  ['helpers/ubs_core/rust_scan.py']='bcc12886e4e21008b33f587f495c9d97e02f868d892d8343656c1c950138c0a8'
   ['helpers/ubs_core/scheduler.py']='9d4d936984f308c82d80d108b006a65ccd2eeb1d41e07325b621fc39147a94ed'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
@@ -412,8 +412,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/misc_cats.py']='6be76fa36414b6de28a0414a122549eade5a84f16686440e58d94079d1293d99'
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
-  ['helpers/ubs_core/swift_scan.py']='9b295cfa6d23d93afe08a61d7d45331289b0adeaaff6e83961636c516b58135f'
-  ['lib/ubs-common.sh']='35fe87edcf04618bc20a18a8673fb237efc0d0813b777a71c7db0e184e4161e1'
+  ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
+  ['lib/ubs-common.sh']='f3ea0a37058c6718392f2f6d8c8023c78e19a278b44aba43fd08c8c0b439b2ec'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6467,6 +6467,18 @@ def last_number(lines, pattern):
     return int(found) if found is not None else 0
 
 
+# A contract-v2 module announces itself on one line of its text output. The
+# runner scrapes counts out of that text, so without proof of origin a module
+# that printed arbitrary text and exited 0 had counts invented for it: the
+# json path validates the contract document and rejects a non-conforming one,
+# the text path trusted whatever it could pattern-match (#110).
+CONTRACT_V2_TEXT_MARKER = re.compile(r"^\s*UBS module:.*\(contract v2\)", re.MULTILINE)
+
+
+def has_contract_v2_marker(text: str) -> bool:
+    return bool(CONTRACT_V2_TEXT_MARKER.search(ANSI.sub("", text)))
+
+
 def summary_from_text(text: str, a) -> dict:
     cleaned = ANSI.sub("", text).replace("\r", "").replace("\0", "")
     lines = cleaned.splitlines()
@@ -6549,15 +6561,22 @@ def is_summary(doc) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress", "blob_base", "toplevel", "helpers_dir", "mirror_map"):
+    for name in ("mode", "lang", "raw", "txt", "json", "sarif", "findings", "metrics_dir", "workspace", "source", "single_file", "timestamp", "project", "no_suppress", "blob_base", "toplevel", "helpers_dir", "mirror_map", "require_marker"):
         ap.add_argument("--" + name.replace("_", "-"), default="")
     a = ap.parse_args()
     if a.mode == "text":
         raw = Path(a.raw).read_text(encoding="utf-8", errors="replace") if os.path.isfile(a.raw) else ""
         text = restore_text(raw if a.no_suppress == "1" else suppress(raw, a.lang, a.helpers_dir), a)
+        # The module's text is kept either way — a human still gets to see what
+        # it printed — but counts are only scraped from text that proves it came
+        # from a contract-v2 module. Exit 3 is the same signal the json mode
+        # uses for a non-conforming document (#110).
+        conforming = a.require_marker != "1" or has_contract_v2_marker(text)
         doc = summary_from_text(text, a)
         text = add_permalinks(text, a)
         Path(a.txt).write_text(text, encoding="utf-8")
+        if not conforming:
+            return 3
         apply_partial(doc, text)
         attach_metrics(doc, a.metrics_dir)
         Path(a.json).write_text(json.dumps(doc), encoding="utf-8")
@@ -6595,12 +6614,16 @@ postprocess_module(){
     no_suppress=1
   fi
   ensure_git_metadata
+  # Only a module that advertises contract v2 is held to the v2 text contract,
+  # so a third-party v1 module keeps the legacy scrape (#110).
+  local require_marker=0
+  is_module_v2 "$lang" && require_marker=1
   python3 "$TMPDIR_RUN/postprocess.py" --mode "$mode" --lang "$lang" --raw "$raw" --txt "$txt" --json "$json" \
     --sarif "$sarif" --findings "$findings" --metrics-dir "$metrics" --workspace "$ws" \
     --source "$proj" --single-file "${SINGLE_FILE_TARGET:-}" --timestamp "$(date_iso)" --project "$proj" \
     --no-suppress "$no_suppress" --blob-base "${GIT_BLOB_BASE:-}" --toplevel "${GIT_TOPLEVEL:-}" \
     --helpers-dir "${UBS_HELPERS_DIR:-$(dirname "${BASH_SOURCE[0]}")/modules/helpers}" \
-    --mirror-map "$WORKSPACE_MIRROR_MAP"
+    --mirror-map "$WORKSPACE_MIRROR_MAP" --require-marker "$require_marker"
 }
 
 # Text-mode partial marker (bead D10). A module that could not evaluate part of
@@ -6647,6 +6670,17 @@ JSON
   apply_inline_suppressions "$lang" <"$raw" >"$txt" 2>>"$err"
   if [[ "$is_v2" -eq 0 ]]; then
     restore_original_paths "$txt"
+  fi
+  # Same text contract as the python path (#110): a contract-v2 module that did
+  # not announce itself is an incomplete module, not a source of counts.
+  if [[ "$is_v2" -eq 1 ]] && ! grep -qE '^[[:space:]]*UBS module:.*\(contract v2\)' "$txt" 2>/dev/null; then
+    module_status=2
+    say_err "${RED}${X}${RESET} Module '$lang' did not emit contract text (exit 2)"
+    echo "Module '$lang' did not emit contract text (exit 2)" >>"$err"
+    cat >"$json" <<JSON
+{"language":"$lang","project":"$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")","files":0,"critical":0,"warning":0,"info":0,"timestamp":"$(date_iso)","status":"error","module_error":"MODULE_INVALID_TEXT","message":"Scanner module '$lang' text output carried no contract-v2 marker, so its counts were not trusted"}
+JSON
+    return 2
   fi
   partial_status_from_text "$txt" "$json"
   attach_metrics_to_json "$json" "$metrics"
@@ -6788,7 +6822,22 @@ JSON
       run_module "$out_raw" "$err" "$module" "${args[@]}" || true
       module_status=$MODULE_RUN_STATUS
       if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
-        postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || true
+        local text_pp_rc=0
+        postprocess_module text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_sarif" "$out_findings" "$metrics_dir" || text_pp_rc=$?
+        # A contract-v2 module whose text carries no `UBS module: … (contract
+        # v2)` line is an incomplete module, not a source of counts. Without
+        # this the runner scraped `Critical issues:` out of whatever the module
+        # printed, so a module that printed garbage and exited 0 had counts
+        # invented for it — the json path has rejected that since bead B10
+        # (#110).
+        if [[ "$text_pp_rc" -ne 0 ]]; then
+          module_status=2
+          say_err "${RED}${X}${RESET} Module '$lang' did not emit contract text (exit 2)"
+          echo "Module '$lang' did not emit contract text (exit 2)" >>"$err"
+          cat >"$out_json" <<JSON
+{"language":"$lang","project":"$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")","files":0,"critical":0,"warning":0,"info":0,"timestamp":"$(date_iso)","status":"error","module_error":"MODULE_INVALID_TEXT","message":"Scanner module '$lang' text output carried no contract-v2 marker, so its counts were not trusted"}
+JSON
+        fi
       else
         legacy_postprocess text "$lang" "$out_raw" "$out_txt" "$out_json" "$out_findings" "$metrics_dir"
       fi

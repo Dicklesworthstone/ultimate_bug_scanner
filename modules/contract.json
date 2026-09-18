@@ -12,7 +12,8 @@
       "jsonl",
       "toon"
     ],
-    "note": "A module asked for --format=jsonl or --format=toon exits 2 (ubs_validate_format in modules/lib/ubs-common.sh); the meta-runner derives those from the module's json."
+    "note": "A module asked for --format=jsonl or --format=toon exits 2 (ubs_validate_format in modules/lib/ubs-common.sh); the meta-runner derives those from the module's json.",
+    "text_marker": "A module's --format=text output MUST contain one line matching '^\\s*UBS module:.*\\(contract v2\\)', conventionally first and including the project path. The meta-runner has no contract document in text mode, so it scrapes 'Files scanned:' / 'Critical issues:' / 'Warning issues:' / 'Info items:' out of the module's text; this marker is its proof that the text came from a conforming module. Text without it is treated as MODULE_INVALID_TEXT (status error, exit 2) and its counts are discarded, the same treatment a non-conforming document gets in json mode. The marker must survive -q, which the meta-runner passes straight through."
   },
   "exit_codes": {
     "0": "no critical findings (and no warnings when --fail-on-warning is set)",

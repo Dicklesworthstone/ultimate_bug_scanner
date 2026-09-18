@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,11 @@ DEFAULT_SNIPPETS: dict[str, str] = {
 # `process_budget` probe having already written its complete JSON before it was
 # killed. Raise it rather than re-run and hope.
 CONFORMANCE_TIMEOUT = int(os.environ.get("UBS_CONFORMANCE_TIMEOUT", "45"))
+
+# The contract-v2 text marker (modules/contract.json formats.text_marker):
+# proof that a module's text output came from a conforming module before the
+# meta-runner scrapes counts out of it.
+_TEXT_MARKER = re.compile(r"^\s*UBS module:.*\(contract v2\)", re.MULTILINE)
 
 
 def run_cmd(
@@ -318,6 +324,14 @@ class ModuleChecker:
         elapsed = time.monotonic() - t0
         ok = proc.returncode in (0, 1) and len(proc.stdout) > 0
         err = f"exit {proc.returncode}, empty output" if not ok else ""
+        if ok and not _TEXT_MARKER.search(proc.stdout):
+            # The meta-runner has no contract document in text mode, so it
+            # scrapes counts out of whatever the module printed. This marker is
+            # the proof of origin that makes the scrape safe; a module without
+            # it is reported as MODULE_INVALID_TEXT and its counts discarded,
+            # so a missing marker silently costs the module its findings (#110).
+            ok = False
+            err = "text output carries no 'UBS module: … (contract v2)' marker"
         self._record_result("format_text", ok, elapsed, err, proc if not ok else None)
 
     def check_format_json(self, fixture: Path) -> None:

@@ -1762,6 +1762,13 @@ def main(argv: list[str] | None = None) -> int:
     cached_findings, files_to_scan = cache.partition_files(original_files)
 
     r = Renderer(scan, quiet=args.quiet)
+    # Contract-v2 text marker (#110). The meta-runner scrapes counts out of a
+    # module's text output, and this line is its proof that the text came from
+    # a conforming module rather than from arbitrary output that happens to
+    # contain "Critical issues:". Appended directly rather than through say(),
+    # because the marker is part of the contract and must survive -q — the
+    # runner passes -q straight through to the modules.
+    r.lines.append(f"UBS module: rust (contract v2) — {args.project or project_dir}")
     if files_to_scan:
         scan.files = list(files_to_scan)
         scan.lines_map = {f: scan.lines_map[f] for f in files_to_scan if f in scan.lines_map}

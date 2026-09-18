@@ -770,7 +770,13 @@ class _Renderer:
         self.buckets: dict[str, list[dict]] = {}
         for rec in records:
             self.buckets.setdefault(str(rec.get("rule", "")), []).append(rec)
-        self.lines: list[str] = []
+        # Contract-v2 text marker (#110): the meta-runner scrapes counts out of
+        # a module's text output, and this line is its proof that the text came
+        # from a conforming module rather than from arbitrary output that
+        # happens to contain "Critical issues:".
+        self.lines: list[str] = [
+            f"UBS module: swift (contract v2) — {args.project or args.project_dir}"
+        ]
         self.detailed = 0
         self._line_cache: dict[str, list[str]] = {}
 

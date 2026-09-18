@@ -114,28 +114,27 @@ def run_scan(target: Path, bin_dir: Path, args: list[str], env: dict[str, str]) 
     )
 
 
-# (case id, stub env, expected status, expected exit, whether text mode is
-#  asserted). The real bash scanner runs in every case and always finds its one
-#  critical, so every row also proves the healthy scanner's evidence survived.
-#
-# `garbage-output` is the one case where text mode is NOT asserted. The
-# module exits 0 there, so it is outside "a module that exits non-zero must
-# never be folded in as success": the JSON path validates the contract
-# document and rejects it (bead B10), but the text path still scrapes counts
-# out of whatever the module printed. That scrape is the legacy text contract
-# and changing it needs a decision across all twelve modules, so the gap is
-# tracked separately rather than papered over here.
+# (case id, stub env, expected status, expected exit). The real bash scanner
+# runs in every case and always finds its one critical, so every row also
+# proves the healthy scanner's evidence survived. Text mode is asserted for
+# every row: it used to be skipped for `garbage-output`, because that module
+# exits 0 and so falls outside "a module that exits non-zero must never be
+# folded in as success", and the text path had no other way to tell. It does
+# now (#110): a contract-v2 module announces itself with a `UBS module: <lang>
+# (contract v2)` line, and text without that marker is an incomplete module
+# rather than a source of counts — the same treatment the JSON path has given
+# a non-conforming document since bead B10.
 MATRIX = [
-    ("clean-module", {"STUB_MODE": "clean", "STUB_EXIT": "0"}, "ok", 1, True),
-    ("findings-exit-1", {"STUB_MODE": "clean", "STUB_EXIT": "1"}, "ok", 1, True),
-    ("module-exit-2", {"STUB_MODE": "clean", "STUB_EXIT": "2"}, "partial", 2, True),
-    ("module-exit-7", {"STUB_MODE": "clean", "STUB_EXIT": "7"}, "partial", 2, True),
-    ("garbage-output", {"STUB_MODE": "garbage", "STUB_EXIT": "0"}, "partial", 2, False),
+    ("clean-module", {"STUB_MODE": "clean", "STUB_EXIT": "0"}, "ok", 1),
+    ("findings-exit-1", {"STUB_MODE": "clean", "STUB_EXIT": "1"}, "ok", 1),
+    ("module-exit-2", {"STUB_MODE": "clean", "STUB_EXIT": "2"}, "partial", 2),
+    ("module-exit-7", {"STUB_MODE": "clean", "STUB_EXIT": "7"}, "partial", 2),
+    ("garbage-output", {"STUB_MODE": "garbage", "STUB_EXIT": "0"}, "partial", 2),
     # The stub sleeps far longer than the budget, so only it can time out; the
     # budget is still generous enough that the real bash scanner never does.
     ("module-timeout", {"STUB_MODE": "sleep", "STUB_EXIT": "0",
                         "UBS_MODULE_TIMEOUT": "5", "UBS_MODULE_TIMEOUT_GRACE": "1"},
-     "partial", 2, True),
+     "partial", 2),
 ]
 
 
@@ -144,7 +143,7 @@ def check_matrix(tmpdir: Path) -> None:
     out_dir = tmpdir / "artifacts"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    for case_id, stub_env, expected_status, expected_exit, assert_text in MATRIX:
+    for case_id, stub_env, expected_status, expected_exit in MATRIX:
         report = out_dir / f"{case_id}.report.json"
         proc = run_scan(target, bin_dir, ["--format=json", f"--report-json={report}"], stub_env)
         blob = proc.stdout + proc.stderr
@@ -187,12 +186,15 @@ def check_matrix(tmpdir: Path) -> None:
                   f"totals={doc.get('totals')}")
 
         # Text mode must tell a human the same thing.
-        if not assert_text:
-            print(f"[status-invariants] SKIP {case_id}/text-mode "
-                  "(module exits 0; text-scrape contract tracked separately)")
-            continue
         text_proc = run_scan(target, bin_dir, [], stub_env)
         text_blob = text_proc.stdout + text_proc.stderr
+        if case_id == "garbage-output":
+            # The counts the stub printed must not reach the human summary
+            # either: the Combined Summary used to read Critical: 100 (42
+            # scraped from the stub plus the bash scanner's real 1).
+            check("garbage-output/no-fabricated-counts-in-text",
+                  "Critical: 100" not in text_blob and "Warning: 99" not in text_blob,
+                  f"fabricated counts reached the text summary\n{text_blob[-600:]}")
         check(f"{case_id}/text-exit-code", text_proc.returncode == expected_exit,
               f"expected {expected_exit}, got {text_proc.returncode}")
         if incomplete_status:

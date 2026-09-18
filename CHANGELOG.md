@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.8] - 2026-09-18 [Release]
+
 ### Scanners
 
 - State the text-output contract and stop inventing counts from text that does not meet it. In `--format=json` the runner validates a module's contract document and rejects a non-conforming one; in `--format=text` it scraped `Critical issues:` / `Warning issues:` / `Files scanned:` out of whatever the module printed. A module that printed one garbage line and exited 0 therefore had counts invented for it — with a stub doing exactly that, text mode reported `Critical: 100` (42 scraped from the stub plus the Bash scanner's real 1) while json mode correctly reported only the Bash critical. Exiting 0 is what put this outside the "a module that exits non-zero must never be folded in as success" cluster. A contract-v2 module now announces itself with one line matching `^\s*UBS module:.*\(contract v2\)` (recorded in `modules/contract.json` as `formats.text_marker`): proof of origin, which is what a scrape needs and what a `Summary Statistics:` trailer cannot give, since the trailer is the counts block in question. Text without it is `MODULE_INVALID_TEXT` — status error, exit 2, counts discarded — the same treatment json mode has given a non-conforming document since bead B10. The module's text is still shown to a human either way, and enforcement is gated on the module advertising contract v2, so a third-party v1 module keeps the legacy scrape. (#110)

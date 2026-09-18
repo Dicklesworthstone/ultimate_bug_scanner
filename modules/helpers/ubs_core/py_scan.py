@@ -763,7 +763,11 @@ def main(argv: list[str] | None = None) -> int:
                 count_only=None, skip_categories=None, category_map=CATEGORY_MAP,
                 skip=skip, errors=scan_errors,
             )
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111, same shape as #103).
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(

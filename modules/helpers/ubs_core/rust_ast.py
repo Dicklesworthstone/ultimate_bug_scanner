@@ -83,8 +83,13 @@ def _parse_run_output(text: str, rule_id: str) -> list[dict]:
 
 
 def _run_spawn_patterns(path_list: list[str], rule_manifest: dict,
-                        ast_grep_bin: str, batch: int) -> tuple[Counter, dict[str, list[dict]]]:
-    """Legacy `ast-grep run --pattern` spawns for the run-mode-only rules."""
+                        ast_grep_bin: str, batch: int,
+                        errors: list[str] | None = None) -> tuple[Counter, dict[str, list[dict]]]:
+    """Legacy `ast-grep run --pattern` spawns for the run-mode-only rules.
+
+    A spawn that could not run appends to ``errors`` instead of contributing a
+    silent zero (#111).
+    """
     from ubs_core.rust_rules import RUN_MODE_RULES
 
     counts: Counter = Counter()
@@ -100,8 +105,26 @@ def _run_spawn_patterns(path_list: list[str], rule_manifest: dict,
                     [ast_grep_bin, "run", "--pattern", pattern, "-l", "rust", *batch_paths],
                     capture_output=True, text=True, timeout=600,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                continue  # legacy: failing pattern spawn contributed 0
+            except FileNotFoundError:
+                if errors is not None:
+                    errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+                continue
+            except OSError as exc:
+                if errors is not None:
+                    errors.append(f"ast-grep could not be launched: {exc}")
+                continue
+            except subprocess.TimeoutExpired:
+                if errors is not None:
+                    errors.append(f"ast-grep timed out on pattern {rule_id}")
+                continue
+            # `run --pattern` exits 0/1 the same way `scan` does; anything else
+            # is a failed spawn, which used to contribute a silent zero.
+            if proc.returncode not in (0, 1) and errors is not None:
+                detail = (proc.stderr or "").strip().splitlines()
+                errors.append(
+                    f"ast-grep exited {proc.returncode} on pattern {rule_id}"
+                    + (f": {detail[0][:160]}" if detail else "")
+                )
             for match in _parse_run_output(proc.stdout, rule_id):
                 key = (match["path"], match["line"], match["col"])
                 if key in seen:
@@ -113,12 +136,17 @@ def _run_spawn_patterns(path_list: list[str], rule_manifest: dict,
 
 
 def scan_all(rule_dir: Path, paths: Sequence[Path], ast_grep_bin: str = _ASTGREP_BIN,
-             batch: int = _BATCH) -> tuple[Counter, dict[str, list[dict]]]:
+             batch: int = _BATCH,
+             errors: list[str] | None = None) -> tuple[Counter, dict[str, list[dict]]]:
     """Run sgconfig-rust.yml (plus the run-mode spawns) over the path list.
 
-    Returns (rule-id match tally, rule-id -> match list). A failed scan
-    degrades to zero matches, exactly like the legacy ``run --pattern``
-    spawns whose failures left every count at 0.
+    Returns (rule-id match tally, rule-id -> match list). Matches already
+    parsed from a failed batch are kept — a partial result is still evidence —
+    but the failure itself is appended to ``errors`` so the caller can report
+    the scan as incomplete. Issue #111 (the same shape #103 fixed for Python):
+    a failed scan used to degrade to zero matches, exactly like the legacy
+    ``run --pattern`` spawns, so a rule pack that never ran was
+    indistinguishable from one that ran and matched nothing.
     """
     counts: Counter = Counter()
     matches: dict[str, list[dict]] = {}
@@ -134,8 +162,27 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ast_grep_bin: str = _ASTGREP
                     [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch_paths],
                     capture_output=True, text=True, timeout=600,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                continue  # legacy: scan failures degraded to zero AST matches
+            except FileNotFoundError:
+                if errors is not None:
+                    errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+                continue
+            except OSError as exc:
+                if errors is not None:
+                    errors.append(f"ast-grep could not be launched: {exc}")
+                continue
+            except subprocess.TimeoutExpired:
+                if errors is not None:
+                    errors.append(f"ast-grep timed out on {config.name}")
+                continue
+            # ast-grep exits 0 with no error-level diagnostics and 1 when it
+            # found some; anything else is a failed invocation, which used to
+            # degrade to zero AST matches.
+            if proc.returncode not in (0, 1) and errors is not None:
+                detail = (proc.stderr or "").strip().splitlines()
+                errors.append(
+                    f"ast-grep exited {proc.returncode} on {config.name}"
+                    + (f": {detail[0][:160]}" if detail else "")
+                )
             for match in _parse_stream(proc.stdout):
                 counts[match["rule"]] += 1
                 matches.setdefault(match["rule"], []).append(match)
@@ -147,7 +194,9 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ast_grep_bin: str = _ASTGREP
         except ValueError:
             rule_manifest = {}
     if rule_manifest:
-        spawn_counts, spawn_matches = _run_spawn_patterns(path_list, rule_manifest, ast_grep_bin, batch)
+        spawn_counts, spawn_matches = _run_spawn_patterns(
+            path_list, rule_manifest, ast_grep_bin, batch, errors
+        )
         counts.update(spawn_counts)
         for rule_id, entries in spawn_matches.items():
             matches.setdefault(rule_id, []).extend(entries)

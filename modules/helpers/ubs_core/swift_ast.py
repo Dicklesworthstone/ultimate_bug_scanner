@@ -32,8 +32,17 @@ def _sev_map(raw: str) -> str:
 
 
 def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
-             detail_limit: int = 3, ast_grep_bin: str = _ASTGREP_BIN) -> dict:
-    """Run the consolidated sgconfig; populate ctx.ast_records + sink records."""
+             detail_limit: int = 3, ast_grep_bin: str = _ASTGREP_BIN,
+             errors: list[str] | None = None) -> dict:
+    """Run the consolidated sgconfig; populate ctx.ast_records + sink records.
+
+    Records already parsed from a failed batch are kept — a partial result is
+    still evidence — but the failure itself is appended to ``errors`` so the
+    caller can report the scan as incomplete. Issue #111 (the same shape #103
+    fixed for Python): this layer used to swallow launch failures, timeouts and
+    non-zero exits, so a rule pack that never ran was indistinguishable from
+    one that ran and found nothing.
+    """
     counters = {"critical": 0, "warning": 0, "info": 0}
     config = rule_dir / "sgconfig-swift.yml"
     path_list = [Path(p) for p in paths]
@@ -57,8 +66,27 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
                     text=True,
                     timeout=600,
                 )
-            except (OSError, subprocess.TimeoutExpired):
-                continue  # legacy: `|| true` on the scan invocation
+            except FileNotFoundError:
+                if errors is not None:
+                    errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+                continue
+            except OSError as exc:
+                if errors is not None:
+                    errors.append(f"ast-grep could not be launched: {exc}")
+                continue
+            except subprocess.TimeoutExpired:
+                if errors is not None:
+                    errors.append(f"ast-grep timed out on {config.name}")
+                continue
+            # ast-grep exits 0 with no error-level diagnostics and 1 when it
+            # found some; anything else is a failed invocation, not a clean
+            # one. The legacy behaviour was `|| true` on the scan.
+            if proc.returncode not in (0, 1) and errors is not None:
+                detail = (proc.stderr or "").strip().splitlines()
+                errors.append(
+                    f"ast-grep exited {proc.returncode} on {config.name}"
+                    + (f": {detail[0][:160]}" if detail else "")
+                )
             for line in proc.stdout.splitlines():
                 line = line.strip()
                 if not line:

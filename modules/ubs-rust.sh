@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e66d4e32cfb3876ea7d52ffd8b8eb036966c04c2529df885d51ee6ee5358762a"
+UBS_LIB_CHECKSUM="35fe87edcf04618bc20a18a8673fb237efc0d0813b777a71c7db0e184e4161e1"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -548,6 +548,12 @@ count_warnings_errors() {
 
 CARGO_UNAVAILABLE=0
 CARGO_UNAVAILABLE_MSG=""
+# Set when the contract-v2 analyzer itself could not finish (#111): its AST
+# layer failed to launch, timed out, or exited abnormally. Unlike
+# CARGO_UNAVAILABLE (a known-degraded but completed scan) this is an incomplete
+# scan, so the module also exits 2.
+ANALYZER_INCOMPLETE=0
+ANALYZER_INCOMPLETE_MSG=""
 V2_SINK=""
 _v2_sink_bucket(){
   local severity="$1" count="$2" title="$3" desc="${4:-}" cat_slug="${5:-}" cat_name="${6:-}" rule="${7:-rust.cargo.phase}"
@@ -857,6 +863,13 @@ run_v2_summary_json(){
     status_json="$(printf '"status":"partial","module_error":"CARGO_UNAVAILABLE","message":"%s"' \
       "$(json_escape "cargo could not run, so compilation, tests and lints were not evaluated: ${CARGO_UNAVAILABLE_MSG}")")"
   fi
+  # An incomplete analysis outranks a merely degraded one: cargo being absent
+  # still leaves a finished scan of everything else, an analyzer that could not
+  # run does not (#111).
+  if [[ "$ANALYZER_INCOMPLETE" -eq 1 ]]; then
+    status_json="$(printf '"status":"partial","module_error":"ANALYZER_ERROR","message":"%s"' \
+      "$(json_escape "$ANALYZER_INCOMPLETE_MSG")")"
+  fi
   printf '{"language":"rust","project":"%s","files":%s,"critical":%s,"warning":%s,"info":%s,"timestamp":"%s","format":"json",%s}\n' \
     "$(json_escape "$PROJECT_DIR")" "$TOTAL_FILES" "$V2_CRITICAL" "$V2_WARNING" "$V2_INFO" "$(json_escape "$(now)")" "$status_json"
 }
@@ -889,6 +902,7 @@ run_v2_legacy_parity_bridges_rust(){
 
 run_contract_v2_rust(){
   local helpers_dir="" list_file sink checks text_out="" rule_dir="" exit_code=0 v2_json_out=""
+  local analyzer_exit=0 parity_exit=0
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-sink.XXXXXX)"
@@ -960,7 +974,20 @@ generate(Path('$DUMP_RULES_DIR'))
   esac
 
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.rust_scan \
-    "${scan_args[@]}" --version "2.0.1" || exit_code=$?
+    "${scan_args[@]}" --version "2.0.1" || analyzer_exit=$?
+  exit_code="$analyzer_exit"
+  # Exit 0/1 are "no findings"/"findings"; anything else means the analyzer did
+  # not finish (#111). Its own summary document carries the precise reason when
+  # one was written, so prefer that over the generic fallback.
+  if [[ "$analyzer_exit" -ne 0 && "$analyzer_exit" -ne 1 ]]; then
+    ANALYZER_INCOMPLETE=1
+    if [[ -n "$v2_json_out" && -s "$v2_json_out" ]] && command -v jq >/dev/null 2>&1; then
+      ANALYZER_INCOMPLETE_MSG="$(jq -r '.message // empty' "$v2_json_out" 2>/dev/null || true)"
+    fi
+    if [[ -z "$ANALYZER_INCOMPLETE_MSG" ]]; then
+      ANALYZER_INCOMPLETE_MSG="Rust analysis did not complete (analyzer exit ${analyzer_exit}); see stderr for the failing invocation"
+    fi
+  fi
 
   if [[ -n "$EMIT_FINDINGS_JSON" ]]; then
     while IFS=$'\t' read -r sev cnt cat ttl desc samples; do
@@ -980,7 +1007,18 @@ PYV2FIND
 )
   fi
 
-  run_v2_legacy_parity_bridges_rust "$sink" "$text_out" || exit_code=$?
+  run_v2_legacy_parity_bridges_rust "$sink" "$text_out" || parity_exit=$?
+  if [[ "$parity_exit" -ne 0 ]]; then
+    exit_code="$parity_exit"
+  fi
+  # Execution failures dominate severity (#111): the parity recount only knows
+  # about findings, so without this an analyzer that could not finish (exit 2)
+  # would be reported as the ordinary "found criticals" exit 1 whenever the
+  # regex layers matched anything. The findings are still emitted, so the
+  # partial evidence is kept alongside the incomplete-scan status.
+  if [[ "$analyzer_exit" -ne 0 && "$analyzer_exit" -ne 1 ]]; then
+    exit_code="$analyzer_exit"
+  fi
 
   if [[ "$FORMAT" == "text" ]]; then
     cat "$text_out" 2>/dev/null || true

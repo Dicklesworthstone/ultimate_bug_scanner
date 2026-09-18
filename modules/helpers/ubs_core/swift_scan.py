@@ -1018,6 +1018,9 @@ def main(argv: list[str] | None = None) -> int:
     suppressions = SourceSuppressions("swift")
 
     capturing_sink = None
+    # Every analysis layer that could not complete appends here, so a scan that
+    # did not finish is never reported as a finished one (#111).
+    scan_errors: list[str] = []
     if files_to_scan:
         from ubs_core.prefilter import build_prefilter_index, run_prefilter
         from ubs_core.registry import analyzers_for_lang
@@ -1059,7 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
 
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
             scan_all(Path(args.ast_rule_dir), ast_files, scan_ctx, capturing_sink, skip=skip,
-                     detail_limit=args.detail_limit)
+                     detail_limit=args.detail_limit, errors=scan_errors)
         if args.ast_available and not scan_ctx.ast_stream_ok:
             _write_record(capturing_sink, {
                 "rule": "swift.concurrency.async-rules",
@@ -1073,9 +1076,13 @@ def main(argv: list[str] | None = None) -> int:
             }, skip)
         run_detectors(scan_ctx, capturing_sink, skip)
         run_analyzers(scan_ctx, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
-        cache.store_scanned_files(files_to_scan, {
-            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
-        })
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111).
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -1127,6 +1134,10 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (#111).
+    if scan_errors:
+        exit_code = 2
 
     if args.json_out:
         import datetime
@@ -1149,11 +1160,16 @@ def main(argv: list[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "ok",
+            "status": "partial" if scan_errors else "ok",
             "findings": records,
             "report": _legacy_report(records, args.version),
             "extras": {"profile": profile_data},
         }
+        if scan_errors:
+            doc["module_error"] = "ANALYZER_ERROR"
+            doc["message"] = (
+                "Swift analysis did not complete: " + "; ".join(scan_errors[:5])
+            )[:500]
         if os.environ.get("UBS_PROFILE") == "1":
             doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1164,8 +1180,11 @@ def main(argv: list[str] | None = None) -> int:
         renderer.render(skip)
         Path(args.text_out).write_text(renderer.text(), encoding="utf-8")
 
+    for problem in scan_errors:
+        sys.stderr.write(f"ubs-swift: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
-                                 "prefilter": prefilter_res.to_dict()}) + "\n")
+                                 "prefilter": prefilter_res.to_dict(),
+                                 "errors": scan_errors}) + "\n")
     return exit_code
 
 

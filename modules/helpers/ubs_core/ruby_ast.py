@@ -56,13 +56,26 @@ def scan_config(
     counted_rules: set[str] | None = None,
     category_map: dict[str, int] | None = None,
     skip: set[int] | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
-    """Run one sgconfig over the path list; write sink records; return counters."""
+    """Run one sgconfig over the path list; write sink records; return counters.
+
+    Failure reporting has two modes (#111). Without ``errors`` every failure
+    raises, which is what a direct caller (the rule-quality harness) wants: a
+    broken rule pack must not look like a pack that matched nothing. With
+    ``errors`` the failure is appended as a bounded description and the scan
+    carries on, so the records already parsed survive and the caller can report
+    an incomplete scan (``status: partial`` / exit 2) instead of losing every
+    other analysis layer to an exception.
+    """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
     if not path_list:
         return counters
     if not config.is_file():
+        if errors is not None:
+            errors.append(f"Ruby AST configuration is missing: {config}")
+            return counters
         raise RuntimeError(f"Ruby AST configuration is missing: {config}")
     cache: dict[Path, list[str]] = {}
     for start in range(0, len(path_list), _BATCH):
@@ -75,11 +88,23 @@ def scan_config(
                 timeout=600,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
+            if errors is not None:
+                errors.append(f"Ruby AST scan could not run with {config.name}: {exc}")
+                continue
             raise RuntimeError(f"Ruby AST scan could not run with {config}: {exc}") from exc
+        # `ast-grep scan` exits 0 with no error-level diagnostics and 1 when it
+        # found some; anything else is a failed invocation.
         if proc.returncode not in (0, 1):
-            raise RuntimeError(
-                f"Ruby AST scan failed with {config} (exit {proc.returncode}): {proc.stderr.strip()}"
-            )
+            detail = (proc.stderr or "").strip()
+            if errors is not None:
+                errors.append(
+                    f"Ruby AST scan failed with {config.name} (exit {proc.returncode})"
+                    + (f": {detail.splitlines()[0][:160]}" if detail else "")
+                )
+            else:
+                raise RuntimeError(
+                    f"Ruby AST scan failed with {config} (exit {proc.returncode}): {detail}"
+                )
         for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -87,8 +112,14 @@ def scan_config(
             try:
                 match = json.loads(line)
             except json.JSONDecodeError as exc:
+                if errors is not None:
+                    errors.append(f"Ruby AST scan returned invalid JSON with {config.name}: {exc}")
+                    continue
                 raise RuntimeError(f"Ruby AST scan returned invalid JSON with {config}: {exc}") from exc
             if not isinstance(match, dict):
+                if errors is not None:
+                    errors.append(f"Ruby AST scan returned a non-object finding with {config.name}")
+                    continue
                 raise RuntimeError(f"Ruby AST scan returned a non-object finding with {config}")
             rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
             file_str = str(match.get("file", "") or match.get("path", ""))
@@ -142,13 +173,17 @@ def scan_all(
     counted_rules: set[str] | None = None,
     category_map: dict[str, int] | None = None,
     skip: set[int] | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
-    """Run every sgconfig-*.yml in rule_dir; aggregate counters."""
+    """Run every sgconfig-*.yml in rule_dir; aggregate counters.
+
+    ``errors`` collects any scan that could not complete, so the caller can
+    report a partial run rather than a clean one (#111)."""
     total = {"critical": 0, "warning": 0, "info": 0}
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         counters = scan_config(
             config, paths, sink, severity_overrides, ast_grep_bin,
-            counted_rules, category_map, skip,
+            counted_rules, category_map, skip, errors,
         )
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value

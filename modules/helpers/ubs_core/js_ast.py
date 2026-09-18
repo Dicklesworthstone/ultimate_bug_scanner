@@ -75,8 +75,14 @@ def scan_config(
     ast_grep_bin: str = _ASTGREP_BIN,
     count_only: set[str] | None = None,
     skip_categories: set[int] | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
-    """Run one sgconfig over the path list; write sink records; return counters."""
+    """Run one sgconfig over the path list; write sink records; return counters.
+
+    A batch that could not run appends to ``errors`` instead of contributing a
+    silent zero, and the records already parsed from a failed batch are kept —
+    a partial result is still evidence (#111).
+    """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
     if not path_list or not config.is_file():
@@ -84,12 +90,34 @@ def scan_config(
     cache: dict[Path, list[str]] = {}
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
-        proc = subprocess.run(
-            [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
+        try:
+            proc = subprocess.run(
+                [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        except FileNotFoundError:
+            if errors is not None:
+                errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+            continue
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"ast-grep could not be launched: {exc}")
+            continue
+        except subprocess.TimeoutExpired:
+            if errors is not None:
+                errors.append(f"ast-grep timed out on {config.name}")
+            continue
+        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
+        # some; anything else is a failed invocation, which used to degrade to
+        # zero AST findings.
+        if proc.returncode not in (0, 1) and errors is not None:
+            detail = (proc.stderr or "").strip().splitlines()
+            errors.append(
+                f"ast-grep exited {proc.returncode} on {config.name}"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
         for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -142,15 +170,20 @@ def scan_all(
     ast_grep_bin: str = _ASTGREP_BIN,
     count_only: set[str] | None = None,
     skip_categories: set[int] | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
     """Run every sgbase-<lang>.yml (base-language rules only) in rule_dir;
     aggregate counters. The variant-bearing sgconfig-*.yml files stay
     SARIF-only, mirroring the legacy text-mode scan of the base pack.
-    Rules whose category is skipped (--skip) are not emitted."""
+    Rules whose category is skipped (--skip) are not emitted.
+
+    ``errors`` collects any scan that could not complete, so the caller can
+    report a partial run rather than a clean one (#111)."""
     total = {"critical": 0, "warning": 0, "info": 0}
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         lang = config.stem.removeprefix("sgconfig-")
-        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin, count_only, skip_categories)
+        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin,
+                               count_only, skip_categories, errors)
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value
     return total

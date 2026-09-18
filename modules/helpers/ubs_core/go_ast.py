@@ -84,6 +84,7 @@ def scan_config(
     skip: set[int] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
     slug_for_category=None,
+    errors: list[str] | None = None,
 ) -> tuple[Counter, dict[str, list[dict]]]:
     """Run one sgconfig over the path list.
 
@@ -109,8 +110,27 @@ def scan_config(
                 text=True,
                 timeout=600,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            continue  # legacy: scan failures degraded to "AST rules disabled"
+        except FileNotFoundError:
+            if errors is not None:
+                errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+            continue
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"ast-grep could not be launched: {exc}")
+            continue
+        except subprocess.TimeoutExpired:
+            if errors is not None:
+                errors.append(f"ast-grep timed out on {config.name}")
+            continue
+        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
+        # some; anything else is a failed invocation, not a clean one. The
+        # legacy behaviour degraded it to "AST rules disabled" (#111).
+        if proc.returncode not in (0, 1) and errors is not None:
+            detail = (proc.stderr or "").strip().splitlines()
+            errors.append(
+                f"ast-grep exited {proc.returncode} on {config.name}"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
         for match in _parse_stream(proc.stdout):
             rule_id = match["rule"]
             counts[rule_id] += 1
@@ -159,8 +179,12 @@ def scan_all(
     skip: set[int] | None = None,
     ast_grep_bin: str = _ASTGREP_BIN,
     slug_for_category=None,
+    errors: list[str] | None = None,
 ) -> tuple[Counter, dict[str, list[dict]]]:
     """Run every sgconfig-*.yml in rule_dir; aggregate tally and matches.
+
+    ``errors`` collects any scan that could not complete, so the caller can
+    report a partial run rather than a clean one (#111).
 
     The category-16 inventory tally covers only the main pack
     (sgconfig-go.yml); the async single-rule config contributes matches and
@@ -173,7 +197,7 @@ def scan_all(
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         counts, matches = scan_config(
             config, paths, consumption, sink, skip, ast_grep_bin,
-            slug_for_category,
+            slug_for_category, errors,
         )
         if config.name == "sgconfig-go.yml":
             total.update(counts)

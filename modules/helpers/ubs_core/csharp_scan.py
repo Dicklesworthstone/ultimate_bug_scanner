@@ -552,6 +552,9 @@ def main(argv: list | None = None) -> int:
 
     capturing_sink = None
     ast_ran = False
+    # Every analysis layer that could not complete appends here, so a scan that
+    # did not finish is never reported as a finished one (#111).
+    scan_errors: list[str] = []
     if files_to_scan:
         from ubs_core.csharp_rules import _RULES
         from ubs_core.registry import analyzers_for_lang
@@ -598,12 +601,17 @@ def main(argv: list | None = None) -> int:
                 rule_category=CATEGORY_MAP,
                 slug_for_rule=slug_for_category,
                 base_dir=base_dir,
+                errors=scan_errors,
             )
             ast_ran = True
         scan_patterns(patterns, texts, capturing_sink, skip, phase=1, ast_ran=ast_ran, prefilter=prefilter_res)
-        cache.store_scanned_files(files_to_scan, {
-            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
-        })
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111).
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -666,12 +674,23 @@ def main(argv: list | None = None) -> int:
         exit_code = 1
     elif args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (#111).
+    if scan_errors:
+        exit_code = 2
 
     if args.text_out:
         render_text(args, ast_ran, patterns)
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns), "ast": ast_ran,
-                                 "prefilter": prefilter_res.to_dict()}) + "\n")
+    stderr_summary = {"counters": counters, "patterns": len(patterns), "ast": ast_ran,
+                      "prefilter": prefilter_res.to_dict()}
+    if scan_errors:
+        # The detail belongs where the meta-runner already surfaces module
+        # stderr; the summary document carries the status and the error class.
+        stderr_summary["errors"] = scan_errors[:5]
+        for problem in scan_errors:
+            sys.stderr.write(f"ubs-csharp: analysis incomplete: {problem}\n")
+    sys.stderr.write(json.dumps(stderr_summary) + "\n")
     return exit_code
 
 

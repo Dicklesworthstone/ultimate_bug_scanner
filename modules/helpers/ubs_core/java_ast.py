@@ -50,8 +50,17 @@ def scan_config(
     counted_rules: set[str] | None = None,
     skip_categories: set[int] | None = None,
     category_for_rule=None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
-    """Run one sgconfig over the path list; write sink records; return counters."""
+    """Run one sgconfig over the path list; write sink records; return counters.
+
+    Records already parsed from a failed batch are kept — a partial result is
+    still evidence — but the failure itself is appended to ``errors`` so the
+    caller can report the scan as incomplete. Issue #111 (the same shape #103
+    fixed for Python): this layer used to swallow launch failures, timeouts and
+    non-zero exits, so a rule pack that never ran was indistinguishable from
+    one that ran and found nothing.
+    """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
     if not path_list or not config.is_file():
@@ -66,8 +75,27 @@ def scan_config(
                 text=True,
                 timeout=600,
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return counters
+        except FileNotFoundError:
+            if errors is not None:
+                errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+            continue
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"ast-grep could not be launched: {exc}")
+            continue
+        except subprocess.TimeoutExpired:
+            if errors is not None:
+                errors.append(f"ast-grep timed out on {config.name}")
+            continue
+        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
+        # some; anything else (bad config, unreadable path, internal error) is
+        # a failed invocation, not a clean one.
+        if proc.returncode not in (0, 1) and errors is not None:
+            detail = (proc.stderr or "").strip().splitlines()
+            errors.append(
+                f"ast-grep exited {proc.returncode} on {config.name}"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
         for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -128,14 +156,19 @@ def scan_all(
     counted_rules: set[str] | None = None,
     skip_categories: set[int] | None = None,
     category_for_rule=None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
-    """Run every sgbase-*.yml in rule_dir; aggregate counters."""
+    """Run every sgbase-*.yml in rule_dir; aggregate counters.
+
+    ``errors`` collects any scan that could not complete, so the caller can
+    report a partial run rather than a clean one (#111).
+    """
     total = {"critical": 0, "warning": 0, "info": 0}
     for config in sorted(rule_dir.glob("sgbase-*.yml")):
         lang = config.stem.removeprefix("sgbase-")
         counters = scan_config(
             config, paths, sink, lang, severity_overrides, ast_grep_bin,
-            counted_rules, skip_categories, category_for_rule,
+            counted_rules, skip_categories, category_for_rule, errors,
         )
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value

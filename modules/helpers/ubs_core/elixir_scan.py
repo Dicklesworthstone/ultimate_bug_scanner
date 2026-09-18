@@ -548,6 +548,9 @@ def main(argv: list[str] | None = None) -> int:
     cached_findings, files_to_scan = cache.partition_files(files)
 
     capturing_sink = None
+    # Every analysis layer that could not complete appends here, so a scan that
+    # did not finish is never reported as a finished one (#111).
+    scan_errors: list[str] = []
     if files_to_scan:
         elixir_analyzers = [a.name for a in analyzers_for_lang("elixir")]
         ast_rules_input = []
@@ -592,8 +595,13 @@ def main(argv: list[str] | None = None) -> int:
                 rule_category=CATEGORY_MAP,
                 slug_for_rule=lambda cat: _CATEGORY_SLUGS.get(cat, "ast"),
                 base_dir=base_dir,
+                errors=scan_errors,
             )
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111).
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -637,6 +645,10 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (#111).
+    if scan_errors:
+        exit_code = 2
 
     if args.json_out:
         records = read_ndjson(args.sink)
@@ -659,13 +671,18 @@ def main(argv: list[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "ok",
+            "status": "partial" if scan_errors else "ok",
             "findings": records,
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
             "report": _legacy_report(records, args.version),
             "extras": {"profile": profile_data},
         }
+        if scan_errors:
+            doc["module_error"] = "ANALYZER_ERROR"
+            doc["message"] = (
+                "Elixir analysis did not complete: " + "; ".join(scan_errors[:5])
+            )[:500]
         if os.environ.get("UBS_PROFILE") == "1":
             doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -673,7 +690,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.text_out:
         _render_text(args, files, counters)
 
-    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns)}) + "\n")
+    for problem in scan_errors:
+        sys.stderr.write(f"ubs-elixir: analysis incomplete: {problem}\n")
+    sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
+                                 "errors": scan_errors}) + "\n")
     return exit_code
 
 

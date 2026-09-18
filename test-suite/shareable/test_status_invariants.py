@@ -298,6 +298,106 @@ def check_incomplete_scan_refuses_baseline(tmpdir: Path) -> None:
         check("baseline/compare-partial-written", False, f"{report2} missing")
 
 
+AST_GREP_FAILING_STUB = r"""#!/usr/bin/env bash
+# Version/help probes succeed, so a module still decides its AST layer is
+# available and runs it; the scan itself exits 2 — a failed invocation
+# (unreadable config, bad path, internal error). A module that reports "ok"
+# after this is reporting a scan that ran and found nothing, when it never ran.
+case "${1:-}" in
+  --version|-V|version|--help|-h|help)
+    echo "ast-grep 0.0.0-stub"
+    exit 0
+    ;;
+esac
+echo "ast-grep: simulated internal error" >&2
+exit 2
+"""
+
+# (module, fixture dir under test-suite/). Every scanner that spawns ast-grep:
+# python (whose #103 fix is the template), the eight *_ast.py helpers of issue
+# #111, and bash, whose ast-grep layer is inline in bash_scan.py and so was in
+# neither issue's file list. cpp has no ast-grep layer (documented in
+# cpp_scan.py) and kotlin's rule pack only feeds the prefilter index — neither
+# one ever spawns the binary, so neither can swallow its failure.
+AST_GREP_MODULES = (
+    ("python", "python/buggy"),
+    ("java", "java/buggy"),
+    ("csharp", "csharp/buggy"),
+    ("elixir", "elixir/buggy"),
+    ("swift", "swift/buggy"),
+    ("golang", "golang/buggy"),
+    ("rust", "rust/buggy"),
+    ("js", "js/buggy"),
+    ("ruby", "ruby/buggy"),
+    ("bash", "bash/buggy"),
+)
+
+
+def check_analyzer_failure_is_never_a_clean_module(tmpdir: Path) -> None:
+    """An ast-grep layer that failed must make its own module report an
+    incomplete scan (issues #103 and #111).
+
+    The run-level half of this is check_matrix above, driven by a stub module.
+    This is the per-module half: the REAL scanner runs against a stub
+    `ast-grep` that exits 2, which is what a broken rule pack, an unreadable
+    config or an internal ast-grep error looks like. Before the fix each
+    module's AST layer swallowed that and contributed zero findings, so a rule
+    pack that never ran was indistinguishable from one that ran and matched
+    nothing — and the finding recount then relabelled the failure as the
+    ordinary "found criticals" exit 1.
+
+    Three things are asserted per language: the process exits 2, the module's
+    own JSON says it did not complete, and the findings from the layers that
+    DID run survive (a failure must not throw away evidence).
+    """
+    work = tmpdir / "analyzer"
+    bin_dir = work / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "ast-grep"
+    stub.write_text(AST_GREP_FAILING_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+
+    merged = os.environ.copy()
+    merged.update({
+        "NO_COLOR": "1",
+        "CI": "1",
+        # The cache must not answer for a scan that failed, and a previous
+        # complete run must not answer for this one either.
+        "UBS_NO_CACHE": "1",
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+    })
+
+    for module, fixture in AST_GREP_MODULES:
+        script = REPO_ROOT / "modules" / f"ubs-{module}.sh"
+        target = REPO_ROOT / "test-suite" / fixture
+        if not script.is_file() or not target.is_dir():
+            check(f"analyzer/{module}-present", False, f"missing {script} or {target}")
+            continue
+        proc = subprocess.run(
+            [str(script), str(target), "--format=json"],
+            cwd=work, capture_output=True, text=True, env=merged, check=False,
+            # Generous: these are real scans of a buggy fixture tree, and the
+            # box may be loaded. A fixed short cap here would be a false red.
+            timeout=600,
+        )
+        check(f"analyzer/{module}-exits-2", proc.returncode == 2,
+              f"expected 2, got {proc.returncode}; stderr={proc.stderr[-300:]}")
+        try:
+            doc = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            check(f"analyzer/{module}-json", False,
+                  f"module JSON was unparseable: {exc}; stdout={proc.stdout[:300]}")
+            continue
+        check(f"analyzer/{module}-status-not-ok", doc.get("status") != "ok",
+              f"status={doc.get('status')!r} after a failed ast-grep")
+        check(f"analyzer/{module}-names-the-failure",
+              doc.get("module_error") == "ANALYZER_ERROR",
+              f"module_error={doc.get('module_error')!r} message={str(doc.get('message'))[:200]!r}")
+        surviving = sum(int(doc.get(key) or 0) for key in ("critical", "warning", "info"))
+        check(f"analyzer/{module}-keeps-other-layers", surviving > 0,
+              "a failed AST layer discarded the findings of every other layer")
+
+
 def check_undeliverable_artifact_fails(tmpdir: Path) -> None:
     """A requested artifact that could not be written must fail the run (#106)."""
     target, bin_dir = make_workspace(tmpdir / "delivery")
@@ -373,6 +473,7 @@ def main() -> int:
         check_matrix(tmpdir)
         check_new_only_preserves_execution_state(tmpdir)
         check_incomplete_scan_refuses_baseline(tmpdir)
+        check_analyzer_failure_is_never_a_clean_module(tmpdir)
         check_undeliverable_artifact_fails(tmpdir)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

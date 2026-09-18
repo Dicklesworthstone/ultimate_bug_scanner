@@ -26,7 +26,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e66d4e32cfb3876ea7d52ffd8b8eb036966c04c2529df885d51ee6ee5358762a"
+UBS_LIB_CHECKSUM="35fe87edcf04618bc20a18a8673fb237efc0d0813b777a71c7db0e184e4161e1"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -502,13 +502,22 @@ for rec in records:
     sev = rec.get("severity", "info")
     counts[sev if sev in counts else "info"] += 1
 
-exit_code = 1 if counts["critical"] > 0 else (scan_exit if scan_exit in (0, 1) else scan_exit)
-if fail_crit >= 0 and counts["critical"] >= fail_crit:
-    exit_code = 1
-if fail_warn >= 0 and counts["warning"] >= fail_warn:
-    exit_code = 1
-elif fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
-    exit_code = 1
+# Issue #111 (the shape #103 fixed for Python): this recount used to overwrite
+# an abnormal scanner status with the ordinary finding exit 1 whenever
+# criticals existed, so "the scanner could not finish" and "the scanner found
+# bugs" became the same exit code. Execution failures dominate severity: a scan
+# that did not complete is reported as incomplete (exit 2) whatever it managed
+# to find, and the findings are still emitted so the partial evidence is kept.
+if scan_exit not in (0, 1):
+    exit_code = scan_exit
+else:
+    exit_code = 1 if counts["critical"] > 0 else scan_exit
+    if fail_crit >= 0 and counts["critical"] >= fail_crit:
+        exit_code = 1
+    if fail_warn >= 0 and counts["warning"] >= fail_warn:
+        exit_code = 1
+    elif fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+        exit_code = 1
 
 # Helper statuses (legacy emit_summary_json "helpers" block), derived from
 # the sink: the A2 analyzers always ran in-process when we got here.
@@ -534,7 +543,11 @@ doc = {
     "format": fmt,
     "tool": "ubs-csharp",
     "version": version,
-    "status": "ok",
+    # A scan that could not finish is not a clean one (#111). Keyed on the
+    # analyzer's own exit, not on the final one, so any abnormal status counts
+    # and not just 2. The detail is on this module's stderr, which the
+    # meta-runner already surfaces.
+    "status": "partial" if scan_exit not in (0, 1) else "ok",
     "tooling": {"rg": int(has_rg or 0), "ast_grep": int(has_ast or 0),
                 "dotnet": int(has_dotnet or 0), "python3": 1},
     "helpers": {"type_narrowing": type_narrowing,
@@ -543,6 +556,12 @@ doc = {
     "exit_code": exit_code,
     "findings": records,
 }
+if scan_exit not in (0, 1):
+    doc["module_error"] = "ANALYZER_ERROR"
+    doc["message"] = (
+        "C# analysis did not complete: an analysis layer failed; see this "
+        "module's stderr for which one"
+    )
 if summary_json:
     try:
         with open(summary_json, "w", encoding="utf-8") as fh:

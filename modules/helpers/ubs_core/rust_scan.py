@@ -261,6 +261,9 @@ class Scan:
         self.texts: dict[Path, str] = {}
         self.lines_map: dict[Path, list[str]] = {}
         self.suppressions = SourceSuppressions("rust")
+        # Every analysis layer that could not complete appends here, so a scan
+        # that did not finish is never reported as a finished one (#111).
+        self.scan_errors: list[str] = []
 
         def _read_entry(p: Path) -> tuple[Path, str, list[str]]:
             try:
@@ -402,7 +405,7 @@ class Scan:
         from ubs_core import rust_ast
 
         targets = ast_files if ast_files is not None else self.files
-        _, matches = rust_ast.scan_all(rule_dir, targets)
+        _, matches = rust_ast.scan_all(rule_dir, targets, errors=self.scan_errors)
         allowed = self.allowed
         for rule_id, entries in matches.items():
             kept: list[dict] = []
@@ -756,13 +759,17 @@ def run_narrowing(scan: Scan, skip_type_narrowing: bool) -> list[Hit]:
         return []
     from ubs_core.analyzers import narrowing_rust
 
-    guard_json = _emit_guard_matches(scan.project_dir)
+    guard_json, guard_incomplete = _emit_guard_matches(scan.project_dir)
     try:
-        if guard_json is not None:
+        if guard_json is not None and not guard_incomplete:
             issues = narrowing_rust.analyze_with_ast_json(scan.project_dir, guard_json)
             if not issues:
                 issues = narrowing_rust.analyze_with_regex(scan.project_dir)
         else:
+            # A guard scan that could not finish is treated exactly like an
+            # absent ast-grep: the regex walk covers the whole file list on its
+            # own, so this keeps coverage complete instead of reporting a
+            # narrower result as a finished one (#111).
             issues = _narrowing_regex_over_list(scan)
     finally:
         if guard_json is not None:
@@ -793,16 +800,23 @@ def _narrowing_regex_over_list(scan: Scan):
     return issues
 
 
-def _emit_guard_matches(project_dir: Path) -> Path | None:
+def _emit_guard_matches(project_dir: Path) -> tuple[Path | None, bool]:
     """Legacy emit_rust_guard_matches (433-449): two pattern-mode JSONL
-    spawns concatenated into one file. Returns None when ast-grep is
-    unavailable (the caller then uses the regex fallback over the list)."""
+    spawns concatenated into one file.
+
+    Returns (path, incomplete). The path is None when ast-grep is unavailable;
+    ``incomplete`` is True when a spawn was attempted and did not succeed. The
+    caller uses the regex analyzer in either case: a spawn that fails after the
+    other one succeeded leaves a *partial* match file, which still yields some
+    issues, so the caller's "empty means fall back" test would not fire and
+    narrowing would silently cover less than the whole tree (#111).
+    """
     import subprocess
     import tempfile
 
     ast_grep = _ast_grep_bin()
     if ast_grep is None:
-        return None
+        return None, False
     fd, tmp_path = tempfile.mkstemp(prefix="ubs-v2-rust-guards-", suffix=".jsonl")
     os.close(fd)
     tmp = Path(tmp_path)
@@ -810,6 +824,7 @@ def _emit_guard_matches(project_dir: Path) -> Path | None:
         "if let Some($BIND) = $SOURCE { $BODY }",
         "if let Ok($BIND) = $SOURCE { $BODY }",
     )
+    incomplete = False
     with tmp.open("w", encoding="utf-8") as fh:
         for pattern in patterns:
             try:
@@ -818,7 +833,11 @@ def _emit_guard_matches(project_dir: Path) -> Path | None:
                     capture_output=True, text=True, timeout=300,
                 )
             except (OSError, subprocess.TimeoutExpired):
+                incomplete = True
                 continue
+            # 0 = no matches, 1 = matches; anything else is a failed spawn.
+            if proc.returncode not in (0, 1):
+                incomplete = True
             for line in proc.stdout.splitlines():
                 line = line.strip()
                 if not line:
@@ -828,7 +847,7 @@ def _emit_guard_matches(project_dir: Path) -> Path | None:
                 except ValueError:
                     continue
                 fh.write(line + "\n")
-    return tmp
+    return tmp, incomplete
 
 
 _AST_GREP_CACHE: str | None = None
@@ -1808,7 +1827,11 @@ def main(argv: list[str] | None = None) -> int:
         by_file: dict[str, list[dict]] = {}
         for record in scan.records:
             by_file.setdefault(record.get("path", ""), []).append(record)
-        cache.store_scanned_files(files_to_scan, by_file)
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111).
+        if not scan.scan_errors:
+            cache.store_scanned_files(files_to_scan, by_file)
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -1858,7 +1881,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         doc = {
             "language": "rust",
-            "status": "ok",
+            "status": "partial" if scan.scan_errors else "ok",
             "project": args.project or str(project_dir),
             "files": files_n,
             "critical": scan.counters["critical"],
@@ -1870,6 +1893,11 @@ def main(argv: list[str] | None = None) -> int:
             "findings": scan.records,
             "extras": {"profile": profile_data},
         }
+        if scan.scan_errors:
+            doc["module_error"] = "ANALYZER_ERROR"
+            doc["message"] = (
+                "Rust analysis did not complete: " + "; ".join(scan.scan_errors[:5])
+            )[:500]
         if os.environ.get("UBS_PROFILE") == "1":
             doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1879,10 +1907,17 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 1
     if args.fail_on_warning and (scan.counters["critical"] + scan.counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (#111).
+    if scan.scan_errors:
+        exit_code = 2
+    for problem in scan.scan_errors:
+        sys.stderr.write(f"ubs-rust: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps({
         "counters": dict(scan.counters), "records": len(scan.records),
         "files": len(scan.files),
         "prefilter": prefilter_res.to_dict(),
+        "errors": scan.scan_errors,
     }) + "\n")
     return exit_code
 

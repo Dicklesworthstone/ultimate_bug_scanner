@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e66d4e32cfb3876ea7d52ffd8b8eb036966c04c2529df885d51ee6ee5358762a"
+UBS_LIB_CHECKSUM="35fe87edcf04618bc20a18a8673fb237efc0d0813b777a71c7db0e184e4161e1"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -728,6 +728,15 @@ PYCSV
 HTML
   fi
 
+  # Issue #111 (the shape #103 fixed for Python): this recomputation used to
+  # reset the scanner's own status to 0 and re-derive the exit from the counts,
+  # so "the scanner could not finish" became "the scanner found bugs" — or,
+  # with no criticals, "clean". Execution failures dominate severity: a scan
+  # that did not complete keeps its exit 2 whatever it managed to find, and the
+  # findings are still emitted so the partial evidence is kept.
+  if [[ "$exit_code" -ne 0 && "$exit_code" -ne 1 ]]; then
+    return "$exit_code"
+  fi
   exit_code=0
   if [[ "$crit" -gt 0 ]]; then exit_code=1; fi
   if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit + warn)) -gt 0 ]]; then exit_code=1; fi

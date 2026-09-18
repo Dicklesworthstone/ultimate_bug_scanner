@@ -17,7 +17,7 @@
   "exit_codes": {
     "0": "no critical findings (and no warnings when --fail-on-warning is set)",
     "1": "critical findings, or warnings with --fail-on-warning",
-    "2": "usage or environment error: unknown flag, unsupported --format, missing modules/lib/ubs-common.sh, missing required tool"
+    "2": "usage or environment error: unknown flag, unsupported --format, missing modules/lib/ubs-common.sh, missing required tool; also an incomplete scan, where an analysis layer could not run (status partial, module_error ANALYZER_ERROR) — the findings it did produce are still emitted"
   },
   "environment": {
     "UBS_LANG": "set by the meta-runner to the module's language name",

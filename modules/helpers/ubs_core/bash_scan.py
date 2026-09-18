@@ -400,7 +400,16 @@ def scan_ast_rules(
     skip: set[int],
     reported_locations: set[tuple[str, int]],
     prefilter: Any = None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
+    """Run the Bash sgconfig over the file list; write sink records.
+
+    A batch that could not run appends to ``errors`` instead of contributing a
+    silent zero, and the records already parsed from a failed batch are kept —
+    a partial result is still evidence. Same shape as the nine ``*_ast.py``
+    helpers (#103, #111); this layer is inline rather than in its own module,
+    which is why it was not in either issue's file list.
+    """
     counters = {"critical": 0, "warning": 0, "info": 0}
     config = rule_dir / "sgconfig-bash.yml"
     if not config.is_file() or not shutil.which("ast-grep"):
@@ -423,8 +432,27 @@ def scan_ast_rules(
                 text=True,
                 timeout=120,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except FileNotFoundError:
+            if errors is not None:
+                errors.append("ast-grep unavailable (ast-grep)")
             continue
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"ast-grep could not be launched: {exc}")
+            continue
+        except subprocess.TimeoutExpired:
+            if errors is not None:
+                errors.append(f"ast-grep timed out on {config.name}")
+            continue
+        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
+        # some; anything else (bad config, unreadable path, internal error) is
+        # a failed invocation, not a clean one.
+        if proc.returncode not in (0, 1) and errors is not None:
+            detail = (proc.stderr or "").strip().splitlines()
+            errors.append(
+                f"ast-grep exited {proc.returncode} on {config.name}"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
 
         for line in proc.stdout.splitlines():
             line = line.strip()
@@ -589,6 +617,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     cached_findings, files_to_scan = cache.partition_files(files)
 
+    # Every analysis layer that could not complete appends here, so a scan that
+    # did not finish is never reported as a finished one (#111).
+    scan_errors: list[str] = []
     capturing_sink = None
     if files_to_scan:
         prefilter_index = build_prefilter_index(
@@ -603,10 +634,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         capturing_sink = CapturingSink()
         scan_files_native(files_to_scan, capturing_sink, skip, reported_locations, prefilter=prefilter_res)
         if args.ast_rule_dir:
-            scan_ast_rules(Path(args.ast_rule_dir), files_to_scan, capturing_sink, skip, reported_locations, prefilter=prefilter_res)
+            scan_ast_rules(Path(args.ast_rule_dir), files_to_scan, capturing_sink, skip,
+                           reported_locations, prefilter=prefilter_res, errors=scan_errors)
         if not args.no_shellcheck:
             scan_shellcheck(files_to_scan, capturing_sink, skip, reported_locations)
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111).
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -655,6 +691,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (#111).
+    if scan_errors:
+        exit_code = 2
 
     if args.json_out:
         records = read_ndjson(sink_path, errors="replace")
@@ -675,10 +715,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "ok",
+            "status": "partial" if scan_errors else "ok",
             "findings": records,
             "extras": {"profile": profile_data},
         }
+        if scan_errors:
+            summary["module_error"] = "ANALYZER_ERROR"
+            summary["message"] = (
+                "Bash analysis did not complete: " + "; ".join(scan_errors[:5])
+            )[:500]
         if os.environ.get("UBS_PROFILE") == "1":
             summary["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -686,6 +731,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.text_out:
         _render_text(args, files, counters)
 
+    for problem in scan_errors:
+        sys.stderr.write(f"ubs-bash: analysis incomplete: {problem}\n")
     return exit_code
 
 

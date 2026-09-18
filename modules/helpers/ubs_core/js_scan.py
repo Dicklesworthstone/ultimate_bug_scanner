@@ -382,6 +382,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     cached_findings, files_to_scan = cache.partition_files(files)
 
+    # Every analysis layer that could not complete appends here, so a scan that
+    # did not finish is never reported as a finished one (#111).
+    scan_errors: list[str] = []
     capturing_sink = None
     if files_to_scan:
         from ubs_core.js_rules import _RULES
@@ -449,8 +452,13 @@ def main(argv: list[str] | None = None) -> int:
                     except OSError:
                         pass
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
-            scan_all(Path(args.ast_rule_dir), ast_files, capturing_sink, overrides, count_only=count_allowed, skip_categories=skip)
-        cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+            scan_all(Path(args.ast_rule_dir), ast_files, capturing_sink, overrides,
+                     count_only=count_allowed, skip_categories=skip, errors=scan_errors)
+        # An incomplete analysis must never become the cached answer: the next
+        # run would hit the cache and report the findings this one could not
+        # produce as a clean, finished scan (#111).
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -494,6 +502,10 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    # Incompleteness dominates severity: a scan that could not finish must not
+    # be reported as a finished scan, whatever it happened to find (#111).
+    if scan_errors:
+        exit_code = 2
 
     if args.json_out:
         records = read_ndjson(args.sink)
@@ -508,9 +520,14 @@ def main(argv: list[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "ok",
+            "status": "partial" if scan_errors else "ok",
             "findings": records,
         }
+        if scan_errors:
+            doc["module_error"] = "ANALYZER_ERROR"
+            doc["message"] = (
+                "JavaScript analysis did not complete: " + "; ".join(scan_errors[:5])
+            )[:500]
         profile_data = {
             "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
             "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
@@ -529,11 +546,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.text_out:
         _render_text(args, files, counters)
 
+    for problem in scan_errors:
+        sys.stderr.write(f"ubs-js: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps({
         "counters": counters,
         "patterns": len(patterns),
         "prefilter": prefilter_res.to_dict(),
         "cache": cache.stats,
+        "errors": scan_errors,
     }) + "\n")
     return exit_code
 

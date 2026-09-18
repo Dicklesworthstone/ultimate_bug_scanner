@@ -1061,8 +1061,9 @@ Exit Codes:
   1                        Warnings found (only with --fail-on-warning)
   2                        Invalid arguments, environment error (e.g., missing ast-grep for JS/TS),
                            a refused scan (directory too large, $HOME or /), or a PARTIAL run in
-                           which a scanner module timed out or crashed. Set UBS_ALLOW_PARTIAL=1 to
-                           exit on findings alone for partial runs.
+                           which a scanner module timed out, crashed, or could not finish one of
+                           its own analysis layers (module_error ANALYZER_ERROR). Set
+                           UBS_ALLOW_PARTIAL=1 to exit on findings alone for partial runs.
   3                        Nothing was scanned: no supported languages detected, so no scanner ran.
                            This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
                            behaviour for callers that intentionally scan mixed/unsupported trees.

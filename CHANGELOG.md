@@ -10,7 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Scanners
+
+- State the text-output contract and stop inventing counts from text that does not meet it. In `--format=json` the runner validates a module's contract document and rejects a non-conforming one; in `--format=text` it scraped `Critical issues:` / `Warning issues:` / `Files scanned:` out of whatever the module printed. A module that printed one garbage line and exited 0 therefore had counts invented for it — with a stub doing exactly that, text mode reported `Critical: 100` (42 scraped from the stub plus the Bash scanner's real 1) while json mode correctly reported only the Bash critical. Exiting 0 is what put this outside the "a module that exits non-zero must never be folded in as success" cluster. A contract-v2 module now announces itself with one line matching `^\s*UBS module:.*\(contract v2\)` (recorded in `modules/contract.json` as `formats.text_marker`): proof of origin, which is what a scrape needs and what a `Summary Statistics:` trailer cannot give, since the trailer is the counts block in question. Text without it is `MODULE_INVALID_TEXT` — status error, exit 2, counts discarded — the same treatment json mode has given a non-conforming document since bead B10. The module's text is still shown to a human either way, and enforcement is gated on the module advertising contract v2, so a third-party v1 module keeps the legacy scrape. (#110)
+- Emit the contract marker from the Rust, Swift and C# modules, which were the three of twelve that did not. Verified by running every module and grepping its real output rather than reading the code — which also confirmed the marker survives `-q`, load-bearing because the meta-runner passes `-q` straight through to the modules.
+- Make `scripts/new-module.sh` scaffold a conforming module. The generated `render_text` printed `UBS module: <name> v<version>` without the `(contract v2)` marker, so a newly scaffolded module would have had its counts discarded by the runner, and it printed `Summary: files N, critical N` — none of the labels the runner scrapes — so it reported zeros however much it found. Both were caught by the new conformance check on the scaffold's own output.
+
+### Test suite
+
+- Assert text mode for every row of the status-invariant matrix. The `garbage-output` row carried `assert_text=False` and printed a SKIP pointing at #110, because a module that exits 0 was outside what the exit-code rules could catch; the text contract catches it now. The row also checks that the fabricated `Critical: 100` never reaches the human summary. With every row asserting, the `assert_text` column and its skip branch were dead and are gone rather than left as a skip that can never fire.
+- Hold every module to the text contract in `contract_conformance.py`, so a module that stops emitting the marker fails its own conformance check rather than silently losing its counts at the runner.
 
 ---
 

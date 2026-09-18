@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -23,6 +24,10 @@ def run_hook(command: str) -> tuple[int, str]:
         text=True,
         capture_output=True,
         check=False,
+        # A hook that reads stdin is exactly where an unbounded wait turns a
+        # deadlock into a silent hang (#123): if it ever stops consuming its
+        # input, this test would block forever instead of failing.
+        timeout=int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "60")),
     )
     # Hook contract: exit 0 always; stdout contains JSON only when denying.
     return proc.returncode, proc.stdout.strip()

@@ -30,6 +30,14 @@ HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
 if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
+# The children below are the scheduler CLI and `ubs` itself, and an unbounded
+# wait on either hides a deadlock while consuming the whole CI slot with no
+# diagnostic (#123). The scheduler CLI is arithmetic on a handful of numbers
+# and the e2e scan is one clean directory, so 180s fires on a hang and not on a
+# busy host; `UBS_TEST_CHILD_TIMEOUT` raises it for a slower one. An expiry
+# raises out of the test, which unittest reports as an error — never a pass.
+CHILD_TIMEOUT_SECONDS = int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "180"))
+
 from ubs_core.scheduler import (  # noqa: E402
     CostModel,
     ScheduleResult,
@@ -239,7 +247,14 @@ class SchedulerCLITests(unittest.TestCase):
             "--file-counts", "python:100,js:50,rust:10",
             "--slots", "2",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, env={**os.environ, "PYTHONPATH": str(HELPERS_DIR)})
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "PYTHONPATH": str(HELPERS_DIR)},
+            timeout=CHILD_TIMEOUT_SECONDS,
+        )
         data = json.loads(proc.stdout)
         self.assertEqual(data["ordered_langs"], ["python", "js", "rust"])
         self.assertEqual(data["slots"], 2)
@@ -254,7 +269,14 @@ class SchedulerCLITests(unittest.TestCase):
             "--makespan", "1000",
             "--slots", "2",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, env={**os.environ, "PYTHONPATH": str(HELPERS_DIR)})
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ, "PYTHONPATH": str(HELPERS_DIR)},
+            timeout=CHILD_TIMEOUT_SECONDS,
+        )
         data = json.loads(proc.stdout)
         self.assertEqual(data["slots"], 2)
         self.assertEqual(data["slot_utilization"], [1.0, 0.5])
@@ -273,7 +295,14 @@ class E2ESchedulerIntegrationTests(unittest.TestCase):
         env = dict(os.environ)
         env["UBS_PROFILE"] = "1"
         env["NO_COLOR"] = "1"
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+            timeout=CHILD_TIMEOUT_SECONDS,
+        )
         data = json.loads(proc.stdout)
         profile = data.get("profile")
         self.assertIsNotNone(profile, "profile block missing from json output")

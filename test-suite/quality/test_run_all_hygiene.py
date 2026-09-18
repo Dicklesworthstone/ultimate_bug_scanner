@@ -38,10 +38,35 @@ def run_guard(repo: Path, script: str, mode: str) -> subprocess.CompletedProcess
 class RunAllHygieneGuardTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="ubs-hygiene-"))
-        subprocess.run(["git", "init", "-q", str(self.tmp)], check=True)
+        # Fixture setup, but still an unbounded wait on a child if it stalls —
+        # a git that blocks on a lock or a credential prompt would hang the
+        # suite with no diagnostic (#123). These three run against a fresh
+        # empty repo, so seconds is generous.
+        git_timeout = int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "60"))
+        subprocess.run(
+            ["git", "init", "-q", str(self.tmp)], check=True, timeout=git_timeout
+        )
         (self.tmp / "tracked.txt").write_text("hello\n")
-        subprocess.run(["git", "-C", str(self.tmp), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(self.tmp), "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "-m", "init"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.tmp), "add", "."], check=True, timeout=git_timeout
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.tmp),
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+            check=True,
+            timeout=git_timeout,
+        )
 
     def test_stray_file_is_named_with_its_step(self) -> None:
         proc = run_guard(self.tmp, 'touch stray.txt; hygiene_check contract-tests; printf "issues=%s\\n" "${#HYGIENE_ISSUES[@]}"', "strict")

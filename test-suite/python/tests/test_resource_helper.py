@@ -2,6 +2,7 @@
 """Regression tests for helper-backed resource lifecycle analyzers."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,12 @@ def run_helper(helper: Path, source_map: dict[str, str], *, prefix: str = "ubs-r
             capture_output=True,
             text=True,
             check=False,
+            # The helper is the only child this harness spawns — the
+            # `subprocess.Popen(["sleep", …])` calls below are fixture *text*
+            # for the scanner to analyse, not children of this process. An
+            # unbounded wait here would turn a hung helper into a silent hang
+            # (#123).
+            timeout=int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "120")),
         )
         return [line for line in result.stdout.strip().splitlines() if line.strip()]
     finally:

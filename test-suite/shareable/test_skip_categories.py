@@ -37,17 +37,45 @@ ENV_BASE = {
 }
 
 
+# Every child here is `ubs` or a scanner module — exactly the processes that
+# can deadlock — so each one carries a deadline and an expiry is a failure,
+# never a pass (#123). The slowest legitimate case is a cold single-file JS
+# scan at a few seconds; 180s fires on a hang rather than on a busy host, and
+# `UBS_TEST_CHILD_TIMEOUT` raises it for a host slower than that.
+CHILD_TIMEOUT_SECONDS = int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "180"))
+
+
+def _partial(stream: bytes | str | None) -> str:
+    if stream is None:
+        return "(none)"
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", "replace")
+    return stream
+
+
 def run(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update(ENV_BASE)
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=CHILD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # `subprocess.run` kills and reaps the child before raising, so no
+        # descendant is leaked. Name everything needed to reproduce it.
+        raise AssertionError(
+            f"child exceeded {CHILD_TIMEOUT_SECONDS}s and was killed\n"
+            f"  command: {cmd}\n"
+            f"  cwd: {cwd}\n"
+            f"  partial stdout: {_partial(exc.stdout)}\n"
+            f"  partial stderr: {_partial(exc.stderr)}"
+        ) from exc
 
 
 def write_block_fns(path: Path, *, with_ignore: bool) -> None:
@@ -72,14 +100,7 @@ def test_issue_51_ubs_ignore_respected() -> None:
         # Baseline: no ignore markers => rule fires with 6 findings.
         write_block_fns(target, with_ignore=False)
         baseline = run([sys.executable, "-c", "import sys; sys.exit(0)"], proj)  # warm subprocess
-        baseline = subprocess.run(
-            ["bash", str(JS_MODULE), str(proj)],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            env={**os.environ, **ENV_BASE},
-            check=False,
-        )
+        baseline = run(["bash", str(JS_MODULE), str(proj)], REPO_ROOT)
         assert (
             "Function declarations in blocks" in baseline.stdout
             or "Function declarations in blocks" in baseline.stderr
@@ -88,14 +109,7 @@ def test_issue_51_ubs_ignore_respected() -> None:
         # With ubs:ignore on every matching line, count_lines() must
         # strip them and the rule must NOT fire.
         write_block_fns(target, with_ignore=True)
-        ignored = subprocess.run(
-            ["bash", str(JS_MODULE), str(proj)],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            env={**os.environ, **ENV_BASE},
-            check=False,
-        )
+        ignored = run(["bash", str(JS_MODULE), str(proj)], REPO_ROOT)
         assert "Function declarations in blocks" not in ignored.stdout, (
             "ubs:ignore was not honored - rule still fired:\n"
             f"STDOUT:\n{ignored.stdout}\nSTDERR:\n{ignored.stderr}"

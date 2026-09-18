@@ -2,6 +2,7 @@
 """Regression tests for the C# helper analyzers."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,10 @@ def run_helper(helper: Path, sources: dict[str, str]) -> list[str]:
             capture_output=True,
             text=True,
             check=False,
+            # An AST helper over a handful of fixture files takes a second or
+            # two; without a deadline a hung helper hangs the suite with no
+            # diagnostic (#123). An expiry raises, which is a failure.
+            timeout=int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "120")),
         )
         return [line for line in result.stdout.splitlines() if line.strip()]
     finally:

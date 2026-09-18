@@ -2,6 +2,7 @@
 """Regression tests for the Java resource lifecycle helper."""
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -27,6 +28,10 @@ class JavaResourceHelperTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                # An AST helper over a handful of fixture files takes a second
+                # or two; without a deadline a hung helper hangs the suite with
+                # no diagnostic (#123). An expiry raises, which is a failure.
+                timeout=int(os.environ.get("UBS_TEST_CHILD_TIMEOUT", "120")),
             )
             return [line for line in result.stdout.splitlines() if line.strip()]
         finally:

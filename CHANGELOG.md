@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.7] - 2026-09-18 [Release]
+
 ### Target selection
 
 - Detect languages when there is no `modules/contract.json`, which is every installed copy of UBS. The contract carries the per-language extension lists and was the file listing's only source of them, but it is not a checksum-verified asset, so it is never downloaded or cached — only a repo checkout has one next to the runner. With no contract nothing matched any language, every per-language file list came back empty, and `detect_lang` reads an empty list as "this language is absent". An installed `ubs` therefore answered `no-supported-languages` and exited 3 for **every** project — it scanned nothing, on everything — while a checkout of the same version scanned the same tree fine. Reproduced identically on v5.4.5, so this predates the current release; `--include-ext=py,rs` was an accidental workaround, because that path was the only one consulting the runner's built-in extension map. The listing now falls back to that map when a language has no contract entry, so the runner's own knowledge that `.py` is Python no longer depends on an optional data file. The contract still wins wherever it is present, and shipping it as a verified asset (which would also restore manifest-file detection, `Cargo.toml` in a directory with no `.rs`) is tracked separately.

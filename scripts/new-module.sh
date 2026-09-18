@@ -238,7 +238,11 @@ sample_parts(){ # "file:line:code" -> prints file, line, code on three lines
   printf '%s\n%s\n%s\n' "$file" "$line" "$s"
 }
 render_text(){
-  echo "UBS module: @DISPLAY@ v${VERSION} — ${PROJECT_DIR}"
+  # The "(contract v2)" marker is required: the meta-runner has no contract
+  # document in text mode, so it scrapes counts out of this output and the
+  # marker is its proof of origin. Text without it is MODULE_INVALID_TEXT and
+  # the module's counts are discarded (modules/contract.json formats.text_marker).
+  echo "UBS module: @DISPLAY@ (contract v2) v${VERSION} — ${PROJECT_DIR}"
   echo "Files: ${TOTAL_FILES} (${INCLUDE_EXT})"
   local i s file line code
   for i in "${!F_SEV[@]}"; do
@@ -253,7 +257,13 @@ render_text(){
       done
     fi
   done
-  printf '\nSummary: files %s, critical %s, warning %s, info %s\n' "$TOTAL_FILES" "$CRITICAL" "$WARNING" "$INFO"
+  # The meta-runner scrapes these exact labels in text mode; a module that
+  # prints its counts in any other shape reports zeros however much it found.
+  printf '\nSummary Statistics:\n'
+  printf 'Files scanned: %s\n' "$TOTAL_FILES"
+  printf 'Critical issues: %s\n' "$CRITICAL"
+  printf 'Warning issues: %s\n' "$WARNING"
+  printf 'Info items: %s\n' "$INFO"
 }
 render_json(){
   local i s file line code first=1 sfirst

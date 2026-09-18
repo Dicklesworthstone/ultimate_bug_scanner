@@ -1015,7 +1015,7 @@ class CSharpRenderedSuppressionTests(unittest.TestCase):
                 with self.subTest(project=project):
                     render_text(SimpleNamespace(
                         sink=str(sink), text_out=str(output), project_dir=str(project),
-                        ci=True, detail_limit=5, skip="",
+                        project="", ci=True, detail_limit=5, skip="",
                     ), ast_ran=True, patterns=[])
                     samples = [
                         match for line in output.read_text(encoding="utf-8").splitlines()
@@ -1090,7 +1090,8 @@ class TextRuleProvenanceTests(unittest.TestCase):
                  "count": 1, "severity": "warning", "message": f"detail {line}"}
                 for line in (1, 2)
             ]
-            args = SimpleNamespace(max_detailed=10, detail_limit=3, ast_available=True)
+            args = SimpleNamespace(max_detailed=10, detail_limit=3, ast_available=True,
+                                   project="", project_dir="")
             renderer = swift_scan._Renderer(args, records)
             renderer.render_spec(next(spec for spec in swift_scan.CHECK_SPECS if spec.rule_id == "swift.narrowing"))
             for record in records:

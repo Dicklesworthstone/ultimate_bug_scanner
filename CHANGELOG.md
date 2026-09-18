@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.6] - 2026-09-18 [Release]
+
 ### Scanners
 
 - Stop nine more scanners reporting a failed ast-grep layer as a clean scan. `py_ast.py` was fixed for this in #103; the same code was still in `java_ast.py`, `csharp_ast.py`, `elixir_ast.py`, `swift_ast.py`, `go_ast.py`, `rust_ast.py`, `js_ast.py`, `ruby_ast.py` and the inline layer in `bash_scan.py`. Each caught `OSError`/`TimeoutExpired` and continued, and none read `returncode` — but `ast-grep scan` exits 0 with no error-level diagnostics and 1 when it found some, so an unreadable config, a bad path or an internal error exits outside `{0, 1}` and the layer contributed zero findings. A rule pack that never ran was therefore indistinguishable from one that ran and matched nothing, and because each module recounted severities afterwards, criticals from the regex layers relabelled the failure as the ordinary exit 1. Against an `ast-grep` that exits 2, seven of these modules reported `status: ok` and exit 1, and Ruby — which raised instead of swallowing — died with a traceback, exit 1 and no report at all. Every one now reports `status: partial`, `module_error: ANALYZER_ERROR`, a message naming the failing invocation, and exit 2, while keeping the findings the other layers did produce: a failure must not throw away evidence, and an incomplete scan must not be reported as a finished one. (#111)

@@ -2455,7 +2455,14 @@ remove_aider_integration() {
 # Remove the hook registrations register_claude_settings_hooks added; delete
 # settings.json when nothing else is left in it.
 unregister_claude_settings_hooks() {
-  local settings=".claude/settings.json"
+  # Anchored to the project root for the reason given on setup_claude_code_hook:
+  # run from a subdirectory, a cwd-relative path names a settings file that the
+  # installer never wrote to, so the uninstall would silently remove nothing
+  # (#131). Outside a repo this falls back to the cwd, which is where a
+  # user-scope settings file would be.
+  local root
+  root="$(claude_project_root)"
+  local settings="${root:-.}/.claude/settings.json"
   [ -f "$settings" ] || return 0
   grep -q -E "on-file-write.sh|git_safety_guard.py" "$settings" 2>/dev/null || return 0
   command -v python3 >/dev/null 2>&1 || { warn "python3 not available; remove the UBS hooks from $settings manually"; return 0; }
@@ -3382,18 +3389,184 @@ create_alias() {
   log "Restart your shell or run: source $rc_file"
 }
 
-setup_claude_code_hook() {
+# True when a PreToolUse hook whose command is dcg is already registered, in
+# either the user-scope settings or the project's. ACFS installs dcg as the Bash
+# guard and deletes git_safety_guard.py nightly; installing ours back on top
+# makes the two tools alternate every night (#131).
+claude_dcg_hook_registered() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$HOME/.claude/settings.json" "$(claude_project_root)/.claude/settings.json" << 'PY'
+import json, os, sys
+
+for path in sys.argv[1:]:
+    if not path or not os.path.exists(path):
+        continue
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        continue
+    if not isinstance(data, dict):
+        continue
+    for entry in (data.get("hooks") or {}).get("PreToolUse") or []:
+        if not isinstance(entry, dict):
+            continue
+        for hook in entry.get("hooks") or []:
+            command = hook.get("command") if isinstance(hook, dict) else None
+            if isinstance(command, str) and os.path.basename(command.split()[0] if command.split() else "") == "dcg":
+                sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Remove UBS hook entries that name $CLAUDE_PROJECT_DIR from the USER-scope
+# settings file. At user scope that variable expands to whichever project is
+# open, so the command points at a .claude/hooks/ that UBS never wrote to —
+# it cannot resolve anywhere, which is what made every session error (#131).
+# Earlier installers wrote exactly this, and idempotency means they would never
+# replace it, so the repair has to be explicit or affected machines stay broken.
+repair_user_scope_claude_hooks() {
+  local settings="$HOME/.claude/settings.json"
+  [ -f "$settings" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
   if dry_run_enabled; then
-    log_dry_run "Would write .claude/hooks/on-file-write.sh, install .claude/hooks/git_safety_guard.py, and register both in .claude/settings.json."
+    log_dry_run "Would remove any \$CLAUDE_PROJECT_DIR UBS hook entries from $settings."
     return 0
   fi
-  if [ ! -d ".claude" ]; then
-    mkdir -p ".claude"
-    log "Created .claude directory for Claude Code integration."
-  fi
-  log "Setting up Claude Code hooks..."
+  local result
+  result="$(python3 - "$settings" << 'PY'
+import json, os, shutil, sys, time
 
-  local hook_dir=".claude/hooks"
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read().strip()
+except OSError:
+    sys.exit(0)
+if not text:
+    sys.exit(0)
+try:
+    data = json.loads(text)
+except json.JSONDecodeError:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+
+OURS = {"on-file-write.sh", "git_safety_guard.py"}
+
+
+def broken(command):
+    return (
+        isinstance(command, str)
+        and "$CLAUDE_PROJECT_DIR" in command
+        and os.path.basename(command) in OURS
+    )
+
+
+removed = []
+hooks = data.get("hooks")
+if isinstance(hooks, dict):
+    for event, entries in list(hooks.items()):
+        if not isinstance(entries, list):
+            continue
+        kept_entries = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                kept_entries.append(entry)
+                continue
+            inner = entry.get("hooks")
+            if not isinstance(inner, list):
+                kept_entries.append(entry)
+                continue
+            kept = [h for h in inner if not (isinstance(h, dict) and broken(h.get("command")))]
+            if len(kept) != len(inner):
+                removed.extend(
+                    os.path.basename(h["command"])
+                    for h in inner
+                    if isinstance(h, dict) and broken(h.get("command"))
+                )
+            if kept:
+                entry["hooks"] = kept
+                kept_entries.append(entry)
+        if len(kept_entries) != len(entries):
+            if kept_entries:
+                hooks[event] = kept_entries
+            else:
+                del hooks[event]
+        else:
+            hooks[event] = kept_entries
+
+if not removed:
+    sys.exit(0)
+shutil.copyfile(path, f"{path}.bak-ubs-{time.strftime('%Y%m%dT%H%M%S')}")
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+print(",".join(sorted(set(removed))))
+PY
+)" || return 0
+  if [ -n "$result" ]; then
+    success "Removed unresolvable \$CLAUDE_PROJECT_DIR hook entries from $settings ($result)"
+    log "They were registered at user scope by an installer before #131 and failed in every project."
+  fi
+}
+
+# Resolve the directory Claude Code will expand $CLAUDE_PROJECT_DIR to, which is
+# the project root rather than the installer's cwd. Echoes nothing when there is
+# no project, which is the "skip gracefully" case.
+claude_project_root() {
+  local root=""
+  if command -v git >/dev/null 2>&1; then
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || root=""
+  fi
+  if [ -n "$root" ] && [ -d "$root" ]; then
+    printf '%s' "$root"
+  fi
+  # Always succeed: "no project" is an ordinary answer, and callers assign this
+  # with `root="$(claude_project_root)"`, where a non-zero status would abort
+  # the installer under `set -e` before it reached the skip path.
+  return 0
+}
+
+setup_claude_code_hook() {
+  # The hook files are written under a project's .claude/hooks/, and the
+  # commands registered for them are written as $CLAUDE_PROJECT_DIR/... — so
+  # both halves have to agree on which directory that is. They did not: the
+  # files went to the cwd while the command assumed the cwd *was* the project.
+  #
+  # Run from $HOME (which is what --easy-mode does under a nightly runner) the
+  # cwd-relative settings file IS ~/.claude/settings.json, so every project
+  # inherited a hook command pointing at its own .claude/hooks/, where nothing
+  # had been installed — and every Bash and Edit call in every project failed
+  # with "hook ... not found" (#131). Run from a subdirectory of a repo, the
+  # files landed in that subdirectory while the command pointed at the root,
+  # which breaks the same way.
+  #
+  # Anchoring both to the repository root makes the two agree wherever the
+  # installer is invoked from, and no project means no correct target at all —
+  # so skip and say how to add it later, exactly as the pre-commit hook does
+  # outside a repo (#58).
+  local root
+  root="$(claude_project_root)"
+  if [ -z "$root" ]; then
+    log "Not in a project (no git repository here) — skipping Claude Code hook setup."
+    log "Claude Code resolves these hooks through \$CLAUDE_PROJECT_DIR, which only has a value inside a project."
+    log "Re-run the installer with --setup-claude-hook from inside a repo to add them later."
+    repair_user_scope_claude_hooks
+    return 0
+  fi
+
+  if dry_run_enabled; then
+    log_dry_run "Would write $root/.claude/hooks/on-file-write.sh, install $root/.claude/hooks/git_safety_guard.py, and register both in $root/.claude/settings.json."
+    return 0
+  fi
+  if [ ! -d "$root/.claude" ]; then
+    mkdir -p "$root/.claude"
+    log "Created $root/.claude directory for Claude Code integration."
+  fi
+  log "Setting up Claude Code hooks in $root ..."
+
+  local hook_dir="$root/.claude/hooks"
   local hook_file="$hook_dir/on-file-write.sh"
 
   mkdir -p "$hook_dir"
@@ -3452,8 +3625,8 @@ HOOK_EOF
   chmod +x "$hook_file"
   success "Claude Code hook created: $hook_file"
 
-  install_claude_safety_guard
-  register_claude_settings_hooks
+  install_claude_safety_guard "$root"
+  register_claude_settings_hooks "$root"
 }
 
 # Install the git/filesystem safety guard (PreToolUse hook for Bash) that README
@@ -3461,17 +3634,29 @@ HOOK_EOF
 # otherwise download it from the release assets and verify it against the
 # release SHA256SUMS when that manifest lists it.
 install_claude_safety_guard() {
-  local hook_dir=".claude/hooks"
+  local root="${1:-.}"
+  local hook_dir="$root/.claude/hooks"
   local target="$hook_dir/git_safety_guard.py"
   local script_dir=""
+  # ACFS now ships destructive_command_guard as the PreToolUse Bash guard and
+  # retires this one, deleting it on every nightly run. Reinstalling it here put
+  # the two back in conflict every night (#131). If dcg already holds that slot,
+  # leave it alone — a second Bash guard buys nothing and loses the argument.
+  if claude_dcg_hook_registered; then
+    log "destructive_command_guard already registered as the PreToolUse Bash hook — skipping git_safety_guard.py."
+    return 0
+  fi
   if [ -f "$target" ]; then
     chmod +x "$target" 2>/dev/null || true
     log "Claude Code safety guard already present: $target"
     return 0
   fi
+  # $target is absolute (it is anchored to the project root), so compare against
+  # it directly — prefixing $(pwd) here would never match and the installer
+  # would copy the file onto itself when run from its own checkout.
   if script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]:-${0}}")" 2>/dev/null && pwd)" \
      && [ -f "$script_dir/.claude/hooks/git_safety_guard.py" ] \
-     && [ "$script_dir/.claude/hooks/git_safety_guard.py" != "$(pwd)/$target" ]; then
+     && [ "$script_dir/.claude/hooks/git_safety_guard.py" != "$target" ]; then
     cp "$script_dir/.claude/hooks/git_safety_guard.py" "$target"
     chmod +x "$target"
     success "Claude Code safety guard installed from local checkout: $target"
@@ -3504,9 +3689,10 @@ install_claude_safety_guard() {
 # whose command is already present is left alone; other settings are preserved;
 # the previous file is backed up before it is rewritten.
 register_claude_settings_hooks() {
-  local settings=".claude/settings.json"
+  local root="${1:-.}"
+  local settings="$root/.claude/settings.json"
   local has_guard=0
-  [ -f ".claude/hooks/git_safety_guard.py" ] && has_guard=1
+  [ -f "$root/.claude/hooks/git_safety_guard.py" ] && has_guard=1
   if ! command -v python3 >/dev/null 2>&1; then
     warn "python3 not available; add these hooks to $settings manually:"
     cat << 'SNIPPET'
@@ -3548,9 +3734,19 @@ for event, matcher, command in wanted:
     if not isinstance(entries, list):
         print(f"invalid:'hooks.{event}' is not a list")
         sys.exit(0)
+    # Match on the hook's basename rather than the exact command string. The
+    # exact-string test treated a corrected entry (one a user had repointed at
+    # an absolute path) as absent and appended a second, broken entry beside it
+    # on every run — observed as duplicate PostToolUse hooks (#131).
+    leaf = os.path.basename(command)
     present = any(
         isinstance(entry, dict)
-        and any(isinstance(h, dict) and h.get("command") == command for h in (entry.get("hooks") or []))
+        and any(
+            isinstance(h, dict)
+            and isinstance(h.get("command"), str)
+            and os.path.basename(h["command"]) == leaf
+            for h in (entry.get("hooks") or [])
+        )
         for entry in entries
     )
     if present:

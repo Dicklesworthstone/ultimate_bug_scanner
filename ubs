@@ -3322,7 +3322,7 @@ ensure_git_metadata(){
 # "scan target not found" diagnostics).
 prepare_single_file_target(){
   [[ ${#SCAN_FILES[@]} -eq 1 ]] || return 1
-  local f="${SCAN_FILES[0]}" scan_root="$SOURCE_PROJECT_DIR" abs
+  local f="${SCAN_FILES[0]}" scan_root="$SOURCE_PROJECT_DIR" abs abs_dir
   [[ -f "$scan_root" ]] && scan_root="$(dirname "$scan_root")"
   if [[ "$f" == /* ]]; then
     abs="$f"
@@ -3333,6 +3333,16 @@ prepare_single_file_target(){
   else
     return 1
   fi
+  # One canonical spelling for the target (#122). Two of the three branches
+  # above leave the path as written, so `ubs ../proj/a.py` produced
+  # "<scan_root>/../proj/a.py" — which still starts with "<scan_root>/", so the
+  # report rewrote every mention of the file to "../proj/a.py" while producers
+  # that skip that rewrite emitted the resolved path. One file, one scan, two
+  # `file` values in one document. Resolving the directory here is what the
+  # third branch always did, so all spellings of the same file now agree.
+  abs_dir="$(cd "$(dirname "$abs")" 2>/dev/null && pwd -P)" || return 1
+  [[ -n "$abs_dir" ]] || return 1
+  abs="$abs_dir/$(basename "$abs")"
   [[ -f "$abs" && ! -L "$abs" ]] || return 1
   lang_for_source_file "$abs" >/dev/null 2>&1 || return 1
   SINGLE_FILE_TARGET="$abs"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -784,6 +785,68 @@ def check_single_file_fast_path() -> None:
     proc2 = run([str(target), str(PY_CLEAN), "--ci", "--only=python", "--format=json"])
     ok2 = proc2.returncode in (0, 1) and "Preparing shadow workspace for 2 file(s)" in proc2.stderr
     report("multi_file_keeps_workspace", ok2, f"exit={proc2.returncode}", proc2 if not ok2 else None)
+
+
+def _file_spellings(node, found: set) -> set:
+    """Every non-empty file/path/uri string anywhere in a report document."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("file", "path", "uri") and isinstance(value, str) and value:
+                found.add(value)
+            _file_spellings(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _file_spellings(value, found)
+    return found
+
+
+def check_single_file_target_has_one_spelling() -> None:
+    """One file scanned once must be named one way (#122).
+
+    The single-file fast path resolved `ubs ../proj/a.py` to
+    "<scan_root>/../proj/a.py", which still starts with "<scan_root>/", so the
+    report rewrote every mention of the target to "../proj/a.py" while
+    producers that skip that rewrite emitted the resolved path. `totals.files`
+    was 1 and the scan was correct, but the document carried two `file` values
+    for the same source, so anything grouping or deduplicating by `file` saw
+    two locations. `a.py`, `./a.py` and the absolute path were always
+    consistent; only a spelling that has to be resolved split.
+    """
+    work = Path(tempfile.mkdtemp(prefix="ubs-one-spelling-"))
+    try:
+        proj = work / "proj"
+        proj.mkdir(parents=True)
+        (proj / "a.py").write_text("import os\neval(input())\n", encoding="utf-8")
+        for label, args, parse in (
+            ("json", ["--format=json", "../proj/a.py"], json.loads),
+            ("sarif", ["--format=sarif", "../proj/a.py"], json.loads),
+        ):
+            proc = run([*args, "--ci"], cwd=proj)
+            write_case_artifacts(f"single_file_one_spelling_{label}", proc)
+            ok = False
+            detail = f"exit={proc.returncode}"
+            try:
+                spellings = _file_spellings(parse(proc.stdout), set())
+                # Every spelling of the one target must be the same string.
+                target_spellings = {s for s in spellings if s.endswith("a.py")}
+                ok = proc.returncode in (0, 1) and len(target_spellings) == 1
+                detail += f" spellings={sorted(target_spellings)}"
+            except Exception as exc:  # noqa: BLE001
+                detail += f" {exc}"
+            report(f"single_file_one_spelling_{label}", ok, detail, proc if not ok else None)
+
+        # Text mode carries the same target through a different rewrite path.
+        text_proc = run(["--ci", "../proj/a.py"], cwd=proj)
+        write_case_artifacts("single_file_one_spelling_text", text_proc)
+        # Path characters only: \S* would swallow adjacent punctuation (a
+        # quote, a bracket) and report the same path twice.
+        text_spellings = set(re.findall(r"[\w./~+-]*a\.py", text_proc.stdout))
+        text_ok = text_proc.returncode in (0, 1) and len(text_spellings) == 1
+        report("single_file_one_spelling_text", text_ok,
+               f"exit={text_proc.returncode} spellings={sorted(text_spellings)}",
+               text_proc if not text_ok else None)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _exclude_project() -> Path:
@@ -2144,6 +2207,7 @@ def main() -> int:
         check_size_refusal_envelope,
         check_file_list_workspace,
         check_single_file_fast_path,
+        check_single_file_target_has_one_spelling,
         check_workspaces_without_rsync,
         check_python_shim_when_only_python_exists,
         check_doctor_fix_refuses_tampered_toon,

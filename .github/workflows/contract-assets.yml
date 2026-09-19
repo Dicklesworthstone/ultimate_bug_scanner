@@ -1,0 +1,248 @@
+name: Installed Contract Assets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs
+      - modules/**
+      - scripts/update_checksums.py
+      - test-suite/shareable/test_contract_checksums.py
+      - test-suite/shareable/test_installed_contract.py
+      - test-suite/shareable/test_meta_runner_modes.py
+      - .github/workflows/contract-assets.yml
+  pull_request:
+    paths:
+      - ubs
+      - modules/**
+      - scripts/update_checksums.py
+      - test-suite/shareable/test_contract_checksums.py
+      - test-suite/shareable/test_installed_contract.py
+      - test-suite/shareable/test_meta_runner_modes.py
+      - .github/workflows/contract-assets.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  installed-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+      - name: Prepare issue 129 runtime and generated pins
+        run: |
+          cat > "$RUNNER_TEMP/contract-runtime.patch" <<'PATCH'
+          diff --git a/ubs b/ubs
+          --- a/ubs
+          +++ b/ubs
+          @@ -2779,11 +2779,7 @@
+           def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: str) -> bool:
+               exts = spec.get("extensions", [])
+          -    # An installed runner has no modules/contract.json next to it: the contract
+          -    # is not a checksum-verified asset, so it is never cached, and every spec
+          -    # comes back empty. Without this fallback no file matches any language, the
+          -    # per-language lists are all empty, and detect_lang reads empty as "this
+          -    # language is absent" — so an installed ubs reported "no supported
+          -    # languages" (exit 3) for every project while a checkout scanned it fine.
+          +    # A cold, offline install may not have the verified detection contract yet.
+          +    # Keep source-extension detection working without treating an unavailable
+          +    # contract as an empty project. Verification failures never reach this path.
+               # The built-in hint map is the runner's own knowledge that .py is Python;
+               # it is narrower than the contract, which still wins wherever it is present.
+          @@ -3173,12 +3173,8 @@
+             t0="$(now_ms)"
+             ensure_tmpdir_run
+             list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
+          -  local contract_file=""
+          -  if [[ -f "$(script_dir)/modules/contract.json" ]]; then
+          -    contract_file="$(script_dir)/modules/contract.json"
+          -  elif [[ -f "$MODULE_DIR/contract.json" ]]; then
+          -    contract_file="$MODULE_DIR/contract.json"
+          -  fi
+          +  # Only the per-run snapshot verified before the first listing may be read.
+          +  # Never rediscover an unchecked checkout/cache file here.
+          +  local contract_file="${DETECTION_CONTRACT_FILE:-}"
+             if ! stats="$(list_scan_files "$scan_root" "$list" "$contract_file" "$TMPDIR_RUN" "$ONLY_LANGS" "$EXCLUDE_LANGS" "$INCLUDE_EXT")"; then
+          @@ -3207,6 +3207,10 @@
+             return 0
+           }
+           
+          +# Delay listing until module-dir normalization and asset/download definitions
+          +# are available. Previously this ran before any installed assets could be fetched.
+          +check_scan_size(){
+           if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" && -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+             build_scan_file_list || true
+           fi
+          @@ -3237,6 +3241,7 @@
+                 "Options: scan a smaller subdirectory; raise the limit with UBS_MAX_DIR_SIZE_MB=5000; disable it with UBS_MAX_DIR_SIZE_MB=0."
+             fi
+           fi
+          +}
+           
+           if [[ -n "$CATEGORY_FILTER" ]]; then
+          @@ -4103,8 +4103,16 @@
+             local rel="$1" path="$2"
+             local expected="${HELPER_CHECKSUMS[$rel]:-}"
+             VERIFY_HELPER_ERR=""
+          -  should_verify_module_path "$path" || return 0
+          -  [[ -n "$expected" ]] || return 0
+          +  if [[ "$rel" == "contract.json" ]]; then
+          +    # Detection also reads a checkout or a private per-run snapshot, neither
+          +    # necessarily under MODULE_DIR. Both must have the same pinned digest.
+          +    if [[ -z "$expected" ]]; then
+          +      VERIFY_HELPER_ERR="missing pinned checksum for contract.json"
+          +      return 2
+          +    fi
+          +  else
+          +    should_verify_module_path "$path" || return 0
+          +    [[ -n "$expected" ]] || return 0
+          +  fi
+             if [[ ! -f "$path" ]]; then
+          @@ -4955,6 +4955,7 @@
+               local empty_sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+               if [[ "${HELPER_CHECKSUMS[$rel]:-}" != "$empty_sha" ]] && [ ! -s "$tmp" ]; then
+          +      VERIFY_HELPER_ERR="checksum mismatch for $rel (empty helper file)"
+                 rm -f "$tmp" 2>/dev/null || true
+          @@ -5038,6 +5038,58 @@
+             return 0
+           }
+           
+          +# The contract is needed BEFORE listing/size guards, not just module dispatch.
+          +# A missing download may use built-in hints; a present or fetched but unverified
+          +# contract must never masquerade as "no supported languages". Repair is explicit
+          +# through doctor --fix, so a failed repair cannot hide a corrupt cached contract.
+          +ensure_detection_contract(){
+          +  DETECTION_CONTRACT_FILE=""
+          +  local rel="contract.json" path snapshot
+          +  if [[ -z "${HELPER_CHECKSUMS[$rel]:-}" ]]; then
+          +    say_err "${RED}$X missing pinned checksum for contract.json; refusing to scan${RESET}"
+          +    return 2
+          +  fi
+          +  path="$(script_dir)/modules/$rel"
+          +  if [[ ! -e "$path" && ! -L "$path" ]]; then
+          +    path="$MODULE_DIR/$rel"
+          +  fi
+          +  if [[ ! -e "$path" && ! -L "$path" ]]; then
+          +    VERIFY_HELPER_ERR=""
+          +    if ! download_helper_asset "$rel" "$path"; then
+          +      if [[ -n "${VERIFY_HELPER_ERR:-}" ]]; then
+          +        say_err "${RED}$X contract.json failed verification (${VERIFY_HELPER_ERR}); refusing to scan${RESET}"
+          +        return 2
+          +      fi
+          +      say_err "${YELLOW}${WARN}${RESET} contract.json unavailable; using built-in extension hints (manifest-only detection unavailable). Run: ubs doctor --fix"
+          +      return 0
+          +    fi
+          +  fi
+          +
+          +  # Verify the bytes the listing will actually consume, not a mutable cache
+          +  # path it would reopen later. Never overwrite checkout assets during a scan.
+          +  ensure_tmpdir_run
+          +  snapshot="$TMPDIR_RUN/detection-contract.json"
+          +  if [[ ! -f "$path" ]] || ! cp "$path" "$snapshot"; then
+          +    say_err "${RED}$X cannot read contract.json at $path; refusing to scan${RESET}"
+          +    return 2
+          +  fi
+          +  if ! verify_helper_checksum "$rel" "$snapshot"; then
+          +    say_err "${RED}$X contract.json failed verification (${VERIFY_HELPER_ERR}); refusing to scan${RESET}"
+          +    say_err "${DIM}  Fix installed assets: ubs doctor --fix; after checkout edits: ./scripts/update_checksums.sh${RESET}"
+          +    return 2
+          +  fi
+          +  DETECTION_CONTRACT_FILE="$snapshot"
+          +  return 0
+          +}
+          +
+           ensure_cached_helpers(){
+          @@ -5391,6 +5391,10 @@
+           # Execution / aggregation
+           # ─────────────────────────────────────────────────────────────────────────────
+           ensure_tmpdir_run
+          +# Unlike the best-effort file listing, integrity failures must not be swallowed
+          +# by a conditional/|| true. Informational modes have already returned above.
+          +ensure_detection_contract || exit 2
+          +check_scan_size
+           
+           # ─────────────────────────────────────────────────────────────────────────────
+          PATCH
+          git apply --recount --check "$RUNNER_TEMP/contract-runtime.patch"
+          git apply --recount "$RUNNER_TEMP/contract-runtime.patch"
+          python3 scripts/update_checksums.py
+          git diff --check
+          git diff > "$RUNNER_TEMP/contract-runtime.diff"
+      - name: Check shell syntax and checksum chain
+        run: |
+          bash -n ubs modules/lib/ubs-common.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Test checksum generation
+        run: python3 test-suite/shareable/test_contract_checksums.py -v
+      - name: Test installed detection, doctor, and fail-closed behavior
+        run: python3 test-suite/shareable/test_installed_contract.py -v
+      - name: Verify generated files are current
+        run: |
+          git diff > "$RUNNER_TEMP/before-generation.diff"
+          python3 scripts/update_checksums.py
+          git diff > "$RUNNER_TEMP/after-generation.diff"
+          cmp "$RUNNER_TEMP/before-generation.diff" "$RUNNER_TEMP/after-generation.diff"
+      - name: Publish verified Git tree without updating any branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          """Publish tested blobs/tree without moving any branch."""
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          
+          
+          def git(*args):
+              return subprocess.check_output(["git", *args], text=True).strip()
+          
+          
+          def api(endpoint, data):
+              result = subprocess.run(
+                  ["gh", "api", "--method", "POST", endpoint, "--input", "-"],
+                  input=json.dumps(data), text=True, capture_output=True, check=True,
+              )
+              return json.loads(result.stdout)
+          
+          
+          repo = os.environ["GITHUB_REPOSITORY"]
+          base = git("rev-parse", "HEAD")
+          changed = git("diff", "--name-only").splitlines()
+          allowed = {"ubs", "SHA256SUMS", "modules/lib/ubs-common.sh", "scripts/new-module.sh"}
+          allowed.update(p.as_posix() for p in Path("modules").glob("ubs-*.sh"))
+          if not changed or set(changed) - allowed:
+              raise SystemExit(f"Unexpected changed paths: {changed}")
+          entries = []
+          for path in changed:
+              mode = git("ls-files", "--stage", "--", path).split()[0]
+              blob = api(f"repos/{repo}/git/blobs", {
+                  "content": base64.b64encode(Path(path).read_bytes()).decode("ascii"),
+                  "encoding": "base64",
+              })
+              entries.append({"path": path, "mode": mode, "type": "blob", "sha": blob["sha"]})
+          tree = api(f"repos/{repo}/git/trees", {
+              "base_tree": git("rev-parse", "HEAD^{tree}"), "tree": entries,
+          })
+          summary = {"base_commit": base, "tree_sha": tree["sha"], "paths": changed}
+          Path(os.environ["RUNNER_TEMP"], "contract-tree.json").write_text(json.dumps(summary, indent=2) + "\n")
+          print(json.dumps(summary, indent=2))
+          print(f"TESTED_TREE_SHA={tree['sha']}")
+          PY
+      - name: Preserve verification diff and tree identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-asset-verification
+          path: |
+            ${{ runner.temp }}/contract-runtime.diff
+            ${{ runner.temp }}/contract-tree.json
+          if-no-files-found: ignore

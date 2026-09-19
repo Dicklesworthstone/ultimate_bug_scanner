@@ -34,6 +34,10 @@ def main():
         print(f"Error: modules directory not found at {modules_dir}", file=sys.stderr)
         sys.exit(1)
 
+    if not (modules_dir / "contract.json").is_file():
+        print(f"Error: required module contract not found at {modules_dir / 'contract.json'}", file=sys.stderr)
+        sys.exit(1)
+
     print("Updating pinned checksums in ubs...")
     
     # Map lang to filename
@@ -69,6 +73,7 @@ def main():
 
     # Step 1: Compute checksums for all helper assets
     helper_map = {
+        "contract.json": "contract.json",
         "helpers/async_task_handles_csharp.py": "helpers/async_task_handles_csharp.py",
         "helpers/cfg_test_only_modules_rust.py": "helpers/cfg_test_only_modules_rust.py",
         "helpers/resource_lifecycle_cpp.py": "helpers/resource_lifecycle_cpp.py",
@@ -115,8 +120,9 @@ def main():
             suffix = match.group(3)
             lines = []
             for rel in sorted(new_helper_checksums):
-                if rel.startswith("helpers/"):
-                    lines.append(f"  ['{rel}']='{new_helper_checksums[rel]}'")
+                # Include root-level data assets too. The shared library's own
+                # digest is added only after rendering this table, below.
+                lines.append(f"  ['{rel}']='{new_helper_checksums[rel]}'")
             return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
         new_lib_content = lib_helper_pattern.sub(replace_common_helpers, lib_content)

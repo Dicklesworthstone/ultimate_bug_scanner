@@ -795,7 +795,7 @@ class RustNativeSuppressionTests(unittest.TestCase):
             ])
 
         with tempfile.TemporaryDirectory(prefix="ubs_rust_lexical_markers_") as temp:
-            root = Path(temp)
+            root = Path(temp).resolve()
             rules = root / "rules"
             rust_rules.generate(rules)
             paths = []
@@ -1145,5 +1145,303 @@ class SwiftAggregateSuppressionTests(unittest.TestCase):
                     self.assertEqual(sum(record["count"] for record in records), expected)
 
 
+class RustExcludeTestsPreciseScopeTests(unittest.TestCase):
+    """Persistent regression tests for Rust precise test-scope interval and span resolution."""
+
+    def test_reject_name_only_authority_ungated_modules(self) -> None:
+        """Ungated `mod tests` and `mod test` must remain scanned production code."""
+        from ubs_core.rust_scan import build_test_scope_index
+
+        code = """pub fn prod_one() {}
+
+mod tests {
+    fn helper() {
+        panic!("ungated tests panic");
+    }
+}
+
+mod test {
+    fn helper() {
+        panic!("ungated test panic");
+    }
+}
+
+mod test_parser {
+    fn parse() {
+        panic!("test_parser panic");
+    }
+}
+"""
+        index = build_test_scope_index(code)
+        self.assertEqual(len(index.line_intervals), 0, "Ungated modules must never be treated as test scope")
+
+    def test_cfg_boolean_implication_of_test(self) -> None:
+        """cfg(...) must provably imply test=True under conservative three-valued evaluation."""
+        from ubs_core.rust_scan import cfg_implies_test, compute_test_intervals
+
+        # Provably test-only:
+        self.assertTrue(cfg_implies_test("test"))
+        self.assertTrue(cfg_implies_test("all(unix, test)"))
+        self.assertTrue(cfg_implies_test("all(test, any(feature = \"a\", feature = \"b\"))"))
+        self.assertTrue(cfg_implies_test("not(not(test))"))
+        self.assertTrue(cfg_implies_test("all(unix, test,)"))  # valid trailing comma
+
+        # Root executable probe counterexamples:
+        # 1. Custom key-value atom: test = "not-a-test-build" is NOT the Boolean test predicate
+        self.assertFalse(cfg_implies_test('test = "not-a-test-build"'))
+        # 2. Unclosed syntax must fail closed
+        self.assertFalse(cfg_implies_test("all(test"))
+        self.assertFalse(cfg_implies_test("any(test"))
+        # 3. Trailing unconsumed input must fail closed
+        self.assertFalse(cfg_implies_test("test, unix"))
+        self.assertFalse(cfg_implies_test("all(test) extra"))
+        # 4. Invalid not arity (not takes exactly one predicate)
+        self.assertFalse(cfg_implies_test("not(not(test, unix))"))
+        self.assertFalse(cfg_implies_test("not()"))
+        self.assertFalse(cfg_implies_test("not(test, unix)"))
+
+        # Other non-test predicates (compiles in production under some environment):
+        self.assertFalse(cfg_implies_test("any(test, unix)"), "any(test, unix) compiles in production on Unix")
+        self.assertFalse(cfg_implies_test("not(test)"))
+        self.assertFalse(cfg_implies_test("all(unix, not(test))"))
+        self.assertFalse(cfg_implies_test("any(test, feature = \"mock\")"))
+        self.assertFalse(cfg_implies_test("feature = \"test-helpers\""))
+        self.assertFalse(cfg_implies_test("unix"))
+        self.assertFalse(cfg_implies_test('target_os = "linux"'))
+        self.assertFalse(cfg_implies_test(""))
+
+        # Verify compute_test_intervals does NOT hide production for cfg(test="not-a-test-build")
+        kv_code = """#[cfg(test = "not-a-test-build")]
+fn prod_helper() {
+    panic!("must be reported");
+}
+"""
+        intervals = compute_test_intervals(kv_code)
+        self.assertEqual(intervals, [], "compute_test_intervals must not hide production for key-value cfg(test=...)")
+
+    def test_restricted_known_test_runners(self) -> None:
+        """Only proven test gating and known runners (test, tokio::test, asupersync::test) qualify."""
+        from ubs_core.rust_scan import is_test_attr
+
+        # Proven runners:
+        self.assertTrue(is_test_attr("#[test]"))
+        self.assertTrue(is_test_attr("#[tokio::test]"))
+        self.assertTrue(is_test_attr("#[tokio::test(flavor = \"multi_thread\")]"))
+        self.assertTrue(is_test_attr("#[asupersync::test]"))
+        self.assertTrue(is_test_attr("#[cfg(test)]"))
+
+        # Arbitrary / unproven attributes rejected:
+        self.assertFalse(is_test_attr("#[criterion]"))
+        self.assertFalse(is_test_attr("#[rstest]"))
+        self.assertFalse(is_test_attr("#[quickcheck]"))
+        self.assertFalse(is_test_attr("#[foo::test]"))
+        self.assertFalse(is_test_attr("#[custom::test_runner]"))
+
+    def test_same_line_production_after_test_item_preserved(self) -> None:
+        """#[cfg(test)] fn t(){} fn production(){panic!(...)} must still report production panic."""
+        from ubs_core.rust_scan import Scan
+
+        code = """// line 1
+#[cfg(test)] fn t(){} fn production(){ panic!("same line prod panic"); }
+// line 3
+"""
+        with tempfile.NamedTemporaryFile(suffix=".rs", mode="w", delete=False) as f:
+            f.write(code)
+            tmp_path = Path(f.name)
+
+        try:
+            scan = Scan([tmp_path], tmp_path.parent, exclude_tests=True, skip=set(), detail_limit=10)
+            hits = scan.rg_lines(r"\bpanic!\(")
+            self.assertEqual(len(hits), 1, "Production panic on same line as test item must be reported")
+            self.assertEqual(hits[0].line, 2)
+            self.assertIn("same line prod panic", hits[0].text)
+
+            # Conservative line check must also not exclude line 2 because it has external code
+            self.assertFalse(scan._is_test_line(str(tmp_path), 2), "Line with external code must not be excluded")
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def test_same_line_production_before_test_item_preserved(self) -> None:
+        """fn prod_before(){panic!(...)} #[cfg(test)] fn t(){} must still report production panic."""
+        from ubs_core.rust_scan import Scan
+
+        code = """// line 1
+fn prod_before(){ panic!("before panic"); } #[cfg(test)] fn t(){}
+// line 3
+"""
+        with tempfile.NamedTemporaryFile(suffix=".rs", mode="w", delete=False) as f:
+            f.write(code)
+            tmp_path = Path(f.name)
+
+        try:
+            scan = Scan([tmp_path], tmp_path.parent, exclude_tests=True, skip=set(), detail_limit=10)
+            hits = scan.rg_lines(r"\bpanic!\(")
+            self.assertEqual(len(hits), 1, "Production panic before test item on same line must be reported")
+            self.assertEqual(hits[0].line, 2)
+            self.assertIn("before panic", hits[0].text)
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def test_cfg_any_test_unix_reports_production_panic(self) -> None:
+        """cfg(any(test, unix)) is production code on Unix and must report findings."""
+        from ubs_core.rust_scan import Scan
+
+        code = """#[cfg(any(test, unix))]
+fn unix_fn() {
+    panic!("unix production panic");
+}
+"""
+        with tempfile.NamedTemporaryFile(suffix=".rs", mode="w", delete=False) as f:
+            f.write(code)
+            tmp_path = Path(f.name)
+
+        try:
+            scan = Scan([tmp_path], tmp_path.parent, exclude_tests=True, skip=set(), detail_limit=10)
+            hits = scan.rg_lines(r"\bpanic!\(")
+            self.assertEqual(len(hits), 1, "cfg(any(test, unix)) panic must be reported with --exclude-tests")
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def test_early_cfg_test_import_and_interleaved_modules(self) -> None:
+        """Early import and interleaved modules only exclude their own scopes."""
+        from ubs_core.rust_scan import build_test_scope_index
+
+        code = """// line 1
+#[cfg(test)]
+use std::collections::HashMap; // lines 2-3
+
+pub struct BeforeProd { pub a: u32 } // line 5
+
+#[cfg(test)]
+mod alphabet_test { // line 8
+    #[test]
+    fn test_alpha() {
+        panic!("alpha");
+    }
+} // line 14
+
+pub struct AfterProd { pub b: u32 } // line 16
+"""
+        index = build_test_scope_index(code)
+        # Check conservative line intervals
+        self.assertTrue(index.contains(3))
+        self.assertFalse(index.contains(5), "BeforeProd must not be in test scope")
+        self.assertTrue(index.contains(9))
+        self.assertTrue(index.contains(13))
+        self.assertFalse(index.contains(16), "AfterProd must not be in test scope")
+
+    def test_unclosed_braces_fail_conservatively(self) -> None:
+        """Malformed / unclosed braces must never blind to EOF."""
+        from ubs_core.rust_scan import build_test_scope_index
+
+        code = """#[cfg(test)]
+mod unclosed {
+    fn broken() {
+        // missing closing braces
+"""
+        index = build_test_scope_index(code)
+        self.assertEqual(len(index.line_intervals), 0, "Unclosed braces must fail conservatively")
+        self.assertFalse(index.contains(4))
+
+    def test_cfg_key_value_test_build_reports_production_panic(self) -> None:
+        """cfg(test = "not-a-test-build") is valid custom key-value cfg and must report panic."""
+        from ubs_core.rust_scan import Scan
+
+        code = """#[cfg(test = "not-a-test-build")]
+fn custom_cfg_prod() {
+    panic!("production panic under key-value cfg");
+}
+"""
+        with tempfile.NamedTemporaryFile(suffix=".rs", mode="w", delete=False) as f:
+            f.write(code)
+            tmp_path = Path(f.name)
+
+        try:
+            scan = Scan([tmp_path], tmp_path.parent, exclude_tests=True, skip=set(), detail_limit=10)
+            hits = scan.rg_lines(r"\bpanic!\(")
+            self.assertEqual(len(hits), 1, "Panic under cfg(test = ...) must be reported with --exclude-tests")
+            self.assertIn("production panic under key-value cfg", hits[0].text)
+        finally:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+    def test_cfg_string_literals_preserved_and_recognized(self) -> None:
+        """cfg(all(test, feature = "x")) must preserve string literals and recognize test scope."""
+        from ubs_core.rust_scan import compute_test_intervals, cfg_implies_test
+
+        # 1. Direct implication evaluation
+        self.assertTrue(cfg_implies_test('all(test, feature = "x")'))
+        self.assertTrue(cfg_implies_test('all(test, target_os = "linux")'))
+
+        # 2. Item-level attribute
+        item_code = """pub fn prod_fn() {}
+#[cfg(all(test, feature = "x"))]
+mod tests {
+    fn helper() {
+        panic!("test panic");
+    }
+}
+pub fn prod_after() {}
+"""
+        intervals = compute_test_intervals(item_code)
+        self.assertEqual(intervals, [(2, 7)], "Item-level cfg with string literals must be recognized as test scope")
+
+        # 3. Root inner attribute
+        root_code = """#![cfg(all(test, feature = "x"))]
+
+pub fn helper() {
+    panic!("test panic");
+}
+"""
+        root_intervals = compute_test_intervals(root_code)
+        self.assertEqual(root_intervals, [(1, 5)], "Root inner attribute with string literals must exclude entire file")
+
+    def test_cfg_comments_safely_handled(self) -> None:
+        """Comments in and around test attributes must be safely handled without breaking parsing."""
+        from ubs_core.rust_scan import compute_test_intervals, is_test_attr
+
+        # Comments inside cfg predicate
+        self.assertTrue(is_test_attr('#[cfg(/* block comment */ all(test, // line comment\n feature = "x"))]'))
+        self.assertTrue(is_test_attr('#[/* outer */ test]'))
+        self.assertTrue(is_test_attr('#[test /* trailing */]'))
+        self.assertTrue(is_test_attr('#[/* outer */ cfg(test)]'))
+        self.assertTrue(is_test_attr('#[cfg(test) /* trailing */]'))
+
+        code = """pub fn prod_fn() {}
+#[cfg(/* comment */ all(test, // line comment
+    feature = "x"
+))]
+mod tests {
+    fn helper() {}
+}
+"""
+        intervals = compute_test_intervals(code)
+        self.assertEqual(intervals, [(2, 7)], "Attribute with comments must be correctly parsed and excluded")
+
+    def test_cfg_recursion_and_token_limits(self) -> None:
+        """Adversarial cfg expressions exceeding depth or token limits must fail closed without crashing."""
+        from ubs_core.rust_scan import cfg_implies_test
+
+        # Recursion depth exceeds _MAX_CFG_DEPTH (32)
+        deep_expr = "all(" * 35 + "test" + ")" * 35
+        self.assertFalse(cfg_implies_test(deep_expr), "Deeply nested cfg must fail closed")
+
+        # Token count exceeds _MAX_CFG_TOKENS (256)
+        many_tokens = "all(test, " + ", ".join(f'feat_{i} = "v"' for i in range(150)) + ")"
+        self.assertFalse(cfg_implies_test(many_tokens), "High token count cfg must fail closed")
+
+
 if __name__ == "__main__":
     unittest.main()
+

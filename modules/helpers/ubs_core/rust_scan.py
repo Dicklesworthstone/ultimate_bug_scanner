@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -245,6 +246,460 @@ def cargo_integration_test_root(path: Path) -> bool:
         return False
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Conservative three-valued cfg evaluation (test=False)
+# ─────────────────────────────────────────────────────────────────────────────
+_CFG_FALSE = 0
+_CFG_UNKNOWN = 1
+_CFG_TRUE = 2
+
+_MAX_CFG_TOKENS = 256
+_MAX_CFG_DEPTH = 32
+
+
+def _tokenize_cfg(text: str) -> list[tuple[str, str]] | None:
+    """Tokenize cfg predicate string strictly. Return None on any invalid syntax."""
+    tokens: list[tuple[str, str]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if ch == "/" and i + 1 < n:
+            if text[i + 1] == "/":
+                i += 2
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if text[i + 1] == "*":
+                depth = 1
+                i += 2
+                while i < n and depth > 0:
+                    if i + 1 < n and text[i:i+2] == "/*":
+                        depth += 1
+                        i += 2
+                    elif i + 1 < n and text[i:i+2] == "*/":
+                        depth -= 1
+                        i += 2
+                    else:
+                        i += 1
+                if depth > 0:
+                    return None  # unclosed block comment
+                continue
+        if len(tokens) >= _MAX_CFG_TOKENS:
+            return None
+        if ch in "(),=":
+            tokens.append((ch, ch))
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            escaped = False
+            while j < n:
+                if escaped:
+                    escaped = False
+                elif text[j] == "\\":
+                    escaped = True
+                elif text[j] == '"':
+                    break
+                j += 1
+            if j >= n or text[j] != '"':
+                return None  # unclosed string
+            tokens.append(("STRING", text[i:j+1]))
+            i = j + 1
+            continue
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            tokens.append(("IDENT", text[i:j]))
+            i = j
+            continue
+        return None  # invalid character
+    return tokens
+
+
+def _parse_and_eval_cfg(tokens: list[tuple[str, str]]) -> int | None:
+    """Parse cfg predicate tokens and evaluate under three-valued logic with test=False.
+
+    Requires strict complete grammar consumption, valid arity, matching parens,
+    and handles key-value unknown atoms (e.g. test = "not-a-test-build").
+    Returns _CFG_FALSE, _CFG_UNKNOWN, or _CFG_TRUE if valid, or None on parse error.
+    """
+    pos = 0
+    n = len(tokens)
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[pos] if pos < n else None
+
+    def consume(expected_type: str | None = None) -> tuple[str, str] | None:
+        nonlocal pos
+        if pos >= n:
+            return None
+        tok = tokens[pos]
+        if expected_type is not None and tok[0] != expected_type:
+            return None
+        pos += 1
+        return tok
+
+    def parse_predicate(depth: int = 0) -> int | None:
+        if depth > _MAX_CFG_DEPTH:
+            return None
+        nonlocal pos
+        tok = consume()
+        if tok is None:
+            return None
+        tok_type, tok_val = tok
+
+        if tok_type == "IDENT":
+            ident = tok_val
+            nxt = peek()
+
+            if ident == "not" and nxt is not None and nxt[0] == "(":
+                consume("(")
+                arg = parse_predicate(depth + 1)
+                if arg is None:
+                    return None
+                # not(...) takes EXACTLY ONE predicate!
+                # Optional trailing comma allowed
+                if peek() is not None and peek()[0] == ",":
+                    consume(",")
+                if not consume(")"):
+                    return None
+                if arg == _CFG_FALSE:
+                    return _CFG_TRUE
+                elif arg == _CFG_TRUE:
+                    return _CFG_FALSE
+                else:
+                    return _CFG_UNKNOWN
+
+            elif ident == "all" and nxt is not None and nxt[0] == "(":
+                consume("(")
+                if peek() is not None and peek()[0] == ")":
+                    consume(")")
+                    return _CFG_TRUE  # empty all() is True
+                args: list[int] = []
+                while True:
+                    arg = parse_predicate(depth + 1)
+                    if arg is None:
+                        return None
+                    args.append(arg)
+                    if peek() is not None and peek()[0] == ",":
+                        consume(",")
+                        if peek() is not None and peek()[0] == ")":
+                            consume(")")
+                            break
+                    elif peek() is not None and peek()[0] == ")":
+                        consume(")")
+                        break
+                    else:
+                        return None
+                if any(a == _CFG_FALSE for a in args):
+                    return _CFG_FALSE
+                elif all(a == _CFG_TRUE for a in args):
+                    return _CFG_TRUE
+                else:
+                    return _CFG_UNKNOWN
+
+            elif ident == "any" and nxt is not None and nxt[0] == "(":
+                consume("(")
+                if peek() is not None and peek()[0] == ")":
+                    consume(")")
+                    return _CFG_FALSE  # empty any() is False
+                args = []
+                while True:
+                    arg = parse_predicate(depth + 1)
+                    if arg is None:
+                        return None
+                    args.append(arg)
+                    if peek() is not None and peek()[0] == ",":
+                        consume(",")
+                        if peek() is not None and peek()[0] == ")":
+                            consume(")")
+                            break
+                    elif peek() is not None and peek()[0] == ")":
+                        consume(")")
+                        break
+                    else:
+                        return None
+                if any(a == _CFG_TRUE for a in args):
+                    return _CFG_TRUE
+                elif all(a == _CFG_FALSE for a in args):
+                    return _CFG_FALSE
+                else:
+                    return _CFG_UNKNOWN
+
+            elif nxt is not None and nxt[0] == "=":
+                # Key-value unknown atom: ident = "string_literal"
+                consume("=")
+                str_tok = consume("STRING")
+                if str_tok is None:
+                    return None
+                # Custom key-value atom (even if key is "test", e.g. test = "foo")
+                # is not the Boolean test predicate; unknown in production.
+                return _CFG_UNKNOWN
+
+            else:
+                # Bare identifier atom
+                if ident == "test":
+                    return _CFG_FALSE
+                return _CFG_UNKNOWN
+
+        return None
+
+    res = parse_predicate(0)
+    if res is None:
+        return None
+    # Strict complete grammar consumption: no trailing unparsed tokens
+    if pos < n:
+        return None
+    return res
+
+
+def cfg_implies_test(cfg_text: str) -> bool:
+    """Return True iff cfg_text provably forces test=True (evaluates to False whenever test=False).
+
+    Evaluates under conservative three-valued logic where test=False and all unknown
+    predicates (os, arch, features, and key-value atoms like test="...") are UNKNOWN.
+    Requires strict complete grammar consumption, arity validation, and matching parens.
+    """
+    if not cfg_text or not cfg_text.strip():
+        return False
+    tokens = _tokenize_cfg(cfg_text)
+    if tokens is None or not tokens:
+        return False
+    val = _parse_and_eval_cfg(tokens)
+    return val == _CFG_FALSE
+
+
+def is_test_attr(attr_text: str) -> bool:
+    """Return True iff attribute text denotes provable test-only scope.
+
+    Restricted strictly to proven test gating and known runners:
+    - `cfg(...)` that provably implies `test`
+    - `#[test]`
+    - `#[tokio::test]`
+    - `#[asupersync::test]`
+    Arbitrary foo::test/criterion/rstest attributes are not treated as test-only authority.
+    """
+    if not attr_text.startswith("#[") or not attr_text.endswith("]"):
+        return False
+    clean = strip_comments_and_strings(attr_text, lang="rust", strip_strings=False)
+    m = re.match(r"^#\[\s*(.+?)\s*\]$", clean, re.DOTALL)
+    if not m:
+        return False
+    inner = m.group(1).strip()
+
+    if inner in ("test", "tokio::test", "asupersync::test"):
+        return True
+    if inner.startswith("test(") or inner.startswith("tokio::test(") or inner.startswith("asupersync::test("):
+        return True
+    if inner.startswith("cfg(") and inner.endswith(")"):
+        return cfg_implies_test(inner[4:-1].strip())
+    return False
+
+
+@dataclass
+class TestScopeIndex:
+    """Index for test-only scopes using conservative line intervals.
+
+    Boundary lines containing any external production code are strictly retained
+    outside line_intervals and remain visible to avoid column unit guessing.
+    """
+    line_intervals: list[tuple[int, int]] = field(default_factory=list)
+    _line_starts_bisect: list[int] = field(init=False, repr=False)
+    _line_ends_bisect: list[int] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._line_starts_bisect = [s for s, _ in self.line_intervals]
+        self._line_ends_bisect = [e for _, e in self.line_intervals]
+
+    def contains_line(self, line_no: int) -> bool:
+        if not self.line_intervals:
+            return False
+        idx = bisect_right(self._line_starts_bisect, line_no) - 1
+        if idx < 0:
+            return False
+        return line_no <= self._line_ends_bisect[idx]
+
+    def contains(self, line_no: int, col: int | None = None) -> bool:
+        # Conservative full-line exclusion: boundary lines with any production
+        # code are strictly retained outside line_intervals and remain visible.
+        # Avoids column unit guessing between byte columns and character offsets.
+        return self.contains_line(line_no)
+
+
+def build_test_scope_index(text: str) -> TestScopeIndex:
+    """Build TestScopeIndex for Rust source text.
+
+    - Rejects name-only authority (no bare mod tests/test matching).
+    - Checks boolean implication of cfg(test).
+    - Emits conservative line intervals [safe_start, safe_end] that strictly retain boundary
+      lines containing any external production code.
+    - Fails conservatively on unclosed braces without blinding to EOF.
+    """
+    lines = text.splitlines(keepends=True)
+    total_lines = len(lines)
+    if total_lines == 0:
+        return TestScopeIndex()
+
+    line_starts = [0]
+    for line in lines:
+        line_starts.append(line_starts[-1] + len(line))
+
+    def get_line(offset: int) -> int:
+        return bisect_right(line_starts, offset)
+
+    stripped = strip_comments_and_strings(text, lang="rust")
+    n = len(stripped)
+
+    # Check for root inner attribute #![cfg(...)]
+    k = 0
+    while k < n and stripped[k].isspace():
+        k += 1
+    while k + 3 <= n and stripped[k:k+3] == "#![":
+        attr_start = k
+        bracket_depth = 0
+        j = k + 2
+        while j < n:
+            if stripped[j] == "[":
+                bracket_depth += 1
+            elif stripped[j] == "]":
+                bracket_depth -= 1
+                if bracket_depth == 0:
+                    j += 1
+                    break
+            j += 1
+        if bracket_depth != 0:
+            break
+        test_form = "#[" + text[attr_start + 3 : j]
+        if is_test_attr(test_form):
+            return TestScopeIndex(line_intervals=[(1, total_lines)])
+        k = j
+        while k < n and stripped[k].isspace():
+            k += 1
+
+    line_intervals: list[tuple[int, int]] = []
+    i = 0
+
+    while i < n:
+        if stripped[i:i+2] == "#[":
+            attr_start = i
+            bracket_depth = 0
+            j = i
+            while j < n:
+                if stripped[j] == "[":
+                    bracket_depth += 1
+                elif stripped[j] == "]":
+                    bracket_depth -= 1
+                    if bracket_depth == 0:
+                        j += 1
+                        break
+                j += 1
+            attr_text = text[i:j]
+            if is_test_attr(attr_text):
+                curr = j
+                while curr < n:
+                    while curr < n and stripped[curr].isspace():
+                        curr += 1
+                    if stripped[curr:curr+2] == "#[":
+                        b_depth = 0
+                        while curr < n:
+                            if stripped[curr] == "[":
+                                b_depth += 1
+                            elif stripped[curr] == "]":
+                                b_depth -= 1
+                                if b_depth == 0:
+                                    curr += 1
+                                    break
+                            curr += 1
+                    else:
+                        break
+
+                p_depth = 0
+                b_depth = 0
+                found_block = False
+                found_semi = False
+                brace_depth = 0
+                k = curr
+                while k < n:
+                    ch = stripped[k]
+                    if ch == "(":
+                        p_depth += 1
+                    elif ch == ")":
+                        p_depth = max(0, p_depth - 1)
+                    elif ch == "[":
+                        b_depth += 1
+                    elif ch == "]":
+                        b_depth = max(0, b_depth - 1)
+                    elif p_depth == 0 and b_depth == 0:
+                        if ch == "{":
+                            found_block = True
+                            brace_depth = 1
+                            k += 1
+                            while k < n and brace_depth > 0:
+                                if stripped[k] == "{":
+                                    brace_depth += 1
+                                elif stripped[k] == "}":
+                                    brace_depth -= 1
+                                k += 1
+                            m = k
+                            while m < n and stripped[m].isspace():
+                                m += 1
+                            if m < n and stripped[m] == ";":
+                                k = m + 1
+                            break
+                        elif ch == ";":
+                            found_semi = True
+                            k += 1
+                            break
+                    k += 1
+
+                if (found_block and brace_depth == 0) or found_semi:
+                    item_end = k
+
+                    start_line = get_line(attr_start)
+                    end_line = get_line(item_end - 1)
+
+                    line_start_char = line_starts[start_line - 1]
+                    line_end_char = line_starts[end_line] if end_line < len(line_starts) else len(text)
+
+                    prefix = stripped[line_start_char : attr_start]
+                    suffix = stripped[item_end : line_end_char]
+
+                    safe_start = start_line + 1 if prefix.strip() else start_line
+                    safe_end = end_line - 1 if suffix.strip() else end_line
+                    if safe_start <= safe_end:
+                        line_intervals.append((safe_start, safe_end))
+
+                    i = item_end
+                    continue
+                else:
+                    i = j
+                    continue
+        i += 1
+
+    merged_lines: list[tuple[int, int]] = []
+    if line_intervals:
+        line_intervals.sort()
+        merged_lines = [line_intervals[0]]
+        for s, e in line_intervals[1:]:
+            last_s, last_e = merged_lines[-1]
+            if s <= last_e + 1:
+                merged_lines[-1] = (last_s, max(last_e, e))
+            else:
+                merged_lines.append((s, e))
+
+    return TestScopeIndex(line_intervals=merged_lines)
+
+
+def compute_test_intervals(text: str) -> list[tuple[int, int]]:
+    """Legacy helper: return conservative line intervals for test items."""
+    return build_test_scope_index(text).line_intervals
+
+
 class Scan:
     def __init__(self, files: Sequence[Path], project_dir: Path, exclude_tests: bool,
                  skip: set[int], detail_limit: int, jobs: int = 1) -> None:
@@ -301,39 +756,48 @@ class Scan:
             str(path) for path in self.files if cargo_integration_test_root(path)
         }
         self.boundary_cache: dict[str, int] = {}
+        self.test_scope_cache: dict[str, TestScopeIndex] = {}
         self.counters: Counter = Counter()
         self.records: list[dict] = []
         self.checks: list[dict] = []
         self.ast_matches: dict[str, list[dict]] = {}
         self._detector_cache: dict[tuple, list[Hit]] = {}
 
-    # ── legacy filter_test_lines / _ubs_test_boundary (839-894) ────────────
+    # ── filter_test_lines / test scope index ───────────────────────────────
+    def test_scope_index(self, path_str: str) -> TestScopeIndex:
+        if path_str in self.test_scope_cache:
+            return self.test_scope_cache[path_str]
+        path = Path(path_str)
+        text = self.texts.get(path)
+        if text is None:
+            try:
+                resolved = path.resolve()
+                text = self.texts.get(resolved)
+            except OSError:
+                text = None
+        if text is None:
+            lines = self.lines_map.get(path)
+            if lines is not None:
+                text = "\n".join(lines)
+            else:
+                try:
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    text = ""
+        index = build_test_scope_index(text)
+        self.test_scope_cache[path_str] = index
+        return index
+
     def test_boundary(self, path_str: str) -> int:
+        """Legacy helper retained for compatibility."""
         if path_str in self.boundary_cache:
             return self.boundary_cache[path_str]
-        path = Path(path_str)
-        lines = self.lines_map.get(path)
-        if lines is None:
-            try:
-                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-            except OSError:
-                lines = []
-        b1 = b2 = 0
-        for idx, line in enumerate(lines, start=1):
-            if b1 == 0 and "#[cfg(test)]" in line:
-                b1 = idx
-            if b2 == 0 and re.match(r"^\s*mod tests(\s|\{|;|$)", line):
-                b2 = idx
-            if b1 and b2:
-                break
-        if b1 and b2:
-            boundary = min(b1, b2)
-        else:
-            boundary = b1 or b2
+        idx = self.test_scope_index(path_str)
+        boundary = idx.line_intervals[0][0] if idx.line_intervals else 0
         self.boundary_cache[path_str] = boundary
         return boundary
 
-    def _is_test_line(self, path_str: str, line_no: int) -> bool:
+    def _is_test_line(self, path_str: str, line_no: int, col: int | None = None) -> bool:
         if not self.exclude_tests:
             return False
         norm = path_str.replace("\\", "/")
@@ -343,15 +807,14 @@ class Scan:
                 return True
         if path_str in self.test_only or str(Path(path_str).resolve()) in self.test_only:
             return True
-        boundary = self.test_boundary(path_str)
-        return boundary > 0 and line_no >= boundary
+        return self.test_scope_index(path_str).contains(line_no, col)
 
     # ── legacy count_lines stage (grep -v marker | filter_test_lines) ──────
     def stream_line_allowed(self, path_str: str, line_no: int, code: str,
-                            rule_id: str | None = None) -> bool:
+                            rule_id: str | None = None, col: int | None = None) -> bool:
         if self.suppressions.is_suppressed(path_str, line_no, rule_id):
             return False
-        return not self._is_test_line(path_str, line_no)
+        return not self._is_test_line(path_str, line_no, col)
 
     # ── rg pipeline equivalent: distinct matching lines ────────────────────
     def rg_lines(self, pattern: str, ignore_case: bool = False,
@@ -363,16 +826,18 @@ class Scan:
         for path, lines in self.lines_map.items():
             path_str = str(path)
             for line_no, line in enumerate(lines, start=1):
-                if not regex.search(line):
+                m = regex.search(line)
+                if not m:
                     continue
+                col = m.start() + 1
                 stream = f"{path_str}:{line_no}:{line}"
                 if exclude is not None and exclude.search(stream):
                     continue
                 if self.suppressions.is_suppressed(path_str, line_no, rule_id):
                     continue
-                if self._is_test_line(path_str, line_no):
+                if self._is_test_line(path_str, line_no, col):
                     continue
-                hits.append(Hit(path_str, line_no, 1, line))
+                hits.append(Hit(path_str, line_no, col, line))
         return hits
 
     # legacy rust_code_match_lines (1034-1047): strip `//`-comments from the
@@ -388,14 +853,16 @@ class Scan:
                 continue
             path_str = str(path)
             for line_no, line in enumerate(lines, start=1):
-                if not regex.search(line):
+                m = regex.search(line)
+                if not m:
                     continue
-                if self.suppressions.is_suppressed(path_str, line_no, rule_id) or self._is_test_line(path_str, line_no):
+                col = m.start() + 1
+                if self.suppressions.is_suppressed(path_str, line_no, rule_id) or self._is_test_line(path_str, line_no, col):
                     continue
                 code = line.split("//", 1)[0]
                 if not regex.search(code):
                     continue
-                hits.append(Hit(path_str, line_no, 1, line))
+                hits.append(Hit(path_str, line_no, col, line))
         return hits
 
     # ── ast layer ──────────────────────────────────────────────────────────
@@ -417,7 +884,7 @@ class Scan:
                 seen.add(key)
                 if entry["path"] not in allowed:
                     continue  # GH #70 authoritative-file-set enforcement
-                if not self.stream_line_allowed(entry["path"], entry["line"], self._source_line(entry["path"], entry["line"])):
+                if not self.stream_line_allowed(entry["path"], entry["line"], self._source_line(entry["path"], entry["line"]), col=entry.get("col")):
                     continue
                 kept.append(entry)
             if kept:
@@ -484,7 +951,7 @@ class Scan:
             path_str, line_no, col, code = hit[0], hit[1], hit[2], hit[3]
             path_str = str((detector_base / Path(path_str)).resolve())
             # legacy: heredoc stdout -> count_lines (marker + test filter)
-            if self.suppressions.is_suppressed(path_str, int(line_no), None) or self._is_test_line(path_str, int(line_no)):
+            if self.suppressions.is_suppressed(path_str, int(line_no), None) or self._is_test_line(path_str, int(line_no), int(col)):
                 continue
             hits.append(Hit(path_str, int(line_no), int(col), code))
         self._detector_cache[key] = hits

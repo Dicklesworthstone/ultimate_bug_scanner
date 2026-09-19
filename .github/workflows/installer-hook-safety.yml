@@ -21,13 +21,25 @@ jobs:
           persist-credentials: false
       - name: Install test dependencies
         run: sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
-      - name: Apply the reviewed literal installer patch
+      - name: Apply the reviewed installer and upgrade patches
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh api repos/Dicklesworthstone/ultimate_bug_scanner/git/blobs/6c05aff56e2f33d0cd9ef40122f8c28646d51c7a --jq .content | base64 -d > "$RUNNER_TEMP/installer.patch"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          path = Path(os.environ['RUNNER_TEMP'], 'installer.patch')
+          text = path.read_text()
+          for name in ('install.sh', 'test-suite/install/run_tests.sh'):
+              text = text.replace(f'--- a/{name}', f'diff --git a/{name} b/{name}\n--- a/{name}', 1)
+          path.write_text(text)
+          PY
           git apply --recount --check "$RUNNER_TEMP/installer.patch"
           git apply --recount "$RUNNER_TEMP/installer.patch"
+          gh api repos/Dicklesworthstone/ultimate_bug_scanner/git/blobs/076a8211d625b6274451feb5d134c558225374ba --jq .content | base64 -d > "$RUNNER_TEMP/upgrade.patch"
+          git apply --check "$RUNNER_TEMP/upgrade.patch"
+          git apply "$RUNNER_TEMP/upgrade.patch"
           ./scripts/update_sha256sums.sh
       - name: Check syntax, lint, and checksum chain
         run: |
@@ -51,7 +63,7 @@ jobs:
               result = subprocess.run(['gh', 'api', '--method', 'POST', endpoint, '--input', '-'], input=json.dumps(payload), text=True, capture_output=True, check=True)
               return json.loads(result.stdout)
           changed = git('diff', '--name-only').splitlines()
-          allowed = {'install.sh', 'SHA256SUMS', 'test-suite/install/run_tests.sh'}
+          allowed = {'install.sh', 'SHA256SUMS', 'test-suite/install/run_tests.sh', 'test-suite/install/test_claude_hook_scope.py'}
           if set(changed) != allowed:
               raise SystemExit(f'Unexpected changed paths: {changed}')
           endpoint = 'repos/Dicklesworthstone/ultimate_bug_scanner/git/'

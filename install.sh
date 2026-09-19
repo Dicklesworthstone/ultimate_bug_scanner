@@ -3389,32 +3389,50 @@ create_alias() {
   log "Restart your shell or run: source $rc_file"
 }
 
-# True when a PreToolUse hook whose command is dcg is already registered, in
-# either the user-scope settings or the project's. ACFS installs dcg as the Bash
-# guard and deletes git_safety_guard.py nightly; installing ours back on top
-# makes the two tools alternate every night (#131).
 claude_dcg_hook_registered() {
-  command -v python3 >/dev/null 2>&1 || return 1
-  python3 - "$HOME/.claude/settings.json" "$(claude_project_root)/.claude/settings.json" << 'PY'
-import json, os, sys
+  command -v python3 >/dev/null 2>&1 || return 2
+  python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" \
+    "$1/.claude/settings.json" "$1/.claude/settings.local.json" <<'PY'
+import json, os, re, shlex, sys
 
-for path in sys.argv[1:]:
-    if not path or not os.path.exists(path):
-        continue
+def is_dcg(command):
+    if not isinstance(command, str):
+        return False
     try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        continue
-    if not isinstance(data, dict):
-        continue
-    for entry in (data.get("hooks") or {}).get("PreToolUse") or []:
-        if not isinstance(entry, dict):
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    # Common shell forms: NAME=value dcg, exec /path/dcg, env NAME=value dcg.
+    while words and (words[0] in ("exec", "env", "--") or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[0])):
+        words.pop(0)
+    return bool(words) and os.path.basename(words[0]) in ("dcg", "dcg.exe", "destructive_command_guard")
+
+try:
+    for path in sys.argv[1:]:
+        if not os.path.exists(path):
             continue
-        for hook in entry.get("hooks") or []:
-            command = hook.get("command") if isinstance(hook, dict) else None
-            if isinstance(command, str) and os.path.basename(command.split()[0] if command.split() else "") == "dcg":
-                sys.exit(0)
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read().strip()
+            data = json.loads(text) if text else {}
+        if not isinstance(data, dict) or not isinstance(data.get("hooks", {}), dict):
+            raise ValueError(f"invalid settings object: {path}")
+        entries = data.get("hooks", {}).get("PreToolUse", [])
+        if not isinstance(entries, list):
+            raise ValueError(f"invalid PreToolUse list: {path}")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks", []), list):
+                raise ValueError(f"invalid hook entry: {path}")
+            matcher = entry.get("matcher", "")
+            if not isinstance(matcher, str):
+                raise ValueError(f"invalid matcher: {path}")
+            if matcher not in ("", "*") and re.search(matcher, "Bash") is None:
+                continue
+            for hook in entry.get("hooks", []):
+                if isinstance(hook, dict) and hook.get("type") == "command" and not hook.get("if") and is_dcg(hook.get("command")):
+                    sys.exit(0)
+except (OSError, ValueError, re.error) as exc:
+    print(f"Cannot inspect Claude hooks: {exc}", file=sys.stderr)
+    sys.exit(2)
 sys.exit(1)
 PY
 }
@@ -3556,17 +3574,28 @@ setup_claude_code_hook() {
     return 0
   fi
 
-  if dry_run_enabled; then
-    log_dry_run "Would write $root/.claude/hooks/on-file-write.sh, install $root/.claude/hooks/git_safety_guard.py, and register both in $root/.claude/settings.json."
+  root="$(cd -- "$root" && pwd -P)" || return 1
+  local config_dir="$root/.claude"
+  if [[ "$root" -ef "$HOME" || "$config_dir" == "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+     || "$config_dir" -ef "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ]]; then
+    warn "Skipping Claude Code project hooks: refusing to modify user-level Claude settings."
     return 0
   fi
-  if [ ! -d "$root/.claude" ]; then
-    mkdir -p "$root/.claude"
-    log "Created $root/.claude directory for Claude Code integration."
+  local entry
+  for entry in "$config_dir" "$config_dir/hooks" "$config_dir/settings.json" \
+    "$config_dir/hooks/on-file-write.sh" "$config_dir/hooks/git_safety_guard.py"; do
+    if [[ -L "$entry" ]]; then
+      warn "Skipping Claude Code hook setup through symlink: $entry"
+      return 0
+    fi
+  done
+  if dry_run_enabled; then
+    log_dry_run "Would configure project hooks in $config_dir (legacy safety guard only when no DCG hook is registered)."
+    return 0
   fi
-  log "Setting up Claude Code hooks in $root ..."
+  log "Setting up Claude Code hooks for $root..."
 
-  local hook_dir="$root/.claude/hooks"
+  local hook_dir="$config_dir/hooks"
   local hook_file="$hook_dir/on-file-write.sh"
 
   mkdir -p "$hook_dir"
@@ -3625,8 +3654,17 @@ HOOK_EOF
   chmod +x "$hook_file"
   success "Claude Code hook created: $hook_file"
 
-  install_claude_safety_guard "$root"
-  register_claude_settings_hooks "$root"
+  local guard_status=0 has_guard=0
+  claude_dcg_hook_registered "$root" || guard_status=$?
+  case "$guard_status" in
+    0) log "DCG already guards Bash; leaving the legacy git_safety_guard integration unchanged." ;;
+    1)
+      install_claude_safety_guard "$root"
+      [ -f "$hook_dir/git_safety_guard.py" ] && has_guard=1
+      ;;
+    *) warn "Could not inspect Claude settings; not adding a legacy safety guard." ;;
+  esac
+  register_claude_settings_hooks "$config_dir/settings.json" "$has_guard"
 }
 
 # Install the git/filesystem safety guard (PreToolUse hook for Bash) that README
@@ -3634,26 +3672,15 @@ HOOK_EOF
 # otherwise download it from the release assets and verify it against the
 # release SHA256SUMS when that manifest lists it.
 install_claude_safety_guard() {
-  local root="${1:-.}"
+  local root="$1"
   local hook_dir="$root/.claude/hooks"
   local target="$hook_dir/git_safety_guard.py"
   local script_dir=""
-  # ACFS now ships destructive_command_guard as the PreToolUse Bash guard and
-  # retires this one, deleting it on every nightly run. Reinstalling it here put
-  # the two back in conflict every night (#131). If dcg already holds that slot,
-  # leave it alone — a second Bash guard buys nothing and loses the argument.
-  if claude_dcg_hook_registered; then
-    log "destructive_command_guard already registered as the PreToolUse Bash hook — skipping git_safety_guard.py."
-    return 0
-  fi
   if [ -f "$target" ]; then
     chmod +x "$target" 2>/dev/null || true
     log "Claude Code safety guard already present: $target"
     return 0
   fi
-  # $target is absolute (it is anchored to the project root), so compare against
-  # it directly — prefixing $(pwd) here would never match and the installer
-  # would copy the file onto itself when run from its own checkout.
   if script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]:-${0}}")" 2>/dev/null && pwd)" \
      && [ -f "$script_dir/.claude/hooks/git_safety_guard.py" ] \
      && [ "$script_dir/.claude/hooks/git_safety_guard.py" != "$target" ]; then
@@ -3686,26 +3713,39 @@ install_claude_safety_guard() {
 
 # Register the hooks in .claude/settings.json (PostToolUse on Edit|Write|MultiEdit
 # for the scanner, PreToolUse on Bash for the safety guard). Idempotent: an entry
-# whose command is already present is left alone; other settings are preserved;
-# the previous file is backed up before it is rewritten.
+# invoking the same hook script is left alone, including corrected absolute
+# paths and custom matchers. Other settings are preserved; replacement is atomic.
 register_claude_settings_hooks() {
-  local root="${1:-.}"
-  local settings="$root/.claude/settings.json"
-  local has_guard=0
-  [ -f "$root/.claude/hooks/git_safety_guard.py" ] && has_guard=1
+  local settings="$1" has_guard="$2"
   if ! command -v python3 >/dev/null 2>&1; then
     warn "python3 not available; add these hooks to $settings manually:"
     cat << 'SNIPPET'
   "hooks": {
-    "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh"}]}],
-    "PreToolUse":  [{"matcher": "Bash", "hooks": [{"type": "command", "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"}]}]
+    "PostToolUse": [{"matcher": "Edit|Write|MultiEdit", "hooks": [{"type": "command", "command": "\"$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh\""}]}]
   }
 SNIPPET
     return 0
   fi
   local result
   if result="$(python3 - "$settings" "$has_guard" << 'PY'
-import json, os, shutil, sys, time
+import json, os, shlex, shutil, stat, sys, tempfile
+
+def script_name(command):
+    if not isinstance(command, str):
+        return ""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return ""
+    if not words:
+        return ""
+    if os.path.basename(words[0]) in ("bash", "sh", "python", "python3"):
+        words.pop(0)
+        while words and words[0].startswith("-"):
+            if words[0] in ("-c", "-m"):
+                return ""  # inline code is not a hook script path
+            words.pop(0)
+    return os.path.basename(words[0]) if words else ""
 
 path, has_guard = sys.argv[1], sys.argv[2] == "1"
 data = {}
@@ -3725,28 +3765,30 @@ hooks = data.setdefault("hooks", {})
 if not isinstance(hooks, dict):
     print("invalid:'hooks' is not an object")
     sys.exit(0)
-wanted = [("PostToolUse", "Edit|Write|MultiEdit", "$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh")]
+wanted = [("PostToolUse", "Edit|Write|MultiEdit", '"$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh"')]
 if has_guard:
-    wanted.append(("PreToolUse", "Bash", "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"))
+    wanted.append(("PreToolUse", "Bash", '"$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"'))
 added = []
 for event, matcher, command in wanted:
     entries = hooks.setdefault(event, [])
     if not isinstance(entries, list):
         print(f"invalid:'hooks.{event}' is not a list")
         sys.exit(0)
-    # Match on the hook's basename rather than the exact command string. The
-    # exact-string test treated a corrected entry (one a user had repointed at
-    # an absolute path) as absent and appended a second, broken entry beside it
-    # on every run — observed as duplicate PostToolUse hooks (#131).
-    leaf = os.path.basename(command)
+    if any(not isinstance(entry, dict) or not isinstance(entry.get("hooks", []), list) for entry in entries):
+        print(f"invalid:'hooks.{event}' contains an invalid entry")
+        sys.exit(0)
+    # Upgrade only the exact command older UBS installers emitted. It breaks
+    # when CLAUDE_PROJECT_DIR contains spaces; corrected/custom commands stay
+    # untouched, including their interpreter, arguments, and matcher.
+    for entry in entries:
+        for hook in entry.get("hooks", []):
+            if isinstance(hook, dict) and hook.get("type") == "command" and hook.get("command") == command[1:-1]:
+                hook["command"] = command
+                added.append(f"{event}:quoted-command")
     present = any(
-        isinstance(entry, dict)
-        and any(
-            isinstance(h, dict)
-            and isinstance(h.get("command"), str)
-            and os.path.basename(h["command"]) == leaf
-            for h in (entry.get("hooks") or [])
-        )
+        any(isinstance(h, dict) and h.get("type") == "command"
+            and script_name(h.get("command")) == script_name(command)
+            for h in entry.get("hooks", []))
         for entry in entries
     )
     if present:
@@ -3756,12 +3798,25 @@ for event, matcher, command in wanted:
 if not added:
     print("unchanged")
     sys.exit(0)
+directory = os.path.dirname(path) or "."
+os.makedirs(directory, exist_ok=True)
+mode = stat.S_IMODE(os.stat(path).st_mode) if os.path.exists(path) else 0o600
 if os.path.exists(path):
-    shutil.copyfile(path, f"{path}.bak-ubs-{time.strftime('%Y%m%dT%H%M%S')}")
-os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-with open(path, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
+    backup_fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + ".bak-ubs-", dir=directory)
+    os.close(backup_fd)
+    shutil.copy2(path, backup)
+fd, temporary = tempfile.mkstemp(prefix=".ubs-settings-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), mode)
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
 print("added:" + ",".join(added))
 PY
 )"; then

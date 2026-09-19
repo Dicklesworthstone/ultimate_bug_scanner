@@ -388,6 +388,7 @@ test_claude_hooks_registered() {
   tmpdirs+=("$ctx")
   local home="$ctx/home" proj="$ctx/proj" log="$ctx/install.log"
   mkdir -p "$home" "$proj/.claude"
+  git -C "$proj" init -q
   # Pre-existing settings must survive the merge.
   printf '{\n  "permissions": {\n    "allow": [\n      "Bash(ls:*)"\n    ]\n  }\n}\n' >"$proj/.claude/settings.json"
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
@@ -407,12 +408,12 @@ test_claude_hooks_registered() {
     return 1
   fi
   if ! python3 - "$settings" << 'PY'
-import json, sys
+import json, shlex, sys
 data = json.load(open(sys.argv[1]))
 assert data["permissions"]["allow"] == ["Bash(ls:*)"], "pre-existing settings were lost"
 hooks = data["hooks"]
 def commands(event):
-    return [h["command"] for entry in hooks.get(event, []) for h in entry.get("hooks", [])]
+    return [shlex.split(h["command"])[0] for entry in hooks.get(event, []) for h in entry.get("hooks", [])]
 assert commands("PostToolUse").count("$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh") == 1, commands("PostToolUse")
 assert commands("PreToolUse").count("$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py") == 1, commands("PreToolUse")
 assert [e["matcher"] for e in hooks["PostToolUse"]] == ["Edit|Write|MultiEdit"]
@@ -1037,6 +1038,7 @@ STUB
 
 test_bash_guard_precedes_bash4_syntax
 test_streamed_easy_mode_does_not_self_relaunch_forever
+python3 "$ROOT_DIR/test-suite/install/test_claude_hook_scope.py" || tests_failed=1
 test_basic_smoke
 test_no_alias_written_when_no_path_modify
 test_skip_typos_flag

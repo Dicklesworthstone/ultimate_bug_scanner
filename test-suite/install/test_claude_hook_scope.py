@@ -259,6 +259,20 @@ setup_claude_code_hook
         self.assertEqual(list(settings.parent.glob("settings.json.bak-ubs-*")), backups)
         self.assertFalse(list(settings.parent.glob(".ubs-settings-*")))
 
+    def test_installer_generated_commands_are_quoted_on_upgrade(self) -> None:
+        path = self.project / ".claude/settings.json"
+        scan = "$CLAUDE_PROJECT_DIR/.claude/hooks/on-file-write.sh"
+        guard = "$CLAUDE_PROJECT_DIR/.claude/hooks/git_safety_guard.py"
+        self.write_settings(path, {"hooks": {"PostToolUse": [command_hook(scan, "Edit|Write")],
+                                            "PreToolUse": [command_hook(guard)]}})
+        self.setup_hooks(self.project)
+        hooks = self.settings()["hooks"]
+        self.assertEqual(hooks["PostToolUse"], [command_hook(f'"{scan}"', "Edit|Write")])
+        self.assertEqual(hooks["PreToolUse"], [command_hook(f'"{guard}"')])
+        before = path.read_bytes()
+        self.setup_hooks(self.project)
+        self.assertEqual(path.read_bytes(), before)
+
     def test_invalid_settings_are_not_replaced(self) -> None:
         path = self.project / ".claude/settings.json"
         path.parent.mkdir()
@@ -282,10 +296,13 @@ class InstallerCLI(unittest.TestCase):
             settings.write_bytes(before)
             bin_dir = root / "bin"
             bin_dir.mkdir()
-            for tool in ("curl", "wget", "crontab"):
+            for tool in ("curl", "wget"):
                 path = bin_dir / tool
                 path.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$0 $*" >> "$TOOL_LOG"\nexit 1\n')
                 path.chmod(0o755)
+            cron = bin_dir / "crontab"
+            cron.write_text('#!/usr/bin/env bash\ncase "$1" in\n-l) exit 0;;\n-) cat >> "$TOOL_LOG";;\n*) exit 1;;\nesac\n')
+            cron.chmod(0o755)
             env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "UBS_", "XDG_", "CLAUDE_"))}
             env.update(HOME=str(home), NO_COLOR="1", SHELL="/bin/bash", TOOL_LOG=str(root / "tools.log"),
                        PATH=str(bin_dir) + os.pathsep + os.environ["PATH"])

@@ -83,32 +83,50 @@ def _regex_start_context(text: str, idx: int) -> bool:
     return not (ch in ')]')
 
 
-def _mask_non_code(text: str) -> str:
-    """Blank comments, string/template-literal text and regex literals with
-    spaces (newlines preserved) so only real code operators survive; ``${...}``
-    interpolation code stays visible. Offsets are identical to the input."""
-    out = list(text)
+def _blank_range(out: list[str], a: int, b: int, n: int) -> None:
+    """Blank out[a:b) preserving newlines, clamped to n."""
+    for j in range(a, min(b, n)):
+        if out[j] != '\n':
+            out[j] = ' '
+
+
+def _mask_code_region(text: str, out: list[str], start: int, stop_brace: bool) -> int:
+    """Mask non-code in ``text[start:]`` into ``out`` (offsets preserved):
+    blank comments, string/template-literal text and regex literals with
+    spaces (newlines preserved). Template ``${...}`` interpolation bodies are
+    masked recursively as code, so regex literals and strings inside them are
+    blanked too. When ``stop_brace`` (interpolation body), scanning stops
+    before the unmatched ``}`` terminator and returns its index; otherwise
+    returns ``len(text)``."""
     n = len(text)
-
-    def blank(a: int, b: int) -> None:
-        for j in range(a, min(b, n)):
-            if out[j] != '\n':
-                out[j] = ' '
-
-    i = 0
+    depth = 0
+    i = start
     while i < n:
         c = text[i]
+        if c == '\n':
+            i += 1
+            continue
+        if c == '}':
+            if stop_brace and depth == 0:
+                return i
+            depth -= 1
+            i += 1
+            continue
+        if c == '{':
+            depth += 1
+            i += 1
+            continue
         nxt = text[i + 1] if i + 1 < n else ''
         if c == '/' and nxt == '/':
             end = text.find('\n', i)
             end = n if end == -1 else end
-            blank(i, end)
+            _blank_range(out, i, end, n)
             i = end
             continue
         if c == '/' and nxt == '*':
             end = text.find('*/', i + 2)
             end = n if end == -1 else end + 2
-            blank(i, end)
+            _blank_range(out, i, end, n)
             i = end
             continue
         if c in '\'"':
@@ -121,7 +139,7 @@ def _mask_non_code(text: str) -> str:
                 if ch == c or ch == '\n':
                     break
                 j += 1
-            blank(i, min(j + 1, n))
+            _blank_range(out, i, min(j + 1, n), n)
             i = j + 1
             continue
         if c == '`':
@@ -129,24 +147,19 @@ def _mask_non_code(text: str) -> str:
             while j < n:
                 ch = text[j]
                 if ch == '\\':
+                    _blank_range(out, j, min(j + 2, n), n)
                     j += 2
                     continue
                 if ch == '`':
                     j += 1
                     break
                 if ch == '$' and j + 1 < n and text[j + 1] == '{':
-                    depth = 1
-                    k = j + 2
-                    while k < n and depth:
-                        if text[k] == '{':
-                            depth += 1
-                        elif text[k] == '}':
-                            depth -= 1
-                        k += 1
-                    blank(j, j + 2)
-                    j = k
+                    _blank_range(out, j, j + 2, n)
+                    close = _mask_code_region(text, out, j + 2, True)
+                    _blank_range(out, close, close + 1, n)
+                    j = close + 1
                     continue
-                blank(j, j + 1)
+                _blank_range(out, j, j + 1, n)
                 j += 1
             i = j
             continue
@@ -176,10 +189,21 @@ def _mask_non_code(text: str) -> str:
                 end = j + 1
                 while end < n and (text[end].isalnum()):
                     end += 1
-                blank(i, end)
+                _blank_range(out, i, end, n)
                 i = end
                 continue
         i += 1
+    return n
+
+
+def _mask_non_code(text: str) -> str:
+    """Blank comments, string/template-literal text and regex literals with
+    spaces (newlines preserved) so only real code operators survive;
+    ``${...}`` interpolation bodies stay visible as code (recursively masked,
+    so regex literals and strings inside them are blanked). Offsets are
+    identical to the input."""
+    out = list(text)
+    _mask_code_region(text, out, 0, False)
     return ''.join(out)
 
 
@@ -554,12 +578,46 @@ def _selftest_run_record_shape(
         assert rec["message"].startswith("Division operations found"), rec
 
 
+def _selftest_regex_in_template_interpolation(
+    tmp_prefix: str = "ubs_core_spec_division_regex_interp_",
+) -> None:
+    import tempfile
+
+    # GH #907: `${...}` interpolation bodies stayed visible in the mask but
+    # were never re-scanned, so a regex literal inside an interpolation had
+    # its opening `/.../` and closing `/flags` read as division chains.
+    src = "\n".join([
+        "export function persistKey(computerId) {",
+        "  return `persist:bot-${computerId.replace(/[^A-Za-z0-9_-]+/g, \"-\")}`;",
+        "}",
+        "export function shellQuote(value) {",
+        "  return `'${String(value).replace(/'/g, `'\"'\"'\"`)}'`;",
+        "}",
+        "export function pathToFileUrl(resolved) {",
+        "  return process.platform === \"win32\"",
+        "    ? `file:///${resolved.replace(/\\\\/g, \"/\")}`",
+        "    : `file://${resolved}`;",
+        "}",
+        "export function realDivision(total, count) {",
+        "  return `ratio ${total / count}`;",
+        "}",
+        "",
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "regex907.js"
+        target.write_text(src, encoding="utf-8")
+        findings = list(scan_file_divisions(target))
+        assert len(findings) == 1, findings  # only ${total / count} divides
+        assert findings[0][0] == 13, findings
+
+
 SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("variable-denominators-flagged", _selftest_variable_denominators_flagged),
     ("gh73-safe-denominators-clean", _selftest_gh73_safe_denominators_clean),
     ("zero-and-unguarded-risky", _selftest_zero_and_unguarded_risky),
     ("non-code-never-matches", _selftest_non_code_never_matches),
     ("template-interpolation-is-code", _selftest_template_interpolation_is_code),
+    ("regex-in-template-interpolation", _selftest_regex_in_template_interpolation),
     ("severity-ladder", _selftest_severity_ladder),
     ("run-record-shape", _selftest_run_record_shape),
 )

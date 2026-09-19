@@ -31,9 +31,16 @@ export function summarize(samples, total) {
   const radians = samples[12] / Math.PI;
   const scaled = samples[13] / 0.5;
   const share = samples[14] / (total || 1);
+  // GH #907: regex literals inside template interpolations are not division
+  // chains — neither the opening `/.../` nor the closing `/flags`.
+  const key1 = `persist:bot-${samples[15].replace(/[^A-Za-z0-9_-]+/g, "-")}`;
+  const quoted = `'${String(samples[16]).replace(/'/g, `'"'"'`)}'`;
+  const fileUrl = `file:///${String(samples[17]).replace(/\\/g, "/")}`;
+  const reFromVar = String(samples[18]).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return [
     half1, half2, half3, half4, half5, half6, half7, half8, half9, half10,
     half11, half12, half13, half14, pct1, pct2, pct3, pct4, pct5, pct6,
     pct7, pct8, pct9, pct10, pct11, pct12, radians, scaled, share,
+    key1, quoted, fileUrl, reFromVar,
   ];
 }

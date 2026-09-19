@@ -5233,7 +5233,8 @@
           }
         },
         "forbid_substrings": [
-          "Division by variable - verify non-zero"
+          "Division by variable - verify non-zero",
+          "Division operations found"
         ]
       }
     },

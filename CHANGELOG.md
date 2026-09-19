@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.9] - 2026-09-19 [Release]
+
 ### Target selection
 
 - Name a single-file target one way. `prepare_single_file_target` resolved two of its three branches by using the path as written, so `ubs ../proj/a.py` produced `<scan_root>/../proj/a.py`. That still starts with `<scan_root>/`, so the report rewrote every mention of the target to `../proj/a.py` while producers that skip that rewrite emitted the resolved path: one file, one scan, `totals.files` of 1, and two different `file` values in the same document, which anything grouping or deduplicating by `file` sees as two locations. `a.py`, `./a.py` and an absolute path were always consistent — only a spelling that has to be resolved split. The target is now canonicalised once, the way the third branch always did, so every spelling of the same file agrees; `ubs /a/../b/c.py` is fixed by the same change. Measured against the released v5.4.8, which reports two spellings for the `..` form where this reports one. (#122)

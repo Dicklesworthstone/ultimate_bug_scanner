@@ -92,6 +92,36 @@ class ContractChecksums(unittest.TestCase):
             after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
             self.assertEqual(before, after)
 
+    def test_verifier_rejects_contract_drift_and_missing_asset(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-contract-verify-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            (root / "modules/helpers").mkdir()
+            verifier = root / "scripts/verify_checksums.sh"
+            shutil.copy2(REPO_ROOT / "scripts/verify_checksums.sh", verifier)
+            result = self.generate(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            def verify() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", str(verifier)], cwd=root, text=True,
+                    capture_output=True, check=False, timeout=30,
+                )
+
+            result = verify()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("modules/contract.json", result.stdout)
+            contract = root / "modules/contract.json"
+            contract.write_bytes(b'{"modules":{}}\n')
+            result = verify()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("SHARED-LIBRARY HELPER CHECKSUM MISMATCH: modules/contract.json", result.stdout)
+            self.assertIn("CHECKSUM MISMATCH: modules/contract.json", result.stdout)
+            contract.rename(contract.with_suffix(".parked"))
+            result = verify()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CHECKSUM FILE MISSING: modules/contract.json", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

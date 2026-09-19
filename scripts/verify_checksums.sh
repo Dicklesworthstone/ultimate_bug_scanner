@@ -104,6 +104,8 @@ echo ""
 echo "Verifying helper checksums..."
 while IFS= read -r -d '' helper; do
   if [[ ! -f "$helper" ]]; then
+    echo -e "${RED}✗ CHECKSUM FILE MISSING: $helper${NC}"
+    FAILED=1
     continue
   fi
 
@@ -121,7 +123,7 @@ while IFS= read -r -d '' helper; do
 
   expected="${EXPECTED_HELPER_CHECKSUMS[$rel]:-MISSING}"
 
-  if [[ "$rel" == helpers/* ]]; then
+  if [[ "$rel" == helpers/* || "$rel" == contract.json ]]; then
     embedded_helper="${EXPECTED_COMMON_HELPER_CHECKSUMS[$rel]:-MISSING}"
     if [[ "$embedded_helper" != "$actual" ]]; then
       echo -e "${RED}✗ SHARED-LIBRARY HELPER CHECKSUM MISMATCH: $helper${NC}"
@@ -144,7 +146,12 @@ while IFS= read -r -d '' helper; do
   else
     echo -e "${GREEN}✓ $helper${NC}"
   fi
-done < <(find modules/helpers modules/lib -type f ! -path "*__pycache__*" -print0 | sort -z)
+done < <({
+  # Enumerate the required root-level asset even when missing (or a symlink),
+  # so deleting it cannot make checksum verification silently skip it.
+  printf '%s\0' modules/contract.json
+  find modules/helpers modules/lib -type f ! -path "*__pycache__*" -print0
+} | sort -z)
 
 if [[ $FAILED -eq 1 ]]; then
   echo ""

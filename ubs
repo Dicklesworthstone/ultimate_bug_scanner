@@ -49,22 +49,23 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='5c1f9e03429aa95b10cd5a46b18d2bb557224eccd567e83af8a17775716abf67'
-  [cpp]='f24e4c56013dd68e00721de262cabff520c9a494b0b50297655da9383f252bf5'
-  [csharp]='b641065beafd9c0d272267c724ca9831489674b4127c7aba861e3b0fd45c9715'
-  [elixir]='41d09484acdc358a0582f702f89daad55552c20b5d544b6c605f3f14c51b2782'
-  [golang]='f984527e6001f5b8a00d7a6d2b7ad5e7ba0beef4603c00a10342c56c0226c169'
-  [java]='cffbf72c884e821613b174a09eaae56be49079a2e206fa96b35798b69ead781b'
-  [js]='e39afc21d0a3bf711bb57c4343d8defb71f5a9afee4730570cd12eb51f9165e5'
-  [kotlin]='e5b28f6d86213b85d7af2b4484971b11cfc2e0ee35f3b6fa52c770e3692d7804'
-  [python]='fce33f9da2d8c68abea7e3f3b9e05e8fe643d3d4dc27bd9f295a3890cb30c72a'
-  [ruby]='7ea5d4b64fb09fd4ed85dcd1ee09fbd59390f19962c32e40d6c20fd3bcc49546'
-  [rust]='efc82bccd3d3a2dcf064d383a88207b1125dac0a7f1a08016c849802921beeb5'
-  [swift]='d777dba5682d4f5b2fb0e2ae1600aad842b347eda70c885b88f12ace2462b2b8'
+  [bash]='03cef59fe51165eb107e48500b89bfa3fcab4ac3f59ed192d78444024d1b2365'
+  [cpp]='4c54d28cdc83842c700097ed5a8991fd65d7c04028bc7ec40e8c76cf29186991'
+  [csharp]='8cc851a3aa07c42d4afba08e77d0aa1771175b0dec73c65b7179ddd1f74dd3a8'
+  [elixir]='d8e6408aef27a5027f970e0206c85a1de4e7065787d924efa6c4ea45bf5ad247'
+  [golang]='07bab0fb2df1930de50689f3b55903deed26209250616a5a620154dea9b76ae9'
+  [java]='563f4cd2889f72d787821bd85a22fabe6ed9d18562d903c539f7bd36687e3fde'
+  [js]='c17229a082c75fd7147be157a24d779901a0406f41b573921e34ee805a7a0d36'
+  [kotlin]='3b9f8d49bc80265927aac9060e345e9dc5fb7776504645adc6e01ae7efab239c'
+  [python]='6451b505f4bcb56743162a52b83a948e60e2ea8504c7964f9e51c74d510673f3'
+  [ruby]='55633bb9739f67f6f1c758197678fc901833e39f0efe38e0fdb821e880f18fc7'
+  [rust]='51fb28ed614ce675169e8cc3504d01973aee22b8558e2bf5ae0c76c21e8bd992'
+  [swift]='a8b76af796fc5455dafed756e9e7f7c03f17cd22945537a41383cace0b3c264f'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
 declare -A HELPER_CHECKSUMS=(
+  ['contract.json']='636e49c1f9b0636e9fe5d2692252575ba9536ab81e4ee339d0d68686a318a746'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'
@@ -413,7 +414,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='6ec345b67748a90d0d17972f61a6a4e1b25b2b8f4323fd44f9fcc5946b760e50'
+  ['lib/ubs-common.sh']='f96e4cf536e3aeb8f1974a90337cc04e1cb9ad3b5678a755505c65fa8d7cda59'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -678,6 +679,7 @@ add_exclude_patterns(){
 }
 
 HELPER_ASSETS=(
+  "contract.json"
   "helpers/async_task_handles_csharp.py"
   "helpers/cfg_test_only_modules_rust.py"
   "helpers/resource_lifecycle_cpp.py"
@@ -2809,12 +2811,9 @@ else:
 
 def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: str) -> bool:
     exts = spec.get("extensions", [])
-    # An installed runner has no modules/contract.json next to it: the contract
-    # is not a checksum-verified asset, so it is never cached, and every spec
-    # comes back empty. Without this fallback no file matches any language, the
-    # per-language lists are all empty, and detect_lang reads empty as "this
-    # language is absent" — so an installed ubs reported "no supported
-    # languages" (exit 3) for every project while a checkout scanned it fine.
+    # A cold, offline install may not have the verified detection contract yet.
+    # Keep source-extension detection working without treating an unavailable
+    # contract as an empty project. Verification failures never reach this path.
     # The built-in hint map is the runner's own knowledge that .py is Python;
     # it is narrower than the contract, which still wins wherever it is present.
     if ext_str and not exts and LANG_EXT_HINTS.get(ext_str) == lang:
@@ -3173,12 +3172,9 @@ build_scan_file_list(){
   t0="$(now_ms)"
   ensure_tmpdir_run
   list="$(mktemp 2>/dev/null || mktemp -t ubslist.XXXXXX)" || return 1
-  local contract_file=""
-  if [[ -f "$(script_dir)/modules/contract.json" ]]; then
-    contract_file="$(script_dir)/modules/contract.json"
-  elif [[ -f "$MODULE_DIR/contract.json" ]]; then
-    contract_file="$MODULE_DIR/contract.json"
-  fi
+  # Only the per-run snapshot verified before the first listing may be read.
+  # Never rediscover an unchecked checkout/cache file here.
+  local contract_file="${DETECTION_CONTRACT_FILE:-}"
   if ! stats="$(list_scan_files "$scan_root" "$list" "$contract_file" "$TMPDIR_RUN" "$ONLY_LANGS" "$EXCLUDE_LANGS" "$INCLUDE_EXT")"; then
     rm -f "$list" 2>/dev/null
     return 1
@@ -3203,6 +3199,9 @@ build_scan_file_list(){
   return 0
 }
 
+# Delay listing until module-dir normalization and asset/download definitions
+# are available. Previously this ran before any installed assets could be fetched.
+check_scan_size(){
 if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && -d "$SOURCE_PROJECT_DIR" && -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
   build_scan_file_list || true
 fi
@@ -3228,6 +3227,7 @@ if [[ "$RUN_SCAN_GUARDS" -eq 1 && "$TARGETED_SCAN_MODE" -eq 0 && "$SKIP_SIZE_CHE
       "Options: scan a smaller subdirectory; raise the limit with UBS_MAX_DIR_SIZE_MB=5000; disable it with UBS_MAX_DIR_SIZE_MB=0."
   fi
 fi
+}
 
 if [[ -n "$CATEGORY_FILTER" ]]; then
   CATEGORY_FILTER="${CATEGORY_FILTER,,}"
@@ -4103,8 +4103,17 @@ verify_helper_checksum(){
   local rel="$1" path="$2"
   local expected="${HELPER_CHECKSUMS[$rel]:-}"
   VERIFY_HELPER_ERR=""
-  should_verify_module_path "$path" || return 0
-  [[ -n "$expected" ]] || return 0
+  if [[ "$rel" == "contract.json" ]]; then
+    # Detection also reads a checkout or a private per-run snapshot, neither
+    # necessarily under MODULE_DIR. Both must have the same pinned digest.
+    if [[ -z "$expected" ]]; then
+      VERIFY_HELPER_ERR="missing pinned checksum for contract.json"
+      return 2
+    fi
+  else
+    should_verify_module_path "$path" || return 0
+    [[ -n "$expected" ]] || return 0
+  fi
   if [[ ! -f "$path" ]]; then
     VERIFY_HELPER_ERR="helper file not found at $path"
     return 1
@@ -4951,6 +4960,7 @@ download_helper_asset(){
     fi
     local empty_sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     if [[ "${HELPER_CHECKSUMS[$rel]:-}" != "$empty_sha" ]] && [ ! -s "$tmp" ]; then
+      VERIFY_HELPER_ERR="checksum mismatch for $rel (empty helper file)"
       rm -f "$tmp" 2>/dev/null || true
       if [[ "$idx" -lt "$total" ]]; then
         say "${YELLOW}${WARN}${RESET} empty helper file for $rel from ${label}; trying main fallback..."
@@ -5035,6 +5045,50 @@ ensure_helper_asset(){
       fi
     fi
   fi
+  return 0
+}
+
+# The contract is needed BEFORE listing/size guards, not just module dispatch.
+# A missing download may use built-in hints; a present or fetched but unverified
+# contract must never masquerade as "no supported languages". Repair is explicit
+# through doctor --fix, so a failed repair cannot hide a corrupt cached contract.
+ensure_detection_contract(){
+  DETECTION_CONTRACT_FILE=""
+  local rel="contract.json" path snapshot
+  if [[ -z "${HELPER_CHECKSUMS[$rel]:-}" ]]; then
+    say_err "${RED}$X missing pinned checksum for contract.json; refusing to scan${RESET}"
+    return 2
+  fi
+  path="$(script_dir)/modules/$rel"
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    path="$MODULE_DIR/$rel"
+  fi
+  if [[ ! -e "$path" && ! -L "$path" ]]; then
+    VERIFY_HELPER_ERR=""
+    if ! download_helper_asset "$rel" "$path"; then
+      if [[ -n "${VERIFY_HELPER_ERR:-}" ]]; then
+        say_err "${RED}$X contract.json failed verification (${VERIFY_HELPER_ERR}); refusing to scan${RESET}"
+        return 2
+      fi
+      say_err "${YELLOW}${WARN}${RESET} contract.json unavailable; using built-in extension hints (manifest-only detection unavailable). Run: ubs doctor --fix"
+      return 0
+    fi
+  fi
+
+  # Verify the bytes the listing will actually consume, not a mutable cache
+  # path it would reopen later. Never overwrite checkout assets during a scan.
+  ensure_tmpdir_run
+  snapshot="$TMPDIR_RUN/detection-contract.json"
+  if [[ ! -f "$path" ]] || ! cp "$path" "$snapshot"; then
+    say_err "${RED}$X cannot read contract.json at $path; refusing to scan${RESET}"
+    return 2
+  fi
+  if ! verify_helper_checksum "$rel" "$snapshot"; then
+    say_err "${RED}$X contract.json failed verification (${VERIFY_HELPER_ERR}); refusing to scan${RESET}"
+    say_err "${DIM}  Fix installed assets: ubs doctor --fix; after checkout edits: ./scripts/update_checksums.sh${RESET}"
+    return 2
+  fi
+  DETECTION_CONTRACT_FILE="$snapshot"
   return 0
 }
 
@@ -5392,6 +5446,10 @@ fi
 # Execution / aggregation
 # ─────────────────────────────────────────────────────────────────────────────
 ensure_tmpdir_run
+# Unlike the best-effort file listing, integrity failures must not be swallowed
+# by a conditional/|| true. Informational modes have already returned above.
+ensure_detection_contract || exit 2
+check_scan_size
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-module time bound + process-group teardown (issue #60)

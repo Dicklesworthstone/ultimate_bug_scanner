@@ -122,6 +122,7 @@ if ! declare -p UBS_HELPER_CHECKSUMS >/dev/null 2>&1; then
   declare -g -A UBS_HELPER_CHECKSUMS=()
 fi
 declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
+  ['contract.json']='636e49c1f9b0636e9fe5d2692252575ba9536ab81e4ee339d0d68686a318a746'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'

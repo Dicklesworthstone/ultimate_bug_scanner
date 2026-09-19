@@ -4,11 +4,36 @@ on:
   push:
     branches: [main]
     paths:
+      - ubs
+      - install.sh
+      - SHA256SUMS
+      - modules/**
+      - scripts/new-module.sh
+      - scripts/update_checksums.py
+      - scripts/verify_checksums.sh
+      - scripts/verify_sha256sums.sh
+      - test-suite/shareable/test_contract_checksums.py
+      - test-suite/shareable/test_installed_contract.py
+      - test-suite/shareable/test_meta_runner_modes.py
+      - .github/workflows/contract-assets.yml
+  pull_request:
+    paths:
+      - ubs
+      - install.sh
+      - SHA256SUMS
+      - modules/**
+      - scripts/new-module.sh
+      - scripts/update_checksums.py
+      - scripts/verify_checksums.sh
+      - scripts/verify_sha256sums.sh
+      - test-suite/shareable/test_contract_checksums.py
+      - test-suite/shareable/test_installed_contract.py
+      - test-suite/shareable/test_meta_runner_modes.py
       - .github/workflows/contract-assets.yml
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   installed-contract:
@@ -16,50 +41,24 @@ jobs:
     timeout-minutes: 15
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
-      - name: Validate the reviewed runtime patch and publish its Git tree
-        run: |
-          # Reuse the exact reviewed preparation/test scripts from the first
-          # commit. This job publishes Git objects only, never a branch update.
-          gh api repos/Dicklesworthstone/ultimate_bug_scanner/contents/.github/workflows/contract-assets.yml?ref=06d8f69718912ad2c60d2352e02ded02db57469c \
-            --jq .content | base64 -d > "$RUNNER_TEMP/reviewed-contract-workflow.yml"
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import subprocess
-
-          lines = Path(os.environ["RUNNER_TEMP"], "reviewed-contract-workflow.yml").read_text().splitlines()
-          index = 0
-          count = 0
-          while index < len(lines):
-              line = lines[index]
-              index += 1
-              if not line.startswith("        run: "):
-                  continue
-              value = line[len("        run: "):]
-              if value == "|":
-                  body = []
-                  while index < len(lines) and (not lines[index].strip() or lines[index].startswith("          ")):
-                      body.append(lines[index][10:])
-                      index += 1
-                  script = "\n".join(body) + "\n"
-              else:
-                  script = value
-              count += 1
-              print(f"::group::Reviewed validation step {count}", flush=True)
-              subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script], check=True)
-              print("::endgroup::", flush=True)
-          if count != 7:
-              raise SystemExit(f"Expected seven reviewed run steps, found {count}")
-          PY
-      - name: Preserve verification diff and tree identity
-        if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: contract-asset-verification-arm
-          path: |
-            ${{ runner.temp }}/contract-runtime.diff
-            ${{ runner.temp }}/contract-tree.json
-          if-no-files-found: ignore
+          persist-credentials: false
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+      - name: Check shell syntax and checksum chain
+        run: |
+          for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh scripts/verify_checksums.sh; do
+            bash -n "$script"
+          done
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Test checksum generation and verification
+        run: python3 test-suite/shareable/test_contract_checksums.py -v
+      - name: Test installed detection, doctor, and fail-closed behavior
+        run: python3 test-suite/shareable/test_installed_contract.py -v
+      - name: Verify generated files are current
+        run: |
+          python3 scripts/update_checksums.py
+          git diff --exit-code

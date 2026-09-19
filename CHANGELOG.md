@@ -10,7 +10,10 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Target selection
+
+- Make a leading slash actually anchor a single-component ignore pattern. `ignore_globs_for_rg` mapped `/target` by stripping the slash, and the resulting bare glob `target` matches a file or directory of that name at **any** depth in rg — so the anchor silently did nothing, and `a/b/target` was dropped along with the root one. `/ignored/**` anchored correctly only because stripping left a separator behind. The function's own header comment said a leading slash anchors, and `.ubsignore` is documented as gitignore-like, where it does; the code was the side that disagreed, so the code is what changed. Both spellings now emit the slash (`!/target`, `!/ignored/**`), which was verified against real `rg` to select exactly what `!ignored/**` did for the multi-component case. The shared `ubs_ignore` matcher — the one both non-rg selection paths use — strips the anchor and matches against the whole relative path, keeping all three paths in agreement. Measured end to end: with `--exclude /ignored` over a tree holding `ignored/bad.py`, `nested/ignored/keep.py` and `root.py`, v5.4.8 scanned 1 file and this scans 2. (#121)
+- Cover the anchored single-component shape in `IgnoreMatcherParityTest`, whose matrix runs the real `ignore_globs_for_rg` against real `rg` and the generated matcher, plus a direct assertion that `/ignored` keeps `nested/ignored/keep.py`. Confirmed to fail against the pre-fix mapping, which routed `/ignored` to the any-depth component matcher.
 
 ---
 

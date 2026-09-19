@@ -137,6 +137,9 @@ class IgnoreMatcherParityTest(unittest.TestCase):
     PATTERNS = (
         "/ignored/**", "ignored", "a/b", "/a/b/**", "**/foo.py", "foo.py",
         "deep/**", "**/ignored/**", "/keep.py", "*.py", "nested",
+        # Single-component anchored patterns: the shape whose leading slash
+        # used to be stripped and therefore matched at any depth (#121).
+        "/ignored", "/nested", "/deep", "/foo.py",
         "dir.with.dots", "/a/b/c.py", "**/deeper", "ignored/bad.py",
         "", "a,b",
         # Bracket expressions, including the two spellings where a `]` directly
@@ -197,6 +200,16 @@ class IgnoreMatcherParityTest(unittest.TestCase):
 
     def test_root_anchor_keeps_the_same_name_deeper_in_the_tree(self) -> None:
         matcher = self.ubs_ignore.IgnoreMatcher("/ignored/**")
+        self.assertTrue(matcher.excluded("ignored/bad.py"))
+        self.assertFalse(matcher.excluded("nested/ignored/keep.py"))
+
+    def test_root_anchor_applies_to_a_single_component_pattern(self) -> None:
+        # #121: the leading slash was stripped, so `/ignored` became the bare
+        # glob `ignored`. A glob with no separator matches a component at any
+        # depth in rg, so the anchor silently did nothing and nested/ignored
+        # was dropped too — while `/ignored/**` anchored correctly, because it
+        # kept a separator. The two spellings now agree.
+        matcher = self.ubs_ignore.IgnoreMatcher("/ignored")
         self.assertTrue(matcher.excluded("ignored/bad.py"))
         self.assertFalse(matcher.excluded("nested/ignored/keep.py"))
 

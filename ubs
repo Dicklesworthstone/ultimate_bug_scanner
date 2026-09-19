@@ -2517,7 +2517,13 @@ ignore_globs_for_rg(){
   for pat in "${pats[@]}"; do
     [[ -z "$pat" ]] && continue
     case "$pat" in
-      /*) printf '%s\n' "!${pat#/}" ;;
+      # Keep the leading slash: rg reads it as root-anchored. Stripping it left
+      # a single-component pattern like `/target` as the bare glob `target`,
+      # which rg matches at any depth — so the anchor silently did nothing and
+      # `a/b/target` was dropped too (#121). Multi-component patterns were
+      # already anchored by virtue of containing a separator, and `!/a/b/**`
+      # selects exactly what `!a/b/**` did.
+      /*) printf '%s\n' "!$pat" ;;
       \*\*/*) printf '%s\n' "!$pat" ;;
       */*) printf '%s\n' "!**/$pat" ;;
       *) printf '%s\n' "!$pat" ;;
@@ -2544,6 +2550,7 @@ The ignore spec is a comma-separated list of patterns. ignore_globs_for_rg
 turns each one into a ripgrep glob; this module reproduces that glob's meaning
 so paths selected without rg agree exactly. Per pattern:
 
+    /a       root-anchored (only the root `a`, never `x/a`)
     /a/b     root-anchored
     **/a     any depth, including the root
     a/b      any depth (rg is given `**/a/b`)
@@ -2558,7 +2565,7 @@ import re
 def rg_glob(pattern):
     """The glob ignore_globs_for_rg emits for `pattern`, without the `!`."""
     if pattern.startswith("/"):
-        return pattern[1:]
+        return pattern
     if pattern.startswith("**/"):
         return pattern
     if "/" in pattern:
@@ -2649,10 +2656,18 @@ class IgnoreMatcher:
             if not pattern:
                 continue
             glob = rg_glob(pattern)
+            # A leading slash is rg's root anchor, not part of the glob: strip
+            # it and match against the whole relative path, which is what
+            # anchoring means. Without this a single-component anchored
+            # pattern like `/target` became the bare glob `target` and matched
+            # at any depth, so the anchor did nothing (#121).
+            anchored = glob.startswith("/")
+            if anchored:
+                glob = glob[1:]
             # A glob with a separator is matched against the whole relative
             # path; one without is matched against each path component, which
             # is how rg treats a slashless glob.
-            (paths if "/" in glob else components).append(glob_to_regex(glob))
+            (paths if anchored or "/" in glob else components).append(glob_to_regex(glob))
         # rg prunes a directory its glob matched, so a path glob also excludes
         # everything below it: `a/b` must drop `a/b/c.py`, not just `a/b`.
         self.path_re = self._compile(paths, r"(?:/.*)?")

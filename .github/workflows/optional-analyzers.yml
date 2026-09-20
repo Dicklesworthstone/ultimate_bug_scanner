@@ -29,6 +29,24 @@ jobs:
           gh api repos/Dicklesworthstone/ultimate_bug_scanner/git/blobs/0aef942ef3e76867b26d32edff69a1388013f811 --jq .content | base64 -d > "$RUNNER_TEMP/ruby.patch"
           git apply --check "$RUNNER_TEMP/ruby.patch"
           git apply "$RUNNER_TEMP/ruby.patch"
+          git apply <<'PATCH'
+          diff --git a/modules/ubs-ruby.sh b/modules/ubs-ruby.sh
+          --- a/modules/ubs-ruby.sh
+          +++ b/modules/ubs-ruby.sh
+          @@ -105,10 +105,10 @@
+           
+           if [[ "$USE_COLOR" -eq 1 ]]; then
+             RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+          -  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+          +  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'
+             BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+           else
+          -  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+          +  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''
+             BOLD=''; DIM=''; RESET=''
+           fi
+           
+          PATCH
           python3 scripts/update_checksums.py
       - name: Verify syntax, lint, and checksum chain
         run: |

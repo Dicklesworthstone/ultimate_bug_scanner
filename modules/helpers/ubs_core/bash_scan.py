@@ -368,7 +368,8 @@ def scan_shellcheck(
             proc = subprocess.run(
                 ["shellcheck", "-f", "json", *batch],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
             )
         except FileNotFoundError:
@@ -394,7 +395,7 @@ def scan_shellcheck(
             )
 
         try:
-            items = json.loads(proc.stdout or "[]")
+            items = json.loads(proc.stdout)
         except ValueError:
             if errors is not None:
                 errors.append(
@@ -403,13 +404,26 @@ def scan_shellcheck(
                 )
             continue
 
+        if not isinstance(items, list):
+            if errors is not None:
+                errors.append("shellcheck returned invalid JSON: expected a diagnostic array")
+            continue
+
+        invalid_items = 0
         for it in items:
-            file_p = it.get("file", "")
-            lineno = int(it.get("line", 1) or 1)
-            col = int(it.get("column", 1) or 1)
-            code = it.get("code")
-            msg = it.get("message", "")
-            level = it.get("level", "info")
+            if (
+                not isinstance(it, dict)
+                or not isinstance(it.get("file"), str) or not it["file"]
+                or any(type(it.get(k)) is not int or it[k] < 1
+                       for k in ("line", "column", "code"))
+                or not isinstance(it.get("message"), str)
+                or it.get("level") not in ("error", "warning", "info", "style")
+            ):
+                invalid_items += 1
+                continue
+            file_p = it["file"]
+            lineno, col, code = it["line"], it["column"], it["code"]
+            msg, level = it["message"], it["level"]
 
             # De-duplicate against native detectors
             if (file_p, lineno) in reported_locations:
@@ -438,6 +452,9 @@ def scan_shellcheck(
                 "message": f"SC{code}: {msg}"[:300],
                 "suppressed": False,
             }) + "\n")
+
+        if invalid_items and errors is not None:
+            errors.append(f"shellcheck returned {invalid_items} malformed diagnostic(s)")
 
     return counters
 
@@ -549,7 +566,8 @@ def scan_ast_rules(
     return counters
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int],
+                 errors: Sequence[str] = ()) -> None:
     sink_path = Path(args.sink)
     records: list[dict] = []
     if sink_path.is_file():
@@ -580,12 +598,17 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         f"Info items: {counters['info']}",
         f"Report generated: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}",
     ]
+    if errors:
+        out_lines.append("Partial: [ANALYZER_ERROR] " + "; ".join(errors[:5]))
 
     for cat in sorted(_SECTION_HEADERS.keys()):
         out_lines.append(_SECTION_HEADERS[cat])
         cat_recs = by_cat.get(cat, [])
         if not cat_recs:
-            out_lines.append("good: clean")
+            if cat == 6 and any(e.startswith("shellcheck ") for e in errors):
+                out_lines.append("Not evaluated: ShellCheck did not complete")
+            else:
+                out_lines.append("good: clean")
             continue
         for r in cat_recs:
             rule = r.get("rule", "")
@@ -685,9 +708,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.ast_rule_dir:
             scan_ast_rules(Path(args.ast_rule_dir), files_to_scan, capturing_sink, skip,
                            reported_locations, prefilter=prefilter_res, errors=scan_errors)
-        if not args.no_shellcheck:
-            scan_shellcheck(files_to_scan, capturing_sink, skip, reported_locations,
-                            errors=scan_errors)
         # An incomplete analysis must never become the cached answer: the next
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).
@@ -709,6 +729,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         except OSError:
             pass
 
+    # ShellCheck also depends on .shellcheckrc, sourced files, PATH and options;
+    # a source-content cache cannot attest that coverage. Cache the native/AST
+    # layers only, and run the optional external layer even on a warm cache.
+    # The helper-source cache key invalidates older combined cache entries.
+    reported_locations = set()
     with open(sink_path, "w", encoding="utf-8") as sink_file:
         for f in files:
             recs = cached_findings.get(f)
@@ -717,6 +742,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if recs:
                 for r in recs:
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    reported_locations.add((r.get("path", ""), r.get("line", 1)))
+        if not args.no_shellcheck:
+            scan_shellcheck(files, sink_file, skip, reported_locations, errors=scan_errors)
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(sink_path)[0] + ".cache")
     cache.write_stats(cache_file)
@@ -779,7 +807,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     if args.text_out:
-        _render_text(args, files, counters)
+        _render_text(args, files, counters, scan_errors)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-bash: analysis incomplete: {problem}\n")

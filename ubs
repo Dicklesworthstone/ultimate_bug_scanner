@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='1cc85db3f3e165011d02e37571d058697804fa2f0a9569c7597e77555075910c'
-  [cpp]='3fd4e51aa57e460755232c014ac44e94c35e424d35c60b19a79e0bbbb1ba0e4b'
-  [csharp]='b0204301b25f259e79d2a894e16eeef4db8c865d2eeda166b829c271dd06f017'
-  [elixir]='37f370c46a6c3ad6fdaadfdd29dc0a5e56239da84c1a77e5314cd2dd3c3a269d'
-  [golang]='4420c04076cae9a2b2794e83850af22d6b5b57264e4b1036e1c46a06b668d6db'
-  [java]='40a047e7f569c0512460225345d5140ef3b953c5f68673a937bede2ec6af5908'
-  [js]='48d823d178f3967bd34b161adfe510431c7fb2dc99c8322c7217510a605f47e1'
-  [kotlin]='6410e61f6948e2fe1bd158013517d425b2b73e4877acf85ba1c83892bfef34de'
-  [python]='f001ddd3b598b4418fd3f241b5575408ed946cf84179f2ff121cb172ebe5ee48'
-  [ruby]='9af3029f033d72910bbe1d605e1d85f0e2ee8147a9b8907602584517dd3fc0d4'
-  [rust]='3ae5972128f5637b6e512f00645903c7b492352e605751a98cba379fff179f80'
-  [swift]='23fc3bd033767228897c3c23007d23186dec29f2072fb79c87a43e85c38a90dc'
+  [bash]='7c835a252e0cb46aeaa055625e0245755a4229ea33bb27b907a88479dc82ef6a'
+  [cpp]='32c8b067a326f6b777f630feeff8b73f97fa48135e93dccc08fa5674fc65fcdf'
+  [csharp]='0a6e2b33ebca96fe4ae1642ec4d8cd6fa07d0ca0c03abf478c4419af303ccd78'
+  [elixir]='dab61510e84865d707fafc60d59788fb24f324a4e37aa5671266281f686cd27a'
+  [golang]='05246acff594555e9867a621d788ba597d799fe51aadb936f7ea501444b49ceb'
+  [java]='b472acff8183ea664a1d70dad297a968059e023a1b8b525211bd71e5bb0255d3'
+  [js]='5f17a8a0e83d84bdd372aa688667da019521eea97abd5439cd65d42d1f252ea7'
+  [kotlin]='85df8c8d56def9f18c6f854d6e02dbee963154d7fc00e1ac58d2cdbe54b8395e'
+  [python]='972feb26ed0e322f4841320855fdff0584b1c26bf502beecf02f9b800b327444'
+  [ruby]='44dc079958614d80d49f6ed708d1193cd40c44cde5496058b961b5d16699633e'
+  [rust]='41a3efb720c4fddfaa5dc4b1a5390cf5ca868140e630fdcc444c9ef85d0ac3e4'
+  [swift]='76a4b52530c691c8452073fb79b144f1e007e2826a12ee9d5fd361f0600cae43'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -168,7 +168,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='6ab6fc656880e2f8fb61ec563d3b7811e128601417d7b7ba7477fcb24197babd'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='4fc6e54f7f55ea1006ecf77c60df301cc29d9cd450a821bf0e3de7436a3519f4'
   ['helpers/ubs_core/bash_rules.py']='b61a431da8298cb7c59e6c2858943536bb1e6308a289ee27698b119fdd7dc5f3'
-  ['helpers/ubs_core/bash_scan.py']='d49c7d1d29e380e36e480b1a567048bc46ff62fe92d6eb29a1353476c085a910'
+  ['helpers/ubs_core/bash_scan.py']='8153084fb914a6ad0d1e81a7c77735445c746877597438486edf191a26ec483c'
   ['helpers/ubs_core/cache.py']='d3e5133dc3d44abc69fcad1b63644582f21fd512b417a0dbfc430eac24dc0474'
   ['helpers/ubs_core/cli.py']='e51b45718093dd0c03b4e85756365ec821619ee0dce38e416be44244fb555151'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
@@ -414,7 +414,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='56e5b337a5d4d7f07a45f63f405289f228fc341a7f137a0485e0bb3838eefe63'
+  ['lib/ubs-common.sh']='017669dfd1d759c0de0a98026a6d741d01ea8af968f0a8cf12759bdd28ff9f8c'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7030,10 +7030,13 @@ JSON
 }
 
 merge_json_scanners(){
-  # Exclude *.findings.json from summary merge (those are detailed findings)
+  # This directory also holds internal metadata and combined exports. Only
+  # selected modules own scanner summaries: globbing *.json can leak metadata
+  # into scanners[] and recount our own exports on a subsequent merge.
   local jsons=()
-  for f in "$TMPDIR_RUN"/*.json; do
-    [[ "$f" == *.findings.json ]] && continue
+  local lang f
+  for lang in "${langs[@]}"; do
+    f="$TMPDIR_RUN/$lang.json"
     [[ -f "$f" ]] && jsons+=("$f")
   done
   if [[ ${#jsons[@]} -eq 0 ]]; then
@@ -7054,7 +7057,7 @@ merge_json_scanners(){
     top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
     prefix="${proj_real#"$top_real"}"
     prefix="${prefix#/}"
-    local -a f_args=()
+    local -a f_args=(--argjson fnd '[]')
     if [[ -f "$findings_file" ]]; then
       f_args=(--slurpfile fnd "$findings_file")
     fi
@@ -7131,9 +7134,13 @@ merge_json_scanners(){
        files:    (map(nz(.files))    | add)
      }}' "${jsons[@]}")
 
-  # Now merge in findings from *.findings.json files (if any exist)
-  local findings_jsons=( "$TMPDIR_RUN"/*.findings.json )
-  if [[ -f "${findings_jsons[0]}" ]]; then
+  # Findings sidecars have the same selected-module ownership as summaries.
+  local findings_jsons=()
+  for lang in "${langs[@]}"; do
+    f="$TMPDIR_RUN/$lang.findings.json"
+    [[ -f "$f" ]] && findings_jsons+=("$f")
+  done
+  if [[ ${#findings_jsons[@]} -gt 0 ]]; then
     # Build a map of language -> findings array
     local findings_map="{}"
     local fm_parts=""

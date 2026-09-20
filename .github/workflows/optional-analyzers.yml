@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   optional-analyzers:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-slim
     timeout-minutes: 15
     env:
       PYTHONDONTWRITEBYTECODE: "1"
@@ -20,7 +20,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+        run: sudo apt-get update && sudo apt-get install -y python3 git gh jq ripgrep rsync shellcheck
       - name: Apply the reviewed coverage and report-isolation patch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

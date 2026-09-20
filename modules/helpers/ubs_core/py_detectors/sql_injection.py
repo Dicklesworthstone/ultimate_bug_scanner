@@ -18,6 +18,7 @@ Same-file and previous-line `ubs:ignore` markers suppress a hit at the call.
 from __future__ import annotations
 
 import ast
+import os
 import re
 from typing import Iterable, Sequence
 
@@ -39,6 +40,94 @@ RULE_CRITICAL, RULE_WARNING = RULES[0][0], RULES[1][0]
 
 SQL_RE = re.compile(r'\b(?:select|insert|update|delete|with|merge|call|exec|create|drop|alter|truncate)\b', re.IGNORECASE)
 EXECUTE_METHODS = {'execute', 'executemany', 'executescript', 'raw', 'read_sql', 'read_sql_query', 'scalar', 'scalars'}
+
+# GH #133: functions a project declares as SQL-identifier sanitizers.
+#
+# An identifier (schema, table, column) cannot be sent as a bind parameter, so
+# code targeting a runtime-configured table has to interpolate it; the accepted
+# pattern is to validate against a strict allowlist and quote the result. The
+# provenance tiers cannot express that, because `config.pg_table` is an
+# ast.Attribute and therefore tainted no matter what ran before it.
+#
+# Empty by default, so a project that sets nothing keeps today's behaviour
+# byte for byte. This is read from the environment rather than a config file
+# because ubs has no project config format; a pre-push gate exports it the way
+# it already exports UBS_SKIP_CATEGORIES.
+SANITIZER_ENV = 'UBS_PY_SQL_SANITIZERS'
+
+
+def dotted_suffixes(name):
+    """Every dotted suffix of `name`, longest first (`a.b.c`, `b.c`, `c`)."""
+    parts = name.split('.')
+    return {'.'.join(parts[index:]) for index in range(len(parts))}
+
+
+def configured_sanitizers(environ=None):
+    """Sanitizer names from the environment, expanded to their suffixes.
+
+    A project writing `psycopg.sql.Identifier` means the same function that
+    the code calls as `sql.Identifier(...)` after `from psycopg import sql`,
+    so the configured name is stored with its suffixes and a call matches when
+    any of its own suffixes is in the set.
+    """
+    raw = (environ if environ is not None else os.environ).get(SANITIZER_ENV, '')
+    names = set()
+    for item in raw.split(','):
+        item = item.strip()
+        if item:
+            names.update(dotted_suffixes(item))
+    return frozenset(names)
+
+
+def is_sanitizer_call(node, sanitizers):
+    """Whether `node` is a call to one of the configured sanitizers."""
+    if not sanitizers or not isinstance(node, ast.Call):
+        return False
+    name = call_name(node.func)
+    return bool(name) and bool(dotted_suffixes(name) & sanitizers)
+
+
+def guarded_expressions(func, text, sanitizers):
+    """Source text of every expression a sanitizer validates in `func`.
+
+    Maps the expression's source segment to the earliest line that validates
+    it, so a sink can require the guard to come first. Nested functions are
+    not descended into: a guard that runs in a closure does not dominate a
+    sink in the enclosing body, and the conservative reading is the one that
+    downgrades less.
+    """
+    guarded = {}
+    if not sanitizers:
+        return guarded
+    pending = list(func.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if is_sanitizer_call(node, sanitizers):
+            for argument in list(node.args) + [keyword.value for keyword in node.keywords]:
+                segment = ast.get_source_segment(text, argument)
+                if not segment:
+                    continue
+                key = segment.strip()
+                line = node.lineno
+                if key not in guarded or line < guarded[key]:
+                    guarded[key] = line
+        pending.extend(ast.iter_child_nodes(node))
+    return guarded
+
+
+def build_guarded_expressions(tree, text, sanitizers):
+    """Per-function guarded-expression tables, keyed by function node id."""
+    tables = {}
+    if not sanitizers:
+        return tables
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            guarded = guarded_expressions(node, text, sanitizers)
+            if guarded:
+                tables[id(node)] = guarded
+    return tables
 
 
 def call_name(node):
@@ -196,15 +285,46 @@ def build_provenance(tree):
 
 
 class SQLInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, text, lines, param_names, name_risk):
+    def __init__(self, text, lines, param_names, name_risk, sanitizers=frozenset(), guarded_tables=None):
         self.text = text
         self.lines = lines
         self.param_names = param_names
         self.name_risk = name_risk
+        self.sanitizers = sanitizers
+        self.guarded_tables = guarded_tables or {}
+        self.func_stack = []
+        self.sink_lineno = None
         self.unsafe_sql_vars = set()
         self.weak_sql_vars = set()
         self.issues = []
         self.warn_issues = []
+
+    def visit_FunctionDef(self, node):
+        self.func_stack.append(node)
+        self.generic_visit(node)
+        self.func_stack.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def is_guarded(self, node):
+        """Whether a sanitizer validated this exact expression before the sink.
+
+        The comparison is on source text inside one function body, which is
+        what the accepted pattern actually writes: the same
+        `config.pg_table` is handed to the validator and then interpolated.
+        A sink outside any function, an expression with no recoverable source
+        segment, or a guard on a later line all answer no (GH #133).
+        """
+        if not self.sanitizers or not self.func_stack or self.sink_lineno is None:
+            return False
+        guarded = self.guarded_tables.get(id(self.func_stack[-1]))
+        if not guarded:
+            return False
+        segment = ast.get_source_segment(self.text, node)
+        if not segment:
+            return False
+        at = guarded.get(segment.strip())
+        return at is not None and at < self.sink_lineno
 
     def names_in(self, node):
         return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
@@ -230,10 +350,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return max_risk(self.classify_expr(node.left), self.classify_expr(node.right))
         if isinstance(node, ast.Name):
             if node.id in self.param_names or node.id in self.unsafe_sql_vars:
-                return 'tainted'
+                # GH #133: a validated identifier is still not provably
+                # static, so it drops one tier to Warning rather than
+                # disappearing. That is enough for a gate to tell a checked
+                # table name from a request parameter in an f-string, and it
+                # cannot hide an injection the way silence would.
+                return 'unknown' if self.is_guarded(node) else 'tainted'
             return self.name_risk.get(node.id, 'unknown')
         if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript, ast.Await)):
-            return 'tainted'
+            # A value produced BY a sanitizer is safe by that function's own
+            # contract — `quote_ident(x)` returns a quoted identifier — so it
+            # is static rather than merely downgraded (GH #133).
+            if is_sanitizer_call(node, self.sanitizers):
+                return 'static'
+            return 'unknown' if self.is_guarded(node) else 'tainted'
         risk = None
         for child in ast.iter_child_nodes(node):
             child_risk = self.classify_expr(child)
@@ -352,6 +482,18 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if has_ignore(self.lines, node.lineno):
             self.generic_visit(node)
             return
+        # The sink's own first line is what a guard has to precede (GH #133).
+        # Using the sink line rather than the interpolated value's line keeps
+        # a guard written inside the same multi-line call from counting.
+        previous_sink = self.sink_lineno
+        self.sink_lineno = node.lineno
+        try:
+            self.classify_sink(node)
+        finally:
+            self.sink_lineno = previous_sink
+        self.generic_visit(node)
+
+    def classify_sink(self, node):
         arg = self.sql_argument(node)
         if arg is not None:
             risk = self.sql_risk(arg)
@@ -368,7 +510,6 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     elif risk == 'warning':
                         self.warn_issues.append((node.lineno, source_line(self.lines, node.lineno)))
                     break
-        self.generic_visit(node)
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
@@ -382,7 +523,15 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
             continue
         lines = text.splitlines()
         param_names, name_risk = build_provenance(tree)
-        analyzer = SQLInjectionAnalyzer(text, lines, param_names, name_risk)
+        sanitizers = configured_sanitizers()
+        analyzer = SQLInjectionAnalyzer(
+            text,
+            lines,
+            param_names,
+            name_risk,
+            sanitizers,
+            build_guarded_expressions(tree, text, sanitizers),
+        )
         analyzer.visit(tree)
         for line_no, code in analyzer.issues:
             yield RULE_CRITICAL, path, line_no, 1, code[:240]

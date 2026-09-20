@@ -47,6 +47,7 @@ if str(HELPERS_DIR) not in sys.path:
 from ubs_core.io import parse_ndjson_lines, read_ndjson  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
 from ubs_core.py_detectors import missing_returns  # noqa: E402
+from ubs_core.py_detectors import sql_injection  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.flow import PATTERNS as FLOW_PATTERNS  # noqa: E402
 from ubs_core.py_patterns.foundations import PATTERNS as FOUNDATION_PATTERNS  # noqa: E402
@@ -768,6 +769,146 @@ class SelfScanShapeTests(unittest.TestCase):
             all(rule == "py.numeric.division" for rule, *_ in hits),
             [h[1:3] for h in hits if h[0] != "py.numeric.division"],
         )
+
+
+# ──────────────────── sql-injection identifier sanitizers ────────────────────
+class SqlIdentifierSanitizerTests(unittest.TestCase):
+    """GH #133: a project-declared validator downgrades a checked identifier.
+
+    A PostgreSQL identifier cannot be bound, so code targeting a
+    runtime-configured table interpolates it after validating against a strict
+    allowlist. The provenance tiers cannot express that on their own: an
+    ``ast.Attribute`` is tainted no matter what ran before it. The downgrade is
+    to Warning rather than silence, so a gate can tell a checked table name
+    from a request parameter in an f-string without the finding disappearing.
+    """
+
+    SANITIZERS = "validate_sql_identifier,quote_ident,psycopg.sql.Identifier"
+
+    CASES = {
+        "validated.py": '''
+            def validated(session, config):
+                validate_sql_identifier(config.pg_table, "pg_table")
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
+        "unvalidated.py": '''
+            def unvalidated(session, config):
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
+        "guard_after_sink.py": '''
+            def guard_after_sink(session, config):
+                rows = session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+                validate_sql_identifier(config.pg_table, "pg_table")
+                return rows
+        ''',
+        "other_expression.py": '''
+            def other_expression(session, config):
+                validate_sql_identifier(config.pg_schema, "pg_schema")
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
+        "sanitizer_return.py": '''
+            def sanitizer_return(session, name):
+                return session.execute(text(f'SELECT 1 FROM {quote_ident(name)}'))
+        ''',
+        "dotted_sanitizer.py": '''
+            from psycopg import sql
+
+            def dotted_sanitizer(session, name):
+                return session.execute(text(f'SELECT 1 FROM {sql.Identifier(name)}'))
+        ''',
+        "validated_parameter.py": '''
+            def validated_parameter(session, column):
+                validate_sql_identifier(column, "column")
+                return session.execute(text(f'SELECT "{column}" FROM t'))
+        ''',
+        "guard_in_nested_function.py": '''
+            def guard_in_nested_function(session, config):
+                def inner():
+                    validate_sql_identifier(config.pg_table, "pg_table")
+                inner()
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
+        "sink_in_nested_function.py": '''
+            def sink_in_nested_function(session, config):
+                validate_sql_identifier(config.pg_table, "pg_table")
+
+                def inner():
+                    return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+                return inner()
+        ''',
+        "sibling_value_not_blessed.py": '''
+            def sibling_value_not_blessed(session, request):
+                validate_sql_identifier(request.args["table"], "table")
+                return session.execute(
+                    text(f'SELECT * FROM t WHERE x = {request.args["value"]}')
+                )
+        ''',
+    }
+
+    def rules_for(self, sanitizers: str | None) -> dict[str, list[str]]:
+        previous = os.environ.get(sql_injection.SANITIZER_ENV)
+        if sanitizers is None:
+            os.environ.pop(sql_injection.SANITIZER_ENV, None)
+        else:
+            os.environ[sql_injection.SANITIZER_ENV] = sanitizers
+        try:
+            hits = run_detector(sql_injection, self.CASES)
+        finally:
+            if previous is None:
+                os.environ.pop(sql_injection.SANITIZER_ENV, None)
+            else:
+                os.environ[sql_injection.SANITIZER_ENV] = previous
+        found: dict[str, list[str]] = {name: [] for name in self.CASES}
+        for rule, path, *_ in hits:
+            found[path.name].append(rule)
+        return found
+
+    def test_no_configuration_leaves_every_case_critical(self) -> None:
+        # An empty list has to keep today's behaviour exactly, which is what
+        # makes the feature safe to ship on by default.
+        self.assertEqual(
+            self.rules_for(None),
+            {name: [sql_injection.RULE_CRITICAL] for name in self.CASES},
+        )
+
+    def test_declared_sanitizer_downgrades_only_what_it_guards(self) -> None:
+        self.assertEqual(
+            self.rules_for(self.SANITIZERS),
+            {
+                # Guarded before the sink, same expression: Warning, not silence.
+                "validated.py": [sql_injection.RULE_WARNING],
+                "validated_parameter.py": [sql_injection.RULE_WARNING],
+                # Produced BY a sanitizer: safe by that function's contract.
+                "sanitizer_return.py": [],
+                "dotted_sanitizer.py": [],
+                # Everything the guard does not reach stays Critical.
+                "unvalidated.py": [sql_injection.RULE_CRITICAL],
+                "guard_after_sink.py": [sql_injection.RULE_CRITICAL],
+                "other_expression.py": [sql_injection.RULE_CRITICAL],
+                "guard_in_nested_function.py": [sql_injection.RULE_CRITICAL],
+                "sink_in_nested_function.py": [sql_injection.RULE_CRITICAL],
+                "sibling_value_not_blessed.py": [sql_injection.RULE_CRITICAL],
+            },
+        )
+
+    def test_unrelated_sanitizer_names_change_nothing(self) -> None:
+        # A configured name that the corpus never calls must not widen or
+        # narrow anything, so a stale entry is inert rather than surprising.
+        self.assertEqual(
+            self.rules_for("some_other_validator"),
+            {name: [sql_injection.RULE_CRITICAL] for name in self.CASES},
+        )
+
+    def test_configured_names_expand_to_their_dotted_suffixes(self) -> None:
+        self.assertEqual(
+            sql_injection.configured_sanitizers({"UBS_PY_SQL_SANITIZERS": "psycopg.sql.Identifier"}),
+            frozenset({"psycopg.sql.Identifier", "sql.Identifier", "Identifier"}),
+        )
+        self.assertEqual(
+            sql_injection.configured_sanitizers({"UBS_PY_SQL_SANITIZERS": " a , ,b "}),
+            frozenset({"a", "b"}),
+        )
+        self.assertEqual(sql_injection.configured_sanitizers({}), frozenset())
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -45,7 +46,8 @@ class ToolOutput:
 
 
 def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
-                errors: list[str], *, env: dict[str, str] | None = None) -> ToolOutput | None:
+                errors: list[str], *, env: dict[str, str] | None = None,
+                merge_stderr: bool = False) -> ToolOutput | None:
     """Bound execution, reap timed-out process groups, and bound captured memory."""
     if not math.isfinite(timeout) or timeout <= 0:
         errors.append(f"{tool}: timeout must be a positive finite number")
@@ -54,7 +56,8 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             proc = subprocess.Popen(
                 list(argv), cwd=root, stdin=subprocess.DEVNULL, stdout=stdout,
-                stderr=stderr, env=env, start_new_session=os.name == "posix",
+                stderr=stdout if merge_stderr else stderr, env=env,
+                start_new_session=os.name == "posix",
             )
             try:
                 proc.wait(timeout=timeout)
@@ -331,4 +334,256 @@ def scan_ruby_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
             except (ValueError, TypeError, KeyError, OSError, RuntimeError) as exc:
                 errors.append(f"{tool}: invalid or incomplete report: {exc}")
         outcomes.append({"tool": tool, "status": "partial" if len(errors) != before else "ok"})
+    return outcomes
+
+
+def _json_stream(output: str, tool: str, errors: list[str], *, vet: bool = False):
+    """Decode consecutive JSON values, keeping evidence before a broken tail.
+
+    go vet's driver adds package headings around its JSON on stderr; these
+    headings (and dependency-download progress) are not analyzer diagnostics.
+    Do not fish arbitrary JSON out of an error message and call it success.
+    """
+    decoder = json.JSONDecoder()
+    offset = 0
+    while offset < len(output):
+        if output[offset].isspace():
+            offset += 1
+            continue
+        if vet and (output.startswith("# ", offset) or output.startswith("go: downloading ", offset)):
+            end = output.find("\n", offset)
+            offset = len(output) if end < 0 else end + 1
+            continue
+        try:
+            doc, offset = decoder.raw_decode(output, offset)
+        except ValueError:
+            errors.append(f"{tool}: invalid or truncated JSON report near {output[offset:offset+120]!r}")
+            break
+        yield doc
+
+
+class GoFindings:
+    """Adapters for gofmt, go vet JSON and govulncheck's v1 message stream."""
+    def __init__(self, files: Sequence[Path], root: Path, sink: TextIO) -> None:
+        self.root, self.sink = root, sink
+        self.selected = {p.resolve(): str(p) for p in files}
+        self.suppressions = SourceSuppressions("go")
+        self.seen: set[tuple] = set()
+        self.module = ""
+        try:
+            for line in (root / "go.mod").read_text(encoding="utf-8").splitlines():
+                fields = shlex.split(line, comments=True)
+                if len(fields) >= 2 and fields[0] == "module":
+                    self.module = fields[1]
+                    break
+        except (OSError, ValueError):
+            pass  # the actual tools report an invalid or unavailable module
+
+    def path(self, path: str) -> Path:
+        file = Path(path)
+        return (file if file.is_absolute() else self.root / file).resolve()
+
+    def emit(self, tool: str, rule: str, path: str, line: int, col: int,
+             severity: str, message: str, *, project: bool = False,
+             extras: dict | None = None) -> None:
+        file = self.path(path)
+        rule = "go." + tool + "." + re.sub(r"[^A-Za-z0-9_.-]", "-", rule)
+        if not project and file not in self.selected:
+            return
+        if not project and self.suppressions.is_suppressed(file, line, rule):
+            return
+        key = (rule, str(file), line, col, message)
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        metadata = {"tool": tool, **(extras or {})}
+        if project:
+            metadata["scope"] = "project"
+        self.sink.write(json.dumps({
+            "rule": rule, "category_id": "golang.tooling", "path": self.selected.get(file, str(file)),
+            "line": line, "col": col, "severity": severity, "message": message[:500],
+            "suppressed": False, "extras": metadata,
+        }, ensure_ascii=False) + "\n")
+
+    def vet(self, output: str, errors: list[str]) -> None:
+        # In JSON mode even analysis errors may exit 0. Inspect both the
+        # package/analyzer error objects and the actual diagnostic arrays.
+        # See Go's analysis/unitchecker and analysis/internal/analysisflags.
+        documents = 0
+        for doc in _json_stream(output, "go vet", errors, vet=True):
+            documents += 1
+            if not isinstance(doc, dict):
+                errors.append("go vet: expected package object")
+                continue
+            for package, analyzers in doc.items():
+                if not isinstance(analyzers, dict):
+                    errors.append(f"go vet: malformed package {package!r}")
+                    continue
+                for analyzer, rows in analyzers.items():
+                    if isinstance(rows, dict) and "error" in rows:
+                        errors.append(f"go vet ({analyzer}): {str(rows['error'])[:200]}")
+                        continue
+                    if not isinstance(rows, list):
+                        errors.append(f"go vet ({analyzer}): expected diagnostic array")
+                        continue
+                    for row in rows:
+                        try:
+                            match = re.fullmatch(r"(.+):(\d+):(\d+)", _text(row["posn"]), re.S)
+                            if not match:
+                                raise ValueError("invalid source position")
+                            self.emit("vet", _text(analyzer), match[1], _positive(int(match[2])),
+                                      _positive(int(match[3])), "warning", _text(row["message"]),
+                                      extras={"package": package})
+                        except (KeyError, TypeError, ValueError, OSError):
+                            errors.append(f"go vet ({analyzer}): malformed diagnostic")
+        if not documents:
+            errors.append("go vet: no JSON analysis report")
+
+    def govulncheck(self, output: str, errors: list[str]) -> None:
+        # JSON mode exits 0 even with vulnerabilities. OSV messages are NOT
+        # findings: they include advisories not affecting the loaded version.
+        # Lower-precision module/package messages precede symbol findings.
+        # https://pkg.go.dev/golang.org/x/vuln/internal/govulncheck
+        advisories: dict[str, dict] = {}
+        groups: dict[tuple[str, str], list[tuple[int, dict]]] = {}
+        config = False
+        for index, doc in enumerate(_json_stream(output, "govulncheck", errors)):
+            try:
+                if not isinstance(doc, dict) or len(doc) != 1:
+                    raise ValueError("expected one message field")
+                kind, value = next(iter(doc.items()))
+                if not isinstance(value, dict):
+                    raise ValueError(f"invalid {kind} message")
+                if index == 0 and kind != "config":
+                    errors.append("govulncheck: missing initial configuration")
+                if kind == "config":
+                    if config or value.get("protocol_version") != "v1.0.0":
+                        raise ValueError("duplicate or unsupported protocol configuration")
+                    config = True
+                    if value.get("scan_level", "symbol") != "symbol":
+                        raise ValueError("symbol-level analysis did not run")
+                elif kind == "osv":
+                    advisories[_text(value["id"])] = value
+                elif kind == "finding":
+                    osv, trace = _text(value["osv"]), _array(value, "trace")
+                    if not trace or any(not isinstance(frame, dict) for frame in trace):
+                        raise ValueError("invalid finding trace")
+                    first = trace[0]
+                    module = _text(first["module"])
+                    if any(not isinstance(first.get(k, ""), str) for k in ("package", "function", "version")):
+                        raise ValueError("invalid vulnerable frame")
+                    if not isinstance(value.get("fixed_version", ""), str):
+                        raise ValueError("invalid fixed version")
+                    level = 2 if first.get("function") else 1 if first.get("package") else 0
+                    groups.setdefault((osv, module), []).append((level, value))
+                elif kind not in ("progress", "SBOM"):
+                    raise ValueError(f"unknown message {kind!r}")
+            except (ValueError, KeyError, TypeError):
+                errors.append("govulncheck: malformed or unsupported stream message")
+        if not config:
+            errors.append("govulncheck: no valid configuration message")
+        for (osv, module), rows in sorted(groups.items()):
+            strongest = max(level for level, _ in rows)
+            for level, row in rows:
+                if level != strongest:
+                    continue
+                trace = row["trace"]
+                path, line, col, project = "go.mod", 1, 1, True
+                local_positions = False
+                invalid = False
+                for frame in trace:
+                    # Positions belong to the frame's MODULE, not the cwd.
+                    # Never attribute a dependency's main.go to ours.
+                    if not self.module or frame.get("module") != self.module:
+                        continue
+                    pos = frame.get("position")
+                    if pos is None:
+                        continue
+                    try:
+                        name = _text(pos["filename"])
+                        loc_line, loc_col = _positive(pos["line"]), _positive(pos["column"])
+                        local_positions = True
+                        if self.path(name) in self.selected:
+                            path, line, col, project = name, loc_line, loc_col, False
+                            break
+                    except (ValueError, KeyError, TypeError, OSError):
+                        invalid = True
+                        errors.append("govulncheck: malformed source location")
+                if invalid or (local_positions and project):
+                    continue  # a trace into unselected source is not a selected-file finding
+                reachability = ("module", "package", "symbol")[level]
+                advisory = advisories.get(osv, {})
+                title = advisory.get("summary") or advisory.get("details") or "Known vulnerability"
+                title = str(title).splitlines()[0][:240]
+                version, fixed = trace[0].get("version", ""), row.get("fixed_version", "")
+                detail = "vulnerable symbol called" if level == 2 else "no vulnerable call found"
+                message = f"{osv}: {title}; {module}@{version} ({detail})"
+                message += f"; fixed in {fixed}" if fixed else "; no fixed version reported"
+                self.emit("govulncheck", osv, path, line, col,
+                          "critical" if level == 2 else "info", message, project=project,
+                          extras={"osv": osv, "module": module, "found_version": version,
+                                  "fixed_version": fixed, "reachability": reachability, "trace": trace})
+
+
+def scan_go_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
+                  packages: str, timeout: float, errors: list[str]) -> list[dict]:
+    """Run opt-in Go tools, preserving selected source and project context.
+
+    gofmt is read-only. go vet/govulncheck load whole packages to resolve types
+    and calls, but source diagnostics cannot re-admit excluded files. Multiple
+    selected modules are analyzed independently; tools never use the caller's
+    unrelated working directory or a source-only cached tool report.
+    """
+    sources = list(dict.fromkeys(p.resolve() for p in files if p.suffix == ".go"))
+    if not sources:
+        return [{"tool": t, "status": "skipped", "reason": "no selected Go source files"}
+                for t in ("gofmt", "go vet", "govulncheck")]
+    try:
+        patterns = shlex.split(packages)
+        if not patterns or any(p.startswith("-") for p in patterns):
+            raise ValueError("expected package patterns, not tool options")
+    except ValueError as exc:
+        errors.append(f"go tools: invalid --test-pkgs: {exc}")
+        return [{"tool": "go tools", "status": "partial"}]
+    project = Path(project_dir or ".").resolve()
+    project = project.parent if project.is_file() else project
+    roots: dict[Path, list[Path]] = {}
+    for file in sources:
+        root = next((p for p in file.parents if (p / "go.mod").is_file()), project)
+        roots.setdefault(root, []).append(file)
+    outcomes = []
+    env = dict(os.environ, NO_COLOR="1")
+    for root, selected in sorted(roots.items()):
+        findings = GoFindings(selected, root, sink)
+        for tool, executable in (("gofmt", "gofmt"), ("go vet", "go"), ("govulncheck", "govulncheck")):
+            installed = shutil.which(executable)
+            outcome = {"tool": tool, "root": str(root)}
+            if not installed:
+                outcomes.append({**outcome, "status": "skipped", "reason": "not installed"})
+                continue
+            before = len(errors)
+            # One gofmt input makes its filename-only output unambiguous even
+            # for names containing newlines. No -w: scanning never formats code.
+            batches = [["-s", "-l", "--", str(p)] for p in selected] if tool == "gofmt" else [
+                ["vet", "-json", "--", *patterns] if tool == "go vet"
+                else ["-format=json", "-scan=symbol", *patterns]]
+            for args in batches:
+                result = run_command(tool, [installed, *args], root, timeout, errors,
+                                     env=env, merge_stderr=tool == "go vet")
+                if result is None:
+                    continue
+                # All three commands use 0 for completed analysis in these
+                # formats. In particular, vet JSON errors can ALSO exit 0.
+                if result.returncode != 0:
+                    errors.append(f"{tool}: exited {result.returncode}: {result.stderr.strip()[:160]}")
+                if tool == "go vet":
+                    findings.vet(result.stdout, errors)
+                elif tool == "govulncheck":
+                    findings.govulncheck(result.stdout, errors)
+                elif result.stdout == args[-1] + "\n":
+                    findings.emit("gofmt", "format", args[-1], 1, 1, "info",
+                                  "File differs from gofmt -s formatting")
+                elif result.stdout:
+                    errors.append("gofmt: unexpected filename report")
+            outcomes.append({**outcome, "status": "partial" if len(errors) != before else "ok"})
     return outcomes

@@ -783,7 +783,8 @@ def _finding_title(rec: dict) -> str:
     return str(rec.get("message", rec.get("rule", "")))
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int],
+                 errors: Sequence[str] = (), external_tools: Sequence[dict] = ()) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -813,6 +814,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         f"UBS module: golang (contract v2) — {args.project or args.project_dir}",
         f"Files scanned: {len(files)}",
     ]
+    if errors:
+        lines.append("Partial: [ANALYZER_ERROR] " + "; ".join(errors[:5])[:500])
     current_section = None
     emitted_subheaders: set[str] = set()
     for rule in ordered_rules:
@@ -843,6 +846,13 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         if num not in categories_with_records and num not in _skip_set(args):
             lines.append(f"good: {note}")
 
+    if 18 not in _skip_set(args):
+        lines += ["", _SECTION_HEADERS[18]]
+        if not args.go_tools:
+            lines.append("Not evaluated: Go tools disabled (use --go-tools)")
+        for outcome in external_tools:
+            detail = outcome.get("reason", "analysis completed" if outcome["status"] == "ok" else "analysis incomplete")
+            lines.append(f"{outcome['tool']}: {outcome['status']} — {detail}")
     lines += [
         f"Go files: {sum(1 for p in files if p.suffix == '.go')}",
         f"Critical issues: {counters['critical']}",
@@ -870,6 +880,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
+    parser.add_argument("--go-tools", action="store_true", help="run optional Go analyzers")
+    parser.add_argument("--test-pkgs", default="./...", help="Go package patterns per selected module")
+    parser.add_argument("--go-timeout", type=float, default=120, help="per-tool timeout in seconds")
     parser.add_argument("--enable-new-analyzers", action="store_true",
                         help="run analyzers with no legacy counterpart (guards_generic/narrowing_go)")
     args = parser.parse_args(argv)
@@ -880,6 +893,7 @@ def main(argv: list[str] | None = None) -> int:
         data = Path(args.files_from).read_bytes()
     entries = data.split(b"\0") if b"\0" in data else data.splitlines()
     files = [Path(raw.decode("utf-8", "surrogateescape")) for raw in entries if raw.strip()]
+    selected_files = list(files)
     skip = _skip_set(args)
     single_file = bool(args.project_dir) and Path(args.project_dir).is_file()
 
@@ -994,6 +1008,13 @@ def main(argv: list[str] | None = None) -> int:
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
 
+    external_tools = []
+    if args.go_tools and 18 not in skip:
+        from ubs_core.external_tools import scan_go_tools
+        with open(args.sink, "a", encoding="utf-8") as sink_file:
+            external_tools = scan_go_tools(selected_files, sink_file, args.project_dir,
+                                          args.test_pkgs, args.go_timeout, scan_errors)
+
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers, ast, computed) is
     # reflected in totals.
@@ -1049,6 +1070,7 @@ def main(argv: list[str] | None = None) -> int:
         extras = doc.get("extras", {}) if isinstance(doc.get("extras"), dict) else {}
         extras["profile"] = profile_data
         extras["ast_findings"] = ast_records
+        extras["external_tools"] = external_tools
         doc["extras"] = extras
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -1059,7 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.text_out:
-        _render_text(args, files, counters)
+        _render_text(args, files, counters, scan_errors, external_tools)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-golang: analysis incomplete: {problem}\n")

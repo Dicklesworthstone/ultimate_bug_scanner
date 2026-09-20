@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="abcda0a574f6a9d91458cfefde5e9686ed0619d9a46aadc1d366cc74cda15f5c"
+UBS_LIB_CHECKSUM="7b15367809353ffce6d49eab57eb41c1af278a60f6133c2be1a0d3960a3146d0"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -98,6 +98,7 @@ DISABLE_PIPEFAIL_DURING_SCAN=1
 LIST_RULES=0
 RUN_GO_TOOLS=0
 GOTEST_PKGS="./..."
+GO_TIMEOUT="${GO_TIMEOUT:-120}"
 CATEGORY_WHITELIST=""
 ONLY_CHANGED=0
 STRICT_MODE=0
@@ -135,6 +136,7 @@ Options:
   --dump-rules=DIR         Persist generated ast-grep rules to DIR for test validation
   --go-tools               Also run gofmt -s -l, go vet, and govulncheck (if available)
   --test-pkgs=PKGS         Package pattern for tests/vet (default: ./...)
+  --go-timeout=SECONDS     Per-tool execution timeout (default: $GO_TIMEOUT)
   --only-changed           Scan only files changed vs git merge-base (if in git repo)
   --strict                 Treat more findings as warnings/errors (aggressive)
   --baseline=FILE          Compare against a previous text report (heuristic deltas)
@@ -200,6 +202,7 @@ while [[ $# -gt 0 ]]; do
     --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
     --go-tools)   RUN_GO_TOOLS=1; shift;;
     --test-pkgs=*) GOTEST_PKGS="${1#*=}"; shift;;
+    --go-timeout=*) GO_TIMEOUT="${1#*=}"; shift;;
     --only-changed) ONLY_CHANGED=1; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
     --no-banner)  NO_BANNER=1; shift;;
@@ -427,6 +430,8 @@ if as_text:
     for num in sorted(SECTION):
         if num in skip:
             continue
+        if num == 18:
+            continue  # go_scan renders actual optional-tool coverage, even with zero findings
         if f"golang.{SLUG[num]}" in covered and num != 16:
             continue
         emit("")
@@ -438,9 +443,6 @@ if as_text:
         if num == 17 and not run_life:
             emit("Info (0 found)")
             emit("    Go toolchain unavailable — Install Go to run the AST helper")
-        if num == 18:
-            emit("Info (0 found)")
-            emit("    Go tools disabled (use --go-tools) or Go not found")
     emit("")
     emit("Summary Statistics:")
     emit(f"Files scanned: {files_n}")
@@ -492,6 +494,9 @@ run_contract_v2_go(){
   local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  if [[ "$RUN_GO_TOOLS" -eq 1 ]]; then
+    scan_args+=(--go-tools "--test-pkgs=$GOTEST_PKGS" "--go-timeout=$GO_TIMEOUT")
+  fi
   if command -v ast-grep >/dev/null 2>&1 || command -v sg >/dev/null 2>&1; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-gov2-rules.XXXXXX)"
     if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "

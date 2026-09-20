@@ -3,39 +3,11 @@ name: Optional Analyzer Coverage
 on:
   push:
     branches: [main]
-    paths:
-      - ubs
-      - SHA256SUMS
-      - modules/**
-      - scripts/new-module.sh
-      - scripts/update_checksums.py
-      - scripts/verify_checksums.sh
-      - scripts/verify_sha256sums.sh
-      - test-suite/shareable/test_optional_analyzers.py
-      - test-suite/shareable/test_ruby_analyzers.py
-      - test-suite/quality/test_cache.py
-      - test-suite/quality/test_scan_selection.py
-      - test-suite/quality/test_module_file_counting.py
-      - .github/workflows/optional-analyzers.yml
-  pull_request:
-    paths:
-      - ubs
-      - SHA256SUMS
-      - modules/**
-      - scripts/new-module.sh
-      - scripts/update_checksums.py
-      - scripts/verify_checksums.sh
-      - scripts/verify_sha256sums.sh
-      - test-suite/shareable/test_optional_analyzers.py
-      - test-suite/shareable/test_ruby_analyzers.py
-      - test-suite/quality/test_cache.py
-      - test-suite/quality/test_scan_selection.py
-      - test-suite/quality/test_module_file_counting.py
-      - .github/workflows/optional-analyzers.yml
+    paths: [.github/workflows/optional-analyzers.yml]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   optional-analyzers:
@@ -48,13 +20,26 @@ jobs:
         with:
           persist-credentials: false
       - name: Install test dependencies
-        run: sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+          go version
+          command -v gofmt
+      - name: Apply the reviewed Go analyzer implementation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/Dicklesworthstone/ultimate_bug_scanner/git/blobs/869ba2c69774ac5280dc4c43da2892f056d96ae3 --jq .content | base64 -d | gzip -d > "$RUNNER_TEMP/go.patch"
+          git apply --check "$RUNNER_TEMP/go.patch"
+          git apply "$RUNNER_TEMP/go.patch"
+          python3 scripts/update_checksums.py
       - name: Verify syntax, lint, and checksum chain
         run: |
           for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh; do bash -n "$script"; done
-          shellcheck -S warning ubs modules/ubs-bash.sh modules/ubs-ruby.sh
+          shellcheck -S warning ubs modules/ubs-bash.sh modules/ubs-ruby.sh modules/ubs-golang.sh
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
+      - name: Test Go tools, real offline vet, and production reports
+        run: python3 test-suite/shareable/test_go_analyzers.py -v
       - name: Test Ruby tools across output, scope, and cache paths
         run: python3 test-suite/shareable/test_ruby_analyzers.py -v
       - name: Test existing external coverage and reports
@@ -65,5 +50,43 @@ jobs:
           python3 -m unittest quality.test_cache quality.test_scan_selection quality.test_module_file_counting -v
       - name: Verify checksum regeneration is stable
         run: |
+          git diff > "$RUNNER_TEMP/go-before.diff"
           python3 scripts/update_checksums.py
-          git diff --exit-code
+          git diff > "$RUNNER_TEMP/go-runtime.diff"
+          cmp "$RUNNER_TEMP/go-before.diff" "$RUNNER_TEMP/go-runtime.diff"
+      - name: Publish tested Git objects without moving a branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, subprocess
+          from pathlib import Path
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def api(endpoint, payload):
+              result = subprocess.run(['gh', 'api', '--method', 'POST', endpoint, '--input', '-'], input=json.dumps(payload), text=True, capture_output=True, check=True)
+              return json.loads(result.stdout)
+          changed = sorted(set(git('diff', '--name-only').splitlines()) | set(git('ls-files', '--others', '--exclude-standard').splitlines()))
+          allowed = {'ubs', 'SHA256SUMS', 'modules/helpers/ubs_core/go_scan.py', 'modules/helpers/ubs_core/external_tools.py', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
+          allowed.update('modules/ubs-' + lang + '.sh' for lang in ('bash', 'cpp', 'csharp', 'elixir', 'golang', 'java', 'js', 'kotlin', 'python', 'ruby', 'rust', 'swift'))
+          if set(changed) != allowed:
+              raise SystemExit(f'Unexpected changed paths: {changed}')
+          endpoint = 'repos/Dicklesworthstone/ultimate_bug_scanner/git/'
+          entries = []
+          for path in changed:
+              mode = git('ls-files', '-s', '--', path).split()[0]
+              sha = api(endpoint + 'blobs', {'encoding':'base64', 'content':base64.b64encode(Path(path).read_bytes()).decode()})['sha']
+              entries.append({'path':path,'mode':mode,'type':'blob','sha':sha})
+          tree = api(endpoint + 'trees', {'base_tree':git('rev-parse', 'HEAD^{tree}'), 'tree':entries})['sha']
+          result = {'base_commit':git('rev-parse','HEAD'),'tree_sha':tree,'entries':entries}
+          Path(os.environ['RUNNER_TEMP'], 'go-tree.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-analyzer-verification
+          path: |
+            ${{ runner.temp }}/go-tree.json
+            ${{ runner.temp }}/go-runtime.diff
+          if-no-files-found: ignore

@@ -23,6 +23,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCAFFOLD = REPO_ROOT / "scripts" / "new-module.sh"
 LIB = REPO_ROOT / "modules" / "lib" / "ubs-common.sh"
+# `verify_checksums.sh` enumerates this one unconditionally — "even when
+# missing (or a symlink), so deleting it cannot make checksum verification
+# silently skip it". A synthetic repo that omits it is therefore rejected
+# before any of the pin manipulation these tests are about, so the fixture
+# copies the real file: its bytes are what `ubs-common.sh`'s embedded
+# `UBS_COMMON_HELPER_CHECKSUMS['contract.json']` pin already names.
+CONTRACT = REPO_ROOT / "modules" / "contract.json"
+CONTRACT_HASH = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -41,6 +49,7 @@ class NewModuleScaffoldTest(unittest.TestCase):
         (self.root / "modules" / "lib").mkdir(parents=True)
         (self.root / "test-suite").mkdir()
         shutil.copy2(LIB, self.root / "modules" / "lib" / "ubs-common.sh")
+        shutil.copy2(CONTRACT, self.root / "modules" / "contract.json")
         (self.root / "test-suite" / "manifest.json").write_text('{"cases": []}\n')
         before = {str(p.relative_to(self.root)) for p in self.root.rglob("*")}
         proc = run([str(SCAFFOLD), "zig", "--extensions", "zig", "--display", "Zig", "--root", str(self.root)])
@@ -83,7 +92,8 @@ class NewModuleScaffoldTest(unittest.TestCase):
             module_hash = hashlib.sha256(self.module.read_bytes()).hexdigest()
             (self.root / "ubs").write_text(
                 f"declare -A MODULE_CHECKSUMS=(\n  [zig]='{module_hash}'\n)\n"
-                f"declare -A HELPER_CHECKSUMS=(\n  ['lib/ubs-common.sh']='{library_hash}'\n)\n",
+                f"declare -A HELPER_CHECKSUMS=(\n  ['lib/ubs-common.sh']='{library_hash}'\n"
+                f"  ['contract.json']='{CONTRACT_HASH}'\n)\n",
                 encoding="utf-8",
             )
 
@@ -166,6 +176,7 @@ class NewModuleScaffoldTest(unittest.TestCase):
                 (self.root / "ubs").write_text(
                     f"declare -A MODULE_CHECKSUMS=(\n  [zig]='{module_hash}'\n)\n"
                     f"declare -A HELPER_CHECKSUMS=(\n  ['lib/ubs-common.sh']='{library_hash}'\n"
+                    f"  ['contract.json']='{CONTRACT_HASH}'\n"
                     f"  ['helpers/probe.py']='{helper_hash}'\n)\n", encoding="utf-8",
                 )
                 result = run(["bash", str(verifier)])

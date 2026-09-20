@@ -13,6 +13,18 @@ from unittest import mock
 from pathlib import Path
 from typing import Any
 
+# Three tests below import `ubs_core` inside the test body, and nothing in this
+# file put `modules/helpers` on the path — they passed only because
+# `test_python_precision` sorts earlier under `unittest discover` and inserts it
+# as a side effect. Running this file alone therefore failed with
+# `ModuleNotFoundError: No module named 'ubs_core'`, which makes a real
+# regression here indistinguishable from a load-order accident. Own the path the
+# way the sibling modules do.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
+if str(HELPERS_DIR) not in sys.path:
+    sys.path.insert(0, str(HELPERS_DIR))
+
 import rule_quality_harness
 
 

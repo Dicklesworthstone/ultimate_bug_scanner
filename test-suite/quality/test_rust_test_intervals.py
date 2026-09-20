@@ -25,16 +25,38 @@ class TestIsTestAttr(unittest.TestCase):
         self.assertTrue(is_test_attr("#[tokio::test]"))
         self.assertTrue(is_test_attr("#[tokio::test(flavor = \"multi_thread\")]"))
         self.assertTrue(is_test_attr("#[asupersync::test]"))
-        self.assertTrue(is_test_attr("#[rstest]"))
-        self.assertTrue(is_test_attr("#[rstest::rstest]"))
-        self.assertTrue(is_test_attr("#[quickcheck]"))
-        self.assertTrue(is_test_attr("#[test_case(1, 2)]"))
-        self.assertTrue(is_test_attr("#[wasm_bindgen_test]"))
+
+    def test_third_party_runner_attributes_are_not_test_authority(self):
+        """These are real test runners, and `is_test_attr` still says no.
+
+        It gates SUPPRESSION: anything it calls test-only stops being scanned.
+        `rust_scan.is_test_attr` documents the allowlist as `#[test]`,
+        `#[tokio::test]`, `#[asupersync::test]` and provable `cfg(...)`, and
+        says in as many words that criterion and rstest attributes are not
+        test-only authority. These assertions pin that decision rather than the
+        wish; flipping them is a one-line change to the allowlist, and should be
+        made there and deliberately, not by a test asserting the opposite.
+        """
+        self.assertFalse(is_test_attr("#[rstest]"))
+        self.assertFalse(is_test_attr("#[rstest::rstest]"))
+        self.assertFalse(is_test_attr("#[quickcheck]"))
+        self.assertFalse(is_test_attr("#[test_case(1, 2)]"))
+        self.assertFalse(is_test_attr("#[wasm_bindgen_test]"))
 
     def test_cfg_test_attributes(self):
         self.assertTrue(is_test_attr("#[cfg(test)]"))
         self.assertTrue(is_test_attr("#[cfg(all(unix, test))]"))
-        self.assertTrue(is_test_attr("#[cfg(any(test, feature = \"mock\"))]"))
+
+    def test_cfg_any_with_test_does_not_imply_test(self):
+        """`any(test, X)` is not test-only, and this is arithmetic, not policy.
+
+        `cfg_implies_test` asks whether the predicate is false whenever
+        `test = False`. Under `any(test, feature = "mock")` with `test = False`,
+        the result is whatever `feature = "mock"` is — UNKNOWN, not false. So
+        the code can be compiled into a non-test build and must keep being
+        scanned. `all(unix, test)` above is the opposite case and does imply it.
+        """
+        self.assertFalse(is_test_attr("#[cfg(any(test, feature = \"mock\"))]"))
 
     def test_negative_attributes(self):
         # Production-only code with cfg(not(test))
@@ -61,7 +83,14 @@ pub fn helper() {
         intervals = compute_test_intervals(code)
         self.assertEqual(intervals, [(1, 5)])
 
-    def test_bare_mod_tests(self):
+    def test_bare_mod_tests_is_not_test_authority(self):
+        """A module called `tests` with no `#[cfg(test)]` keeps being scanned.
+
+        This is the same rule `test_reject_module_name_contains_test_authority`
+        below states, applied to the name that looks most convincing. A module
+        name is not a compilation condition: `mod tests` without the attribute
+        ships in the ordinary build, so a `panic!` inside it is a real finding.
+        """
         code = """pub fn prod() {
     let x = 1;
 }
@@ -73,15 +102,28 @@ mod tests {
 }
 """
         intervals = compute_test_intervals(code)
-        self.assertEqual(intervals, [(5, 9)])
+        self.assertEqual(intervals, [])
 
-    def test_bare_mod_test_singular(self):
+    def test_bare_mod_test_singular_is_not_test_authority(self):
+        """Singular `mod test`, same rule as the plural above."""
         code = """pub(crate) mod test {
     fn test_one() {}
 }
 """
         intervals = compute_test_intervals(code)
-        self.assertEqual(intervals, [(1, 3)])
+        self.assertEqual(intervals, [])
+
+    def test_cfg_test_mod_tests_is_test_authority(self):
+        """The control for the two above: the attribute is what does the work."""
+        code = """pub fn prod() {}
+
+#[cfg(test)]
+mod tests {
+    fn t() {}
+}
+"""
+        intervals = compute_test_intervals(code)
+        self.assertEqual(intervals, [(3, 6)])
 
     def test_reject_module_name_contains_test_authority(self):
         """CRITICAL: mod test_parser must remain scanned unless cfg(test)."""

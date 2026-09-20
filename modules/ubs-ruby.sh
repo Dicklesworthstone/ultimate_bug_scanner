@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="017669dfd1d759c0de0a98026a6d741d01ea8af968f0a8cf12759bdd28ff9f8c"
+UBS_LIB_CHECKSUM="abcda0a574f6a9d91458cfefde5e9686ed0619d9a46aadc1d366cc74cda15f5c"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -105,10 +105,10 @@ if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
 
 if [[ "$USE_COLOR" -eq 1 ]]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
-  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'
   BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''
   BOLD=''; DIM=''; RESET=''
 fi
 
@@ -276,42 +276,6 @@ if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
   CI_MODE=1
 fi
 
-HAS_BUNDLE=0
-BUNDLE_EXEC=()
-if command -v bundle >/dev/null 2>&1 && [[ -f "$PROJECT_DIR/Gemfile" ]]; then
-  HAS_BUNDLE=1
-  BUNDLE_EXEC=(bundle exec)
-fi
-
-with_timeout() {
-  local to="$1"; shift || true
-  if command -v timeout >/dev/null 2>&1; then timeout "$to" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$to" "$@"
-  else "$@"; fi
-}
-
-run_rb_tool_text() {
-  local tool="$1"; shift || true
-  if [[ "$ENABLE_BUNDLER_TOOLS" -eq 1 && "$HAS_BUNDLE" -eq 1 ]]; then
-    if [[ "$tool" == "bundle" ]]; then with_timeout "$RB_TIMEOUT" bundle "$@" || true
-    else with_timeout "$RB_TIMEOUT" "${BUNDLE_EXEC[@]}" "$tool" "$@" || true; fi
-  else
-    if command -v "$tool" >/dev/null 2>&1; then with_timeout "$RB_TIMEOUT" "$tool" "$@" || true; fi
-  fi
-}
-
-run_bundle_audit() {
-  if [[ "$HAS_BUNDLE" -eq 1 && -f "$PROJECT_DIR/Gemfile.lock" ]]; then
-    with_timeout "$RB_TIMEOUT" bundle audit check --update || true
-  elif command -v bundler-audit >/dev/null 2>&1; then
-    with_timeout "$RB_TIMEOUT" bundler-audit check --update || true
-  elif command -v bundle-audit >/dev/null 2>&1; then
-    with_timeout "$RB_TIMEOUT" bundle-audit check --update || true
-  else
-    say "  ${GRAY}${INFO} bundler-audit not available; skipping${RESET}"
-  fi
-}
-
 # Silence options unused in contract-v2 for shellcheck
 : "$VERBOSE" "$DETAIL_LIMIT" "$JOBS" "$USER_RULE_DIR" "$QUIET" "$CI_MODE" "$USE_COLOR"
 : "$ONLY_RULES" "$DISABLE_RULES" "$AG_THREADS" "$AG_FIXABLE_ONLY" "$AG_PREVIEW_FIX"
@@ -347,48 +311,6 @@ PYRULES
   ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
   exit 0
 fi
-
-# ── Legacy-parity bridge: bundler tools (category 19) ───────────────────────
-run_v2_rb_tools(){
-  if [[ "$ENABLE_BUNDLER_TOOLS" -ne 1 ]]; then
-    say "  ${GRAY}${INFO} bundler-based analyzers disabled (--no-bundler)${RESET}"
-    return 0
-  fi
-  local TOOL
-  IFS=',' read -r -a RBTOOLS <<< "$RB_TOOLS"
-  for TOOL in "${RBTOOLS[@]}"; do
-    case "$TOOL" in
-      rubocop)
-        print_subheader "rubocop (lint/style)"
-        run_rb_tool_text rubocop --format clang --force-exclusion "$PROJECT_DIR" || true
-        ;;
-      brakeman)
-        print_subheader "brakeman (Rails security)"
-        if [[ -d "$PROJECT_DIR/app" || -d "$PROJECT_DIR/config" ]]; then
-          run_rb_tool_text brakeman -q -w2 -z "$PROJECT_DIR" || true
-        else
-          say "  ${GRAY}${INFO} Rails app structure not detected; brakeman may be N/A${RESET}"
-          run_rb_tool_text brakeman -q -z "$PROJECT_DIR" || true
-        fi
-        ;;
-      bundler-audit)
-        print_subheader "bundler-audit (dependency vulns)"
-        run_bundle_audit
-        ;;
-      reek)
-        print_subheader "reek (code smells)"
-        run_rb_tool_text reek --single-line "$PROJECT_DIR" || true
-        ;;
-      fasterer)
-        print_subheader "fasterer (perf idioms)"
-        run_rb_tool_text fasterer "$PROJECT_DIR" || true
-        ;;
-      *)
-        say "  ${GRAY}${INFO} Unknown tool '$TOOL' ignored${RESET}"
-        ;;
-    esac
-  done
-}
 
 # ── Legacy-parity bridges: record-less section headers + summary + exit ─────
 run_v2_legacy_parity_bridges_ruby(){
@@ -512,6 +434,9 @@ run_contract_v2_ruby(){
   local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
+  if [[ "$ENABLE_BUNDLER_TOOLS" -eq 1 && ",$v2_skip," != *",19,"* ]]; then
+    scan_args+=(--rb-tools "$RB_TOOLS" --rb-timeout "$RB_TIMEOUT")
+  fi
 
   local ast_rule_dir=""
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
@@ -547,10 +472,6 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
   esac
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.ruby_scan \
     "${scan_args[@]}" --version "2.0.1" || exit_code=$?
-
-  if [[ ",$v2_skip," != *",19,"* && "$FORMAT" == "text" ]]; then
-    run_v2_rb_tools
-  fi
 
   run_v2_legacy_parity_bridges_ruby "$sink" "$list_file" "$exit_code" "$text_out" \
     "$v2_skip" || exit_code=$?

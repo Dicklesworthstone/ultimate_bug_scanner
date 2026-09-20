@@ -477,7 +477,8 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     return {"version": version, "findings": findings}
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int],
+                 errors: Sequence[str] = ()) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -490,6 +491,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         f"UBS module: ruby (contract v2) — {args.project or args.project_dir}",
         f"Files scanned: {len(files)}",
     ]
+    if errors:
+        lines.append("Partial: [ANALYZER_ERROR] " + "; ".join(errors[:5])[:500])
     category_order = {num: i for i, num in enumerate(sorted(_CATEGORY_SLUGS))}
     ordered_rules = sorted(
         by_rule,
@@ -567,6 +570,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
+    parser.add_argument("--rb-tools", default="", help="optional Ruby analyzer names (CSV)")
+    parser.add_argument("--rb-timeout", type=float, default=120, help="per-tool timeout in seconds")
     parser.add_argument("--enable-new-analyzers", action="store_true",
                         help="run analyzers with no legacy counterpart (ruby.narrowing)")
     args = parser.parse_args(argv)
@@ -692,6 +697,16 @@ def main(argv: list[str] | None = None) -> int:
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
 
+    # External tools depend on more than source bytes. Run them outside the
+    # incremental cache and before every renderer so findings/status agree in
+    # text, JSON, SARIF and sidecars (including warm-cache invocations).
+    external_tools = []
+    if 19 not in skip and args.rb_tools:
+        from ubs_core.external_tools import scan_ruby_tools
+        with open(args.sink, "a", encoding="utf-8") as sink_file:
+            external_tools = scan_ruby_tools(files, sink_file, args.project_dir,
+                                            args.rb_tools, args.rb_timeout, scan_errors)
+
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, detectors, analyzers, ast) is reflected in totals.
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -738,7 +753,8 @@ def main(argv: list[str] | None = None) -> int:
             # Legacy issue-64 payload (title + samples) carried inside the
             # module summary so the combined JSON keeps per-finding samples.
             "report": _legacy_report(records, args.version),
-            "extras": {"profile": profile_data, "ast_findings": ast_records},
+            "extras": {"profile": profile_data, "ast_findings": ast_records,
+                       "external_tools": external_tools},
         }
         if scan_errors:
             doc["module_error"] = "ANALYZER_ERROR"
@@ -750,7 +766,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        _render_text(args, files, counters)
+        _render_text(args, files, counters, scan_errors)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-ruby: analysis incomplete: {problem}\n")

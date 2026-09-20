@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='03cef59fe51165eb107e48500b89bfa3fcab4ac3f59ed192d78444024d1b2365'
-  [cpp]='4c54d28cdc83842c700097ed5a8991fd65d7c04028bc7ec40e8c76cf29186991'
-  [csharp]='8cc851a3aa07c42d4afba08e77d0aa1771175b0dec73c65b7179ddd1f74dd3a8'
-  [elixir]='d8e6408aef27a5027f970e0206c85a1de4e7065787d924efa6c4ea45bf5ad247'
-  [golang]='07bab0fb2df1930de50689f3b55903deed26209250616a5a620154dea9b76ae9'
-  [java]='563f4cd2889f72d787821bd85a22fabe6ed9d18562d903c539f7bd36687e3fde'
-  [js]='c17229a082c75fd7147be157a24d779901a0406f41b573921e34ee805a7a0d36'
-  [kotlin]='3b9f8d49bc80265927aac9060e345e9dc5fb7776504645adc6e01ae7efab239c'
-  [python]='6451b505f4bcb56743162a52b83a948e60e2ea8504c7964f9e51c74d510673f3'
-  [ruby]='55633bb9739f67f6f1c758197678fc901833e39f0efe38e0fdb821e880f18fc7'
-  [rust]='51fb28ed614ce675169e8cc3504d01973aee22b8558e2bf5ae0c76c21e8bd992'
-  [swift]='a8b76af796fc5455dafed756e9e7f7c03f17cd22945537a41383cace0b3c264f'
+  [bash]='1cc85db3f3e165011d02e37571d058697804fa2f0a9569c7597e77555075910c'
+  [cpp]='3fd4e51aa57e460755232c014ac44e94c35e424d35c60b19a79e0bbbb1ba0e4b'
+  [csharp]='b0204301b25f259e79d2a894e16eeef4db8c865d2eeda166b829c271dd06f017'
+  [elixir]='37f370c46a6c3ad6fdaadfdd29dc0a5e56239da84c1a77e5314cd2dd3c3a269d'
+  [golang]='4420c04076cae9a2b2794e83850af22d6b5b57264e4b1036e1c46a06b668d6db'
+  [java]='40a047e7f569c0512460225345d5140ef3b953c5f68673a937bede2ec6af5908'
+  [js]='48d823d178f3967bd34b161adfe510431c7fb2dc99c8322c7217510a605f47e1'
+  [kotlin]='6410e61f6948e2fe1bd158013517d425b2b73e4877acf85ba1c83892bfef34de'
+  [python]='f001ddd3b598b4418fd3f241b5575408ed946cf84179f2ff121cb172ebe5ee48'
+  [ruby]='9af3029f033d72910bbe1d605e1d85f0e2ee8147a9b8907602584517dd3fc0d4'
+  [rust]='3ae5972128f5637b6e512f00645903c7b492352e605751a98cba379fff179f80'
+  [swift]='23fc3bd033767228897c3c23007d23186dec29f2072fb79c87a43e85c38a90dc'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -168,7 +168,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='6ab6fc656880e2f8fb61ec563d3b7811e128601417d7b7ba7477fcb24197babd'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='4fc6e54f7f55ea1006ecf77c60df301cc29d9cd450a821bf0e3de7436a3519f4'
   ['helpers/ubs_core/bash_rules.py']='b61a431da8298cb7c59e6c2858943536bb1e6308a289ee27698b119fdd7dc5f3'
-  ['helpers/ubs_core/bash_scan.py']='cdc9485ffb0cfdd77ee1b765a6fbad5e103505c83c7ad33fbb896c358f762c1e'
+  ['helpers/ubs_core/bash_scan.py']='d49c7d1d29e380e36e480b1a567048bc46ff62fe92d6eb29a1353476c085a910'
   ['helpers/ubs_core/cache.py']='d3e5133dc3d44abc69fcad1b63644582f21fd512b417a0dbfc430eac24dc0474'
   ['helpers/ubs_core/cli.py']='e51b45718093dd0c03b4e85756365ec821619ee0dce38e416be44244fb555151'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
@@ -414,7 +414,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='f96e4cf536e3aeb8f1974a90337cc04e1cb9ad3b5678a755505c65fa8d7cda59'
+  ['lib/ubs-common.sh']='56e5b337a5d4d7f07a45f63f405289f228fc341a7f137a0485e0bb3838eefe63'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5078,7 +5078,15 @@ ensure_detection_contract(){
   # Verify the bytes the listing will actually consume, not a mutable cache
   # path it would reopen later. Never overwrite checkout assets during a scan.
   ensure_tmpdir_run
-  snapshot="$TMPDIR_RUN/detection-contract.json"
+  # Not beside the scanner summaries. `merge_json_scanners` collects
+  # "$TMPDIR_RUN"/*.json as the per-language results, skipping only
+  # *.findings.json — so a snapshot named detection-contract.json there was
+  # merged into `scanners[]` as if it were a language, giving every
+  # --format=json consumer an extra entry with no language/files/findings and
+  # breaking the documented schema. Assets the run verifies are not results;
+  # keep them in their own directory so the glob cannot confuse the two.
+  mkdir -p "$TMPDIR_RUN/assets" 2>/dev/null || true
+  snapshot="$TMPDIR_RUN/assets/detection-contract.json"
   if [[ ! -f "$path" ]] || ! cp "$path" "$snapshot"; then
     say_err "${RED}$X cannot read contract.json at $path; refusing to scan${RESET}"
     return 2

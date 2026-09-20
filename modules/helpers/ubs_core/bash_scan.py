@@ -329,7 +329,32 @@ def scan_shellcheck(
     sink,
     skip: set[int],
     reported_locations: set[tuple[str, int]],
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
+    """Run ShellCheck over the file list; write sink records.
+
+    A batch that could not run appends to ``errors`` instead of contributing a
+    silent zero, and whatever the batch did parse is kept — the same shape the
+    ast-grep layer above uses (#103, #111, #128).
+
+    ShellCheck's exit codes, measured rather than assumed:
+
+    ``0``
+        clean, stdout ``[]``.
+    ``1``
+        findings, stdout a valid JSON array. An unexpected shebang is reported
+        *here*, as SC1071/SC2148 — not as a failed invocation, so honouring
+        exit 2 does not turn a green scan red over an odd interpreter line.
+    ``2``
+        at least one path could not be opened (missing, unreadable). stdout is
+        still valid JSON carrying the findings from the files it *could* read,
+        and the per-file reason goes to stderr. That is a genuine coverage gap,
+        so it is recorded — while the findings it did produce are kept.
+
+    A missing shellcheck is not an error: it is an optional tool, and the
+    ``shutil.which`` guard below skips the layer the way ``--no-shellcheck``
+    would.
+    """
     counters = {"critical": 0, "warning": 0, "info": 0}
     if 6 in skip or not shutil.which("shellcheck"):
         return counters
@@ -346,12 +371,36 @@ def scan_shellcheck(
                 text=True,
                 timeout=120,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except FileNotFoundError:
+            if errors is not None:
+                errors.append("shellcheck unavailable (shellcheck)")
             continue
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"shellcheck could not be launched: {exc}")
+            continue
+        except subprocess.TimeoutExpired:
+            if errors is not None:
+                errors.append(
+                    f"shellcheck timed out on a batch of {len(batch)} file(s)"
+                )
+            continue
+
+        if proc.returncode not in (0, 1) and errors is not None:
+            detail = (proc.stderr or "").strip().splitlines()
+            errors.append(
+                f"shellcheck exited {proc.returncode} on a batch of {len(batch)} file(s)"
+                + (f": {detail[0][:160]}" if detail else "")
+            )
 
         try:
             items = json.loads(proc.stdout or "[]")
         except ValueError:
+            if errors is not None:
+                errors.append(
+                    "shellcheck produced output that is not JSON on a batch of "
+                    f"{len(batch)} file(s)"
+                )
             continue
 
         for it in items:
@@ -637,7 +686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             scan_ast_rules(Path(args.ast_rule_dir), files_to_scan, capturing_sink, skip,
                            reported_locations, prefilter=prefilter_res, errors=scan_errors)
         if not args.no_shellcheck:
-            scan_shellcheck(files_to_scan, capturing_sink, skip, reported_locations)
+            scan_shellcheck(files_to_scan, capturing_sink, skip, reported_locations,
+                            errors=scan_errors)
         # An incomplete analysis must never become the cached answer: the next
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).

@@ -115,19 +115,15 @@ severity: warning
 message: "Use 'is (not) None' instead of '== None' or '!= None"
 ''',
     ),
-    (
-        "is-literal",
-        r'''id: py.is-literal
-language: python
-rule:
-  any:
-    - pattern: $X is 0
-    - pattern: $X is 1
-    - pattern: $X is -1
-severity: warning
-message: "Avoid 'is' for int/str literals; small-int identity is a CPython implementation detail"
-''',
-    ),
+    # `x is <literal>` has no rule here. It is covered by the AST detector
+    # `py.comparison.is-literal` (py_detectors/is_literal.py), whose match set —
+    # every int/float/complex/str/bytes constant, list/tuple/dict/set/f-string
+    # display, and unary +/-/~ over one of those, in both `is` and `is not` — is
+    # a strict superset of the three patterns this rule carried (`is 0`, `is 1`,
+    # `is -1`). Every hit it produced was therefore a second report of a finding
+    # the detector had already made, under a second id (GH #109 §3). Measured
+    # before removal: `x is 0` / `x is 1` / `x is -1` each returned two
+    # warnings, while `x is 42`, `x is "lit"` and `x is not 1` returned one.
     (
         "except-broad",
         r'''id: py.except-broad
@@ -617,25 +613,13 @@ severity: info
 message: "requests call without timeout=... may hang"
 ''',
     ),
-    (
-        "json-loads-no-try",
-        r'''id: py.json.loads-no-try
-language: python
-rule:
-  pattern: json.loads($DATA)
-  not:
-    inside:
-      # Any try statement with at least one except clause; the earlier
-      # single-statement pattern ($A / $B) missed every multi-statement try
-      # body and reported well-guarded json.loads calls (GH self-scan).
-      kind: try_statement
-      stopBy: end
-      has:
-        kind: except_clause
-severity: warning
-message: "json.loads without exception handling"
-''',
-    ),
+    # `json.loads` has no rule here. It is covered by the AST detector
+    # `py.parsing.json-loads-no-try` (py_detectors/json_loads.py), which matched
+    # every call this rule did, so each unguarded call was reported twice under
+    # two ids (GH #109 §3). The one thing this rule got right and the detector
+    # did not — that a `try` without an `except` clause is not error handling —
+    # moved into the detector when this was removed, so deduplicating cost no
+    # coverage. `json.load` is a different function and keeps its rule below.
     (
         "sql-interpolation-percent",
         r'''id: py.sql-string-format-percent
@@ -721,10 +705,11 @@ rule:
   pattern: json.load($F)
   not:
     inside:
-      # Same fix as py.json.loads-no-try: without `stopBy: end` this only
-      # looked at the immediate parent, so `try: x = json.load(f)` — three
-      # nodes below the try_statement — was reported as unguarded, and a
-      # `try:` with no except clause counted as protection.
+      # Without `stopBy: end` this only looked at the immediate parent, so
+      # `try: x = json.load(f)` — three nodes below the try_statement — was
+      # reported as unguarded, and a `try:` with no except clause counted as
+      # protection. The `json.loads` detector now makes the same two
+      # distinctions in Python; see py_detectors/json_loads.py.
       kind: try_statement
       stopBy: end
       has:

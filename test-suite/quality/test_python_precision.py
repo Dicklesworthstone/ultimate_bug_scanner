@@ -46,6 +46,7 @@ if str(HELPERS_DIR) not in sys.path:
 
 from ubs_core.io import parse_ndjson_lines, read_ndjson  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
+from ubs_core.py_detectors import json_loads  # noqa: E402
 from ubs_core.py_detectors import missing_returns  # noqa: E402
 from ubs_core.py_detectors import sql_injection  # noqa: E402
 from ubs_core.py_patterns.debug_typing import PATTERNS as DEBUG_PATTERNS  # noqa: E402
@@ -400,6 +401,110 @@ class OpenMissingWithTests(unittest.TestCase):
         self.assertEqual(len(hits), 2, hits)
 
 
+# ─────────────────────── json.loads without a handler ───────────────────────
+class JsonLoadsGuardTests(unittest.TestCase):
+    """`py.parsing.json-loads-no-try` after the #109 §3 deduplication.
+
+    The ast-grep twin `py.json.loads-no-try` was removed because it reported
+    every call this detector already did. It was right about one thing the
+    detector was not — a `try` is only error handling if it has an `except` —
+    so that moved here, and these pin both halves.
+    """
+
+    def test_the_detector_is_the_only_json_loads_rule(self) -> None:
+        from ubs_core.py_rules import _RULES
+
+        rules = dict(_RULES)
+        self.assertNotIn("json-loads-no-try", rules,
+                         "the ast-grep twin is back; it double-counts the detector")
+        declared = {line.split(":", 1)[1].strip()
+                    for source in rules.values()
+                    for line in source.splitlines()
+                    if line.startswith("id:")}
+        self.assertNotIn("py.json.loads-no-try", declared)
+        # `json.load` is a different function and keeps its own rule.
+        self.assertIn("py.json-load-no-try", declared)
+
+    def test_try_with_except_still_guards(self) -> None:
+        hits = run_detector(json_loads, {"guarded.py": '''
+            import json
+
+            def f(s):
+                try:
+                    return json.loads(s)
+                except ValueError:
+                    return None
+        '''})
+        self.assertEqual(hits, [])
+
+    def test_try_without_except_is_not_error_handling(self) -> None:
+        """try/finally guarantees cleanup, not a caught JSONDecodeError."""
+        hits = run_detector(json_loads, {"finally_only.py": '''
+            import json
+
+            def f(s, lock):
+                try:
+                    return json.loads(s)
+                finally:
+                    lock.release()
+        '''})
+        self.assertEqual(len(hits), 1, hits)
+
+    def test_handler_and_finally_bodies_are_not_protected_by_their_own_try(self) -> None:
+        """An exception raised there propagates past handlers already chosen."""
+        hits = run_detector(json_loads, {"bodies.py": '''
+            import json
+
+            def in_handler(s):
+                try:
+                    pass
+                except ValueError:
+                    return json.loads(s)
+
+            def in_finally(s):
+                try:
+                    pass
+                except ValueError:
+                    pass
+                finally:
+                    return json.loads(s)
+
+            def in_orelse(s):
+                try:
+                    pass
+                except ValueError:
+                    pass
+                else:
+                    return json.loads(s)
+        '''})
+        self.assertEqual(len(hits), 3, hits)
+
+    def test_an_outer_try_still_guards_an_inner_finally(self) -> None:
+        """The walk continues outward instead of stopping at the first Try."""
+        hits = run_detector(json_loads, {"nested.py": '''
+            import json
+
+            def f(s, lock):
+                try:
+                    try:
+                        pass
+                    finally:
+                        return json.loads(s)
+                except ValueError:
+                    return None
+        '''})
+        self.assertEqual(hits, [])
+
+    def test_suppression_marker_is_honoured(self) -> None:
+        hits = run_detector(json_loads, {"quiet.py": '''
+            import json
+
+            def f(s):
+                return json.loads(s)  # ubs:ignore
+        '''})
+        self.assertEqual(hits, [])
+
+
 # ───────────────────────────── is <literal> ─────────────────────────────
 class IsLiteralSingletonTests(unittest.TestCase):
     def test_bool_singletons_are_idiomatic(self) -> None:
@@ -425,13 +530,35 @@ class IsLiteralSingletonTests(unittest.TestCase):
         '''})
         self.assertEqual(len(hits), 3, hits)
 
-    def test_ast_grep_rule_no_longer_names_bool(self) -> None:
+    def test_the_detector_is_the_only_is_literal_rule(self) -> None:
+        """One defect, one id. The ast-grep twin was a pure double count.
+
+        `py.is-literal` matched `$X is 0` / `is 1` / `is -1` — a strict subset
+        of what this detector reports — so every hit it produced was a second
+        report of a finding already made under `py.comparison.is-literal`
+        (GH #109 §3). Deleting it cost no coverage; the subset assertion below
+        is what makes that checkable rather than asserted.
+        """
         from ubs_core.py_rules import _RULES
 
-        source = dict(_RULES)["is-literal"]
-        self.assertNotIn("is True", source)
-        self.assertNotIn("is False", source)
-        self.assertIn("is 0", source)
+        rules = dict(_RULES)
+        self.assertNotIn("is-literal", rules,
+                         "the ast-grep twin is back; it double-counts the detector")
+        declared = {line.split(":", 1)[1].strip()
+                    for source in rules.values()
+                    for line in source.splitlines()
+                    if line.startswith("id:")}
+        self.assertNotIn("py.is-literal", declared)
+
+        # Everything the removed rule could match, the detector still reports.
+        hits = run_detector(is_literal, {"subset.py": '''
+            def f(x):
+                a = x is 0
+                b = x is 1
+                c = x is -1
+                return a, b, c
+        '''})
+        self.assertEqual(len(hits), 3, hits)
 
 
 # ─────────────────────── pattern layer: string masking ───────────────────────

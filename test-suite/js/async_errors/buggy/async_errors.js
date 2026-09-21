@@ -5,20 +5,16 @@ async function fetchUserProfile(id) {
 }
 
 function saveSettings(settings) {
-  return window.api
-    .save(settings)
-    .then(() => console.log('saved!'));
+  return window.api.save(settings).then(() => console.log("saved!"));
 }
 
 async function loadAllProjects(projectIds) {
-  const results = await Promise.all(
-    projectIds.map((id) => fetch(`/api/projects/${id}`))
-  );
+  const results = await Promise.all(projectIds.map((id) => fetch(`/api/projects/${id}`)));
   return results;
 }
 
 export async function bootstrapSession(userId) {
   await fetchUserProfile(userId);
-  saveSettings({ theme: 'dark' });
+  saveSettings({ theme: "dark" });
   await loadAllProjects([1, 2, 3]);
 }

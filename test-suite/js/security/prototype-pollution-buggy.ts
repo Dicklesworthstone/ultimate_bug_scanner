@@ -5,10 +5,16 @@ type RequestLike = {
   json(): Promise<Record<string, unknown>>;
 };
 
-declare function merge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown>;
+declare function merge(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+): Record<string, unknown>;
 declare const lodash: {
   merge(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown>;
-  defaultsDeep(target: Record<string, unknown>, source: Record<string, unknown>): Record<string, unknown>;
+  defaultsDeep(
+    target: Record<string, unknown>,
+    source: Record<string, unknown>,
+  ): Record<string, unknown>;
 };
 
 export function assignBodyIntoConfig(req: RequestLike): Record<string, unknown> {

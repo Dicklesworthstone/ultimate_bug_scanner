@@ -14,15 +14,19 @@ type RequestLike = {
 
 const app = express();
 
-app.use(cors({
-  origin: "*",
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: "*",
+    credentials: true,
+  }),
+);
 
-app.use(cors({
-  origin: true,
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  }),
+);
 
 export function allowAllCredentialedResponses(res: ResponseLike): void {
   res.setHeader("Access-Control-Allow-Origin", "*");

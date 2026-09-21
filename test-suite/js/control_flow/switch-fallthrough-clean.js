@@ -26,7 +26,7 @@ export function accumulate(mode, values) {
       break;
     case "double":
       total = values.length * 2;
-      // fall through
+    // fall through
     case "count":
       total += values.length;
       break;

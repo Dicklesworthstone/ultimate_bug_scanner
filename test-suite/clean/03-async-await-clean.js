@@ -18,8 +18,8 @@ async function loadUserData(userId, signal = AbortSignal.timeout(5000)) {
     }
     return await response.json();
   } catch (error) {
-    console.error('Failed to load user:', error);
-    throw error;  // Re-throw for caller to handle
+    console.error("Failed to load user:", error);
+    throw error; // Re-throw for caller to handle
   }
 }
 
@@ -29,23 +29,23 @@ async function loadAllData(userId) {
     const [user, posts, comments] = await Promise.all([
       fetchUser(userId),
       fetchPosts(userId),
-      fetchComments(userId)
+      fetchComments(userId),
     ]);
 
     return { user, posts, comments };
   } catch (error) {
-    console.error('Failed to load data:', error);
+    console.error("Failed to load data:", error);
     throw error;
   }
 }
 
 // GOOD: Promise with .catch()
 function fetchData(signal = AbortSignal.timeout(5000)) {
-  return fetch('/api/data', { signal })
-    .then(res => res.json())
-    .then(data => processData(data))
-    .catch(error => {
-      console.error('Fetch failed:', error);
+  return fetch("/api/data", { signal })
+    .then((res) => res.json())
+    .then((data) => processData(data))
+    .catch((error) => {
+      console.error("Fetch failed:", error);
       throw error;
     });
 }
@@ -53,23 +53,23 @@ function fetchData(signal = AbortSignal.timeout(5000)) {
 // GOOD: Handling multiple promises with error handling
 async function processItems(items) {
   const results = await Promise.all(
-    items.map(item => processItem(item).catch(err => {
-      console.error(`Failed to process item ${item.id}:`, err);
-      return null;  // Continue with other items
-    }))
+    items.map((item) =>
+      processItem(item).catch((err) => {
+        console.error(`Failed to process item ${item.id}:`, err);
+        return null; // Continue with other items
+      }),
+    ),
   );
 
-  return results.filter(r => r !== null);
+  return results.filter((r) => r !== null);
 }
 
 // GOOD: Using Promise.allSettled for handling partial failures
 async function fetchMultipleEndpoints(urls, signal = AbortSignal.timeout(5000)) {
-  const results = await Promise.allSettled(
-    urls.map(url => fetch(url, { signal }))
-  );
+  const results = await Promise.allSettled(urls.map((url) => fetch(url, { signal })));
 
   return results.map((result, index) => {
-    if (result.status === 'fulfilled') {
+    if (result.status === "fulfilled") {
       return result.value;
     } else {
       console.error(`Failed to fetch ${urls[index]}:`, result.reason);
@@ -89,13 +89,13 @@ class DataService {
       this.data = await this.loadData();
       this.initialized = true;
     } catch (error) {
-      console.error('Initialization failed:', error);
+      console.error("Initialization failed:", error);
       throw error;
     }
   }
 
   async loadData() {
-    const response = await fetch('/api/initial-data', { signal: AbortSignal.timeout(5000) });
+    const response = await fetch("/api/initial-data", { signal: AbortSignal.timeout(5000) });
     return response.json();
   }
 }
@@ -128,8 +128,8 @@ async function fetchWithTimeout(url, timeout = 5000) {
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error('Request timeout');
+    if (error.name === "AbortError") {
+      throw new Error("Request timeout");
     }
     throw error;
   }
@@ -143,9 +143,9 @@ async function asyncMap(array, asyncFn) {
 // GOOD: Return await when needed for stack traces
 async function getUserWithLogging(id) {
   try {
-    return await fetchUser(id);  // Keep await for better stack trace
+    return await fetchUser(id); // Keep await for better stack trace
   } catch (error) {
-    console.error('Failed to get user:', error);
+    console.error("Failed to get user:", error);
     throw error;
   }
 }

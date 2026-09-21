@@ -1,5 +1,5 @@
-import { createProxyMiddleware } from "http-proxy-middleware";
 import httpProxy from "http-proxy";
+import { createProxyMiddleware } from "http-proxy-middleware";
 import { NextResponse } from "next/server";
 
 type ExpressRequest = {

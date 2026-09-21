@@ -4,8 +4,7 @@
 // Placement 1: marker on the line immediately above a multi-line statement.
 export function checkTokenPrev(userToken: string, expectedToken: string): boolean {
   // ubs:ignore -- public correlation id, not a secret.
-  const matches =
-    userToken === expectedToken;
+  const matches = userToken === expectedToken;
   return matches;
 }
 
@@ -14,7 +13,7 @@ export function checkTokenPrev(userToken: string, expectedToken: string): boolea
 export function checkTokenBlock(userToken: string, expectedToken: string): void {
   if (userToken !== expectedToken) {
     // ubs:ignore -- public correlation id, not a secret.
-    throw new Error('mismatch');
+    throw new Error("mismatch");
   }
 }
 

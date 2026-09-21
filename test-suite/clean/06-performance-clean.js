@@ -7,13 +7,13 @@
 function renderManyItems(items) {
   const fragment = document.createDocumentFragment();
 
-  items.forEach(item => {
-    const li = document.createElement('li');
+  items.forEach((item) => {
+    const li = document.createElement("li");
     li.textContent = item.name;
-    fragment.appendChild(li);  // Build in memory
+    fragment.appendChild(li); // Build in memory
   });
 
-  document.getElementById('list').appendChild(fragment);  // Single reflow
+  document.getElementById("list").appendChild(fragment); // Single reflow
 }
 
 // GOOD: Debouncing expensive operations
@@ -38,7 +38,7 @@ function throttle(fn, limit) {
     if (!inThrottle) {
       fn.apply(this, args);
       inThrottle = true;
-      setTimeout(() => inThrottle = false, limit);
+      setTimeout(() => (inThrottle = false), limit);
     }
   };
 }
@@ -72,7 +72,7 @@ const expensiveCalculation = memoize((n) => {
 // GOOD: Using Set for fast lookups
 function findCommonElements(arr1, arr2) {
   const set1 = new Set(arr1);
-  return arr2.filter(item => set1.has(item));  // O(n) instead of O(n²)
+  return arr2.filter((item) => set1.has(item)); // O(n) instead of O(n²)
 }
 
 // GOOD: Efficient array operations with single pass
@@ -94,7 +94,7 @@ function buildLargeString(items) {
     parts.push(items[i]);
   }
 
-  return parts.join('');  // O(n) instead of O(n²)
+  return parts.join(""); // O(n) instead of O(n²)
 }
 
 // GOOD: Lazy evaluation with generators
@@ -115,14 +115,14 @@ function* lazyFilter(iterable, predicate) {
 // Usage: Process only what's needed
 const numbers = Array.from({ length: 1000000 }, (_, i) => i);
 const transformed = lazyFilter(
-  lazyMap(numbers, x => x * 2),
-  x => x > 100
+  lazyMap(numbers, (x) => x * 2),
+  (x) => x > 100,
 );
 
 // Only computes as we iterate
 for (const value of transformed) {
   console.log(value);
-  if (value > 200) break;  // Stop early
+  if (value > 200) break; // Stop early
 }
 
 // GOOD: Object pooling for frequently created objects
@@ -132,9 +132,7 @@ class Vector3Pool {
   }
 
   acquire() {
-    return this.pool.length > 0
-      ? this.pool.pop()
-      : { x: 0, y: 0, z: 0 };
+    return this.pool.length > 0 ? this.pool.pop() : { x: 0, y: 0, z: 0 };
   }
 
   release(vector) {
@@ -156,10 +154,7 @@ class VirtualList {
 
   render(scrollTop) {
     const startIndex = Math.floor(scrollTop / this.itemHeight);
-    const endIndex = Math.min(
-      startIndex + this.visibleCount,
-      this.items.length
-    );
+    const endIndex = Math.min(startIndex + this.visibleCount, this.items.length);
 
     // Only render visible items
     const fragment = document.createDocumentFragment();
@@ -169,13 +164,13 @@ class VirtualList {
       fragment.appendChild(item);
     }
 
-    this.container.textContent = '';
+    this.container.textContent = "";
     this.container.appendChild(fragment);
   }
 
   createItem(data, index) {
-    const div = document.createElement('div');
-    div.style.position = 'absolute';
+    const div = document.createElement("div");
+    div.style.position = "absolute";
     div.style.top = `${index * this.itemHeight}px`;
     div.style.height = `${this.itemHeight}px`;
     div.textContent = data;
@@ -209,9 +204,9 @@ class Animator {
 // GOOD: Batch reading and writing DOM
 function updateElements(elements, updates) {
   // Batch reads
-  const measurements = elements.map(el => ({
+  const measurements = elements.map((el) => ({
     width: el.offsetWidth,
-    height: el.offsetHeight
+    height: el.offsetHeight,
   }));
 
   // Batch writes
@@ -224,10 +219,7 @@ function updateElements(elements, updates) {
 // GOOD: Web Workers for heavy computation
 class WorkerPool {
   constructor(workerScript, poolSize = 4) {
-    this.workers = Array.from(
-      { length: poolSize },
-      () => new Worker(workerScript)
-    );
+    this.workers = Array.from({ length: poolSize }, () => new Worker(workerScript));
     this.queue = [];
     this.activeWorkers = new Set();
   }
@@ -254,7 +246,7 @@ class WorkerPool {
   }
 
   getAvailableWorker() {
-    return this.workers.find(w => !this.activeWorkers.has(w));
+    return this.workers.find((w) => !this.activeWorkers.has(w));
   }
 
   processQueue() {
@@ -265,7 +257,7 @@ class WorkerPool {
   }
 
   terminate() {
-    this.workers.forEach(w => w.terminate());
+    this.workers.forEach((w) => w.terminate());
   }
 }
 
@@ -297,7 +289,7 @@ class IndexedDBCache {
   }
 
   async get(key) {
-    const transaction = this.db.transaction([this.storeName], 'readonly');
+    const transaction = this.db.transaction([this.storeName], "readonly");
     const store = transaction.objectStore(this.storeName);
     const request = store.get(key);
 
@@ -308,7 +300,7 @@ class IndexedDBCache {
   }
 
   async set(key, value) {
-    const transaction = this.db.transaction([this.storeName], 'readwrite');
+    const transaction = this.db.transaction([this.storeName], "readwrite");
     const store = transaction.objectStore(this.storeName);
     const request = store.put(value, key);
 
@@ -322,10 +314,7 @@ class IndexedDBCache {
 // GOOD: Intersection Observer for lazy loading
 class LazyLoader {
   constructor(options = {}) {
-    this.observer = new IntersectionObserver(
-      this.handleIntersection.bind(this),
-      options
-    );
+    this.observer = new IntersectionObserver(this.handleIntersection.bind(this), options);
   }
 
   observe(element, callback) {
@@ -334,10 +323,10 @@ class LazyLoader {
   }
 
   handleIntersection(entries) {
-    entries.forEach(entry => {
+    entries.forEach((entry) => {
       if (entry.isIntersecting) {
         const callback = entry.target.dataset.lazyCallback;
-        if (callback && typeof window[callback] === 'function') {
+        if (callback && typeof window[callback] === "function") {
           window[callback](entry.target);
         }
         this.observer.unobserve(entry.target);
@@ -383,8 +372,7 @@ class PriorityQueue {
         break;
       }
 
-      [this.heap[index], this.heap[parentIndex]] =
-        [this.heap[parentIndex], this.heap[index]];
+      [this.heap[index], this.heap[parentIndex]] = [this.heap[parentIndex], this.heap[index]];
 
       index = parentIndex;
     }
@@ -412,8 +400,7 @@ class PriorityQueue {
 
       if (smallest === index) break;
 
-      [this.heap[index], this.heap[smallest]] =
-        [this.heap[smallest], this.heap[index]];
+      [this.heap[index], this.heap[smallest]] = [this.heap[smallest], this.heap[index]];
 
       index = smallest;
     }

@@ -1,6 +1,6 @@
+import { exec } from "child_process";
 import crypto from "crypto";
 import React, { useCallback, useEffect, useMemo } from "react";
-import { exec } from "child_process";
 
 type ResponseLike = {
   set(name: string, value: string): void;
@@ -17,7 +17,7 @@ type Props = {
 
 export function AstGrepRulePackCoverage(props: Props) {
   const chosen = props.value ?? props.fallback ?? "fallback";
-  const ambiguous = props.value ?? props.fallback ? "yes" : "no";
+  const ambiguous = (props.value ?? props.fallback) ? "yes" : "no";
   const derived = useMemo(() => props.items.map((item) => item.label).join(","), []);
   const stableHandler = useCallback(() => props.value.toUpperCase(), []);
 

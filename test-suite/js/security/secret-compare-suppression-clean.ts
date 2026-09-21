@@ -3,7 +3,8 @@
 // locator line from the report. The detector used to test the marker against
 // comment-stripped text, so a trailing "// ubs:ignore" was counted anyway.
 export function verifyToken(authToken: string, expectedAuthToken: string): boolean {
-  if (authToken !== expectedAuthToken) { // ubs:ignore -- deliberate: not a secret comparison
+  if (authToken !== expectedAuthToken) {
+    // ubs:ignore -- deliberate: not a secret comparison
     return false;
   }
   return true;

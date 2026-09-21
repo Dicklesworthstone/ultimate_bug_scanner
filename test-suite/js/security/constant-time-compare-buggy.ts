@@ -11,7 +11,11 @@ type User = {
   resetToken: string;
 };
 
-export function webhookSignatureCheck(req: RequestLike, body: string, signingSecret: string): boolean {
+export function webhookSignatureCheck(
+  req: RequestLike,
+  body: string,
+  signingSecret: string,
+): boolean {
   const expectedSignature = crypto.createHmac("sha256", signingSecret).update(body).digest("hex");
   const providedSignature = req.headers["x-signature"] ?? "";
   return providedSignature === expectedSignature;

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-const fs = require('fs/promises');
-const path = require('path');
+const fs = require("fs/promises");
+const path = require("path");
 let ts;
 try {
-  ts = require('typescript');
+  ts = require("typescript");
 } catch (err) {
   ts = null;
 }
@@ -15,10 +15,10 @@ try {
 // the API surface and fall back to the text heuristic instead of crashing.
 if (
   ts &&
-  (typeof ts.createSourceFile !== 'function' ||
+  (typeof ts.createSourceFile !== "function" ||
     !ts.ScriptKind ||
     !ts.SyntaxKind ||
-    typeof ts.forEachChild !== 'function')
+    typeof ts.forEachChild !== "function")
 ) {
   ts = null;
 }
@@ -32,36 +32,36 @@ function parseArgs(argv) {
   let target = null;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--exclude') {
+    if (arg === "--exclude") {
       if (i + 1 < argv.length) excludes.push(argv[++i]);
       continue;
     }
-    if (arg.startsWith('--exclude=')) {
-      excludes.push(arg.slice('--exclude='.length));
+    if (arg.startsWith("--exclude=")) {
+      excludes.push(arg.slice("--exclude=".length));
       continue;
     }
-    if (arg.startsWith('--')) continue;
+    if (arg.startsWith("--")) continue;
     if (target === null) target = arg;
   }
   return { target, excludes };
 }
 
 function globToRegExp(glob) {
-  let source = '';
+  let source = "";
   for (let i = 0; i < glob.length; i++) {
     const ch = glob[i];
-    if (ch === '*') {
-      if (glob[i + 1] === '*') {
-        source += '.*';
+    if (ch === "*") {
+      if (glob[i + 1] === "*") {
+        source += ".*";
         i++;
-        if (glob[i + 1] === '/') i++;
+        if (glob[i + 1] === "/") i++;
       } else {
-        source += '[^/]*';
+        source += "[^/]*";
       }
-    } else if (ch === '?') {
-      source += '[^/]';
+    } else if (ch === "?") {
+      source += "[^/]";
     } else {
-      source += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+      source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
     }
   }
   return new RegExp(`^${source}$`);
@@ -69,26 +69,37 @@ function globToRegExp(glob) {
 
 const { target: cliTarget, excludes: cliExcludes } = parseArgs(process.argv.slice(2));
 const projectDir = path.resolve(cliTarget || process.cwd());
-const SKIP_DIRS = new Set(['.git', '.hg', '.svn', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.turbo', '.expo']);
+const SKIP_DIRS = new Set([
+  ".git",
+  ".hg",
+  ".svn",
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  ".nuxt",
+  ".turbo",
+  ".expo",
+]);
 const SKIP_PATTERNS = [];
 for (const spec of cliExcludes) {
-  for (const rawEntry of spec.split(',')) {
-    const entry = rawEntry.trim().replace(/^\.\//, '').replace(/\/+$/, '');
+  for (const rawEntry of spec.split(",")) {
+    const entry = rawEntry.trim().replace(/^\.\//, "").replace(/\/+$/, "");
     if (!entry) continue;
-    if (/[*?[\]]/.test(entry) || entry.includes('/')) {
+    if (/[*?[\]]/.test(entry) || entry.includes("/")) {
       SKIP_PATTERNS.push(globToRegExp(entry));
     } else {
       SKIP_DIRS.add(entry);
     }
   }
 }
-const EXTENSIONS = new Set(['.ts', '.tsx']);
+const EXTENSIONS = new Set([".ts", ".tsx"]);
 
 function isExcluded(fullPath, name) {
   if (SKIP_DIRS.has(name)) return true;
   if (SKIP_PATTERNS.length === 0) return false;
-  const rel = path.relative(projectDir, fullPath).split(path.sep).join('/');
-  if (!rel || rel.startsWith('..')) return false;
+  const rel = path.relative(projectDir, fullPath).split(path.sep).join("/");
+  if (!rel || rel.startsWith("..")) return false;
   return SKIP_PATTERNS.some((re) => re.test(rel) || re.test(name));
 }
 
@@ -118,19 +129,21 @@ async function collectFiles(target) {
 
   let batches;
   try {
-    batches = await Promise.all(entries.map(async (entry) => {
-      if (entry.isSymbolicLink()) return [];
-      const fullPath = path.join(target, entry.name);
-      if (isExcluded(fullPath, entry.name)) return [];
-      if (entry.isDirectory()) {
-        if (entry.name.startsWith('.') && entry.name.length > 1) return [];
-        return collectFiles(fullPath);
-      }
-      if (entry.isFile() && EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
-        return [fullPath];
-      }
-      return [];
-    }));
+    batches = await Promise.all(
+      entries.map(async (entry) => {
+        if (entry.isSymbolicLink()) return [];
+        const fullPath = path.join(target, entry.name);
+        if (isExcluded(fullPath, entry.name)) return [];
+        if (entry.isDirectory()) {
+          if (entry.name.startsWith(".") && entry.name.length > 1) return [];
+          return collectFiles(fullPath);
+        }
+        if (entry.isFile() && EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+          return [fullPath];
+        }
+        return [];
+      }),
+    );
   } catch (err) {
     console.warn(`[ubs-type-narrowing] Failed to enumerate ${target}: ${err.message}`);
     return [];
@@ -144,31 +157,39 @@ function formatLocation(file, sourceFile, pos) {
 }
 
 async function analyzeFileWithTs(filePath) {
-  const sourceText = await fs.readFile(filePath, 'utf8');
-  const scriptKind = filePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
-  const sourceFile = ts.createSourceFile(filePath, sourceText, ts.ScriptTarget.Latest, true, scriptKind);
+  const sourceText = await fs.readFile(filePath, "utf8");
+  const scriptKind = filePath.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const sourceFile = ts.createSourceFile(
+    filePath,
+    sourceText,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  );
   const results = [];
   const nextNavigationTerminators = new Set();
   const nextNavigationNamespaces = new Set();
   const nextNavigationNoReturnExports = new Set([
-    'redirect',
-    'permanentRedirect',
-    'notFound',
-    'forbidden',
-    'unauthorized',
+    "redirect",
+    "permanentRedirect",
+    "notFound",
+    "forbidden",
+    "unauthorized",
   ]);
 
   function collectNoReturnImports() {
     for (const stmt of sourceFile.statements) {
       if (!ts.isImportDeclaration(stmt)) continue;
       if (!ts.isStringLiteral(stmt.moduleSpecifier)) continue;
-      if (stmt.moduleSpecifier.text !== 'next/navigation') continue;
+      if (stmt.moduleSpecifier.text !== "next/navigation") continue;
       const clause = stmt.importClause;
       if (!clause || !clause.namedBindings) continue;
       const bindings = clause.namedBindings;
       if (ts.isNamedImports(bindings)) {
         for (const specifier of bindings.elements) {
-          const imported = specifier.propertyName ? specifier.propertyName.text : specifier.name.text;
+          const imported = specifier.propertyName
+            ? specifier.propertyName.text
+            : specifier.name.text;
           if (nextNavigationNoReturnExports.has(imported)) {
             nextNavigationTerminators.add(specifier.name.text);
           }
@@ -182,10 +203,7 @@ async function analyzeFileWithTs(filePath) {
   function extractGuardedIdentifier(expression) {
     if (ts.isBinaryExpression(expression)) {
       const op = expression.operatorToken.kind;
-      if (
-        op === ts.SyntaxKind.EqualsEqualsToken ||
-        op === ts.SyntaxKind.EqualsEqualsEqualsToken
-      ) {
+      if (op === ts.SyntaxKind.EqualsEqualsToken || op === ts.SyntaxKind.EqualsEqualsEqualsToken) {
         const left = ts.isIdentifier(expression.left) ? expression.left : null;
         const right = ts.isIdentifier(expression.right) ? expression.right : null;
         if (left && isNullish(expression.right)) return left;
@@ -194,12 +212,18 @@ async function analyzeFileWithTs(filePath) {
         if (right && isUndefinedIdent(expression.left)) return right;
       }
     }
-    if (ts.isPrefixUnaryExpression(expression) && expression.operator === ts.SyntaxKind.ExclamationToken) {
+    if (
+      ts.isPrefixUnaryExpression(expression) &&
+      expression.operator === ts.SyntaxKind.ExclamationToken
+    ) {
       if (ts.isIdentifier(expression.operand)) {
         return expression.operand;
       }
       // Handle !x.prop (optional chain guard)
-      if (ts.isPropertyAccessExpression(expression.operand) || ts.isElementAccessExpression(expression.operand)) {
+      if (
+        ts.isPropertyAccessExpression(expression.operand) ||
+        ts.isElementAccessExpression(expression.operand)
+      ) {
         // For now, we only track simple identifiers, but we could expand this.
         // Returning null avoids false positives on complex expressions.
         return null;
@@ -213,7 +237,7 @@ async function analyzeFileWithTs(filePath) {
   }
 
   function isUndefinedIdent(node) {
-    return ts.isIdentifier(node) && node.text === 'undefined';
+    return ts.isIdentifier(node) && node.text === "undefined";
   }
 
   function isKnownNoReturnCall(node) {
@@ -223,8 +247,10 @@ async function analyzeFileWithTs(filePath) {
       return nextNavigationTerminators.has(callee.text);
     }
     if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression)) {
-      return nextNavigationNamespaces.has(callee.expression.text) &&
-        nextNavigationNoReturnExports.has(callee.name.text);
+      return (
+        nextNavigationNamespaces.has(callee.expression.text) &&
+        nextNavigationNoReturnExports.has(callee.name.text)
+      );
     }
     return false;
   }
@@ -239,17 +265,24 @@ async function analyzeFileWithTs(filePath) {
     if (ts.isCallExpression(node) && isKnownNoReturnCall(node)) return true;
     if (ts.isBlock(node)) return node.statements.some(blockHasExit);
     if (ts.isIfStatement(node)) {
-      return node.elseStatement ? blockHasExit(node.thenStatement) && blockHasExit(node.elseStatement) : false;
+      return node.elseStatement
+        ? blockHasExit(node.thenStatement) && blockHasExit(node.elseStatement)
+        : false;
     }
     return false;
   }
 
   function statementRedefines(stmt, name) {
     if (ts.isVariableStatement(stmt)) {
-      return stmt.declarationList.declarations.some((d) => ts.isIdentifier(d.name) && d.name.text === name);
+      return stmt.declarationList.declarations.some(
+        (d) => ts.isIdentifier(d.name) && d.name.text === name,
+      );
     }
     if (ts.isExpressionStatement(stmt) && ts.isBinaryExpression(stmt.expression)) {
-      if (stmt.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(stmt.expression.left)) {
+      if (
+        stmt.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(stmt.expression.left)
+      ) {
         return stmt.expression.left.text === name;
       }
     }
@@ -266,15 +299,27 @@ async function analyzeFileWithTs(filePath) {
       let found = null;
       const search = (node) => {
         if (found) return;
-        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === name
+        ) {
           found = node.expression;
           return;
         }
-        if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+        if (
+          ts.isPropertyAccessExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === name
+        ) {
           found = node.expression;
           return;
         }
-        if (ts.isElementAccessExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === name) {
+        if (
+          ts.isElementAccessExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === name
+        ) {
           found = node.expression;
           return;
         }
@@ -288,7 +333,10 @@ async function analyzeFileWithTs(filePath) {
 
   function statementAssigns(stmt, name) {
     if (ts.isExpressionStatement(stmt) && ts.isBinaryExpression(stmt.expression)) {
-      if (stmt.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(stmt.expression.left)) {
+      if (
+        stmt.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(stmt.expression.left)
+      ) {
         return stmt.expression.left.text === name;
       }
     }
@@ -301,7 +349,9 @@ async function analyzeFileWithTs(filePath) {
       return node.statements.some((s) => blockAssigns(s, name));
     }
     if (ts.isIfStatement(node)) {
-      return node.elseStatement ? blockAssigns(node.thenStatement, name) && blockAssigns(node.elseStatement, name) : false;
+      return node.elseStatement
+        ? blockAssigns(node.thenStatement, name) && blockAssigns(node.elseStatement, name)
+        : false;
     }
     return false;
   }
@@ -321,14 +371,14 @@ async function analyzeFileWithTs(filePath) {
           // This implies the guard was "if (x is bad) { log but don't exit }".
           // So if `if (!x) { log } x.foo()`, x might be null.
           // This logic seems correct for "guard clauses that fail to guard".
-          
+
           if (guarded && !stmt.elseStatement && !blockHasExit(stmt.thenStatement)) {
             if (blockAssigns(stmt.thenStatement, guarded.text)) return;
             const usage = findUsageAfter(statements, idx, guarded);
             if (usage) {
               results.push({
                 location: formatLocation(filePath, sourceFile, usage.getStart(sourceFile)),
-                message: `Value '${guarded.text}' may still be null/undefined after guard`
+                message: `Value '${guarded.text}' may still be null/undefined after guard`,
               });
             }
           }
@@ -344,16 +394,19 @@ async function analyzeFileWithTs(filePath) {
 }
 
 async function analyzeFileFallback(filePath) {
-  const text = await fs.readFile(filePath, 'utf8');
+  const text = await fs.readFile(filePath, "utf8");
   const lines = text.split(/\r?\n/);
   const results = [];
-  const nextNavigationImport = /from\s+['"]next\/navigation['"]/.test(text) ||
+  const nextNavigationImport =
+    /from\s+['"]next\/navigation['"]/.test(text) ||
     /require\(\s*['"]next\/navigation['"]\s*\)/.test(text);
   const noReturnCall = /\b(?:redirect|permanentRedirect|notFound|forbidden|unauthorized)\s*\(/;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     // Match both loose (==) and strict (===) equality to be consistent with AST analyzer
-    const guard = line.match(/if\s*\(\s*!([A-Za-z_$][\w$]*)\b\s*\)/) || line.match(/if\s*\(\s*([A-Za-z_$][\w$]*)\b\s*===?\s*(?:null|undefined)\b\s*\)/);
+    const guard =
+      line.match(/if\s*\(\s*!([A-Za-z_$][\w$]*)\b\s*\)/) ||
+      line.match(/if\s*\(\s*([A-Za-z_$][\w$]*)\b\s*===?\s*(?:null|undefined)\b\s*\)/);
     if (!guard) continue;
     const name = guard[1];
     // GH #76: `continue`/`break` terminate the iteration or the enclosing
@@ -374,17 +427,19 @@ async function analyzeFileFallback(filePath) {
       }
     }
     if (exits) continue;
-    
+
     // Regex to find usage: word boundary + name + (dot or bracket)
     // e.g. name.prop or name['prop']
-    const usageRegex = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.|\\s*\\[)`);
-    const assignmentRegex = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*=`);
+    const usageRegex = new RegExp(
+      `\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\.|\\s*\\[)`,
+    );
+    const assignmentRegex = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=`);
 
     for (let j = i + 1; j < Math.min(lines.length, i + 25); j++) {
       if (usageRegex.test(lines[j])) {
         results.push({
           location: `${filePath}:${j + 1}:1`,
-          message: `Value '${name}' checked earlier but used without return (text heuristic)`
+          message: `Value '${name}' checked earlier but used without return (text heuristic)`,
         });
         break;
       }
@@ -408,7 +463,7 @@ async function main() {
     });
   }
   if (!ts) {
-    console.log('[ubs-type-narrowing] TypeScript compiler not detected');
+    console.log("[ubs-type-narrowing] TypeScript compiler not detected");
   }
 }
 

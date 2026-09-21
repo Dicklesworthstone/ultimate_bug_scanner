@@ -109,7 +109,7 @@ function processUser(user) {
 
 // BUG 10: Confusing boolean logic
 function shouldShow(user, item) {
-  if (!!user && !!item && user.canView && !item.hidden && (user.isPremium || item.isFree)) {
+  if (user && item && user.canView && !item.hidden && (user.isPremium || item.isFree)) {
     return true;
   }
   return false;

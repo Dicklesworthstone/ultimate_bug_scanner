@@ -1,6 +1,5 @@
-import jwt from "jsonwebtoken";
-import { verify as verifyToken } from "jsonwebtoken";
 import { jwtVerify } from "jose";
+import jwt, { verify as verifyToken } from "jsonwebtoken";
 
 const ISSUER = "https://auth.example.com";
 const AUDIENCE = "api";

@@ -27,21 +27,36 @@ export async function rawDbQueryFromQuery(req: RequestLike, db: Database): Promi
   return db.query(sql);
 }
 
-export async function rawDbQueryFromRouteParams(_request: RequestLike, { params }: RouteContext, db: Database): Promise<unknown> {
+export async function rawDbQueryFromRouteParams(
+  _request: RequestLike,
+  { params }: RouteContext,
+  db: Database,
+): Promise<unknown> {
   const tenant = params.tenant;
   return db.query("SELECT id FROM tenants WHERE slug = '" + tenant + "'");
 }
 
-export async function rawDbQueryFromDestructuredRouteParams(_request: RequestLike, { params }: RouteContext, db: Database): Promise<unknown> {
+export async function rawDbQueryFromDestructuredRouteParams(
+  _request: RequestLike,
+  { params }: RouteContext,
+  db: Database,
+): Promise<unknown> {
   const { account } = params;
   return db.query("SELECT id FROM accounts WHERE slug = '" + account + "'");
 }
 
-export async function rawDbQueryFromNestedRouteParams(_request: RequestLike, { params: { tenant } }: RouteContext, db: Database): Promise<unknown> {
+export async function rawDbQueryFromNestedRouteParams(
+  _request: RequestLike,
+  { params: { tenant } }: RouteContext,
+  db: Database,
+): Promise<unknown> {
   return db.query("SELECT id FROM memberships WHERE tenant = '" + tenant + "'");
 }
 
-export async function dynamicTableWithPlaceholder(req: RequestLike, db: Database): Promise<unknown> {
+export async function dynamicTableWithPlaceholder(
+  req: RequestLike,
+  db: Database,
+): Promise<unknown> {
   const table = req.query.table;
   return db.query("SELECT id FROM " + table + " WHERE owner = $1", ["system"]);
 }
@@ -56,12 +71,20 @@ export async function prismaUnsafeConcat(req: RequestLike, prisma: PrismaLike): 
   return prisma.$executeRawUnsafe("DELETE FROM tenant_jobs WHERE tenant = '" + tenant + "'");
 }
 
-export async function safeTagDoesNotHideUnsafeSameStatement(req: RequestLike, prisma: PrismaLike): Promise<unknown> {
+export async function safeTagDoesNotHideUnsafeSameStatement(
+  req: RequestLike,
+  prisma: PrismaLike,
+): Promise<unknown> {
   const tenant = req.query.tenant;
-  return prisma.$queryRaw`SELECT 1`.then(() => prisma.$executeRawUnsafe("DELETE FROM tenant_jobs WHERE tenant = '" + tenant + "'"));
+  return prisma.$queryRaw`SELECT 1`.then(() =>
+    prisma.$executeRawUnsafe("DELETE FROM tenant_jobs WHERE tenant = '" + tenant + "'"),
+  );
 }
 
-export async function sequelizeInterpolated(req: RequestLike, sequelize: SequelizeLike): Promise<unknown> {
+export async function sequelizeInterpolated(
+  req: RequestLike,
+  sequelize: SequelizeLike,
+): Promise<unknown> {
   const role = req.query.role;
   return sequelize.query(`SELECT * FROM users WHERE role = '${role}'`);
 }

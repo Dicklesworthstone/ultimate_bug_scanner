@@ -5,16 +5,16 @@
 
 // GOOD: Using textContent instead of innerHTML
 function displayComment(comment) {
-  const div = document.getElementById('comments');
+  const div = document.getElementById("comments");
   if (div) {
-    div.textContent = comment;  // Safe - no XSS
+    div.textContent = comment; // Safe - no XSS
   }
 }
 
 // GOOD: Sanitizing HTML (assuming DOMPurify is available)
 function displayRichComment(html) {
-  const div = document.getElementById('comments');
-  if (div && typeof DOMPurify !== 'undefined') {
+  const div = document.getElementById("comments");
+  if (div && typeof DOMPurify !== "undefined") {
     div.textContent = DOMPurify.sanitize(html);
   }
 }
@@ -24,14 +24,14 @@ const API_KEY = process.env.API_KEY;
 const DB_PASSWORD = process.env.DB_PASSWORD;
 
 // GOOD: Strong crypto hash
-const crypto = require('crypto');
+const crypto = require("crypto");
 function hashPassword(password) {
-  return crypto.createHash('sha256').update(password).digest('hex');
+  return crypto.createHash("sha256").update(password).digest("hex");
 }
 
 // GOOD: Cryptographically secure random
 function generateSecureToken() {
-  return crypto.randomBytes(32).toString('hex');
+  return crypto.randomBytes(32).toString("hex");
 }
 
 // GOOD: HTTPS URLs
@@ -43,9 +43,9 @@ function safeMerge(target, source) {
   const result = { ...target };
 
   for (const key in source) {
-    if (Object.prototype.hasOwnProperty.call(source, key)) {
+    if (Object.hasOwn(source, key)) {
       // Skip __proto__, constructor, prototype
-      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      if (key === "__proto__" || key === "constructor" || key === "prototype") {
         continue;
       }
       result[key] = source[key];
@@ -61,10 +61,10 @@ const phoneRegex = /^\d{10}$/;
 
 // GOOD: Validating input before using
 function executeUserAction(action) {
-  const allowedActions = ['save', 'delete', 'update', 'view'];
+  const allowedActions = ["save", "delete", "update", "view"];
 
   if (!allowedActions.includes(action)) {
-    throw new Error('Invalid action');
+    throw new Error("Invalid action");
   }
 
   // Now safe to use action
@@ -73,14 +73,14 @@ function executeUserAction(action) {
 
 // GOOD: Creating elements safely
 function createUserCard(user) {
-  const card = document.createElement('div');
-  card.className = 'user-card';
+  const card = document.createElement("div");
+  card.className = "user-card";
 
-  const name = document.createElement('h3');
-  name.textContent = user.name;  // Safe
+  const name = document.createElement("h3");
+  name.textContent = user.name; // Safe
 
-  const email = document.createElement('p');
-  email.textContent = user.email;  // Safe
+  const email = document.createElement("p");
+  email.textContent = user.email; // Safe
 
   card.appendChild(name);
   card.appendChild(email);
@@ -90,8 +90,8 @@ function createUserCard(user) {
 
 // GOOD: Using CSP-friendly approaches
 function loadScript(src) {
-  const script = document.createElement('script');
-  script.src = src;  // No inline code
+  const script = document.createElement("script");
+  script.src = src; // No inline code
   script.async = true;
   document.head.appendChild(script);
 }
@@ -99,5 +99,5 @@ function loadScript(src) {
 // GOOD: Parameterized queries (SQL injection prevention)
 function getUserById(db, userId) {
   // Using parameterized query
-  return db.query('SELECT * FROM users WHERE id = ?', [userId]);
+  return db.query("SELECT * FROM users WHERE id = ?", [userId]);
 }

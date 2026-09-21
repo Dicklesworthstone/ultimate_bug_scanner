@@ -25,7 +25,7 @@ function isPriceEqual(price1, price2) {
 // BUG 4: Accumulating floating-point errors
 function calculateCartTotal(items) {
   let total = 0;
-  items.forEach(item => {
+  items.forEach((item) => {
     total += item.price * item.quantity;
   });
   return total;
@@ -73,7 +73,7 @@ function toCents(dollars) {
 function calculateCompoundInterest(principal, rate, years) {
   let amount = principal;
   for (let i = 0; i < years; i++) {
-    amount *= (1 + rate);
+    amount *= 1 + rate;
   }
   return amount;
 }
@@ -119,7 +119,7 @@ function isCheaper(price1, price2) {
 // BUG 16: Summing up transaction fees
 function calculateTotalFees(transactions) {
   return transactions.reduce((sum, tx) => {
-    return sum + (tx.amount * 0.029 + 0.30);  // 2.9% + 30¢
+    return sum + (tx.amount * 0.029 + 0.3); // 2.9% + 30¢
   }, 0);
 }
 // Each calculation adds small errors
@@ -149,7 +149,7 @@ function sortByPrice(items) {
 // BUG 20: Running balance calculation
 function updateBalance(currentBalance, transactions) {
   let balance = currentBalance;
-  transactions.forEach(tx => {
+  transactions.forEach((tx) => {
     balance += tx.amount;
   });
   return balance;
@@ -161,7 +161,7 @@ function updateBalance(currentBalance, transactions) {
 
 // BUG 21: Price display formatting
 function formatPrice(price) {
-  return '$' + price.toFixed(2);
+  return "$" + price.toFixed(2);
 }
 // formatPrice(0.1 + 0.2) === "$0.30" ✓ Works!
 // But: formatPrice(1.005) === "$1.00" (should be "$1.01")
@@ -212,5 +212,5 @@ module.exports = {
   convertCurrency,
   calculateTotalFees,
   calculateProfitMargin,
-  formatPrice
+  formatPrice,
 };

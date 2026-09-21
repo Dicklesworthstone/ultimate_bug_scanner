@@ -13,13 +13,10 @@ async function fetchProfile(userId: string): Promise<Profile> {
 export function ProfilePanel({ userId }: { userId: string }) {
   const [profile, setProfile] = useState<Profile | null>(null);
 
-  useEffect(
-    async () => {
-      const nextProfile = await fetchProfile(userId);
-      setProfile(nextProfile);
-    },
-    [userId]
-  );
+  useEffect(async () => {
+    const nextProfile = await fetchProfile(userId);
+    setProfile(nextProfile);
+  }, [userId]);
 
   return <h2>{profile?.displayName ?? "Loading"}</h2>;
 }

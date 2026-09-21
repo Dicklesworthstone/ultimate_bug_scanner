@@ -3,7 +3,7 @@
 // Expected: 25+ WARNING/CRITICAL issues - Common React mistakes
 // ============================================================================
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useCallback, useEffect, useState } from "react";
 
 // BUG 1: Missing dependency in useEffect
 function UserProfile({ userId }) {
@@ -11,7 +11,7 @@ function UserProfile({ userId }) {
 
   useEffect(() => {
     fetchUser(userId).then(setUser);
-  }, []);  // Missing userId dependency!
+  }, []); // Missing userId dependency!
 
   return <div>{user?.name}</div>;
 }
@@ -24,8 +24,8 @@ class Counter extends React.Component {
   }
 
   increment() {
-    this.state.count++;  // WRONG! Mutates state directly
-    this.forceUpdate();  // Anti-pattern
+    this.state.count++; // WRONG! Mutates state directly
+    this.forceUpdate(); // Anti-pattern
   }
 
   render() {
@@ -49,7 +49,7 @@ function TodoList({ todos }) {
 // BUG 4: Using array index as key
 function Items({ items }) {
   return items.map((item, index) => (
-    <div key={index}>{item.name}</div>  // Bad! Causes issues when reordering
+    <div key={index}>{item.name}</div> // Bad! Causes issues when reordering
   ));
 }
 
@@ -58,8 +58,8 @@ function ClickCounter() {
   const [count, setCount] = useState(0);
 
   const handleClick = () => {
-    setCount(count + 1);  // May be stale!
-    setCount(count + 1);  // Won't increment by 2
+    setCount(count + 1); // May be stale!
+    setCount(count + 1); // Won't increment by 2
   };
 
   return <button onClick={handleClick}>{count}</button>;
@@ -81,7 +81,7 @@ function DataFetcher({ url }) {
 // BUG 7: Calling hooks conditionally
 function ConditionalHook({ condition }) {
   if (condition) {
-    useState(0);  // WRONG! Hooks must be called unconditionally
+    useState(0); // WRONG! Hooks must be called unconditionally
   }
 
   return <div>Content</div>;
@@ -98,7 +98,7 @@ function ExpensiveComponent({ items }) {
 // BUG 9: Props mutation
 function TodoItem({ todo }) {
   const handleComplete = () => {
-    todo.completed = true;  // WRONG! Mutates props
+    todo.completed = true; // WRONG! Mutates props
     forceUpdate();
   };
 
@@ -108,7 +108,7 @@ function TodoItem({ todo }) {
 // BUG 10: Forgetting to bind this in class components
 class Button extends React.Component {
   handleClick() {
-    console.log(this.props.label);  // 'this' will be undefined!
+    console.log(this.props.label); // 'this' will be undefined!
   }
 
   render() {
@@ -120,7 +120,7 @@ class Button extends React.Component {
 class BadComponent extends React.Component {
   render() {
     if (this.state.needsUpdate) {
-      this.setState({ needsUpdate: false });  // Causes infinite loop!
+      this.setState({ needsUpdate: false }); // Causes infinite loop!
     }
     return <div>Content</div>;
   }
@@ -135,11 +135,15 @@ function WindowSize() {
       setSize({ width: window.innerWidth, height: window.innerHeight });
     };
 
-    window.addEventListener('resize', handleResize);
+    window.addEventListener("resize", handleResize);
     // Missing cleanup!
   }, []);
 
-  return <div>{size.width} x {size.height}</div>;
+  return (
+    <div>
+      {size.width} x {size.height}
+    </div>
+  );
 }
 
 // BUG 13: Prop drilling (not a bug per se, but anti-pattern)
@@ -176,7 +180,7 @@ function Parent() {
 // BUG 15: String refs (deprecated)
 class OldStyleRefs extends React.Component {
   handleClick() {
-    this.refs.myInput.focus();  // Deprecated!
+    this.refs.myInput.focus(); // Deprecated!
   }
 
   render() {
@@ -186,11 +190,11 @@ class OldStyleRefs extends React.Component {
 
 // BUG 16: Incorrect useCallback dependencies
 function SearchComponent({ onSearch }) {
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState("");
 
   const handleSearch = useCallback(() => {
     onSearch(query);
-  }, []);  // Missing query dependency!
+  }, []); // Missing query dependency!
 
   return <input onChange={(e) => setQuery(e.target.value)} />;
 }
@@ -209,18 +213,20 @@ function Outer() {
 function Form() {
   const handleSubmit = (e) => {
     // Missing e.preventDefault()
-    console.log('Submitting...');
+    console.log("Submitting...");
     // Page will reload!
   };
 
-  return <form onSubmit={handleSubmit}>
-    <button type="submit">Submit</button>
-  </form>;
+  return (
+    <form onSubmit={handleSubmit}>
+      <button type="submit">Submit</button>
+    </form>
+  );
 }
 
 // BUG 19: Derived state that should be computed
 function FullNameComponent({ firstName, lastName }) {
-  const [fullName, setFullName] = useState('');
+  const [fullName, setFullName] = useState("");
 
   useEffect(() => {
     setFullName(`${firstName} ${lastName}`);
@@ -232,14 +238,14 @@ function FullNameComponent({ firstName, lastName }) {
 
 // BUG 20: Multiple state updates causing multiple renders
 function MultiUpdate() {
-  const [name, setName] = useState('');
-  const [email, setEmail] = useState('');
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
   const [age, setAge] = useState(0);
 
   const handleUpdate = () => {
-    setName('John');    // Render 1
-    setEmail('j@x.com'); // Render 2
-    setAge(30);          // Render 3
+    setName("John"); // Render 1
+    setEmail("j@x.com"); // Render 2
+    setAge(30); // Render 3
     // Should batch these or use single state object
   };
 
@@ -250,7 +256,7 @@ function MultiUpdate() {
 function ObjectDependency({ config }) {
   useEffect(() => {
     initialize(config);
-  }, [config]);  // config is object, will trigger on every render if not memoized
+  }, [config]); // config is object, will trigger on every render if not memoized
 
   return <div>Initialized</div>;
 }
@@ -260,10 +266,10 @@ function AsyncUpdate() {
   const [data, setData] = useState(null);
 
   const fetchData = async () => {
-    const result1 = await api.fetch('/endpoint1');
+    const result1 = await api.fetch("/endpoint1");
     setData(result1);
-    const result2 = await api.fetch('/endpoint2');
-    setData(result2);  // If component unmounts between calls, this crashes
+    const result2 = await api.fetch("/endpoint2");
+    setData(result2); // If component unmounts between calls, this crashes
   };
 
   useEffect(() => {
@@ -282,7 +288,7 @@ function Checkbox({ checked, onChange }) {
 // BUG 24: Using findDOMNode (deprecated)
 class LegacyComponent extends React.Component {
   componentDidMount() {
-    const node = ReactDOM.findDOMNode(this);  // Deprecated!
+    const node = ReactDOM.findDOMNode(this); // Deprecated!
     node.focus();
   }
 
@@ -299,7 +305,7 @@ function RiskyComponent({ data }) {
 
 // BUG 26: Spreading all props blindly
 function Wrapper(props) {
-  return <div {...props} />;  // Could pass invalid HTML attributes
+  return <div {...props} />; // Could pass invalid HTML attributes
 }
 
 // BUG 27: Using componentWillMount (deprecated)
@@ -319,23 +325,29 @@ function InfiniteLoop() {
   const [data, setData] = useState([]);
 
   useEffect(() => {
-    setData([...data, 'new item']);  // Causes infinite loop!
-  }, [data]);  // data changes, triggers effect, changes data again...
+    setData([...data, "new item"]); // Causes infinite loop!
+  }, [data]); // data changes, triggers effect, changes data again...
 
-  return <ul>{data.map((item, i) => <li key={i}>{item}</li>)}</ul>;
+  return (
+    <ul>
+      {data.map((item, i) => (
+        <li key={i}>{item}</li>
+      ))}
+    </ul>
+  );
 }
 
 export {
-  UserProfile,
-  Counter,
-  TodoList,
-  Items,
-  ClickCounter,
-  DataFetcher,
-  ConditionalHook,
-  ExpensiveComponent,
-  TodoItem,
-  Button,
   BadComponent,
-  WindowSize
+  Button,
+  ClickCounter,
+  ConditionalHook,
+  Counter,
+  DataFetcher,
+  ExpensiveComponent,
+  Items,
+  TodoItem,
+  TodoList,
+  UserProfile,
+  WindowSize,
 };

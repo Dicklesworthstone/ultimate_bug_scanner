@@ -3,7 +3,7 @@
 // Expected: No React anti-patterns, follows best practices
 // ============================================================================
 
-import React, { useState, useEffect, useCallback, useMemo, useRef, memo } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // GOOD: Proper useEffect dependencies
 function UserProfile({ userId }) {
@@ -15,13 +15,13 @@ function UserProfile({ userId }) {
     setLoading(true);
 
     fetchUser(userId)
-      .then(data => {
+      .then((data) => {
         if (!cancelled) {
           setUser(data);
           setLoading(false);
         }
       })
-      .catch(error => {
+      .catch((error) => {
         if (!cancelled) {
           console.error(error);
           setLoading(false);
@@ -29,9 +29,9 @@ function UserProfile({ userId }) {
       });
 
     return () => {
-      cancelled = true;  // Cleanup
+      cancelled = true; // Cleanup
     };
-  }, [userId]);  // Correct dependencies
+  }, [userId]); // Correct dependencies
 
   if (loading) return <div>Loading...</div>;
   return <div>{user?.name}</div>;
@@ -42,11 +42,11 @@ function Counter() {
   const [count, setCount] = useState(0);
 
   const increment = useCallback(() => {
-    setCount(prevCount => prevCount + 1);  // Function form
+    setCount((prevCount) => prevCount + 1); // Function form
   }, []);
 
   const incrementBy = useCallback((amount) => {
-    setCount(prevCount => prevCount + amount);
+    setCount((prevCount) => prevCount + amount);
   }, []);
 
   return (
@@ -61,12 +61,12 @@ function Counter() {
 // GOOD: Using unique, stable keys
 function TodoList({ todos }) {
   const handleClick = useCallback((todoId) => {
-    console.log('Clicked:', todoId);
+    console.log("Clicked:", todoId);
   }, []);
 
   return (
     <ul>
-      {todos.map(todo => (
+      {todos.map((todo) => (
         <li key={todo.id} onClick={() => handleClick(todo.id)}>
           {todo.text}
         </li>
@@ -92,26 +92,30 @@ function ExpensiveComponent({ items, filter }) {
 function WindowSize() {
   const [size, setSize] = useState({
     width: window.innerWidth,
-    height: window.innerHeight
+    height: window.innerHeight,
   });
 
   useEffect(() => {
     const handleResize = () => {
       setSize({
         width: window.innerWidth,
-        height: window.innerHeight
+        height: window.innerHeight,
       });
     };
 
-    window.addEventListener('resize', handleResize);
+    window.addEventListener("resize", handleResize);
 
     // Cleanup function
     return () => {
-      window.removeEventListener('resize', handleResize);
+      window.removeEventListener("resize", handleResize);
     };
   }, []);
 
-  return <div>{size.width} x {size.height}</div>;
+  return (
+    <div>
+      {size.width} x {size.height}
+    </div>
+  );
 }
 
 // GOOD: Using context to avoid prop drilling
@@ -142,13 +146,13 @@ function Level3() {
 
 // GOOD: Memoizing child components
 const ExpensiveChild = memo(({ data }) => {
-  console.log('ExpensiveChild rendered');
+  console.log("ExpensiveChild rendered");
   return <div>{JSON.stringify(data)}</div>;
 });
 
 function Parent() {
   const [count, setCount] = useState(0);
-  const data = useMemo(() => ({ value: 'stable' }), []);
+  const data = useMemo(() => ({ value: "stable" }), []);
 
   return (
     <div>
@@ -192,7 +196,7 @@ function useDebounce(value, delay) {
 }
 
 function SearchComponent() {
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState("");
   const debouncedQuery = useDebounce(query, 500);
 
   useEffect(() => {
@@ -223,7 +227,7 @@ class ErrorBoundary extends React.Component {
   }
 
   componentDidCatch(error, errorInfo) {
-    console.error('Error caught by boundary:', error, errorInfo);
+    console.error("Error caught by boundary:", error, errorInfo);
     // Log to error reporting service
   }
 
@@ -246,27 +250,25 @@ class ErrorBoundary extends React.Component {
 
 // GOOD: Form handling with preventDefault
 function Form() {
-  const [formData, setFormData] = useState({ name: '', email: '' });
+  const [formData, setFormData] = useState({ name: "", email: "" });
 
-  const handleSubmit = useCallback((e) => {
-    e.preventDefault();
-    console.log('Submitting:', formData);
-    submitForm(formData);
-  }, [formData]);
+  const handleSubmit = useCallback(
+    (e) => {
+      e.preventDefault();
+      console.log("Submitting:", formData);
+      submitForm(formData);
+    },
+    [formData],
+  );
 
   const handleChange = useCallback((e) => {
     const { name, value } = e.target;
-    setFormData(prev => ({ ...prev, [name]: value }));
+    setFormData((prev) => ({ ...prev, [name]: value }));
   }, []);
 
   return (
     <form onSubmit={handleSubmit}>
-      <input
-        name="name"
-        value={formData.name}
-        onChange={handleChange}
-        placeholder="Name"
-      />
+      <input name="name" value={formData.name} onChange={handleChange} placeholder="Name" />
       <input
         name="email"
         type="email"
@@ -290,17 +292,17 @@ function FullNameComponent({ firstName, lastName }) {
 // GOOD: Batching state updates
 function MultiUpdate() {
   const [state, setState] = useState({
-    name: '',
-    email: '',
-    age: 0
+    name: "",
+    email: "",
+    age: 0,
   });
 
   const handleUpdate = useCallback(() => {
     // Single state update
     setState({
-      name: 'John',
-      email: 'j@x.com',
-      age: 30
+      name: "John",
+      email: "j@x.com",
+      age: 30,
     });
   }, []);
 
@@ -310,11 +312,7 @@ function MultiUpdate() {
 // GOOD: Stable object dependencies with useMemo
 function ConfigComponent({ config }) {
   // Memoize config to avoid unnecessary re-renders
-  const stableConfig = useMemo(() => config, [
-    config.host,
-    config.port,
-    config.timeout
-  ]);
+  const stableConfig = useMemo(() => config, [config.host, config.port, config.timeout]);
 
   useEffect(() => {
     initialize(stableConfig);
@@ -332,7 +330,7 @@ function AsyncComponent() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const result = await api.fetch('/endpoint');
+        const result = await api.fetch("/endpoint");
         if (isMountedRef.current) {
           setData(result);
         }
@@ -357,18 +355,12 @@ function AsyncComponent() {
 
 // GOOD: Controlled checkbox with default value
 function Checkbox({ checked = false, onChange }) {
-  return (
-    <input
-      type="checkbox"
-      checked={checked}
-      onChange={(e) => onChange(e.target.checked)}
-    />
-  );
+  return <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />;
 }
 
 // GOOD: Conditional rendering without hooks
 function ConditionalContent({ showContent }) {
-  const [count, setCount] = useState(0);  // Always called
+  const [count, setCount] = useState(0); // Always called
 
   if (!showContent) {
     return <div>No content</div>;
@@ -381,7 +373,9 @@ function ConditionalContent({ showContent }) {
 function Wrapper({ children, className, ...validProps }) {
   // Only spread valid props
   const divProps = Object.keys(validProps).reduce((acc, key) => {
-    if (['id', 'style', 'data-*', 'aria-*'].some(valid => key.startsWith(valid.replace('*', '')))) {
+    if (
+      ["id", "style", "data-*", "aria-*"].some((valid) => key.startsWith(valid.replace("*", "")))
+    ) {
       acc[key] = validProps[key];
     }
     return acc;
@@ -395,7 +389,7 @@ function Wrapper({ children, className, ...validProps }) {
 }
 
 // GOOD: Lazy loading components
-const HeavyComponent = React.lazy(() => import('./HeavyComponent'));
+const HeavyComponent = React.lazy(() => import("./HeavyComponent"));
 
 function LazyLoadingExample() {
   return (
@@ -408,20 +402,20 @@ function LazyLoadingExample() {
 }
 
 export {
-  UserProfile,
-  Counter,
-  TodoList,
-  ExpensiveComponent,
-  WindowSize,
   App,
-  Parent,
-  TextInput,
-  useDebounce,
-  SearchComponent,
-  ErrorBoundary,
-  Form,
-  FullNameComponent,
   AsyncComponent,
   Checkbox,
-  LazyLoadingExample
+  Counter,
+  ErrorBoundary,
+  ExpensiveComponent,
+  Form,
+  FullNameComponent,
+  LazyLoadingExample,
+  Parent,
+  SearchComponent,
+  TextInput,
+  TodoList,
+  UserProfile,
+  useDebounce,
+  WindowSize,
 };

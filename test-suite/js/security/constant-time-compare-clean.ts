@@ -11,10 +11,16 @@ type User = {
 function timingSafeStringEqual(left: string, right: string): boolean {
   const leftBuffer = Buffer.from(left);
   const rightBuffer = Buffer.from(right);
-  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+  return (
+    leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer)
+  );
 }
 
-export function webhookSignatureCheck(req: RequestLike, body: string, signingSecret: string): boolean {
+export function webhookSignatureCheck(
+  req: RequestLike,
+  body: string,
+  signingSecret: string,
+): boolean {
   const expectedSignature = crypto.createHmac("sha256", signingSecret).update(body).digest("hex");
   const providedSignature = req.headers["x-signature"] ?? "";
   return timingSafeStringEqual(providedSignature, expectedSignature);

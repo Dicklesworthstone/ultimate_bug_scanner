@@ -19,7 +19,10 @@ function stripPrototypeKeys(input: Record<string, unknown>): Record<string, unkn
   return clean;
 }
 
-function safeMerge<T extends Record<string, unknown>>(target: T, source: Record<string, unknown>): T {
+function safeMerge<T extends Record<string, unknown>>(
+  target: T,
+  source: Record<string, unknown>,
+): T {
   const clean = stripPrototypeKeys(source);
   return Object.assign(target, clean);
 }

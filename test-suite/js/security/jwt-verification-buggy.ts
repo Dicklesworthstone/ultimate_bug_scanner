@@ -1,7 +1,6 @@
-import jwt from "jsonwebtoken";
-import * as jwtNamespace from "jsonwebtoken";
-import { decode as decodeToken, verify } from "jsonwebtoken";
 import { decodeJwt, jwtVerify } from "jose";
+import * as jwtNamespace from "jsonwebtoken";
+import jwt, { decode as decodeToken, verify } from "jsonwebtoken";
 import jwtDecode from "jwt-decode";
 
 const { verify: verifyFromRequire } = require("jsonwebtoken");
@@ -40,7 +39,10 @@ export function acceptsNoneAlgorithm(token: string): unknown {
   return jwt.verify(token, SECRET, { algorithms: ["none"] });
 }
 
-export function verifiesSignatureWithoutIssuerAudience(token: string, publicKey: string): string | object {
+export function verifiesSignatureWithoutIssuerAudience(
+  token: string,
+  publicKey: string,
+): string | object {
   return jwt.verify(token, publicKey, { algorithms: ["RS256"] });
 }
 

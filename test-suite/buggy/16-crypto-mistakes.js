@@ -108,7 +108,7 @@ function createSessionToken(userId) {
 }
 
 // BUG 17: No key rotation
-let MASTER_KEY = loadKeyFromFile();  // Same key used forever
+const MASTER_KEY = loadKeyFromFile();  // Same key used forever
 
 function encryptSensitiveData(data) {
   const cipher = crypto.createCipheriv('aes-256-gcm', MASTER_KEY, crypto.randomBytes(12));

@@ -14,15 +14,15 @@ async function loadUserData(userId, signal = AbortSignal.timeout(5000)) {
 
     return await response.json();
   } catch (error) {
-    if (error.name === 'TypeError') {
-      console.error('Network error:', error.message);
-      throw new Error('Failed to connect to server');
-    } else if (error.message.includes('HTTP error')) {
-      console.error('API error:', error.message);
+    if (error.name === "TypeError") {
+      console.error("Network error:", error.message);
+      throw new Error("Failed to connect to server");
+    } else if (error.message.includes("HTTP error")) {
+      console.error("API error:", error.message);
       throw error;
     } else {
-      console.error('Unexpected error:', error);
-      throw new Error('An unexpected error occurred');
+      console.error("Unexpected error:", error);
+      throw new Error("An unexpected error occurred");
     }
   }
 }
@@ -31,7 +31,7 @@ async function loadUserData(userId, signal = AbortSignal.timeout(5000)) {
 class ValidationError extends Error {
   constructor(message, field, value) {
     super(message);
-    this.name = 'ValidationError';
+    this.name = "ValidationError";
     this.field = field;
     this.value = value;
     Error.captureStackTrace(this, ValidationError);
@@ -40,11 +40,11 @@ class ValidationError extends Error {
 
 function validateEmail(email) {
   if (!email) {
-    throw new ValidationError('Email is required', 'email', email);
+    throw new ValidationError("Email is required", "email", email);
   }
 
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    throw new ValidationError('Invalid email format', 'email', email);
+    throw new ValidationError("Invalid email format", "email", email);
   }
 
   return true;
@@ -63,7 +63,7 @@ async function processFile(filename) {
     throw error;
   } finally {
     if (fileHandle) {
-      await fileHandle.close();  // Always cleanup
+      await fileHandle.close(); // Always cleanup
     }
   }
 }
@@ -71,14 +71,14 @@ async function processFile(filename) {
 // GOOD: Promise rejection handling
 function fetchWithErrorHandling(url, signal = AbortSignal.timeout(5000)) {
   return fetch(url, { signal })
-    .then(response => {
+    .then((response) => {
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
       return response.json();
     })
-    .catch(error => {
-      console.error('Fetch failed:', error);
+    .catch((error) => {
+      console.error("Fetch failed:", error);
       // Return fallback or rethrow
       throw error;
     });
@@ -92,13 +92,13 @@ async function complexOperation() {
     return await saveToDatabase(parsed);
   } catch (error) {
     if (error instanceof SyntaxError) {
-      console.error('JSON parsing failed:', error.message);
-      throw new Error('Invalid data format');
-    } else if (error.name === 'DatabaseError') {
-      console.error('Database operation failed:', error);
-      throw new Error('Failed to save data');
+      console.error("JSON parsing failed:", error.message);
+      throw new Error("Invalid data format");
+    } else if (error.name === "DatabaseError") {
+      console.error("Database operation failed:", error);
+      throw new Error("Failed to save data");
     } else {
-      console.error('Unexpected error:', error);
+      console.error("Unexpected error:", error);
       throw error;
     }
   }
@@ -111,7 +111,7 @@ class ErrorBoundary {
       try {
         return await fn(...args);
       } catch (error) {
-        console.error('Error in wrapped function:', error);
+        console.error("Error in wrapped function:", error);
         ErrorBoundary.handleError(error);
         throw error;
       }
@@ -120,7 +120,7 @@ class ErrorBoundary {
 
   static handleError(error) {
     // Centralized error handling
-    if (process.env.NODE_ENV === 'production') {
+    if (process.env.NODE_ENV === "production") {
       // Send to monitoring service
       ErrorReporter.report(error);
     } else {
@@ -131,16 +131,16 @@ class ErrorBoundary {
 
 // GOOD: Validation before risky operations
 function divideNumbers(a, b) {
-  if (typeof a !== 'number' || typeof b !== 'number') {
-    throw new TypeError('Both arguments must be numbers');
+  if (typeof a !== "number" || typeof b !== "number") {
+    throw new TypeError("Both arguments must be numbers");
   }
 
   if (b === 0) {
-    throw new RangeError('Cannot divide by zero');
+    throw new RangeError("Cannot divide by zero");
   }
 
   if (!Number.isFinite(a) || !Number.isFinite(b)) {
-    throw new RangeError('Arguments must be finite numbers');
+    throw new RangeError("Arguments must be finite numbers");
   }
 
   return a / b;
@@ -151,7 +151,7 @@ function parseJSON(jsonString, fallback = null) {
   try {
     return JSON.parse(jsonString); // ubs:ignore
   } catch (error) {
-    console.warn('Failed to parse JSON:', error.message);
+    console.warn("Failed to parse JSON:", error.message);
     return fallback;
   }
 }
@@ -174,7 +174,7 @@ async function fetchWithRetry(url, maxRetries = 3) {
       console.warn(`Attempt ${attempt} failed:`, error.message);
 
       if (attempt < maxRetries) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
       }
     }
   }
@@ -201,7 +201,7 @@ async function getUserPreferences(userId) {
   try {
     return await fetchUserPreferences(userId);
   } catch (error) {
-    console.warn('Failed to load user preferences, using defaults:', error);
+    console.warn("Failed to load user preferences, using defaults:", error);
     return getDefaultPreferences();
   }
 }
@@ -248,24 +248,24 @@ function createUser(userData) {
   const errors = [];
 
   if (!userData.email) {
-    errors.push({ field: 'email', message: 'Email is required' });
+    errors.push({ field: "email", message: "Email is required" });
   } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userData.email)) {
-    errors.push({ field: 'email', message: 'Invalid email format' });
+    errors.push({ field: "email", message: "Invalid email format" });
   }
 
   if (!userData.password || userData.password.length < 8) {
-    errors.push({ field: 'password', message: 'Password must be at least 8 characters' });
+    errors.push({ field: "password", message: "Password must be at least 8 characters" });
   }
 
   if (errors.length > 0) {
-    const error = new Error('Validation failed');
-    error.name = 'ValidationError';
+    const error = new Error("Validation failed");
+    error.name = "ValidationError";
     error.errors = errors;
     throw error;
   }
 
   return {
     email: userData.email,
-    passwordHash: hashPassword(userData.password)
+    passwordHash: hashPassword(userData.password),
   };
 }

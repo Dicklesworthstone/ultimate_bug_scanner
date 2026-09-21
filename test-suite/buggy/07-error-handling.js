@@ -14,7 +14,7 @@ try {
 try {
   parseJSON(data);
 } catch {
-  console.log('Error occurred');  // No error details!
+  console.log("Error occurred"); // No error details!
 }
 
 // BUG 3: Try without finally (resource leak potential)
@@ -31,30 +31,30 @@ function processFile(filename) {
 // BUG 4: Generic error messages
 function saveUser(user) {
   if (!user.email) {
-    throw new Error('Error');  // Useless message
+    throw new Error("Error"); // Useless message
   }
   if (!user.name) {
-    throw new Error('Error occurred');  // Also useless
+    throw new Error("Error occurred"); // Also useless
   }
 }
 
 // BUG 5: Throwing strings instead of Error objects
 function validateInput(input) {
   if (!input) {
-    throw 'Invalid input';  // Should be: throw new Error('Invalid input')
+    throw "Invalid input"; // Should be: throw new Error('Invalid input')
   }
   if (input.length < 3) {
-    throw 'Too short';  // No stack trace!
+    throw "Too short"; // No stack trace!
   }
 }
 
 // BUG 6: Catch that doesn't re-throw or handle
 async function fetchData() {
   try {
-    const response = await fetch('/api/data');
+    const response = await fetch("/api/data");
     return response.json();
   } catch (error) {
-    console.log('Fetch failed');  // Logs but doesn't propagate or handle
+    console.log("Fetch failed"); // Logs but doesn't propagate or handle
   }
   // Returns undefined on error - caller doesn't know it failed!
 }
@@ -64,17 +64,17 @@ try {
   dangerousOperation();
 } catch (e) {
   // Catches ALL errors - can't handle different error types differently
-  console.log('Something went wrong');
+  console.log("Something went wrong");
 }
 
 // BUG 8: JSON.parse without try/catch
 function loadConfig(json) {
-  const config = JSON.parse(json);  // Throws on invalid JSON
+  const config = JSON.parse(json); // Throws on invalid JSON
   return config;
 }
 
 function handleData(data) {
-  const obj = JSON.parse(data);  // No error handling
+  const obj = JSON.parse(data); // No error handling
   processObject(obj);
 }
 
@@ -86,17 +86,17 @@ try {
   processEverything(user, posts, comments);
 } catch (e) {
   // Which operation failed? No way to know!
-  console.error('Operation failed');
+  console.error("Operation failed");
 }
 
 // BUG 10: Error logged but not thrown
 function validateAge(age) {
   if (age < 0) {
-    console.error('Invalid age');
+    console.error("Invalid age");
     // Should throw or return error - just logging isn't enough
   }
   if (age > 150) {
-    console.error('Age too high');
+    console.error("Age too high");
     // Continues executing with invalid data!
   }
   return age;
@@ -117,16 +117,16 @@ function getData() {
     return fetchData();
   } finally {
     cleanup();
-    return null;  // Overrides the try return!
+    return null; // Overrides the try return!
   }
 }
 
 // BUG 13: Error constructor without 'new'
 function handleError(msg) {
-  throw Error(msg);  // Works but should use 'new Error(msg)'
+  throw Error(msg); // Works but should use 'new Error(msg)'
 }
 
 // BUG 14: Catch without doing anything
-fetch('/api/data')
-  .then(res => res.json())
-  .catch(e => {});  // Empty catch - silent failure
+fetch("/api/data")
+  .then((res) => res.json())
+  .catch((e) => {}); // Empty catch - silent failure

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 export function CleanHooks({ userId, theme, signal }) {
   const [count, setCount] = useState(0);
@@ -14,6 +14,6 @@ export function CleanHooks({ userId, theme, signal }) {
   }, [theme, count]);
 
   useEffect(() => {
-    console.log('apply', memoizedConfig);
+    console.log("apply", memoizedConfig);
   }, [memoizedConfig]);
 }

@@ -11,16 +11,13 @@ const authStore = {
   },
 };
 
-window.addEventListener(
-  "message",
-  (event: MessageEvent<AuthBridgeMessage>) => {
-    if (event.origin !== TRUSTED_PARENT_ORIGIN) {
-      return;
-    }
-    if (event.data.kind !== "auth-token") {
-      return;
-    }
-
-    authStore.save(event.data.token);
+window.addEventListener("message", (event: MessageEvent<AuthBridgeMessage>) => {
+  if (event.origin !== TRUSTED_PARENT_ORIGIN) {
+    return;
   }
-);
+  if (event.data.kind !== "auth-token") {
+    return;
+  }
+
+  authStore.save(event.data.token);
+});

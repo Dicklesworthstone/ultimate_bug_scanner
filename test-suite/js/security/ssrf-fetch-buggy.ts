@@ -1,7 +1,7 @@
-import http from "http";
-import https from "https";
 import axios from "axios";
 import got from "got";
+import http from "http";
+import https from "https";
 
 type ExpressRequest = {
   query: Record<string, string | undefined>;
@@ -30,7 +30,9 @@ export function streamHeaderTarget(req: ExpressRequest): http.ClientRequest {
   return http.get(remoteEndpoint!);
 }
 
-export function nextRouteProxy(request: { nextUrl: { searchParams: URLSearchParams } }): Promise<Response> {
+export function nextRouteProxy(request: {
+  nextUrl: { searchParams: URLSearchParams };
+}): Promise<Response> {
   return fetch(request.nextUrl.searchParams.get("target")!, {
     signal: AbortSignal.timeout(5000),
   });

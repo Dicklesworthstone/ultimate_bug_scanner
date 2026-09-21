@@ -6,9 +6,9 @@ function runUserCode(code) {
 }
 
 function render(comment) {
-  document.getElementById('box').innerHTML = comment; // XSS
+  document.getElementById("box").innerHTML = comment; // XSS
 }
 
 function fetchData(url) {
-  return fetch(url).then(res => res.text()); // Missing error handling
+  return fetch(url).then((res) => res.text()); // Missing error handling
 }

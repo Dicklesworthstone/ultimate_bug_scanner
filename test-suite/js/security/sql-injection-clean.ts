@@ -30,25 +30,43 @@ export async function parameterizedDbQuery(req: RequestLike, db: Database): Prom
   return db.query("SELECT id, email FROM users WHERE email = $1", [email]);
 }
 
-export async function parameterizedRouteParams(_request: RequestLike, { params }: RouteContext, db: Database): Promise<unknown> {
+export async function parameterizedRouteParams(
+  _request: RequestLike,
+  { params }: RouteContext,
+  db: Database,
+): Promise<unknown> {
   return db.query("SELECT id FROM tenants WHERE slug = $1", [params.tenant]);
 }
 
-export async function parameterizedDestructuredRouteParams(_request: RequestLike, { params }: RouteContext, db: Database): Promise<unknown> {
+export async function parameterizedDestructuredRouteParams(
+  _request: RequestLike,
+  { params }: RouteContext,
+  db: Database,
+): Promise<unknown> {
   const { account } = params;
   return db.query("SELECT id FROM accounts WHERE slug = $1", [account]);
 }
 
-export async function parameterizedNestedRouteParams(_request: RequestLike, { params: { tenant } }: RouteContext, db: Database): Promise<unknown> {
+export async function parameterizedNestedRouteParams(
+  _request: RequestLike,
+  { params: { tenant } }: RouteContext,
+  db: Database,
+): Promise<unknown> {
   return db.query("SELECT id FROM memberships WHERE tenant = $1", [tenant]);
 }
 
-export async function prismaSafeTaggedTemplate(req: RequestLike, prisma: PrismaLike): Promise<unknown> {
+export async function prismaSafeTaggedTemplate(
+  req: RequestLike,
+  prisma: PrismaLike,
+): Promise<unknown> {
   const status = req.body.status;
   return prisma.$queryRaw`SELECT * FROM invoices WHERE status = ${status}`;
 }
 
-export async function sequelizeReplacements(req: RequestLike, sequelize: SequelizeLike): Promise<unknown> {
+export async function sequelizeReplacements(
+  req: RequestLike,
+  sequelize: SequelizeLike,
+): Promise<unknown> {
   const role = req.query.role;
   return sequelize.query("SELECT * FROM users WHERE role = :role", {
     replacements: { role },

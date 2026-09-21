@@ -7,26 +7,27 @@ type ResponseLike = {
 
 const app = express();
 const TRUSTED_ORIGIN = "https://app.example.com";
-const allowedOrigins = new Set([
-  TRUSTED_ORIGIN,
-  "https://admin.example.com",
-]);
+const allowedOrigins = new Set([TRUSTED_ORIGIN, "https://admin.example.com"]);
 
-app.use(cors({
-  origin: [TRUSTED_ORIGIN, "https://admin.example.com"],
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: [TRUSTED_ORIGIN, "https://admin.example.com"],
+    credentials: true,
+  }),
+);
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) {
-      callback(null, origin);
-      return;
-    }
-    callback(new Error("origin is not allowed"));
-  },
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.has(origin)) {
+        callback(null, origin);
+        return;
+      }
+      callback(new Error("origin is not allowed"));
+    },
+    credentials: true,
+  }),
+);
 
 export function trustedCredentialedResponse(res: ResponseLike): void {
   res.setHeader("Access-Control-Allow-Origin", TRUSTED_ORIGIN);

@@ -5,7 +5,7 @@
 
 // BUG 1: Length calculation with emojis
 function truncateText(text, maxLength) {
-  return text.substring(0, maxLength);  // Wrong with surrogate pairs!
+  return text.substring(0, maxLength); // Wrong with surrogate pairs!
 }
 // "👨‍👩‍👧‍👦".length === 11 (not 1)
 // truncateText("Hello 👨‍👩‍👧‍👦 World", 10) breaks the emoji
@@ -25,7 +25,7 @@ function areNamesEqual(name1, name2) {
 
 // BUG 4: Reverse string breaking grapheme clusters
 function reverseString(str) {
-  return str.split('').reverse().join('');
+  return str.split("").reverse().join("");
 }
 // reverseString("👨‍👩‍👧‍👦") breaks the family emoji into individual parts
 
@@ -39,8 +39,8 @@ function validateEmail(email) {
 // BUG 6: URL encoding issues
 function buildUrl(base, params) {
   const query = Object.keys(params)
-    .map(key => `${key}=${params[key]}`)
-    .join('&');
+    .map((key) => `${key}=${params[key]}`)
+    .join("&");
   return `${base}?${query}`;
 }
 // Doesn't encode special characters: buildUrl('/search', {q: '北京 & 上海'})
@@ -60,17 +60,17 @@ function getCharacterCount(text) {
 
 // BUG 9: Substring with combining characters
 function getFirstName(fullName) {
-  return fullName.split(' ')[0];
+  return fullName.split(" ")[0];
 }
 // Works fine, but then:
 function getInitial(name) {
-  return name[0];  // Breaks with combining diacritics
+  return name[0]; // Breaks with combining diacritics
 }
 // "José"[0] === "J", but "J̃osé"[0] === "J̃" (J + combining tilde)
 
 // BUG 10: CSV injection via unicode
 function exportToCSV(data) {
-  return data.map(row => row.join(',')).join('\n');
+  return data.map((row) => row.join(",")).join("\n");
 }
 // If row contains: ["\u202E=SUM(A1:A10)"] (Right-to-Left Override)
 // Can create formula injection in Excel
@@ -84,7 +84,7 @@ function sortNames(names) {
 
 // BUG 12: Homoglyph attacks in validation
 function isSafeDomain(domain) {
-  return domain === 'example.com';
+  return domain === "example.com";
 }
 // Doesn't catch: "exаmple.com" (Cyrillic 'а' instead of Latin 'a')
 // Or: "ехаmple.com" (multiple Cyrillic chars)
@@ -131,7 +131,7 @@ function extractFilename(path) {
 }
 // Works, but:
 function removeExtension(filename) {
-  return filename.replace(/\..*$/, '');
+  return filename.replace(/\..*$/, "");
 }
 // "file.backup.tar.gz" becomes "file" (removes too much)
 
@@ -144,25 +144,25 @@ function logData(data) {
 
 // BUG 20: Displaying user content without escaping
 function showUsername(username) {
-  document.getElementById('user').textContent = username;
+  document.getElementById("user").textContent = username;
 }
 // Safe, but:
 function showBio(bio) {
-  document.getElementById('bio').innerHTML = bio;
+  document.getElementById("bio").innerHTML = bio;
 }
 // If bio contains: "<img src=x onerror='alert(1)'>" - XSS
 // Even worse with unicode: "<img src=\u0000 onerror='alert(1)'>"
 
 // BUG 21: Locale-dependent string operations
 function formatCurrency(amount) {
-  return amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
 }
 // formatCurrency(1000000) === "1,000,000" in US
 // But European format uses "1.000.000" or "1 000 000"
 
 // BUG 22: Phone number parsing
 function parsePhone(phone) {
-  return phone.replace(/\D/g, '');
+  return phone.replace(/\D/g, "");
 }
 // Removes all non-digits, but loses country code formatting
 // "+1 (555) 123-4567" becomes "15551234567"
@@ -181,5 +181,5 @@ module.exports = {
   sortNames,
   isSafeDomain,
   sanitizeUsername,
-  isImageFile
+  isImageFile,
 };

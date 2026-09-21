@@ -12,6 +12,6 @@ export async function warmUserCache(ids: string[]): Promise<User[]> {
   return Promise.all(
     ids.map((id) => {
       return fetchUser(id);
-    })
+    }),
   );
 }

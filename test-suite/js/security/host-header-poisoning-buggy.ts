@@ -27,7 +27,11 @@ export function forwardedVerificationUrl(request: WebRequest, token: string): st
   return verifyUrl;
 }
 
-export async function sendResetEmail(req: HeaderRequest, mailer: Mailer, token: string): Promise<void> {
+export async function sendResetEmail(
+  req: HeaderRequest,
+  mailer: Mailer,
+  token: string,
+): Promise<void> {
   const host = req.get("host") ?? "app.example.com";
   const resetLink = `https://${host}/account/reset?token=${token}`;
   await mailer.send({

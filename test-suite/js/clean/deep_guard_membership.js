@@ -1,14 +1,13 @@
 // GH #90 regression: membership-test guards must suppress the deep_guard
 // unguarded-nested-access finding, and the guard idiom itself
 // (Object.prototype.hasOwnProperty.call) must never be flagged as a chain.
-'use strict';
 
 const FIELD_RANK = { name: 1, date: 2, size: 3 };
 const CATCHALL_RANK = 99;
 
 // The exact false positive from the field report: the flagged line IS a guard.
 function rankOf(field) {
-  return Object.prototype.hasOwnProperty.call(FIELD_RANK, field) ? FIELD_RANK[field] : CATCHALL_RANK;
+  return Object.hasOwn(FIELD_RANK, field) ? FIELD_RANK[field] : CATCHALL_RANK;
 }
 
 // `in`-operator ternary guard.
@@ -23,7 +22,7 @@ function detailName(obj, key) {
 
 // Membership test guarding an if body.
 function guardedLookup(config, key) {
-  if (Object.prototype.hasOwnProperty.call(config, key)) {
+  if (Object.hasOwn(config, key)) {
     return config.data.entries.byKey.first;
   }
   return null;

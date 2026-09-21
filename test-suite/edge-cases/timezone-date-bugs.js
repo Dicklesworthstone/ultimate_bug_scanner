@@ -5,7 +5,7 @@
 
 // BUG 1: Using Date() without timezone awareness
 function getToday() {
-  return new Date().toISOString().split('T')[0];
+  return new Date().toISOString().split("T")[0];
 }
 // Returns different dates depending on user's timezone
 // At 11 PM PST, returns next day in UTC
@@ -13,7 +13,7 @@ function getToday() {
 // BUG 2: Comparing dates as strings
 function isExpired(expiryDate) {
   const now = new Date().toISOString();
-  return expiryDate < now;  // String comparison!
+  return expiryDate < now; // String comparison!
 }
 // "2024-11-16" < "2024-2-17" === true (wrong! Feb 17 is later)
 
@@ -43,7 +43,7 @@ function getBusinessDays(start, end) {
     if (current.getDay() !== 0 && current.getDay() !== 6) {
       days++;
     }
-    current.setDate(current.getDate() + 1);  // Assumes 24h days
+    current.setDate(current.getDate() + 1); // Assumes 24h days
   }
 
   return days;
@@ -99,7 +99,7 @@ function getWeekNumber(date) {
 // BUG 12: Storing dates as YYYY-MM-DD strings
 function saveAppointment(dateStr, time) {
   const appointment = `${dateStr}T${time}:00`;
-  database.save(appointment);  // No timezone info!
+  database.save(appointment); // No timezone info!
 }
 // "2024-11-16T14:00:00" - is this 2pm UTC? Local? Undefined!
 
@@ -148,7 +148,7 @@ function isValidDateRange2(startStr, endStr) {
 // BUG 17: Scheduling recurring events
 function getNextOccurrence(lastRun) {
   const next = new Date(lastRun);
-  next.setDate(next.getDate() + 7);  // Next week
+  next.setDate(next.getDate() + 7); // Next week
   return next;
 }
 // If lastRun was during DST and next week isn't (or vice versa):
@@ -157,7 +157,7 @@ function getNextOccurrence(lastRun) {
 // BUG 18: Midnight calculations
 function endOfDay(date) {
   const end = new Date(date);
-  end.setHours(24, 0, 0, 0);  // Midnight
+  end.setHours(24, 0, 0, 0); // Midnight
   return end;
 }
 // setHours(24) rolls over to next day correctly, but:
@@ -165,8 +165,8 @@ function endOfDay(date) {
 
 // BUG 19: Date serialization in JSON
 const event = {
-  title: 'Meeting',
-  date: new Date('2024-11-16T14:00:00Z')
+  title: "Meeting",
+  date: new Date("2024-11-16T14:00:00Z"),
 };
 
 const json = JSON.stringify(event);
@@ -199,7 +199,7 @@ function getTimeRemaining(endDate) {
   return {
     hours: Math.floor(remaining / (1000 * 60 * 60)),
     minutes: Math.floor((remaining / (1000 * 60)) % 60),
-    seconds: Math.floor((remaining / 1000) % 60)
+    seconds: Math.floor((remaining / 1000) % 60),
   };
 }
 // Doesn't handle negative values (past dates)
@@ -223,5 +223,5 @@ module.exports = {
   isLeapYear,
   calculateAge,
   getRelativeTime,
-  getWeekNumber
+  getWeekNumber,
 };

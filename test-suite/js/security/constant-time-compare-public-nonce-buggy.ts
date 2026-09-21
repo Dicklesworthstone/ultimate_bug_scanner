@@ -34,7 +34,11 @@ export function doneTokenCheck(doneAuthToken: string, expectedAuthToken: string)
 // one-sided comparison against an innocently-named variable must fire. The
 // #61 narrowing only applies to purely name-based (no-taint) two-sided
 // comparisons.
-export function webhookDigestCheck(payload: string, signingSecret: string, provided: string): boolean {
+export function webhookDigestCheck(
+  payload: string,
+  signingSecret: string,
+  provided: string,
+): boolean {
   const derived = crypto.createHmac("sha256", signingSecret).update(payload).digest("hex");
   return derived === provided;
 }

@@ -1,7 +1,11 @@
-import { notFound, redirect as nextRedirect } from "next/navigation";
+import { redirect as nextRedirect, notFound } from "next/navigation";
 
-interface Demo { value?: string; }
-interface UserProfile { email?: string; }
+interface Demo {
+  value?: string;
+}
+interface UserProfile {
+  email?: string;
+}
 
 function useDemo(x?: Demo) {
   if (!x?.value) {
@@ -11,10 +15,7 @@ function useDemo(x?: Demo) {
 }
 
 // Multiline default params should not be misread as global assignments.
-const addDefaults = (
-  a = 1,
-  b = 2,
-): number => a + b;
+const addDefaults = (a = 1, b = 2): number => a + b;
 
 addDefaults();
 

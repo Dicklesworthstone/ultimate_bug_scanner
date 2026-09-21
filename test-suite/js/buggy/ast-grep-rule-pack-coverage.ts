@@ -1,5 +1,5 @@
-import crypto from "crypto";
 import { exec } from "child_process";
+import crypto from "crypto";
 import { useCallback, useEffect, useMemo } from "react";
 
 type ResponseLike = {
@@ -18,7 +18,7 @@ type CoverageInput = {
 
 export function exerciseTypeScriptRulePack(input: CoverageInput) {
   const chosen = input.value ?? input.fallback ?? "fallback";
-  const ambiguous = input.value ?? input.fallback ? "yes" : "no";
+  const ambiguous = (input.value ?? input.fallback) ? "yes" : "no";
   const derived = useMemo(() => input.items.join(","), []);
   const handler = useCallback(() => input.value.toUpperCase(), []);
 

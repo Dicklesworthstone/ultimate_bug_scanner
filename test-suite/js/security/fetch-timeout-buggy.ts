@@ -17,5 +17,7 @@ export function saveUser(user: ApiUser): Promise<Response> {
 }
 
 export function loadAuditTrail(userId: string): Promise<string> {
-  return window.fetch(`/api/users/${encodeURIComponent(userId)}/audit`).then((response) => response.text());
+  return window
+    .fetch(`/api/users/${encodeURIComponent(userId)}/audit`)
+    .then((response) => response.text());
 }

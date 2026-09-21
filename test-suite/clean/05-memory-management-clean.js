@@ -8,16 +8,16 @@ class Component {
   constructor(elementId) {
     this.element = document.getElementById(elementId);
     this.handleClick = this.handleClick.bind(this);
-    this.element.addEventListener('click', this.handleClick); // ubs:ignore
+    this.element.addEventListener("click", this.handleClick); // ubs:ignore
   }
 
   handleClick(event) {
-    console.log('Clicked:', event.target);
+    console.log("Clicked:", event.target);
   }
 
   destroy() {
-    this.element.removeEventListener('click', this.handleClick);
-    this.element = null;  // Release reference
+    this.element.removeEventListener("click", this.handleClick);
+    this.element = null; // Release reference
   }
 }
 
@@ -106,38 +106,38 @@ class LRUCache {
 
 // GOOD: Proper resource cleanup with try-finally
 async function processFileWithCleanup(filename) {
-  const fileHandle = await fs.promises.open(filename, 'r');
+  const fileHandle = await fs.promises.open(filename, "r");
 
   try {
     const buffer = Buffer.alloc(1024);
     await fileHandle.read(buffer, 0, buffer.length, 0);
     return buffer;
   } finally {
-    await fileHandle.close();  // Always cleanup
+    await fileHandle.close(); // Always cleanup
   }
 }
 
 // GOOD: Avoiding circular references
 function createDataStructure() {
-  const parent = { name: 'parent' };
-  const child = { name: 'child' };
+  const parent = { name: "parent" };
+  const child = { name: "child" };
 
   // Instead of: parent.child = child; child.parent = parent;
   // Use WeakRef or just IDs:
-  parent.childId = 'child-1';
-  child.parentId = 'parent-1';
+  parent.childId = "child-1";
+  child.parentId = "parent-1";
 
   return { parent, child };
 }
 
 // GOOD: Stream processing for large data
-const { Readable } = require('stream');
+const { Readable } = require("stream");
 
 async function processLargeFile(filename) {
-  const stream = fs.createReadStream(filename, { encoding: 'utf8' });
+  const stream = fs.createReadStream(filename, { encoding: "utf8" });
 
   for await (const chunk of stream) {
-    processChunk(chunk);  // Process in chunks, not all at once
+    processChunk(chunk); // Process in chunks, not all at once
   }
 }
 
@@ -147,10 +147,7 @@ async function getAllUsersInBatches(batchSize = 100) {
   const results = [];
 
   while (true) {
-    const batch = await db.query(
-      'SELECT * FROM users LIMIT ? OFFSET ?',
-      [batchSize, offset]
-    );
+    const batch = await db.query("SELECT * FROM users LIMIT ? OFFSET ?", [batchSize, offset]);
 
     if (batch.length === 0) break;
 
@@ -173,14 +170,14 @@ class TaskQueue {
 
   async processAll() {
     while (this.tasks.length > 0) {
-      const task = this.tasks.shift();  // Remove from array
+      const task = this.tasks.shift(); // Remove from array
       await task();
       // Task is now eligible for GC
     }
   }
 
   clear() {
-    this.tasks.length = 0;  // Clear array properly
+    this.tasks.length = 0; // Clear array properly
   }
 }
 
@@ -232,7 +229,11 @@ class ObjectPool {
 // Usage:
 const vectorPool = new ObjectPool(
   () => ({ x: 0, y: 0, z: 0 }),
-  (v) => { v.x = 0; v.y = 0; v.z = 0; }
+  (v) => {
+    v.x = 0;
+    v.y = 0;
+    v.z = 0;
+  },
 );
 
 // GOOD: AbortController for cleanup
@@ -244,12 +245,12 @@ async function fetchWithAbort(url, timeoutMs = 5000) {
     const response = await fetch(url, { signal: controller.signal });
     return await response.json();
   } catch (error) {
-    if (error.name === 'AbortError') {
-      console.log('Request was aborted');
+    if (error.name === "AbortError") {
+      console.log("Request was aborted");
     }
     throw error;
   } finally {
-    clearTimeout(timeoutId);  // Cleanup timeout
+    clearTimeout(timeoutId); // Cleanup timeout
   }
 }
 
@@ -261,7 +262,7 @@ function createCounter() {
   return {
     increment() {
       count++;
-      listeners.forEach(fn => fn(count));
+      listeners.forEach((fn) => fn(count));
     },
 
     addListener(fn) {
@@ -273,7 +274,7 @@ function createCounter() {
     destroy() {
       listeners.clear();
       count = 0;
-    }
+    },
   };
 }
 
@@ -285,7 +286,7 @@ const registry = new FinalizationRegistry((heldValue) => {
 
 function createTrackedObject(id) {
   const obj = { id };
-  registry.register(obj, id);  // Track for cleanup
+  registry.register(obj, id); // Track for cleanup
   return obj;
 }
 
@@ -314,8 +315,8 @@ class WebSocketManager {
     this.ws = new WebSocket(this.url);
 
     this.ws.onmessage = (event) => {
-      const listeners = this.listeners.get('message') || [];
-      listeners.forEach(fn => fn(event.data));
+      const listeners = this.listeners.get("message") || [];
+      listeners.forEach((fn) => fn(event.data));
     };
 
     return this;

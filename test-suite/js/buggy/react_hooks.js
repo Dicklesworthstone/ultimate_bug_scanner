@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 export function BuggyHooks({ userId, theme }) {
   const [count, setCount] = useState(0);
@@ -15,6 +15,6 @@ export function BuggyHooks({ userId, theme }) {
   const memoizedConfig = useMemo(() => ({ config }), [config]);
 
   useEffect(() => {
-    console.log('apply', memoizedConfig);
+    console.log("apply", memoizedConfig);
   }, [memoizedConfig]);
 }

@@ -8,6 +8,7 @@ on:
       - "install.sh"
       - "SHA256SUMS"
       - ".github/workflows/checksum-sync.yml"
+      - "test-suite/quality/test_build_output_pruning.py"
   pull_request:
     paths:
       - "ubs"

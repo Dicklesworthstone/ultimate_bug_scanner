@@ -2834,11 +2834,7 @@ def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: st
         return True
     if lang == "bash" and not ext_str:
         try:
-            full_path = os.path.join(root, os.fsencode(rel_str))
-            # Pruning sees raw walk entries, including FIFOs and devices.
-            # Only regular files may be opened to inspect a shebang.
-            if not os.path.isfile(full_path):
-                return False
+            full_path = os.path.join(root, rel_str.encode("utf-8", "replace"))
             with open(full_path, "rb") as f:
                 head = f.read(128)
                 if head.startswith(b"#!"):
@@ -2867,31 +2863,12 @@ def matches_lang(rel_str: str, name_str: str, ext_str: str, spec: dict, lang: st
     return False
 
 
-# Cache the exact language-selection predicate, not a second source-extension
-# table. In particular, Bash entrypoints may have no extension, and contracts
-# recognize manifests and extensions that SOURCE_EXTENSIONS does not (#136).
-lang_matches: dict[bytes, tuple[str, ...]] = {}
-
-
-def matching_langs(rel: bytes) -> tuple[str, ...]:
-    if rel not in lang_matches:
-        rel_str = os.fsdecode(rel)
-        name_str = rel_str.rsplit("/", 1)[-1]
-        ext_str = ext_of(rel.rsplit(b"/", 1)[-1])
-        lang_matches[rel] = tuple(
-            lang for lang in all_module_langs
-            if matches_lang(rel_str, name_str, ext_str, modules_spec.get(lang, {}), lang)
-        )
-    return lang_matches[rel]
-
-
 # Content-scoped directories (bead B4b). A directory named obj/env/bin is
 # skipped only when its content says it is build output: obj when it holds
 # C# build artefacts (project.assets.json, *.AssemblyInfo.cs, *.nuget.*), env
 # when it is a virtualenv (pyvenv.cfg, bin/activate, Scripts/activate), bin
-# only when no file under it is recognized by ANY shipped scanner (regardless
-# of --only/--exclude-langs) or the legacy source hints. Decisions are cached
-# per directory; every automatic prune is reported on stderr, never stdout.
+# when no file under it has a source extension. Decisions are cached per
+# directory; the whole listing is needed for bin, so it is a second pass.
 scoped_cache: dict[bytes, bool] = {}
 
 
@@ -2910,18 +2887,8 @@ def scoped_skip(dirpath: bytes, name: bytes, files_under: set[bytes]) -> bool:
         verdict = any(e == b"project.assets.json" or b".nuget." in e or e.endswith(b".AssemblyInfo.cs") for e in entries) or any(
             os.path.isdir(os.path.join(full, e)) and e.lower() in (b"debug", b"release") for e in entries)
     elif name == b"bin":
-        verdict = not any(
-            ext_of(rel.rsplit(b"/", 1)[-1]) in source_exts or matching_langs(rel)
-            for rel in files_under
-        )
+        verdict = not any(ext_of(f.rsplit(b"/", 1)[-1]) in source_exts for f in files_under)
     scoped_cache[dirpath] = verdict
-    if verdict:
-        reason = "virtualenv" if name == b"env" else "build output"
-        print(
-            f"UBS: skipping {os.fsdecode(dirpath)!r} "
-            f"(treated as {reason}; {len(files_under)} listed files)",
-            file=sys.stderr,
-        )
     return verdict
 
 
@@ -2999,11 +2966,16 @@ selected_files = set()
 selected_bytes = 0
 
 for rel in kept:
+    rel_str = os.fsdecode(rel)
+    name_str = rel_str.rsplit("/", 1)[-1]
+    ext_str = ext_of(os.fsencode(name_str))
     is_sel = False
-    for l in matching_langs(rel):
-        lang_files[l].append(rel)
-        if l in target_langs:
-            is_sel = True
+    for l in all_module_langs:
+        spec = modules_spec.get(l, {})
+        if matches_lang(rel_str, name_str, ext_str, spec, l):
+            lang_files[l].append(rel)
+            if l in target_langs:
+                is_sel = True
     if is_sel:
         selected_files.add(rel)
         selected_bytes += kept_sizes.get(rel, 0)

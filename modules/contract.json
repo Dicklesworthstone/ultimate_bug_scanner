@@ -3,15 +3,8 @@
   "about": "Machine-readable contract of the language modules (bead A3b, 2026-09-03). Hand-maintained; scripts/check_docs_claims.py verifies every flag here against each module's argument parser, renders modules/README.md's Options block from it (scripts/gen_module_readme.py) and fails when a parser flag shared by 7+ modules is missing here. Per-module `contract` is 2 for all modules following the A4 port (modules/lib/ubs-common.sh + ubs_core, --files-from).",
   "invocation": "modules/ubs-<lang>.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]",
   "formats": {
-    "module": [
-      "text",
-      "json",
-      "sarif"
-    ],
-    "meta_runner_only": [
-      "jsonl",
-      "toon"
-    ],
+    "module": ["text", "json", "sarif"],
+    "meta_runner_only": ["jsonl", "toon"],
     "note": "A module asked for --format=jsonl or --format=toon exits 2 (ubs_validate_format in modules/lib/ubs-common.sh); the meta-runner derives those from the module's json.",
     "text_marker": "A module's --format=text output MUST contain one line matching '^\\s*UBS module:.*\\(contract v2\\)', conventionally first and including the project path. The meta-runner has no contract document in text mode, so it scrapes 'Files scanned:' / 'Critical issues:' / 'Warning issues:' / 'Info items:' out of the module's text; this marker is its proof that the text came from a conforming module. Text without it is treated as MODULE_INVALID_TEXT (status error, exit 2) and its counts are discarded, the same treatment a non-conforming document gets in json mode. The marker must survive -q, which the meta-runner passes straight through."
   },
@@ -133,17 +126,7 @@
     {
       "flag": "--only",
       "value": "CSV",
-      "modules": [
-        "bash",
-        "cpp",
-        "csharp",
-        "elixir",
-        "java",
-        "kotlin",
-        "ruby",
-        "rust",
-        "swift"
-      ],
+      "modules": ["bash", "cpp", "csharp", "elixir", "java", "kotlin", "ruby", "rust", "swift"],
       "documented": false,
       "doc": "run only these category numbers"
     },
@@ -207,31 +190,14 @@
     },
     {
       "flag": "--list-categories",
-      "modules": [
-        "bash",
-        "cpp",
-        "csharp",
-        "kotlin",
-        "python",
-        "rust",
-        "swift"
-      ],
+      "modules": ["bash", "cpp", "csharp", "kotlin", "python", "rust", "swift"],
       "documented": true,
       "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin)"
     },
     {
       "flag": "--summary-json",
       "value": "FILE",
-      "modules": [
-        "bash",
-        "csharp",
-        "elixir",
-        "kotlin",
-        "python",
-        "ruby",
-        "rust",
-        "swift"
-      ],
+      "modules": ["bash", "csharp", "elixir", "kotlin", "python", "ruby", "rust", "swift"],
       "documented": false,
       "doc": "write summary JSON to FILE"
     },
@@ -247,14 +213,7 @@
     "js": {
       "file": "ubs-js.sh",
       "display": "JavaScript / TypeScript",
-      "extensions": [
-        "js",
-        "jsx",
-        "ts",
-        "tsx",
-        "mjs",
-        "cjs"
-      ],
+      "extensions": ["js", "jsx", "ts", "tsx", "mjs", "cjs"],
       "manifest_files": [
         "package.json",
         "tsconfig.json",
@@ -276,24 +235,12 @@
         ".env.*"
       ],
       "contract": 2,
-      "extra_flags": [
-        "--dump-rules",
-        "--list-rules",
-        "--max-samples",
-        "--rules"
-      ]
+      "extra_flags": ["--dump-rules", "--list-rules", "--max-samples", "--rules"]
     },
     "python": {
       "file": "ubs-python.sh",
       "display": "Python",
-      "extensions": [
-        "py",
-        "pyi",
-        "pyx",
-        "pxd",
-        "pxi",
-        "ipynb"
-      ],
+      "extensions": ["py", "pyi", "pyx", "pxd", "pxi", "ipynb"],
       "manifest_files": [
         "pyproject.toml",
         "setup.py",
@@ -372,9 +319,7 @@
     "rust": {
       "file": "ubs-rust.sh",
       "display": "Rust",
-      "extensions": [
-        "rs"
-      ],
+      "extensions": ["rs"],
       "manifest_files": [
         "Cargo.toml",
         "Cargo.lock",
@@ -409,12 +354,7 @@
     "golang": {
       "file": "ubs-golang.sh",
       "display": "Go",
-      "extensions": [
-        "go",
-        "tmpl",
-        "gotmpl",
-        "tpl"
-      ],
+      "extensions": ["go", "tmpl", "gotmpl", "tpl"],
       "manifest_files": [
         "go.mod",
         "go.sum",
@@ -442,16 +382,8 @@
     "java": {
       "file": "ubs-java.sh",
       "display": "Java",
-      "extensions": [
-        "java"
-      ],
-      "manifest_files": [
-        "pom.xml",
-        "build.gradle",
-        "settings.gradle",
-        "gradlew",
-        ".mvn"
-      ],
+      "extensions": ["java"],
+      "manifest_files": ["pom.xml", "build.gradle", "settings.gradle", "gradlew", ".mvn"],
       "contract": 2,
       "extra_flags": [
         "--detail",
@@ -481,13 +413,7 @@
         "rbs",
         "jbuilder"
       ],
-      "manifest_files": [
-        "Gemfile",
-        "Gemfile.lock",
-        "Rakefile",
-        "*.gemspec",
-        ".rubocop.yml"
-      ],
+      "manifest_files": ["Gemfile", "Gemfile.lock", "Rakefile", "*.gemspec", ".rubocop.yml"],
       "contract": 2,
       "extra_flags": [
         "--ag-fixable-only",
@@ -510,16 +436,7 @@
     "swift": {
       "file": "ubs-swift.sh",
       "display": "Swift",
-      "extensions": [
-        "swift",
-        "mm",
-        "m",
-        "metal",
-        "plist",
-        "xib",
-        "storyboard",
-        "xcconfig"
-      ],
+      "extensions": ["swift", "mm", "m", "metal", "plist", "xib", "storyboard", "xcconfig"],
       "manifest_files": [
         "Package.swift",
         "Podfile",
@@ -556,10 +473,7 @@
     "csharp": {
       "file": "ubs-csharp.sh",
       "display": "C#",
-      "extensions": [
-        "cs",
-        "csx"
-      ],
+      "extensions": ["cs", "csx"],
       "manifest_files": [
         "*.csproj",
         "*.sln",
@@ -593,18 +507,8 @@
     "elixir": {
       "file": "ubs-elixir.sh",
       "display": "Elixir",
-      "extensions": [
-        "ex",
-        "exs",
-        "eex",
-        "heex",
-        "leex",
-        "sface"
-      ],
-      "manifest_files": [
-        "mix.exs",
-        "mix.lock"
-      ],
+      "extensions": ["ex", "exs", "eex", "heex", "leex", "sface"],
+      "manifest_files": ["mix.exs", "mix.lock"],
       "contract": 2,
       "extra_flags": [
         "--dump-rules",
@@ -623,10 +527,7 @@
     "bash": {
       "file": "ubs-bash.sh",
       "display": "Bash",
-      "extensions": [
-        "sh",
-        "bash"
-      ],
+      "extensions": ["sh", "bash"],
       "manifest_files": [],
       "contract": 2,
       "extra_flags": [
@@ -647,14 +548,8 @@
     "kotlin": {
       "file": "ubs-kotlin.sh",
       "display": "Kotlin",
-      "extensions": [
-        "kt",
-        "kts"
-      ],
-      "manifest_files": [
-        "build.gradle.kts",
-        "settings.gradle.kts"
-      ],
+      "extensions": ["kt", "kts"],
+      "manifest_files": ["build.gradle.kts", "settings.gradle.kts"],
       "contract": 2,
       "extra_flags": [
         "--ast-rule-dir",

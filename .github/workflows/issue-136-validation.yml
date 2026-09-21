@@ -1,0 +1,100 @@
+name: Issue 136 Traversal Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/issue-136-validation.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli
+      - name: Record tested base and reproduce the original bug
+        run: |
+          echo "ISSUE136_BASE $(git rev-parse HEAD)"
+          if PYTHONPATH=test-suite/quality python3 -m unittest test_build_output_pruning.BuildOutputListingTest -v > "$RUNNER_TEMP/issue136-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/issue136-before.log"
+            echo "Expected the unfixed listing to fail the new regressions" >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/issue136-before.log"
+          grep -q '^FAIL: test_shell_extensions_are_never_build_output' "$RUNNER_TEMP/issue136-before.log"
+          shellcheck -S warning ubs > "$RUNNER_TEMP/issue136-lint-before.log" 2>&1 || true
+      - name: Apply only the immutable reviewed traversal patch
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import yaml
+          # The immutable commit contains the patch authored for this task.
+          # Run only its patch step, never branch writes or unrelated jobs.
+          source = subprocess.check_output([
+              'git', 'show',
+              '56eb6debc658316a0a749fc463479e1ef8265a7b:.github/workflows/checksum-sync.yml'
+          ], text=True)
+          steps = yaml.safe_load(source)['jobs']['issue-136-validation']['steps']
+          patch = [s['run'] for s in steps if s.get('name') == 'Apply the reviewed traversal patch']
+          assert len(patch) == 1
+          subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', patch[0]], check=True)
+          PY
+      - name: Validate the full runner and selection regressions
+        run: |
+          bash -n ubs
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v
+          shellcheck -S warning ubs > "$RUNNER_TEMP/issue136-lint-after.log" 2>&1 || true
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          def diagnostics(name):
+              text = (Path(os.environ['RUNNER_TEMP']) / name).read_text()
+              return sorted(re.findall(r'\bSC\d+\b', text))
+          assert diagnostics('issue136-lint-after.log') == diagnostics('issue136-lint-before.log'), 'ShellCheck diagnostics changed'
+          print('ShellCheck: no new diagnostic codes')
+          PY
+          git diff --check
+          git diff --stat
+      - name: Store tested blobs without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          for name in ('ubs', 'SHA256SUMS'):
+              data = Path(name).read_bytes()
+              payload = json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'})
+              response = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=payload, text=True, capture_output=True, check=True, timeout=90,
+              )
+              blob = json.loads(response.stdout)
+              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              assert blob['sha'] == expected, (name, blob)
+              print(f"ISSUE136_BLOB {name} {blob['sha']}", flush=True)
+          PY

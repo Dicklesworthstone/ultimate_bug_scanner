@@ -131,3 +131,5 @@ tmp-rel-*
 rustc-ice-*.txt
 /.gate_*.sh
 /.verify_*.sh
+# RCH Go module cache mirrored into the workspace
+.rch-go/

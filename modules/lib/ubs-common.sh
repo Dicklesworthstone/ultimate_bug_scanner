@@ -122,7 +122,7 @@ if ! declare -p UBS_HELPER_CHECKSUMS >/dev/null 2>&1; then
   declare -g -A UBS_HELPER_CHECKSUMS=()
 fi
 declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
-  ['contract.json']='636e49c1f9b0636e9fe5d2692252575ba9536ab81e4ee339d0d68686a318a746'
+  ['contract.json']='93cd47cd7142c954c4d6a34a62e6786d1512762b9352098000c8415c86912203'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'
@@ -136,7 +136,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_kotlin.py']='a50e5060d1784b53e27cfc4dba745011fb2e3b7bd15176f91f0477eced54d321'
   ['helpers/type_narrowing_rust.py']='155095a92a5a90ef88d668a88236f7d8611ec6f94aad42615eacdbe92b21e163'
   ['helpers/type_narrowing_swift.py']='d83d064db4418d4c245e6bcf7a386280e27c0ebdc57a7c4f6c32443887d6eeea'
-  ['helpers/type_narrowing_ts.js']='37cefad3c650ae04d1c5f7da42edfca3b5dea1f0c2263025bcec527111b930c9'
+  ['helpers/type_narrowing_ts.js']='67bb540f1b85993336f06d712a5c1e6f28ee2201d4404a8e00279d01b9859637'
   ['helpers/ubs_core/__init__.py']='b75e6b0fd574ac97252fe667280d5807ce1fc6726b1a92980796e46e8de3592f'
   ['helpers/ubs_core/__main__.py']='4aed5b835f04ba3a51b13a650b15dc05e2e43436e9e8be19000551999172639e'
   ['helpers/ubs_core/analyzers/__init__.py']='090badfe6b8be4c60de495a74b362acff5a4d9f8461dbb56d5b6718783e39b86'
@@ -158,7 +158,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/async_timer.py']='b24c3462cfc469c330ecfc63ff63e2d20cc2b92165f627dc148ac76bbf105ea4'
   ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='5269b88dd078cae71d1a3c2e23523032507ac49265560dd0c27273c41c38c5aa'
   ['helpers/ubs_core/analyzers/ctcompare_go.py']='67b66f44a697628c36dc5499aa40e9bfd737391d72f6940a623ef427d7a4e64d'
-  ['helpers/ubs_core/analyzers/ctcompare_js.py']='43695373ce47cbe3ff6810d3f1dfdb748d8a104247415ba214d3bee9c225135a'
+  ['helpers/ubs_core/analyzers/ctcompare_js.py']='462e601e16b1359711b50c241fab8911157f5efa341eba533c4519a2464ce04f'
   ['helpers/ubs_core/analyzers/ctcompare_py.py']='720fcd492c865ac3b947a7917037207907b79c99e752bed5da21435a0e375c50'
   ['helpers/ubs_core/analyzers/ctcompare_rust.py']='64e19bbfabeff7ee4f0d08f58a5540da78236e32654a188af7b5a5138f09a7d9'
   ['helpers/ubs_core/analyzers/guards_generic.py']='61ef81e6255aa3c09ed175648f8cbd99ee2bff9a98ed3c968781533beb91b4a5'

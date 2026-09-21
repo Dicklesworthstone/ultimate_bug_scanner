@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml
           npm install --global @ast-grep/cli
-      - name: Record tested base and reproduce the original bug
+      - name: Record baseline and reproduce the original bug
         run: |
           echo "ISSUE136_BASE $(git rev-parse HEAD)"
           if PYTHONPATH=test-suite/quality python3 -m unittest test_build_output_pruning.BuildOutputListingTest -v > "$RUNNER_TEMP/issue136-before.log" 2>&1; then
@@ -36,16 +36,21 @@ jobs:
             echo "Expected the unfixed listing to fail the new regressions" >&2
             exit 1
           fi
-          cat "$RUNNER_TEMP/issue136-before.log"
+          tail -35 "$RUNNER_TEMP/issue136-before.log"
           grep -q '^FAIL: test_shell_extensions_are_never_build_output' "$RUNNER_TEMP/issue136-before.log"
           shellcheck -S warning ubs > "$RUNNER_TEMP/issue136-lint-before.log" 2>&1 || true
+          rc=0
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/issue136-checksums-before.log" 2>&1 || rc=$?
+          echo "$rc" > "$RUNNER_TEMP/issue136-checksums-before.rc"
+          echo "Baseline asset-checksum exit code: $rc"
+          grep -A2 MISMATCH "$RUNNER_TEMP/issue136-checksums-before.log" || true
       - name: Apply only the immutable reviewed traversal patch
+        id: patch
         run: |
           python3 - <<'PY'
           import subprocess
           import yaml
-          # The immutable commit contains the patch authored for this task.
-          # Run only its patch step, never branch writes or unrelated jobs.
+          # Only the patch step authored for this task, pinned by commit.
           source = subprocess.check_output([
               'git', 'show',
               '56eb6debc658316a0a749fc463479e1ef8265a7b:.github/workflows/checksum-sync.yml'
@@ -55,30 +60,49 @@ jobs:
           assert len(patch) == 1
           subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', patch[0]], check=True)
           PY
-      - name: Validate the full runner and selection regressions
+      - name: Validate traversal, syntax, and checksum parity
+        id: core
         run: |
           bash -n ubs
-          ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v
-          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v
+          PYTHONPATH=test-suite/quality python3 -m unittest test_build_output_pruning.BuildOutputListingTest -v
           shellcheck -S warning ubs > "$RUNNER_TEMP/issue136-lint-after.log" 2>&1 || true
+          rc=0
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/issue136-checksums-after.log" 2>&1 || rc=$?
+          test "$rc" = "$(cat "$RUNNER_TEMP/issue136-checksums-before.rc")"
+          cmp "$RUNNER_TEMP/issue136-checksums-before.log" "$RUNNER_TEMP/issue136-checksums-after.log"
+          echo "Asset checksum diagnostics match the baseline exactly (exit $rc)"
           python3 - <<'PY'
           import os
           import re
+          import subprocess
           from pathlib import Path
           def diagnostics(name):
               text = (Path(os.environ['RUNNER_TEMP']) / name).read_text()
               return sorted(re.findall(r'\bSC\d+\b', text))
           assert diagnostics('issue136-lint-after.log') == diagnostics('issue136-lint-before.log'), 'ShellCheck diagnostics changed'
-          print('ShellCheck: no new diagnostic codes')
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == {'ubs', 'SHA256SUMS'}, changed
+          print('ShellCheck: no new diagnostic codes; only runner and checksum changed')
           PY
           git diff --check
           git diff --stat
-      - name: Store tested blobs without changing any branch
+      - name: Run full-runner and existing selection regressions
+        id: integration
+        run: |
+          new_rc=0
+          old_rc=0
+          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v > "$RUNNER_TEMP/issue136-new-tests.log" 2>&1 || new_rc=$?
+          cat "$RUNNER_TEMP/issue136-new-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v > "$RUNNER_TEMP/issue136-selection-tests.log" 2>&1 || old_rc=$?
+          cat "$RUNNER_TEMP/issue136-selection-tests.log"
+          test "$new_rc" -eq 0 && test "$old_rc" -eq 0
+      - name: Store candidates without changing any branch
+        if: always() && steps.core.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          INTEGRATION_OUTCOME: ${{ steps.integration.outcome }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -86,6 +110,11 @@ jobs:
           import os
           import subprocess
           from pathlib import Path
+          # Keep the publication candid about integration results. Blobs alone
+          # change no branch; the connector reviews their diff before committing.
+          print('ISSUE136_INTEGRATION', os.environ['INTEGRATION_OUTCOME'], flush=True)
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == {'ubs', 'SHA256SUMS'}, changed
           for name in ('ubs', 'SHA256SUMS'):
               data = Path(name).read_bytes()
               payload = json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'})

@@ -78,7 +78,11 @@ class GenerateTests(unittest.TestCase):
         self.assertTrue(all(p.is_file() for p in (self.rule_dir / "rules").iterdir()))
 
     def test_manifest_completeness(self) -> None:
-        on_disk = json.loads((self.rule_dir / "manifest.json").read_text(encoding="utf-8"))
+        raw = (self.rule_dir / "manifest.json").read_text(encoding="utf-8")
+        try:
+            on_disk = json.loads(raw)
+        except ValueError as exc:
+            self.fail(f"generate() wrote a manifest.json that is not JSON: {exc}\n{raw[:400]}")
         self.assertEqual(on_disk, self.manifest)
         self.assertEqual(len(self.manifest), 37)
         for rule_id, entry in self.manifest.items():

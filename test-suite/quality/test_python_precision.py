@@ -970,6 +970,92 @@ class SqlIdentifierSanitizerTests(unittest.TestCase):
                     text(f'SELECT * FROM t WHERE x = {request.args["value"]}')
                 )
         ''',
+        # ── function summaries: the reporter's real shape ──────────────────
+        # The guard is a call to a helper, and the sanitizer runs one frame
+        # down. v1 left this Critical because no sanitizer was called with
+        # `config.pg_table` in this body.
+        "wrapper_validates.py": '''
+            class Writer:
+                @classmethod
+                def _validate_writeback_identifiers(cls, config, writeback_column):
+                    validate_sql_identifier(config.pg_schema, "pg_schema")
+                    validate_sql_identifier(config.pg_table, "pg_table")
+                    validate_sql_identifier(writeback_column, "writeback_column")
+
+                @classmethod
+                def run(cls, session, config, writeback_column):
+                    cls._validate_writeback_identifiers(config, writeback_column)
+                    return session.execute(
+                        text(f'SELECT "{writeback_column}" FROM "{config.pg_table}"')
+                    )
+        ''',
+        # The line between a summary and prefix rooting. The wrapper validates
+        # three named attributes of `config`; a fourth is not one of them and
+        # must stay Critical. Prefix rooting would bless it.
+        "wrapper_sibling_not_blessed.py": '''
+            class Writer:
+                @classmethod
+                def _validate(cls, config):
+                    validate_sql_identifier(config.pg_table, "pg_table")
+
+                @classmethod
+                def run(cls, session, config):
+                    cls._validate(config)
+                    return session.execute(
+                        text(f'SELECT 1 FROM "{config.pg_unvalidated}"')
+                    )
+        ''',
+        "wrapper_after_sink.py": '''
+            class Writer:
+                @classmethod
+                def _validate(cls, config):
+                    validate_sql_identifier(config.pg_table, "pg_table")
+
+                @classmethod
+                def run(cls, session, config):
+                    rows = session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+                    cls._validate(config)
+                    return rows
+        ''',
+        # A wrapper that calls a wrapper. The summary fixpoint has to carry
+        # the suffix through both frames.
+        "wrapper_chain.py": '''
+            def _inner(cfg):
+                validate_sql_identifier(cfg.pg_table, "pg_table")
+
+            def _outer(config):
+                _inner(config)
+
+            def run(session, config):
+                _outer(config)
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
+        # Two methods share a name and only one validates. Nothing resolves
+        # a call to a class here, so the summary keeps only what BOTH do —
+        # which is nothing.
+        "wrapper_name_collision.py": '''
+            class Strict:
+                def _check(self, config):
+                    validate_sql_identifier(config.pg_table, "pg_table")
+
+            class Loose:
+                def _check(self, config):
+                    return config
+
+            def run(session, helper, config):
+                helper._check(config)
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
+        # `*args` means no argument can be matched to a parameter name, so the
+        # wrapper's summary cannot be applied to anything.
+        "wrapper_star_args.py": '''
+            def _validate(config):
+                validate_sql_identifier(config.pg_table, "pg_table")
+
+            def run(session, config, rest):
+                _validate(*rest)
+                return session.execute(text(f'SELECT 1 FROM "{config.pg_table}"'))
+        ''',
     }
 
     def rules_for(self, sanitizers: str | None) -> dict[str, list[str]]:
@@ -1015,6 +1101,18 @@ class SqlIdentifierSanitizerTests(unittest.TestCase):
                 "guard_in_nested_function.py": [sql_injection.RULE_CRITICAL],
                 "sink_in_nested_function.py": [sql_injection.RULE_CRITICAL],
                 "sibling_value_not_blessed.py": [sql_injection.RULE_CRITICAL],
+                # A guard that happens inside a helper still counts, because
+                # the helper's summary says which of its parameters reach a
+                # sanitizer and as what.
+                "wrapper_validates.py": [sql_injection.RULE_WARNING],
+                "wrapper_chain.py": [sql_injection.RULE_WARNING],
+                # …and only that. These are the four ways the summary must
+                # decline, and the first is what separates it from prefix
+                # rooting.
+                "wrapper_sibling_not_blessed.py": [sql_injection.RULE_CRITICAL],
+                "wrapper_after_sink.py": [sql_injection.RULE_CRITICAL],
+                "wrapper_name_collision.py": [sql_injection.RULE_CRITICAL],
+                "wrapper_star_args.py": [sql_injection.RULE_CRITICAL],
             },
         )
 

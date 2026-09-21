@@ -87,7 +87,198 @@ def is_sanitizer_call(node, sanitizers):
     return bool(name) and bool(dotted_suffixes(name) & sanitizers)
 
 
-def guarded_expressions(func, text, sanitizers):
+def rooted_attribute(node):
+    """Split an attribute chain into its root name and dotted suffix.
+
+    `config.pg_table` -> `('config', 'pg_table')`; a bare `writeback_column`
+    -> `('writeback_column', '')`. Anything not rooted at a plain name — a
+    subscript, a call result — returns None, because there is no stable way
+    to say which value a caller passed.
+    """
+    parts = []
+    current = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return None
+    return current.id, '.'.join(reversed(parts))
+
+
+def _positional_parameters(func):
+    return [arg.arg for arg in list(func.args.posonlyargs) + list(func.args.args)]
+
+
+def _all_parameters(func):
+    args = func.args
+    names = set(_positional_parameters(func))
+    names.update(arg.arg for arg in args.kwonlyargs)
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _bind_call_arguments(node, record):
+    """Map parameter name -> caller-side argument expression for one call.
+
+    `cls._validate(config, col)` binds `config`/`col` to the *second* and
+    third parameters of a method whose first is `cls`, so the implicit
+    receiver is dropped when the call goes through an attribute. `*args`
+    stops positional binding: past it nothing can be matched to a name.
+    """
+    positional = list(record['positional'])
+    if positional and positional[0] in ('self', 'cls') and isinstance(node.func, ast.Attribute):
+        positional = positional[1:]
+    bound = {}
+    for index, argument in enumerate(node.args):
+        if isinstance(argument, ast.Starred):
+            break
+        if index < len(positional):
+            bound[positional[index]] = argument
+    for keyword in node.keywords:
+        if keyword.arg:
+            bound[keyword.arg] = keyword.value
+    return bound
+
+
+def call_validated_segments(node, text, sanitizers, summaries):
+    """Source segments this call validates, direct or through a wrapper.
+
+    A direct sanitizer call validates its own arguments. A call to a function
+    whose summary says "my parameter `config` reaches a sanitizer as
+    `config.pg_table`" validates the caller's argument extended by that
+    suffix — so `cls._validate_writeback_identifiers(config, writeback_column)`
+    validates `config.pg_table` and `writeback_column`, and nothing else on
+    `config`. That is the difference between a summary and prefix rooting:
+    `config.some_other_column` stays tainted (GH #133).
+    """
+    segments = []
+    if is_sanitizer_call(node, sanitizers):
+        for argument in list(node.args) + [keyword.value for keyword in node.keywords]:
+            segment = ast.get_source_segment(text, argument)
+            if segment:
+                segments.append(segment.strip())
+        return segments
+
+    name = call_name(node.func)
+    if not name:
+        return segments
+    record = summaries.get(name.split('.')[-1])
+    if not record:
+        return segments
+    bound = _bind_call_arguments(node, record)
+    for parameter, suffixes in record['validates'].items():
+        argument = bound.get(parameter)
+        if argument is None:
+            continue
+        segment = ast.get_source_segment(text, argument)
+        if not segment:
+            continue
+        segment = segment.strip()
+        for suffix in suffixes:
+            segments.append(f'{segment}.{suffix}' if suffix else segment)
+    return segments
+
+
+def _function_validates(func, sanitizers, summaries):
+    """Which of `func`'s own parameters reach a sanitizer, and as what.
+
+    `{'config': {'pg_table', 'pg_schema'}, 'writeback_column': {''}}`. The
+    empty suffix means the parameter itself was validated. Nested functions
+    are skipped for the same reason `guarded_expressions` skips them.
+    """
+    parameters = _all_parameters(func)
+    validates = {}
+    if not parameters:
+        return validates
+    pending = list(func.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Call):
+            direct = is_sanitizer_call(node, sanitizers)
+            record = None
+            if not direct:
+                name = call_name(node.func)
+                record = summaries.get(name.split('.')[-1]) if name else None
+            if direct:
+                arguments = list(node.args) + [keyword.value for keyword in node.keywords]
+                pairs = [(argument, '') for argument in arguments]
+            elif record:
+                bound = _bind_call_arguments(node, record)
+                pairs = [
+                    (bound[parameter], suffix)
+                    for parameter, suffixes in record['validates'].items()
+                    if parameter in bound
+                    for suffix in suffixes
+                ]
+            else:
+                pairs = []
+            for argument, suffix in pairs:
+                rooted = rooted_attribute(argument)
+                if rooted is None or rooted[0] not in parameters:
+                    continue
+                root, own_suffix = rooted
+                combined = '.'.join(part for part in (own_suffix, suffix) if part)
+                validates.setdefault(root, set()).add(combined)
+        pending.extend(ast.iter_child_nodes(node))
+    return validates
+
+
+def build_sanitizer_summaries(tree, sanitizers, rounds=4):
+    """Per-function-name summaries of which parameters reach a sanitizer.
+
+    Recomputed a bounded number of times so a wrapper that calls a wrapper is
+    reached (`_validate_all` -> `_validate_one` -> `validate_sql_identifier`)
+    without letting a recursive definition iterate forever.
+
+    Two functions in one module may share a name. Rather than guess which one
+    a call meant, the name is dropped unless both take the same positional
+    parameters, and then only what BOTH validate is kept — a summary must
+    never claim a guard that one of the candidates does not perform.
+    """
+    summaries = {}
+    if not sanitizers:
+        return summaries
+    functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not functions:
+        return summaries
+
+    for _ in range(rounds):
+        current = {}
+        dropped = set()
+        for func in functions:
+            validates = _function_validates(func, sanitizers, summaries)
+            record = {'positional': _positional_parameters(func), 'validates': validates}
+            existing = current.get(func.name)
+            if existing is None:
+                if func.name not in dropped:
+                    current[func.name] = record
+                continue
+            if existing['positional'] != record['positional']:
+                current.pop(func.name, None)
+                dropped.add(func.name)
+                continue
+            merged = {}
+            for parameter, suffixes in existing['validates'].items():
+                shared = suffixes & record['validates'].get(parameter, set())
+                if shared:
+                    merged[parameter] = shared
+            existing['validates'] = merged
+        current = {name: record for name, record in current.items() if record['validates']}
+        if current == summaries:
+            break
+        summaries = current
+    return summaries
+
+
+def guarded_expressions(func, text, sanitizers, summaries=None):
     """Source text of every expression a sanitizer validates in `func`.
 
     Maps the expression's source segment to the earliest line that validates
@@ -99,17 +290,14 @@ def guarded_expressions(func, text, sanitizers):
     guarded = {}
     if not sanitizers:
         return guarded
+    summaries = summaries or {}
     pending = list(func.body)
     while pending:
         node = pending.pop()
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             continue
-        if is_sanitizer_call(node, sanitizers):
-            for argument in list(node.args) + [keyword.value for keyword in node.keywords]:
-                segment = ast.get_source_segment(text, argument)
-                if not segment:
-                    continue
-                key = segment.strip()
+        if isinstance(node, ast.Call):
+            for key in call_validated_segments(node, text, sanitizers, summaries):
                 line = node.lineno
                 if key not in guarded or line < guarded[key]:
                     guarded[key] = line
@@ -122,9 +310,10 @@ def build_guarded_expressions(tree, text, sanitizers):
     tables = {}
     if not sanitizers:
         return tables
+    summaries = build_sanitizer_summaries(tree, sanitizers)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            guarded = guarded_expressions(node, text, sanitizers)
+            guarded = guarded_expressions(node, text, sanitizers, summaries)
             if guarded:
                 tables[id(node)] = guarded
     return tables

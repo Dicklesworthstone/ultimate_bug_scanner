@@ -20,7 +20,7 @@ from ubs_core.registry import Analyzer, RunContext, register
 exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
 
-compare_re = re.compile(r'(?<![=!<>])(?P<left>.+?)\s*(?P<op>===|!==|==|!=)\s*(?P<right>.+)')
+compare_re = re.compile(r'(?<![=!<>])(?:===|!==|==|!=)(?!=)')
 assignment_re = re.compile(r'\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?P<expr>.+)')
 loose_assignment_re = re.compile(r'\b(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?!=)(?P<expr>.+)')
 identifier_re = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
@@ -86,6 +86,12 @@ term_word_re = re.compile(r'[a-z][a-z0-9]*')
 nullish_re = re.compile(r'^(?:null|undefined|true|false|0|1|NaN|Number\.NaN|""|\'\'|``)$')
 length_re = re.compile(r'\b(?:length|byteLength|size)\b')
 string_literal_re = re.compile(r'''(["'`])(?:\\.|(?!\1).)*?\1''')
+comparison_token_re = re.compile(
+    string_literal_re.pattern
+    + rf'|(?P<compare>{compare_re.pattern})'
+    + r'|(?P<boolean>&&|\|\|)'
+    + r'|(?P<open>[\[(])|(?P<close>[\])])|(?P<separator>[;{}])'
+)
 keywords = {
     'if', 'return', 'const', 'let', 'var', 'true', 'false', 'null', 'undefined',
     'await', 'async', 'function', 'typeof', 'instanceof', 'new', 'this',
@@ -306,7 +312,10 @@ def collect_sensitive_vars(lines):
 def clean_operand_text(operand):
     clean = operand.strip()
     clean = re.sub(r'^(?:if|while)\s*\(\s*', '', clean)
-    clean = re.split(r'\s*(?:&&|\|\||[;{])', clean, maxsplit=1)[0].strip()
+    # Boolean boundaries are resolved before classifying a comparison (GH #135).
+    # Truncating both operands at the first connective can replace the LEFT
+    # operand with an unrelated earlier term, and also splits quoted text.
+    clean = re.split(r'\s*[;{]', clean, maxsplit=1)[0].strip()
     while clean and clean[-1] in ';{}){':
         clean = clean[:-1].strip()
     return clean
@@ -323,14 +332,64 @@ def operand_is_nullish_or_shape_check(operand):
     return False
 
 
-def unsafe_secret_compare(statement, sensitive_vars):
+def comparison_operands(statement: str) -> Iterable[tuple[int, str, str]]:
+    """Bound each equality's operands before sensitivity checks (GH #135)."""
+    tokens = []
+    depth = 0
+    for match in comparison_token_re.finditer(statement):
+        kind = match.lastgroup
+        if kind is None:  # A quoted literal, not code punctuation.
+            continue
+        tokens.append((match, depth))
+        if kind == 'open':
+            depth += 1
+        elif kind == 'close':
+            depth -= 1
+
+    for index, (comparison, level) in enumerate(tokens):
+        if comparison.lastgroup != 'compare':
+            continue
+        start, end = 0, len(statement)
+        # A connective in a nested operand, e.g. (secret || fallback), is not
+        # a boundary of the surrounding equality. Quotes are skipped above.
+        for previous, previous_level in reversed(tokens[:index]):
+            kind = previous.lastgroup
+            if (kind == 'separator'
+                    or (kind == 'boolean' and previous_level <= level)
+                    or (kind == 'open' and previous_level < level)):
+                start = previous.end()
+                break
+        for following, following_level in tokens[index + 1:]:
+            kind = following.lastgroup
+            if (kind == 'separator'
+                    or (kind == 'boolean' and following_level <= level)
+                    or (kind == 'close' and following_level <= level)):
+                end = following.start()
+                break
+        left = statement[start:comparison.start()]
+        right = statement[comparison.end():end]
+        if left.strip() and right.strip():
+            yield comparison.start(), left, right
+
+
+def unsafe_secret_compare(statement, sensitive_vars, *, comparison_start=0, comparison_limit=None):
     if safe_compare_re.search(statement) or 'ubs:ignore' in statement:
         return False
-    match = compare_re.search(statement)
-    if not match:
-        return False
-    left = clean_operand_text(match.group('left'))
-    right = clean_operand_text(match.group('right'))
+    # Match within each term, never across &&/||. An exempt comparison only
+    # exempts that term; later terms may still compare actual secret values.
+    for offset, left, right in comparison_operands(statement):
+        if offset < comparison_start:
+            continue
+        if comparison_limit is not None and offset >= comparison_limit:
+            continue
+        if unsafe_secret_operands(left, right, sensitive_vars):
+            return True
+    return False
+
+
+def unsafe_secret_operands(left, right, sensitive_vars):
+    left = clean_operand_text(left)
+    right = clean_operand_text(right)
     if operand_is_nullish_or_shape_check(left) or operand_is_nullish_or_shape_check(right):
         return False
 
@@ -375,8 +434,21 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
         stripped = code_line(raw).strip()
         if not stripped or has_ignore(lines, idx) or ('==' not in stripped and '!=' not in stripped):
             continue
-        statement = statement_from(lines, idx)
-        if not statement or not unsafe_secret_compare(statement, sensitive_vars):
+        prefix = ''
+        if compare_re.match(stripped):
+            # An operator may start a continuation line. Recover its real left
+            # operand, but do not re-report comparisons from the prefix.
+            start = statement_start(lines, idx)
+            prefix = ' '.join(code_line(line).strip() for line in lines[start:idx])
+            if prefix:
+                prefix += ' '
+        statement = prefix + statement_from(lines, idx)
+        # Lookahead completes a multiline operand, but a comparison on a later
+        # physical line must be reported there, not on this line as well.
+        if not statement or not unsafe_secret_compare(
+            statement, sensitive_vars, comparison_start=len(prefix),
+            comparison_limit=len(prefix) + len(stripped)
+        ):
             continue
         if idx in seen_lines:
             continue
@@ -516,12 +588,152 @@ def _selftest_main_dialect(tmp_prefix: str = "ubs_core_ctcompare_js_") -> None:
     assert lines_out[1].startswith("leaky.ts\t2\t"), lines_out
 
 
+def _selftest_boolean_operand_boundaries() -> None:
+    # GH #135: the secret-named call is not an operand of the typeof check.
+    for connective in ('||', '&&'):
+        for operator in ('===', '!==', '==', '!='):
+            for statement in (
+                f'if (!isValidSecret(secret) {connective} typeof envelope {operator} "string") return false;',
+                f'if (typeof envelope {operator} "string" {connective} !isValidSecret(secret)) return false;',
+                f'if (ready {connective} !isValidSecret(secret) {connective} typeof envelope {operator} "string") return false;',
+            ):
+                assert not unsafe_secret_compare(statement, set()), statement
+    # A tainted value in another term must not taint the comparison either.
+    statement = 'if (cachedValue || typeof envelope !== "string") return false;'
+    assert not unsafe_secret_compare(statement, {'cachedValue'}), statement
+
+
+def _selftest_later_boolean_comparisons() -> None:
+    for connective in ('||', '&&'):
+        for prefix in (
+            'ready',
+            'typeof envelope !== "string"',
+            'expectedSignature.byteLength !== SIGNATURE_BYTES',
+            'secret === undefined',
+            'doneToken !== sessionNonce',
+        ):
+            statement = f'if ({prefix} {connective} expectedSignature !== actualSignature) return false;'
+            assert unsafe_secret_compare(statement, set()), statement
+        statement = f'if (ready {connective} cachedValue === suppliedValue) return false;'
+        assert unsafe_secret_compare(statement, {'cachedValue'}), statement
+
+
+def _selftest_quoted_boolean_text() -> None:
+    # Splitting quoted ||/&& would expose secret words as identifiers.
+    for literal in ('"public || secret"', "'public && secret'", '`public || secret`',
+                    r'"public \" || secret"'):
+        statement = f'if (kind === {literal} && state !== "ready") return false;'
+        assert not unsafe_secret_compare(statement, set()), statement
+    statement = 'if (kind === "public || secret" && expectedSignature !== actualSignature) return false;'
+    assert unsafe_secret_compare(statement, set()), statement
+
+
+def _selftest_boolean_exemptions() -> None:
+    for prop in ('length', 'byteLength', 'size'):
+        for connective in ('||', '&&'):
+            for operands in (f'expectedSignature.{prop} !== SIGNATURE_BYTES',
+                             f'SIGNATURE_BYTES !== expectedSignature.{prop}'):
+                statement = f'if (!isValidSecret(secret) {connective} {operands}) return false;'
+                assert not unsafe_secret_compare(statement, set()), statement
+    for value in ('null', 'undefined', 'true', 'false', '0', '1', '42', '""'):
+        statement = f'if (ready && secret !== {value}) return false;'
+        assert not unsafe_secret_compare(statement, set()), statement
+    for function in ('timingSafeEqual', 'crypto.timingSafeEqual', 'safeEqual',
+                     'safeCompare', 'constantTimeEqual', 'compareDigest',
+                     'verifyWebhookSignature', 'subtle.verify', 'crypto.subtle.verify'):
+        statement = f'if (expectedSignature.byteLength !== SIGNATURE_BYTES || !{function}(expectedSignature, actualSignature)) return false;'
+        assert not unsafe_secret_compare(statement, set()), statement
+
+
+def _selftest_envelope_guard_regression() -> None:
+    source = '''function isValidSecret(secret: Uint8Array | undefined): boolean {
+  return secret !== undefined && secret.byteLength > 0;
+}
+
+export function verifyEnvelope(
+  envelope: string | null | undefined,
+  secret: Uint8Array | undefined,
+): boolean {
+  if (!isValidSecret(secret) || typeof envelope !== "string") return false;
+  return envelope.length > 0;
+}
+
+if (
+  expectedSignature.byteLength !== SIGNATURE_BYTES ||
+  !timingSafeEqual(expectedSignature, actualSignature)
+) {
+  return undefined;
+}
+'''
+    with tempfile.TemporaryDirectory(prefix="ubs_core_ctcompare_js_") as tmp:
+        target = Path(tmp) / "envelope.ts"
+        target.write_text(source, encoding="utf-8")
+        assert collect_issues(Path(tmp)) == []
+        assert list(run(RunContext(lang="javascript", files=[target]))) == []
+
+
+def _selftest_nested_boolean_operands() -> None:
+    for statement in (
+        'return (secret || fallback) === supplied;',
+        'return supplied === (secret || fallback);',
+        'if (ready && (expectedSignature || fallback) !== actualSignature) return false;',
+        'if (typeof envelope !== "string" || ((expectedSignature || fallback) !== actualSignature)) return false;',
+    ):
+        assert unsafe_secret_compare(statement, set()), statement
+    statement = 'if (kind === "expectedSignature !== actualSignature" || state === "ready") return false;'
+    assert not unsafe_secret_compare(statement, set()), statement
+
+
+def _selftest_multiline_boolean_locations() -> None:
+    source = '''if (
+  typeof envelope !== "string" ||
+  expectedSignature !== actualSignature
+) {
+  return false;
+}
+if (kind === "public" || expectedSignature !== actualSignature) return false;
+'''
+    with tempfile.TemporaryDirectory(prefix="ubs_core_ctcompare_js_") as tmp:
+        target = Path(tmp) / "unsafe.ts"
+        target.write_text(source, encoding="utf-8")
+        findings = list(run(RunContext(lang="javascript", files=[target])))
+    assert [f["line"] for f in findings] == [3, 7], findings
+    assert all(f["rule"] == "javascript.ctcompare.unsafe_secret_compare" for f in findings)
+
+
+def _selftest_leading_operator_continuations() -> None:
+    for operator in ('===', '!==', '==', '!='):
+        source = f'''if (expectedSignature
+    {operator} actualSignature) return false;
+const matches = expectedSignature
+    {operator} supplied;
+if (!isValidSecret(secret) || typeof envelope
+    {operator} "string") return false;
+if (expectedSignature !== actualSignature &&
+    expectedSignature.length
+    {operator} 32) return false;
+'''
+        with tempfile.TemporaryDirectory(prefix="ubs_core_ctcompare_js_") as tmp:
+            target = Path(tmp) / "continued.ts"
+            target.write_text(source, encoding="utf-8")
+            findings = list(run(RunContext(lang="javascript", files=[target])))
+        assert [f["line"] for f in findings] == [2, 4, 7], (operator, findings)
+
+
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("positive_detects_secret_compare", _selftest_positive),
     ("ubs_ignore_suppresses", _selftest_suppression),
     ("timing_safe_equal_negative", _selftest_safe_compare_negative),
     ("run_finds_unsafe_compares", _selftest_run),
     ("main_reproduces_count_dialect", _selftest_main_dialect),
+    ("boolean_operands_stay_in_their_clause", _selftest_boolean_operand_boundaries),
+    ("later_boolean_comparisons_are_checked", _selftest_later_boolean_comparisons),
+    ("quoted_boolean_text_is_not_a_boundary", _selftest_quoted_boolean_text),
+    ("boolean_length_and_safe_compare_exemptions", _selftest_boolean_exemptions),
+    ("issue_135_envelope_guard_is_clean", _selftest_envelope_guard_regression),
+    ("nested_boolean_operands_keep_their_secrets", _selftest_nested_boolean_operands),
+    ("multiline_boolean_findings_keep_their_line", _selftest_multiline_boolean_locations),
+    ("leading_operator_continuations_keep_the_left_operand", _selftest_leading_operator_continuations),
 )
 
 register(Analyzer(layer="ctcompare", lang="javascript", name="ctcompare_js", run=run, selftests=SELF_TESTS))

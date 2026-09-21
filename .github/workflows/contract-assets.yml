@@ -113,7 +113,7 @@ jobs:
           gh api -H "$ua" "repos/$GH_REPO/git/blobs/cbf19d9512e0afcd0e49f6918c72ec21b5c8fe25" --jq .content | base64 --decode > "$RUNNER_TEMP/contract.patch"
       - name: Prove incomplete discovery currently reports success
         run: |
-          git apply --recount --include=test-suite/quality/test_scan_selection.py "$RUNNER_TEMP/discovery.patch"
+          git apply --recount --unidiff-zero --include=test-suite/quality/test_scan_selection.py "$RUNNER_TEMP/discovery.patch"
           if PYTHONPATH=test-suite/quality python3 -m unittest test_scan_selection.InputDiscoveryFailureTest.test_unreadable_subtree_refuses_every_output_format -v > "$RUNNER_TEMP/discovery-before.log" 2>&1; then
             cat "$RUNNER_TEMP/discovery-before.log"
             echo 'Expected the unfixed runner to fail the refusal regression' >&2
@@ -125,7 +125,7 @@ jobs:
           shellcheck -f json ubs modules/ubs-*.sh scripts/*.sh > "$RUNNER_TEMP/lint-before.json" || true
       - name: Apply and validate fail-closed discovery
         run: |
-          git apply --recount --include=ubs "$RUNNER_TEMP/discovery.patch"
+          git apply --recount --unidiff-zero --include=ubs "$RUNNER_TEMP/discovery.patch"
           sha256sum install.sh ubs > SHA256SUMS
           bash -n ubs
           ./scripts/verify_checksums.sh > "$RUNNER_TEMP/checksums-phase1.log"
@@ -138,7 +138,7 @@ jobs:
           cp test-suite/quality/test_scan_selection.py "$RUNNER_TEMP/completeness-phase1/test_scan_selection.py"
       - name: Prove explicitly included inputs are currently discarded
         run: |
-          git apply --recount --include=test-suite/quality/test_build_output_pruning.py "$RUNNER_TEMP/contract.patch"
+          git apply --recount --unidiff-zero --include=test-suite/quality/test_build_output_pruning.py "$RUNNER_TEMP/contract.patch"
           if PYTHONPATH=test-suite/quality python3 -m unittest test_build_output_pruning.BuildOutputListingTest.test_extra_extensions_override_the_data_suffix_blacklist -v > "$RUNNER_TEMP/contract-before.log" 2>&1; then
             cat "$RUNNER_TEMP/contract-before.log"
             echo 'Expected the unfixed input filter to fail the inclusion regression' >&2
@@ -148,7 +148,7 @@ jobs:
           grep -q '^FAIL: test_extra_extensions_override_the_data_suffix_blacklist' "$RUNNER_TEMP/contract-before.log"
       - name: Apply and validate scanner input contract propagation
         run: |
-          git apply --recount --include=ubs "$RUNNER_TEMP/contract.patch"
+          git apply --recount --unidiff-zero --include=ubs "$RUNNER_TEMP/contract.patch"
           sha256sum install.sh ubs > SHA256SUMS
           bash -n ubs
           ./scripts/verify_checksums.sh > "$RUNNER_TEMP/checksums-phase2.log"
@@ -229,10 +229,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          test "$(git hash-object ubs)" = 29206518142189a21d0d84c5323bfec05819e7b7
           ua='User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0'
           for sha in eb3acb77c753a05339cd29cc6f68ac23149ff5ca cbf19d9512e0afcd0e49f6918c72ec21b5c8fe25; do
             gh api -H "$ua" "repos/$GH_REPO/git/blobs/$sha" --jq .content | base64 --decode > "$RUNNER_TEMP/$sha.patch"
-            git apply --recount "$RUNNER_TEMP/$sha.patch"
+            git apply --recount --unidiff-zero "$RUNNER_TEMP/$sha.patch"
           done
           sha256sum install.sh ubs > SHA256SUMS
       - name: Run the full suite with a bounded runtime

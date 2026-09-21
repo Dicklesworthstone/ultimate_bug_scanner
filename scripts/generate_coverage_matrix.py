@@ -48,8 +48,17 @@ def load_registry() -> dict[str, Any]:
         with REGISTRY_PATH.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     except ImportError:
+        # The YAML-less fallback needs the same diagnostic as the JSON branch
+        # above: `except ImportError` does not cover a decode failure here, so
+        # without this a malformed registry surfaced as a bare traceback.
         import json
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise SystemExit(
+                f"{REGISTRY_PATH} is neither YAML-loadable (no PyYAML installed) "
+                f"nor valid JSON: {exc}"
+            ) from exc
 
 
 def render_markdown_matrix(registry: dict[str, Any]) -> str:

@@ -277,8 +277,17 @@ class ScanSmokeTests(unittest.TestCase):
                 )
                 self.assertLessEqual(proc.returncode, 1, proc.stderr)
                 for line in proc.stdout.splitlines():
-                    if line.strip():
-                        hits.add(json.loads(line).get("ruleId", ""))
+                    if not line.strip():
+                        continue
+                    # The enclosing try/finally cleans the temp dir; it does
+                    # not handle anything. A line of `--json=stream` that does
+                    # not decode means ast-grep changed its output contract,
+                    # which is a result worth naming rather than a traceback.
+                    try:
+                        record = json.loads(line)
+                    except ValueError as exc:
+                        self.fail(f"ast-grep --json=stream emitted non-JSON {line!r}: {exc}")
+                    hits.add(record.get("ruleId", ""))
             self.assertIn("js.parseInt-no-radix", hits)
             self.assertIn("js.nan-direct-compare", hits)
         finally:

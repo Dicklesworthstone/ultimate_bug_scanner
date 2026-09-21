@@ -62,3 +62,184 @@ jobs:
         run: |
           python3 scripts/update_checksums.py
           git diff --exit-code
+
+  # Temporary candidate validation; the final direct commit restores this
+  # workflow. These jobs never update refs or create pull requests.
+  scan-completeness:
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'validate scan completeness')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify reviewed base and guidance
+        run: |
+          test "$(git hash-object ubs)" = 29206518142189a21d0d84c5323bfec05819e7b7
+          if find test-suite .github -name AGENTS.md -print | grep .; then
+            echo 'Nested guidance requires review before patching' >&2
+            exit 1
+          fi
+          echo "COMPLETENESS_BASE $(git rev-parse HEAD)"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          issues = [json.loads(line) for line in Path('.beads/issues.jsonl').read_text().splitlines() if line.strip()]
+          opened = [i for i in issues if i.get('status') not in ('closed', 'tombstone')]
+          print('OPEN BEADS', len(opened))
+          for issue in sorted(opened, key=lambda i: i.get('priority', 9))[:10]:
+              print(issue['id'], issue.get('priority'), issue.get('status'), issue.get('title'))
+          PY
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Fetch immutable patches authored for this task
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ua='User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0'
+          gh api -H "$ua" "repos/$GH_REPO/git/blobs/eb3acb77c753a05339cd29cc6f68ac23149ff5ca" --jq .content | base64 --decode > "$RUNNER_TEMP/discovery.patch"
+          gh api -H "$ua" "repos/$GH_REPO/git/blobs/cbf19d9512e0afcd0e49f6918c72ec21b5c8fe25" --jq .content | base64 --decode > "$RUNNER_TEMP/contract.patch"
+      - name: Prove incomplete discovery currently reports success
+        run: |
+          git apply --recount --include=test-suite/quality/test_scan_selection.py "$RUNNER_TEMP/discovery.patch"
+          if PYTHONPATH=test-suite/quality python3 -m unittest test_scan_selection.InputDiscoveryFailureTest.test_unreadable_subtree_refuses_every_output_format -v > "$RUNNER_TEMP/discovery-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/discovery-before.log"
+            echo 'Expected the unfixed runner to fail the refusal regression' >&2
+            exit 1
+          fi
+          tail -50 "$RUNNER_TEMP/discovery-before.log"
+          grep -q '^FAIL: test_unreadable_subtree_refuses_every_output_format' "$RUNNER_TEMP/discovery-before.log"
+          grep -q 'AssertionError: 0 != 2' "$RUNNER_TEMP/discovery-before.log"
+          shellcheck -f json ubs modules/ubs-*.sh scripts/*.sh > "$RUNNER_TEMP/lint-before.json" || true
+      - name: Apply and validate fail-closed discovery
+        run: |
+          git apply --recount --include=ubs "$RUNNER_TEMP/discovery.patch"
+          sha256sum install.sh ubs > SHA256SUMS
+          bash -n ubs
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/checksums-phase1.log"
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v
+          git diff --check
+          mkdir -p "$RUNNER_TEMP/completeness-phase1"
+          cp ubs SHA256SUMS "$RUNNER_TEMP/completeness-phase1/"
+          cp test-suite/quality/test_scan_selection.py "$RUNNER_TEMP/completeness-phase1/test_scan_selection.py"
+      - name: Prove explicitly included inputs are currently discarded
+        run: |
+          git apply --recount --include=test-suite/quality/test_build_output_pruning.py "$RUNNER_TEMP/contract.patch"
+          if PYTHONPATH=test-suite/quality python3 -m unittest test_build_output_pruning.BuildOutputListingTest.test_extra_extensions_override_the_data_suffix_blacklist -v > "$RUNNER_TEMP/contract-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/contract-before.log"
+            echo 'Expected the unfixed input filter to fail the inclusion regression' >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/contract-before.log"
+          grep -q '^FAIL: test_extra_extensions_override_the_data_suffix_blacklist' "$RUNNER_TEMP/contract-before.log"
+      - name: Apply and validate scanner input contract propagation
+        run: |
+          git apply --recount --include=ubs "$RUNNER_TEMP/contract.patch"
+          sha256sum install.sh ubs > SHA256SUMS
+          bash -n ubs
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/checksums-phase2.log"
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v
+          python3 test-suite/shareable/test_installed_contract.py -v
+          python3 scripts/update_checksums.py
+          ./scripts/verify_sha256sums.sh
+          shellcheck -f json ubs modules/ubs-*.sh scripts/*.sh > "$RUNNER_TEMP/lint-after.json" || true
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          def diagnostics(name):
+              data = json.loads((Path(os.environ['RUNNER_TEMP']) / name).read_text())
+              return collections.Counter((d['code'], d['level'], d['message']) for d in data)
+          added = diagnostics('lint-after.json') - diagnostics('lint-before.json')
+          assert not added, added
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == {'ubs', 'SHA256SUMS', 'test-suite/quality/test_scan_selection.py', 'test-suite/quality/test_build_output_pruning.py'}, changed
+          print('All targeted regressions passed; no new ShellCheck diagnostics')
+          PY
+          git diff --check
+          git diff --stat
+      - name: Store both tested candidates without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          phase1 = Path(os.environ['RUNNER_TEMP']) / 'completeness-phase1'
+          files = {
+              'phase1': {'ubs': phase1 / 'ubs', 'SHA256SUMS': phase1 / 'SHA256SUMS',
+                         'test-suite/quality/test_scan_selection.py': phase1 / 'test_scan_selection.py'},
+              'phase2': {name: Path(name) for name in ('ubs', 'SHA256SUMS', 'test-suite/quality/test_build_output_pruning.py')},
+          }
+          for phase, paths in files.items():
+              for name, path in paths.items():
+                  data = path.read_bytes()
+                  response = subprocess.run([
+                      'gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                      '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-',
+                  ], input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                     text=True, capture_output=True, check=True, timeout=90)
+                  sha = json.loads(response.stdout)['sha']
+                  expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+                  assert sha == expected
+                  mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+                  print('COMPLETENESS_BLOB', phase, name, sha, mode, flush=True)
+          PY
+
+  scan-completeness-full-suite:
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'validate scan completeness')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install suite dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Apply the same immutable candidate patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ua='User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0'
+          for sha in eb3acb77c753a05339cd29cc6f68ac23149ff5ca cbf19d9512e0afcd0e49f6918c72ec21b5c8fe25; do
+            gh api -H "$ua" "repos/$GH_REPO/git/blobs/$sha" --jq .content | base64 --decode > "$RUNNER_TEMP/$sha.patch"
+            git apply --recount "$RUNNER_TEMP/$sha.patch"
+          done
+          sha256sum install.sh ubs > SHA256SUMS
+      - name: Run the full suite with a bounded runtime
+        working-directory: test-suite
+        run: |
+          rc=0
+          timeout 240 bash ./run_all.sh > "$RUNNER_TEMP/full-suite.log" 2>&1 || rc=$?
+          tail -100 "$RUNNER_TEMP/full-suite.log"
+          echo "COMPLETENESS_FULL_SUITE_EXIT $rc"
+          exit "$rc"

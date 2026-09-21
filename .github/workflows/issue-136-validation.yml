@@ -20,7 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
           fetch-depth: 0
           persist-credentials: false
       - name: Install test dependencies
@@ -44,11 +43,12 @@ jobs:
           echo "$rc" > "$RUNNER_TEMP/issue136-checksums-before.rc"
           echo "Baseline asset-checksum exit code: $rc"
           grep -A2 MISMATCH "$RUNNER_TEMP/issue136-checksums-before.log" || true
-      - name: Apply only the immutable reviewed traversal patch
-        id: patch
+      - name: Apply the reviewed traversal patch with the FIFO guard
         run: |
           python3 - <<'PY'
+          import hashlib
           import subprocess
+          from pathlib import Path
           import yaml
           # Only the patch step authored for this task, pinned by commit.
           source = subprocess.check_output([
@@ -59,13 +59,30 @@ jobs:
           patch = [s['run'] for s in steps if s.get('name') == 'Apply the reviewed traversal patch']
           assert len(patch) == 1
           subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', patch[0]], check=True)
+          runner = Path('ubs')
+          text = runner.read_text()
+          old = '            full_path = os.path.join(root, os.fsencode(rel_str))\n            with open(full_path, "rb") as f:\n'
+          new = (
+              '            full_path = os.path.join(root, os.fsencode(rel_str))\n'
+              '            # Pruning sees raw walk entries, including FIFOs and devices.\n'
+              '            # Only regular files may be opened to inspect a shebang.\n'
+              '            if not os.path.isfile(full_path):\n'
+              '                return False\n'
+              '            with open(full_path, "rb") as f:\n'
+          )
+          assert text.count(old) == 1
+          runner.write_text(text.replace(old, new))
+          Path('SHA256SUMS').write_text(''.join(
+              f'{hashlib.sha256(Path(name).read_bytes()).hexdigest()}  {name}\n'
+              for name in ('install.sh', 'ubs')
+          ))
           PY
-      - name: Validate traversal, syntax, and checksum parity
-        id: core
+      - name: Validate syntax, checksums, lint parity, and all regressions
         run: |
           bash -n ubs
           ./scripts/verify_sha256sums.sh
-          PYTHONPATH=test-suite/quality python3 -m unittest test_build_output_pruning.BuildOutputListingTest -v
+          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v
           shellcheck -S warning ubs > "$RUNNER_TEMP/issue136-lint-after.log" 2>&1 || true
           rc=0
           ./scripts/verify_checksums.sh > "$RUNNER_TEMP/issue136-checksums-after.log" 2>&1 || rc=$?
@@ -87,22 +104,10 @@ jobs:
           PY
           git diff --check
           git diff --stat
-      - name: Run full-runner and existing selection regressions
-        id: integration
-        run: |
-          new_rc=0
-          old_rc=0
-          python3 -m unittest discover -s test-suite/quality -p test_build_output_pruning.py -v > "$RUNNER_TEMP/issue136-new-tests.log" 2>&1 || new_rc=$?
-          cat "$RUNNER_TEMP/issue136-new-tests.log"
-          python3 -m unittest discover -s test-suite/quality -p test_scan_selection.py -v > "$RUNNER_TEMP/issue136-selection-tests.log" 2>&1 || old_rc=$?
-          cat "$RUNNER_TEMP/issue136-selection-tests.log"
-          test "$new_rc" -eq 0 && test "$old_rc" -eq 0
-      - name: Store candidates without changing any branch
-        if: always() && steps.core.outcome == 'success'
+      - name: Store fully tested blobs without changing any branch
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          INTEGRATION_OUTCOME: ${{ steps.integration.outcome }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -110,9 +115,6 @@ jobs:
           import os
           import subprocess
           from pathlib import Path
-          # Keep the publication candid about integration results. Blobs alone
-          # change no branch; the connector reviews their diff before committing.
-          print('ISSUE136_INTEGRATION', os.environ['INTEGRATION_OUTCOME'], flush=True)
           changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
           assert changed == {'ubs', 'SHA256SUMS'}, changed
           for name in ('ubs', 'SHA256SUMS'):

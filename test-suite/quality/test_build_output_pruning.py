@@ -62,7 +62,7 @@ class BuildOutputListingTest(unittest.TestCase):
         return ("walk", "rg") if shutil.which("rg") else ("walk",)
 
     def listing(self, mode, *, contract=True, only="", exclude_langs="",
-                include_ext="", ignore=""):
+                include_ext="", ignore="", timeout=120):
         work = self.base / ("listing-" + mode)
         work.mkdir(exist_ok=True)
         out = work / "selected.files"
@@ -90,7 +90,7 @@ class BuildOutputListingTest(unittest.TestCase):
             str(self.root), str(out), str(work), mode, only,
             exclude_langs, include_ext, ignore,
             str(self.contract) if contract else "",
-        ], check=True, text=True)
+        ], check=True, text=True, timeout=timeout)
         kept = {os.fsdecode(p) for p in out.read_bytes().split(b"\0") if p}
         by_lang = {
             path.stem: {os.fsdecode(p) for p in path.read_bytes().split(b"\0") if p}
@@ -199,6 +199,17 @@ class BuildOutputListingTest(unittest.TestCase):
                 self.assertEqual(len(notices), 1, stderr)
                 self.assertIn("build output", notices[0])
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO support")
+    def test_nonregular_entry_does_not_block_shebang_detection(self) -> None:
+        (self.root / "bin").mkdir()
+        os.mkfifo(self.root / "bin" / "pipe")
+        self.write("scripts/deploy.sh")
+        # os.walk lists FIFOs. A shebang probe must not open one and hang.
+        kept, languages, _, stderr = self.listing("walk", timeout=5)
+        self.assertEqual(kept, {"scripts/deploy.sh"})
+        self.assertEqual(languages["bash"], {"scripts/deploy.sh"})
+        self.assertIn("skipping 'bin'", stderr)
+
     def test_identified_virtualenv_and_obj_pruning_is_visible(self) -> None:
         self.write("env/pyvenv.cfg", "home = /usr\n")
         self.write("env/site.py", "import os\n")
@@ -239,7 +250,10 @@ class BuildOutputEndToEndTest(unittest.TestCase):
                                          {"UBS_TEST_NO_RG": no_rg})
                         self.assertEqual(result.returncode, 1, result.stderr[-4000:])
                         self.assertEqual(scanned_count(result), 1)
-                        self.assertEqual(reported_files(result), {str(script)})
+                        # Explicit-file mode reports project-relative paths;
+                        # directory mode may report absolute paths.
+                        reported = {str((root / path).resolve()) for path in reported_files(result)}
+                        self.assertEqual(reported, {str(script.resolve())})
                         doc = summary(result)
                         self.assertGreater(doc["totals"]["critical"], 0)
                         self.assertIn("bash.security.eval-variable", json.dumps(doc))

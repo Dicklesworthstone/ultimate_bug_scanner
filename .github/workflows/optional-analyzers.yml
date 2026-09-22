@@ -80,3 +80,41 @@ jobs:
         run: |
           python3 scripts/update_checksums.py
           git diff --exit-code
+
+  pin-landed-coverage-assets:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'publish validated v5.4.11 asset pin')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PIN_SHA: 56768dabf4d0e01b8980b1298d67d8b6710ecd21
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: 56768dabf4d0e01b8980b1298d67d8b6710ecd21
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify the already-landed version and immutable assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$PIN_SHA" origin/main
+          test "$(cat VERSION)" = 5.4.11
+          grep -q '^UBS_VERSION="5.4.11"' ubs
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Create the missing tag without replacing an existing tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint="repos/$GH_REPO/git/ref/tags/v5.4.11"
+          if existing="$(gh api "$endpoint" --jq '.object.sha' 2>/dev/null)"; then
+            test "$existing" = "$PIN_SHA"
+          else
+            gh api --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/v5.4.11 -f sha="$PIN_SHA"
+          fi
+          test "$(gh api "$endpoint" --jq '.object.sha')" = "$PIN_SHA"
+          echo "Verified v5.4.11 points to $PIN_SHA"

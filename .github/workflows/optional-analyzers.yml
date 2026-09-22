@@ -90,31 +90,29 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      PIN_SHA: 56768dabf4d0e01b8980b1298d67d8b6710ecd21
+      GIT_TERMINAL_PROMPT: "0"
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: 56768dabf4d0e01b8980b1298d67d8b6710ecd21
           fetch-depth: 0
           persist-credentials: false
-      - name: Verify the already-landed version and immutable assets
+      - name: Verify current main has the exact tested source and assets
         shell: bash
         run: |
           set -euo pipefail
-          git merge-base --is-ancestor "$PIN_SHA" origin/main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(cat VERSION)" = 5.4.11
-          grep -q '^UBS_VERSION="5.4.11"' ubs
+          git diff --exit-code 56768dabf4d0e01b8980b1298d67d8b6710ecd21 HEAD -- VERSION ubs modules scripts SHA256SUMS test-suite
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-      - name: Create the missing tag without replacing an existing tag
+      - name: Pin this main commit without replacing any tag
         shell: bash
         run: |
           set -euo pipefail
-          endpoint="repos/$GH_REPO/git/ref/tags/v5.4.11"
-          if existing="$(gh api "$endpoint" --jq '.object.sha' 2>/dev/null)"; then
-            test "$existing" = "$PIN_SHA"
-          else
-            gh api --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/v5.4.11 -f sha="$PIN_SHA"
-          fi
-          test "$(gh api "$endpoint" --jq '.object.sha')" = "$PIN_SHA"
-          echo "Verified v5.4.11 points to $PIN_SHA"
+          gh auth setup-git
+          # Tag the commit that already introduced this workflow, not an older
+          # workflow tree. No workflow permission or branch write is required.
+          timeout 120 git push origin "$GITHUB_SHA:refs/tags/v5.4.11"
+          actual="$(git ls-remote --tags origin refs/tags/v5.4.11 | cut -f1)"
+          test "$actual" = "$GITHUB_SHA"
+          echo "Verified v5.4.11 points to $GITHUB_SHA"

@@ -110,13 +110,26 @@ class Pattern:
     thresholds: tuple[tuple[int, str], ...]
     case_insensitive: bool = False
     exclude_regex: re.Pattern[str] | None = None  # legacy `grep -v` post-filters
+    # Spans blanked (same-length spaces) before `regex` runs, so an idiom that
+    # would otherwise match is invisible while the rest of the line still counts.
+    mask_regex: re.Pattern[str] | None = None
     gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
     suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide count-comparison
 
 
+def _mask_spans(text: str, mask: re.Pattern[str]) -> str:
+    """Blank every `mask` match with spaces of the same length, so offsets and
+    line numbers of the masked text are identical to the original."""
+    return mask.sub(lambda m: " " * (m.end() - m.start()), text)
+
+
 def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
-    """Yield (line_number, line_text) for matches, skipping excluded lines."""
-    for match in pattern.regex.finditer(text):
+    """Yield (line_number, line_text) for matches, skipping excluded lines.
+
+    Line text is always taken from the original source, even when the search
+    ran over a masked copy."""
+    haystack = text if pattern.mask_regex is None else _mask_spans(text, pattern.mask_regex)
+    for match in pattern.regex.finditer(haystack):
         line_no = text.count("\n", 0, match.start()) + 1
         line_start = text.rfind("\n", 0, match.start()) + 1
         line_end = text.find("\n", match.start())
@@ -210,8 +223,6 @@ def scan_patterns(
 def load_patterns() -> list[Pattern]:
     """Aggregate PATTERNS from every ubs_core.js_patterns.* module."""
     import importlib
-    """Aggregate PATTERNS from every ubs_core.js_patterns.* module."""
-    import importlib
     import pkgutil
 
     from ubs_core import js_patterns
@@ -230,6 +241,8 @@ def _record_category(finding: dict) -> int | None:
         return 5
     if rule.startswith(("js.security.", "javascript.security.", "js.taint.", "javascript.taint.")):
         return 7
+    if rule.startswith("javascript.ctcompare."):
+        return 7
     if rule.startswith("javascript.guards."):
         return 1
     if rule.startswith("js.hooks."):
@@ -241,6 +254,14 @@ def _record_category(finding: dict) -> int | None:
         return 10
     if rule.startswith("javascript.function-scope."):
         return 8
+    # An analyzer that states its category outright (js.<slug>) is believed:
+    # the number is what --skip and the text renderer work in.
+    category_id = str(finding.get("category_id", ""))
+    if category_id.startswith("js."):
+        slug = category_id[3:]
+        for num, known in _CATEGORY_SLUGS.items():
+            if known == slug:
+                return num
     return None
 
 

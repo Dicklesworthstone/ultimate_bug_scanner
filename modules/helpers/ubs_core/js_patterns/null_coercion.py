@@ -14,6 +14,14 @@ import re
 
 from ubs_core.js_scan import Pattern
 
+# `<expr> == null`, `null != <expr>`, and the same with `undefined`: the
+# operator plus the nullish operand on whichever side it sits. The negative
+# lookarounds keep `===` / `!==` (already exempt) and `<=`/`>=` untouched.
+_NULLISH_LOOSE_EQUALITY = re.compile(
+    r"(?<![=!<>])(?:==|!=)(?!=)\s*(?:null|undefined)\b"
+    r"|\b(?:null|undefined)\s*(?<![=!<>])(?:==|!=)(?!=)"
+)
+
 PATTERNS: list[Pattern] = [
     # ── CATEGORY 1: NULL SAFETY & DEFENSIVE PROGRAMMING (ubs-js.sh 3864-3943) ──
     Pattern(
@@ -49,6 +57,11 @@ PATTERNS: list[Pattern] = [
         regex=re.compile(r"(^|[^=!<>])==($|[^=])|(^|[^=!<>])!=($|[^=])", re.MULTILINE),
         thresholds=((0, "critical"),),
         exclude_regex=re.compile(r"===|!=="),
+        # `x == null` / `x != undefined` is the deliberate nullish idiom
+        # (null and undefined in one comparison; ESLint eqeqeq "smart" exempts
+        # it), so those comparisons are blanked before the search. Any other
+        # `==` on the same line still counts.
+        mask_regex=_NULLISH_LOOSE_EQUALITY,
     ),
     Pattern(
         category=4,

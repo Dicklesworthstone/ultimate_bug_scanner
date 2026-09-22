@@ -83,32 +83,53 @@ def _regex_start_context(text: str, idx: int) -> bool:
     return not (ch in ')]')
 
 
-def _mask_non_code(text: str) -> str:
-    """Blank comments, string/template-literal text and regex literals with
-    spaces (newlines preserved) so only real code operators survive; ``${...}``
-    interpolation code stays visible. Offsets are identical to the input."""
-    out = list(text)
+def _blank(out: list[str], a: int, b: int) -> None:
+    """Replace ``out[a:b)`` with spaces, keeping newlines so offsets and line
+    numbers stay identical to the input."""
+    for j in range(max(a, 0), min(b, len(out))):
+        if out[j] != '\n':
+            out[j] = ' '
+
+
+def _mask_code(text: str, out: list[str], start: int, *, interpolation: bool) -> int:
+    """Mask the non-code of ``text[start:]`` into ``out`` and return where the
+    region ended.
+
+    Comments, quoted strings, template-literal text and regex literals are
+    blanked; only real code operators survive. A template ``${...}`` body is
+    code, so it is masked by a recursive call with ``interpolation=True``,
+    which stops at the ``}`` that closes the interpolation (the first ``}``
+    that no ``{`` inside the body opened) and returns its index. Braces inside
+    strings, comments, regexes and nested templates are masked before they
+    are counted, so they can never move that boundary. The top-level call
+    (``interpolation=False``) returns ``len(text)``.
+    """
     n = len(text)
-
-    def blank(a: int, b: int) -> None:
-        for j in range(a, min(b, n)):
-            if out[j] != '\n':
-                out[j] = ' '
-
-    i = 0
+    depth = 0
+    i = start
     while i < n:
         c = text[i]
         nxt = text[i + 1] if i + 1 < n else ''
+        if c == '{':
+            depth += 1
+            i += 1
+            continue
+        if c == '}':
+            if interpolation and depth == 0:
+                return i
+            depth -= 1
+            i += 1
+            continue
         if c == '/' and nxt == '/':
             end = text.find('\n', i)
             end = n if end == -1 else end
-            blank(i, end)
+            _blank(out, i, end)
             i = end
             continue
         if c == '/' and nxt == '*':
             end = text.find('*/', i + 2)
             end = n if end == -1 else end + 2
-            blank(i, end)
+            _blank(out, i, end)
             i = end
             continue
         if c in '\'"':
@@ -121,7 +142,7 @@ def _mask_non_code(text: str) -> str:
                 if ch == c or ch == '\n':
                     break
                 j += 1
-            blank(i, min(j + 1, n))
+            _blank(out, i, min(j + 1, n))
             i = j + 1
             continue
         if c == '`':
@@ -129,32 +150,26 @@ def _mask_non_code(text: str) -> str:
             while j < n:
                 ch = text[j]
                 if ch == '\\':
+                    _blank(out, j, j + 2)  # an escaped char is still text
                     j += 2
                     continue
                 if ch == '`':
                     j += 1
                     break
                 if ch == '$' and j + 1 < n and text[j + 1] == '{':
-                    depth = 1
-                    k = j + 2
-                    while k < n and depth:
-                        if text[k] == '{':
-                            depth += 1
-                        elif text[k] == '}':
-                            depth -= 1
-                        k += 1
-                    blank(j, j + 2)
-                    j = k
+                    _blank(out, j, j + 2)
+                    close = _mask_code(text, out, j + 2, interpolation=True)
+                    _blank(out, close, close + 1)
+                    j = close + 1
                     continue
-                blank(j, j + 1)
+                _blank(out, j, j + 1)
                 j += 1
             i = j
             continue
         if c == '/' and nxt == '=':
             i += 2  # /= division-assignment: code, but not a $L / $R node
             continue
-        if c == '/' and nxt not in ('/', '*') and not _jsx_punct(text, i) \
-                and _regex_start_context(text, i):
+        if c == '/' and not _jsx_punct(text, i) and _regex_start_context(text, i):
             j = i + 1
             in_class = False
             while j < n:
@@ -176,10 +191,20 @@ def _mask_non_code(text: str) -> str:
                 end = j + 1
                 while end < n and (text[end].isalnum()):
                     end += 1
-                blank(i, end)
+                _blank(out, i, end)
                 i = end
                 continue
         i += 1
+    return n
+
+
+def _mask_non_code(text: str) -> str:
+    """Blank comments, string/template-literal text and regex literals with
+    spaces (newlines preserved) so only real code operators survive; ``${...}``
+    interpolation bodies are code and are masked recursively, so a regex or
+    string inside one is blanked too. Offsets are identical to the input."""
+    out = list(text)
+    _mask_code(text, out, 0, interpolation=False)
     return ''.join(out)
 
 
@@ -534,6 +559,31 @@ def _selftest_template_interpolation_is_code(
         assert findings[0][0] == 1, findings
 
 
+def _selftest_interpolation_bodies_are_masked_as_code(
+    tmp_prefix: str = "ubs_core_spec_division_interp_code_",
+) -> None:
+    import tempfile
+
+    # A regex, string, comment or nested template inside `${...}` used to be
+    # left visible in the mask (the body was skipped, never masked), so the
+    # `/.../` of a regex read as two division chains; a `\/` in template text
+    # leaked its slash the same way. Only the real `${total / count}` divides.
+    src = "\n".join([
+        "const key = `id-${name.replace(/[^a-z0-9]+/gi, '-')}`;",
+        "const quoted = `'${String(v).replace(/'/g, `'\"'\"'`)}'`;",
+        "const url = `file:///${p.replace(/\\\\/g, '/')}`;",
+        "const obj = `${ {a: '}'}.a } ${'/'} ${x /* a / b */}`;",
+        "const esc = `a\\/b ${x} \\`${y}`;",
+        "const real = `ratio ${total / count}`;",
+        "",
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "interp.js"
+        target.write_text(src, encoding="utf-8")
+        findings = list(scan_file_divisions(target))
+        assert findings == [(6, 23, "count")], findings
+
+
 def _selftest_run_record_shape(
     tmp_prefix: str = "ubs_core_spec_division_run_",
 ) -> None:
@@ -560,6 +610,7 @@ SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("zero-and-unguarded-risky", _selftest_zero_and_unguarded_risky),
     ("non-code-never-matches", _selftest_non_code_never_matches),
     ("template-interpolation-is-code", _selftest_template_interpolation_is_code),
+    ("interpolation-bodies-masked-as-code", _selftest_interpolation_bodies_are_masked_as_code),
     ("severity-ladder", _selftest_severity_ladder),
     ("run-record-shape", _selftest_run_record_shape),
 )

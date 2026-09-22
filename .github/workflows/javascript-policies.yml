@@ -82,7 +82,8 @@ jobs:
           retention-days: 7
 
   pin-tested-assets:
-    if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'ci: pin validated 5.4.13 assets')
+    if: >-
+      github.event_name == 'push' && startsWith(github.event.head_commit.message, 'ci: pin validated 5.4.13 assets')
     runs-on: macos-latest
     timeout-minutes: 5
     permissions:

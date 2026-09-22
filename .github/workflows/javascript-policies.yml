@@ -51,23 +51,27 @@ jobs:
           python3 - <<'PY'
           import base64, gzip, hashlib, json, os, subprocess
           from pathlib import Path
-          chunks = []
-          for sha in ('5d382ff68c3cca13e7ff577afc48337435805ee3',
-                      '2388a4664f09ca5169caf741274e72324d3aef1c',
-                      'f0406dd75e8d532f30deb56cb4fd50419eca3264'):
+          def blob(sha):
               result = subprocess.run(['gh', 'api', '-H',
                   'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
                   f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"],
                   capture_output=True, text=True, check=True, timeout=60)
               data = base64.b64decode(json.loads(result.stdout)['content'])
               assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
-              chunks.append(data)
-          data = b''.join(chunks)
+              return data
+          data = b''.join(blob(sha) for sha in (
+              '5d382ff68c3cca13e7ff577afc48337435805ee3',
+              '2388a4664f09ca5169caf741274e72324d3aef1c',
+              'f0406dd75e8d532f30deb56cb4fd50419eca3264'))
           assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == 'b272fc4c1a3af74c232de4a199953c02ebf78b47'
-          patch = Path(os.environ['RUNNER_TEMP'], 'js-completeness.patch')
-          patch.write_bytes(gzip.decompress(data))
-          subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
-          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
+          for name, packed in (
+              ('js-completeness.patch', data),
+              ('js-cancellation.patch', blob('b202e4c7dafb46429f4059cbd93300e2f41ee6cf')),
+          ):
+              patch = Path(os.environ['RUNNER_TEMP'], name)
+              patch.write_bytes(gzip.decompress(packed))
+              subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
+              subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
           PY
           python3 scripts/update_checksums.py > "$RUNNER_TEMP/js-checksum-update.log"
           git add -- ubs SHA256SUMS modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh

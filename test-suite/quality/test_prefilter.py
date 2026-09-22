@@ -2,7 +2,7 @@
 """Unit tests for ubs_core.prefilter — Necessary-literal prefilter (bead C2).
 
 Verifies:
-1. Every ast-grep rule in every language pack extracts non-empty literals OR is in ALLOWED_EMPTY_RULES.
+1. Every ast-grep rule has a structural literal proof or is explicitly admitted by fallback.
 2. ALLOWED_EMPTY_RULES contains no stale or missing rules.
 3. Pattern literal extraction correctly extracts keywords and ignores lookarounds.
 4. PrefilterIndex builds correct inverted index and expanded substring containment.
@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import importlib  # ubs:ignore[py.deprecations.deprecated-api]
 import io
+import itertools
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,6 +25,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+try:
+    import yaml  # Optional: the optimizer also supports dependency-free JSON.
+except ImportError:
+    yaml = None
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -65,9 +72,9 @@ class RuleLiteralExtractionTests(unittest.TestCase):
         "swift",
     )
 
-    def test_all_pack_rules_extract_literals_or_are_allowed_empty(self) -> None:
+    def test_all_pack_rules_have_a_proof_or_explicit_fallback(self) -> None:
         total_rules = 0
-        unmatched_rules: list[tuple[str, str, str]] = []
+        proven_rules = 0
 
         for lang in self.PACK_LANGUAGES:
             mod = importlib.import_module(f"ubs_core.{lang}_rules")
@@ -75,8 +82,8 @@ class RuleLiteralExtractionTests(unittest.TestCase):
             self.assertIsNotNone(gen, f"Module ubs_core.{lang}_rules lacks generate()")
             with tempfile.TemporaryDirectory() as td:
                 tdp = Path(td)
-                manifest = gen(tdp)
-                for yml_file in sorted(tdp.glob("*.yml")):
+                gen(tdp)
+                for yml_file in sorted(tdp.rglob("*.yml")):
                     if yml_file.name.startswith(("sgconfig", "sgbase")):
                         continue
                     text = yml_file.read_text(encoding="utf-8")
@@ -86,17 +93,22 @@ class RuleLiteralExtractionTests(unittest.TestCase):
                         rule_id = id_m.group(1)
                     total_rules += 1
                     lits = extract_ast_rule_literals(rule_id, text, lang=lang)
-                    if not lits:
-                        allowed = ALLOWED_EMPTY_RULES.get(lang, set())
-                        if rule_id not in allowed and yml_file.stem not in allowed:
-                            unmatched_rules.append((lang, rule_id, yml_file.name))
+                    index = build_prefilter_index(ast_rules=[(rule_id, text)], lang=lang)
+                    self.assertEqual(index.rules[rule_id].literals, frozenset(lits))
+                    self.assertEqual(index.rules[rule_id].is_fallback, not lits)
+                    if lits:
+                        proven_rules += 1
+                    else:
+                        self.assertIn(rule_id, index.fallback_rules)
+                        self.assertTrue(index.has_ast_fallback)
 
         self.assertGreater(total_rules, 100, f"Expected >100 rules across packs, got {total_rules}")
-        self.assertEqual(
-            unmatched_rules,
-            [],
-            f"Found rules with empty literals not listed in ALLOWED_EMPTY_RULES: {unmatched_rules}",
-        )
+        # Guard against simply disabling all optimization, but never demand
+        # invented literals for context-only, quoted or unknown predicates.
+        if yaml is not None:
+            self.assertGreater(proven_rules, 20)
+        else:
+            self.assertEqual(proven_rules, 0)
 
     def test_allowed_empty_rules_whitelist_integrity(self) -> None:
         """Every rule listed in ALLOWED_EMPTY_RULES must be a recognized language."""
@@ -121,7 +133,7 @@ class RuleLiteralExtractionTests(unittest.TestCase):
                     text = (root / f"{slug}.yml").read_text(encoding="utf-8")
                     self.assertEqual(
                         extract_ast_rule_literals(rule_id, text, lang="rust"),
-                        {"async"},
+                        {"async"} if yaml is not None else set(),
                     )
                     self.assertEqual(
                         extract_ast_rule_literals(rule_id, manifest[rule_id], lang="rust"),
@@ -131,13 +143,14 @@ class RuleLiteralExtractionTests(unittest.TestCase):
     def test_structured_positive_relations_extract_required_literals(self) -> None:
         for relation in ("has", "inside", "precedes", "follows"):
             rule = {relation: {"regex": r"\basync\b", "stopBy": {"regex": "unrequired_stop"}}}
-            for text in (
-                rule,
-                json.dumps({"rule": rule}),
-                f"id: test.rule\nrule: {json.dumps(rule)}\n",
+            for text, expected in (
+                (rule, {"async"}),
+                (json.dumps({"rule": rule}), {"async"}),
+                (f"id: test.rule\nrule: {json.dumps(rule)}\n",
+                 {"async"} if yaml is not None else set()),
             ):
                 with self.subTest(relation=relation, text=text):
-                    self.assertEqual(extract_ast_rule_literals("test.rule", text), {"async"})
+                    self.assertEqual(extract_ast_rule_literals("test.rule", text), expected)
 
     def test_structured_scalar_patterns_require_fixed_identifiers(self) -> None:
         cases = (
@@ -151,9 +164,13 @@ class RuleLiteralExtractionTests(unittest.TestCase):
         )
         for pattern, expected in cases:
             rule = {"pattern": pattern}
-            for text in (rule, json.dumps({"rule": rule}), f"rule: {json.dumps(rule)}\n"):
+            for text in (rule, json.dumps({"rule": rule})):
                 with self.subTest(pattern=pattern, text=text):
                     self.assertEqual(extract_ast_rule_literals("test.rule", text), expected)
+            self.assertEqual(
+                extract_ast_rule_literals("test.rule", f"rule: {json.dumps(rule)}\n"),
+                expected if yaml is not None else set(),
+            )
 
     def test_scalar_unknowns_do_not_require_incidental_text(self) -> None:
         for pattern in (
@@ -187,13 +204,14 @@ class RuleLiteralExtractionTests(unittest.TestCase):
                         {"any": [{"pattern": "optional_call($X)"}, {"kind": "identifier"}]}]}
         self.assertEqual(extract_ast_rule_literals("test.rule", rule), {"required_call"})
 
-    def test_unquoted_yaml_flow_mapping_keeps_existing_extraction(self) -> None:
+    def test_yaml_flow_mapping_proves_identifiers_not_dotted_adjacency(self) -> None:
         for text in (
             "rule: { pattern: 'console.log($X)' }\n",
             "{ pattern: 'console.log($X)' }\n",
         ):
             with self.subTest(text=text):
-                self.assertIn("console.log", extract_ast_rule_literals("test.rule", text))
+                self.assertEqual(extract_ast_rule_literals("test.rule", text),
+                                 {"console", "log"} if yaml is not None else set())
 
     def test_structured_negative_context_and_unknown_regexes_fall_back(self) -> None:
         rules = (
@@ -260,6 +278,100 @@ class PatternLiteralExtractionTests(unittest.TestCase):
         self.assertIn("foo", lits)
         self.assertNotIn("safe_token", lits)
 
+    def test_optional_and_literal_free_alternatives_are_not_requirements(self) -> None:
+        for regex, source in (
+            (r"(?:danger)?[A-Z]", "X"),
+            (r"danger|[0-9]", "7"),
+            (r"^puts\(|^p\(", "p("),
+            (r"^-e[ \t]+|file:/", "-e "),
+            (r"(?P<danger>[0-9])", "7"),
+            (r"[ab]val", "bval"),
+            (r"foo?", "fo"),
+            (r"\x65val", "eval"),
+            (r"(?x) [0-9] # incidental_word", "7"),
+        ):
+            with self.subTest(regex=regex):
+                pattern = DummyPattern("test.rule", re.compile(regex))
+                self.assertIsNotNone(pattern.regex.search(source))
+                literals = extract_pattern_literals(pattern)
+                self.assertTrue(not literals or any(lit.lower() in source.lower() for lit in literals), literals)
+
+    def test_nested_required_predicates_retain_useful_literals(self) -> None:
+        for regex, expected in (
+            (r"(?:danger)?required", {"required"}),
+            (r"(?:open|close)+", {"open", "close"}),
+            (r"(?=necessary)[a-z]+", {"necessary"}),
+            (r"(?<!irrelevant)required", {"required"}),
+            (r"(?>open|close)", {"open", "close"}),
+        ):
+            with self.subTest(regex=regex):
+                self.assertEqual(extract_pattern_literals(DummyPattern("test.rule", re.compile(regex))), expected)
+
+    def test_yaml_rule_metadata_never_becomes_required_source(self) -> None:
+        examples = (
+            "rule:\n  any:\n    - pattern: danger($X)\n    - kind: identifier\n",
+            "rule:\n  pattern:\n    context: 'function synthetic_scaffold() { $X; }'\n    selector: identifier\n",
+            "rule:\n  regex: '(?:danger)?[a-z]'\n",
+            "rule:\n  pattern: $X\nmessage: incidental_metadata\n",
+            "rule:\n  pattern: $X\nfix: replacement($X)\n",
+        )
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertEqual(extract_ast_rule_literals("test.rule", text), set())
+
+    def test_shipped_patterns_keep_their_literal_free_matches(self) -> None:
+        from ubs_core.py_scan import load_patterns as python_patterns
+        from ubs_core.ruby_scan import load_patterns as ruby_patterns
+
+        for patterns, rule, source in (
+            (python_patterns(), "py.packaging.editable-local", "-e ../checkout\n"),
+            (ruby_patterns(), "ruby.debug.puts-statements", "p(value)\n"),
+            (ruby_patterns(), "ruby.debug.puts-statements-info", "pp(value)\n"),
+        ):
+            pattern = next(p for p in patterns if p.rule_id == rule)
+            self.assertIsNotNone(pattern.regex.search(source))
+            with self.subTest(rule=rule), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "source"
+                target.write_text(source)
+                result = run_prefilter([target], build_prefilter_index(patterns=[pattern]))
+                self.assertIn(rule, result.candidate_rules_for(target))
+
+    def test_exhaustive_small_regex_matches_always_satisfy_the_proof(self) -> None:
+        atoms = ("ab", "bc", "[ab]", "[ab]c", r"\x61b", ".")
+        expressions = set(atoms)
+        for left, right in itertools.product(atoms, repeat=2):
+            expressions.update((f"(?:{left}|{right})", f"(?:{left})?{right}",
+                                f"(?:{left}|{right})?", f"{left}(?!{right})"))
+        samples = ["".join(chars) for length in range(6)
+                   for chars in itertools.product("abc", repeat=length)]
+        matches = 0
+        for expression in expressions:
+            regex = re.compile(expression)
+            literals = extract_pattern_literals(DummyPattern("proof.test", regex))
+            for sample in samples:
+                if regex.search(sample):
+                    matches += 1
+                    self.assertTrue(not literals or any(lit in sample for lit in literals),
+                                    (expression, sample, literals))
+        self.assertGreater(matches, 10000)
+
+    def test_unavailable_parsers_fall_back_instead_of_guessing(self) -> None:
+        with patch.object(re, "_parser", None):
+            self.assertEqual(extract_pattern_literals(DummyPattern("test", r"danger")), set())
+        with patch.dict(sys.modules, {"yaml": None}):
+            self.assertEqual(extract_ast_rule_literals("test", "rule:\n  pattern: danger($X)\n"), set())
+            self.assertEqual(extract_ast_rule_literals("test", {"pattern": "danger($X)"}), {"danger"})
+
+    def test_recursive_yaml_and_mixed_documents_do_not_invent_a_proof(self) -> None:
+        for text in ("rule: &loop\n  any: [*loop]\n",
+                     "rule: {pattern: danger($X)}\n---\nrule: {kind: identifier}\n",
+                     'rule: {"pattern": "danger($X)"}\n---\nrule: {kind: identifier}\n'):
+            self.assertEqual(extract_ast_rule_literals("test", text), set())
+
+    def test_invalid_regex_cannot_make_the_optimizer_crash(self) -> None:
+        for regex in ("(", "[", "(?invalid)"):
+            self.assertEqual(extract_pattern_literals(DummyPattern("test", regex)), set())
+
 
 class PrefilterIndexTests(unittest.TestCase):
     """Test inverted index construction and substring expansion."""
@@ -295,7 +407,7 @@ class RunPrefilterTests(unittest.TestCase):
             clean = root / "clean.js"
             clean.write_text("const value = 1;\n", encoding="utf-8")
             rule = {"pattern": "console.log($$$ARBITRARY_ARGUMENTS)"}
-            text = f"id: test.scalar\nrule: {json.dumps(rule)}\n"
+            text = json.dumps({"id": "test.scalar", "rule": rule})
             index = build_prefilter_index(ast_rules=[("test.scalar", text)])
             self.assertFalse(index.fallback_rules)
             result = run_prefilter([target, clean], index)
@@ -344,11 +456,13 @@ class RunPrefilterTests(unittest.TestCase):
                 with self.subTest(slug=slug):
                     rule_id = f"rust.ast.{slug}"
                     text = (rules_dir / f"{slug}.yml").read_text(encoding="utf-8")
-                    literals = extract_ast_rule_literals(rule_id, text, lang="rust")
+                    literals = extract_ast_rule_literals(rule_id, manifest[rule_id], lang="rust")
                     self.assertTrue(literals, rule_id)
-                    self.assertEqual(extract_ast_rule_literals(rule_id, manifest[rule_id], lang="rust"),
-                                     literals)
-                    index = build_prefilter_index(ast_rules=[(rule_id, text)], lang="rust")
+                    self.assertEqual(extract_ast_rule_literals(rule_id, text, lang="rust"),
+                                     literals if yaml is not None else set())
+                    index = build_prefilter_index(
+                        ast_rules=[(rule_id, json.dumps(manifest[rule_id]))], lang="rust",
+                    )
                     self.assertFalse(index.fallback_rules)
                     positive = []
                     for branch, source in enumerate(sources):
@@ -572,6 +686,47 @@ class PrefilterAdmissionTests(unittest.TestCase):
         scan_patterns(patterns, [self.target], filtered, set(), prefilter=result)
         scan_patterns(patterns, [self.target], unfiltered, set())
         self.assertEqual(filtered.getvalue(), unfiltered.getvalue())
+
+    def test_registered_security_analyzer_does_not_depend_on_guessed_keywords(self) -> None:
+        from ubs_core.analyzers.sec_path_traversal import run
+        from ubs_core.registry import RunContext
+
+        for sink in ("fs.writeFile", "fs.unlink", "fs.mkdir", "res.sendFile"):
+            with self.subTest(sink=sink):
+                self.target.write_text(f'{sink}(req.query.path, "data");\n')
+                files = [self.target]
+                expected = list(run(RunContext(lang="javascript", files=files)))
+                self.assertTrue(expected)
+                name = "sec_path_traversal"
+                result = run_prefilter(files, build_prefilter_index(analyzers=[name]))
+                selected = result.filter_files_for_analyzer(name, files)
+                self.assertEqual(list(run(RunContext(lang="javascript", files=selected))), expected)
+
+    def test_real_scanner_cold_warm_and_unfiltered_security_findings_agree(self) -> None:
+        self.target.write_text('fs.writeFile(req.query.path, "data");\n')
+        sink = self.root / "findings.ndjson"
+        summary = self.root / "summary.json"
+        env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
+                   UBS_CACHE_DIR=str(self.root / "cache"), UBS_PROFILE="1")
+        expected = None
+        for name, disabled, hits in (("cold", "0", 0), ("warm", "0", 1), ("unfiltered", "1", 0)):
+            env.update(UBS_NO_PREFILTER=disabled, UBS_NO_CACHE=disabled)
+            with self.subTest(scan=name):
+                proc = subprocess.run(
+                    [sys.executable, "-m", "ubs_core.js_scan", "--sink", str(sink),
+                     "--json-out", str(summary), "--project-dir", str(self.root), "--fail-on-warning"],
+                    input=os.fsencode(self.target) + b"\0", capture_output=True,
+                    cwd=self.root, env=env, timeout=60,
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr.decode("utf-8", "replace"))
+                doc = json.loads(summary.read_text())
+                self.assertEqual(doc["status"], "ok")
+                self.assertEqual(doc["profile"]["cache_hits"], hits)
+                findings = doc["findings"]
+                self.assertIn("js.security.path-traversal", {row["rule"] for row in findings})
+                if expected is None:
+                    expected = findings
+                self.assertEqual(findings, expected)
 
 
 if __name__ == "__main__":

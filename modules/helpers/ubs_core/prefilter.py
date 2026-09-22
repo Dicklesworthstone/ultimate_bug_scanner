@@ -1,10 +1,9 @@
 """ubs_core.prefilter — Necessary-literal prefilter for ast-grep, patterns, and analyzers (bead C2).
 
-Extracts necessary literal tokens from ast-grep rule packs, regex patterns, and
-registered analyzers. Runs one ripgrep pass over the file
-list to compute per-file rule candidate sets. Ast-grep and pattern checks then
-run only on candidate files that can match, eliminating 80-95% of ast-grep and
-regex overhead on multi-file projects.
+Extracts necessary literal tokens from structured ast-grep rules and regex
+syntax trees. One ripgrep pass computes per-file candidates. Checks without
+a proven source requirement, including arbitrary analyzer callbacks, remain
+eligible for every selected file.
 
 Conservative by construction: rules with no extractable literal fall back to
 matching all files. UBS_NO_PREFILTER=1 disables prefiltering entirely.
@@ -27,8 +26,8 @@ ENV_NO_PREFILTER = "UBS_NO_PREFILTER"
 # Batch size for ripgrep file argument lists (ARG_MAX safety)
 _RG_BATCH = 400
 
-# Rules that are explicitly permitted to have an empty literal set across rule packs.
-# No rule may extract an empty set silently; any unlisted empty rule fails quality checks.
+# Known rules that need full coverage. Other unprovable expressions also use
+# explicit fallback; this table is NOT permission to guess source requirements.
 ALLOWED_EMPTY_RULES: dict[str, set[str]] = {
     "js": {
         "js.async.dangling-promise",
@@ -56,31 +55,6 @@ ALLOWED_EMPTY_RULES: dict[str, set[str]] = {
     "csharp": set(),  # All 4 C# rules extract literals
     "swift": set(),   # All Swift rules extract literals
 }
-
-# Known necessary literals for common analyzer families
-ANALYZER_LITERALS: dict[str, set[str]] = {
-    "sec_jwt": {"jwt", "jsonwebtoken", "ParseUnverified", "decode", "verify", "JWT"},
-    "sec_archive_entry": {"zip", "tar", "extract", "unzip", "Archive", "ZipFile", "TarFile"},
-    "sec_cookies": {"cookie", "Set-Cookie", "cookieParser", "session", "sameSite"},
-    "sec_cors": {"cors", "Access-Control-Allow-Origin", "origin"},
-    "sec_dangerous_html": {"dangerouslySetInnerHTML", "innerHTML", "outerHTML", "document.write"},
-    "sec_fetch_abort": {"fetch", "AbortController", "signal", "timeout"},
-    "sec_hardcoded_secrets": {"password", "secret", "token", "apiKey", "api_key", "bearer", "passwd"},
-    "sec_header_injection": {"setHeader", "header", "writeHead", "Response", "NextResponse", "headers"},
-    "sec_host_header": {"host", "x-forwarded-host", "getHeader"},
-    "sec_jsx_target_blank": {"target=\"_blank\"", "target='_blank'", "target=_blank", "_blank"},
-    "sec_open_redirect": {"redirect", "Location", "location.href", "sendRedirect"},
-    "sec_path_traversal": {"readFile", "readFileSync", "createReadStream", "join", "resolve", "send_file"},
-    "sec_post_message": {"postMessage", "addEventListener"},
-    "sec_request_body": {"body", "bodyParser", "json", "urlencoded"},
-    "sec_request_regex": {"RegExp", "test", "exec", "match"},
-    "sec_reverse_proxy": {"createProxyMiddleware", "createProxyServer", "httpProxy", "rewrite", "x-forwarded-for"},
-    "sec_sql_injection": {"SELECT", "INSERT", "UPDATE", "DELETE", "query", "execute", "sql", "WHERE"},
-    "sec_ssrf_fetch": {"fetch", "axios", "http.get", "https.get", "request"},
-    "sec_tls": {"rejectUnauthorized", "NODE_TLS_REJECT_UNAUTHORIZED", "insecure", "tls"},
-    "sec_weak_random": {"Math.random", "randomUUID", "randomBytes", "getRandomValues", "randomInt"},
-}
-
 
 @dataclass(frozen=True)
 class RuleSpec:
@@ -218,14 +192,14 @@ def _pattern_identifier_literals(pattern: str) -> set[str]:
             if len(word) >= 2 and word.lower() not in ("true", "false")}
 
 
-def _structured_rule_literals(rule: Any) -> set[str]:
+def _structured_rule_literals(rule: Any, depth: int = 0) -> set[str]:
     """Return a conservative OR-set of literals from required JSON constraints.
 
     Scalar code patterns and simple identifier regexes are interpreted.
     Pattern contexts, negated rules, and stopBy traversal boundaries are not
     matched source and must never contribute prefilter requirements.
     """
-    if not isinstance(rule, dict):
+    if not isinstance(rule, dict) or depth > 48:
         return set()
 
     literals: set[str] = set()
@@ -244,16 +218,16 @@ def _structured_rule_literals(rule: Any) -> set[str]:
             literals.add(match.group(1))
 
     for relation in ("has", "inside", "precedes", "follows"):
-        literals.update(_structured_rule_literals(rule.get(relation)))
+        literals.update(_structured_rule_literals(rule.get(relation), depth + 1))
 
     conjunction = rule.get("all")
     if isinstance(conjunction, list):
         for member in conjunction:
-            literals.update(_structured_rule_literals(member))
+            literals.update(_structured_rule_literals(member, depth + 1))
 
     alternatives = rule.get("any")
     if isinstance(alternatives, list) and alternatives:
-        branches = [_structured_rule_literals(member) for member in alternatives]
+        branches = [_structured_rule_literals(member, depth + 1) for member in alternatives]
         if all(branches):
             # At least one branch must match. A branch without a proven
             # literal makes this disjunction unsuitable for prefiltering.
@@ -286,169 +260,85 @@ def extract_ast_rule_literals(rule_id: str, rule_text: str | dict, lang: str = "
             return set()
         return _structured_rule_literals(document.get("rule", document))
 
-    # Rust structural rules are JSON objects embedded under a YAML root key.
-    # Parse that object, never scan its pattern.context scaffolding as YAML.
-    structured = re.search(r'(?m)^rule:[ \t]*(?=\{\s*(?:"|\}))', text)
-    if structured:
-        try:
-            rule, _ = json.JSONDecoder().raw_decode(text[structured.end():])
-        except ValueError:
-            return set()
-        return _structured_rule_literals(rule)
-
-    literals: set[str] = set()
-    lines = text.splitlines()
-    in_pattern = False
-    in_not = False
-    not_indent = 0
-    pattern_lines: list[str] = []
-
-    # 1. Parse pattern lines, regex lines, and inline pattern objects
-    for line in lines:
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip())
-
-        if in_not:
-            if indent > not_indent and stripped:
-                continue
-            else:
-                in_not = False
-
-        if stripped.startswith("- not:") or stripped.startswith("not:"):
-            in_not = True
-            not_indent = indent
-            continue
-
-        if stripped.startswith("- "):
-            stripped = stripped[2:].strip()
-
-        # Handle inline mappings: rule: { pattern: "..." }
-        inline_m = re.findall(r'pattern:\s*(?:"([^"]+)"|\'([^\']+)\'|([^}\n,]+))', stripped)
-        if inline_m:
-            for m in inline_m:
-                val = (m[0] or m[1] or m[2]).strip()
-                if val and val not in ("|", ">-", ">"):
-                    pattern_lines.append(val)
-
-        if stripped.startswith("pattern:"):
-            val = stripped.split("pattern:", 1)[1].strip()
-            if val in ("|", ">-", ">", ""):
-                in_pattern = True
-            else:
-                pattern_lines.append(val)
-        elif in_pattern:
-            if line.startswith("  ") or line.startswith("\t") or stripped == "":
-                if stripped:
-                    pattern_lines.append(stripped)
-            else:
-                in_pattern = False
-
-        if "regex:" in stripped and not in_not:
-            val = stripped.split("regex:", 1)[1].strip().strip("\"'")
-            cleaned_rg = re.sub(r"\[[^\]]*\]", " ", val)
-            words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", cleaned_rg)
-            for w in words:
-                if len(w) >= 3 and w.lower() not in ("true", "false", "null", "nil", "none", "undefined", "fetch", "axios"):
-                    literals.add(w)
-
-        # Check for kind-specific literals
-        if "kind: import_spec" in stripped or "kind: \"import_spec\"" in stripped:
-            literals.add("import")
-
-    # 2. Extract tokens from pattern lines
-    for p in pattern_lines:
-        # Punctuation / operator literals that are very specific in source
-        if "??" in p:
-            literals.add("??")
-        if "!." in p:
-            literals.add("!.")
-        if "is not" in p:
-            literals.add("is not")
-        elif " is " in p or p.startswith("is "):
-            literals.add("is")
-        if "/>" in p:
-            literals.add("/>")
-
-        # Dotted expressions (e.g. JSON.parse, Object.assign)
-        for d in re.findall(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", p):
-            literals.add(d)
-
-        literals.update(_pattern_identifier_literals(p))
-
-    return literals
-
-
-def _strip_lookarounds(pat: str) -> str:
-    """Strip (?!...) and (?<!...) lookarounds from regex pattern string."""
-    res = []
-    i = 0
-    n = len(pat)
-    while i < n:
-        if pat[i:i+3] == "(?!" or pat[i:i+4] == "(?<!":
-            depth = 1
-            i += 3 if pat[i:i+3] == "(?!" else 4
-            in_class = False
-            while i < n and depth > 0:
-                ch = pat[i]
-                if ch == "\\":
-                    i += 2
-                    continue
-                if in_class:
-                    if ch == "]":
-                        in_class = False
-                else:
-                    if ch == "[":
-                        in_class = True
-                    elif ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
-                i += 1
-            res.append(" ")
-        else:
-            res.append(pat[i])
-            i += 1
-    return "".join(res)
+    # YAML formatting, alternatives, pattern contexts and metadata cannot be
+    # understood by grepping for words. Use the same structural proof as JSON.
+    # PyYAML is optional: without it this optimization simply admits all files,
+    # rather than making it a new scanner runtime dependency.
+    try:
+        import yaml
+    except ImportError:
+        return set()
+    try:
+        documents = list(yaml.safe_load_all(text))
+        branches = [
+            _structured_rule_literals(doc.get("rule", doc)) if isinstance(doc, dict) else set()
+            for doc in documents
+        ]
+    except (yaml.YAMLError, ValueError, RecursionError):
+        return set()
+    return set().union(*branches) if branches and all(branches) else set()
 
 
 def _extract_regex_literals(regex: Any) -> set[str]:
+    """Prove an OR-set of necessary literals from Python's regex syntax tree.
+
+    A concatenation may use any mandatory child; an alternation needs a proof
+    for EVERY branch. Optional repeats, negative assertions, group names and
+    verbose comments are never source requirements. Unknown syntax or a
+    runtime without CPython's parser disables this optimization safely.
+    """
     if not regex:
         return set()
-
     pat = regex.pattern if hasattr(regex, "pattern") else str(regex)
+    if not isinstance(pat, str):
+        return set()
 
-    # Normalize single-letter character classes: [Ee] -> e
-    pat_norm = re.sub(r"\[([A-Za-z])(?:[A-Za-z])?\]", lambda m: m.group(1).lower(), pat)
-    # Strip negative lookaheads / lookbehinds (negative conditions must not be required literals)
-    pat_norm = _strip_lookarounds(pat_norm)
+    def alternatives(branches) -> set[str]:
+        proofs = [walk(branch) for branch in branches]
+        return set().union(*proofs) if proofs and all(proofs) else set()
 
-    literals: set[str] = set()
+    def walk(sequence) -> set[str]:
+        literals: set[str] = set()
+        run: list[str] = []
 
-    # Top-level alternation: alert|confirm|prompt -> all branches must provide tokens
-    parts = pat_norm.split("|")
-    if len(parts) > 1 and len(parts) <= 15:
-        all_branch_tokens: list[set[str]] = []
-        for part in parts:
-            cleaned = re.sub(r"\[[^\]]*\]", " ", part)
-            cleaned = re.sub(r"\\[bBwWsSdD]", " ", cleaned)
-            words = {w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}", cleaned)
-                     if w.lower() not in ("true", "false", "null", "nil", "none", "undefined")}
-            if words:
-                all_branch_tokens.append(words)
-        if len(all_branch_tokens) == len(parts):
-            # Every branch has tokens: union of branches is necessary
-            return set.union(*all_branch_tokens)
+        def flush() -> None:
+            literals.update(re.findall(r"[a-z_][a-z0-9_]{1,}", "".join(run)))
+            run.clear()
 
-    # General regex: extract words of length >= 3 outside character classes
-    cleaned = re.sub(r"\[[^\]]*\]", " ", pat_norm)
-    cleaned = re.sub(r"\\[bBwWsSdD]", " ", cleaned)
-    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", cleaned)
-    for w in words:
-        wl = w.lower()
-        if len(wl) >= 3 and wl not in ("true", "false", "null", "nil", "none", "undefined"):
-            literals.add(wl)
+        for opcode, value in sequence:
+            op = str(opcode)
+            if op == "LITERAL":
+                run.append(chr(value).lower())
+                continue
+            if op == "IN" and all(str(kind) == "LITERAL" for kind, _ in value):
+                chars = {chr(code).lower() for _, code in value}
+                if len(chars) == 1:
+                    run.append(chars.pop())
+                    continue
+            flush()
+            if op == "SUBPATTERN":
+                literals.update(walk(value[-1]))
+            elif op in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                if value[0] > 0:
+                    literals.update(walk(value[2]))
+            elif op == "BRANCH":
+                literals.update(alternatives(value[1]))
+            elif op == "ASSERT":
+                literals.update(walk(value[1]))
+            elif op == "ATOMIC_GROUP":
+                literals.update(walk(value))
+            elif op == "GROUPREF_EXISTS":
+                literals.update(alternatives((value[1], value[2] or [])))
+            elif op not in ("IN", "AT", "ANY", "NOT_LITERAL", "CATEGORY", "ASSERT_NOT", "GROUPREF"):
+                return set()
+        flush()
+        return literals
 
-    return literals
+    try:
+        from re import _parser
+        return walk(_parser.parse(pat, getattr(regex, "flags", 0)))
+    except (ImportError, AttributeError, ValueError, TypeError, OverflowError, RecursionError, re.error):
+        return set()
 
 
 def extract_pattern_literals(pattern: Any) -> set[str]:
@@ -514,12 +404,14 @@ def build_prefilter_index(
     # 3. Analyzers
     if analyzers:
         for aname in analyzers:
-            lits = ANALYZER_LITERALS.get(aname, set())
-            is_fallback = len(lits) == 0
+            # An arbitrary callback's name is not a necessary source predicate.
+            # Global guessed keyword lists omitted real sinks (e.g. writeFile,
+            # unlink, mkdir and sendFile in the path-traversal analyzer). Let
+            # callbacks apply their own guards to the complete selection.
             index.add_rule(RuleSpec(
                 rule_id=aname,
-                literals=frozenset(lits),
-                is_fallback=is_fallback,
+                literals=frozenset(),
+                is_fallback=True,
                 kind="analyzer",
             ))
 

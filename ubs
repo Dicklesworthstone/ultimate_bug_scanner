@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.13"
+UBS_VERSION="5.4.14"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='be76e93701bb3813a5f04ccf7a8425ecf1ba99ec68500ae40121035271a41949'
-  [cpp]='a9924b9eb0ca5a62be7c0db3866811dad7fb7cbf42bd48ab48021f81ac6aa47f'
-  [csharp]='438fe963f6807752fcd79425b1257705e428df2fa143ec9a407ee71a46095069'
-  [elixir]='3dd4876e32e288d333b60a3fc1b04cd5b337304e38ac5277b6fff9ba54c21207'
-  [golang]='1a1918d29f15638f1f4e4c8afeaf939240343de504807872a49c0afdc2adf1a1'
-  [java]='4a72924c41f30a8291173c922ed749e2bc2834f4857415cd9969303e3ac98eaf'
-  [js]='bcf4db0ecd9ac681894caf568d9feabd77b49c391ca4c4ec81c06c26b067c75b'
-  [kotlin]='e90a2ac4c542ecbe884ab25b5c871dc75d6fb432c9b38074aee8f956a1fe11bb'
-  [python]='9071e02091a4c1f238bc0cd15f9652cfc8874d931103b387652e0ad23e7fc0c1'
-  [ruby]='6cee5a3338db1d0cc715db5c46974a69790c4388ff158d03262f893589847d80'
-  [rust]='e4c5e4de596a96f21b2f4c2035a50c6f88859f56259d79ddad4076c0e6447922'
-  [swift]='4d82cfd4ec41cf7f61ebea87c2f1664ca4acb40416445b20ce44d521c5e37e42'
+  [bash]='12f3537b33aba3ee86c56748133c3b35120a23c6c94cdfcc9dcf3e6f69ed4426'
+  [cpp]='b00cebfebae229ef3198e0ce39270d469d76cdb122954a5a3b2c1a59c34e957e'
+  [csharp]='a812c2df1bf82e5f46d3ad5f38a1b3c12a51deb83d448b2a4934d1698813d9cd'
+  [elixir]='2b64d13035b9c4e68ac99ea465d8aece209933a10d4c1db20aab681fb5c2e6a9'
+  [golang]='a94a24f83f640eed75044ca2be8fd7d8930ffc0544356a7d43d328863b6f3ac0'
+  [java]='3330ce4ee3106a98e459c0a58de780882ec5334f87ea601542c7f63660ea8322'
+  [js]='be52f36bf83bf3f69041c24d482b16098bd0df301575ffddab3ccdd2c70ef4b0'
+  [kotlin]='575443c5f602de88c758951afbda667a2a78d6719157581fca3a659fb8ff7b9f'
+  [python]='60fdbd95f8ac601d7772f45fa39096a17c4cfa02bfc99982eb8e2afe78c7affc'
+  [ruby]='ddff1ebf511013fa49c51680a1780c04dd0288d9e7159931e5ac5bb15ea31142'
+  [rust]='3e38a07ef87244bbe71d33ba3614f205eb142df3a913c88b69f89d393829a17d'
+  [swift]='1711101ebef3331923f12d8703dbaf13169079292d43be31ef2c5c1107d8a95f'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -294,7 +294,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='2ea25fa756000235c64be1b02dad721d5e5d57284522648de73dcec36be14fde'
   ['helpers/ubs_core/lexer.py']='12c6db052e94728b110b2cd551311ba88ef815a3839eb565a4d6f2eb1256bfa5'
-  ['helpers/ubs_core/prefilter.py']='0c6c75c4e0e24eb9b6d03ba213f9d558f18b2672640d42cdaef33076f807d635'
+  ['helpers/ubs_core/prefilter.py']='2e93afaf372ae220aca2e197667a6f08cbd570ca23587a8ef5e94c369a916a64'
   ['helpers/ubs_core/py_ast.py']='ab9239b606c0c06f7d9ea4d1e7dbcaaf73cb86ca40445cdbf56d286e73339cc2'
   ['helpers/ubs_core/py_detectors/__init__.py']='7ff850f4cf568398d6d1791d8ed932271ae685d789083683ae11917e24fd8504'
   ['helpers/ubs_core/py_detectors/_pathlike.py']='90b1b71bce5606f1a5684c9122fc14ac27bbbf5ba4ebf455343e29145a0b2e1c'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='f4480fda5cdda8c99aafe4f71a7867dd029098ea32ac19a10a00814557b052bf'
+  ['lib/ubs-common.sh']='9791db2d009df8a0ec7572c033191476e253ef4b29f616f83b2dbe2434a9cba2'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

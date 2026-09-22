@@ -12,6 +12,7 @@ Verifies:
 from __future__ import annotations
 
 import importlib  # ubs:ignore[py.deprecations.deprecated-api]
+import io
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -415,6 +417,161 @@ class RunPrefilterTests(unittest.TestCase):
                     os.environ.pop(ENV_NO_PREFILTER, None)
                 else:
                     os.environ[ENV_NO_PREFILTER] = old_val
+
+
+class PrefilterAdmissionTests(unittest.TestCase):
+    """The optional accelerator must never remove real scanner candidates."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="ubs-prefilter-admission-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.target = self.root / "source.js"
+        self.target.write_text("danger();\n", encoding="utf-8")
+        self.index = PrefilterIndex()
+        for literal in ("danger", "safe"):
+            self.index.add_rule(RuleSpec(
+                rule_id=literal, literals=frozenset({literal}),
+                is_fallback=False, kind="ast",
+            ))
+        self.index.finalize()
+
+    def fake_rg(self, output: str, status: int = 0) -> dict[str, str]:
+        executable = self.root / "rg"
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\nsys.stdout.write({output!r})\n"
+            f"sys.exit({status})\n", encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return {"PATH": str(self.root) + os.pathsep + os.environ.get("PATH", "")}
+
+    def assert_bypassed(self, output: str, status: int = 0) -> None:
+        stderr = io.StringIO()
+        with patch.dict(os.environ, self.fake_rg(output, status)), patch("sys.stderr", stderr):
+            result = run_prefilter([self.target], self.index)
+        self.assertTrue(result.is_bypass)
+        self.assertEqual(result.ast_files, [self.target])
+        self.assertEqual(result.candidate_rules_for(self.target), set(self.index.rules))
+        self.assertIn("bypass", stderr.getvalue())
+
+    def test_rg_failure_cannot_become_a_negative_match(self) -> None:
+        self.assert_bypassed('{"type":"summary","data":{"stats":{"matches":0}}}\n', 2)
+
+    def test_malformed_or_truncated_json_cannot_drop_candidates(self) -> None:
+        for output in ("not json\n", "[]\n", "{\"type\":\"match\"}\n", "", "null\n"):
+            with self.subTest(output=output):
+                self.assert_bypassed(output)
+
+    def test_well_formed_but_incomplete_stream_cannot_drop_candidates(self) -> None:
+        self.assert_bypassed(json.dumps({"type": "begin", "data": {
+            "path": {"text": str(self.target)},
+        }}) + "\n")
+
+    @unittest.skipUnless(os.name == "posix", "requires byte-preserving POSIX filenames")
+    def test_non_utf8_filename_retains_the_scannable_file(self) -> None:
+        target = self.root / os.fsdecode(b"entry-\xff.js")
+        target.write_text("danger();\n", encoding="utf-8")
+        result = run_prefilter([target], self.index)
+        self.assertIn("danger", result.candidate_rules_for(target))
+        self.assertIn(target, result.ast_files)
+
+    def test_binary_detection_does_not_hide_source_after_nul(self) -> None:
+        self.target.write_bytes(b"// metadata\x00\ndanger();\n")
+        result = run_prefilter([self.target], self.index)
+        self.assertIn("danger", result.candidate_rules_for(self.target))
+
+    def test_non_utf8_source_line_keeps_every_matching_literal(self) -> None:
+        self.target.write_bytes(b"// \xff danger safe\n")
+        result = run_prefilter([self.target], self.index)
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    def test_lossy_decoding_and_unicode_folding_cannot_remove_candidates(self) -> None:
+        # Shipped helpers use both errors='ignore' and errors='replace', and
+        # Python re.IGNORECASE includes Unicode equivalents absent from ASCII.
+        for content in (b"dange\xffr();\n", "ſafe();\n".encode()):
+            with self.subTest(content=content):
+                self.target.write_bytes(content)
+                result = run_prefilter([self.target], self.index)
+                self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    def test_bounded_executor_failure_admits_every_check(self) -> None:
+        from ubs_core.external_tools import ToolOutput
+
+        for message in ("timed out", "output exceeds limit", "could not launch"):
+            def failed(*args, **kwargs):
+                args[4].append(message)
+                return ToolOutput(0, "", "")
+            with self.subTest(message=message), patch(
+                "ubs_core.external_tools.run_command", side_effect=failed,
+            ), patch("sys.stderr", io.StringIO()):
+                result = run_prefilter([self.target], self.index)
+            self.assertTrue(result.is_bypass)
+            self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFOs")
+    def test_special_file_never_launches_rg(self) -> None:
+        target = self.root / "named-pipe.js"
+        os.mkfifo(target)
+        with patch("ubs_core.external_tools.run_command") as execute, patch("sys.stderr", io.StringIO()):
+            result = run_prefilter([target], self.index)
+        execute.assert_not_called()
+        self.assertTrue(result.is_bypass)
+
+    def test_aliases_share_candidates_and_dash_is_not_stdin(self) -> None:
+        target = self.root / "-"
+        target.write_text("danger();\n", encoding="utf-8")
+        old_cwd = Path.cwd()
+        try:
+            os.chdir(self.root)
+            files = [Path("-"), target]
+            result = run_prefilter(files, self.index)
+            for file in files:
+                self.assertIn("danger", result.candidate_rules_for(file))
+            self.assertEqual(result.ast_files, files)
+        finally:
+            os.chdir(old_cwd)
+
+    def test_adding_rule_after_finalization_rebuilds_the_matcher(self) -> None:
+        self.index.add_rule(RuleSpec("ger", frozenset({"ger"}), False, kind="ast"))
+        result = run_prefilter([self.target], self.index)
+        self.assertIn("ger", result.candidate_rules_for(self.target))
+
+    def test_successful_no_match_still_filters_clean_inputs(self) -> None:
+        self.target.write_text("untouched();\n", encoding="utf-8")
+        result = run_prefilter([self.target], self.index)
+        self.assertFalse(result.is_bypass)
+        self.assertEqual(result.ast_files, [])
+        self.assertEqual(result.candidate_rules_for(self.target), set())
+
+    def test_overlapping_literals_retain_both_rules(self) -> None:
+        self.target.write_text("abcdef();\n", encoding="utf-8")
+        index = PrefilterIndex()
+        for literal in ("abcd", "cdef"):
+            index.add_rule(RuleSpec(literal, frozenset({literal}), False, kind="ast"))
+        result = run_prefilter([self.target], index)
+        self.assertEqual(result.candidate_rules_for(self.target), {"abcd", "cdef"})
+
+    def test_user_rg_config_cannot_limit_the_scan(self) -> None:
+        self.target.write_text("safe();\ndanger();\n", encoding="utf-8")
+        config = self.root / "ripgreprc"
+        config.write_text("--max-count=1\n", encoding="utf-8")
+        with patch.dict(os.environ, {"RIPGREP_CONFIG_PATH": str(config)}):
+            result = run_prefilter([self.target], self.index)
+        self.assertEqual(result.candidate_rules_for(self.target), {"danger", "safe"})
+
+    def test_real_native_findings_match_unfiltered_execution(self) -> None:
+        from ubs_core.js_scan import Pattern, scan_patterns
+
+        self.target.write_text("abcdef();\n", encoding="utf-8")
+        patterns = [Pattern(
+            category=7, rule_id=literal, title=literal, regex=re.compile(literal),
+            thresholds=((0, "critical"),),
+        ) for literal in ("abcd", "cdef")]
+        result = run_prefilter([self.target], build_prefilter_index(patterns=patterns))
+        filtered, unfiltered = io.StringIO(), io.StringIO()
+        scan_patterns(patterns, [self.target], filtered, set(), prefilter=result)
+        scan_patterns(patterns, [self.target], unfiltered, set())
+        self.assertEqual(filtered.getvalue(), unfiltered.getvalue())
 
 
 if __name__ == "__main__":

@@ -74,3 +74,87 @@ jobs:
         run: |
           python3 scripts/update_checksums.py
           git diff --exit-code
+
+  bash-policy-validation:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'validate Bash policy coverage')
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli
+      - name: Read the immutable procedure authored for this task
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, yaml
+          from pathlib import Path
+          source = subprocess.check_output([
+              'git', 'show', '0a9cb41a2bfbd8f0b8d4bb1ffbc0040475a34eea:.github/workflows/checksum-sync.yml'
+          ], text=True)
+          steps = yaml.safe_load(source)['jobs']['bash-policy-validation']['steps']
+          names = [
+              'Retrieve immutable reviewed patch and regression cases',
+              'Demonstrate lost-policy regression on the unmodified implementation',
+              'Apply reviewed changes and update the required checksum chain',
+              'Run targeted unit and real-analyzer integration regressions',
+              'Exercise the full test gate without concealing its result',
+              'Store reviewed candidate blobs without moving any branch',
+          ]
+          for index, name in enumerate(names):
+              matches = [step['run'] for step in steps if step.get('name') == name]
+              assert len(matches) == 1, name
+              Path(os.environ['RUNNER_TEMP'], f'policy-step-{index}.sh').write_text(matches[0])
+          PY
+          mkdir -p "$RUNNER_TEMP/policy-bundle/tools"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/policy-bundle/source.tar"
+          cp -L "$(command -v shellcheck)" "$RUNNER_TEMP/policy-bundle/tools/shellcheck"
+          find "$(npm root -g)/@ast-grep" -type f -name ast-grep -exec cp {} "$RUNNER_TEMP/policy-bundle/tools/ast-grep" \;
+          "$RUNNER_TEMP/policy-bundle/tools/ast-grep" --version
+      - name: Retrieve candidate inputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash -e -o pipefail "$RUNNER_TEMP/policy-step-0.sh"
+      - name: Preserve a reproducible checkout and analyzer binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bash-policy-repro
+          path: ${{ runner.temp }}/policy-bundle
+          retention-days: 3
+      - name: Reproduce the original lost finding
+        run: bash -e -o pipefail "$RUNNER_TEMP/policy-step-1.sh"
+      - name: Apply reviewed candidate and synchronize checksums
+        run: bash -e -o pipefail "$RUNNER_TEMP/policy-step-2.sh"
+      - name: Validate targeted regressions
+        id: targeted
+        run: bash -e -o pipefail "$RUNNER_TEMP/policy-step-3.sh"
+      - name: Run the full test gate
+        id: full
+        if: always() && steps.targeted.outcome == 'success'
+        run: bash -e -o pipefail "$RUNNER_TEMP/policy-step-4.sh"
+      - name: Store tested candidate blobs only
+        if: always() && steps.targeted.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FULL_OUTCOME: ${{ steps.full.outcome }}
+        run: bash -e -o pipefail "$RUNNER_TEMP/policy-step-5.sh"
+      - name: Preserve validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bash-policy-validation-logs
+          path: |
+            ${{ runner.temp }}/policy-*.log
+            ${{ runner.temp }}/policy-lint-*.json
+          retention-days: 3

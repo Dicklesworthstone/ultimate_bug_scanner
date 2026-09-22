@@ -44,6 +44,12 @@ if [[ -n "${UBS_REPO_RAW_BASE:-}" ]]; then
 fi
 REPO_RAW="${REPO_RAW_BASE}/v${UBS_VERSION}"
 REPO_RAW_LATEST="${REPO_RAW_BASE}/main"
+# Opt-in only (issue #140): when the pinned tag fetch of a module or helper
+# fails, fall back to main only if the operator sets UBS_ALLOW_MAIN_FALLBACK=1.
+# A silent fallback mixes a main-branch asset into a tag install; the version
+# skew resurfaces as checksum refusals the doctor cannot durably repair,
+# because the doctor downloads through the same fallback.
+UBS_ALLOW_MAIN_FALLBACK="${UBS_ALLOW_MAIN_FALLBACK:-0}"
 MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
@@ -1488,6 +1494,9 @@ Environment Variables:
   UBS_NO_CACHE=1              Disable scan caching (like --no-cache)
   UBS_CACHE_DIR=PATH          Override root directory for scan cache (like --cache-dir)
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
+  UBS_ALLOW_MAIN_FALLBACK=1   Opt in to fetching modules/helpers from main when the
+                              pinned tag fetch fails (default off: a silent fallback
+                              can mix main content into a tag install, #140)
   UBS_MODULE_TIMEOUT=SECS     Per-module timeout (default: 300)
   UBS_PROFILE=1               Add phase timings (copy, fan-out, per module, merge, total ms)
                               as a "profile" block in json/toon output and a Profile line in text
@@ -1622,6 +1631,7 @@ cat <<'JSON'
     {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
     {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Per-module timeout (default 300)."},
     {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
+    {"name": "UBS_ALLOW_MAIN_FALLBACK", "value": "1", "description": "Opt in to fetching modules/helpers from main when the pinned tag fetch fails (default off: a silent fallback can mix main content into a tag install)."},
     {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, list_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
     {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables). Measured over the listed files: binary/media/archive/data files and files above UBS_MAX_FILE_MB are not counted or copied."},
@@ -4900,7 +4910,7 @@ download_module(){
   release_url=$(printf '%s' "$MODULE_PATH_TEMPLATE" | sed "s/%s/$lang/")
   latest_url=$(printf '%s' "$MODULE_PATH_TEMPLATE_LATEST" | sed "s/%s/$lang/")
   local -a urls=("$release_url")
-  if [[ "$latest_url" != "$release_url" ]]; then
+  if [[ "$latest_url" != "$release_url" && "${UBS_ALLOW_MAIN_FALLBACK}" == "1" ]]; then
     urls+=("$latest_url")
   fi
   local total=${#urls[@]} idx=0
@@ -4939,6 +4949,9 @@ download_module(){
         continue
       fi
       say "${RED}$X ${err_msg}${RESET}"
+      if [[ "${UBS_ALLOW_MAIN_FALLBACK}" != "1" ]]; then
+        say_err "main fallback is disabled (set UBS_ALLOW_MAIN_FALLBACK=1 to fetch from main); Fix: retry the download, or run ubs --update"
+      fi
       return 1
     fi
     # sanity checks
@@ -4949,6 +4962,9 @@ download_module(){
         continue
       fi
       say "${RED}$X empty module file for $lang${RESET}"
+      if [[ "${UBS_ALLOW_MAIN_FALLBACK}" != "1" ]]; then
+        say_err "main fallback is disabled (set UBS_ALLOW_MAIN_FALLBACK=1 to fetch from main); Fix: retry the download, or run ubs --update"
+      fi
       return 1
     fi
     head="$(head -n 1 "$tmp" | tr -d '\r')"
@@ -4980,6 +4996,9 @@ download_module(){
           continue
         fi
         say "${RED}$X failed to verify module ${BOLD}$lang${RESET}: $err_msg"
+        if [[ "${UBS_ALLOW_MAIN_FALLBACK}" != "1" ]]; then
+          say_err "main fallback is disabled (set UBS_ALLOW_MAIN_FALLBACK=1 to fetch from main); Fix: retry the download, or run ubs --update"
+        fi
         return 1
       fi
     fi
@@ -5001,7 +5020,7 @@ download_helper_asset(){
   local latest_url="${REPO_RAW_LATEST}/modules/${rel}"
   local url label tmp err_msg
   local -a urls=("$release_url")
-  if [[ "$latest_url" != "$release_url" ]]; then
+  if [[ "$latest_url" != "$release_url" && "${UBS_ALLOW_MAIN_FALLBACK}" == "1" ]]; then
     urls+=("$latest_url")
   fi
   local total=${#urls[@]} idx=0
@@ -5040,6 +5059,9 @@ download_helper_asset(){
         continue
       fi
       say "${RED}$X ${err_msg}${RESET}"
+      if [[ "${UBS_ALLOW_MAIN_FALLBACK}" != "1" ]]; then
+        say_err "main fallback is disabled (set UBS_ALLOW_MAIN_FALLBACK=1 to fetch from main); Fix: retry the download, or run ubs --update"
+      fi
       return 1
     fi
     local empty_sha="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -5072,6 +5094,9 @@ download_helper_asset(){
           continue
         fi
         say "${RED}$X failed to verify helper ${BOLD}$rel${RESET}: $err_msg"
+        if [[ "${UBS_ALLOW_MAIN_FALLBACK}" != "1" ]]; then
+          say_err "main fallback is disabled (set UBS_ALLOW_MAIN_FALLBACK=1 to fetch from main); Fix: retry the download, or run ubs --update"
+        fi
         return 1
       fi
     fi

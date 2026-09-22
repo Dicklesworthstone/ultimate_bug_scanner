@@ -73,6 +73,7 @@ class Sandbox:
         tamper: bool = False,
         serve_tampered: bool = False,
         missing_helper: bool = False,
+        release_serves_nothing: bool = False,
         tamper_targets: tuple[str, ...] = (TAMPERED_HELPER,),
     ) -> None:
         self.tmp = tmp
@@ -105,8 +106,16 @@ class Sandbox:
                 target.write_text(target.read_text(encoding="utf-8") + TAMPER_SUFFIX, encoding="utf-8")
         # Local "raw.githubusercontent.com": both the release tag and main paths.
         for ref in (f"v{ubs_version()}", "main"):
+            if release_serves_nothing and ref == f"v{ubs_version()}":
+                # The tag answers 404: the release fetch fails and only the
+                # main fallback could repair the cache (#140).
+                continue
             mod_raw_dir = self.raw_base / ref / "modules"
             mod_raw_dir.mkdir(parents=True, exist_ok=True)
+            # modules/contract.json ships through the same helper channel.
+            contract = MODULES / "contract.json"
+            if contract.is_file():
+                shutil.copy2(contract, mod_raw_dir / "contract.json")
             shutil.copy2(MODULES / "ubs-python.sh", mod_raw_dir / "ubs-python.sh")
             dest = mod_raw_dir / "helpers"
             dest.mkdir(parents=True, exist_ok=True)
@@ -220,6 +229,32 @@ def check_download_failure_only_warns() -> None:
         combined = proc.stdout + proc.stderr
         ok = proc.returncode in (0, 1) and "continuing with reduced accuracy" in combined and "refusing" not in combined
         report("download_failure_only_warns", ok, f"exit={proc.returncode}", proc)
+
+
+def check_main_fallback_disabled_by_default() -> None:
+    # Issue #140: a failed tag fetch must not be silently repaired from main.
+    # A main-branch asset dropped into a tag install is the version skew that
+    # made the module refuse its own helpers and could not be durably repaired
+    # by the doctor, which downloads through the same fallback.
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        sb = Sandbox(Path(tmp), tamper=False, serve_tampered=False, missing_helper=True, release_serves_nothing=True)
+        proc = sb.run()
+        combined = proc.stdout + proc.stderr
+        ok = "(main fallback)" not in combined and "main fallback is disabled" in combined
+        report("main_fallback_disabled_by_default", ok, f"exit={proc.returncode}", proc)
+
+
+def check_main_fallback_opt_in_works() -> None:
+    # The explicit escape hatch still repairs the cache from main, loudly.
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp:
+        sb = Sandbox(Path(tmp), tamper=False, serve_tampered=False, missing_helper=True, release_serves_nothing=True)
+        proc = sb.run(("UBS_ALLOW_MAIN_FALLBACK", "1"))
+        combined = proc.stdout + proc.stderr
+        # "helper unavailable" must be gone: the fallback repaired the cache.
+        # (A later refusal from the module's own manifest is upstream main's
+        # pre-existing drift, exercised by test_standalone_module_verifies.)
+        ok = "(main fallback)" in combined and "helper unavailable" not in combined
+        report("main_fallback_opt_in_works", ok, f"exit={proc.returncode}", proc)
 
 
 def setup_module_sandbox(dest: Path) -> None:
@@ -499,6 +534,8 @@ def main() -> int:
         check_tampered_core_refused,
         check_override_allows_unverified,
         check_download_failure_only_warns,
+        check_main_fallback_disabled_by_default,
+        check_main_fallback_opt_in_works,
         test_tampered_helper_refused,
         test_standalone_module_verifies,
         check_tampered_module_refreshed_from_clean_source,

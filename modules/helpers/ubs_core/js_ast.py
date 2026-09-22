@@ -20,6 +20,7 @@ count exceeds its removeEventListener count.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -92,7 +93,8 @@ def scan_config(
         batch = [str(p) for p in path_list[start : start + _BATCH]]
         try:
             proc = subprocess.run(
-                [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
+                [os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin,
+                 "scan", "-c", str(config), "--json=stream", *batch],
                 capture_output=True,
                 text=True,
                 timeout=600,
@@ -141,6 +143,9 @@ def scan_config(
             path = Path(file_str)
             line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
             severity = (severity_overrides or {}).get(rule_id) or str(match.get("severity", "warning"))
+            severity = {"error": "critical", "hint": "info"}.get(severity, severity)
+            if severity == "off":
+                continue
             if severity not in counters:
                 severity = "warning"
             if rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
@@ -172,9 +177,10 @@ def scan_all(
     skip_categories: set[int] | None = None,
     errors: list[str] | None = None,
 ) -> dict[str, int]:
-    """Run every sgbase-<lang>.yml (base-language rules only) in rule_dir;
-    aggregate counters. The variant-bearing sgconfig-*.yml files stay
-    SARIF-only, mirroring the legacy text-mode scan of the base pack.
+    """Run the grammar configs and the isolated custom policy config once.
+
+    Custom policies retain their authored severity and every reported ID:
+    built-in counting/calibration must not silently weaken project policies.
     Rules whose category is skipped (--skip) are not emitted.
 
     ``errors`` collects any scan that could not complete, so the caller can
@@ -182,8 +188,10 @@ def scan_all(
     total = {"critical": 0, "warning": 0, "info": 0}
     for config in sorted(rule_dir.glob("sgconfig-*.yml")):
         lang = config.stem.removeprefix("sgconfig-")
-        counters = scan_config(config, paths, sink, lang, severity_overrides, ast_grep_bin,
-                               count_only, skip_categories, errors)
+        custom = lang == "custom"
+        counters = scan_config(config, paths, sink, lang,
+                               None if custom else severity_overrides, ast_grep_bin,
+                               None if custom else count_only, skip_categories, errors)
         for key, value in counters.items():
             total[key] = total.get(key, 0) + value
     return total

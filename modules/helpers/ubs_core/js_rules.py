@@ -18,9 +18,9 @@ and the per-group severity/summary/remediation metadata maps (96-202).
     <rule_dir>/manifest.json rule_id -> {severity, language, file} for the 37
                              base rules; also the dict ``generate`` returns
 
-User rules (``user_rules_dir``) are copied verbatim under ``rules/``, listed in
-the config of their declared grammar, and excluded from variant generation
-(GH #93): their author controls language targeting.
+User rules are copied verbatim under ``rules/custom/`` and scanned once through
+their own config. ast-grep, not a partial YAML parser, interprets their grammar,
+IDs, multi-document syntax and severity. They never overwrite built-in files.
 
 Manifest severity is ``SEVERITY_MAP[rule_id]`` when mapped, else the YAML
 severity — matching legacy report-time lookup (ubs-js.sh 522). The exported
@@ -32,6 +32,7 @@ contract category grammar ``<lang>.<family>`` (js.async, js.error, ...).
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -744,19 +745,44 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict:
     rules_dir = rule_dir / "rules"
     rules_dir.mkdir(parents=True, exist_ok=True)
 
-    # User rules are copied verbatim and excluded from language-variant
-    # generation (GH #93): a user rule may rely on language-specific syntax
-    # and its author controls its language targeting. (ubs-js.sh 3142-3152)
-    user_rule_files: list[Path] = []
+    # Keep policies isolated from built-in filenames and calibration. Discover
+    # both YAML suffixes recursively; never silently skip an explicit pack.
+    custom_entries: list[str] = []
     if user_rules_dir is not None:
         user_rules_dir = Path(user_rules_dir)
-        if user_rules_dir.is_dir():
-            shutil.copytree(user_rules_dir, rules_dir, dirs_exist_ok=True)
-            user_rule_files = sorted(
-                path
-                for path in user_rules_dir.iterdir()
-                if path.is_file() and path.suffix == ".yml"
-            )
+        if not user_rules_dir.is_dir():
+            raise ValueError(f"Custom rules directory does not exist: {user_rules_dir}")
+        if rule_dir.resolve().is_relative_to(user_rules_dir.resolve()):
+            raise ValueError("Generated rules must not be inside the custom rules directory")
+        def walk_error(exc: OSError) -> None:
+            raise exc
+
+        candidates: list[Path] = []
+        for root, directories, files in os.walk(user_rules_dir, onerror=walk_error):
+            candidates.extend(Path(root) / name for name in directories + files)
+        for source in sorted(candidates):
+            if source.suffix not in {".yml", ".yaml"}:
+                continue
+            if not source.is_file():
+                raise ValueError(f"Custom rule is not a regular file: {source}")
+            text = source.read_text(encoding="utf-8")
+            if not text.strip():
+                raise ValueError(f"Custom rule is empty: {source}")
+            target = rules_dir / "custom" / source.relative_to(user_rules_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            custom_entries.append(target.relative_to(rule_dir).as_posix())
+        if not custom_entries:
+            raise ValueError(f"No .yml or .yaml custom rules found in {user_rules_dir}")
+    custom_config = rule_dir / "sgconfig-custom.yml"
+    if custom_entries or custom_config.exists():
+        # JSON strings are valid YAML scalars, including paths containing ':',
+        # '#', apostrophes and newlines. Replace the selection on regeneration
+        # so old copied policies cannot remain active after being removed.
+        custom_config.write_text(
+            "ruleDirs: " + json.dumps(custom_entries, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
     manifest: dict[str, dict[str, str]] = {}
     grammar_files: dict[str, list[str]] = {grammar: [] for grammar in _GRAMMARS}
@@ -779,16 +805,6 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict:
                 _retarget(rule_text, language, target), encoding="utf-8"
             )
             grammar_files[target].append(variant)
-
-    for user_file in user_rule_files:
-        user_text = user_file.read_text(encoding="utf-8", errors="replace")
-        language = _first_match(_LANGUAGE_RE, user_text)
-        # An off-grammar (or undeclared) user rule cannot match under the three
-        # JS grammars, so listing it in every config mirrors the legacy
-        # scan-everything behavior without double counting.
-        grammars = (language,) if language in _GRAMMARS else _GRAMMARS
-        for grammar in grammars:
-            grammar_files[grammar].append(f"rules/{user_file.name}")
 
     for grammar in _GRAMMARS:
         # ast-grep discovers rules per `ruleDirs` entry; a single entry accepts

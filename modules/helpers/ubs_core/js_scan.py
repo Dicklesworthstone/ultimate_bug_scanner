@@ -452,6 +452,11 @@ def main(argv: list[str] | None = None) -> int:
                     except OSError:
                         pass
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
+            if (Path(args.ast_rule_dir) / "sgconfig-custom.yml").is_file():
+                # Arbitrary policies may be structural, multi-document or use
+                # YAML aliases. Built-in literal hints cannot prove that a
+                # file is irrelevant to them; let ast-grep select the grammar.
+                ast_files = files_to_scan
             scan_all(Path(args.ast_rule_dir), ast_files, capturing_sink, overrides,
                      count_only=count_allowed, skip_categories=skip, errors=scan_errors)
         # An incomplete analysis must never become the cached answer: the next

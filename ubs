@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.11"
+UBS_VERSION="5.4.12"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='56327a1e0aeb5178a4233dc91ba1f1c34b1fae29f182c695df0eb8ca12811c9c'
-  [cpp]='b9c5b5f177887b918d5efbf124e437673456b234b7a5b18d28bb60a406fda9e4'
-  [csharp]='e2ee621b37b3b06846f5221a31396922b4aa83f75399c24e10c5dd7485cc3eab'
-  [elixir]='029f09d58ffe7027f26d7892185af1badcfc4706f7dd474418673030d58c9598'
-  [golang]='bbb9a2fe6cb0876e6e36567e7e6e34da3bb4057de2ad378480c3be4370e11197'
-  [java]='313c3831ec0f2aee597aa9ca52acedb21eb81b779ea5d4b23fe5b2f05874466d'
-  [js]='666a25885b2fb5f12e55629706e85eebd2804242f9c6b625b6fd1f426169a334'
-  [kotlin]='5980bd1e92e4fdc0cecd21674e0ba96b12598b8d74920933fcdc4aa099e2e501'
-  [python]='7de02c0aedca9eda37d1606dc4232aa75fbc1f3e69b99fdef62ab020d72d7bd6'
-  [ruby]='8a3d56ab07fa4b179970b325ee1c9a1d7e9124b8a00aec251a0777e1ae39bf3b'
-  [rust]='a8eb1e50b8e3d2069e2ee97095f095eec31f2b8b5cdd79608bcfab960d585662'
-  [swift]='69141e7c0057025ff46592380ef201b6d19d7d3f42b6c296bc68986c9317abf5'
+  [bash]='0eee1269790651499cbbcad8b94a30ec049205b8245a64d0e6db42608e47cbe6'
+  [cpp]='9b9d03dbf0093fea4c397065e5cde8629e1dc78270c21ae57c380f2d8001808f'
+  [csharp]='b5132e4550d04743aa4ca3062445423fc33c1db7db0fe80a63452575774efa53'
+  [elixir]='c28b9e1c42e5a863e13f9a0874400e052143b9895e55aa0d95027309c7fd52c2'
+  [golang]='4d0eef02e7834a7688ebfab4d9c9c513cd7b7971ab2d5e28a14afa03a697b05c'
+  [java]='882d1a1cc390acb97916a3470e6f765a1949e2eb0edc1fe3ab98ce6285d7065d'
+  [js]='96801375b3519433acb559fc4902e0a8cc21eb9f60f638696616a9ad54229a69'
+  [kotlin]='17468d2c6ebe4c239de0d7a63647b700522577c5c50241a6a660ceff3ce2e8a7'
+  [python]='24584d7febba97797e15fcbed5023de737cc2eb922ba8f010be51e085d167d43'
+  [ruby]='2584cec5342e882de4a5a94443dbf4d294e2a79e2b481dd06bab92a810629368'
+  [rust]='4e07299b8f2ed483f160b95c4b99db175509538aa890a0c468b009c1cce98424'
+  [swift]='f4971b26052a1c0cc3747b2be7551e34119c9dc050cde2fa83c3f9d06d6ae7c2'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -281,7 +281,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/java_patterns/security_rg.py']='d1ddb0626ec8729133b915dd27401ea2823df452acd18920c2efd919119864fa'
   ['helpers/ubs_core/java_rules.py']='25646798a89ca69b7a101901456ab0970ad28abdffef5fab33458ff8b900a9cf'
   ['helpers/ubs_core/java_scan.py']='e1d39a3790f943feca57062ff77be558ae766a87fffbffd374f98fe50fbb4997'
-  ['helpers/ubs_core/js_ast.py']='8d626f499b5cfeab8d41775c0d0fb090d56ec052d5cf014eb48a93f11bd6af9f'
+  ['helpers/ubs_core/js_ast.py']='d13bab2345cc73777deb0781d05f9d60e57245b23c2de21d6e841048c72c5235'
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
   ['helpers/ubs_core/js_patterns/debug_quality.py']='de6e0c36dfb9e06691b65ec5e8fd7739ec22840ebf5c487801f998218bb78172'
   ['helpers/ubs_core/js_patterns/eq_regex_dom.py']='d2513ecc6d6311612e0ccd02293d25a5373ef60cf4d689f96ec30c4c12cf4d8a'
@@ -289,8 +289,8 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_patterns/null_coercion.py']='68a079a324429730c55abfef5752f231021c2484177b7f43e49f287e6f55ba59'
   ['helpers/ubs_core/js_patterns/proto_vars.py']='b4fdf0f9ccfa5b4133f12f53dc2813fcd618530756c9a299ed16e1d0c0388b31'
   ['helpers/ubs_core/js_patterns/security_node.py']='7ceb9d14a629fb7bb89fce5c702a7ccc769260be10feab937a843b473efcf81e'
-  ['helpers/ubs_core/js_rules.py']='aef56a2d91a68b9e4aad2586de9d94342555ad74008fb06c0ab10a8142b7eecc'
-  ['helpers/ubs_core/js_scan.py']='ea5b401d230e0b905551057a63dcf46a45e4cfb388afd968111aec3503321902'
+  ['helpers/ubs_core/js_rules.py']='e038f6d8a7ad177e7cce78aa236580c3d2f8cb6dae65bfad172f3961465ebc4a'
+  ['helpers/ubs_core/js_scan.py']='57331bb3e6e4702be56cea645b05c3dac9944b69a0165f46c208635fe3885403'
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='2ea25fa756000235c64be1b02dad721d5e5d57284522648de73dcec36be14fde'
   ['helpers/ubs_core/lexer.py']='12c6db052e94728b110b2cd551311ba88ef815a3839eb565a4d6f2eb1256bfa5'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='b6004fc3958b659f37c9305e63201de163e9e2098043748d2b10777a1235e50b'
+  ['lib/ubs-common.sh']='166821595c43591d4e7c7b58ca7c26b8afad5ff2dc9e3c1c69847d6de3370c4b'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2387,18 +2387,36 @@ if [[ "$USER_RULES_REQUESTED" -eq 1 ]]; then
   if ! USER_RULES_DIR="$(cd -- "$USER_RULES_DIR" && pwd -P)"; then
     refuse_scan "invalid-rules-directory" "Cannot resolve the --rules directory" ""
   fi
-  _custom_rule_count=0
-  for _custom_rule in "$USER_RULES_DIR"/*.yml "$USER_RULES_DIR"/*.yaml; do
-    [[ -e "$_custom_rule" || -L "$_custom_rule" ]] || continue
-    if [[ ! -f "$_custom_rule" || ! -r "$_custom_rule" ]]; then
-      refuse_scan "invalid-rule-file" "Custom rule is not a readable regular file: $_custom_rule" ""
-    fi
-    _custom_rule_count=$((_custom_rule_count + 1))
-  done
+  if ! _custom_rule_count="$(python3 - "$USER_RULES_DIR" <<'PYRULES'
+import os
+import sys
+from pathlib import Path
+
+def failed(exc):
+    raise exc
+
+count = 0
+try:
+    for root, directories, files in os.walk(sys.argv[1], onerror=failed):
+        for name in directories + files:
+            path = Path(root) / name
+            if path.suffix not in {'.yml', '.yaml'}:
+                continue
+            if not path.is_file() or not os.access(path, os.R_OK):
+                raise ValueError(f'Custom rule is not a readable regular file: {path}')
+            count += 1
+except (OSError, ValueError) as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(2)
+print(count)
+PYRULES
+)"; then
+    refuse_scan "invalid-rule-file" "Cannot read the requested custom rules: $USER_RULES_DIR" ""
+  fi
   if [[ "$_custom_rule_count" -eq 0 ]]; then
     refuse_scan "empty-rules-directory" "--rules directory contains no .yml or .yaml files: $USER_RULES_DIR" ""
   fi
-  unset _custom_rule _custom_rule_count
+  unset _custom_rule_count
 fi
 
 # Load ignore patterns early so size checks can respect .ubsignore

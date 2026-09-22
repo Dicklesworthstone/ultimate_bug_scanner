@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="b6004fc3958b659f37c9305e63201de163e9e2098043748d2b10777a1235e50b"
+UBS_LIB_CHECKSUM="166821595c43591d4e7c7b58ca7c26b8afad5ff2dc9e3c1c69847d6de3370c4b"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -129,6 +129,7 @@ JOBS="${JOBS:-0}"
 MAX_JSON_SAMPLES=3
 REPORT_JSON=""
 USER_RULE_DIR=""
+USER_RULES_REQUESTED=0
 DUMP_RULES_DIR=""
 LIST_RULES=0
 FILES_FROM=""
@@ -200,7 +201,9 @@ while [[ $# -gt 0 ]]; do
     --jobs=*)     JOBS="${1#*=}"; shift;;
     --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
-    --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    --rules=*)    USER_RULE_DIR="${1#*=}"; USER_RULES_REQUESTED=1; shift;;
+    --rules)      [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo 'ERROR: --rules requires a directory' >&2; exit 2; }
+                  USER_RULE_DIR="$2"; USER_RULES_REQUESTED=1; shift 2;;
     --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
     --list-rules) LIST_RULES=1; shift;;
     --report-json=*) REPORT_JSON="${1#*=}"; shift;;
@@ -239,6 +242,10 @@ if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; 
 
 # Silence options unused in contract-v2 for shellcheck
 : "$VERBOSE" "$DETAIL_LIMIT" "$JOBS" "$MAX_JSON_SAMPLES" "$USER_RULE_DIR" "$QUIET" "$CI_MODE" "$USE_COLOR"
+if [[ "$USER_RULES_REQUESTED" -eq 1 && -z "$USER_RULE_DIR" ]]; then
+  echo 'ERROR: --rules requires a nonempty directory' >&2
+  exit 2
+fi
 : "$RED" "$GREEN" "$YELLOW" "$BLUE" "$MAGENTA" "$CYAN" "$WHITE" "$GRAY" "$BOLD" "$DIM" "$RESET"
 : "${SCRIPT_DIR}" "${PROJECT_DIR}" "${OUTPUT_FILE:-}" "${SOURCE_PROJECT_DIR:-}"
 
@@ -282,12 +289,10 @@ PYRULES
   fi
   if [[ -n "$DUMP_RULES_DIR" ]]; then
     mkdir -p -- "$DUMP_RULES_DIR" || exit 2
-    for rule_file in "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml; do
-      [[ -f "$rule_file" ]] || continue
-      cp -- "$rule_file" "$DUMP_RULES_DIR/" || exit 2
-    done
+    cp -R -- "$tmp_rules/." "$DUMP_RULES_DIR/" || exit 2
   fi
-  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
+  find "$tmp_rules/rules" -type f \( -name '*.yml' -o -name '*.yaml' \) -exec \
+    awk '/^id:[[:space:]]*/{sub(/^id:[[:space:]]*/,"");print;}' {} + | LC_ALL=C sort -u
   exit 0
 fi
 
@@ -494,6 +499,10 @@ run_contract_v2_js(){
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
 
   if ! check_ast_grep; then
+    if [[ "$USER_RULES_REQUESTED" -eq 1 ]]; then
+      echo 'ERROR: --rules requires ast-grep; requested policies cannot be skipped' >&2
+      return 2
+    fi
     local has_sensitive=0
     if [[ -f "$list_file" ]]; then
       if tr '\0' '\n' <"$list_file" 2>/dev/null | grep -qE '\.(tsx?|jsx)$'; then
@@ -517,26 +526,26 @@ run_contract_v2_js(){
 
   if check_ast_grep; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-jsv2-rules.XXXXXX)"
-    if ! UBS_JS_USER_RULES="${USER_RULE_DIR:-}" PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-import os
+    cleanup_add "$ast_rule_dir"
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$ast_rule_dir" "$USER_RULE_DIR" <<'PYRULES'
+import sys
 from pathlib import Path
 from ubs_core.js_rules import generate
-user = os.environ.get('UBS_JS_USER_RULES', '')
-generate(Path('$ast_rule_dir'), Path(user) if user else None)
-" 2>/dev/null; then
-      ast_rule_dir=""
+generate(Path(sys.argv[1]), Path(sys.argv[2]) if sys.argv[2] else None)
+PYRULES
+    then
+      echo 'ERROR: failed to generate AST rules; scan is incomplete' >&2
+      return 2
     fi
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
   if [[ -n "$DUMP_RULES_DIR" ]]; then
-    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
-    UBS_JS_USER_RULES="${USER_RULE_DIR:-}" PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-import os
-from pathlib import Path
-from ubs_core.js_rules import generate
-user = os.environ.get('UBS_JS_USER_RULES', '')
-generate(Path('$DUMP_RULES_DIR'), Path(user) if user else None)
-" 2>/dev/null || true
+    if [[ -z "$ast_rule_dir" ]]; then
+      echo 'ERROR: --dump-rules requires ast-grep' >&2
+      return 2
+    fi
+    mkdir -p -- "$DUMP_RULES_DIR" || return 2
+    cp -R -- "$ast_rule_dir/." "$DUMP_RULES_DIR/" || return 2
   fi
 
   case "$FORMAT" in

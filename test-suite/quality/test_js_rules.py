@@ -202,37 +202,44 @@ class UserRuleTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_user_rules_copied_verbatim(self) -> None:
-        rules = self.rule_dir / "rules"
+        rules = self.rule_dir / "rules" / "custom"
         self.assertEqual(
             (rules / "my-rule.yml").read_text(encoding="utf-8"),
             (self.user_dir / "my-rule.yml").read_text(encoding="utf-8"),
         )
         self.assertTrue((rules / "sub" / "deep.yml").is_file())
-        self.assertTrue((rules / "README.txt").is_file())
+        self.assertFalse((rules / "README.txt").exists())
 
     def test_user_rules_excluded_from_variants(self) -> None:
         rules = self.rule_dir / "rules"
         self.assertFalse(list(rules.glob("my-rule.*.yml")))
         self.assertFalse(list(rules.glob("ts-rule.*.yml")))
 
-    def test_user_rules_listed_in_declared_grammar_config(self) -> None:
-        js_cfg = (self.rule_dir / "sgconfig-javascript.yml").read_text(encoding="utf-8")
-        ts_cfg = (self.rule_dir / "sgconfig-typescript.yml").read_text(encoding="utf-8")
-        tx_cfg = (self.rule_dir / "sgconfig-tsx.yml").read_text(encoding="utf-8")
-        self.assertIn("rules/my-rule.yml", js_cfg)
-        self.assertNotIn("my-rule", ts_cfg)
-        self.assertNotIn("my-rule", tx_cfg)
-        self.assertIn("rules/ts-rule.yml", ts_cfg)
-        self.assertNotIn("ts-rule.yml", js_cfg)
+    def test_user_rules_are_scheduled_once_in_isolated_config(self) -> None:
+        config = (self.rule_dir / "sgconfig-custom.yml").read_text(encoding="utf-8")
+        paths = json.loads(config.removeprefix("ruleDirs: "))
+        self.assertEqual(paths, ["rules/custom/my-rule.yml", "rules/custom/sub/deep.yml",
+                                 "rules/custom/ts-rule.yml"])
+        for grammar in GRAMMARS:
+            self.assertNotIn("custom/", (self.rule_dir / f"sgconfig-{grammar}.yml").read_text())
 
     def test_generated_manifest_unaffected_by_user_rules(self) -> None:
         self.assertEqual(len(self.manifest), 37)
         self.assertNotIn("myorg.my-rule", self.manifest)
 
-    def test_missing_user_dir_is_ignored(self) -> None:
+    def test_missing_user_dir_is_rejected(self) -> None:
         rule_dir = self.tmp / "pack-nousers"
-        manifest = generate(rule_dir, self.tmp / "does-not-exist")
-        self.assertEqual(len(manifest), 37)
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            generate(rule_dir, self.tmp / "does-not-exist")
+
+    def test_regeneration_disables_previous_custom_selection(self) -> None:
+        generate(self.rule_dir)
+        self.assertEqual((self.rule_dir / "sgconfig-custom.yml").read_text(), "ruleDirs: []\n")
+
+    def test_nonregular_yaml_is_rejected(self) -> None:
+        (self.user_dir / "directory.yaml").mkdir()
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            generate(self.rule_dir, self.user_dir)
 
 
 class MapTests(unittest.TestCase):

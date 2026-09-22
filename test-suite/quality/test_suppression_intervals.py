@@ -810,14 +810,13 @@ class RustNativeSuppressionTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 paths.append(path)
-                # Ownership unwrap retains the legacy `ast-grep run` whole-
-                # line anchor (column1); the generated parsing rule uses the
-                # exact AST expression column. Neither rule may borrow the
-                # other's location contract during cold or cached rendering.
+                # Both structured AST paths report the actual expression
+                # column, not the old run-mode whole-line anchor. Suppression
+                # and cached rendering must preserve those precise locations.
                 expected[path] = sorted(
-                    [(rule, 3, 1 if rule == ownership else first.index("raw.parse") + 1)
+                    [(rule, 3, first.index("raw.parse") + 1)
                      for rule in first_rules]
-                    + [(ownership, 4, 1), (parsing, 4, 5)]
+                    + [(ownership, 4, 5), (parsing, 4, 5)]
                 )
             inputs = root / "inputs"
             sink = root / "findings.ndjson"

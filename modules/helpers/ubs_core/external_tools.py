@@ -25,8 +25,9 @@ import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
-from typing import Sequence, TextIO
+from typing import Iterator, Sequence, TextIO
 
 from ubs_core.suppression import SourceSuppressions
 
@@ -131,6 +132,148 @@ def _array(doc: object, key: str) -> list:
     if not isinstance(doc, dict) or not isinstance(doc.get(key), list):
         raise ValueError(f"expected {key!r} array")
     return doc[key]
+
+
+def ast_rule_configs(rule_dir: Path, paths: Sequence[Path],
+                     errors: list[str] | None = None, *,
+                     prefix: str = "sgconfig-") -> list[Path]:
+    """Find a requested AST pack without mistaking its absence for a clean scan."""
+    if not paths:
+        return []
+    try:
+        # iterdir raises for a missing/unreadable directory; glob may hide it.
+        configs = sorted(p for p in Path(rule_dir).iterdir()
+                         if p.name.startswith(prefix) and p.suffix in {".yml", ".yaml"})
+        if configs:
+            return configs
+        detail = f"no {prefix} rule configurations"
+    except OSError as exc:
+        detail = str(exc)
+    message = f"ast-grep: cannot load requested rule pack {rule_dir}: {detail}"
+    if errors is None:
+        raise RuntimeError(message)
+    errors.append(message)
+    return []
+
+
+def parse_ast_diagnostics(text: str, errors: list[str] | None = None,
+                          *, context: str = "ast-grep",
+                          run_rule_id: str | None = None) -> Iterator[dict]:
+    """Yield validated NDJSON evidence; report corruption instead of skipping it.
+
+    A malformed row does not erase earlier or later valid findings. Limit the
+    diagnostic detail, not the validation: every row is checked, even when a
+    caller will subsequently filter its rule or category. Without an error
+    accumulator, incomplete analysis raises rather than becoming a clean API
+    result. Field aliases are normalized once for all language adapters.
+    ``run --pattern`` has no diagnostic rule/severity fields: only that mode
+    supplies ``run_rule_id`` from the caller's known pattern definition.
+    """
+    failures = 0
+    details: list[str] = []
+    # NDJSON is delimited by LF, not by Unicode line separators that may
+    # legitimately occur inside a JSON string (including a source filename).
+    for number, line in enumerate(StringIO(text), 1):
+        if not line.strip():
+            continue
+        try:
+            match = json.loads(line)
+            if not isinstance(match, dict):
+                raise ValueError("expected a diagnostic object")
+            if run_rule_id is not None:
+                match["ruleId"], match["severity"] = run_rule_id, "warning"
+            rule = match.get("ruleId") or match.get("rule_id") or match.get("id")
+            file = match.get("file") or match.get("path")
+            for field, value in (("ruleId", rule), ("file", file)):
+                if not isinstance(value, str) or not value.strip() or "\0" in value:
+                    raise ValueError(f"invalid {field}")
+                value.encode("utf-8")
+            location = match.get("range")
+            start = location.get("start") if isinstance(location, dict) else None
+            if not isinstance(start, dict):
+                raise ValueError("missing diagnostic location")
+            for field in ("line", "column"):
+                if type(start.get(field)) is not int or start[field] < 0:
+                    raise ValueError(f"invalid location {field}")
+            if "end" in location:
+                end = location["end"]
+                if not isinstance(end, dict) or any(
+                    type(end.get(field)) is not int or end[field] < 0
+                    for field in ("line", "column")
+                ):
+                    raise ValueError("invalid end location")
+                if (end["line"], end["column"]) < (start["line"], start["column"]):
+                    raise ValueError("reversed diagnostic range")
+            if match.get("severity") not in (
+                "error", "warning", "info", "hint", "off", "critical", "fatal", "warn", "note",
+            ):
+                raise ValueError("invalid diagnostic severity")
+            for field in ("message", "text", "snippet", "lines"):
+                if field in match:
+                    value = match[field]
+                    if not isinstance(value, str):
+                        raise ValueError(f"invalid {field}")
+                    value.encode("utf-8")
+            # Swift's correlation layer consumes the optional METHOD capture.
+            # Check its container types before it can erase other valid rows.
+            if "metaVariables" in match:
+                meta = match["metaVariables"]
+                if not isinstance(meta, dict):
+                    raise ValueError("invalid metaVariables")
+                single = meta.get("single", {})
+                if not isinstance(single, dict) or any(not isinstance(v, dict) for v in single.values()):
+                    raise ValueError("invalid single capture")
+            match["ruleId"], match["file"] = rule, file
+        except (ValueError, UnicodeError, RecursionError) as exc:
+            failures += 1
+            if len(details) < 4:
+                details.append(f"row {number}: {str(exc)[:160]}")
+            continue
+        yield match
+    if failures:
+        message = f"{context}: {failures} malformed AST diagnostic(s) ({'; '.join(details)})"
+        if errors is None:
+            raise RuntimeError(message)
+        errors.append(message)
+
+
+def scan_ast_config(config: Path, paths: Sequence[Path],
+                    errors: list[str] | None = None, *, ast_grep_bin: str = "ast-grep",
+                    batch_size: int = 400, timeout: float = 600.0) -> Iterator[dict]:
+    """Execute a pack with bounded capture, cancellation cleanup and strict input.
+
+    The verified executable exported by the runner is authoritative. A broken
+    explicit override must fail, not fall back to another installation. Valid
+    output from failed/timed-out batches survives, and later batches still run.
+    """
+    if not paths:
+        return
+    if type(batch_size) is not int or batch_size <= 0:
+        raise ValueError("AST batch size must be a positive integer")
+    failures = errors if errors is not None else []
+    config = Path(config)
+    if not config.is_file():
+        failures.append(f"ast-grep: missing or nonregular rule configuration: {config}")
+    else:
+        executable = os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin
+        for start in range(0, len(paths), batch_size):
+            batch = [str(p) for p in paths[start:start + batch_size]]
+            output = run_command(
+                "ast-grep", [executable, "scan", "-c", str(config.resolve()),
+                             "--json=stream", "--", *batch],
+                Path.cwd(), timeout, failures, strict_utf8=True,
+            )
+            if output is None:
+                continue
+            if output.returncode not in (0, 1):
+                detail = output.stderr.strip().splitlines()
+                failures.append(
+                    f"ast-grep exited {output.returncode} on {config.name}"
+                    + (f": {detail[0][:160]}" if detail else "")
+                )
+            yield from parse_ast_diagnostics(output.stdout, failures, context=f"ast-grep ({config.name})")
+    if errors is None and failures:
+        raise RuntimeError("; ".join(failures))
 
 
 class RubyFindings:

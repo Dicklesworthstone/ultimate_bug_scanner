@@ -587,7 +587,7 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     return {"version": version, "findings": findings}
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int], *, complete: bool = True) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -650,7 +650,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         4: "No 'is' literal comparisons",
     }
     for num, note in good_notes.items():
-        if num not in categories_with_records and num not in _skip_set(args):
+        if complete and num not in categories_with_records and num not in _skip_set(args):
             lines.append(f"good: {note}")
 
     lines += [
@@ -862,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        _render_text(args, files, counters)
+        _render_text(args, files, counters, complete=not scan_errors)
 
     if scan_errors:
         for problem in scan_errors:

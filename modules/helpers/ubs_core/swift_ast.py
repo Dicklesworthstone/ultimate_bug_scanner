@@ -13,10 +13,10 @@ once, and feeds BOTH legacy consumers of the shared AG stream:
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Sequence
 from ubs_core.suppression import SourceSuppressions
+from ubs_core.external_tools import scan_ast_config
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
@@ -55,58 +55,18 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
         except (ValueError, OSError):
             manifest = {}
 
-    stream: list[dict] = []
-    if path_list and config.is_file():
-        for start in range(0, len(path_list), _BATCH):
-            batch = [str(p) for p in path_list[start : start + _BATCH]]
-            try:
-                proc = subprocess.run(
-                    [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
-                    capture_output=True,
-                    text=True,
-                    timeout=600,
-                )
-            except FileNotFoundError:
-                if errors is not None:
-                    errors.append(f"ast-grep unavailable ({ast_grep_bin})")
-                continue
-            except OSError as exc:
-                if errors is not None:
-                    errors.append(f"ast-grep could not be launched: {exc}")
-                continue
-            except subprocess.TimeoutExpired:
-                if errors is not None:
-                    errors.append(f"ast-grep timed out on {config.name}")
-                continue
-            # ast-grep exits 0 with no error-level diagnostics and 1 when it
-            # found some; anything else is a failed invocation, not a clean
-            # one. The legacy behaviour was `|| true` on the scan.
-            if proc.returncode not in (0, 1) and errors is not None:
-                detail = (proc.stderr or "").strip().splitlines()
-                errors.append(
-                    f"ast-grep exited {proc.returncode} on {config.name}"
-                    + (f": {detail[0][:160]}" if detail else "")
-                )
-            for line in proc.stdout.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                stream.append(obj)
+    stream = [obj for obj in scan_ast_config(config, path_list, errors,
+              ast_grep_bin=ast_grep_bin, batch_size=_BATCH) if obj["severity"] != "off"]
 
     # legacy AG_STREAM_FILE semantics: an empty stream means the ast layer is
     # unusable for correlation ("Could not build ast-grep per-file index")
     ctx.ast_stream_ok = bool(stream)
     ctx.ast_records = []
     for obj in stream:
-        rid = str(obj.get("ruleId", "") or obj.get("rule_id", "") or obj.get("id", "") or "unknown")
-        rng = obj.get("range") or {}
-        start = rng.get("start") or {}
-        row = int(start.get("row", start.get("line", 0)) or 0)
-        col = int(start.get("column", 0) or 0)
+        rid = obj["ruleId"]
+        rng = obj["range"]
+        start = rng["start"]
+        row, col = start["line"], start["column"]
         ctx.ast_records.append({
             "rid": rid,
             "file": str(obj.get("file", "") or ""),
@@ -128,13 +88,11 @@ def scan_all(rule_dir: Path, paths: Sequence[Path], ctx, sink, skip=None,
 
     suppressions = SourceSuppressions("swift")
     for obj in stream:
-        rid = str(obj.get("ruleId", "") or obj.get("rule_id", "") or obj.get("id", "") or "unknown")
-        file_str = str(obj.get("file", "?") or "?")
-        rng = obj.get("range") or {}
-        start = rng.get("start") or {}
-        row = int(start.get("row", start.get("line", 0)) or 0)
+        rid, file_str = obj["ruleId"], obj["file"]
+        start = obj["range"]["start"]
+        row = start["line"]
         line_no = row + 1
-        col_no = int(start.get("column", 0) or 0) + 1
+        col_no = start["column"] + 1
         message = str(obj.get("message") or rid)
         severity = _sev_map(str(obj.get("severity") or obj.get("level") or "info"))
         override = (manifest.get(rid) or {}).get("severity")

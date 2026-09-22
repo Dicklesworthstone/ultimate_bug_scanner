@@ -18,11 +18,11 @@ placements on top.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Sequence
 
 from ubs_core.ruby_scan import MARKER
+from ubs_core.external_tools import ast_rule_configs, scan_ast_config
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
@@ -70,97 +70,46 @@ def scan_config(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    if not path_list:
-        return counters
-    if not config.is_file():
-        if errors is not None:
-            errors.append(f"Ruby AST configuration is missing: {config}")
-            return counters
-        raise RuntimeError(f"Ruby AST configuration is missing: {config}")
     cache: dict[Path, list[str]] = {}
-    for start in range(0, len(path_list), _BATCH):
-        batch = [str(p) for p in path_list[start : start + _BATCH]]
-        try:
-            proc = subprocess.run(
-                [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            if errors is not None:
-                errors.append(f"Ruby AST scan could not run with {config.name}: {exc}")
-                continue
-            raise RuntimeError(f"Ruby AST scan could not run with {config}: {exc}") from exc
-        # `ast-grep scan` exits 0 with no error-level diagnostics and 1 when it
-        # found some; anything else is a failed invocation.
-        if proc.returncode not in (0, 1):
-            detail = (proc.stderr or "").strip()
-            if errors is not None:
-                errors.append(
-                    f"Ruby AST scan failed with {config.name} (exit {proc.returncode})"
-                    + (f": {detail.splitlines()[0][:160]}" if detail else "")
-                )
-            else:
-                raise RuntimeError(
-                    f"Ruby AST scan failed with {config} (exit {proc.returncode}): {detail}"
-                )
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                match = json.loads(line)
-            except json.JSONDecodeError as exc:
-                if errors is not None:
-                    errors.append(f"Ruby AST scan returned invalid JSON with {config.name}: {exc}")
-                    continue
-                raise RuntimeError(f"Ruby AST scan returned invalid JSON with {config}: {exc}") from exc
-            if not isinstance(match, dict):
-                if errors is not None:
-                    errors.append(f"Ruby AST scan returned a non-object finding with {config.name}")
-                    continue
-                raise RuntimeError(f"Ruby AST scan returned a non-object finding with {config}")
-            rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
-            file_str = str(match.get("file", "") or match.get("path", ""))
-            if not rule_id or not file_str:
-                continue
-            counted = counted_rules is None or rule_id in counted_rules
-            category = (category_map or {}).get(rule_id, 18)
-            if skip and category in skip:
-                continue  # --skip applies to counted and report-only rules.
-            rng = match.get("range", {}).get("start", {})
-            path = Path(file_str)
-            line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
-            # Legacy parser severity: YAML tier mapped at parse time; the
-            # SEVERITY_MAP override wins (ubs-ruby.sh 3366-3369 defaults).
-            raw_severity = str(match.get("severity", "info")).lower().strip()
-            if raw_severity in ("critical", "error", "fatal"):
-                default_severity = "critical"
-            elif raw_severity in ("warning", "warn"):
-                default_severity = "warning"
-            else:
-                default_severity = "info"
-            severity = (severity_overrides or {}).get(rule_id) or default_severity
-            if severity not in counters:
-                severity = "warning"
-            if _has_marker(path, line_no, cache):
-                continue  # legacy line + previous-line marker check
-            if counted:
-                counters[severity] = counters.get(severity, 0) + 1
-            message = str(match.get("message", "")).strip() or rule_id
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
-                "path": file_str,
-                "line": line_no,
-                "col": int(rng.get("column", 0)) + 1,
-                "severity": severity,
-                "message": f"{rule_id}: {message}"[:300],
-                "suppressed": False,
-                "_ast_pack": True,
-                "_report_only": not counted,
-            }, ensure_ascii=False) + "\n")
+    for match in scan_ast_config(config, path_list, errors,
+                                 ast_grep_bin=ast_grep_bin, batch_size=_BATCH):
+        rule_id, file_str = match["ruleId"], match["file"]
+        counted = counted_rules is None or rule_id in counted_rules
+        category = (category_map or {}).get(rule_id, 18)
+        if skip and category in skip:
+            continue  # --skip applies to counted and report-only rules.
+        rng = match["range"]["start"]
+        path = Path(file_str)
+        line_no = rng["line"] + 1
+        raw_severity = match["severity"]
+        if raw_severity == "off":
+            continue
+        if raw_severity in ("critical", "error", "fatal"):
+            default_severity = "critical"
+        elif raw_severity in ("warning", "warn"):
+            default_severity = "warning"
+        else:
+            default_severity = "info"
+        severity = (severity_overrides or {}).get(rule_id) or default_severity
+        if severity not in counters:
+            severity = "warning"
+        if _has_marker(path, line_no, cache):
+            continue
+        if counted:
+            counters[severity] = counters.get(severity, 0) + 1
+        message = match.get("message", "").strip() or rule_id
+        sink.write(json.dumps({
+            "rule": rule_id,
+            "category_id": rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id,
+            "path": file_str,
+            "line": line_no,
+            "col": rng["column"] + 1,
+            "severity": severity,
+            "message": f"{rule_id}: {message}"[:300],
+            "suppressed": False,
+            "_ast_pack": True,
+            "_report_only": not counted,
+        }, ensure_ascii=False) + "\n")
     return counters
 
 
@@ -180,7 +129,7 @@ def scan_all(
     ``errors`` collects any scan that could not complete, so the caller can
     report a partial run rather than a clean one (#111)."""
     total = {"critical": 0, "warning": 0, "info": 0}
-    for config in sorted(rule_dir.glob("sgconfig-*.yml")):
+    for config in ast_rule_configs(rule_dir, paths, errors):
         counters = scan_config(
             config, paths, sink, severity_overrides, ast_grep_bin,
             counted_rules, category_map, skip, errors,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -1529,6 +1531,420 @@ fn probe_text_version(client: &Client, url: &str) {
                 partial = scan(paths, "json", remaining, len(paths) - 1)
                 self.assertEqual(partial, [record for record in cold if record["path"] != str(changed)])
                 self.assertEqual(scan(paths, "sarif", remaining, len(paths)), partial)
+
+
+class AstIngestionTests(unittest.TestCase):
+    """All AST adapters must distinguish an empty scan from lost evidence."""
+
+    def setUp(self) -> None:
+        from ubs_core import external_tools
+        self.tools = external_tools
+        scratch = tempfile.TemporaryDirectory(prefix="ubs-ast-ingestion-")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.source = self.root / "source with spaces.py"
+        self.source.write_text("value = 42\n", encoding="utf-8")
+        self.config = self.root / "sgconfig-python.yml"
+        self.config.write_text("ruleDirs: []\n", encoding="utf-8")
+        self.binary = self.root / "cached analyzer"
+        environment = patch.dict(os.environ, {"UBS_AST_GREP_BIN": str(self.binary)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def diagnostic(self, **changes) -> dict:
+        row = {"ruleId": "custom.critical", "file": str(self.source),
+               "range": {"start": {"line": 0, "column": 2}},
+               "severity": "error", "message": "project policy", "text": "value"}
+        row.update(changes)
+        return row
+
+    def executable(self, payload: bytes, code: int = 0, suffix: str = "") -> None:
+        self.binary.write_text(
+            f"#!{sys.executable}\nimport sys, time\n"
+            f"sys.stdout.buffer.write({payload!r})\nsys.stdout.flush()\n"
+            + suffix + f"\nsys.exit({code})\n", encoding="utf-8",
+        )
+        self.binary.chmod(0o755)
+
+    def payload(self, *rows) -> bytes:
+        return ("\n".join(json.dumps(row) for row in rows) + "\n").encode("utf-8")
+
+    def test_valid_records_survive_malformed_json_and_record_shapes(self) -> None:
+        invalid = [None, [], False, "bad", {}, {"ruleId": []},
+                   self.diagnostic(file="\0"), self.diagnostic(ruleId=3),
+                   self.diagnostic(range={"start": {"line": True, "column": 0}}),
+                   self.diagnostic(range={"start": {"line": -1, "column": 0}}),
+                   self.diagnostic(range={"start": {"line": "0", "column": 0}}),
+                   self.diagnostic(range={"start": {"line": 0}}),
+                   self.diagnostic(severity=[]), self.diagnostic(severity="fatal-ish"),
+                   self.diagnostic(message={}), self.diagnostic(text=None),
+                   self.diagnostic(lines=[]), self.diagnostic(metaVariables=[]),
+                   self.diagnostic(metaVariables={"single": {"METHOD": []}}),
+                   self.diagnostic(range={"start": {"line": 0, "column": 2},
+                                          "end": {"line": 0, "column": 1}}),
+                   self.diagnostic(file="bad\udcff.py")]
+        for row in invalid:
+            with self.subTest(row=row):
+                errors = []
+                stream = self.payload(self.diagnostic(), row, self.diagnostic(ruleId="later"))
+                records = list(self.tools.parse_ast_diagnostics(stream.decode(), errors))
+                self.assertEqual([r["ruleId"] for r in records], ["custom.critical", "later"])
+                self.assertEqual(len(errors), 1)
+        errors = []
+        self.assertEqual(list(self.tools.parse_ast_diagnostics("{\n", errors)), [])
+        self.assertIn("malformed AST", errors[0])
+
+    def test_bad_rows_are_counted_without_unbounded_error_messages(self) -> None:
+        errors = []
+        list(self.tools.parse_ast_diagnostics("null\n" * 5000, errors))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("5000 malformed", errors[0])
+        self.assertLess(len(errors[0]), 1000)
+
+    def test_unicode_separators_inside_json_strings_are_not_record_boundaries(self) -> None:
+        row = self.diagnostic(file="source\u2028name.py", message="one\u0085two\u2029three")
+        errors = []
+        actual = list(self.tools.parse_ast_diagnostics(json.dumps(row, ensure_ascii=False) + "\n", errors))
+        self.assertEqual(actual, [row])
+        self.assertFalse(errors)
+
+    def test_error_accumulator_is_not_required_to_fail_closed(self) -> None:
+        sink = []
+        with self.assertRaisesRegex(RuntimeError, "malformed AST"):
+            for row in self.tools.parse_ast_diagnostics(self.payload(self.diagnostic(), None).decode()):
+                sink.append(row)
+        self.assertEqual(len(sink), 1)
+
+    def test_missing_or_nonregular_config_never_becomes_empty_success(self) -> None:
+        for config in (self.root / "missing.yml", self.root):
+            with self.subTest(config=config):
+                errors = []
+                self.assertEqual(list(self.tools.scan_ast_config(config, [self.source], errors)), [])
+                self.assertIn("configuration", errors[0])
+                with self.assertRaises(RuntimeError):
+                    list(self.tools.scan_ast_config(config, [self.source]))
+
+    def test_empty_selection_does_not_require_analyzer_or_config(self) -> None:
+        errors = []
+        self.assertEqual(list(self.tools.scan_ast_config(self.root / "missing", [], errors)), [])
+        self.assertEqual(self.tools.ast_rule_configs(self.root / "missing", [], errors), [])
+        self.assertFalse(errors)
+
+    def test_missing_or_empty_rule_pack_is_reported(self) -> None:
+        empty = self.root / "empty"
+        empty.mkdir()
+        for folder in (empty, self.root / "missing"):
+            errors = []
+            self.assertEqual(self.tools.ast_rule_configs(folder, [self.source], errors), [])
+            self.assertIn("cannot load requested rule pack", errors[0])
+
+    def test_success_and_finding_exits_do_not_mean_incomplete(self) -> None:
+        for code, rows in ((0, ()), (0, (self.diagnostic(severity="warning"),)),
+                           (1, (self.diagnostic(),))):
+            with self.subTest(code=code, rows=rows):
+                self.executable(self.payload(*rows), code)
+                errors = []
+                result = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+                self.assertEqual(len(result), len(rows))
+                self.assertFalse(errors)
+
+    def test_failed_invocation_keeps_diagnostics(self) -> None:
+        for code in (2, 3, 124, 127):
+            with self.subTest(code=code):
+                self.executable(self.payload(self.diagnostic()), code)
+                errors = []
+                result = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+                self.assertEqual(len(result), 1)
+                self.assertIn(f"exited {code}", errors[-1])
+
+    def test_verified_binary_override_is_authoritative(self) -> None:
+        self.executable(self.payload(self.diagnostic()))
+        errors = []
+        records = list(self.tools.scan_ast_config(
+            self.config, [self.source], errors, ast_grep_bin="does-not-exist",
+        ))
+        self.assertEqual(len(records), 1)
+        self.assertFalse(errors)
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": str(self.root / "missing")}):
+            self.assertEqual(list(self.tools.scan_ast_config(self.config, [self.source], errors)), [])
+        self.assertIn("could not launch", errors[0])
+
+    def test_timeout_keeps_completed_records(self) -> None:
+        self.executable(self.payload(self.diagnostic()), suffix="time.sleep(30)\n")
+        errors = []
+        records = list(self.tools.scan_ast_config(self.config, [self.source], errors, timeout=2))
+        self.assertEqual(len(records), 1)
+        self.assertTrue(any("timed out" in e for e in errors))
+
+    def test_capture_limit_keeps_complete_records_and_reports_truncation(self) -> None:
+        valid = self.payload(self.diagnostic())
+        self.executable(valid + b"x" * 2048)
+        errors = []
+        with patch.object(self.tools, "OUTPUT_LIMIT", len(valid) + 8):
+            records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+        self.assertEqual(len(records), 1)
+        self.assertTrue(any("output exceeds" in e for e in errors))
+
+    def test_invalid_utf8_is_incomplete_but_valid_rows_remain(self) -> None:
+        self.executable(self.payload(self.diagnostic()) + b"\xff\n")
+        errors = []
+        records = list(self.tools.scan_ast_config(self.config, [self.source], errors))
+        self.assertEqual(len(records), 1)
+        self.assertTrue(any("UTF-8" in e for e in errors))
+
+    def test_later_batches_run_after_an_earlier_failure(self) -> None:
+        outputs = [self.tools.ToolOutput(2, "null\n", "failed first batch"),
+                   self.tools.ToolOutput(1, self.payload(self.diagnostic()).decode(), "")]
+        errors = []
+        with patch.object(self.tools, "run_command", side_effect=outputs) as run:
+            records = list(self.tools.scan_ast_config(
+                self.config, [self.source, self.source], errors, batch_size=1,
+            ))
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(len(records), 1)
+        self.assertTrue(errors)
+        self.assertIn("--", run.call_args.args[1])
+        self.assertTrue(run.call_args.kwargs["strict_utf8"])
+
+    def test_python_adapter_preserves_valid_finding_and_marks_corruption(self) -> None:
+        from ubs_core import py_ast
+        self.executable(self.payload(self.diagnostic(), None))
+        sink, errors = io.StringIO(), []
+        counts = py_ast.scan_config(self.config, [self.source], sink, errors=errors)
+        self.assertEqual(counts, {"critical": 1, "warning": 0, "info": 0})
+        self.assertEqual(json.loads(sink.getvalue())["col"], 3)
+        self.assertTrue(errors)
+
+    def test_python_filters_do_not_conceal_malformed_output(self) -> None:
+        from ubs_core import py_ast
+        self.executable(self.payload(self.diagnostic(), None))
+        sink, errors = io.StringIO(), []
+        counts = py_ast.scan_config(self.config, [self.source], sink, count_only=set(), errors=errors)
+        self.assertEqual(sum(counts.values()), 0)
+        self.assertFalse(sink.getvalue())
+        self.assertTrue(errors)
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep is required")
+    def test_real_ast_grep_output_and_error_severity_are_preserved(self) -> None:
+        from ubs_core import py_ast
+        rule = self.root / "policy.yaml"
+        rule.write_text('id: policy-print\nlanguage: python\nseverity: error\n'
+                        'message: No print calls\nrule:\n  pattern: print($$$)\n', encoding="utf-8")
+        self.config.write_text("ruleDirs:\n  - " + json.dumps(str(rule)) + "\n", encoding="utf-8")
+        self.source.write_text("print(42)\n", encoding="utf-8")
+        sink, errors = io.StringIO(), []
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": shutil.which("ast-grep")}):
+            counts = py_ast.scan_all(self.root, [self.source], sink, errors=errors)
+        self.assertEqual(counts["critical"], 1)
+        self.assertFalse(errors)
+        self.assertEqual(json.loads(sink.getvalue())["rule"], "policy-print")
+
+    def test_python_complete_scan_and_partial_scan_are_not_cache_equivalent(self) -> None:
+        from ubs_core.py_rules import generate
+        rules = self.root / "rules"
+        generate(rules)
+        files = self.root / "files"
+        files.write_bytes(os.fsencode(self.source) + b"\0")
+        env = {**os.environ, "PYTHONPATH": str(HELPERS_DIR), "PYTHONDONTWRITEBYTECODE": "1",
+               "UBS_NO_PREFILTER": "1", "UBS_CACHE_DIR": str(self.root / "cache"),
+               "UBS_NO_CACHE": "0", "UBS_PROFILE": "1"}
+        report, sink = self.root / "report.json", self.root / "findings.jsonl"
+        command = [sys.executable, "-m", "ubs_core.py_scan", "--files-from", str(files),
+                   "--project-dir", str(self.root), "--sink", str(sink), "--json-out", str(report),
+                   "--ast-rule-dir", str(rules)]
+        for broken in (True, True, False, False):
+            self.executable(self.payload(self.diagnostic(), None) if broken else self.payload(self.diagnostic()))
+            proc = subprocess.run(command, cwd=self.root, env=env, capture_output=True, text=True, timeout=30)
+            doc = json.loads(report.read_text())
+            self.assertEqual(proc.returncode, 2 if broken else 1, proc.stderr)
+            self.assertEqual(doc["status"], "partial" if broken else "ok")
+            self.assertGreater(doc["critical"], 0)
+            if broken:
+                self.assertEqual(doc["module_error"], "ANALYZER_ERROR")
+                self.assertEqual(doc["profile"]["cache_hits"], 0)
+        self.assertEqual(doc["profile"]["cache_hits"], 1)
+
+    ADAPTERS = ("py", "java", "csharp", "elixir", "go", "ruby", "rust", "swift")
+
+    def adapter(self, name: str, errors: list[str], *, root: Path | None = None,
+                prepare: bool = True) -> list[dict]:
+        import importlib
+        from types import SimpleNamespace
+        module = importlib.import_module("ubs_core." + name + "_ast")
+        root = root or self.root / name
+        config = root / ("sgbase-java.yml" if name == "java" else f"sgconfig-{name}.yml")
+        if prepare:
+            root.mkdir(exist_ok=True)
+            config.write_text("ruleDirs: []\n", encoding="utf-8")
+        sink = io.StringIO()
+        if name == "rust":
+            from ubs_core import rust_rules
+            with patch.object(rust_rules, "RUN_MODE_RULES", {}):
+                _, matches = module.scan_all(root, [self.source], errors=errors)
+            return [row for rows in matches.values() for row in rows]
+        if name == "swift":
+            module.scan_all(root, [self.source], SimpleNamespace(), sink, errors=errors)
+        elif name == "go":
+            module.scan_all(root, [self.source], {}, sink, errors=errors)
+        else:
+            module.scan_all(root, [self.source], sink, errors=errors)
+        return [json.loads(line) for line in sink.getvalue().splitlines()]
+
+    def test_every_adapter_keeps_valid_rows_around_corruption(self) -> None:
+        self.executable(self.payload(self.diagnostic(), None, self.diagnostic(ruleId="later")))
+        for name in self.ADAPTERS:
+            with self.subTest(adapter=name):
+                errors = []
+                records = self.adapter(name, errors)
+                self.assertEqual([r["rule"] for r in records], ["custom.critical", "later"])
+                self.assertEqual([r["col"] for r in records], [3, 3])
+                self.assertTrue(any("malformed AST" in e for e in errors))
+
+    def test_every_adapter_marks_missing_pack_incomplete(self) -> None:
+        for name in self.ADAPTERS:
+            with self.subTest(adapter=name):
+                errors = []
+                self.assertEqual(self.adapter(name, errors, root=self.root / "missing", prepare=False), [])
+                self.assertTrue(errors)
+
+    def test_every_adapter_honors_verified_binary_and_failure_status(self) -> None:
+        for code in (1, 2):
+            self.executable(self.payload(self.diagnostic()), code)
+            for name in self.ADAPTERS:
+                with self.subTest(adapter=name, code=code):
+                    errors = []
+                    records = self.adapter(name, errors)
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(bool(errors), code == 2)
+                    if name != "rust":
+                        self.assertEqual(records[0]["severity"], "critical")
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": str(self.root / "absent")}):
+            for name in self.ADAPTERS:
+                errors = []
+                self.assertEqual(self.adapter(name, errors), [])
+                self.assertTrue(errors)
+
+    def test_config_discovery_preserves_java_base_pack_and_yaml_extension(self) -> None:
+        (self.root / "sgbase-java.yaml").write_text("ruleDirs: []\n")
+        errors = []
+        configs = self.tools.ast_rule_configs(self.root, [self.source], errors, prefix="sgbase-")
+        self.assertEqual([p.name for p in configs], ["sgbase-java.yaml"])
+        self.assertFalse(errors)
+
+    def test_rust_run_mode_records_validate_and_preserve_unusual_paths(self) -> None:
+        from ubs_core.rust_ast import _parse_run_output
+        row = self.diagnostic(file="source:with\nnewline.rs")
+        row.pop("ruleId")
+        row.pop("severity")
+        errors = []
+        records = _parse_run_output(self.payload(row, None, row).decode(), "rust.ast.unwrap", errors)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["path"], "source:with\nnewline.rs")
+        self.assertEqual(records[0]["col"], 3)
+        self.assertTrue(errors)
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "real ast-grep is required")
+    def test_real_rust_nested_patterns_run_without_optional_manifest(self) -> None:
+        from ubs_core import rust_ast
+        folder = self.root / "rust-real"
+        folder.mkdir()
+        pack = folder / "pack"
+        pack.mkdir()
+        (pack / "sgconfig-rust.yml").write_text("ruleDirs: []\n")
+        source = folder / "nested:with\nnewline.rs"
+        source.write_text("fn main() { let x = Some(Some(1)); x.unwrap().unwrap(); }\n")
+        errors = []
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": shutil.which("ast-grep")}):
+            counts, matches = rust_ast.scan_all(pack, [source], errors=errors)
+        self.assertFalse(errors)
+        self.assertEqual(counts["rust.ast.unwrap"], 2)
+        self.assertEqual([m["path"] for m in matches["rust.ast.unwrap"]], [str(source)] * 2)
+        self.assertEqual([m["col"] for m in matches["rust.ast.unwrap"]], [36, 36])
+        from ubs_core.rust_scan import Scan
+        scan = Scan([source], folder, False, set(), 3)
+        with patch.dict(os.environ, {"UBS_AST_GREP_BIN": shutil.which("ast-grep")}):
+            scan.load_ast_matches(pack)
+        self.assertEqual(len(scan.ast_hits(["unwrap"])), 2)
+        self.assertFalse(scan.scan_errors)
+        files, sink, report = folder / "files", folder / "findings.jsonl", folder / "summary.json"
+        files.write_bytes(os.fsencode(source) + b"\0")
+        env = {**os.environ, "UBS_AST_GREP_BIN": shutil.which("ast-grep"),
+               "PYTHONPATH": str(HELPERS_DIR), "PYTHONDONTWRITEBYTECODE": "1",
+               "UBS_NO_PREFILTER": "1", "UBS_CACHE_DIR": str(folder / "cache"),
+               "UBS_NO_CACHE": "0", "UBS_PROFILE": "1"}
+        command = [sys.executable, "-m", "ubs_core.rust_scan", "--files-from", str(files),
+                   "--sink", str(sink), "--project-dir", str(folder), "--ast-rule-dir", str(pack),
+                   "--json-out", str(report), "--quiet"]
+        for _ in range(2):
+            proc = subprocess.run(command, cwd=folder, env=env, capture_output=True, text=True, timeout=30)
+            self.assertIn(proc.returncode, (0, 1), proc.stderr)
+            doc = json.loads(report.read_text())
+            self.assertEqual(doc["status"], "ok", doc)
+            unwrap = [r for r in doc["findings"] if r["rule"] == "rust.ownership.unwrap-expect"]
+            self.assertEqual(sum(r.get("count", 1) for r in unwrap), 2, unwrap)
+        self.assertEqual(doc["profile"]["cache_hits"], 1)
+
+    def test_python_partial_text_does_not_claim_unfinished_checks_are_good(self) -> None:
+        from ubs_core import py_scan
+        from types import SimpleNamespace
+        sink, output = self.root / "empty.jsonl", self.root / "output.txt"
+        sink.write_text("")
+        args = SimpleNamespace(sink=str(sink), text_out=str(output), project="",
+                               project_dir=str(self.root), skip="")
+        py_scan._render_text(args, [self.source], {"critical": 0, "warning": 0, "info": 0}, complete=False)
+        self.assertNotIn("good:", output.read_text())
+
+    def test_every_core_cli_preserves_findings_and_retries_partial_analysis(self) -> None:
+        import importlib
+        cases = {
+            "py": ("py", "value = 42\n", "custom.critical"),
+            "java": ("java", "class Sample {}\n", "java.resource.executor-no-shutdown"),
+            "csharp": ("cs", "class Sample {}\n", "cs-async-discarded-task-run"),
+            "elixir": ("ex", "value = 42\n", "elixir.code-eval-string"),
+            "go": ("go", "package sample\n", "go.async.goroutine-err-no-check"),
+            "ruby": ("rb", "value = 42\n", "ruby.async.thread-no-rescue"),
+            "rust": ("rs", "fn main() { let x = Some(1); }\n", "rust.ast.unwrap"),
+            "swift": ("swift", "let value = 42\n", "swift.force-try"),
+        }
+        for name, (extension, text, rule) in cases.items():
+            with self.subTest(language=name):
+                root = self.root / ("cli-" + name)
+                root.mkdir()
+                source = root / ("sample." + extension)
+                source.write_text(text)
+                rules = root / "pack"
+                importlib.import_module("ubs_core." + name + "_rules").generate(rules)
+                files, sink, report = root / "files", root / "sink", root / "summary.json"
+                files.write_bytes(os.fsencode(source) + b"\0")
+                row = self.diagnostic(ruleId=rule, file=str(source), range={"start": {"line": 0, "column": 0}})
+                self.executable(self.payload(row, None))
+                env = {**os.environ, "PYTHONPATH": str(HELPERS_DIR), "PYTHONDONTWRITEBYTECODE": "1",
+                       "UBS_NO_PREFILTER": "1", "UBS_CACHE_DIR": str(root / "cache"),
+                       "UBS_NO_CACHE": "0", "UBS_PROFILE": "1"}
+                command = [sys.executable, "-m", "ubs_core." + name + "_scan",
+                           "--files-from", str(files), "--sink", str(sink),
+                           "--project-dir", str(root),
+                           "--ast-rule-dir", str(rules)]
+                if name != "csharp":
+                    command += ["--json-out", str(report)]
+                for _ in range(2):
+                    proc = subprocess.run(command, cwd=root, env=env, capture_output=True,
+                                          text=True, timeout=45)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    if name == "csharp":
+                        # C#'s wrapper renders the JSON summary; its core
+                        # exposes the same failure through stderr and sink.
+                        summary = json.loads(proc.stderr.splitlines()[-1])
+                        self.assertTrue(summary["errors"])
+                        rows = [json.loads(line) for line in sink.read_text().splitlines()]
+                        self.assertTrue(any(r.get("rule") == rule for r in rows), rows)
+                        continue
+                    doc = json.loads(report.read_text())
+                    self.assertEqual(doc["status"], "partial", doc)
+                    self.assertEqual(doc["module_error"], "ANALYZER_ERROR", doc)
+                    expected_rule = "rust.ownership.unwrap-expect" if name == "rust" else rule
+                    self.assertTrue(any(r.get("rule") == expected_rule for r in doc["findings"]), doc)
+                    self.assertEqual(doc["profile"]["cache_hits"], 0, doc)
 
 
 if __name__ == "__main__":

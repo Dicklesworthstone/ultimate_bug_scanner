@@ -31,10 +31,10 @@ Those records survive the file cache without changing the legacy counters.
 from __future__ import annotations
 
 import json
-import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Sequence
+from ubs_core.external_tools import ast_rule_configs, parse_ast_diagnostics, scan_ast_config
 
 _ASTGREP_BIN = "ast-grep"
 _BATCH = 400  # paths per scan invocation (argv length safety)
@@ -49,31 +49,19 @@ COMPUTED_RULES = frozenset({
 })
 
 
-def _parse_stream(text: str) -> list[dict]:
-    matches: list[dict] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            match = json.loads(line)
-        except ValueError:
-            continue
-        rule_id = str(match.get("ruleId", "") or match.get("rule_id", "") or match.get("id", ""))
-        file_str = str(match.get("file", "") or match.get("path", ""))
-        if not rule_id or not file_str:
-            continue
-        rng = match.get("range", {}).get("start", {})
-        matches.append({
-            "rule": rule_id,
-            "path": file_str,
-            "line": int(rng.get("line", 0)) + 1,  # ast-grep rows are 0-based
-            "col": int(rng.get("column", 0)) + 1,
-            "text": str(match.get("text", "") or match.get("snippet", "")).strip(),
-            "severity": str(match.get("severity", "warning")),
-            "message": str(match.get("message", "")),
-        })
-    return matches
+def _normalize_match(match: dict) -> dict:
+    start = match["range"]["start"]
+    return {
+        "rule": match["ruleId"], "path": match["file"],
+        "line": start["line"] + 1, "col": start["column"] + 1,
+        "text": (match.get("text", "") or match.get("snippet", "")).strip(),
+        "severity": match["severity"], "message": match.get("message", ""),
+    }
+
+
+def _parse_stream(text: str, errors: list[str] | None = None) -> list[dict]:
+    return [_normalize_match(match) for match in parse_ast_diagnostics(text, errors)
+            if match["severity"] != "off"]
 
 
 def scan_config(
@@ -98,76 +86,47 @@ def scan_config(
     counts: Counter = Counter()
     matches: dict[str, list[dict]] = {}
     path_list = [Path(p) for p in paths]
-    if not path_list or not config.is_file():
-        return counts, matches
     slug = slug_for_category or (lambda category: f"cat{category}")
-    for start in range(0, len(path_list), _BATCH):
-        batch = [str(p) for p in path_list[start : start + _BATCH]]
-        try:
-            proc = subprocess.run(
-                [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-        except FileNotFoundError:
-            if errors is not None:
-                errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+    for diagnostic in scan_ast_config(config, path_list, errors,
+                                      ast_grep_bin=ast_grep_bin, batch_size=_BATCH):
+        if diagnostic["severity"] == "off":
             continue
-        except OSError as exc:
-            if errors is not None:
-                errors.append(f"ast-grep could not be launched: {exc}")
-            continue
-        except subprocess.TimeoutExpired:
-            if errors is not None:
-                errors.append(f"ast-grep timed out on {config.name}")
-            continue
-        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
-        # some; anything else is a failed invocation, not a clean one. The
-        # legacy behaviour degraded it to "AST rules disabled" (#111).
-        if proc.returncode not in (0, 1) and errors is not None:
-            detail = (proc.stderr or "").strip().splitlines()
-            errors.append(
-                f"ast-grep exited {proc.returncode} on {config.name}"
-                + (f": {detail[0][:160]}" if detail else "")
-            )
-        for match in _parse_stream(proc.stdout):
-            rule_id = match["rule"]
-            counts[rule_id] += 1
-            matches.setdefault(rule_id, []).append(match)
-            report_category = 1 if config.name == "sgconfig-go-async.yml" else 16
-            if not skip or report_category not in skip:
-                severity = match["severity"].lower()
-                severity = {"error": "critical", "fatal": "critical", "warn": "warning",
-                            "note": "info"}.get(severity, severity)
-                if severity not in {"critical", "warning", "info"}:
-                    severity = "info"
-                sink.write(json.dumps({
-                    "rule": rule_id,
-                    "category_id": f"golang.{slug(report_category)}",
-                    "path": match["path"],
-                    "line": match["line"],
-                    "col": match["col"],
-                    "severity": severity,
-                    "message": (match["message"] or match["text"] or rule_id)[:300],
-                    "suppressed": False,
-                    "_ast_pack": True,
-                    "_report_only": True,
-                }, ensure_ascii=False) + "\n")
-            for entry in consumption.get(rule_id, []):
-                category, severity, title = entry
-                if skip and category in skip:
-                    continue
-                sink.write(json.dumps({
-                    "rule": rule_id,
-                    "category_id": f"golang.{slug(category)}",
-                    "path": match["path"],
-                    "line": match["line"],
-                    "col": match["col"],
-                    "severity": severity,
-                    "message": f"{title}: {match['text']}"[:300] if match["text"] else title,
-                    "suppressed": False,
-                }, ensure_ascii=False) + "\n")
+        match = _normalize_match(diagnostic)
+        rule_id = match["rule"]
+        counts[rule_id] += 1
+        matches.setdefault(rule_id, []).append(match)
+        report_category = 1 if config.name == "sgconfig-go-async.yml" else 16
+        if not skip or report_category not in skip:
+            severity = match["severity"]
+            severity = {"error": "critical", "fatal": "critical", "warn": "warning",
+                        "note": "info", "hint": "info"}.get(severity, severity)
+            if severity not in {"critical", "warning", "info"}:
+                severity = "info"
+            sink.write(json.dumps({
+                "rule": rule_id,
+                "category_id": f"golang.{slug(report_category)}",
+                "path": match["path"],
+                "line": match["line"],
+                "col": match["col"],
+                "severity": severity,
+                "message": (match["message"] or match["text"] or rule_id)[:300],
+                "suppressed": False,
+                "_ast_pack": True,
+                "_report_only": True,
+            }, ensure_ascii=False) + "\n")
+        for category, severity, title in consumption.get(rule_id, []):
+            if skip and category in skip:
+                continue
+            sink.write(json.dumps({
+                "rule": rule_id,
+                "category_id": f"golang.{slug(category)}",
+                "path": match["path"],
+                "line": match["line"],
+                "col": match["col"],
+                "severity": severity,
+                "message": f"{title}: {match['text']}"[:300] if match["text"] else title,
+                "suppressed": False,
+            }, ensure_ascii=False) + "\n")
     return counts, matches
 
 
@@ -194,7 +153,7 @@ def scan_all(
     """
     total: Counter = Counter()
     all_matches: dict[str, list[dict]] = {}
-    for config in sorted(rule_dir.glob("sgconfig-*.yml")):
+    for config in ast_rule_configs(rule_dir, paths, errors):
         counts, matches = scan_config(
             config, paths, consumption, sink, skip, ast_grep_bin,
             slug_for_category, errors,

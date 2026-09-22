@@ -878,9 +878,9 @@ class Scan:
             kept: list[dict] = []
             seen: set[tuple] = set()
             for entry in entries:
-                key = (entry["path"], entry["line"], entry["col"])
+                key = (entry["path"], entry["line"], entry["col"], entry.get("text", ""))
                 if key in seen:
-                    continue  # legacy per-pattern (file,line,col) dedup
+                    continue  # exact duplicates, not distinct nested expressions
                 seen.add(key)
                 if entry["path"] not in allowed:
                     continue  # GH #70 authoritative-file-set enforcement

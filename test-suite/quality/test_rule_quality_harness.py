@@ -656,9 +656,9 @@ class AstGrepRulePackHelperTest(unittest.TestCase):
             )
             config = root / "sgconfig.yml"
             config.write_text("ruleDirs:\n  - invalid.yml\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "Ruby AST scan failed.*exit 8"):
+            with self.assertRaisesRegex(RuntimeError, "ast-grep exited 8"):
                 scan_config(config, [fixture], io.StringIO())
-            with self.assertRaisesRegex(RuntimeError, "configuration is missing"):
+            with self.assertRaisesRegex(RuntimeError, "missing or nonregular rule configuration"):
                 scan_config(root / "absent.yml", [fixture], io.StringIO())
 
     def test_repaired_rust_rules_match_syntax_without_comment_or_string_lookalikes(self) -> None:

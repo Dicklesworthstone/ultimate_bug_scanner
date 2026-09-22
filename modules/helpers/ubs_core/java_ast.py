@@ -17,11 +17,11 @@ counting or emitting either counted or report-only AST records.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Sequence
 
 from ubs_core.suppression import SourceSuppressions
+from ubs_core.external_tools import ast_rule_configs, scan_ast_config
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -63,87 +63,49 @@ def scan_config(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    if not path_list or not config.is_file():
-        return counters
     suppressions = SourceSuppressions("kotlin" if lang == "kotlin" else "java")
-    for start in range(0, len(path_list), _BATCH):
-        batch = [str(p) for p in path_list[start : start + _BATCH]]
-        try:
-            proc = subprocess.run(
-                [ast_grep_bin, "scan", "-c", str(config), "--json=stream", *batch],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-        except FileNotFoundError:
-            if errors is not None:
-                errors.append(f"ast-grep unavailable ({ast_grep_bin})")
+    for match in scan_ast_config(config, path_list, errors,
+                                 ast_grep_bin=ast_grep_bin, batch_size=_BATCH):
+        rule_id, file_str = match["ruleId"], match["file"]
+        counted = counted_rules is None or rule_id in counted_rules
+        if skip_categories:
+            category = _family_category(rule_id) if counted else 15
+            if category is None and category_for_rule is not None:
+                category = category_for_rule(rule_id)
+            if category is not None and category in skip_categories:
+                continue
+        rng = match["range"]["start"]
+        path = Path(file_str)
+        line_no = rng["line"] + 1
+        raw_severity = match["severity"]
+        if raw_severity == "off":
             continue
-        except OSError as exc:
-            if errors is not None:
-                errors.append(f"ast-grep could not be launched: {exc}")
+        default_severity = {"error": "critical", "fatal": "critical", "warn": "warning",
+                            "note": "info", "hint": "info"}.get(raw_severity, raw_severity)
+        severity = (severity_overrides or {}).get(rule_id) or default_severity
+        if severity not in counters:
+            severity = "warning"
+        if suppressions.is_suppressed(path, line_no, rule_id):
             continue
-        except subprocess.TimeoutExpired:
-            if errors is not None:
-                errors.append(f"ast-grep timed out on {config.name}")
-            continue
-        # ast-grep exits 0 with no error-level diagnostics and 1 when it found
-        # some; anything else (bad config, unreadable path, internal error) is
-        # a failed invocation, not a clean one.
-        if proc.returncode not in (0, 1) and errors is not None:
-            detail = (proc.stderr or "").strip().splitlines()
-            errors.append(
-                f"ast-grep exited {proc.returncode} on {config.name}"
-                + (f": {detail[0][:160]}" if detail else "")
-            )
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                match = json.loads(line)
-            except ValueError:
-                continue
-            rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
-            file_str = str(match.get("file", "") or match.get("path", ""))
-            if not rule_id or not file_str:
-                continue
-            counted = counted_rules is None or rule_id in counted_rules
-            if skip_categories:
-                category = _family_category(rule_id) if counted else 15
-                if category is None and category_for_rule is not None:
-                    category = category_for_rule(rule_id)
-                if category is not None and category in skip_categories:
-                    continue  # --skip: the category is disabled
-            rng = match.get("range", {}).get("start", {})
-            path = Path(file_str)
-            line_no = int(rng.get("line", 0)) + 1  # ast-grep rows are 0-based
-            raw_severity = str(match.get("severity", "warning")).lower()
-            default_severity = {"error": "critical", "warn": "warning", "note": "info"}.get(raw_severity, raw_severity)
-            severity = (severity_overrides or {}).get(rule_id) or default_severity
-            if severity not in counters:
-                severity = "warning"
-            if suppressions.is_suppressed(path, line_no, rule_id):
-                continue
-            if counted:
-                counters[severity] = counters.get(severity, 0) + 1
-            message = str(match.get("message", "")).strip() or str(match.get("text", ""))[:240]
-            if category_for_rule is not None:
-                category_id = category_for_rule(rule_id)
-            else:
-                category_id = rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": category_id,
-                "path": file_str,
-                "line": line_no,
-                "col": int(rng.get("column", 0)) + 1,
-                "severity": severity,
-                "message": message[:240],
-                "suppressed": False,
-                "_ast_pack": True,
-                "_report_only": not counted,
-            }, ensure_ascii=False) + "\n")
+        if counted:
+            counters[severity] = counters.get(severity, 0) + 1
+        message = match.get("message", "").strip() or match.get("text", "")[:240]
+        if category_for_rule is not None:
+            category_id = category_for_rule(rule_id)
+        else:
+            category_id = rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id
+        sink.write(json.dumps({
+            "rule": rule_id,
+            "category_id": category_id,
+            "path": file_str,
+            "line": line_no,
+            "col": rng["column"] + 1,
+            "severity": severity,
+            "message": message[:240],
+            "suppressed": False,
+            "_ast_pack": True,
+            "_report_only": not counted,
+        }, ensure_ascii=False) + "\n")
     return counters
 
 
@@ -164,7 +126,7 @@ def scan_all(
     report a partial run rather than a clean one (#111).
     """
     total = {"critical": 0, "warning": 0, "info": 0}
-    for config in sorted(rule_dir.glob("sgbase-*.yml")):
+    for config in ast_rule_configs(rule_dir, paths, errors, prefix="sgbase-"):
         lang = config.stem.removeprefix("sgbase-")
         counters = scan_config(
             config, paths, sink, lang, severity_overrides, ast_grep_bin,

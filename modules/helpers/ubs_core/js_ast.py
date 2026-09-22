@@ -1,6 +1,6 @@
 """ubs_core.js_ast — consolidated ast-grep rule-pack scanning (bead 0xjg.4).
 
-Runs the ≤ 3 sgconfigs produced by `ubs_core.js_rules.generate` (one
+Runs the grammar and custom-policy sgconfigs produced by `ubs_core.js_rules.generate` (one
 `ast-grep scan -c <config> --json=stream` invocation per grammar group),
 parses the stream once, and appends normalized records to the same NDJSON
 findings sink the pattern layer uses.
@@ -20,12 +20,13 @@ count exceeds its removeEventListener count.
 from __future__ import annotations
 
 import json
+import io
 import os
-import subprocess
 from pathlib import Path
 from typing import Sequence
 
 from ubs_core.js_scan import MARKER
+from ubs_core.external_tools import run_command
 
 _ASTGREP_BIN = "ast-grep"
 
@@ -41,6 +42,38 @@ _FAMILY_CATEGORY = {
     "js.security": 7,
 }
 _BATCH = 400  # paths per scan invocation (argv length safety)
+_TIMEOUT = 600.0
+
+
+def _validated_match(line: str) -> dict:
+    """Validate the analyzer boundary before filtering or counting evidence."""
+    match = json.loads(line)
+    if not isinstance(match, dict):
+        raise ValueError("expected a diagnostic object")
+    rule_id = match.get("ruleId") or match.get("rule_id")
+    path = match.get("file") or match.get("path")
+    for field, value in (("ruleId", rule_id), ("file", path)):
+        if not isinstance(value, str) or not value.strip() or "\0" in value:
+            raise ValueError(f"invalid {field}")
+        value.encode("utf-8")
+    location = match.get("range")
+    start = location.get("start") if isinstance(location, dict) else None
+    if not isinstance(start, dict):
+        raise ValueError("missing diagnostic location")
+    for field in ("line", "column"):
+        value = start.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"invalid location {field}")
+    severity = match.get("severity")
+    if severity not in ("critical", "error", "warning", "info", "hint", "off"):
+        raise ValueError("invalid diagnostic severity")
+    for field in ("message", "text"):
+        if field in match:
+            value = match[field]
+            if not isinstance(value, str):
+                raise ValueError(f"invalid {field}")
+            value.encode("utf-8")
+    return match
 
 
 def _file_lines(path: Path, cache: dict[Path, list[str]]) -> list[str]:
@@ -86,48 +119,46 @@ def scan_config(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
-    if not path_list or not config.is_file():
+    problems = errors if errors is not None else []
+    if not path_list:
+        return counters
+    if not config.is_file():
+        problems.append(f"ast-grep: missing or nonregular config {config}")
         return counters
     cache: dict[Path, list[str]] = {}
     for start in range(0, len(path_list), _BATCH):
         batch = [str(p) for p in path_list[start : start + _BATCH]]
-        try:
-            proc = subprocess.run(
-                [os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin,
-                 "scan", "-c", str(config), "--json=stream", *batch],
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-        except FileNotFoundError:
-            if errors is not None:
-                errors.append(f"ast-grep unavailable ({ast_grep_bin})")
-            continue
-        except OSError as exc:
-            if errors is not None:
-                errors.append(f"ast-grep could not be launched: {exc}")
-            continue
-        except subprocess.TimeoutExpired:
-            if errors is not None:
-                errors.append(f"ast-grep timed out on {config.name}")
+        proc = run_command(
+            f"ast-grep ({config.name})",
+            [os.environ.get("UBS_AST_GREP_BIN") or ast_grep_bin,
+             "scan", "-c", str(config), "--json=stream", *batch],
+            Path.cwd(), _TIMEOUT, problems, strict_utf8=True,
+        )
+        if proc is None:
             continue
         # ast-grep exits 0 with no error-level diagnostics and 1 when it found
         # some; anything else is a failed invocation, which used to degrade to
         # zero AST findings.
-        if proc.returncode not in (0, 1) and errors is not None:
+        if proc.returncode not in (0, 1):
             detail = (proc.stderr or "").strip().splitlines()
-            errors.append(
+            problems.append(
                 f"ast-grep exited {proc.returncode} on {config.name}"
                 + (f": {detail[0][:160]}" if detail else "")
             )
-        for line in proc.stdout.splitlines():
+        invalid = valid = 0
+        first_problem = ""
+        for record_no, line in enumerate(io.StringIO(proc.stdout), 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                match = json.loads(line)
-            except ValueError:
+                match = _validated_match(line)
+            except (ValueError, UnicodeError, RecursionError) as exc:
+                invalid += 1
+                if not first_problem:
+                    first_problem = f"record {record_no}: {str(exc)[:160]}"
                 continue
+            valid += 1
             rule_id = str(match.get("ruleId", "") or match.get("rule_id", ""))
             file_str = str(match.get("file", "") or match.get("path", ""))
             if not rule_id or not file_str:
@@ -148,7 +179,7 @@ def scan_config(
                 continue
             if severity not in counters:
                 severity = "warning"
-            if rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
+            if lang != "custom" and rule_id == "js.resource.listener-no-remove" and not _listener_imbalance(path, cache):
                 continue  # legacy rg-delta: adds <= removes means balanced
             if _has_marker(path, line_no, cache):
                 continue  # legacy line + previous-line marker check
@@ -164,6 +195,10 @@ def scan_config(
                 "message": message[:240],
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")
+        if invalid:
+            problems.append(f"ast-grep ({config.name}): {invalid} malformed diagnostic(s); {first_problem}")
+        if proc.returncode == 1 and not valid:
+            problems.append(f"ast-grep ({config.name}): findings exit without valid diagnostics")
     return counters
 
 
@@ -186,7 +221,13 @@ def scan_all(
     ``errors`` collects any scan that could not complete, so the caller can
     report a partial run rather than a clean one (#111)."""
     total = {"critical": 0, "warning": 0, "info": 0}
-    for config in sorted(rule_dir.glob("sgconfig-*.yml")):
+    configs = sorted(rule_dir.glob("sgconfig-*.yml"))
+    if paths and errors is not None:
+        for grammar in ("javascript", "typescript", "tsx"):
+            expected = rule_dir / f"sgconfig-{grammar}.yml"
+            if not expected.is_file():
+                errors.append(f"ast-grep: missing or nonregular config {expected}")
+    for config in configs:
         lang = config.stem.removeprefix("sgconfig-")
         custom = lang == "custom"
         counters = scan_config(config, paths, sink, lang,

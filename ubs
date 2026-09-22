@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.12"
+UBS_VERSION="5.4.13"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='0eee1269790651499cbbcad8b94a30ec049205b8245a64d0e6db42608e47cbe6'
-  [cpp]='9b9d03dbf0093fea4c397065e5cde8629e1dc78270c21ae57c380f2d8001808f'
-  [csharp]='b5132e4550d04743aa4ca3062445423fc33c1db7db0fe80a63452575774efa53'
-  [elixir]='c28b9e1c42e5a863e13f9a0874400e052143b9895e55aa0d95027309c7fd52c2'
-  [golang]='4d0eef02e7834a7688ebfab4d9c9c513cd7b7971ab2d5e28a14afa03a697b05c'
-  [java]='882d1a1cc390acb97916a3470e6f765a1949e2eb0edc1fe3ab98ce6285d7065d'
-  [js]='96801375b3519433acb559fc4902e0a8cc21eb9f60f638696616a9ad54229a69'
-  [kotlin]='17468d2c6ebe4c239de0d7a63647b700522577c5c50241a6a660ceff3ce2e8a7'
-  [python]='24584d7febba97797e15fcbed5023de737cc2eb922ba8f010be51e085d167d43'
-  [ruby]='2584cec5342e882de4a5a94443dbf4d294e2a79e2b481dd06bab92a810629368'
-  [rust]='4e07299b8f2ed483f160b95c4b99db175509538aa890a0c468b009c1cce98424'
-  [swift]='f4971b26052a1c0cc3747b2be7551e34119c9dc050cde2fa83c3f9d06d6ae7c2'
+  [bash]='be76e93701bb3813a5f04ccf7a8425ecf1ba99ec68500ae40121035271a41949'
+  [cpp]='a9924b9eb0ca5a62be7c0db3866811dad7fb7cbf42bd48ab48021f81ac6aa47f'
+  [csharp]='438fe963f6807752fcd79425b1257705e428df2fa143ec9a407ee71a46095069'
+  [elixir]='3dd4876e32e288d333b60a3fc1b04cd5b337304e38ac5277b6fff9ba54c21207'
+  [golang]='1a1918d29f15638f1f4e4c8afeaf939240343de504807872a49c0afdc2adf1a1'
+  [java]='4a72924c41f30a8291173c922ed749e2bc2834f4857415cd9969303e3ac98eaf'
+  [js]='bcf4db0ecd9ac681894caf568d9feabd77b49c391ca4c4ec81c06c26b067c75b'
+  [kotlin]='e90a2ac4c542ecbe884ab25b5c871dc75d6fb432c9b38074aee8f956a1fe11bb'
+  [python]='9071e02091a4c1f238bc0cd15f9652cfc8874d931103b387652e0ad23e7fc0c1'
+  [ruby]='6cee5a3338db1d0cc715db5c46974a69790c4388ff158d03262f893589847d80'
+  [rust]='e4c5e4de596a96f21b2f4c2035a50c6f88859f56259d79ddad4076c0e6447922'
+  [swift]='4d82cfd4ec41cf7f61ebea87c2f1664ca4acb40416445b20ce44d521c5e37e42'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -230,7 +230,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='d61aa7f4f865e18858a5cb43c4a51b671345e9505bafc10896c0cec598877ead'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
-  ['helpers/ubs_core/external_tools.py']='38aa1ebe5a6a815d30252dda073ea2e153503f3746fae61078d9680521bd6cd2'
+  ['helpers/ubs_core/external_tools.py']='86c5a0b7ac7446a2454e10ea18ed5d145c2f92da7ffadffe05460b7e3d8d77d9'
   ['helpers/ubs_core/findings_merge.py']='a5b718082d9a67f586388273eafa589db653c8497801d96be3a4d168a32a35a6'
   ['helpers/ubs_core/go_ast.py']='0d70f8efdc1c4934c559bbe189e95d5f72cae4195f4f342cc7c0d21e9f2f9e0b'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
@@ -281,7 +281,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/java_patterns/security_rg.py']='d1ddb0626ec8729133b915dd27401ea2823df452acd18920c2efd919119864fa'
   ['helpers/ubs_core/java_rules.py']='25646798a89ca69b7a101901456ab0970ad28abdffef5fab33458ff8b900a9cf'
   ['helpers/ubs_core/java_scan.py']='e1d39a3790f943feca57062ff77be558ae766a87fffbffd374f98fe50fbb4997'
-  ['helpers/ubs_core/js_ast.py']='d13bab2345cc73777deb0781d05f9d60e57245b23c2de21d6e841048c72c5235'
+  ['helpers/ubs_core/js_ast.py']='cc0ee3b63512bb043ac5167dfbb8b67b7c2cbdbe5ae8e9d11d6828c62451da5f'
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
   ['helpers/ubs_core/js_patterns/debug_quality.py']='de6e0c36dfb9e06691b65ec5e8fd7739ec22840ebf5c487801f998218bb78172'
   ['helpers/ubs_core/js_patterns/eq_regex_dom.py']='d2513ecc6d6311612e0ccd02293d25a5373ef60cf4d689f96ec30c4c12cf4d8a'
@@ -290,7 +290,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_patterns/proto_vars.py']='b4fdf0f9ccfa5b4133f12f53dc2813fcd618530756c9a299ed16e1d0c0388b31'
   ['helpers/ubs_core/js_patterns/security_node.py']='7ceb9d14a629fb7bb89fce5c702a7ccc769260be10feab937a843b473efcf81e'
   ['helpers/ubs_core/js_rules.py']='e038f6d8a7ad177e7cce78aa236580c3d2f8cb6dae65bfad172f3961465ebc4a'
-  ['helpers/ubs_core/js_scan.py']='57331bb3e6e4702be56cea645b05c3dac9944b69a0165f46c208635fe3885403'
+  ['helpers/ubs_core/js_scan.py']='2b854734e9c38ee81bb418ae94526b709aad6b790ed091664f324f0f3fc7b057'
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='2ea25fa756000235c64be1b02dad721d5e5d57284522648de73dcec36be14fde'
   ['helpers/ubs_core/lexer.py']='12c6db052e94728b110b2cd551311ba88ef815a3839eb565a4d6f2eb1256bfa5'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='166821595c43591d4e7c7b58ca7c26b8afad5ff2dc9e3c1c69847d6de3370c4b'
+  ['lib/ubs-common.sh']='f4480fda5cdda8c99aafe4f71a7867dd029098ea32ac19a10a00814557b052bf'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7048,12 +7048,13 @@ JSON
     scanner_status="error"
   fi
   if need_cmd jq && [[ -s "$out_json" ]] && jq -e 'type=="object"' "$out_json" >/dev/null 2>&1; then
-    # A module may report itself partial (e.g. the Rust module when cargo could
-    # not run, bead D10): keep that status and its module_error/message when
-    # the process itself exited normally.
+    # A contract-v2 module can finish its report but not its analysis. Exit 2
+    # is the documented coverage-failure gate, not evidence that this valid
+    # partial report is unusable. A timeout or another crash still wins.
     jq --arg s "$scanner_status" --argjson rc "$module_status" '
-      (if $s == "ok" and .status == "partial" then . else . + {status:$s} end)
-      + (if $s == "error" and (.module_error|not) then
+      (if .status == "partial" and ($s == "ok" or ($s == "error" and $rc == 2))
+       then . else . + {status:$s} end)
+      + (if .status == "error" and (.module_error|not) then
            {module_error:("MODULE_EXIT_" + ($rc|tostring)),
             message:("Scanner module exited with status " + ($rc|tostring) + " before producing a result; see stderr")}
          else {} end)' "$out_json" > "$out_json.tmp" 2>/dev/null && mv "$out_json.tmp" "$out_json"
@@ -7850,7 +7851,7 @@ fi
 # exits 2.
 RUN_STATUS="ok"
 FAILED_MODULES_JSON="[]"
-HEALTHY_SCANNERS=0
+USABLE_SCANNERS=0
 if need_cmd jq; then
   scanner_jsons=()
   for L in "${langs[@]}"; do
@@ -7859,8 +7860,8 @@ if need_cmd jq; then
   if [[ ${#scanner_jsons[@]} -gt 0 ]]; then
     FAILED_MODULES_JSON="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") != "ok") | {language, status, module_error, message}]' "${scanner_jsons[@]}" 2>/dev/null || echo '[]')"
     [[ "$FAILED_MODULES_JSON" != "[]" ]] && RUN_STATUS="partial"
-    HEALTHY_SCANNERS="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") == "ok")] | length' "${scanner_jsons[@]}" 2>/dev/null || echo 0)"
-    HEALTHY_SCANNERS="${HEALTHY_SCANNERS:-0}"
+    USABLE_SCANNERS="$(jq -s -c '[.[] | select(type=="object") | select((.status // "ok") == "ok" or .status == "partial")] | length' "${scanner_jsons[@]}" 2>/dev/null || echo 0)"
+    USABLE_SCANNERS="${USABLE_SCANNERS:-0}"
   fi
 fi
 # A module that exited 2 is an environment/tooling failure rather than a
@@ -7875,7 +7876,7 @@ fi
 # failure. A module that ran and timed out, or that crashed after producing a
 # summary, stays "partial" — as does any failure alongside a scanner that did
 # complete.
-if [[ "$HAS_ENV_ERROR" -eq 1 && "$HEALTHY_SCANNERS" -eq 0 ]]; then
+if [[ "$HAS_ENV_ERROR" -eq 1 && "$USABLE_SCANNERS" -eq 0 ]]; then
   RUN_STATUS="error"
 fi
 

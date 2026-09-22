@@ -277,7 +277,8 @@ def run_analyzers(
             }, ensure_ascii=False) + "\n")
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int],
+                 errors: Sequence[str] = ()) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -295,6 +296,9 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         f"UBS module: js (contract v2) — {args.project or args.project_dir}",
         f"Files scanned: {len(files)}",
     ]
+    if errors:
+        lines.append("Partial: [ANALYZER_ERROR] JavaScript analysis did not complete: "
+                     + "; ".join(errors[:3])[:350])
     ordered_rules = sorted(
         by_rule,
         key=lambda rule: (by_rule[rule][0].get("category_id", ""), rule),
@@ -336,7 +340,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
     }
     for num, slug in _CATEGORY_SLUGS.items():
         good = _GOOD_LINES.get(slug)
-        if good and slug not in categories_with_records:
+        if not errors and good and slug not in categories_with_records:
             lines.append(f"good: {good}")
 
     lines += [
@@ -549,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        _render_text(args, files, counters)
+        _render_text(args, files, counters, scan_errors)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-js: analysis incomplete: {problem}\n")

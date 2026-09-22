@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence, TextIO
@@ -47,7 +48,7 @@ class ToolOutput:
 
 def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                 errors: list[str], *, env: dict[str, str] | None = None,
-                merge_stderr: bool = False) -> ToolOutput | None:
+                merge_stderr: bool = False, strict_utf8: bool = False) -> ToolOutput | None:
     """Bound execution, reap timed-out process groups, and bound captured memory."""
     if not math.isfinite(timeout) or timeout <= 0:
         errors.append(f"{tool}: timeout must be a positive finite number")
@@ -59,10 +60,8 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                 stderr=stdout if merge_stderr else stderr, env=env,
                 start_new_session=os.name == "posix",
             )
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                errors.append(f"{tool}: timed out after {timeout:g}s")
+
+            def stop() -> None:
                 try:
                     if os.name == "posix":
                         os.killpg(proc.pid, signal.SIGKILL)
@@ -71,12 +70,45 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
                 except ProcessLookupError:
                     pass
                 proc.wait()
+
+            def cancel(signum, _frame) -> None:
+                # GNU timeout signals the module group, but the analyzer is
+                # isolated from it. Unwind through stop() before exiting.
+                raise SystemExit(128 + signum)
+
+            previous_handlers = {}
+            try:
+                if os.name == "posix" and threading.current_thread() is threading.main_thread():
+                    for signum in (signal.SIGTERM, signal.SIGHUP):
+                        previous = signal.getsignal(signum)
+                        if previous == signal.SIG_DFL:
+                            previous_handlers[signum] = previous
+                            signal.signal(signum, cancel)
+                try:
+                    proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    errors.append(f"{tool}: timed out after {timeout:g}s")
+                    stop()
+            except BaseException:
+                # KeyboardInterrupt, parent deadlines and caller cancellation
+                # must not leave the isolated analyzer (or its children) alive.
+                stop()
+                raise
+            finally:
+                for signum, previous in previous_handlers.items():
+                    signal.signal(signum, previous)
             stdout.seek(0)
             raw = stdout.read(OUTPUT_LIMIT + 1)
             if len(raw) > OUTPUT_LIMIT:
                 errors.append(f"{tool}: output exceeds {OUTPUT_LIMIT} bytes")
+            data = raw[:OUTPUT_LIMIT]
+            if strict_utf8:
+                try:
+                    data.decode("utf-8")
+                except UnicodeDecodeError:
+                    errors.append(f"{tool}: output is not valid UTF-8")
             stderr.seek(0)
-            return ToolOutput(proc.returncode, raw[:OUTPUT_LIMIT].decode("utf-8", "replace"),
+            return ToolOutput(proc.returncode, data.decode("utf-8", "replace"),
                               stderr.read(4096).decode("utf-8", "replace"))
     except OSError as exc:
         errors.append(f"{tool}: could not launch or capture output: {exc}")

@@ -316,9 +316,11 @@ class Integration(unittest.TestCase):
         result = self.scan("--go-tools", "--go-timeout=5", '--test-pkgs=./...', "--format=json", meta=True, vuln="error")
         self.assertEqual(result.returncode, 2, result.stderr)
         doc = json.loads(result.stdout)
-        # The runner calls the whole invocation an error when its ONLY module
-        # is incomplete; it must still retain the module's usable evidence.
-        self.assertEqual(doc["status"], "error")
+        # Usable partial evidence remains partial even without another healthy
+        # module. The nonzero coverage gate and the analyzer error still apply.
+        self.assertEqual(doc["status"], "partial")
+        self.assertEqual(doc["failed_modules"][0]["status"], "partial")
+        self.assertEqual(doc["scanners"][0]["status"], "partial")
         self.assertEqual(doc["failed_modules"][0]["module_error"], "ANALYZER_ERROR")
         self.assertTrue(any(f["rule_id"] == "go.govulncheck."+OSV for f in doc["findings"]))
 

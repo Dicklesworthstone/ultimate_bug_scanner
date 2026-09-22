@@ -83,3 +83,115 @@ jobs:
           name: javascript-completeness-validation
           path: ${{ runner.temp }}/js-*.log
           retention-days: 7
+
+
+  ast-completeness-candidate:
+    if: >-
+      github.event_name == 'push' && contains(github.event.head_commit.message, 'stage AST completeness candidate')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install focused validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli@0.45.3
+      - name: Apply reviewed source and release patches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, subprocess
+          from pathlib import Path
+          blobs = {
+              'ast-completeness.patch': '84221c96e946da1cc51c58e9aa84e71852ac263e',
+              'version.patch': '6c7e4a7cb2887faad4a54731608753188a8f27a7',
+          }
+          for name, sha in blobs.items():
+              r = subprocess.run(
+                  ['gh','api','-H','User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                   f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"],
+                  text=True, capture_output=True, check=True, timeout=90)
+              payload=json.loads(r.stdout)
+              data=base64.b64decode(payload['content'])
+              Path(os.environ['RUNNER_TEMP'], name).write_bytes(data)
+              subprocess.run(['git','apply','--check',str(Path(os.environ['RUNNER_TEMP'],name))],check=True)
+              subprocess.run(['git','apply',str(Path(os.environ['RUNNER_TEMP'],name))],check=True)
+          PY
+          python3 scripts/update_checksums.py
+          test "$(cat VERSION)" = 5.4.16
+          grep -q '^UBS_VERSION="5.4.16"' ubs
+      - name: Verify integrity and focused regressions
+        run: |
+          set -euo pipefail
+          bash -n ubs
+          for s in modules/ubs-*.sh modules/lib/ubs-common.sh; do bash -n "$s"; done
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          shellcheck -S warning ubs modules/ubs-python.sh modules/ubs-rust.sh
+          (cd test-suite && python3 -m unittest quality.test_rule_quality_harness quality.test_suppression_intervals quality.test_ubs_core -v) 2>&1 | tee "$RUNNER_TEMP/ast-quality.log"
+          python3 test-suite/shareable/test_status_invariants.py 2>&1 | tee "$RUNNER_TEMP/ast-status.log"
+          git diff --check
+      - name: Store exact validated blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess
+          from pathlib import Path
+          paths=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          required={
+            'README.md','VERSION','SHA256SUMS','ubs',
+            'modules/helpers/ubs_core/csharp_ast.py',
+            'modules/helpers/ubs_core/elixir_ast.py',
+            'modules/helpers/ubs_core/external_tools.py',
+            'modules/helpers/ubs_core/go_ast.py',
+            'modules/helpers/ubs_core/java_ast.py',
+            'modules/helpers/ubs_core/py_ast.py',
+            'modules/helpers/ubs_core/py_scan.py',
+            'modules/helpers/ubs_core/ruby_ast.py',
+            'modules/helpers/ubs_core/rust_ast.py',
+            'modules/helpers/ubs_core/rust_scan.py',
+            'modules/helpers/ubs_core/swift_ast.py',
+            'test-suite/quality/test_rule_quality_harness.py',
+            'test-suite/quality/test_suppression_intervals.py',
+            'test-suite/quality/test_ubs_core.py',
+          }
+          assert set(paths)==required,(set(paths)-required,required-set(paths))
+          entries=[]
+          for name in paths:
+              data=Path(name).read_bytes()
+              r=subprocess.run(
+                  ['gh','api','--method','POST','-H',
+                   'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                   f"repos/{os.environ['GH_REPO']}/git/blobs",'--input','-'],
+                  input=json.dumps({'content':base64.b64encode(data).decode(),'encoding':'base64'}),
+                  text=True,capture_output=True,check=True,timeout=90)
+              sha=json.loads(r.stdout)['sha']
+              expected=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+              assert sha==expected,(name,sha,expected)
+              mode=subprocess.check_output(['git','ls-files','--stage','--',name],text=True).split()[0]
+              entries.append({'path':name,'mode':mode,'type':'blob','sha':sha})
+          manifest={'parent':os.environ['GITHUB_SHA'],'files':entries}
+          Path(os.environ['RUNNER_TEMP'],'ast-candidate.json').write_text(json.dumps(manifest,indent=2))
+          print('AST_CANDIDATE '+json.dumps(manifest),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ast-completeness-candidate
+          path: |
+            ${{ runner.temp }}/ast-candidate.json
+            ${{ runner.temp }}/ast-quality.log
+            ${{ runner.temp }}/ast-status.log
+          retention-days: 7

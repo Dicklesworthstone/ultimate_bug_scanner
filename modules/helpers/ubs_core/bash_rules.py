@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 from pathlib import Path
 
 __all__ = [
@@ -104,6 +105,19 @@ message: "test -a / -o is obsolete and has ambiguous precedence in POSIX; use te
 
 
 def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict[str, dict]:
+    # An explicitly requested policy pack cannot silently become the built-in
+    # pack alone. Validate it before publishing a usable generated config.
+    user_files: list[tuple[Path, str]] = []
+    if user_rules_dir is not None:
+        if not user_rules_dir.is_dir():
+            raise ValueError(f"custom rule directory does not exist: {user_rules_dir}")
+        for path in sorted([*user_rules_dir.glob("*.yml"), *user_rules_dir.glob("*.yaml")]):
+            if not path.is_file():
+                raise ValueError(f"custom rule is not a regular file: {path}")
+            user_files.append((path, path.read_text(encoding="utf-8")))
+        if not user_files:
+            raise ValueError(f"custom rule directory contains no .yml or .yaml files: {user_rules_dir}")
+
     rule_dir.mkdir(parents=True, exist_ok=True)
     rules_sub = rule_dir / "rules"
     rules_sub.mkdir(parents=True, exist_ok=True)
@@ -124,23 +138,18 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict[str, di
                 "language": "bash",
             }
 
-    if user_rules_dir and user_rules_dir.is_dir():
-        for pat in ("*.yml", "*.yaml"):
-            for f in user_rules_dir.glob(pat):
-                dest = rules_sub / f"user_{f.name}"
-                shutil.copy2(f, dest)
-                try:
-                    for line in f.read_text(encoding="utf-8", errors="ignore").splitlines():
-                        if line.startswith("id:"):
-                            urid = line.split(":", 1)[1].strip()
-                            manifest[urid] = {
-                                "file": str(dest),
-                                "severity": "warning",
-                                "language": "bash",
-                            }
-                            break
-                except OSError:
-                    pass
+    for path, content in user_files:
+        dest = rules_sub / f"user_{path.name}"
+        shutil.copy2(path, dest)
+        for line in content.splitlines():
+            if line.startswith("id:"):
+                urid = line.split(":", 1)[1].strip()
+                manifest[urid] = {
+                    "file": str(dest),
+                    "severity": "warning",
+                    "language": "bash",
+                }
+                break
 
     sgconfig = rule_dir / "sgconfig-bash.yml"
     sgconfig.write_text(
@@ -150,4 +159,9 @@ def generate(rule_dir: Path, user_rules_dir: Path | None = None) -> dict[str, di
     (rule_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8"
     )
+    if user_rules_dir is not None:
+        print(
+            f"ubs-bash: loaded {len(user_files)} custom rule file(s) from {user_rules_dir}",
+            file=sys.stderr,
+        )
     return manifest

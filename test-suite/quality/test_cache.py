@@ -172,6 +172,27 @@ class IncrementalCacheTests(unittest.TestCase):
         run_env["UBS_PREFILTER_FILE"] = str(self.test_root / "prefilter-stats.json")
         return helpers, run_env
 
+    def test_yaml_policy_content_change_invalidates_a_cached_clean_scan(self) -> None:
+        source = self.project_dir / "entry.sh"
+        source.write_text("#!/bin/sh\ncurl https://example.invalid/script\n", encoding="utf-8")
+        rules = self.test_root / "policies"
+        rules.mkdir()
+        policy = rules / "policy.yaml"
+        policy.write_text("id: project-policy\nrule:\n  pattern: wget $$$A\n", encoding="utf-8")
+        first = ScanCache("bash", self.project_dir, custom_rules=str(rules))
+        first.store_scanned_files([source], {str(source): []})
+        warm = ScanCache("bash", self.project_dir, custom_rules=str(rules))
+        cached, misses = warm.partition_files([source])
+        self.assertEqual(cached, {source: []})
+        self.assertEqual(misses, [])
+        # Keep the filename, ID and source unchanged. Only the requested
+        # policy changed: replaying the old clean result would lose coverage.
+        policy.write_text("id: project-policy\nrule:\n  pattern: curl $$$A\n", encoding="utf-8")
+        changed = ScanCache("bash", self.project_dir, custom_rules=str(rules))
+        cached, misses = changed.partition_files([source])
+        self.assertEqual(cached, {})
+        self.assertEqual(misses, [source])
+
     def _decode_json(self, payload: str, context: str) -> Any:
         try:
             return json.loads(payload)

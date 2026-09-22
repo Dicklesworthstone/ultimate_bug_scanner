@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.10"
+UBS_VERSION="5.4.11"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='a6087b926cfd235f0818861d2f483de8452986171971feb69832448373914887'
-  [cpp]='c05662d351d85606eeb5146eee365a6be63fef90281e36226a8ed702a41ad300'
-  [csharp]='3dd0ba0db73ef192bb23f4399242e6341317aad71f5af5a736921323c46bef61'
-  [elixir]='e266997ea5deea1ab042f66ba6293d7546e39b717c5497c716a590989eb87112'
-  [golang]='5587e1bd90c9682c020e0bbb30ed9f640c34c29d3ff80db8559821cda083bbdc'
-  [java]='ddd0ab6c66b6493816b0076fd46f98302e69aa54438308db6db3724a538e4768'
-  [js]='76ec56a5df7d3c4facaeaa898acb479beea9231913d256a401050ccc38d5367f'
-  [kotlin]='fce6371b1d8aba312e512f83abb17a95b3004238be271ce079e4dcb00a0868a6'
-  [python]='d686284761db2c8d50380a07c78cb834560d00aa9630f790e51edf4eee148905'
-  [ruby]='c106642d13568fffd7c1367bbc08535297f2b286a29304c10072262d0c1b4832'
-  [rust]='1df3075191bbbe040aa7e70ea465b8f2672c18ebec5d991365c352218cc57de8'
-  [swift]='8e68ad43e2a7ee66dacc462329a6ab636e16b11c6e817a4eb7abc846945c0311'
+  [bash]='56327a1e0aeb5178a4233dc91ba1f1c34b1fae29f182c695df0eb8ca12811c9c'
+  [cpp]='b9c5b5f177887b918d5efbf124e437673456b234b7a5b18d28bb60a406fda9e4'
+  [csharp]='e2ee621b37b3b06846f5221a31396922b4aa83f75399c24e10c5dd7485cc3eab'
+  [elixir]='029f09d58ffe7027f26d7892185af1badcfc4706f7dd474418673030d58c9598'
+  [golang]='bbb9a2fe6cb0876e6e36567e7e6e34da3bb4057de2ad378480c3be4370e11197'
+  [java]='313c3831ec0f2aee597aa9ca52acedb21eb81b779ea5d4b23fe5b2f05874466d'
+  [js]='666a25885b2fb5f12e55629706e85eebd2804242f9c6b625b6fd1f426169a334'
+  [kotlin]='5980bd1e92e4fdc0cecd21674e0ba96b12598b8d74920933fcdc4aa099e2e501'
+  [python]='7de02c0aedca9eda37d1606dc4232aa75fbc1f3e69b99fdef62ab020d72d7bd6'
+  [ruby]='8a3d56ab07fa4b179970b325ee1c9a1d7e9124b8a00aec251a0777e1ae39bf3b'
+  [rust]='a8eb1e50b8e3d2069e2ee97095f095eec31f2b8b5cdd79608bcfab960d585662'
+  [swift]='69141e7c0057025ff46592380ef201b6d19d7d3f42b6c296bc68986c9317abf5'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -167,9 +167,9 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_rust.py']='d7b70068d53f76e78f3bdded9a6eda734987c6e2de59ea9739682ca99deb30fa'
   ['helpers/ubs_core/analyzers/taint_swift_redirect.py']='6ab6fc656880e2f8fb61ec563d3b7811e128601417d7b7ba7477fcb24197babd'
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='4fc6e54f7f55ea1006ecf77c60df301cc29d9cd450a821bf0e3de7436a3519f4'
-  ['helpers/ubs_core/bash_rules.py']='b61a431da8298cb7c59e6c2858943536bb1e6308a289ee27698b119fdd7dc5f3'
-  ['helpers/ubs_core/bash_scan.py']='8153084fb914a6ad0d1e81a7c77735445c746877597438486edf191a26ec483c'
-  ['helpers/ubs_core/cache.py']='d3e5133dc3d44abc69fcad1b63644582f21fd512b417a0dbfc430eac24dc0474'
+  ['helpers/ubs_core/bash_rules.py']='17eda47be732993bb1f636cf0375823042c1701646cd656cf9735ae8dc298882'
+  ['helpers/ubs_core/bash_scan.py']='a2c65de4e90a4c1aad47068b83a030ff2abd42214f1e1c6dc30f3a01f4cc04d4'
+  ['helpers/ubs_core/cache.py']='121008fdd270030ea2ab8108bd16bbb82598750baa1b6e5d40ab48442afe2458'
   ['helpers/ubs_core/cli.py']='e51b45718093dd0c03b4e85756365ec821619ee0dce38e416be44244fb555151'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='adb8693a5ac0370aa0bc9f7aabbb05eb63da64fac792e1451f15b352f870a114'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='db752b43c8c9759bb32961d624fd5506f98fd21734406b436a121856f52761c4'
+  ['lib/ubs-common.sh']='b6004fc3958b659f37c9305e63201de163e9e2098043748d2b10777a1235e50b'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1288,6 +1288,7 @@ SKIP_TYPE_NARROWING=0
 [[ "${UBS_SKIP_TYPE_NARROWING:-0}" == "1" ]] && SKIP_TYPE_NARROWING=1
 INCLUDE_EXT=""             # csv forwarded to modules as --include-ext=
 USER_RULES_DIR=""          # forwarded to modules as --rules= (custom ast-grep rules)
+USER_RULES_REQUESTED=0     # distinguish an absent option from --rules=
 OUTPUT_FILE=""             # tee the rendered report to this file (--output / PROJECT_DIR OUTPUT_FILE)
 LIST_CATEGORIES=0
 TEE_PID=""
@@ -2239,10 +2240,10 @@ else
       --include-ext)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; INCLUDE_EXT="$1"; shift;;
-      --rules=*) USER_RULES_DIR="${1#*=}"; shift;;
+      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_DIR="${1#*=}"; shift;;
       --rules)
-        if [[ $# -lt 2 ]]; then usage; exit 2; fi
-        shift; USER_RULES_DIR="$1"; shift;;
+        if [[ $# -lt 2 ]]; then say_err "ERROR: --rules requires a directory"; exit 2; fi
+        USER_RULES_REQUESTED=1; shift; USER_RULES_DIR="$1"; shift;;
       --output=*) OUTPUT_FILE="${1#*=}"; shift;;
       --output|-o)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -2373,6 +2374,31 @@ if [[ "$SHOW_VERSION" -eq 1 ]]; then
   fi
   say "UBS Meta-Runner v${UBS_VERSION}${short_sha:+ (git $short_sha)}"
   exit 0
+fi
+
+# A requested policy is part of the scan contract, not an optional hint.
+# Validate before detection so even an empty project cannot silently accept a
+# typo, and anchor relative paths before modules enter their shadow workspace.
+if [[ "$USER_RULES_REQUESTED" -eq 1 ]]; then
+  if [[ -z "$USER_RULES_DIR" || ! -d "$USER_RULES_DIR" || ! -r "$USER_RULES_DIR" || ! -x "$USER_RULES_DIR" ]]; then
+    refuse_scan "invalid-rules-directory" "--rules requires a readable directory: $USER_RULES_DIR" "" \
+      "No scan was performed because the requested custom policy could not be loaded."
+  fi
+  if ! USER_RULES_DIR="$(cd -- "$USER_RULES_DIR" && pwd -P)"; then
+    refuse_scan "invalid-rules-directory" "Cannot resolve the --rules directory" ""
+  fi
+  _custom_rule_count=0
+  for _custom_rule in "$USER_RULES_DIR"/*.yml "$USER_RULES_DIR"/*.yaml; do
+    [[ -e "$_custom_rule" || -L "$_custom_rule" ]] || continue
+    if [[ ! -f "$_custom_rule" || ! -r "$_custom_rule" ]]; then
+      refuse_scan "invalid-rule-file" "Custom rule is not a readable regular file: $_custom_rule" ""
+    fi
+    _custom_rule_count=$((_custom_rule_count + 1))
+  done
+  if [[ "$_custom_rule_count" -eq 0 ]]; then
+    refuse_scan "empty-rules-directory" "--rules directory contains no .yml or .yaml files: $USER_RULES_DIR" ""
+  fi
+  unset _custom_rule _custom_rule_count
 fi
 
 # Load ignore patterns early so size checks can respect .ubsignore
@@ -6876,10 +6902,8 @@ run_lang(){
   [[ "${QUIET:-0}" -eq 1 ]] && args+=('-q')
   [[ "$JOBS" -gt 0 ]] && args+=("--jobs=$JOBS")
   [[ -n "$INCLUDE_EXT" ]] && args+=("--include-ext=$INCLUDE_EXT")
-  # Custom ast-grep rules: every module except elixir (no ast-grep integration
-  # yet) accepts --rules=DIR; forwarding it there would be rejected as an
-  # unknown option.
-  if [[ -n "$USER_RULES_DIR" && "$lang" != "elixir" ]]; then
+  # All shipped modules support custom AST rules, including Elixir.
+  if [[ -n "$USER_RULES_DIR" ]]; then
     args+=("--rules=$USER_RULES_DIR")
   fi
   if [[ "$lang" == "csharp" && ${#CSHARP_MODULE_ARGS[@]} -gt 0 ]]; then

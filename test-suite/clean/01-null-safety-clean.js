@@ -103,3 +103,14 @@ function displayUserInfo({ name, email, phone } = {}) {
   console.log("Email:", email ?? "N/A");
   console.log("Phone:", phone ?? "N/A");
 }
+
+// GOOD: `== null` / `!= null` is the deliberate nullish check (null or
+// undefined in one comparison), the one loose comparison ESLint's eqeqeq
+// "smart" mode exempts. It must not report as loose equality.
+function labelOf(value) {
+  if (value == null) {
+    return "unknown";
+  }
+  const isSet = value != null && value.label != undefined;
+  return isSet ? value.label : "unlabelled";
+}

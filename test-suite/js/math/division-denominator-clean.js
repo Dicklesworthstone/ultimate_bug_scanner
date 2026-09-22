@@ -63,3 +63,16 @@ export function summarize(samples, total) {
     share,
   ];
 }
+
+// A regex, string or comment inside a template interpolation is not code
+// that divides: `${x.replace(/.../g, "-")}` used to read as two `$L / $R`
+// chains (the regex body and its flags), and an escaped `\/` in template
+// text leaked its slash the same way.
+export function keys(computerId, value, resolved, x) {
+  const key = `persist:bot-${computerId.replace(/[^A-Za-z0-9_-]+/g, "-")}`;
+  const quoted = `'${String(value).replace(/'/g, `'"'"'`)}'`;
+  const fileUrl = `file:///${resolved.replace(/\\/g, "/")}`;
+  const objectInside = `${ {a: "}"}.a } ${"/"} ${x /* a / b */}`;
+  const escaped = `a\/b ${x} \`${value}`;
+  return [key, quoted, fileUrl, objectInside, escaped];
+}

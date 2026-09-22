@@ -3869,7 +3869,7 @@
     },
     {
       "id": "js-division-denominator-clean",
-      "description": "Constant non-zero denominators (/2, /100, Math.PI) and (x || 1) guards must never raise the division warning regardless of repository size.",
+      "description": "Constant non-zero denominators (/2, /100, Math.PI), (x || 1) guards, and regex/string/comment slashes inside template interpolations must never raise the division finding at any tier.",
       "path": "test-suite/js/math/division-denominator-clean.js",
       "language": "js",
       "tags": ["js", "math", "division", "clean"],
@@ -3888,7 +3888,7 @@
             "max": 0
           }
         },
-        "forbid_substrings": ["Division by variable - verify non-zero"]
+        "forbid_substrings": ["Division by variable - verify non-zero", "Division operations found"]
       }
     },
     {

@@ -22,6 +22,7 @@ import re  # noqa: E402
 
 from ubs_core.js_scan import (  # noqa: E402
     Pattern,
+    _record_category,
     iter_matches,
     load_patterns,
     resolve_severity,
@@ -575,6 +576,141 @@ class AstCompletenessTests(unittest.TestCase):
             counts, rows, errors = executor.submit(self.real_analyzer, "pass\n").result(timeout=5)
         self.assertFalse(rows or errors)
         self.assertEqual(sum(counts.values()), 0)
+
+
+class MaskRegexTests(unittest.TestCase):
+    """Pattern.mask_regex blanks an idiom before the search without moving
+    line numbers or hiding the rest of the line."""
+
+    def test_masked_span_is_invisible_but_the_rest_of_the_line_counts(self) -> None:
+        p = _pat(
+            regex=re.compile(r"\bdebugger\b"),
+            mask_regex=re.compile(r"debugger\s*;\s*//\s*allowed"),
+        )
+        text = "\n".join([
+            "debugger; // allowed",
+            "debugger; // allowed  debugger;",
+            "debugger;",
+        ])
+        hits = list(iter_matches(p, text))
+        self.assertEqual([line for line, _ in hits], [2, 3])
+        # Reported text is the original source, not the masked copy.
+        self.assertEqual(hits[0][1], "debugger; // allowed  debugger;")
+
+
+class LooseEqualityNullishTests(unittest.TestCase):
+    """GH #137: `x == null` / `x != undefined` is the deliberate nullish idiom
+    (ESLint eqeqeq "smart" exempts it); every other loose comparison on the
+    same line must still count."""
+
+    def setUp(self) -> None:
+        patterns = [p for p in load_patterns() if p.rule_id == "js.type-coercion.loose-equality"]
+        self.assertEqual(len(patterns), 1)
+        self.pattern = patterns[0]
+
+    def hits(self, text: str) -> list[int]:
+        return [line for line, _ in iter_matches(self.pattern, text)]
+
+    def test_nullish_comparisons_are_exempt(self) -> None:
+        src = "\n".join([
+            "if (value == null) {",
+            "const unknown = summary?.costUsd == null;",
+            "meta.agentUsed != null && meta.originalModel != null",
+            "if (leaders.get(key) == null) {}",
+            "if (x == undefined) {}",
+            "if (null == x) {}",
+            "if (undefined != x) {}",
+            "x==null",
+        ])
+        self.assertEqual(self.hits(src), [])
+
+    def test_other_loose_comparisons_still_report(self) -> None:
+        src = "\n".join([
+            "if (x == 'x') {}",              # 1
+            "if (x == null && y == 5) {}",   # 2: the nullish half is masked, y == 5 is not
+            "if (x == nullable) {}",         # 3: not the literal null
+            "if (x == undefinedValue) {}",   # 4
+            "x==5",                          # 5
+            "if (typeof x == 'string') {}",  # 6
+            "if (a === null) {}",            # strict: never reported
+            "if (a <= null) {}",             # relational: never reported
+        ])
+        self.assertEqual(self.hits(src), [1, 2, 3, 4, 5, 6])
+
+
+class AnalyzerCategoryTests(unittest.TestCase):
+    """GH #134: analyzer findings must resolve to the category number that
+    --skip and the text renderer use, whatever prefix their rule id carries."""
+
+    def test_ctcompare_maps_to_security(self) -> None:
+        self.assertEqual(_record_category({"rule": "javascript.ctcompare.unsafe_secret_compare"}), 7)
+
+    def test_explicit_category_id_is_honoured(self) -> None:
+        self.assertEqual(_record_category({"rule": "javascript.something.new",
+                                           "category_id": "js.type-coercion"}), 4)
+        self.assertEqual(_record_category({"rule": "javascript.something.new",
+                                           "category_id": "js.security"}), 7)
+
+    def test_unknown_rule_without_category_stays_unmapped(self) -> None:
+        self.assertIsNone(_record_category({"rule": "javascript.something.new"}))
+        self.assertIsNone(_record_category({"rule": "javascript.something.new",
+                                            "category_id": "js.not-a-category"}))
+
+
+class MetaRunnerRegressionTests(unittest.TestCase):
+    """End-to-end through the meta-runner, the way the reports were filed."""
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="js-issue-", dir=artifacts)
+        self.addCleanup(self.tmp.cleanup)
+        self.project = Path(self.tmp.name) / "project"
+        self.project.mkdir()
+
+    def scan(self, *args):
+        result = subprocess.run(
+            [str(REPO_ROOT / "ubs"), "--format=json", "--no-color", "--ci", "--only=js",
+             *args, str(self.project)], cwd=self.tmp.name,
+            env={**os.environ, "UBS_NO_AUTO_UPDATE": "1", "UBS_NO_CACHE": "1",
+                 "UBS_SKIP_TYPE_NARROWING": "1"},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        rules = sorted(f["rule"] for s in report["scanners"] for f in s.get("findings", []))
+        return report, rules
+
+    def test_gh134_skip_category_reaches_ctcompare_findings(self) -> None:
+        (self.project / "a.ts").write_text(
+            "export function nonceReplayCheck(sessionNonce: string, expectedNonce: string): boolean {\n"
+            "  return sessionNonce === expectedNonce;\n}\n"
+        )
+        report, rules = self.scan()
+        self.assertIn("javascript.ctcompare.unsafe_secret_compare", rules)
+        self.assertEqual(report["totals"]["critical"], 1, report)
+        report, rules = self.scan("--skip=js.security")
+        self.assertEqual(rules, [], report)
+        self.assertEqual(report["totals"]["critical"], 0, report)
+
+    def test_gh137_nullish_check_is_not_a_loose_equality_finding(self) -> None:
+        (self.project / "nullish.ts").write_text(
+            "export function label(value: string | null | undefined): string {\n"
+            "  if (value == null) {\n    return \"unknown\";\n  }\n"
+            "  const unknown = value != null;\n"
+            "  return value;\n}\n"
+        )
+        report, rules = self.scan()
+        self.assertNotIn("js.type-coercion.loose-equality", rules, report)
+        (self.project / "loose.ts").write_text(
+            "export function isX(value: string): boolean {\n  return value == \"x\";\n}\n"
+        )
+        report, rules = self.scan()
+        self.assertIn("js.type-coercion.loose-equality", rules, report)
+        loose = [f for s in report["scanners"] for f in s.get("findings", [])
+                 if f["rule"] == "js.type-coercion.loose-equality"]
+        self.assertEqual([(Path(f["path"]).name, f["line"]) for f in loose], [("loose.ts", 2)])
+
 
 
 if __name__ == "__main__":

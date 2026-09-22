@@ -113,11 +113,18 @@ jobs:
           python3 - <<'PY'
           import base64, gzip, hashlib, json, os, subprocess
           from pathlib import Path
-          sha = '5684b3b813c4939f929932525d6ee60e804d8bbb'
-          response = subprocess.check_output(['gh', 'api',
-              f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True, timeout=60)
-          data = base64.b64decode(json.loads(response)['content'])
-          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+          chunks = []
+          for sha in ('b690dc96ececb5055c4854360812c48ba96d2afa',
+                      'd4530a227328aec317069d6b14c80fcbd09d60ae',
+                      '032b1026e0d5edec97664ad1c2d61d837664e7a9',
+                      '0be3919e9e56a4a5996a3b362a180cc2abc0abdb'):
+              response = subprocess.check_output(['gh', 'api',
+                  f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True, timeout=60)
+              chunk = base64.b64decode(json.loads(response)['content'])
+              assert hashlib.sha1(b'blob ' + str(len(chunk)).encode() + b'\0' + chunk).hexdigest() == sha
+              chunks.append(chunk)
+          data = b''.join(chunks)
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == 'b59425a3fb79675d38a0997aa7c9967ebcd17d04'
           patch = Path(os.environ['RUNNER_TEMP'], 'prefilter.patch')
           patch.write_bytes(gzip.decompress(data))
           subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
@@ -166,7 +173,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: prefilter-admission-validation
+          name: prefilter-proof-validation
           path: ${{ runner.temp }}/prefilter-*
           retention-days: 7
 
@@ -191,7 +198,7 @@ jobs:
           import json, os, subprocess
           from pathlib import Path
           version = Path('VERSION').read_text().strip()
-          assert version == '5.4.14'
+          assert version == '5.4.15'
           prefix = ['gh', 'api']
           base = 'repos/' + os.environ['GH_REPO'] + '/git/'
           endpoint = base + 'ref/tags/v' + version

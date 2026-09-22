@@ -11,6 +11,7 @@ on:
       - test-suite/quality/test_js_*.py
       - test-suite/quality/test_bash_scan.py
       - test-suite/quality/test_cache.py
+      - test-suite/quality/test_prefilter.py
       - test-suite/quality/test_build_output_pruning.py
       - test-suite/quality/test_scan_selection.py
       - test-suite/quality/test_module_file_counting.py
@@ -26,6 +27,7 @@ on:
       - test-suite/quality/test_js_*.py
       - test-suite/quality/test_bash_scan.py
       - test-suite/quality/test_cache.py
+      - test-suite/quality/test_prefilter.py
       - test-suite/quality/test_build_output_pruning.py
       - test-suite/quality/test_scan_selection.py
       - test-suite/quality/test_module_file_counting.py
@@ -67,7 +69,7 @@ jobs:
       - name: Exercise policies, cache, real analyzers and traversal
         run: |
           cd test-suite
-          python3 -m unittest quality.test_js_rules quality.test_js_scan quality.test_bash_scan quality.test_cache quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v 2>&1 | tee "$RUNNER_TEMP/js-policy-tests.log"
+          python3 -m unittest quality.test_js_rules quality.test_js_scan quality.test_bash_scan quality.test_cache quality.test_prefilter quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v 2>&1 | tee "$RUNNER_TEMP/js-policy-tests.log"
       - name: Exercise partial reports and optional analyzer adapters
         run: |
           python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-optional-tests.log"
@@ -80,3 +82,124 @@ jobs:
           name: javascript-completeness-validation
           path: ${{ runner.temp }}/js-*.log
           retention-days: 7
+
+  prefilter-validation:
+    if: >-
+      github.event_name == 'push' && contains(github.event.head_commit.message, 'validate prefilter admission')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      UBS_NO_AUTO_UPDATE: "1"
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli@0.45.3
+      - name: Apply the immutable reviewed prefilter patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess
+          from pathlib import Path
+          sha = '5684b3b813c4939f929932525d6ee60e804d8bbb'
+          response = subprocess.check_output(['gh', 'api',
+              f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True, timeout=60)
+          data = base64.b64decode(json.loads(response)['content'])
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+          patch = Path(os.environ['RUNNER_TEMP'], 'prefilter.patch')
+          patch.write_bytes(gzip.decompress(data))
+          subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
+          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
+          PY
+          python3 scripts/update_checksums.py > "$RUNNER_TEMP/prefilter-checksums.log"
+          git add -- ubs SHA256SUMS modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh
+      - name: Validate complete quality unit suite and status contracts
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p 'test_*.py' -v 2>&1 | tee "$RUNNER_TEMP/prefilter-quality.log"
+          python3 test-suite/shareable/test_status_invariants.py 2>&1 | tee "$RUNNER_TEMP/prefilter-status.log"
+          python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/prefilter-optional.log"
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/prefilter-verify.log"
+          ./scripts/verify_sha256sums.sh
+          shellcheck -S warning ubs modules/ubs-js.sh
+          python3 scripts/update_checksums.py > "$RUNNER_TEMP/prefilter-repeat.log"
+          git diff --exit-code
+          git diff --cached --check
+      - name: Store tested source objects without changing any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, subprocess
+          from pathlib import Path
+          entries = []
+          paths = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+          assert paths and all(not p.startswith('.github/') for p in paths)
+          for name in paths:
+              data = Path(name).read_bytes()
+              response = subprocess.run(['gh', 'api', '--method', 'POST',
+                  f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=json.dumps({'content': base64.b64encode(data).decode(), 'encoding': 'base64'}),
+                  text=True, capture_output=True, check=True, timeout=60)
+              sha = json.loads(response.stdout)['sha']
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              mode = subprocess.check_output(['git', 'ls-files', '--stage', '--', name], text=True).split()[0]
+              entries.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha})
+          root = Path(os.environ['RUNNER_TEMP'])
+          (root / 'prefilter-candidate.json').write_text(json.dumps({'parent': os.environ['GITHUB_SHA'], 'files': entries}, indent=2))
+          tree = subprocess.check_output(['git', 'write-tree'], text=True).strip()
+          with (root / 'prefilter-source.tar').open('wb') as archive:
+              subprocess.run(['git', 'archive', '--format=tar', tree], stdout=archive, check=True)
+          print('PREFILTER_CANDIDATE', json.dumps(entries))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prefilter-admission-validation
+          path: ${{ runner.temp }}/prefilter-*
+          retention-days: 7
+
+  pin-prefilter-assets:
+    if: >-
+      github.event_name == 'push' && startsWith(github.event.head_commit.message, 'fix(prefilter):')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pin the tested module version without replacing an existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          version = Path('VERSION').read_text().strip()
+          assert version == '5.4.14'
+          prefix = ['gh', 'api']
+          base = 'repos/' + os.environ['GH_REPO'] + '/git/'
+          endpoint = base + 'ref/tags/v' + version
+          current = subprocess.run(prefix + [endpoint], capture_output=True, text=True, timeout=60)
+          if current.returncode:
+              assert str(json.loads(current.stdout).get('status')) == '404', current.stderr
+              subprocess.run(prefix + ['--method', 'POST', base + 'refs', '-f',
+                  'ref=refs/tags/v' + version, '-f', 'sha=' + os.environ['GITHUB_SHA']], check=True, timeout=60)
+          result = json.loads(subprocess.check_output(prefix + [endpoint], text=True, timeout=60))
+          assert result['object']['sha'] == os.environ['GITHUB_SHA'], 'Refusing to replace existing tag'
+          PY

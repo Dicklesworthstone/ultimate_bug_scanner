@@ -7,12 +7,14 @@ on:
       - ubs
       - modules/**
       - test-suite/quality/test_js_*.py
+      - test-suite/shareable/test_status_invariants.py
       - .github/workflows/javascript-policies.yml
   pull_request:
     paths:
       - ubs
       - modules/**
       - test-suite/quality/test_js_*.py
+      - test-suite/shareable/test_status_invariants.py
       - .github/workflows/javascript-policies.yml
   workflow_dispatch:
 
@@ -40,8 +42,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli@0.45.3
-      - name: Apply the immutable reviewed candidate
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, 'prepare JavaScript policy candidate')
+      - name: Apply the immutable reviewed completeness candidate
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, 'prepare JavaScript completeness candidate')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -50,9 +52,9 @@ jobs:
           import base64, gzip, hashlib, json, os, subprocess
           from pathlib import Path
           chunks = []
-          for sha in ('ea103b3f603d276fc8e9652006f78a58d211abd3',
-                      'd395522681671434931f945d865dfcf2c777b259',
-                      '6c53e992cdf45b2d45c6e7eb501e3f6d7e1f5169'):
+          for sha in ('5d382ff68c3cca13e7ff577afc48337435805ee3',
+                      '2388a4664f09ca5169caf741274e72324d3aef1c',
+                      'f0406dd75e8d532f30deb56cb4fd50419eca3264'):
               result = subprocess.run(['gh', 'api', '-H',
                   'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
                   f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"],
@@ -61,8 +63,8 @@ jobs:
               assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
               chunks.append(data)
           data = b''.join(chunks)
-          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == 'd18e366b485f362e7364b2f5d068cac6018b3675'
-          patch = Path(os.environ['RUNNER_TEMP'], 'js-policy.patch')
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == 'b272fc4c1a3af74c232de4a199953c02ebf78b47'
+          patch = Path(os.environ['RUNNER_TEMP'], 'js-completeness.patch')
           patch.write_bytes(gzip.decompress(data))
           subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
           subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
@@ -78,12 +80,18 @@ jobs:
           python3 scripts/update_checksums.py > "$RUNNER_TEMP/js-checksum-repeat.log"
           git diff --exit-code
           git diff --cached --check
-      - name: Exercise policies, real analyzers, selection and traversal
+      - name: Exercise policies, cache, real analyzers and traversal
         run: |
           cd test-suite
-          python3 -m unittest quality.test_js_rules quality.test_js_scan quality.test_bash_scan quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v 2>&1 | tee "$RUNNER_TEMP/js-policy-tests.log"
+          python3 -m unittest quality.test_js_rules quality.test_js_scan quality.test_bash_scan quality.test_cache quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v 2>&1 | tee "$RUNNER_TEMP/js-policy-tests.log"
+      - name: Exercise partial reports and optional analyzer adapters
+        run: |
+          python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-optional-tests.log"
+          python3 test-suite/shareable/test_ruby_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-ruby-tests.log"
+          python3 test-suite/shareable/test_go_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-go-tests.log"
+          python3 test-suite/shareable/test_status_invariants.py 2>&1 | tee "$RUNNER_TEMP/js-status-tests.log"
       - name: Store tested source objects without changing any branch
-        if: github.event_name == 'push' && contains(github.event.head_commit.message, 'prepare JavaScript policy candidate')
+        if: github.event_name == 'push' && contains(github.event.head_commit.message, 'prepare JavaScript completeness candidate')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -111,22 +119,22 @@ jobs:
           print('JS_CANDIDATE', json.dumps(manifest))
           PY
       - name: Pin the validated landed module version
-        if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'fix(js-policy):')
+        if: github.event_name == 'push' && startsWith(github.event.head_commit.message, 'fix(scan-completeness):')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          test "$(cat VERSION)" = 5.4.12
-          endpoint="repos/$GH_REPO/git/ref/tags/v5.4.12"
+          test "$(cat VERSION)" = 5.4.13
+          endpoint="repos/$GH_REPO/git/ref/tags/v5.4.13"
           if existing="$(gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' "$endpoint" --jq '.object.sha' 2>/dev/null)"; then
             test "$existing" = "$GITHUB_SHA"
           else
-            gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/v5.4.12 -f sha="$GITHUB_SHA"
+            gh api -H 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0' --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/v5.4.13 -f sha="$GITHUB_SHA"
           fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: javascript-policy-validation
+          name: javascript-completeness-validation
           path: |
             ${{ runner.temp }}/js-*.log
             ${{ runner.temp }}/js-candidate.json

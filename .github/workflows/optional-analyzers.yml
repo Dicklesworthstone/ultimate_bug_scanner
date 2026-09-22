@@ -80,39 +80,3 @@ jobs:
         run: |
           python3 scripts/update_checksums.py
           git diff --exit-code
-
-  pin-landed-coverage-assets:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'publish validated v5.4.11 asset pin')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      GIT_TERMINAL_PROMPT: "0"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify current main has the exact tested source and assets
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$(cat VERSION)" = 5.4.11
-          git diff --exit-code 56768dabf4d0e01b8980b1298d67d8b6710ecd21 HEAD -- VERSION ubs modules scripts SHA256SUMS test-suite
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-      - name: Pin this main commit without replacing any tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          gh auth setup-git
-          # Tag the commit that already introduced this workflow, not an older
-          # workflow tree. No workflow permission or branch write is required.
-          timeout 120 git push origin "$GITHUB_SHA:refs/tags/v5.4.11"
-          actual="$(git ls-remote --tags origin refs/tags/v5.4.11 | cut -f1)"
-          test "$actual" = "$GITHUB_SHA"
-          echo "Verified v5.4.11 points to $GITHUB_SHA"

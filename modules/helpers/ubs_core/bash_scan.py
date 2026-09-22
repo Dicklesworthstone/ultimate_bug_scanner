@@ -69,6 +69,15 @@ _SUMMARY_TITLES: dict[str, str] = {
     "bash.locale.unexported_lc_all": "LC_ALL assigned without export",
 }
 
+# Only these AST rules duplicate a specific native detector. A shared line
+# number alone is not a duplicate: it can carry several independent defects,
+# including project-defined policies that must never be hidden (GH #138).
+_NATIVE_AST_EQUIVALENTS = {
+    "bash.security.eval-variable": "bash.security.eval_variable",
+    "bash.variable.local-command-subst": "bash.variable.local_command_subst",
+    "bash.security.mktemp-dry-run": "bash.security.mktemp_dry_run",
+}
+
 
 def slug_for_category(category: int) -> str:
     return _CATEGORY_SLUGS.get(category, f"cat-{category}")
@@ -216,7 +225,7 @@ def scan_files_native(
     files: Sequence[Path],
     sink,
     skip: set[int],
-    reported_locations: set[tuple[str, int]],
+    reported_locations: set[tuple[str, int, str]],
     prefilter: Any = None,
 ) -> dict[str, int]:
     counters = {"critical": 0, "warning": 0, "info": 0}
@@ -277,7 +286,7 @@ def scan_files_native(
                 if re.search(r"(?:^|[\s;&|])\[\[\s+", line) or re.search(r"^\s*function\s+[a-zA-Z_]", line):
                     rule_id = "bash.syntax.posix_bashism"
                     if not _has_suppression(lines, lineno, rule_id):
-                        key = (file_str, lineno)
+                        key = (file_str, lineno, rule_id)
                         reported_locations.add(key)
                         counters["warning"] += 1
                         sink.write(json.dumps({
@@ -307,7 +316,7 @@ def scan_files_native(
                 if check.regex.search(line):
                     if _has_suppression(lines, lineno, check.rule_id):
                         continue
-                    key = (file_str, lineno)
+                    key = (file_str, lineno, check.rule_id)
                     reported_locations.add(key)
                     counters[check.severity] += 1
                     sink.write(json.dumps({
@@ -328,7 +337,7 @@ def scan_shellcheck(
     files: Sequence[Path],
     sink,
     skip: set[int],
-    reported_locations: set[tuple[str, int]],
+    reported_locations: set[tuple[str, int, str]],
     errors: list[str] | None = None,
 ) -> dict[str, int]:
     """Run ShellCheck over the file list; write sink records.
@@ -425,8 +434,9 @@ def scan_shellcheck(
             lineno, col, code = it["line"], it["column"], it["code"]
             msg, level = it["message"], it["level"]
 
-            # De-duplicate against native detectors
-            if (file_p, lineno) in reported_locations:
+            # A native warning does not attest to unrelated ShellCheck checks
+            # on the same line. Suppress only an already reported rule ID.
+            if (file_p, lineno, f"bash.shellcheck.SC{code}") in reported_locations:
                 continue
 
             # Skip style/informational checks that produce noise on valid scripts
@@ -464,7 +474,7 @@ def scan_ast_rules(
     files: Sequence[Path],
     sink,
     skip: set[int],
-    reported_locations: set[tuple[str, int]],
+    reported_locations: set[tuple[str, int, str]],
     prefilter: Any = None,
     errors: list[str] | None = None,
 ) -> dict[str, int]:
@@ -478,7 +488,14 @@ def scan_ast_rules(
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     config = rule_dir / "sgconfig-bash.yml"
-    if not config.is_file() or not shutil.which("ast-grep"):
+    if not config.is_file():
+        if errors is not None:
+            errors.append(f"ast-grep configuration not found: {config}")
+        return counters
+    ast_bin = os.environ.get("UBS_AST_GREP_BIN") or shutil.which("ast-grep")
+    if not ast_bin:
+        if errors is not None:
+            errors.append(f"ast-grep unavailable for requested rule pack: {config}")
         return counters
 
     target_files = files
@@ -493,9 +510,10 @@ def scan_ast_rules(
         batch = file_strs[i:i + batch_size]
         try:
             proc = subprocess.run(
-                ["ast-grep", "scan", "-c", str(config), "--json=stream", *batch],
+                [ast_bin, "scan", "-c", str(config), "--json=stream", *batch],
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
             )
         except FileNotFoundError:
@@ -520,6 +538,7 @@ def scan_ast_rules(
                 + (f": {detail[0][:160]}" if detail else "")
             )
 
+        invalid_records = 0
         for line in proc.stdout.splitlines():
             line = line.strip()
             if not line:
@@ -527,15 +546,33 @@ def scan_ast_rules(
             try:
                 m = json.loads(line)
             except ValueError:
+                invalid_records += 1
                 continue
-            rule_id = m.get("ruleId") or ""
-            file_p = m.get("file") or ""
-            rng = m.get("range", {}).get("start", {})
-            lineno = int(rng.get("line", 0)) + 1
-            col = int(rng.get("column", 0)) + 1
+            # Bad analyzer output is lost coverage, not a clean result or a
+            # traceback that discards other findings. Never invent line 1 for
+            # a diagnostic whose required location is absent or malformed.
+            if not isinstance(m, dict):
+                invalid_records += 1
+                continue
+            rng = m.get("range")
+            start = rng.get("start") if isinstance(rng, dict) else None
+            if (
+                not isinstance(m.get("ruleId"), str) or not m["ruleId"]
+                or not isinstance(m.get("file"), str) or not m["file"]
+                or not isinstance(start, dict)
+                or any(type(start.get(k)) is not int or start[k] < 0
+                       for k in ("line", "column"))
+                or not isinstance(m.get("message", ""), str)
+                or not isinstance(m.get("severity", "warning"), str)
+            ):
+                invalid_records += 1
+                continue
+            rule_id, file_p = m["ruleId"], m["file"]
+            lineno, col = start["line"] + 1, start["column"] + 1
             message = m.get("message") or rule_id
 
-            if (file_p, lineno) in reported_locations:
+            native_rule = _NATIVE_AST_EQUIVALENTS.get(rule_id)
+            if native_rule and (file_p, lineno, native_rule) in reported_locations:
                 continue
 
             sev_raw = (m.get("severity") or "warning").lower()
@@ -551,7 +588,7 @@ def scan_ast_rules(
                 continue
 
             counters[sev] += 1
-            reported_locations.add((file_p, lineno))
+            reported_locations.add((file_p, lineno, rule_id))
             sink.write(json.dumps({
                 "rule": rule_id,
                 "category_id": f"bash.{slug_for_category(cat)}",
@@ -562,6 +599,11 @@ def scan_ast_rules(
                 "message": f"{rule_id}: {message}"[:300],
                 "suppressed": False,
             }) + "\n")
+
+        if invalid_records and errors is not None:
+            errors.append(
+                f"ast-grep returned {invalid_records} malformed diagnostic(s) on {config.name}"
+            )
 
     return counters
 
@@ -702,7 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         prefilter_res = run_prefilter(files_to_scan, prefilter_index)
 
-        reported_locations: set[tuple[str, int]] = set()
+        reported_locations: set[tuple[str, int, str]] = set()
         capturing_sink = CapturingSink()
         scan_files_native(files_to_scan, capturing_sink, skip, reported_locations, prefilter=prefilter_res)
         if args.ast_rule_dir:
@@ -742,7 +784,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if recs:
                 for r in recs:
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
-                    reported_locations.add((r.get("path", ""), r.get("line", 1)))
+                    reported_locations.add((r.get("path", ""), r.get("line", 1), r.get("rule", "")))
         if not args.no_shellcheck:
             scan_shellcheck(files, sink_file, skip, reported_locations, errors=scan_errors)
 

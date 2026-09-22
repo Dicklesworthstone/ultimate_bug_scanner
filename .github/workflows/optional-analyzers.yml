@@ -14,6 +14,7 @@ on:
       - test-suite/shareable/test_optional_analyzers.py
       - test-suite/shareable/test_ruby_analyzers.py
       - test-suite/shareable/test_go_analyzers.py
+      - test-suite/quality/test_bash_scan.py
       - test-suite/quality/test_cache.py
       - test-suite/quality/test_scan_selection.py
       - test-suite/quality/test_module_file_counting.py
@@ -30,6 +31,7 @@ on:
       - test-suite/shareable/test_optional_analyzers.py
       - test-suite/shareable/test_ruby_analyzers.py
       - test-suite/shareable/test_go_analyzers.py
+      - test-suite/quality/test_bash_scan.py
       - test-suite/quality/test_cache.py
       - test-suite/quality/test_scan_selection.py
       - test-suite/quality/test_module_file_counting.py
@@ -45,6 +47,7 @@ jobs:
     timeout-minutes: 15
     env:
       PYTHONDONTWRITEBYTECODE: "1"
+      UBS_NO_AUTO_UPDATE: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -52,6 +55,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli@0.45.3
           go version
           command -v gofmt
       - name: Verify syntax, lint, and checksum chain
@@ -60,6 +64,8 @@ jobs:
           shellcheck -S warning ubs modules/ubs-bash.sh modules/ubs-ruby.sh modules/ubs-golang.sh
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
+      - name: Test custom policies with real analyzers and all report formats
+        run: python3 -m unittest discover -s test-suite/quality -p test_bash_scan.py -v
       - name: Test Go tools, real offline vet, and production reports
         run: python3 test-suite/shareable/test_go_analyzers.py -v
       - name: Test Ruby tools across output, scope, and cache paths
@@ -74,134 +80,3 @@ jobs:
         run: |
           python3 scripts/update_checksums.py
           git diff --exit-code
-
-  bash-policy-validation:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'validate Bash policy coverage')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    defaults:
-      run:
-        shell: bash
-    env:
-      UBS_NO_AUTO_UPDATE: "1"
-      PYTHONDONTWRITEBYTECODE: "1"
-      GH_REPO: ${{ github.repository }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Install test dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
-          npm install --global @ast-grep/cli@0.45.3
-      - name: Apply immutable reviewed implementation and integration-test corrections
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 - <<'PY'
-          import base64, hashlib, json, os, subprocess, yaml
-          from pathlib import Path
-          source = subprocess.check_output(['git', 'show',
-              '9510b742b2085088e3f504a4b3128eaa234b6a84:.github/workflows/optional-analyzers.yml'], text=True)
-          steps = yaml.safe_load(source)['jobs']['bash-policy-validation']['steps']
-          scripts = {step['name']: step['run'] for step in steps if 'run' in step}
-          for name in ('Record baseline lint', 'Apply the exact reviewed patch and final workflow files'):
-              subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', scripts[name]], check=True)
-          result = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
-              f"repos/{os.environ['GH_REPO']}/git/blobs/1cdc5d9f08a3b9404628cedc4f215193e028fcfc"],
-              capture_output=True, text=True, check=True, timeout=90)
-          data = base64.b64decode(json.loads(result.stdout)['content'])
-          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == '1cdc5d9f08a3b9404628cedc4f215193e028fcfc'
-          patch = Path(os.environ['RUNNER_TEMP'], 'policy-test-corrections.patch')
-          patch.write_bytes(data)
-          subprocess.run(['git', 'apply', '--index', '--check', str(patch)], check=True)
-          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
-          subprocess.run(['bash', '-e', '-o', 'pipefail', '-c', scripts['Verify release version and complete checksum chain']], check=True)
-          PY
-      - name: Verify all focused regressions without swallowing pipeline failures
-        run: |
-          set -euo pipefail
-          python3 -m unittest discover -s test-suite/quality -p test_bash_scan.py -v 2>&1 | tee "$RUNNER_TEMP/policy-bash-final.log"
-          (cd test-suite && python3 -m unittest quality.test_cache quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v) 2>&1 | tee "$RUNNER_TEMP/policy-regressions-final.log"
-          python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/policy-optional-final.log"
-          shellcheck -f json ubs modules/ubs-*.sh scripts/*.sh > "$RUNNER_TEMP/policy-lint-after.json" || test "$?" -eq 1
-          python3 - <<'PY'
-          import collections, json, os
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP'])
-          def diagnostics(name):
-              return collections.Counter((d['file'], d['code'], d['message']) for d in json.loads((root / name).read_text()))
-          new = diagnostics('policy-lint-after.json') - diagnostics('policy-lint-before.json')
-          assert not new, new
-          print('ShellCheck: no new diagnostics')
-          PY
-          git diff --exit-code
-          git diff --cached --check
-      - name: Check whether repository-wide JavaScript failures predate the patch
-        run: |
-          set -euo pipefail
-          baseline="$RUNNER_TEMP/policy-baseline"
-          mkdir -p "$baseline"
-          git archive HEAD | tar -xf - -C "$baseline"
-          for variant in baseline candidate; do
-            root="$GITHUB_WORKSPACE"
-            if test "$variant" = baseline; then root="$baseline"; fi
-            rc=0
-            (cd "$root" && python3 test-suite/run_manifest.py --case js-node-clean --case js-typescript-jsx-target-blank-noopener-buggy) > "$RUNNER_TEMP/policy-js-$variant.log" 2>&1 || rc=$?
-            echo "JS_GATE $variant exit=$rc"
-            grep -E 'FAIL|expected|critical count|warning count|missing substring' "$RUNNER_TEMP/policy-js-$variant.log" || true
-          done
-      - name: Publish the validated immutable candidate tag, never main
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GIT_TERMINAL_PROMPT: "0"
-          GIT_AUTHOR_NAME: OpenAI
-          GIT_AUTHOR_EMAIL: noreply@openai.com
-          GIT_COMMITTER_NAME: OpenAI
-          GIT_COMMITTER_EMAIL: noreply@openai.com
-        run: |
-          set -euo pipefail
-          git diff --exit-code
-          git diff --cached --check
-          cat > "$RUNNER_TEMP/policy-commit-message.txt" <<EOF
-          fix(coverage): preserve custom policies and independent Bash findings (#138)
-
-          Preserve independent native, AST and ShellCheck evidence; report invalid
-          analyzer output as partial rather than clean and never cache lost coverage.
-          Validate explicit policy directories before language detection, pass paths
-          safely, forward custom rules to Elixir, and invalidate cached clean results
-          on changes to .yaml policies. Synchronize the full checksum chain and
-          version to 5.4.11; retain real-analyzer coverage in regular CI.
-
-          Add 44 Bash unit/integration tests and YAML cache regression; update the
-          existing ShellCheck tests for rule-aware deduplication and support both
-          discovery and package invocation of the traversal regression suite.
-
-          Focused validation: Actions run $GITHUB_RUN_ID, strict pipeline failures.
-          Previous full gate: 533 quality unit tests passed; JavaScript rule-pack
-          and manifest checks failed and the full gate exceeded its 900s limit.
-          This commit does not claim a green repository-wide test suite.
-          EOF
-          tree="$(git write-tree)"
-          candidate="$(git commit-tree "$tree" -p "$GITHUB_SHA" < "$RUNNER_TEMP/policy-commit-message.txt")"
-          echo "POLICY_TREE=$tree"
-          echo "POLICY_COMMIT=$candidate"
-          git diff-tree --no-commit-id --name-only -r "$candidate"
-          gh auth setup-git
-          timeout 120 git push origin "$candidate:refs/tags/v5.4.11"
-          printf '%s\n' "$candidate" > "$RUNNER_TEMP/policy-commit-sha.txt"
-          echo "POLICY_PUBLISHED_TAG=v5.4.11"
-      - name: Preserve validation evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bash-policy-strict-validation
-          path: |
-            ${{ runner.temp }}/policy-*.log
-            ${{ runner.temp }}/policy-*.json
-            ${{ runner.temp }}/policy-commit-*.txt
-          retention-days: 7

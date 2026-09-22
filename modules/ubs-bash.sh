@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="db752b43c8c9759bb32961d624fd5506f98fd21734406b436a121856f52761c4"
+UBS_LIB_CHECKSUM="b6004fc3958b659f37c9305e63201de163e9e2098043748d2b10777a1235e50b"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -130,10 +130,30 @@ while [[ $# -gt 0 ]]; do
     --report-json) REPORT_JSON="${2:-}"; shift 2;;
     --files-from=*) FILES_FROM="${1#*=}"; shift;;
     --files-from) FILES_FROM="${2:-}"; shift 2;;
-    --rules=*) USER_RULE_DIR="${1#*=}"; shift;;
-    --rules) USER_RULE_DIR="${2:-}"; shift 2;;
-    --ast-rule-dir=*) AST_RULE_DIR="${1#*=}"; shift;;
-    --ast-rule-dir) AST_RULE_DIR="${2:-}"; shift 2;;
+    --rules=*|--rules)
+      if [[ "$1" == --rules ]]; then
+        [[ $# -ge 2 ]] || { echo "ERROR: --rules requires a directory" >&2; exit 2; }
+        USER_RULE_DIR="$2"; shift 2
+      else
+        USER_RULE_DIR="${1#*=}"; shift
+      fi
+      if [[ -z "$USER_RULE_DIR" || ! -d "$USER_RULE_DIR" || ! -r "$USER_RULE_DIR" || ! -x "$USER_RULE_DIR" ]]; then
+        echo "ERROR: --rules requires a readable directory: $USER_RULE_DIR" >&2
+        exit 2
+      fi
+      ;;
+    --ast-rule-dir=*|--ast-rule-dir)
+      if [[ "$1" == --ast-rule-dir ]]; then
+        [[ $# -ge 2 ]] || { echo "ERROR: --ast-rule-dir requires a directory" >&2; exit 2; }
+        AST_RULE_DIR="$2"; shift 2
+      else
+        AST_RULE_DIR="${1#*=}"; shift
+      fi
+      if [[ -z "$AST_RULE_DIR" || ! -f "$AST_RULE_DIR/sgconfig-bash.yml" || ! -r "$AST_RULE_DIR/sgconfig-bash.yml" ]]; then
+        echo "ERROR: --ast-rule-dir requires a readable sgconfig-bash.yml: $AST_RULE_DIR" >&2
+        exit 2
+      fi
+      ;;
     --dump-rules=*) DUMP_RULES_DIR="${1#*=}"; shift;;
     --dump-rules) DUMP_RULES_DIR="${2:-rules-dump}"; shift 2;;
     --list-rules) LIST_RULES=1; shift;;
@@ -165,6 +185,37 @@ done
 
 : "$JOBS" "$VERBOSE" "$QUIET" "$NO_COLOR_FLAG" "$LANGUAGE" "$CI_MODE"
 
+ast_rules_available(){
+  [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]] &&
+    command -v "${UBS_AST_GREP_BIN:-ast-grep}" >/dev/null 2>&1
+}
+
+# Pass paths as data, never interpolate them into executable Python. A quote
+# in a legitimate directory name previously disabled all AST coverage (#138).
+generate_bash_rules(){
+  local destination="$1" helpers_dir="$2"
+  PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$destination" "$USER_RULE_DIR" <<'PYRULES'
+from pathlib import Path
+import sys
+from ubs_core.bash_rules import generate
+
+try:
+    generate(Path(sys.argv[1]), Path(sys.argv[2]) if sys.argv[2] else None)
+except (OSError, ValueError) as exc:
+    print(f"ubs-bash: cannot generate AST rules: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PYRULES
+}
+
+if [[ -n "$USER_RULE_DIR" && -n "$AST_RULE_DIR" ]]; then
+  echo "ERROR: --rules and --ast-rule-dir cannot be combined; use one complete rule pack" >&2
+  exit 2
+fi
+if [[ -n "$USER_RULE_DIR" || -n "$AST_RULE_DIR" ]] && ! ast_rules_available; then
+  echo "ERROR: requested AST rules require ast-grep (or UBS_AST_GREP_BIN)" >&2
+  exit 2
+fi
+
 if [[ "$LIST_CATS" -eq 1 ]]; then
   printf '1  syntax        Bash syntax & arithmetic gotchas\n'
   printf '2  control-flow  Control flow & exit codes\n'
@@ -176,31 +227,25 @@ if [[ "$LIST_CATS" -eq 1 ]]; then
 fi
 
 if [[ "$LIST_RULES" -eq 1 ]]; then
-  if ! command -v ast-grep >/dev/null 2>&1 || [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" == "1" ]]; then
+  if ! ast_rules_available; then
     echo "ERROR: --list-rules requires ast-grep." >&2
     exit 2
   fi
   helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   tmp_rules="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-bashv2-rules.XXXXXX)"
-  if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$tmp_rules" "$USER_RULE_DIR" <<'PYRULES'
-from pathlib import Path
-import sys
-from ubs_core.bash_rules import generate
-generate(Path(sys.argv[1]), Path(sys.argv[2]) if sys.argv[2] else None)
-PYRULES
-  then
+  if ! generate_bash_rules "$tmp_rules" "$helpers_dir"; then
     echo "ERROR: failed to generate AST rules" >&2
     exit 2
   fi
   if [[ -n "$DUMP_RULES_DIR" ]]; then
     mkdir -p -- "$DUMP_RULES_DIR" || exit 2
-    for rule_file in "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml; do
+    for rule_file in "$tmp_rules"/rules/*.yml "$tmp_rules"/rules/*.yaml "$tmp_rules"/*.yml; do
       [[ -f "$rule_file" ]] || continue
       cp -- "$rule_file" "$DUMP_RULES_DIR/" || exit 2
     done
   fi
-  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
+  ( set +o pipefail; awk 'BEGIN{FS=":"}/^id:[[:space:]]*/{gsub(/^[[:space:]]*id:[[:space:]]*/,"");print;}' "$tmp_rules"/rules/*.yml "$tmp_rules"/rules/*.yaml "$tmp_rules"/*.yml 2>/dev/null || true ) | LC_ALL=C sort -u
   rm -rf "$tmp_rules" 2>/dev/null || true
   exit 0
 fi
@@ -240,28 +285,23 @@ run_contract_v2_bash(){
 
   local ast_rule_dir="$AST_RULE_DIR"
   local created_ast_dir=""
-  if [[ -z "$ast_rule_dir" ]] && command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
+  if [[ -z "$ast_rule_dir" ]] && ast_rules_available; then
     created_ast_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-bashv2-rules.XXXXXX)"
-    if PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from pathlib import Path
-from ubs_core.bash_rules import generate
-generate(Path('$created_ast_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
-" 2>/dev/null; then
+    if generate_bash_rules "$created_ast_dir" "$helpers_dir"; then
       ast_rule_dir="$created_ast_dir"
     else
       rm -rf "$created_ast_dir" 2>/dev/null || true
-      created_ast_dir=""
+      echo "ERROR: failed to generate AST rules; refusing an incomplete scan" >&2
+      return 2
     fi
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
 
   if [[ -n "$DUMP_RULES_DIR" ]]; then
-    mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
-    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from pathlib import Path
-from ubs_core.bash_rules import generate
-generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
-" 2>/dev/null || true
+    if ! generate_bash_rules "$DUMP_RULES_DIR" "$helpers_dir"; then
+      echo "ERROR: failed to dump AST rules: $DUMP_RULES_DIR" >&2
+      return 2
+    fi
   fi
 
   case "$FORMAT" in

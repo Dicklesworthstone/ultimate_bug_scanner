@@ -69,8 +69,20 @@ class ShellCheckResults(unittest.TestCase):
         _, rows, errors, _ = self.invoke(self.result(1, [diagnostic(code=2034)]))
         self.assertFalse(rows or errors)
 
-    def test_deduplication_keeps_existing_native_finding(self):
-        _, rows, errors, _ = self.invoke(self.result(1, [diagnostic()]), reported={("sample.sh", 3)})
+    def test_independent_shellcheck_finding_survives_native_warning(self):
+        native = ("sample.sh", 3, "bash.robustness.cd_without_exit")
+        counts, rows, errors, _ = self.invoke(
+            self.result(1, [diagnostic()]), reported={native},
+        )
+        self.assertEqual(counts["warning"], 1)
+        self.assertEqual([row["rule"] for row in rows], ["bash.shellcheck.SC2086"])
+        self.assertFalse(errors)
+
+    def test_same_shellcheck_rule_is_not_reported_twice(self):
+        _, rows, errors, _ = self.invoke(
+            self.result(1, [diagnostic()]),
+            reported={("sample.sh", 3, "bash.shellcheck.SC2086")},
+        )
         self.assertFalse(rows or errors)
 
     def test_processing_usage_timeout_and_signal_exits_are_partial(self):

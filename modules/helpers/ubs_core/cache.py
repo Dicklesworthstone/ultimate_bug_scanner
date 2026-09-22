@@ -176,7 +176,9 @@ def hash_rules_dir(rules_dir: Path | str) -> str:
     if not p.is_dir():
         return ""
     h = hashlib.blake2b(digest_size=16)
-    for rf in sorted(p.rglob("*.yml")):
+    # Both suffixes are accepted by the rule generators. Ignoring .yaml lets
+    # a changed project policy replay yesterday's clean result (GH #138).
+    for rf in sorted([*p.rglob("*.yml"), *p.rglob("*.yaml")]):
         try:
             h.update(rf.name.encode("utf-8"))
             h.update(rf.read_bytes())

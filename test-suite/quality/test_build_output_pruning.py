@@ -18,10 +18,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from test_scan_selection import (
-    REPO_ROOT, UBS, bash_function, reported_files, run_helper, run_ubs,
-    scanned_count, summary,
-)
+if __package__:
+    from .test_scan_selection import (
+        REPO_ROOT, UBS, bash_function, reported_files, run_helper, run_ubs,
+        scanned_count, summary,
+    )
+else:
+    from test_scan_selection import (
+        REPO_ROOT, UBS, bash_function, reported_files, run_helper, run_ubs,
+        scanned_count, summary,
+    )
 
 SHELL_SOURCE = '#!/usr/bin/env bash\ncd /tmp\nrm -rf "$1"\neval "$2"\n'
 

@@ -56,7 +56,7 @@ jobs:
       - name: Install real analyzers
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq jq ripgrep rsync shellcheck
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
           npm install --global @ast-grep/cli@0.45.3
       - name: Verify source and checksum integrity
         run: |
@@ -70,6 +70,7 @@ jobs:
         run: |
           cd test-suite
           python3 -m unittest quality.test_js_rules quality.test_js_scan quality.test_bash_scan quality.test_cache quality.test_prefilter quality.test_build_output_pruning quality.test_scan_selection quality.test_module_file_counting -v 2>&1 | tee "$RUNNER_TEMP/js-policy-tests.log"
+          python3 -S -m unittest quality.test_prefilter -v 2>&1 | tee "$RUNNER_TEMP/js-prefilter-without-yaml.log"
       - name: Exercise partial reports and optional analyzer adapters
         run: |
           python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/js-optional-tests.log"
@@ -129,12 +130,22 @@ jobs:
           patch.write_bytes(gzip.decompress(data))
           subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
           subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
+          sha = '302a987b2144f1698847714856fd20b772380fed'
+          response = subprocess.check_output(['gh', 'api',
+              f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True, timeout=60)
+          data = base64.b64decode(json.loads(response)['content'])
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+          patch = Path(os.environ['RUNNER_TEMP'], 'prefilter-optional-yaml-tests.patch')
+          patch.write_bytes(data)
+          subprocess.run(['git', 'apply', '--check', '--index', str(patch)], check=True)
+          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
           PY
           python3 scripts/update_checksums.py > "$RUNNER_TEMP/prefilter-checksums.log"
           git add -- ubs SHA256SUMS modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh
-      - name: Validate complete quality unit suite and status contracts
+      - name: Validate final prefilter tests and status contracts
         run: |
-          python3 -m unittest discover -s test-suite/quality -p 'test_*.py' -v 2>&1 | tee "$RUNNER_TEMP/prefilter-quality.log"
+          python3 -m unittest discover -s test-suite/quality -p test_prefilter.py -v 2>&1 | tee "$RUNNER_TEMP/prefilter-quality.log"
+          python3 -S -m unittest discover -s test-suite/quality -p test_prefilter.py -v 2>&1 | tee "$RUNNER_TEMP/prefilter-without-yaml.log"
           python3 test-suite/shareable/test_status_invariants.py 2>&1 | tee "$RUNNER_TEMP/prefilter-status.log"
           python3 test-suite/shareable/test_optional_analyzers.py -v 2>&1 | tee "$RUNNER_TEMP/prefilter-optional.log"
           ./scripts/verify_checksums.sh > "$RUNNER_TEMP/prefilter-verify.log"

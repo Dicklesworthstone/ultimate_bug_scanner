@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='222f4d58abab83aa37e76a1d8b7f6dec77b5fbe5b7bc28e818363241783a46b8'
-  [cpp]='50b91be9f70aae0356e5f56c384f55c1dc1acf0af83b3e9bddcb004eb356308c'
-  [csharp]='5aeda474bed65a770407dd7f7afd10217b108582a69230bfc8956b907cede4e3'
-  [elixir]='59548dc275e1312fc9444790622219780ecb825ad95f31b6e8a59b79d393d70a'
-  [golang]='6e58e339d4bdef904dc4b288efe23173eac7073413236cd1a7d9795f1191b915'
-  [java]='10d4d2302daf7209f4c283a3e9d299a62a02885a7fa9e76b5c04d1064c0f27dc'
-  [js]='7fea62b4ab23d69edf4dba4818bd05ac1ddbebbcf65bd87b8b8b7b5dcea657ed'
-  [kotlin]='955b52b37898d4fa95d8301d1aa889ea601d5e6c091886980a2abca00711dafa'
-  [python]='ba45db44ab946d4bf46a3001c56565c7811eb4d817a22701ff852e9738201e3c'
-  [ruby]='4af61928aa84a436276f29cccb721757d6134f9ced9da60a6d145bf5647b299e'
-  [rust]='f9589cb7ba91bd29abe1294de75d19879910f6a2eb613e4005eeaafb3cd77836'
-  [swift]='a092b5d5ad48f2f53d4ed9a4a92e7d828f7087b2dccaa77f587f5e073ccbcf90'
+  [bash]='65ecfed5413ee2ef1907ec0df8105a72e230225cff553723e3fa82f8c39077fd'
+  [cpp]='056eff9fcde12878c1124dcf63d4297c28f10fc2249657e96c6cfb17884f3a3e'
+  [csharp]='91c4e5bff2aad2b17c291c5daf6df94f2717f46dbe1e7de2fde3317c01656901'
+  [elixir]='37ca061a6590fedc7cdddfd615d7bfd67670df5a15cd1f8f4ef09afcf8047573'
+  [golang]='04bd72d81e92e64ab24b35636a71e5ee0850e51af09838521f7d97e0e6c17b56'
+  [java]='93f1a83aa70283adf9aa40c6cd8fd83f074c96f267a7f78b3e559e54a9e48509'
+  [js]='b96014008e599bc1ca784f913753a0ca3c8437e3647d9320f9d02eeca2933564'
+  [kotlin]='4596208088c5329fd437d5a1ec650c9aff0c76c395a7934666b72461050de4f1'
+  [python]='f47d58e6c9d44f818319d851c6995eba168c4bffe770ba4ff8bd5efde5f57183'
+  [ruby]='a3f503efe8ec6c6c42cad7bc05bc296faf802214fd2f7965bf0a0bd2062b438b'
+  [rust]='e136828819f4377ae49f4fa747fa8e04505e4c4bea31235f90d35f328229c490'
+  [swift]='3518dbf0fd514c703bab0c1ef11ca021d2a1cca1eed258857a8ec205f598f58a'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='e56676ebee603cc1f2eba436058d5fe277260b35346d72f2eb2d1ee3b5787b72'
+  ['lib/ubs-common.sh']='7245c5d47333283343741c925dc632c5157f873b9c669df2a93ef506c85530bb'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3741,12 +3741,55 @@ checksum_tool_name(){
   return 1
 }
 
+# Prints the digest. Returns 1 only when no checksum tool exists, 3 when the
+# tool ran and failed, and passes a signal death (status >= 128) through
+# unchanged so callers can tell it apart from both.
+#
+# Deliberately no pipeline. Every caller runs this inside `x="$(...)"`, and
+# under `shopt -s lastpipe` (set near the top of this script and in most
+# modules) bash links the lastpipe entry into the job's process ring in
+# append_process() while SIGCHLD is unblocked; a SIGCHLD in that window makes
+# waitchld() walk a NULL link and the subshell dies with SIGSEGV (observed on
+# bash 5.3.15). The old `| awk` form also ended in `return 0`, so a failing
+# tool was reported as success.
 compute_sha256(){
-  local path="$1"
-  if need_cmd sha256sum; then sha256sum "$path" | awk '{print $1}'; return 0; fi
-  if need_cmd shasum; then shasum -a 256 "$path" | awk '{print $1}'; return 0; fi
-  if need_cmd openssl; then openssl dgst -sha256 "$path" | awk '{print $NF}'; return 0; fi
-  return 1
+  local path="$1" out rc=0
+  if need_cmd sha256sum; then out="$(sha256sum "$path")" || rc=$?
+  elif need_cmd shasum; then out="$(shasum -a 256 "$path")" || rc=$?
+  elif need_cmd openssl; then out="$(openssl dgst -sha256 "$path")" || rc=$?; out="${out##* }"
+  else return 1
+  fi
+  if (( rc != 0 )); then
+    (( rc >= 128 )) && return "$rc"
+    return 3
+  fi
+  printf '%s\n' "${out%% *}"
+}
+
+# checksum_file PATH: sets SHA256_RESULT, or sets SHA256_FAILURE and returns 2.
+# A command-substitution subshell killed by a signal (status >= 128) says
+# nothing about the file or the toolchain, so it is retried; if it keeps
+# happening it is reported as what it is (SHA256_TRANSIENT=1), never as a
+# missing tool.
+checksum_file(){
+  local path="$1" rc=0 attempt
+  SHA256_RESULT="" SHA256_FAILURE="" SHA256_TRANSIENT=0
+  for attempt in 1 2 3; do
+    rc=0
+    SHA256_RESULT="$(compute_sha256 "$path")" || rc=$?
+    (( rc < 128 )) && break
+  done
+  (( rc == 0 )) && return 0
+  SHA256_RESULT=""
+  if (( rc == 1 )); then
+    SHA256_FAILURE="unable to compute checksum (install sha256sum, shasum, or openssl)"
+  elif (( rc >= 128 )); then
+    SHA256_TRANSIENT=1
+    SHA256_FAILURE="checksum subprocess for $path was killed by signal $((rc - 128)) on all $attempt attempts; the file was not judged"
+  else
+    SHA256_FAILURE="checksum command failed for $path (status $rc)"
+  fi
+  return 2
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3860,11 +3903,15 @@ ensure_ast_grep_tool_cache(){
   if [[ ! -f "$zip_path" ]]; then
     need_download=1
   else
-    local current_sha
-    if ! current_sha="$(compute_sha256 "$zip_path")"; then
-      return 2
+    if ! checksum_file "$zip_path"; then
+      # No checksum tool at all: the download below could not be verified
+      # either. Any other failure did not judge the cached zip, so fetch a
+      # fresh copy, which is verified (and reported) below.
+      checksum_tool_name >/dev/null 2>&1 || return 2
+      need_download=1
+    elif [[ "$SHA256_RESULT" != "$expected" ]]; then
+      need_download=1
     fi
-    [[ "$current_sha" == "$expected" ]] || need_download=1
   fi
 
   if [[ "$need_download" -eq 1 ]]; then
@@ -3879,11 +3926,11 @@ ensure_ast_grep_tool_cache(){
       say_err "${DIM}Install ast-grep manually (https://ast-grep.github.io/) or re-run install.sh.${RESET}"
       return 1
     fi
-    local sha
-    if ! sha="$(compute_sha256 "$tmp_zip")"; then
-      say_err "${RED}${X}${RESET} cannot verify ast-grep download (no sha256 tool available)"
+    if ! checksum_file "$tmp_zip"; then
+      say_err "${RED}${X}${RESET} cannot verify ast-grep download ($SHA256_FAILURE)"
       return 2
     fi
+    local sha="$SHA256_RESULT"
     if [[ "$sha" != "$expected" ]]; then
       say_err "${RED}${X}${RESET} ast-grep checksum mismatch for ${asset}"
       say_err "${DIM}Expected: ${expected}${RESET}"
@@ -3941,10 +3988,12 @@ ensure_toon_tool_cache(){
     rm -f "$tmp" 2>/dev/null
     return 1
   fi
-  if ! sha="$(compute_sha256 "$tmp")"; then
+  if ! checksum_file "$tmp"; then
+    say_err "${RED}${X}${RESET} cannot verify toon encoder download (${SHA256_FAILURE}); nothing installed"
     rm -f "$tmp" 2>/dev/null
     return 2
   fi
+  sha="$SHA256_RESULT"
   if [[ "$sha" != "$expected" ]]; then
     say_err "${RED}${X}${RESET} toon encoder checksum mismatch for ${asset}; nothing installed"
     say_err "${DIM}Expected: ${expected}${RESET}"
@@ -4171,11 +4220,11 @@ verify_module_checksum(){
     VERIFY_MODULE_ERR="module file not found at $path"
     return 1
   fi
-  local actual
-  if ! actual="$(compute_sha256 "$path")"; then
-    VERIFY_MODULE_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
+  if ! checksum_file "$path"; then
+    VERIFY_MODULE_ERR="$SHA256_FAILURE"
     return 2
   fi
+  local actual="$SHA256_RESULT"
   if [[ "$actual" != "$expected" ]]; then
     VERIFY_MODULE_ERR="checksum mismatch for $lang (expected $expected, got $actual)"
     return 1
@@ -4187,6 +4236,7 @@ verify_helper_checksum(){
   local rel="$1" path="$2"
   local expected="${HELPER_CHECKSUMS[$rel]:-}"
   VERIFY_HELPER_ERR=""
+  VERIFY_HELPER_TRANSIENT=0
   if [[ "$rel" == "contract.json" ]]; then
     # Detection also reads a checkout or a private per-run snapshot, neither
     # necessarily under MODULE_DIR. Both must have the same pinned digest.
@@ -4202,11 +4252,12 @@ verify_helper_checksum(){
     VERIFY_HELPER_ERR="helper file not found at $path"
     return 1
   fi
-  local actual
-  if ! actual="$(compute_sha256 "$path")"; then
-    VERIFY_HELPER_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
+  if ! checksum_file "$path"; then
+    VERIFY_HELPER_ERR="$SHA256_FAILURE"
+    VERIFY_HELPER_TRANSIENT="$SHA256_TRANSIENT"
     return 2
   fi
+  local actual="$SHA256_RESULT"
   if [[ "$actual" != "$expected" ]]; then
     VERIFY_HELPER_ERR="checksum mismatch for $rel (expected $expected, got $actual)"
     return 1
@@ -4965,11 +5016,10 @@ download_module(){
       VERIFY_MODULE_ERR=""
       local expected="${MODULE_CHECKSUMS[$lang]:-}"
       if [[ -n "$expected" ]]; then
-        local sha
-        if ! sha="$(compute_sha256 "$tmp")"; then
-          VERIFY_MODULE_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
-        elif [[ "$sha" != "$expected" ]]; then
-          VERIFY_MODULE_ERR="checksum mismatch for $lang (expected $expected, got $sha)"
+        if ! checksum_file "$tmp"; then
+          VERIFY_MODULE_ERR="$SHA256_FAILURE"
+        elif [[ "$SHA256_RESULT" != "$expected" ]]; then
+          VERIFY_MODULE_ERR="checksum mismatch for $lang (expected $expected, got $SHA256_RESULT)"
         fi
       fi
       if [[ -n "${VERIFY_MODULE_ERR:-}" ]]; then
@@ -5057,11 +5107,10 @@ download_helper_asset(){
       VERIFY_HELPER_ERR=""
       local expected="${HELPER_CHECKSUMS[$rel]:-}"
       if [[ -n "$expected" ]]; then
-        local sha
-        if ! sha="$(compute_sha256 "$tmp")"; then
-          VERIFY_HELPER_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
-        elif [[ "$sha" != "$expected" ]]; then
-          VERIFY_HELPER_ERR="checksum mismatch for $rel (expected $expected, got $sha)"
+        if ! checksum_file "$tmp"; then
+          VERIFY_HELPER_ERR="$SHA256_FAILURE"
+        elif [[ "$SHA256_RESULT" != "$expected" ]]; then
+          VERIFY_HELPER_ERR="checksum mismatch for $rel (expected $expected, got $SHA256_RESULT)"
         fi
       fi
       if [[ -n "${VERIFY_HELPER_ERR:-}" ]]; then
@@ -5105,7 +5154,8 @@ ensure_helper_asset(){
     verify_helper_checksum "$rel" "$path" || verify_code=$?
     if [[ $verify_code -eq 2 ]]; then
       say "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
-      rm -f "$path" 2>/dev/null || true
+      # A killed checksum subprocess never judged the file; keep it.
+      [[ "${VERIFY_HELPER_TRANSIENT:-0}" == "1" ]] || rm -f "$path" 2>/dev/null || true
       return 2
     fi
     if [[ $verify_code -ne 0 ]]; then
@@ -5433,11 +5483,11 @@ check_and_update_self(){
     self_update_fail "could not download ubs from $release_base"
     return $?
   fi
-  local actual_sum
-  if ! actual_sum="$(compute_sha256 "$new_self")" || [[ -z "$actual_sum" ]]; then
-    self_update_fail "no sha256 tool available (need sha256sum, shasum, or openssl)"
+  if ! checksum_file "$new_self" || [[ -z "$SHA256_RESULT" ]]; then
+    self_update_fail "${SHA256_FAILURE:-checksum of downloaded ubs is empty}"
     return $?
   fi
+  local actual_sum="$SHA256_RESULT"
   if [[ "$actual_sum" != "$expected_sum" ]]; then
     self_update_fail "checksum mismatch for downloaded ubs (expected $expected_sum, got $actual_sum)"
     return $?

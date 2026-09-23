@@ -222,6 +222,104 @@ def check_download_failure_only_warns() -> None:
         report("download_failure_only_warns", ok, f"exit={proc.returncode}", proc)
 
 
+SIGNAL_ONCE_SHA256SUM = """#!/bin/bash
+# Kill the shell that launched this checksum once (every time with
+# UBS_TEST_SIGNAL_ALWAYS=1) for files matching UBS_TEST_SIGNAL_MATCH, then
+# behave normally. The digest is computed inside `x="$(compute_sha256 ...)"`, so the parent
+# here is that command-substitution subshell: its death is what a crashing or
+# OOM-killed subshell looks like to the caller (status >= 128), while the
+# checksum tool itself is present and healthy.
+case "${@: -1}" in ${UBS_TEST_SIGNAL_MATCH:-*}) ;; *) exec /usr/bin/sha256sum "$@" ;; esac
+if mkdir "$UBS_TEST_SIGNAL_ONCE" 2>/dev/null || [[ "${UBS_TEST_SIGNAL_ALWAYS:-0}" == 1 ]]; then
+  printf '%s\\n' "${@: -1}" > "$UBS_TEST_SIGNAL_ONCE/target"
+  kill -KILL "$PPID"
+fi
+exec /usr/bin/sha256sum "$@"
+"""
+
+
+def _signal_death_case(name: str, match: str) -> None:
+    # A checksum subshell killed by a signal says nothing about the file or the
+    # toolchain. It must not be reported as "install sha256sum", must not delete
+    # the byte-correct cached file, and must not fail the scan.
+    if not Path("/usr/bin/sha256sum").is_file():
+        report(name, True, "skipped: no /usr/bin/sha256sum")
+        return
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-signal-") as tmp:
+        sb = Sandbox(Path(tmp), tamper=False, serve_tampered=False)
+        stub_dir = Path(tmp) / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "sha256sum"
+        stub.write_text(SIGNAL_ONCE_SHA256SUM, encoding="utf-8")
+        stub.chmod(0o755)
+        marker = Path(tmp) / "signal-once"
+        proc = sb.run(
+            ("PATH", f"{stub_dir}:/usr/local/bin:/usr/bin:/bin"),
+            ("UBS_TEST_SIGNAL_ONCE", str(marker)),
+            ("UBS_TEST_SIGNAL_MATCH", match),
+        )
+        combined = proc.stdout + proc.stderr
+        target_file = marker / "target"
+        fired = target_file.is_file()
+        target = Path(target_file.read_text(encoding="utf-8").strip()) if fired else None
+        survived = target is not None and target.is_file()
+        ok = (
+            fired
+            and survived
+            and proc.returncode in (0, 1)
+            and '"totals"' in proc.stdout
+            and "install sha256sum" not in combined
+            and "refusing" not in combined
+        )
+        report(
+            name,
+            ok,
+            f"exit={proc.returncode} fired={fired} target_survived={survived}",
+            proc,
+        )
+
+
+def check_helper_checksum_persistent_signal_death_keeps_helper() -> None:
+    # Every checksum attempt of one helper is killed: the helper can't be
+    # verified, so refusing the scan is right, but the report must name the
+    # signal death rather than a missing tool, and the unjudged file must stay.
+    name = "helper_checksum_persistent_signal_death_keeps_helper"
+    if not Path("/usr/bin/sha256sum").is_file():
+        report(name, True, "skipped: no /usr/bin/sha256sum")
+        return
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-signal-") as tmp:
+        sb = Sandbox(Path(tmp), tamper=False, serve_tampered=False)
+        stub_dir = Path(tmp) / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "sha256sum"
+        stub.write_text(SIGNAL_ONCE_SHA256SUM, encoding="utf-8")
+        stub.chmod(0o755)
+        marker = Path(tmp) / "signal-once"
+        proc = sb.run(
+            ("PATH", f"{stub_dir}:/usr/local/bin:/usr/bin:/bin"),
+            ("UBS_TEST_SIGNAL_ONCE", str(marker)),
+            ("UBS_TEST_SIGNAL_MATCH", f"*/{TAMPERED_HELPER}"),
+            ("UBS_TEST_SIGNAL_ALWAYS", "1"),
+        )
+        combined = proc.stdout + proc.stderr
+        helper = sb.module_dir / TAMPERED_HELPER
+        ok = (
+            proc.returncode == 2
+            and "killed by signal" in combined
+            and "install sha256sum" not in combined
+            and helper.is_file()
+        )
+        report(name, ok, f"exit={proc.returncode} helper_kept={helper.is_file()}", proc)
+
+
+def check_module_checksum_signal_death_is_not_a_missing_tool() -> None:
+    _signal_death_case("module_checksum_signal_death_is_not_a_missing_tool", "*/ubs-python.sh")
+
+
+def check_helper_checksum_signal_death_keeps_helper() -> None:
+    _signal_death_case("helper_checksum_signal_death_keeps_helper", f"*/{TAMPERED_HELPER}")
+
+
 def setup_module_sandbox(dest: Path) -> None:
     (dest / "helpers").mkdir(parents=True, exist_ok=True)
     (dest / "lib").mkdir(parents=True, exist_ok=True)
@@ -499,6 +597,9 @@ def main() -> int:
         check_tampered_core_refused,
         check_override_allows_unverified,
         check_download_failure_only_warns,
+        check_module_checksum_signal_death_is_not_a_missing_tool,
+        check_helper_checksum_signal_death_keeps_helper,
+        check_helper_checksum_persistent_signal_death_keeps_helper,
         test_tampered_helper_refused,
         test_standalone_module_verifies,
         check_tampered_module_refreshed_from_clean_source,

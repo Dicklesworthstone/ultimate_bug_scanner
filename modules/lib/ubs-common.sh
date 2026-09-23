@@ -100,20 +100,68 @@ ubs_with_timeout(){
 }
 
 # ── Asset integrity & helper resolution (bead E1) ────────────────────────────
-# ubs_sha256_file FILE: compute sha256 digest of FILE (prints hex string).
-# Returns 0 on success, 1 on missing file or unavailable hash tool.
+# ubs_sha256_file FILE: compute sha256 digest of FILE (prints lowercase hex).
+# Returns 0 on success, 1 on missing file or unavailable hash tool, 3 when the
+# tool ran but failed or printed no digest; a status above 128 (how bash
+# reports a child killed by signal N) passes through unchanged.
+#
+# Deliberately pipeline-free: callers run this inside `x="$(...)"` in modules
+# that set `shopt -s lastpipe`, and bash's lastpipe job bookkeeping has a
+# SIGCHLD race that can crash that subshell. Cutting the digest in-shell also
+# stops a failing tool from yielding "success" with an empty digest.
 ubs_sha256_file(){
-  local file="$1"
+  local file="$1" out="" rc=0 field=first
   [[ -f "$file" ]] || return 1
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    out="$(sha256sum "$file" 2>/dev/null)" || rc=$?
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    out="$(shasum -a 256 "$file" 2>/dev/null)" || rc=$?
   elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}'
+    out="$(openssl dgst -sha256 "$file" 2>/dev/null)" || rc=$?
+    field=last
   else
     return 1
   fi
+  if (( rc != 0 )); then
+    (( rc > 128 )) && return "$rc"
+    return 3
+  fi
+  # GNU tools prefix the line with a backslash when the file name needed escaping.
+  if [[ "$field" == first ]]; then out="${out#\\}"; out="${out%%[[:space:]]*}"; else out="${out##*[[:space:]]}"; fi
+  [[ "$out" =~ ^[0-9a-fA-F]{64}$ ]] || return 3
+  printf '%s\n' "${out,,}"
+}
+
+# ubs_sha256_into VAR FILE: store FILE's digest in VAR in the caller's shell.
+# A status above 128 means the hashing subshell was killed by a signal (or a
+# tool exited with such a code); that says nothing about FILE, so it is
+# retried a bounded number of times. On failure UBS_SHA256_ERR holds an
+# accurate reason and ubs_sha256_file's status is returned; VAR is untouched.
+UBS_SHA256_ERR=""
+ubs_sha256_into(){
+  local __ubs_sha_var="$1" __ubs_sha_file="$2" __ubs_sha_out="" __ubs_sha_rc=0 __ubs_sha_try
+  UBS_SHA256_ERR=""
+  for __ubs_sha_try in 1 2 3; do
+    __ubs_sha_rc=0
+    __ubs_sha_out="$(ubs_sha256_file "$__ubs_sha_file")" || __ubs_sha_rc=$?
+    if (( __ubs_sha_rc == 0 )); then
+      printf -v "$__ubs_sha_var" '%s' "$__ubs_sha_out"
+      return 0
+    fi
+    (( __ubs_sha_rc > 128 )) || break
+  done
+  case "$__ubs_sha_rc" in
+    1)
+      if [[ -f "$__ubs_sha_file" ]]; then
+        UBS_SHA256_ERR="unable to compute checksum for '$__ubs_sha_file' (install sha256sum, shasum, or openssl)"
+      else
+        UBS_SHA256_ERR="unable to compute checksum: '$__ubs_sha_file' is not a regular file"
+      fi
+      ;;
+    3) UBS_SHA256_ERR="checksum tool failed on '$__ubs_sha_file'" ;;
+    *) UBS_SHA256_ERR="checksum of '$__ubs_sha_file' could not be computed: the hashing subprocess ended with status $__ubs_sha_rc (signal $((__ubs_sha_rc - 128))) on all $__ubs_sha_try attempts; the file was not judged" ;;
+  esac
+  return "$__ubs_sha_rc"
 }
 
 # Pinned helper and asset checksums for standalone module execution (bead E1).
@@ -549,8 +597,8 @@ ubs_resolve_helper(){
   fi
 
   local actual
-  if ! actual="$(ubs_sha256_file "$target")"; then
-    ubs_die "unable to compute checksum for helper '$target' (install sha256sum, shasum, or openssl)" 2
+  if ! ubs_sha256_into actual "$target"; then
+    ubs_die "helper '$_rel': $UBS_SHA256_ERR; refusing to execute" 2
   fi
 
   if [[ "$actual" != "$expected" ]]; then
@@ -614,8 +662,8 @@ ubs_resolve_helpers_dir(){
     for _core_rel in "${!UBS_COMMON_HELPER_CHECKSUMS[@]}"; do
       if [[ "$_core_rel" == helpers/ubs_core/* && -f "${base_dir}/${_core_rel}" ]]; then
         _core_expected="${UBS_COMMON_HELPER_CHECKSUMS[$_core_rel]}"
-        if ! _core_actual="$(ubs_sha256_file "${base_dir}/${_core_rel}")"; then
-          ubs_die "unable to compute checksum for '${base_dir}/${_core_rel}'" 2
+        if ! ubs_sha256_into _core_actual "${base_dir}/${_core_rel}"; then
+          ubs_die "helper file '$_core_rel': $UBS_SHA256_ERR; refusing to execute" 2
         fi
         if [[ "$_core_actual" != "$_core_expected" ]]; then
           ubs_die "helper file '$_core_rel' failed checksum verification (expected $_core_expected, got $_core_actual); refusing to execute (run 'ubs doctor --fix' or set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" 2

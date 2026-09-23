@@ -225,13 +225,15 @@ def check_download_failure_only_warns() -> None:
 SIGNAL_ONCE_SHA256SUM = """#!/bin/bash
 # Kill the shell that launched this checksum once (every time with
 # UBS_TEST_SIGNAL_ALWAYS=1) for files matching UBS_TEST_SIGNAL_MATCH, then
-# behave normally. The digest is computed inside `x="$(compute_sha256 ...)"`, so the parent
+# behave normally. With UBS_TEST_EXIT_STATUS set, exit with that status
+# instead of killing anything (a tool failure, not a signal death). The digest is computed inside `x="$(compute_sha256 ...)"`, so the parent
 # here is that command-substitution subshell: its death is what a crashing or
 # OOM-killed subshell looks like to the caller (status >= 128), while the
 # checksum tool itself is present and healthy.
 case "${@: -1}" in ${UBS_TEST_SIGNAL_MATCH:-*}) ;; *) exec /usr/bin/sha256sum "$@" ;; esac
 if mkdir "$UBS_TEST_SIGNAL_ONCE" 2>/dev/null || [[ "${UBS_TEST_SIGNAL_ALWAYS:-0}" == 1 ]]; then
   printf '%s\\n' "${@: -1}" > "$UBS_TEST_SIGNAL_ONCE/target"
+  [[ -z "${UBS_TEST_EXIT_STATUS:-}" ]] || exit "$UBS_TEST_EXIT_STATUS"
   kill -KILL "$PPID"
 fi
 exec /usr/bin/sha256sum "$@"
@@ -305,11 +307,43 @@ def check_helper_checksum_persistent_signal_death_keeps_helper() -> None:
         helper = sb.module_dir / TAMPERED_HELPER
         ok = (
             proc.returncode == 2
-            and "killed by signal" in combined
+            and "death by signal" in combined
             and "install sha256sum" not in combined
             and helper.is_file()
         )
         report(name, ok, f"exit={proc.returncode} helper_kept={helper.is_file()}", proc)
+
+
+def check_helper_checksum_tool_failure_is_not_a_signal_or_missing_tool() -> None:
+    # The checksum tool itself exits 200 (outside the 129..192 range bash uses
+    # for signal deaths): that is a tool failure, reported as such -- neither a
+    # missing tool nor a signal death -- and the scan refuses the helper.
+    name = "helper_checksum_tool_failure_is_not_a_signal_or_missing_tool"
+    if not Path("/usr/bin/sha256sum").is_file():
+        report(name, True, "skipped: no /usr/bin/sha256sum")
+        return
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-signal-") as tmp:
+        sb = Sandbox(Path(tmp), tamper=False, serve_tampered=False)
+        stub_dir = Path(tmp) / "stub-bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "sha256sum"
+        stub.write_text(SIGNAL_ONCE_SHA256SUM, encoding="utf-8")
+        stub.chmod(0o755)
+        proc = sb.run(
+            ("PATH", f"{stub_dir}:/usr/local/bin:/usr/bin:/bin"),
+            ("UBS_TEST_SIGNAL_ONCE", str(Path(tmp) / "signal-once")),
+            ("UBS_TEST_SIGNAL_MATCH", f"*/{TAMPERED_HELPER}"),
+            ("UBS_TEST_SIGNAL_ALWAYS", "1"),
+            ("UBS_TEST_EXIT_STATUS", "200"),
+        )
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode == 2
+            and "checksum command failed" in combined
+            and "install sha256sum" not in combined
+            and "death by signal" not in combined
+        )
+        report(name, ok, f"exit={proc.returncode}", proc)
 
 
 def check_module_checksum_signal_death_is_not_a_missing_tool() -> None:
@@ -600,6 +634,7 @@ def main() -> int:
         check_module_checksum_signal_death_is_not_a_missing_tool,
         check_helper_checksum_signal_death_keeps_helper,
         check_helper_checksum_persistent_signal_death_keeps_helper,
+        check_helper_checksum_tool_failure_is_not_a_signal_or_missing_tool,
         test_tampered_helper_refused,
         test_standalone_module_verifies,
         check_tampered_module_refreshed_from_clean_source,

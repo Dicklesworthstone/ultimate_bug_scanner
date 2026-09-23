@@ -102,12 +102,17 @@ ubs_with_timeout(){
 # ── Asset integrity & helper resolution (bead E1) ────────────────────────────
 # ubs_sha256_file FILE: compute sha256 digest of FILE (prints hex string).
 # Returns 0 on success, 1 on missing file or unavailable hash tool, 3 when the
-# hash tool ran and failed; a signal death (status >= 128) passes through.
+# hash tool ran and failed; a signal-like status (see below) passes through.
 #
 # Deliberately no pipeline: callers run this inside `x="$(...)"` after the
 # module has set `shopt -s lastpipe`, and bash can segfault that subshell when
 # SIGCHLD arrives while append_process() is linking the lastpipe entry into the
 # job's process ring (observed on bash 5.3.15). See compute_sha256 in ubs.
+# ubs_sha256_status_is_signal_like STATUS: bash reports a child killed by
+# signal N as 128+N. A status in that range is only signal-like (a tool may
+# exit with it too), so it earns a bounded retry, never a verdict.
+ubs_sha256_status_is_signal_like(){ (( $1 > 128 && $1 <= 128 + 64 )); }
+
 ubs_sha256_file(){
   local file="$1" out rc=0
   [[ -f "$file" ]] || return 1
@@ -122,30 +127,30 @@ ubs_sha256_file(){
     return 1
   fi
   if (( rc != 0 )); then
-    (( rc >= 128 )) && return "$rc"
+    ubs_sha256_status_is_signal_like "$rc" && return "$rc"
     return 3
   fi
   printf '%s\n' "${out%% *}"
 }
 
 # ubs_sha256_or_die FILE LABEL: sets UBS_SHA256 to FILE's digest or exits
-# via ubs_die with a message that names the real failure. A command
-# substitution killed by a signal (status >= 128) is retried: it says nothing
-# about the file, and reporting it as a missing tool sent users to install
-# sha256sum while it was present.
+# via ubs_die with a message that names the real failure. A signal-like status
+# (typically the command substitution killed by a signal) is retried a bounded
+# number of times: it says nothing about the file, and reporting it as a
+# missing tool sent users to install sha256sum while it was present.
 ubs_sha256_or_die(){
   local file="$1" label="$2" rc=0 attempt
   UBS_SHA256=""
   for attempt in 1 2 3; do
     rc=0
     UBS_SHA256="$(ubs_sha256_file "$file")" || rc=$?
-    (( rc < 128 )) && break
+    ubs_sha256_status_is_signal_like "$rc" || break
   done
   (( rc == 0 )) && return 0
   if (( rc == 1 )); then
     ubs_die "unable to compute checksum for $label (install sha256sum, shasum, or openssl)" 2
-  elif (( rc >= 128 )); then
-    ubs_die "checksum subprocess for $label was killed by signal $((rc - 128)) on all $attempt attempts; the file was not judged" 2
+  elif ubs_sha256_status_is_signal_like "$rc"; then
+    ubs_die "checksum subprocess for $label ended with status $rc on all $attempt attempts (how bash reports death by signal $((rc - 128))); the file was not judged" 2
   fi
   ubs_die "checksum command failed for $label (status $rc)" 2
 }

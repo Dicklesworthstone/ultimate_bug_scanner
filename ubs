@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='65ecfed5413ee2ef1907ec0df8105a72e230225cff553723e3fa82f8c39077fd'
-  [cpp]='056eff9fcde12878c1124dcf63d4297c28f10fc2249657e96c6cfb17884f3a3e'
-  [csharp]='91c4e5bff2aad2b17c291c5daf6df94f2717f46dbe1e7de2fde3317c01656901'
-  [elixir]='37ca061a6590fedc7cdddfd615d7bfd67670df5a15cd1f8f4ef09afcf8047573'
-  [golang]='04bd72d81e92e64ab24b35636a71e5ee0850e51af09838521f7d97e0e6c17b56'
-  [java]='93f1a83aa70283adf9aa40c6cd8fd83f074c96f267a7f78b3e559e54a9e48509'
-  [js]='b96014008e599bc1ca784f913753a0ca3c8437e3647d9320f9d02eeca2933564'
-  [kotlin]='4596208088c5329fd437d5a1ec650c9aff0c76c395a7934666b72461050de4f1'
-  [python]='f47d58e6c9d44f818319d851c6995eba168c4bffe770ba4ff8bd5efde5f57183'
-  [ruby]='a3f503efe8ec6c6c42cad7bc05bc296faf802214fd2f7965bf0a0bd2062b438b'
-  [rust]='e136828819f4377ae49f4fa747fa8e04505e4c4bea31235f90d35f328229c490'
-  [swift]='3518dbf0fd514c703bab0c1ef11ca021d2a1cca1eed258857a8ec205f598f58a'
+  [bash]='4c6561a5bc839da1ee17c007581b2a3659fdc77bec5e23550bd1fdcbf0d1b6a5'
+  [cpp]='0be8d459a0c5b4c4f192048f0e32bd1a6e0cfc332d62aec8cb30a2b772ab97cd'
+  [csharp]='3f77d192590c799856abdd688121003a83af5283eae5929ede80061b10b7314f'
+  [elixir]='59805ca1e5e4f2efd9465254237d741632b3ca463569ccfe1738162f7531c992'
+  [golang]='74039fd5269859cfc00957d7660929a0c6fa0b5c0e9d05a477e94f051a186f0c'
+  [java]='e2977154e85a85d6f520e5a32a8d6857e5169dd30e400da5672719c82906a692'
+  [js]='3463738331fd6bdac7bc78e7a0db6e05a36a66195d9f6820d37a1f27c7086d8c'
+  [kotlin]='f9f72c5788ac94c095fb3dc9ca252f45abf546fc18e096703869c0324c352fb3'
+  [python]='f7499158da23e31197332ab0564adb27cb646a860dfc0dd3c2821e9f6fbe65c3'
+  [ruby]='07ddb132468e89883a8cbb177406477beede08b685d232d597a671ce4344bd04'
+  [rust]='99b1ea060455e16d3bf5b93f146203422003c6ee5102f9a8058a0d0b614ce265'
+  [swift]='307cc166312ddd358feee822ab5c933707a211d9605e9a5af116f9c47b2ae5dc'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='7245c5d47333283343741c925dc632c5157f873b9c669df2a93ef506c85530bb'
+  ['lib/ubs-common.sh']='7f382d2fbdbd9a1eb3f71e95f0c5bcb1a7126e4c2eb232f14970934a9ac5b052'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3741,9 +3741,14 @@ checksum_tool_name(){
   return 1
 }
 
+# sha256_status_is_signal_like STATUS: bash reports a child killed by signal N
+# as 128+N. A status in that range is only *signal-like* (a tool may also exit
+# with it), so it earns a bounded retry and an honest message, never a verdict.
+sha256_status_is_signal_like(){ (( $1 > 128 && $1 <= 128 + 64 )); }
+
 # Prints the digest. Returns 1 only when no checksum tool exists, 3 when the
-# tool ran and failed, and passes a signal death (status >= 128) through
-# unchanged so callers can tell it apart from both.
+# tool ran and failed, and passes a signal-like status through unchanged so
+# callers can tell it apart from both.
 #
 # Deliberately no pipeline. Every caller runs this inside `x="$(...)"`, and
 # under `shopt -s lastpipe` (set near the top of this script and in most
@@ -3760,32 +3765,33 @@ compute_sha256(){
   else return 1
   fi
   if (( rc != 0 )); then
-    (( rc >= 128 )) && return "$rc"
+    sha256_status_is_signal_like "$rc" && return "$rc"
     return 3
   fi
   printf '%s\n' "${out%% *}"
 }
 
 # checksum_file PATH: sets SHA256_RESULT, or sets SHA256_FAILURE and returns 2.
-# A command-substitution subshell killed by a signal (status >= 128) says
-# nothing about the file or the toolchain, so it is retried; if it keeps
-# happening it is reported as what it is (SHA256_TRANSIENT=1), never as a
-# missing tool.
+# A signal-like status (typically a command-substitution subshell killed by a
+# signal) says nothing about the file or the toolchain, so it is retried a
+# bounded number of times; if it persists it is reported as such
+# (SHA256_TRANSIENT=1), never as a missing tool. Either way the file is not
+# treated as verified.
 checksum_file(){
   local path="$1" rc=0 attempt
   SHA256_RESULT="" SHA256_FAILURE="" SHA256_TRANSIENT=0
   for attempt in 1 2 3; do
     rc=0
     SHA256_RESULT="$(compute_sha256 "$path")" || rc=$?
-    (( rc < 128 )) && break
+    sha256_status_is_signal_like "$rc" || break
   done
   (( rc == 0 )) && return 0
   SHA256_RESULT=""
   if (( rc == 1 )); then
     SHA256_FAILURE="unable to compute checksum (install sha256sum, shasum, or openssl)"
-  elif (( rc >= 128 )); then
+  elif sha256_status_is_signal_like "$rc"; then
     SHA256_TRANSIENT=1
-    SHA256_FAILURE="checksum subprocess for $path was killed by signal $((rc - 128)) on all $attempt attempts; the file was not judged"
+    SHA256_FAILURE="checksum subprocess for $path ended with status $rc on all $attempt attempts (how bash reports death by signal $((rc - 128))); the file was not judged"
   else
     SHA256_FAILURE="checksum command failed for $path (status $rc)"
   fi

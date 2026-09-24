@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     env:
       UBS_NO_AUTO_UPDATE: "1"
@@ -187,5 +187,6 @@ jobs:
               blob = json.loads(response.stdout)
               expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
               assert blob['sha'] == expected, (name, blob)
-              print(f"ISSUE143_BLOB {name} {blob['sha']}", flush=True)
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              print(f"ISSUE143_BLOB {name} {blob['sha']} {mode}", flush=True)
           PY

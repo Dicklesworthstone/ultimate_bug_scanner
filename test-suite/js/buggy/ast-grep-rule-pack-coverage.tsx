@@ -17,7 +17,7 @@ type Props = {
 
 export function AstGrepRulePackCoverage(props: Props) {
   const chosen = props.value ?? props.fallback ?? "fallback";
-  const ambiguous = (props.value ?? props.fallback) ? "yes" : "no";
+  const ambiguous = props.value ?? props.fallback ? "yes" : "no";
   const derived = useMemo(() => props.items.map((item) => item.label).join(","), []);
   const stableHandler = useCallback(() => props.value.toUpperCase(), []);
 

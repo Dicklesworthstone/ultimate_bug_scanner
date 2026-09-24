@@ -56,7 +56,7 @@ METADATA_TERMS = {
     'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
     'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
     'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
-    'count', 'len', 'length',
+    'count', 'len', 'length', 'scope', 'scopes',
 }
 NULLISH_RE = re.compile(r'^(?:nil|true|false|0|1|""|``)$')
 SHAPE_RE = re.compile(r'\b(?:len|cap)\s*\(|\.(?:Len|Size)\s*\(')

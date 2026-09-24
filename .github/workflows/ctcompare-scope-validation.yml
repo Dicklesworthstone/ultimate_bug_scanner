@@ -1,0 +1,191 @@
+name: Constant-time scope metadata regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ctcompare-scope-validation.yml
+      - modules/helpers/ubs_core/analyzers/ctcompare_*.py
+      - test-suite/quality/test_ctcompare_scope_metadata.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install scanner test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep shellcheck python3-yaml
+          npm install --global @ast-grep/cli
+      - name: Reproduce all four false positives and verify credential controls on main's baseline
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/ctcompare-baseline" 77a10fcf931d8472ee53e38a6e4af0bfaf36b755
+          cp test-suite/quality/test_ctcompare_scope_metadata.py "$RUNNER_TEMP/ctcompare-baseline/test-suite/quality/"
+          cd "$RUNNER_TEMP/ctcompare-baseline"
+          export PYTHONPATH=test-suite/quality
+          python3 -m unittest test_ctcompare_scope_metadata.CredentialDetectionTests -v
+          if python3 -m unittest test_ctcompare_scope_metadata.ScopeMetadataTests.test_reported_authorization_scope -v > "$RUNNER_TEMP/ctcompare-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/ctcompare-before.log"
+            echo "Expected the four unfixed analyzers to reproduce GH #143" >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/ctcompare-before.log"
+          grep -Fx 'FAILED (failures=4)' "$RUNNER_TEMP/ctcompare-before.log"
+      - name: Record existing ShellCheck diagnostics
+        run: |
+          rc=0
+          shellcheck ubs modules/ubs-*.sh scripts/*.sh > "$RUNNER_TEMP/shellcheck-before.log" 2>&1 || rc=$?
+          echo "$rc" > "$RUNNER_TEMP/shellcheck-before.rc"
+      - name: Apply only the reviewed metadata additions when not yet landed
+        run: |
+          cat > "$RUNNER_TEMP/ctcompare.patch" <<'PATCH'
+          diff --git a/modules/helpers/ubs_core/analyzers/ctcompare_go.py b/modules/helpers/ubs_core/analyzers/ctcompare_go.py
+          --- a/modules/helpers/ubs_core/analyzers/ctcompare_go.py
+          +++ b/modules/helpers/ubs_core/analyzers/ctcompare_go.py
+          @@ -56,7 +56,7 @@
+               'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
+               'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
+               'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
+          -    'count', 'len', 'length',
+          +    'count', 'len', 'length', 'scope', 'scopes',
+           }
+           NULLISH_RE = re.compile(r'^(?:nil|true|false|0|1|""|``)$')
+           SHAPE_RE = re.compile(r'\b(?:len|cap)\s*\(|\.(?:Len|Size)\s*\(')
+          diff --git a/modules/helpers/ubs_core/analyzers/ctcompare_js.py b/modules/helpers/ubs_core/analyzers/ctcompare_js.py
+          --- a/modules/helpers/ubs_core/analyzers/ctcompare_js.py
+          +++ b/modules/helpers/ubs_core/analyzers/ctcompare_js.py
+          @@ -61,7 +61,7 @@
+               'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
+               'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
+               'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
+          -    'count', 'len', 'length',
+          +    'count', 'len', 'length', 'scope', 'scopes',
+           }
+           # Concept family of each vocabulary term, used to decide whether two
+           # name-sensitive operands compare the SAME secret (issue #61).
+          diff --git a/modules/helpers/ubs_core/analyzers/ctcompare_py.py b/modules/helpers/ubs_core/analyzers/ctcompare_py.py
+          --- a/modules/helpers/ubs_core/analyzers/ctcompare_py.py
+          +++ b/modules/helpers/ubs_core/analyzers/ctcompare_py.py
+          @@ -64,7 +64,7 @@
+               'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
+               'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
+               'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
+          -    'count', 'len', 'length',
+          +    'count', 'len', 'length', 'scope', 'scopes',
+           }
+           
+           # Unkeyed hashlib constructors (GH #102). ``hashlib.new`` is unkeyed too but is
+          diff --git a/modules/helpers/ubs_core/analyzers/ctcompare_rust.py b/modules/helpers/ubs_core/analyzers/ctcompare_rust.py
+          --- a/modules/helpers/ubs_core/analyzers/ctcompare_rust.py
+          +++ b/modules/helpers/ubs_core/analyzers/ctcompare_rust.py
+          @@ -68,7 +68,7 @@
+               "status", "type", "mode", "scheme", "parser", "alg", "algorithm",
+               "aud", "audience", "claim", "claims", "exp", "expiration", "header",
+               "headers", "issuer", "iss", "kid", "name", "label", "id", "index",
+          -    "count", "len", "length",
+          +    "count", "len", "length", "scope", "scopes",
+           }
+           nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
+           shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")
+          PATCH
+          if git apply --check "$RUNNER_TEMP/ctcompare.patch"; then
+            git apply "$RUNNER_TEMP/ctcompare.patch"
+          else
+            # A rerun after landing must prove the exact patch is already present.
+            git apply --reverse --check "$RUNNER_TEMP/ctcompare.patch"
+          fi
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+      - name: Run source-level regressions and existing security suites
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p test_ctcompare_scope_metadata.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_security_precision.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_js_scan.py -v
+      - name: Run constant-time manifest cases through public scanner entry points
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          root = Path.cwd()
+          original = root / 'test-suite' / 'manifest.json'
+          data = json.loads(original.read_text())
+          data['cases'] = [case for case in data['cases'] if any(
+              term in json.dumps(case).lower()
+              for term in ('ctcompare', 'constant-time', 'parser_token_compare')
+          )]
+          assert data['cases'], 'No constant-time manifest cases selected'
+          defaults = data.setdefault('defaults', {})
+          defaults['ubs_bin'] = str((original.parent / defaults.get('ubs_bin', '../ubs')).resolve())
+          defaults['artifacts_dir'] = str(original.parent / 'artifacts' / 'ctcompare-scope-manifest')
+          for case in data['cases']:
+              if 'ubs_bin' in case:
+                  case['ubs_bin'] = str((original.parent / case['ubs_bin']).resolve())
+          selected = original.parent / 'artifacts' / 'ctcompare-scope-manifest.json'
+          selected.parent.mkdir(parents=True, exist_ok=True)
+          selected.write_text(json.dumps(data, indent=2) + '\n')
+          print('Selected manifest cases:', ', '.join(case['id'] for case in data['cases']), flush=True)
+          subprocess.run(['python3', 'test-suite/run_manifest.py', '--manifest', str(selected)], check=True)
+          PY
+      - name: Verify checksum closure, syntax, and lint parity
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          bash -n ubs
+          for file in modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+          rc=0
+          shellcheck ubs modules/ubs-*.sh scripts/*.sh > "$RUNNER_TEMP/shellcheck-after.log" 2>&1 || rc=$?
+          test "$rc" = "$(cat "$RUNNER_TEMP/shellcheck-before.rc")"
+          cmp "$RUNNER_TEMP/shellcheck-before.log" "$RUNNER_TEMP/shellcheck-after.log"
+          echo "ShellCheck diagnostics are identical to the baseline (exit $rc)."
+          git diff --check
+          git diff > "$RUNNER_TEMP/ctcompare-tested.patch"
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/ctcompare-regenerated.patch"
+          cmp "$RUNNER_TEMP/ctcompare-tested.patch" "$RUNNER_TEMP/ctcompare-regenerated.patch"
+      - name: Store verified blobs without updating any branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
+          allowed.update(f'modules/ubs-{lang}.sh' for lang in (
+              'bash', 'cpp', 'csharp', 'elixir', 'golang', 'java', 'js', 'kotlin', 'python', 'ruby', 'rust', 'swift'
+          ))
+          analyzers = {f'modules/helpers/ubs_core/analyzers/ctcompare_{lang}.py' for lang in ('go', 'js', 'py', 'rust')}
+          allowed.update(analyzers)
+          assert changed <= allowed, changed - allowed
+          assert not changed or analyzers <= changed, changed
+          print('ISSUE143_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
+          for name in sorted(changed):
+              data = Path(name).read_bytes()
+              payload = json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'})
+              response = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=payload, text=True, capture_output=True, check=True, timeout=90,
+              )
+              blob = json.loads(response.stdout)
+              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              assert blob['sha'] == expected, (name, blob)
+              print(f"ISSUE143_BLOB {name} {blob['sha']}", flush=True)
+          PY

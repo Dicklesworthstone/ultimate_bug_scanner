@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='222f4d58abab83aa37e76a1d8b7f6dec77b5fbe5b7bc28e818363241783a46b8'
-  [cpp]='50b91be9f70aae0356e5f56c384f55c1dc1acf0af83b3e9bddcb004eb356308c'
-  [csharp]='5aeda474bed65a770407dd7f7afd10217b108582a69230bfc8956b907cede4e3'
-  [elixir]='59548dc275e1312fc9444790622219780ecb825ad95f31b6e8a59b79d393d70a'
-  [golang]='6e58e339d4bdef904dc4b288efe23173eac7073413236cd1a7d9795f1191b915'
-  [java]='10d4d2302daf7209f4c283a3e9d299a62a02885a7fa9e76b5c04d1064c0f27dc'
-  [js]='7fea62b4ab23d69edf4dba4818bd05ac1ddbebbcf65bd87b8b8b7b5dcea657ed'
-  [kotlin]='955b52b37898d4fa95d8301d1aa889ea601d5e6c091886980a2abca00711dafa'
-  [python]='ba45db44ab946d4bf46a3001c56565c7811eb4d817a22701ff852e9738201e3c'
-  [ruby]='4af61928aa84a436276f29cccb721757d6134f9ced9da60a6d145bf5647b299e'
-  [rust]='f9589cb7ba91bd29abe1294de75d19879910f6a2eb613e4005eeaafb3cd77836'
-  [swift]='a092b5d5ad48f2f53d4ed9a4a92e7d828f7087b2dccaa77f587f5e073ccbcf90'
+  [bash]='5827676097d530cf6b7adb3b62e78d26bde94586d2da6b8ed87b4fb77fa99f8e'
+  [cpp]='9d751fdfbf7cd9d32f7a1ce5c8bc7aeae12dbd390db0e71a200e267d2ca96253'
+  [csharp]='42052ba5bc2f722744359edf14baefd18bb8490d9e2183a53a1df11c2aab91ac'
+  [elixir]='6ac0cdd17ca5504cd546cef11580ede83a1fa30ecc3652f9570cbf70a246561e'
+  [golang]='1e7093ac93c7d18bc81a36597b550f15de88fbc401e9d8bcee7fd876de8f6443'
+  [java]='0642c7457f9fdd8fbee4a1b55efdabdb4177dd42c4bc4602639b9a4db7603cc1'
+  [js]='37601ad78cdc8c54d911ff79a876809129ba2162fa7b5e685a42bbcd32e91d96'
+  [kotlin]='4eac4b654a6d816b4e113cc864b4878db58c02ffb848e180afeabcf953d19063'
+  [python]='98207ef70c51a563921bf820dd7354349e61bea101e04cd5ef8381e374d455f6'
+  [ruby]='a87155a7c197d2607a76d50678ff7125b439a8310a95fbe17de709d58ab82585'
+  [rust]='ed616155a7f7c6896d075459e54b2d09ca52fbcb08d971f7f430da455e1aa5df'
+  [swift]='e6e283ad965535c5c6b377a4b200f4cd5fe46bf5b0981a31c8e97c11645d0fef'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -100,10 +100,10 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/async_sort_comparator.py']='7410aaa138a3a9204a0e47fc81ed9942f14031728edd21a991373df5d17c225b'
   ['helpers/ubs_core/analyzers/async_timer.py']='b24c3462cfc469c330ecfc63ff63e2d20cc2b92165f627dc148ac76bbf105ea4'
   ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='5269b88dd078cae71d1a3c2e23523032507ac49265560dd0c27273c41c38c5aa'
-  ['helpers/ubs_core/analyzers/ctcompare_go.py']='67b66f44a697628c36dc5499aa40e9bfd737391d72f6940a623ef427d7a4e64d'
-  ['helpers/ubs_core/analyzers/ctcompare_js.py']='462e601e16b1359711b50c241fab8911157f5efa341eba533c4519a2464ce04f'
-  ['helpers/ubs_core/analyzers/ctcompare_py.py']='720fcd492c865ac3b947a7917037207907b79c99e752bed5da21435a0e375c50'
-  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='64e19bbfabeff7ee4f0d08f58a5540da78236e32654a188af7b5a5138f09a7d9'
+  ['helpers/ubs_core/analyzers/ctcompare_go.py']='a46dfb62750d28394179c86cc9f1571f7f921bceb6e7dccd37bb141f88b3a790'
+  ['helpers/ubs_core/analyzers/ctcompare_js.py']='9bd3ac8d780fc38ddcd9d7af7114772a6a029b62ad7d930c9425d28dfc6c2479'
+  ['helpers/ubs_core/analyzers/ctcompare_py.py']='cb7f1dff8aa8af1d2ae809893eecb083b46c7c21609a0af00889f75c215f7671'
+  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='1516328e603555b1764b6846539df41ecf161d2e0a94bcafa6fdc217ff0a46dc'
   ['helpers/ubs_core/analyzers/guards_generic.py']='61ef81e6255aa3c09ed175648f8cbd99ee2bff9a98ed3c968781533beb91b4a5'
   ['helpers/ubs_core/analyzers/guards_js.py']='4a27ccb62965a474c40de644f15cf2e4018642f42971501c480d7015c399eafa'
   ['helpers/ubs_core/analyzers/guards_py.py']='beb7d42b8b34a27b28107b7f557e206aed6a6ad26454c8b0dfe6b7271dd4d1de'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='e56676ebee603cc1f2eba436058d5fe277260b35346d72f2eb2d1ee3b5787b72'
+  ['lib/ubs-common.sh']='12450548577498f94cbbc85476314a793b1d0232426aaeee331eb1c44f5e2f78'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3741,12 +3741,63 @@ checksum_tool_name(){
   return 1
 }
 
+# compute_sha256 PATH: print the lowercase hex sha256 of PATH.
+# Status: 0 ok; 1 no hash tool on PATH; 3 the tool ran but failed or printed
+# no digest; >128 passes through unchanged (how bash reports a child killed by
+# signal N, i.e. 128+N).
+#
+# Deliberately pipeline-free: callers run this inside `x="$(...)"` with
+# `shopt -s lastpipe` in effect, and bash's job bookkeeping for a lastpipe
+# pipeline has a SIGCHLD race that can crash the substitution subshell. The
+# digest is cut out in-shell instead of via `| awk`, which also stops a failing
+# tool from being reported as success with an empty digest.
 compute_sha256(){
-  local path="$1"
-  if need_cmd sha256sum; then sha256sum "$path" | awk '{print $1}'; return 0; fi
-  if need_cmd shasum; then shasum -a 256 "$path" | awk '{print $1}'; return 0; fi
-  if need_cmd openssl; then openssl dgst -sha256 "$path" | awk '{print $NF}'; return 0; fi
-  return 1
+  local path="$1" out="" rc=0 field=first
+  if need_cmd sha256sum; then
+    out="$(sha256sum "$path")" || rc=$?
+  elif need_cmd shasum; then
+    out="$(shasum -a 256 "$path")" || rc=$?
+  elif need_cmd openssl; then
+    out="$(openssl dgst -sha256 "$path")" || rc=$?
+    field=last
+  else
+    return 1
+  fi
+  if (( rc != 0 )); then
+    (( rc > 128 )) && return "$rc"
+    return 3
+  fi
+  # GNU tools prefix the line with a backslash when the file name needed escaping.
+  if [[ "$field" == first ]]; then out="${out#\\}"; out="${out%%[[:space:]]*}"; else out="${out##*[[:space:]]}"; fi
+  [[ "$out" =~ ^[0-9a-fA-F]{64}$ ]] || return 3
+  printf '%s\n' "${out,,}"
+}
+
+# sha256_into VAR PATH: store PATH's sha256 in VAR (in the caller's shell).
+# A status above 128 means the hashing subshell was killed by a signal (or a
+# tool exited with such a code); that proves nothing about the file, so it is
+# retried a bounded number of times. On failure SHA256_ERR holds an accurate
+# reason and the status from compute_sha256 is returned. VAR is never set to a
+# partial or empty digest.
+SHA256_ERR=""
+sha256_into(){
+  local __sha_var="$1" __sha_path="$2" __sha_out="" __sha_rc=0 __sha_try
+  SHA256_ERR=""
+  for __sha_try in 1 2 3; do
+    __sha_rc=0
+    __sha_out="$(compute_sha256 "$__sha_path")" || __sha_rc=$?
+    if (( __sha_rc == 0 )); then
+      printf -v "$__sha_var" '%s' "$__sha_out"
+      return 0
+    fi
+    (( __sha_rc > 128 )) || break
+  done
+  case "$__sha_rc" in
+    1) SHA256_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)" ;;
+    3) SHA256_ERR="checksum tool $(checksum_tool_name || echo '?') failed on $__sha_path" ;;
+    *) SHA256_ERR="checksum of $__sha_path could not be computed: the hashing subprocess ended with status $__sha_rc (signal $((__sha_rc - 128))) on all $__sha_try attempts; the file was not judged" ;;
+  esac
+  return "$__sha_rc"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3861,7 +3912,8 @@ ensure_ast_grep_tool_cache(){
     need_download=1
   else
     local current_sha
-    if ! current_sha="$(compute_sha256 "$zip_path")"; then
+    if ! sha256_into current_sha "$zip_path"; then
+      say_err "${RED}${X}${RESET} cannot verify cached ast-grep archive: ${SHA256_ERR}"
       return 2
     fi
     [[ "$current_sha" == "$expected" ]] || need_download=1
@@ -3880,8 +3932,8 @@ ensure_ast_grep_tool_cache(){
       return 1
     fi
     local sha
-    if ! sha="$(compute_sha256 "$tmp_zip")"; then
-      say_err "${RED}${X}${RESET} cannot verify ast-grep download (no sha256 tool available)"
+    if ! sha256_into sha "$tmp_zip"; then
+      say_err "${RED}${X}${RESET} cannot verify ast-grep download: ${SHA256_ERR}"
       return 2
     fi
     if [[ "$sha" != "$expected" ]]; then
@@ -3941,7 +3993,8 @@ ensure_toon_tool_cache(){
     rm -f "$tmp" 2>/dev/null
     return 1
   fi
-  if ! sha="$(compute_sha256 "$tmp")"; then
+  if ! sha256_into sha "$tmp"; then
+    say_err "${RED}${X}${RESET} cannot verify the toon encoder download: ${SHA256_ERR}; nothing installed"
     rm -f "$tmp" 2>/dev/null
     return 2
   fi
@@ -4172,8 +4225,8 @@ verify_module_checksum(){
     return 1
   fi
   local actual
-  if ! actual="$(compute_sha256 "$path")"; then
-    VERIFY_MODULE_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
+  if ! sha256_into actual "$path"; then
+    VERIFY_MODULE_ERR="$SHA256_ERR"
     return 2
   fi
   if [[ "$actual" != "$expected" ]]; then
@@ -4203,8 +4256,8 @@ verify_helper_checksum(){
     return 1
   fi
   local actual
-  if ! actual="$(compute_sha256 "$path")"; then
-    VERIFY_HELPER_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
+  if ! sha256_into actual "$path"; then
+    VERIFY_HELPER_ERR="$SHA256_ERR"
     return 2
   fi
   if [[ "$actual" != "$expected" ]]; then
@@ -4966,8 +5019,8 @@ download_module(){
       local expected="${MODULE_CHECKSUMS[$lang]:-}"
       if [[ -n "$expected" ]]; then
         local sha
-        if ! sha="$(compute_sha256 "$tmp")"; then
-          VERIFY_MODULE_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
+        if ! sha256_into sha "$tmp"; then
+          VERIFY_MODULE_ERR="$SHA256_ERR"
         elif [[ "$sha" != "$expected" ]]; then
           VERIFY_MODULE_ERR="checksum mismatch for $lang (expected $expected, got $sha)"
         fi
@@ -5058,8 +5111,8 @@ download_helper_asset(){
       local expected="${HELPER_CHECKSUMS[$rel]:-}"
       if [[ -n "$expected" ]]; then
         local sha
-        if ! sha="$(compute_sha256 "$tmp")"; then
-          VERIFY_HELPER_ERR="unable to compute checksum (install sha256sum, shasum, or openssl)"
+        if ! sha256_into sha "$tmp"; then
+          VERIFY_HELPER_ERR="$SHA256_ERR"
         elif [[ "$sha" != "$expected" ]]; then
           VERIFY_HELPER_ERR="checksum mismatch for $rel (expected $expected, got $sha)"
         fi
@@ -5104,8 +5157,11 @@ ensure_helper_asset(){
     local verify_code=0
     verify_helper_checksum "$rel" "$path" || verify_code=$?
     if [[ $verify_code -eq 2 ]]; then
+      # Status 2 means the helper could not be judged at all (no usable hash
+      # tool, a hashing subprocess killed by a signal, no pinned digest). Refuse
+      # to run it, but keep the file: deleting bytes that were never shown to
+      # be wrong only forces a needless re-download.
       say "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
-      rm -f "$path" 2>/dev/null || true
       return 2
     fi
     if [[ $verify_code -ne 0 ]]; then
@@ -5434,8 +5490,8 @@ check_and_update_self(){
     return $?
   fi
   local actual_sum
-  if ! actual_sum="$(compute_sha256 "$new_self")" || [[ -z "$actual_sum" ]]; then
-    self_update_fail "no sha256 tool available (need sha256sum, shasum, or openssl)"
+  if ! sha256_into actual_sum "$new_self"; then
+    self_update_fail "$SHA256_ERR"
     return $?
   fi
   if [[ "$actual_sum" != "$expected_sum" ]]; then

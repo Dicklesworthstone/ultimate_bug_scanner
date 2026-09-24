@@ -64,7 +64,7 @@ METADATA_TERMS = {
     'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
     'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
     'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
-    'count', 'len', 'length',
+    'count', 'len', 'length', 'scope', 'scopes',
 }
 
 # Unkeyed hashlib constructors (GH #102). ``hashlib.new`` is unkeyed too but is

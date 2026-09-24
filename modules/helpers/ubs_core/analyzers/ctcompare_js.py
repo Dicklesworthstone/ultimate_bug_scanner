@@ -61,7 +61,7 @@ METADATA_TERMS = {
     'status', 'type', 'mode', 'scheme', 'parser', 'alg', 'algorithm',
     'aud', 'audience', 'claim', 'claims', 'exp', 'expiration', 'header',
     'headers', 'issuer', 'iss', 'kid', 'name', 'label', 'id', 'index',
-    'count', 'len', 'length',
+    'count', 'len', 'length', 'scope', 'scopes',
 }
 # Concept family of each vocabulary term, used to decide whether two
 # name-sensitive operands compare the SAME secret (issue #61).

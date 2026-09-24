@@ -100,20 +100,68 @@ ubs_with_timeout(){
 }
 
 # ── Asset integrity & helper resolution (bead E1) ────────────────────────────
-# ubs_sha256_file FILE: compute sha256 digest of FILE (prints hex string).
-# Returns 0 on success, 1 on missing file or unavailable hash tool.
+# ubs_sha256_file FILE: compute sha256 digest of FILE (prints lowercase hex).
+# Returns 0 on success, 1 on missing file or unavailable hash tool, 3 when the
+# tool ran but failed or printed no digest; a status above 128 (how bash
+# reports a child killed by signal N) passes through unchanged.
+#
+# Deliberately pipeline-free: callers run this inside `x="$(...)"` in modules
+# that set `shopt -s lastpipe`, and bash's lastpipe job bookkeeping has a
+# SIGCHLD race that can crash that subshell. Cutting the digest in-shell also
+# stops a failing tool from yielding "success" with an empty digest.
 ubs_sha256_file(){
-  local file="$1"
+  local file="$1" out="" rc=0 field=first
   [[ -f "$file" ]] || return 1
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    out="$(sha256sum "$file" 2>/dev/null)" || rc=$?
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    out="$(shasum -a 256 "$file" 2>/dev/null)" || rc=$?
   elif command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}'
+    out="$(openssl dgst -sha256 "$file" 2>/dev/null)" || rc=$?
+    field=last
   else
     return 1
   fi
+  if (( rc != 0 )); then
+    (( rc > 128 )) && return "$rc"
+    return 3
+  fi
+  # GNU tools prefix the line with a backslash when the file name needed escaping.
+  if [[ "$field" == first ]]; then out="${out#\\}"; out="${out%%[[:space:]]*}"; else out="${out##*[[:space:]]}"; fi
+  [[ "$out" =~ ^[0-9a-fA-F]{64}$ ]] || return 3
+  printf '%s\n' "${out,,}"
+}
+
+# ubs_sha256_into VAR FILE: store FILE's digest in VAR in the caller's shell.
+# A status above 128 means the hashing subshell was killed by a signal (or a
+# tool exited with such a code); that says nothing about FILE, so it is
+# retried a bounded number of times. On failure UBS_SHA256_ERR holds an
+# accurate reason and ubs_sha256_file's status is returned; VAR is untouched.
+UBS_SHA256_ERR=""
+ubs_sha256_into(){
+  local __ubs_sha_var="$1" __ubs_sha_file="$2" __ubs_sha_out="" __ubs_sha_rc=0 __ubs_sha_try
+  UBS_SHA256_ERR=""
+  for __ubs_sha_try in 1 2 3; do
+    __ubs_sha_rc=0
+    __ubs_sha_out="$(ubs_sha256_file "$__ubs_sha_file")" || __ubs_sha_rc=$?
+    if (( __ubs_sha_rc == 0 )); then
+      printf -v "$__ubs_sha_var" '%s' "$__ubs_sha_out"
+      return 0
+    fi
+    (( __ubs_sha_rc > 128 )) || break
+  done
+  case "$__ubs_sha_rc" in
+    1)
+      if [[ -f "$__ubs_sha_file" ]]; then
+        UBS_SHA256_ERR="unable to compute checksum for '$__ubs_sha_file' (install sha256sum, shasum, or openssl)"
+      else
+        UBS_SHA256_ERR="unable to compute checksum: '$__ubs_sha_file' is not a regular file"
+      fi
+      ;;
+    3) UBS_SHA256_ERR="checksum tool failed on '$__ubs_sha_file'" ;;
+    *) UBS_SHA256_ERR="checksum of '$__ubs_sha_file' could not be computed: the hashing subprocess ended with status $__ubs_sha_rc (signal $((__ubs_sha_rc - 128))) on all $__ubs_sha_try attempts; the file was not judged" ;;
+  esac
+  return "$__ubs_sha_rc"
 }
 
 # Pinned helper and asset checksums for standalone module execution (bead E1).
@@ -157,10 +205,10 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/async_sort_comparator.py']='7410aaa138a3a9204a0e47fc81ed9942f14031728edd21a991373df5d17c225b'
   ['helpers/ubs_core/analyzers/async_timer.py']='b24c3462cfc469c330ecfc63ff63e2d20cc2b92165f627dc148ac76bbf105ea4'
   ['helpers/ubs_core/analyzers/cfg_test_only_rust.py']='5269b88dd078cae71d1a3c2e23523032507ac49265560dd0c27273c41c38c5aa'
-  ['helpers/ubs_core/analyzers/ctcompare_go.py']='67b66f44a697628c36dc5499aa40e9bfd737391d72f6940a623ef427d7a4e64d'
-  ['helpers/ubs_core/analyzers/ctcompare_js.py']='462e601e16b1359711b50c241fab8911157f5efa341eba533c4519a2464ce04f'
-  ['helpers/ubs_core/analyzers/ctcompare_py.py']='720fcd492c865ac3b947a7917037207907b79c99e752bed5da21435a0e375c50'
-  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='64e19bbfabeff7ee4f0d08f58a5540da78236e32654a188af7b5a5138f09a7d9'
+  ['helpers/ubs_core/analyzers/ctcompare_go.py']='a46dfb62750d28394179c86cc9f1571f7f921bceb6e7dccd37bb141f88b3a790'
+  ['helpers/ubs_core/analyzers/ctcompare_js.py']='9bd3ac8d780fc38ddcd9d7af7114772a6a029b62ad7d930c9425d28dfc6c2479'
+  ['helpers/ubs_core/analyzers/ctcompare_py.py']='cb7f1dff8aa8af1d2ae809893eecb083b46c7c21609a0af00889f75c215f7671'
+  ['helpers/ubs_core/analyzers/ctcompare_rust.py']='1516328e603555b1764b6846539df41ecf161d2e0a94bcafa6fdc217ff0a46dc'
   ['helpers/ubs_core/analyzers/guards_generic.py']='61ef81e6255aa3c09ed175648f8cbd99ee2bff9a98ed3c968781533beb91b4a5'
   ['helpers/ubs_core/analyzers/guards_js.py']='4a27ccb62965a474c40de644f15cf2e4018642f42971501c480d7015c399eafa'
   ['helpers/ubs_core/analyzers/guards_py.py']='beb7d42b8b34a27b28107b7f557e206aed6a6ad26454c8b0dfe6b7271dd4d1de'
@@ -549,8 +597,8 @@ ubs_resolve_helper(){
   fi
 
   local actual
-  if ! actual="$(ubs_sha256_file "$target")"; then
-    ubs_die "unable to compute checksum for helper '$target' (install sha256sum, shasum, or openssl)" 2
+  if ! ubs_sha256_into actual "$target"; then
+    ubs_die "helper '$_rel': $UBS_SHA256_ERR; refusing to execute" 2
   fi
 
   if [[ "$actual" != "$expected" ]]; then
@@ -614,8 +662,8 @@ ubs_resolve_helpers_dir(){
     for _core_rel in "${!UBS_COMMON_HELPER_CHECKSUMS[@]}"; do
       if [[ "$_core_rel" == helpers/ubs_core/* && -f "${base_dir}/${_core_rel}" ]]; then
         _core_expected="${UBS_COMMON_HELPER_CHECKSUMS[$_core_rel]}"
-        if ! _core_actual="$(ubs_sha256_file "${base_dir}/${_core_rel}")"; then
-          ubs_die "unable to compute checksum for '${base_dir}/${_core_rel}'" 2
+        if ! ubs_sha256_into _core_actual "${base_dir}/${_core_rel}"; then
+          ubs_die "helper file '$_core_rel': $UBS_SHA256_ERR; refusing to execute" 2
         fi
         if [[ "$_core_actual" != "$_core_expected" ]]; then
           ubs_die "helper file '$_core_rel' failed checksum verification (expected $_core_expected, got $_core_actual); refusing to execute (run 'ubs doctor --fix' or set UBS_ALLOW_UNVERIFIED_HELPERS=1 to override)" 2

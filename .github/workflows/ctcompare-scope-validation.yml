@@ -1,0 +1,73 @@
+name: Constant-time scope metadata regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ctcompare-scope-validation.yml
+      - modules/helpers/ubs_core/analyzers/ctcompare_*.py
+      - test-suite/quality/test_ctcompare_scope_metadata.py
+      - test-suite/quality/test_security_precision.py
+      - test-suite/quality/test_js_scan.py
+      - test-suite/manifest.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install scanner test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep shellcheck python3-yaml
+          npm install --global @ast-grep/cli
+      - name: Run source-level regressions and existing security suites
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p test_ctcompare_scope_metadata.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_security_precision.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_js_scan.py -v
+      - name: Run constant-time manifest cases through public scanner entry points
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          root = Path.cwd()
+          original = root / 'test-suite' / 'manifest.json'
+          data = json.loads(original.read_text())
+          data['cases'] = [case for case in data['cases'] if any(
+              term in json.dumps(case).lower()
+              for term in ('ctcompare', 'constant-time', 'parser_token_compare')
+          )]
+          assert data['cases'], 'No constant-time manifest cases selected'
+          defaults = data.setdefault('defaults', {})
+          defaults['ubs_bin'] = str((original.parent / defaults.get('ubs_bin', '../ubs')).resolve())
+          defaults['artifacts_dir'] = str(original.parent / 'artifacts' / 'ctcompare-scope-manifest')
+          for case in data['cases']:
+              if 'ubs_bin' in case:
+                  case['ubs_bin'] = str((original.parent / case['ubs_bin']).resolve())
+          selected = original.parent / 'artifacts' / 'ctcompare-scope-manifest.json'
+          selected.parent.mkdir(parents=True, exist_ok=True)
+          selected.write_text(json.dumps(data, indent=2) + '\n')
+          print('Selected manifest cases:', ', '.join(case['id'] for case in data['cases']), flush=True)
+          subprocess.run(['python3', 'test-suite/run_manifest.py', '--manifest', str(selected)], check=True)
+          PY
+      - name: Verify checksum closure and shell syntax
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          bash -n ubs
+          for file in modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+          git diff --exit-code

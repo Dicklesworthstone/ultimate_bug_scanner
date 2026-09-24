@@ -222,6 +222,119 @@ def check_download_failure_only_warns() -> None:
         report("download_failure_only_warns", ok, f"exit={proc.returncode}", proc)
 
 
+# ── Hashing subprocess killed mid-checksum ─────────────────────────────────
+# Checksums are taken as `x="$(compute_sha256 f)"`. If that substitution
+# subshell dies (bash's lastpipe SIGCHLD race segfaults it; OOM kills do the
+# same), the runner used to report a missing sha256sum and delete the helper.
+# A `sha256sum` stub first on PATH reproduces that deterministically: for the
+# target file it kills its parent (the substitution subshell) with SIGSEGV, or
+# in "fail" mode simply exits 1, then otherwise execs the real tool.
+MISSING_TOOL_ADVICE = "install sha256sum, shasum, or openssl"
+KILLER_STUB = """#!/bin/bash
+for arg in "$@"; do
+  if [[ "$arg" == *"$UBS_TEST_STUB_TARGET"* ]]; then
+    case "$UBS_TEST_STUB_MODE" in
+      fail) echo "stub: simulated read error" >&2; exit 1 ;;
+      always) echo fired >> "$UBS_TEST_STUB_LOG"; kill -SEGV "$PPID"; sleep 2 ;;
+      once)
+        if [[ ! -s "$UBS_TEST_STUB_LOG" ]]; then
+          echo fired >> "$UBS_TEST_STUB_LOG"; kill -SEGV "$PPID"; sleep 2
+        fi ;;
+    esac
+  fi
+done
+exec "$UBS_TEST_REAL_SHA256SUM" "$@"
+"""
+
+
+def killer_stub_env(tmp: Path, target: str, mode: str) -> list[tuple[str, str]]:
+    real = shutil.which("sha256sum", path="/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin")
+    if real is None:
+        raise RuntimeError("no real sha256sum found to wrap")
+    stub_dir = tmp / "stub-bin"
+    stub_dir.mkdir()
+    stub = stub_dir / "sha256sum"
+    stub.write_text(KILLER_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    log = tmp / "stub.log"
+    log.write_text("", encoding="utf-8")
+    return [
+        ("PATH", f"{stub_dir}:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin:{os.environ.get('PATH', '')}"),
+        ("UBS_TEST_REAL_SHA256SUM", real),
+        ("UBS_TEST_STUB_TARGET", target),
+        ("UBS_TEST_STUB_MODE", mode),
+        ("UBS_TEST_STUB_LOG", str(log)),
+    ]
+
+
+def check_helper_checksum_signal_death_is_retried() -> None:
+    """One killed hashing subshell is retried; the scan proceeds on a good helper."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp_s:
+        tmp = Path(tmp_s)
+        sb = Sandbox(tmp)
+        proc = sb.run(*killer_stub_env(tmp, TAMPERED_HELPER, "once"))
+        combined = proc.stdout + proc.stderr
+        fired = "fired" in (tmp / "stub.log").read_text(encoding="utf-8")
+        ok = (
+            fired
+            and proc.returncode in (0, 1)
+            and '"totals"' in proc.stdout
+            and "refusing" not in combined
+            and MISSING_TOOL_ADVICE not in combined
+            and (sb.module_dir / TAMPERED_HELPER).is_file()
+        )
+        report("helper_checksum_signal_death_is_retried", ok, f"exit={proc.returncode} fired={fired}", proc)
+
+
+def check_helper_checksum_persistent_signal_death_keeps_helper() -> None:
+    """A hashing subshell that keeps dying fails closed with a truthful reason
+    and never deletes the (unjudged, byte-correct) cached helper."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp_s:
+        tmp = Path(tmp_s)
+        sb = Sandbox(tmp)
+        helper = sb.module_dir / TAMPERED_HELPER
+        before = helper.read_bytes()
+        proc = sb.run(*killer_stub_env(tmp, TAMPERED_HELPER, "always"))
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode == 2
+            and "refusing to scan with unverified helpers" in combined
+            and "signal 11" in combined
+            and MISSING_TOOL_ADVICE not in combined
+            and helper.is_file()
+            and helper.read_bytes() == before
+        )
+        report("helper_checksum_persistent_signal_death_keeps_helper", ok, f"exit={proc.returncode} helper_kept={helper.is_file()}", proc)
+
+
+def check_helper_checksum_tool_failure_is_not_missing_tool() -> None:
+    """A hash tool that is present but fails is reported as such, not as absent."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp_s:
+        tmp = Path(tmp_s)
+        sb = Sandbox(tmp)
+        proc = sb.run(*killer_stub_env(tmp, TAMPERED_HELPER, "fail"))
+        combined = proc.stdout + proc.stderr
+        ok = (
+            proc.returncode == 2
+            and "checksum tool sha256sum failed" in combined
+            and MISSING_TOOL_ADVICE not in combined
+            and (sb.module_dir / TAMPERED_HELPER).is_file()
+        )
+        report("helper_checksum_tool_failure_is_not_missing_tool", ok, f"exit={proc.returncode}", proc)
+
+
+def check_module_checksum_signal_death_is_retried() -> None:
+    """Same for the cached language module's own checksum."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-") as tmp_s:
+        tmp = Path(tmp_s)
+        sb = Sandbox(tmp)
+        proc = sb.run(*killer_stub_env(tmp, "cache/ubs-python.sh", "once"))
+        combined = proc.stdout + proc.stderr
+        fired = "fired" in (tmp / "stub.log").read_text(encoding="utf-8")
+        ok = fired and proc.returncode in (0, 1) and '"totals"' in proc.stdout and MISSING_TOOL_ADVICE not in combined
+        report("module_checksum_signal_death_is_retried", ok, f"exit={proc.returncode} fired={fired}", proc)
+
+
 def setup_module_sandbox(dest: Path) -> None:
     (dest / "helpers").mkdir(parents=True, exist_ok=True)
     (dest / "lib").mkdir(parents=True, exist_ok=True)
@@ -276,6 +389,36 @@ def test_tampered_helper_refused() -> None:
             and "UBS_ALLOW_UNVERIFIED_HELPERS=1" in combined
         )
         report("test_tampered_helper_refused", ok, f"exit={proc.returncode}", proc)
+
+
+def test_standalone_checksum_signal_death() -> None:
+    """lib/ubs-common.sh (standalone module run): a killed hashing subshell is
+    retried once, and a persistent one fails closed without blaming the tool."""
+    for mode in ("once", "always"):
+        with tempfile.TemporaryDirectory(prefix="ubs-sc-standalone-") as tmp_s:
+            tmp = Path(tmp_s)
+            mod_dir = tmp / "mods"
+            setup_module_sandbox(mod_dir)
+            env = os.environ.copy()
+            env.update({"NO_COLOR": "1", "UBS_ALLOW_UNVERIFIED_HELPERS": "0"})
+            env.pop("UBS_VERIFIED_ASSET_DIR", None)
+            env.update(dict(killer_stub_env(tmp, CORE_ASSET, mode)))
+            cmd = [str(mod_dir / "ubs-python.sh"), "--ci", "--format=json", str(PY_FIXTURE)]
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied module argv scans the fixed fixture with a stub hash tool.
+            combined = proc.stdout + proc.stderr
+            fired = (tmp / "stub.log").stat().st_size > 0
+            if mode == "once":
+                ok = fired and standalone_scan_completed(proc) and MISSING_TOOL_ADVICE not in combined
+            else:
+                ok = (
+                    fired
+                    and proc.returncode == 2
+                    and "signal 11" in combined
+                    and CORE_ASSET in combined
+                    and MISSING_TOOL_ADVICE not in combined
+                    and (mod_dir / CORE_ASSET).is_file()
+                )
+            report(f"standalone_checksum_signal_death_{mode}", ok, f"exit={proc.returncode} fired={fired}", proc)
 
 
 def test_standalone_module_verifies() -> None:
@@ -499,6 +642,11 @@ def main() -> int:
         check_tampered_core_refused,
         check_override_allows_unverified,
         check_download_failure_only_warns,
+        check_helper_checksum_signal_death_is_retried,
+        check_helper_checksum_persistent_signal_death_keeps_helper,
+        check_helper_checksum_tool_failure_is_not_missing_tool,
+        check_module_checksum_signal_death_is_retried,
+        test_standalone_checksum_signal_death,
         test_tampered_helper_refused,
         test_standalone_module_verifies,
         check_tampered_module_refreshed_from_clean_source,

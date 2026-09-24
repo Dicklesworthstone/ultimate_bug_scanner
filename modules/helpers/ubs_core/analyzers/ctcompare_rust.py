@@ -68,7 +68,7 @@ metadata_terms = {
     "status", "type", "mode", "scheme", "parser", "alg", "algorithm",
     "aud", "audience", "claim", "claims", "exp", "expiration", "header",
     "headers", "issuer", "iss", "kid", "name", "label", "id", "index",
-    "count", "len", "length",
+    "count", "len", "length", "scope", "scopes",
 }
 nullish_re = re.compile(r'^(?:None|Some\s*\([^)]*\)|Ok\s*\([^)]*\)|Err\s*\([^)]*\)|true|false|0|1|""|b""|\[\])$')
 shape_re = re.compile(r"\b(?:len|is_empty|capacity)\s*\(|\.(?:len|is_empty|capacity)\s*\(")

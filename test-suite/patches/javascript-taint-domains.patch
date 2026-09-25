@@ -1,0 +1,254 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index cee7dd2..2cfd14e 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -44,21 +44,18 @@ SOURCE_PATTERNS = [
+     (re.compile(r"\bURLSearchParams\s*\([^)]*\)", re.IGNORECASE), 'URLSearchParams payload'),
+ ]
+ 
+-SANITIZER_REGEXES = [
+-    re.compile(r"DOMPurify\.sanitize"),
+-    re.compile(r"sanitizeHtml"),
+-    re.compile(r"escapeHtml"),
+-    re.compile(r"xssFilters"),
+-    re.compile(r"encodeURIComponent"),
+-    re.compile(r"he\.escape"),
+-    re.compile(r"(?:lodash|_)\.escape"),
+-    re.compile(r"validator\.escape"),
+-    re.compile(r"stripTags"),
+-    re.compile(r"sanitizeInput"),
+-    re.compile(r"sanitizeUrl"),
+-    re.compile(r"shellescape"),
+-    re.compile(r"db\.escape|pool\.escape|connection\.escape|mysql\.escape|sqlstring\.escape"),
+-]
++# Escaping for one interpreter is not escaping for another. Unknown helpers,
++# URL encoders and tag strippers are deliberately not universal sanitizers.
++SANITIZERS_BY_RULE = {
++    'js.taint.xss': re.compile(
++        r'(?<![\w$.])(?:DOMPurify\.sanitize|sanitizeHtml|escapeHtml|'
++        r'he\.escape|(?:lodash|_)\.escape|validator\.escape)\s*\('
++    ),
++    'js.taint.command': re.compile(r'(?<![\w$.])shellescape\s*\('),
++    'js.taint.sql': re.compile(
++        r'(?<![\w$.])(?:db|pool|connection|mysql|sqlstring)\.escape\s*\('
++    ),
++}
+ 
+ CHILD_PROCESS_APIS = ('execFileSync', 'execFile', 'execSync', 'spawnSync', 'spawn', 'exec')
+ CHILD_PROCESS_API_RE = r"(?:execFileSync|execFile|execSync|spawnSync|spawn|exec)"
+@@ -308,13 +305,50 @@ def assignment_sources(expr: str):
+     return []
+ 
+ 
+-def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
+-    for regex in SANITIZER_REGEXES:
+-        if regex.search(expr):
+-            return True
+-    if sink_rule == 'js.taint.sql' and re.search(r",\s*(?:\[[^\]]+\]|params|values|bindings)", expr, re.IGNORECASE):
+-        return True
+-    return False
++def unsanitized_expression(expr: str, sink_rule: str | None) -> str:
++    """Mask only complete sanitizer call results, not their unsafe siblings.
++
++    Input has already had comments and inert literal text removed. Replacing
++    complete calls with spaces preserves offsets and cannot join identifiers.
++    An incomplete call is not evidence of sanitization.
++    """
++    regex = SANITIZERS_BY_RULE.get(sink_rule)
++    if regex is None:
++        return expr
++    out = list(expr)
++    covered_until = 0
++    for match in regex.finditer(expr):
++        if match.start() < covered_until:
++            continue
++        depth = 1
++        for index in range(match.end(), len(expr)):
++            char = expr[index]
++            if char == '(':
++                depth += 1
++            elif char == ')':
++                depth -= 1
++                if depth == 0:
++                    covered_until = index + 1
++                    out[match.start():covered_until] = ' ' * (covered_until - match.start())
++                    break
++    return ''.join(out)
++
++
++def query_argument(expr: str) -> str:
++    """Isolate SQL text: bound data never makes a dynamic query safe."""
++    stack = []
++    closing = {')': '(', ']': '[', '}': '{'}
++    for index, char in enumerate(expr):
++        if char in '([{':
++            stack.append(char)
++        elif char in closing:
++            if not stack or stack[-1] != closing[char]:
++                # Malformed syntax is not evidence for excluding the rest.
++                return expr
++            stack.pop()
++        elif char == ',' and not stack:
++            return expr[:index]
++    return expr
+ 
+ 
+ def expr_has_tainted(expr: str, tainted):
+@@ -354,7 +388,9 @@ def extend_path(meta, new_node):
+     return clone
+ 
+ 
+-def record_taint(assignments):
++def record_taint(assignments, sink_rule: str | None = None):
++    assignments = [(line, target, unsanitized_expression(expr, sink_rule))
++                   for line, target, expr in assignments]
+     tainted = {}
+     for line_no, target, expr in assignments:
+         sources = assignment_sources(expr)
+@@ -366,10 +402,12 @@ def record_taint(assignments):
+                 'line': line_no,
+                 'path': [snippet.strip(), target]
+             }
+-    for _ in range(6):
++    # Each productive iteration adds a variable from this finite assignment
++    # set. Stop at the fixed point, not at an arbitrary six-hop ceiling.
++    while True:
+         changed = False
+         for line_no, target, expr in assignments:
+-            if target in tainted or expr_has_sanitizer(expr):
++            if target in tainted:
+                 continue
+             ref, meta = expr_has_tainted(expr, tainted)
+             if ref:
+@@ -402,67 +440,16 @@ def format_path(path, sink_label):
+ 
+ 
+ def analyze_file(path, issues):
+-    try:
+-        text = path.read_text(encoding='utf-8')
+-    except (UnicodeDecodeError, OSError):
+-        return
+-    lines = text.splitlines()
+-    assignments = parse_assignments(lines)
+-    tainted = record_taint(assignments)
+-    child_process_modules, child_process_functions = child_process_bindings(lines)
+-    for idx, raw in enumerate(lines, start=1):
+-        stripped = strip_comments(raw)
+-        if not stripped:
+-            continue
+-        command_sink = find_child_process_sink(source_line(raw), child_process_modules, child_process_functions)
+-        if command_sink:
+-            expr, sink_label = command_sink
+-            if expr and not expr_has_sanitizer(expr, 'js.taint.command'):
+-                literal = find_sources(expr)
+-                if literal:
+-                    snippet, _ = literal[0]
+-                    path_desc = f"{snippet.strip()} -> {sink_label}"
+-                else:
+-                    ref, meta = expr_has_tainted(expr, tainted)
+-                    if ref:
+-                        path_desc = format_path(meta.get('path', [ref]), sink_label)
+-                    else:
+-                        path_desc = ''
+-                if path_desc:
+-                    try:
+-                        rel = path.relative_to(BASE_DIR)
+-                    except ValueError:
+-                        rel = path.name
+-                    sample = f"{rel}:{idx} {path_desc}"
+-                    bucket = issues['js.taint.command']
+-                    bucket['count'] += 1
+-                    if len(bucket['samples']) < 3:
+-                        bucket['samples'].append(sample)
+-        for regex, rule, sink_label in SINKS:
+-            match = regex.search(stripped)
+-            if not match:
+-                continue
+-            expr = match.group(1).strip()
+-            if not expr or expr_has_sanitizer(expr, rule):
+-                continue
+-            literal = find_sources(expr)
+-            if literal:
+-                snippet, _ = literal[0]
+-                path_desc = f"{snippet.strip()} -> {sink_label}"
+-            else:
+-                ref, meta = expr_has_tainted(expr, tainted)
+-                if not ref:
+-                    continue
+-                path_desc = format_path(meta.get('path', [ref]), sink_label)
+-            try:
+-                rel = path.relative_to(BASE_DIR)
+-            except ValueError:
+-                rel = path.name
+-            sample = f"{rel}:{idx} {path_desc}"
+-            bucket = issues[rule]
+-            bucket['count'] += 1
+-            if len(bucket['samples']) < 3:
+-                bucket['samples'].append(sample)
++    # Both public entrypoints consume the same uncapped finding stream.
++    for rule, line, _col, path_desc in scan_file_findings(path):
++        try:
++            rel = path.relative_to(BASE_DIR)
++        except ValueError:
++            rel = path.name
++        bucket = issues[rule]
++        bucket['count'] += 1
++        if len(bucket['samples']) < 3:
++            bucket['samples'].append(f"{rel}:{line} {path_desc}")
+ 
+ 
+ def main(argv=None) -> int:
+@@ -505,7 +492,7 @@ def scan_file_findings(path: Path):
+         return
+     lines = text.splitlines()
+     assignments = parse_assignments(lines)
+-    tainted = record_taint(assignments)
++    tainted_by_rule = {rule: record_taint(assignments, rule) for rule in KIND_BY_RULE}
+     child_process_modules, child_process_functions = child_process_bindings(lines)
+     for idx, raw in enumerate(lines, start=1):
+         stripped = strip_comments(raw)
+@@ -515,13 +502,15 @@ def scan_file_findings(path: Path):
+         command_sink = find_child_process_sink(line, child_process_modules, child_process_functions)
+         if command_sink:
+             expr, sink_label = command_sink
+-            if expr and not expr_has_sanitizer(expr, 'js.taint.command'):
++            col = len(line) - len(expr) + 1
++            expr = unsanitized_expression(strip_comments(expr), 'js.taint.command')
++            if expr:
+                 literal = find_sources(expr)
+                 if literal:
+                     snippet, _ = literal[0]
+                     path_desc = f"{snippet.strip()} -> {sink_label}"
+                 else:
+-                    ref, meta = expr_has_tainted(expr, tainted)
++                    ref, meta = expr_has_tainted(expr, tainted_by_rule['js.taint.command'])
+                     if ref:
+                         path_desc = format_path(meta.get('path', [ref]), sink_label)
+                     else:
+@@ -529,20 +518,23 @@ def scan_file_findings(path: Path):
+                 if path_desc:
+                     # every child-process sink regex ends in `\((.*)`, so the
+                     # captured expr is a suffix of the searched line
+-                    yield 'js.taint.command', idx, len(line) - len(expr) + 1, path_desc
++                    yield 'js.taint.command', idx, col, path_desc
+         for regex, rule, sink_label in SINKS:
+             match = regex.search(stripped)
+             if not match:
+                 continue
+             expr = match.group(1).strip()
+-            if not expr or expr_has_sanitizer(expr, rule):
++            if rule == 'js.taint.sql':
++                expr = query_argument(expr)
++            expr = unsanitized_expression(expr, rule)
++            if not expr:
+                 continue
+             literal = find_sources(expr)
+             if literal:
+                 snippet, _ = literal[0]
+                 path_desc = f"{snippet.strip()} -> {sink_label}"
+             else:
+-                ref, meta = expr_has_tainted(expr, tainted)
++                ref, meta = expr_has_tainted(expr, tainted_by_rule[rule])
+                 if not ref:
+                     continue
+                 path_desc = format_path(meta.get('path', [ref]), sink_label)

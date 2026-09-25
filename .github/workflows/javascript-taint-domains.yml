@@ -1,0 +1,128 @@
+name: JavaScript Taint Domains
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/js/test_taint_domains.py
+      - test-suite/patches/javascript-taint-domains.patch
+      - .github/workflows/javascript-taint-domains.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-candidate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    # Only publish content-addressed blobs. Never change refs, branches or tags.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify immutable candidate base and reproduce defects
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = cee7dd2b3c454022027f789688409366c22a8aa6
+          echo "JS_TAINT_BASE $(git rev-parse HEAD)"
+          if python3 test-suite/js/test_taint_domains.py > "$RUNNER_TEMP/js-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/js-before.log"
+            echo 'The candidate base no longer reproduces the defects.' >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/js-before.log"
+          grep -q 'FAILED (failures=22)' "$RUNNER_TEMP/js-before.log"
+      - name: Apply reviewed implementation and regenerate integrity chain
+        run: |
+          git apply --check test-suite/patches/javascript-taint-domains.patch
+          git apply test-suite/patches/javascript-taint-domains.patch
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Validate source regressions
+        run: |
+          python3 test-suite/js/test_taint_domains.py
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Install end-to-end dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Validate real scanner findings and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          cases = [
+              ('eval-domain', 'eval(DOMPurify.sanitize(req.query.value));', 'javascript.taint.eval'),
+              ('sql-bindings', 'db.query(req.query.sql, [req.query.id]);', 'javascript.taint.sql'),
+              ('html-clean', 'const clean = DOMPurify.sanitize(req.query.value);\nres.send(clean);', None),
+          ]
+          for name, source, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-js-domains-') as tmp:
+                  path = Path(tmp) / 'app.js'
+                  path.write_text(source + '\n', encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(path), '--only=js', '--format=json', '--ci'],
+                                          cwd=tmp, text=True, capture_output=True, timeout=120)
+                  print(name, 'exit', result.returncode, result.stderr, flush=True)
+                  assert result.returncode in (0, 1), result.stdout
+                  data = json.loads(result.stdout)
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              if isinstance(value.get(key), str):
+                                  rules.add(value[key])
+                          for item in value.values():
+                              visit(item)
+                      elif isinstance(value, list):
+                          for item in value:
+                              visit(item)
+                  visit(data)
+                  aliases = {rule.replace('javascript.', 'js.') for rule in rules}
+                  if expected:
+                      assert expected in rules or expected.replace('javascript.', 'js.') in aliases, (name, rules, data)
+                  else:
+                      assert 'javascript.taint.xss' not in rules and 'js.taint.xss' not in rules, (name, rules)
+                  print('JS_TAINT_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+      - name: Verify deterministic regeneration and publish tested blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
+          allowed.update(str(p) for p in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, changed
+          before = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          assert all(Path(name).read_bytes() == data for name, data in before.items())
+          for name in changed:
+              data = Path(name).read_bytes()
+              response = subprocess.run([
+                  'gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-',
+              ], input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                 text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              print('JS_TAINT_BLOB', name, sha, mode, flush=True)
+          PY

@@ -85,7 +85,7 @@ def strip_comments_and_strings(
     n = len(text)
 
     in_line_comment = False
-    in_block_comment = False
+    block_comment_depth = 0
     in_string = False
     in_triple_string = False
     string_quote = ""
@@ -108,11 +108,15 @@ def strip_comments_and_strings(
             continue
 
         # Inside block comment
-        if in_block_comment:
+        if block_comment_depth:
             result.append(ch if preserve_comments else mask_char(ch))
-            if ch == "*" and nxt == "/":
+            if is_rust and ch == "/" and nxt == "*":
+                result.append("*" if preserve_comments else " ")
+                block_comment_depth += 1
+                i += 2
+            elif ch == "*" and nxt == "/":
                 result.append("/" if preserve_comments else " ")
-                in_block_comment = False
+                block_comment_depth -= 1
                 i += 2
             else:
                 i += 1
@@ -161,7 +165,7 @@ def strip_comments_and_strings(
                 continue
 
             if not is_hash_comment and ch == "/" and nxt == "*":
-                in_block_comment = True
+                block_comment_depth = 1
                 result.extend("/*" if preserve_comments else "  ")
                 i += 2
                 continue

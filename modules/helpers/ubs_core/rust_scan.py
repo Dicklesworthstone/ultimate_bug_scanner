@@ -496,8 +496,9 @@ def is_test_attr(attr_text: str) -> bool:
         return True
     if inner.startswith("test(") or inner.startswith("tokio::test(") or inner.startswith("asupersync::test("):
         return True
-    if inner.startswith("cfg(") and inner.endswith(")"):
-        return cfg_implies_test(inner[4:-1].strip())
+    cfg = re.fullmatch(r"(?:r#)?cfg\s*\((.*)\)", inner, re.DOTALL)
+    if cfg:
+        return cfg_implies_test(cfg.group(1))
     return False
 
 

@@ -1,7 +1,7 @@
 """ubs_core.analyzers.cfg_test_only_rust — resolve #[cfg(test)]-only modules (bead A2).
 
-Logic moved verbatim from modules/helpers/cfg_test_only_modules_rust.py, which
-remains as a thin entrypoint. Part of the fix for GH #80: `--exclude-tests`
+The modules/helpers/cfg_test_only_modules_rust.py script is a thin entrypoint.
+Part of the fix for GH #80: `--exclude-tests`
 must also exclude files that are test-only because every `mod name;`
 declaration referencing them is gated by `#[cfg(test)]` (directly or
 transitively via another test-only file). A file that is also referenced by at
@@ -17,66 +17,202 @@ Also exposes a structured `run(ctx)` for the `python3 -m ubs_core` CLI.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.rust_scan import is_test_attr
 
-# `mod name;` declaration (out-of-line module), optionally pub / pub(...).
+# Both inline and out-of-line modules, including raw identifiers and visibility.
 MOD_DECL_RE = re.compile(
-    r"^\s*(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
+    r"(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+([^\s;{}]+)\s*([;{])"
 )
-# A single outer attribute at the start of the remaining line text.
-ATTR_PREFIX_RE = re.compile(r"^\s*#\[([^\]]*)\]")
-# cfg(test) / cfg(all(test, ...)) / cfg(any? no - any(test,..) is NOT test-only)
-CFG_TEST_RE = re.compile(r"^\s*cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*test\s*[,)])")
-PATH_ATTR_RE = re.compile(r'^\s*path\s*=\s*"([^"]+)"\s*$')
+ATTR_OPEN_RE = re.compile(r"#\s*(!\s*)?\[")
+PATH_KEY_RE = re.compile(r"\b(?:r#)?path\s*=\s*")
+INCLUDE_RE = re.compile(r"(?:r#)?include\s*!\s*([({\[])")
+TOKEN_RE = re.compile(r"(?:r#)?\w+|\S")
 CRATE_ROOT_NAMES = {"lib.rs", "main.rs", "mod.rs"}
+_MAX_PATH_VARIANTS = 32
+_MAX_SCOPE_DEPTH = 256
 
 
-def strip_line_comment(line: str) -> str:
-    """Drop // comments while respecting simple string literals."""
-    out = []
-    quote = ""
-    escape = False
-    i = 0
-    n = len(line)
-    while i < n:
-        ch = line[i]
-        if quote:
-            out.append(ch)
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == quote:
-                quote = ""
-            i += 1
+def _delimited_end(masked: str, start: int) -> int | None:
+    """Find a complete attribute token tree without interpreting literal text."""
+    closers = {"[": "]", "(": ")", "{": "}"}
+    stack = [closers[masked[start]]]
+    for pos in range(start + 1, len(masked)):
+        ch = masked[pos]
+        if ch in closers:
+            stack.append(closers[ch])
+            if len(stack) > _MAX_SCOPE_DEPTH:
+                return None
+        elif ch in "])}":
+            if ch != stack.pop():
+                return None
+            if not stack:
+                return pos + 1
+    return None
+
+
+def _path_literal(text: str, start: int) -> tuple[str, int] | None:
+    """Read ordinary/raw path literals; unsupported escapes keep all files scanned."""
+    while start < len(text) and text[start].isspace():
+        start += 1
+    raw = re.match(r'r(#{0,255})"', text[start:])
+    if raw:
+        value_start = start + raw.end()
+        end = text.find('"' + raw.group(1), value_start)
+        if end >= 0:
+            return text[value_start:end], end + 1 + len(raw.group(1))
+        return None
+    if start >= len(text) or text[start] != '"':
+        return None
+    try:
+        value, consumed = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
+    return (value, start + consumed) if isinstance(value, str) else None
+
+
+def _attribute_paths(attrs: list[str]) -> tuple[list[str], bool] | None:
+    """Collect every possible path, retaining the default for conditional paths.
+
+    Unknown cfg_attr predicates may select a production alias, so each literal
+    path participates in the reference graph. No target configuration is guessed.
+    """
+    paths: list[str] = []
+    has_direct_path = False
+    for attr in attrs:
+        clean = strip_comments_and_strings(attr, lang="rust", strip_strings=False)
+        masked = strip_comments_and_strings(attr, lang="rust")
+        direct = re.match(r"\s*(?:r#)?path\s*=", clean)
+        conditional = re.match(r"\s*(?:r#)?cfg_attr\s*\(", clean)
+        if not direct and not conditional:
             continue
-        if ch == '"':
-            quote = ch
-            out.append(ch)
-            i += 1
+        for key in PATH_KEY_RE.finditer(masked):
+            # Whitespace masking includes the literal itself; locate its start
+            # from the '=' instead of the end of the greedy whitespace match.
+            literal = _path_literal(clean, masked.index("=", key.start()) + 1)
+            if literal is None:
+                return None
+            value, end = literal
+            if direct and clean[end:].strip():
+                return None
+            paths.append(value)
+        has_direct_path = has_direct_path or bool(direct)
+    return paths, not has_direct_path
+
+
+def _cfg_gated(attr: str) -> bool:
+    clean = strip_comments_and_strings(attr, lang="rust", strip_strings=False)
+    return bool(re.match(r"\s*(?:r#)?cfg\s*\(", clean)) and is_test_attr("#[" + attr + "]")
+
+
+@dataclass
+class _Scope:
+    module_dirs: tuple[Path, ...]
+    path_dirs: tuple[Path, ...]
+    closer: str = ""
+    gated: bool = False
+    trusted: bool = True
+    inner_allowed: bool = True
+
+
+def _module_references(declaring: Path, text: str, *, as_crate_root: bool = False) -> list[tuple[Path, bool]] | None:
+    """Read lexical module references, failing conservatively on ambiguous scopes.
+
+    Only file/inline-module bodies authorize exclusions. References in other
+    token trees (including macro bodies) can keep files visible but cannot grant
+    test-only authority. Comments and literals never contribute declarations.
+    """
+    masked = strip_comments_and_strings(text, lang="rust")
+    base = declaring.parent
+    module_base = base if as_crate_root or declaring.name in CRATE_ROOT_NAMES else base / declaring.stem
+    scopes = [_Scope((module_base,), (base,))]
+    refs: list[tuple[Path, bool]] = []
+    attrs: list[str] = []
+    pos = 0
+    while pos < len(masked):
+        if masked[pos].isspace():
+            pos += 1
             continue
-        if ch == "/" and i + 1 < n and line[i + 1] == "/":
-            break
-        out.append(ch)
-        i += 1
-    return "".join(out)
+        scope = scopes[-1]
+        attr_open = ATTR_OPEN_RE.match(masked, pos)
+        if attr_open:
+            end = _delimited_end(masked, attr_open.end() - 1)
+            if end is None:
+                return None
+            attr = text[attr_open.end():end - 1]
+            if attr_open.group(1):
+                if scope.inner_allowed and scope.trusted:
+                    scope.gated = scope.gated or _cfg_gated(attr)
+            else:
+                attrs.append(attr)
+            pos = end
+            continue
 
+        scope.inner_allowed = False
+        module = MOD_DECL_RE.match(masked, pos)
+        if module:
+            paths = _attribute_paths(attrs)
+            if paths is None:
+                return None
+            path_values, include_default = paths
+            name = module.group(1).removeprefix("r#")
+            if not name.isidentifier():
+                return None
+            gated = scope.trusted and (scope.gated or any(_cfg_gated(attr) for attr in attrs))
+            explicit = [directory / path for directory in scope.path_dirs for path in path_values]
+            defaults = [directory / name for directory in scope.module_dirs] if include_default else []
+            if len(explicit) + len(defaults) > _MAX_PATH_VARIANTS:
+                return None
+            if module.group(2) == ";":
+                targets = explicit + [candidate for directory in defaults
+                                      for candidate in (directory.with_suffix(".rs"), directory / "mod.rs")]
+                refs.extend((target, gated) for target in targets)
+            else:
+                directories = tuple(dict.fromkeys(explicit + defaults))
+                scopes.append(_Scope(directories, directories, "}", gated, scope.trusted))
+                if len(scopes) > _MAX_SCOPE_DEPTH:
+                    return None
+            attrs = []
+            pos = module.end()
+            continue
 
-def resolve_targets(declaring: Path, name: str, path_attr: str | None) -> list[Path]:
-    """Candidate files a `mod name;` in `declaring` refers to."""
-    parent = declaring.parent
-    if path_attr:
-        return [parent / path_attr]
-    if declaring.name in CRATE_ROOT_NAMES:
-        base = parent
-    else:
-        base = parent / declaring.stem
-    return [base / f"{name}.rs", base / name / "mod.rs"]
+        attrs = []
+        include = INCLUDE_RE.match(masked, pos)
+        if include:
+            end = _delimited_end(masked, include.end() - 1)
+            if end is None:
+                return None
+            arguments = strip_comments_and_strings(text[include.end():end - 1], lang="rust", strip_strings=False)
+            literal = _path_literal(arguments, 0)
+            if literal is None or arguments[literal[1]:].strip() not in ("", ","):
+                # A computed include path may name any scanned file.
+                return None
+            # include! paths are relative to the source file, even in inline
+            # modules. Preserve these possible production uses conservatively.
+            refs.append((declaring.parent / literal[0], False))
+            pos = end
+            continue
+        ch = masked[pos]
+        if ch in "{([":
+            scopes.append(_Scope(scope.module_dirs, scope.path_dirs,
+                                 {"{": "}", "(": ")", "[": "]"}[ch], trusted=False))
+            if len(scopes) > _MAX_SCOPE_DEPTH:
+                return None
+        elif ch in "})]":
+            if len(scopes) == 1 or scopes[-1].closer != ch:
+                return None
+            scopes.pop()
+        token = TOKEN_RE.match(masked, pos)
+        pos = token.end() if token else pos + 1
+    return refs if len(scopes) == 1 else None
 
 
 def compute_test_only(raw_entries: list[str]) -> list[str]:
@@ -93,49 +229,61 @@ def compute_test_only(raw_entries: list[str]) -> list[str]:
         except OSError:
             continue
 
-    # target(resolved) -> list of (source_resolved, cfg_test_gated)
-    refs: dict[Path, list[tuple[Path, bool]]] = {}
+    # target(resolved) -> list of (source_resolved, cfg_test_gated).
+    # None is a production-preserving edge from an uncertain crate-root view;
+    # it cannot inherit test-only authority from another module context.
+    refs: dict[Path, list[tuple[Path | None, bool]]] = {}
+    source_refs: dict[Path, list[tuple[Path, bool]]] = {}
 
     for resolved, entry in by_resolved.items():
         try:
             text = Path(entry).read_text(encoding="utf-8", errors="ignore")
         except OSError:
-            continue
-        pending_cfg_test = False
-        pending_path: str | None = None
-        for raw in text.splitlines():
-            line = strip_line_comment(raw)
-            if not line.strip():
-                continue
-            # Consume any leading attributes (supports `#[cfg(test)] mod x;`
-            # on one line as well as attributes on preceding lines).
-            rest = line
-            while True:
-                m = ATTR_PREFIX_RE.match(rest)
-                if not m:
-                    break
-                inner = m.group(1)
-                if CFG_TEST_RE.match(inner):
-                    pending_cfg_test = True
-                pm = PATH_ATTR_RE.match(inner)
-                if pm:
-                    pending_path = pm.group(1)
-                rest = rest[m.end():]
-            if not rest.strip():
-                # Attribute-only line: state carries to the next line.
-                continue
-            dm = MOD_DECL_RE.match(rest)
-            if dm:
-                for target in resolve_targets(Path(entry), dm.group(1), pending_path):
-                    try:
-                        tr = target.resolve()
-                    except OSError:
-                        continue
-                    if tr in by_resolved:
-                        refs.setdefault(tr, []).append((resolved, pending_cfg_test))
-            # Any non-attribute line terminates the pending attribute state.
-            pending_cfg_test = False
-            pending_path = None
+            # An unreadable source might contain a production reference.
+            return []
+        references = _module_references(resolved, text)
+        if references is None:
+            return []
+        source_refs[resolved] = []
+        for target, gated in references:
+            try:
+                tr = target.resolve()
+            except OSError:
+                return []
+            if tr in by_resolved:
+                source_refs[resolved].append((tr, gated))
+
+        if resolved.name not in CRATE_ROOT_NAMES:
+            # Cargo bin/example/custom target roots need not be called main.rs
+            # or lib.rs. Without target metadata, also retain files reachable
+            # from their root interpretation; guessed paths never exclude files.
+            root_references = _module_references(resolved, text, as_crate_root=True)
+            if root_references is None:
+                return []
+            for target, gated in root_references:
+                if gated:
+                    continue
+                try:
+                    tr = target.resolve()
+                except OSError:
+                    return []
+                if tr in by_resolved:
+                    refs.setdefault(tr, []).append((None, False))
+
+    # A non-root filename has a reliable ordinary-module interpretation only
+    # when reached through declarations from a recognized source root. An
+    # unreferenced custom root cannot exclude guessed stem/name.rs siblings.
+    known_sources = {path for path in by_resolved if path.name in CRATE_ROOT_NAMES}
+    pending = list(known_sources)
+    while pending:
+        source = pending.pop()
+        for target, _ in source_refs.get(source, ()):
+            if target not in known_sources:
+                known_sources.add(target)
+                pending.append(target)
+    for source, targets in source_refs.items():
+        for target, gated in targets:
+            refs.setdefault(target, []).append((source, gated and source in known_sources))
 
     # Fixpoint: test-only if every reference is cfg(test)-gated or comes from
     # a file that is itself test-only. Unreferenced files are never test-only.

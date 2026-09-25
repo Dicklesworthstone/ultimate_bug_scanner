@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,9 +15,12 @@ if str(HELPERS_DIR) not in sys.path:
 from ubs_core.rust_scan import (  # noqa: E402
     Scan,
     TestScopeIndex,
+    _apply_exclude_tests,
     compute_test_intervals,
     is_test_attr,
 )
+from ubs_core.analyzers.cfg_test_only_rust import compute_test_only  # noqa: E402
+from ubs_core.lexer import strip_comments_and_strings  # noqa: E402
 
 
 class TestIsTestAttr(unittest.TestCase):
@@ -46,6 +50,7 @@ class TestIsTestAttr(unittest.TestCase):
     def test_cfg_test_attributes(self):
         self.assertTrue(is_test_attr("#[cfg(test)]"))
         self.assertTrue(is_test_attr("#[cfg(all(unix, test))]"))
+        self.assertTrue(is_test_attr("#[cfg /* spacing is legal */ (all(unix, test))]"))
 
     def test_cfg_any_with_test_does_not_imply_test(self):
         """`any(test, X)` is not test-only, and this is arithmetic, not policy.
@@ -299,6 +304,223 @@ mod tests { // Line 11
                 tmp_path.unlink()
             except OSError:
                 pass
+
+
+class TestModuleTestExclusion(unittest.TestCase):
+    """The module prefilter must never hide a possible production reference."""
+
+    def setUp(self):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="rust-cfg-", dir=artifacts)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def write_sources(self, sources):
+        files = []
+        for name, source in sources.items():
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8")
+            files.append(path)
+        return files
+
+    def excluded(self, declaration, extra=None):
+        sources = {"lib.rs": declaration, "support.rs": 'pub fn helper() { panic!("real panic"); }\n'}
+        sources.update(extra or {})
+        files = self.write_sources(sources)
+        return {str(Path(path).relative_to(self.root)) for path in compute_test_only([str(p) for p in files])}
+
+    def test_comment_and_literal_declarations_have_no_authority(self):
+        fake = "#[cfg(test)]\nmod support;\n"
+        for declaration in (
+            "/*\n" + fake + "*/",
+            "/* outer /* nested */\n" + fake + "*/",
+            'const EXAMPLE: &str = "\n' + fake + '";',
+            'const EXAMPLE: &str = r##"quoted \" example\n' + fake + '"##;',
+            'const EXAMPLE: &[u8] = br#"\n' + fake + '"#;',
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertEqual(self.excluded(declaration), set())
+
+    def test_same_line_production_alias_keeps_real_panic(self):
+        files = self.write_sources({
+            "lib.rs": '#[cfg(test)] #[path="support.rs"] mod check; #[path="support.rs"] pub(crate) mod production;\n',
+            "support.rs": 'pub fn helper() { panic!("real production panic"); }\n',
+        })
+        scan = Scan(files, self.root, exclude_tests=True, skip=set(), detail_limit=10)
+        _apply_exclude_tests(scan)
+        hits = scan.rg_lines(r"\bpanic!\(")
+        self.assertEqual([(Path(hit.path).name, hit.line) for hit in hits], [("support.rs", 1)])
+
+    def test_predicate_authority_matches_item_scopes(self):
+        for predicate in (
+            "test", "all(unix, test)", "not(not(test))",
+            'all(any(feature = "a", feature = "b"), test)',
+            "all(/* nested /* block */ comment */ unix, test,)",
+        ):
+            with self.subTest(predicate=predicate):
+                self.assertEqual(self.excluded(f"#[cfg ({predicate})]\nmod support;"), {"support.rs"})
+
+    def test_multiline_attributes_and_declaration(self):
+        declaration = '''#[
+            cfg(all(
+                feature = "support",
+                test,
+            ))
+        ]
+        pub(in crate)
+        mod
+        support
+        ;
+        '''
+        self.assertEqual(self.excluded(declaration), {"support.rs"})
+
+    def test_unknown_and_malformed_predicates_keep_sources(self):
+        for predicate in (
+            'test = "custom-build"', "any(test, unix)", "not(test)",
+            "all(test) extra", "all(test, bad())", "not(test, unix)",
+            "all(test", "not(" * 100 + "test" + ")" * 100,
+            "all(test," + ",".join(["unix"] * 300) + ")",
+        ):
+            with self.subTest(predicate=predicate):
+                self.assertEqual(self.excluded(f"#[cfg({predicate})]\nmod support;"), set())
+        self.assertEqual(self.excluded("#[cfg(all(test,)) trailing]\nmod support;"), set())
+
+    def test_inline_scope_uses_module_directory(self):
+        self.assertEqual(self.excluded(
+            "#[cfg(test)] mod checks { mod support; }",
+            {"checks/support.rs": "pub fn helper() {}"},
+        ), {"checks/support.rs"})
+
+    def test_inline_inner_attribute_gates_descendants(self):
+        self.assertEqual(self.excluded(
+            "mod checks { #![cfg(all(unix, test))] mod support; }",
+            {"checks/support.rs": "pub fn helper() {}"},
+        ), {"checks/support.rs"})
+
+    def test_inline_production_path_alias_keeps_source(self):
+        self.assertEqual(self.excluded('''#[cfg(test)] mod support;
+mod production { #[path = "../support.rs"] mod shared; }
+'''), set())
+
+    def test_inline_path_overrides_and_non_root_module_files(self):
+        self.assertEqual(self.excluded("mod feature;", {
+            "feature.rs": '#[cfg(test)] #[path = "fixtures"] mod check { mod nested; }',
+            "fixtures/nested.rs": "pub fn helper() {}",
+        }), {"fixtures/nested.rs"})
+        self.assertEqual(self.excluded("mod feature;", {
+            "feature.rs": '#[cfg(test)] mod check { #[path = "helper.rs"] mod nested; }',
+            "feature/check/helper.rs": "pub fn helper() {}",
+        }), {"feature/check/helper.rs"})
+
+    def test_transitive_test_only_sources(self):
+        self.assertEqual(self.excluded("#[cfg(all(unix, test))] mod support;", {
+            "support.rs": "mod nested;",
+            "support/nested.rs": "pub fn helper() {}",
+        }), {"support.rs", "support/nested.rs"})
+
+    def test_non_test_source_breaks_transitive_exclusion(self):
+        self.assertEqual(self.excluded('''#[cfg(test)] mod support;
+#[path = "support/nested.rs"] mod live;
+''', {
+            "support.rs": "mod nested;",
+            "support/nested.rs": "pub fn helper() {}",
+        }), {"support.rs"})
+
+    def test_conditional_path_aliases_preserve_production(self):
+        for path_attr in (
+            'cfg_attr(unix, path = "support.rs")',
+            'cfg_attr(unix, cfg_attr(feature = "native", path = "support.rs"))',
+            'cfg_attr(unix, path = r#"support.rs"#)',
+        ):
+            with self.subTest(path_attr=path_attr):
+                self.assertEqual(self.excluded(
+                    f"#[cfg(test)] mod support; #[{path_attr}] mod live;"
+                ), set())
+
+    def test_raw_path_literal_and_raw_module_identifier(self):
+        self.assertEqual(self.excluded(
+            '#[cfg(test)] #[path = r#"support.rs"#] mod r#type;'
+        ), {"support.rs"})
+
+    def test_unicode_and_raw_path_production_aliases(self):
+        for alias in (
+            '#[path = "support.rs"] mod producción;',
+            '#[path = "support.rs"] mod 中文;',
+            '#[path = "support.rs"] mod cafe\u0301;',
+            '#[r#path = "support.rs"] mod live;',
+            '#[r#cfg_attr(unix, r#path = "support.rs")] mod live;',
+        ):
+            with self.subTest(alias=alias):
+                self.assertEqual(self.excluded(
+                    '#[cfg(test)] mod checks { #[path = "../support.rs"] mod support; }\n' + alias
+                ), set())
+
+    def test_source_include_keeps_production_file(self):
+        for use in (
+            'include!("support.rs");',
+            'mod live { include!(r#"support.rs"#,); }',
+            'include!(concat!("support", ".rs"));',
+        ):
+            with self.subTest(use=use):
+                self.assertEqual(self.excluded("#[cfg(test)] mod support;\n" + use), set())
+        self.assertEqual(self.excluded(
+            '#[cfg(test)] mod support; const TEXT: &str = include_str!("support.rs");'
+        ), {"support.rs"})
+
+    def test_nonstandard_crate_roots_preserve_sibling_production(self):
+        self.assertEqual(self.excluded("#[cfg(test)] mod support;", {
+            "api.rs": "mod support;",
+        }), set())
+        self.assertEqual(self.excluded('#[cfg(test)] #[path = "bin/support.rs"] mod check;', {
+            "bin/runner.rs": "mod support;",
+            "bin/support.rs": 'pub fn helper() { panic!("production"); }',
+        }), set())
+
+    def test_unknown_root_does_not_exclude_guessed_module_tree(self):
+        self.assertEqual(self.excluded("", {
+            "api.rs": "#[cfg(test)] mod support;",
+            "api/support.rs": 'pub fn unrelated() { panic!("production"); }',
+        }), set())
+
+    def test_root_inner_attribute_propagates_to_outlined_modules(self):
+        self.assertEqual(self.excluded("#![cfg(all(unix, test))]\nmod support;"), {"support.rs"})
+
+    def test_macro_token_trees_cannot_authorize_exclusion(self):
+        for declaration in (
+            "macro_rules! example { () => { #[cfg(test)] mod support; }; }",
+            "example!(#[cfg(test)] mod support;);",
+            "example![#[cfg(test)] mod support;];",
+        ):
+            with self.subTest(declaration=declaration):
+                self.assertEqual(self.excluded(declaration), set())
+
+    def test_ambiguous_source_keeps_all_possible_production_files(self):
+        self.assertEqual(self.excluded("#[cfg(test)] mod support;", {
+            "production.rs": '#[path = "support.rs"',
+        }), set())
+        self.assertEqual(self.excluded("#[cfg(test)] mod support;", {
+            "production.rs": '#[path = concat!("support", ".rs")] mod live;',
+        }), set())
+
+    def test_nested_rust_comments_preserve_offsets_and_real_production(self):
+        text = '''/* outer /* inner */
+#[cfg(test)]
+mod imaginary {
+*/
+pub fn production() { panic!("real panic"); }
+/* } */
+'''
+        masked = strip_comments_and_strings(text, lang="rust")
+        self.assertEqual(len(masked), len(text))
+        self.assertEqual(masked.count("\n"), text.count("\n"))
+        self.assertNotIn("imaginary", masked)
+        self.assertIn("fn production", masked)
+        self.assertEqual(compute_test_intervals(text), [])
+        kept = strip_comments_and_strings(text, lang="rust", preserve_comments=True)
+        self.assertIn("/* outer /* inner */", kept)
+        self.assertIn("fn production", kept)
 
 
 if __name__ == "__main__":

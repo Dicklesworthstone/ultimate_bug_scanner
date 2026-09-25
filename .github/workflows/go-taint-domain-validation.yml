@@ -1,0 +1,134 @@
+name: Go Taint Domain Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/go-taint-domain-validation.yml
+  workflow_dispatch:
+
+# Only immutable Git blobs are written. Publishing a branch remains a separate
+# reviewed fast-forward operation after this workflow's tests have passed.
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      UBS_NO_AUTO_UPDATE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Record baseline and install the exact reviewed analyzer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "GO_TAINT_BASE $(git rev-parse HEAD)"
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          name = 'modules/helpers/ubs_core/analyzers/taint_go.py'
+          before = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
+          assert before == '0be1398a3228f131f77a1d9ab4c98354e7698ac4', before
+          sha = '3033c6471249189b70f946972fc7591e1bb069e0'
+          data = json.loads(subprocess.check_output(
+              ['gh', 'api', f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True))
+          assert data['encoding'] == 'base64'
+          raw = base64.b64decode(data['content'])
+          assert hashlib.sha256(raw).hexdigest() == 'd71179619a42917c519e280d5e59f28c816003ab4313a48a2f2fee02f0347eb6'
+          compile(raw, name, 'exec')
+          Path(name).write_bytes(raw)
+          PY
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+      - name: Run source regressions and registry compatibility
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p test_taint_go_domains.py -v
+          python3 -m unittest discover -s test-suite/quality -p test_ubs_core.py -v
+      - name: Run real Go taint manifest scans without changing expectations
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          cases = json.loads(Path('test-suite/manifest.json').read_text())['cases']
+          selected = [case['id'] for case in cases if case.get('enabled', True)
+                      and ('golang' in case['id'] or case['id'].startswith('go-'))
+                      and 'taint' in json.dumps(case).lower()]
+          print('GO_TAINT_MANIFEST_CASES', selected, flush=True)
+          assert selected, 'No Go taint manifest cases found'
+          args = ['python3', 'test-suite/run_manifest.py']
+          for name in selected:
+              args.extend(['--case', name])
+          subprocess.run(args, check=True)
+          PY
+      - name: Verify the complete integrity chain and generation idempotence
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          bash -n ubs
+          bash -n modules/lib/ubs-common.sh
+          for module in modules/ubs-*.sh; do bash -n "$module"; done
+          git diff --check
+          git diff > "$RUNNER_TEMP/go-taint-tested.diff"
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/go-taint-idempotent.diff"
+          cmp "$RUNNER_TEMP/go-taint-tested.diff" "$RUNNER_TEMP/go-taint-idempotent.diff"
+      - name: Store verified publication blobs without updating any ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_go.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert changed <= allowed, changed - allowed
+          assert 'modules/helpers/ubs_core/analyzers/taint_go.py' in changed
+          for name in sorted(changed):
+              raw = Path(name).read_bytes()
+              payload = json.dumps({'content': raw.decode('utf-8'), 'encoding': 'utf-8'})
+              result = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=payload, text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(result.stdout)['sha']
+              expected = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              assert sha == expected, (name, sha, expected)
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              print('GO_TAINT_TESTED_BLOB', mode, name, sha, flush=True)
+          PY
+      - name: Package source and diagnostic artifacts
+        if: always()
+        run: |
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/go-taint-source-snapshot.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-taint-domain-validation
+          path: |
+            ${{ runner.temp }}/go-taint-source-snapshot.tar.gz
+            ${{ runner.temp }}/go-taint-*.diff
+            test-suite/artifacts/
+          retention-days: 3

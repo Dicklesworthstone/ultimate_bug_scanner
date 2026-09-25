@@ -24,7 +24,9 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -380,6 +382,201 @@ class ExternalTargetTest(unittest.TestCase):
             for child in stub_dir.iterdir():
                 child.unlink()
             stub_dir.rmdir()
+
+
+class PostprocessStreamingTests(unittest.TestCase):
+    """Exercise the live generated postprocessor, including large reports."""
+
+    def setUp(self) -> None:
+        self.started = time.monotonic()
+        print(f"[{self.id()}] RUN", flush=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="ubs-postprocess-")
+        self.root = Path(self._tmp.name)
+        self.raw = self.root / "module.raw"
+        self.text = self.root / "module.txt"
+        self.summary = self.root / "module.json"
+        self.findings = self.root / "module.findings.json"
+        self.project = self.root / "project"
+        self.project.mkdir()
+        run_helper([
+            "bash", "-c", 'TMPDIR_RUN="$1"\n' + bash_function("write_postprocess_script")
+            + "\nwrite_postprocess_script\n", "postprocess-test", str(self.root),
+        ], check=True)
+
+    def tearDown(self) -> None:
+        result = self._outcome.result
+        failed = any(test is self for test, _ in result.failures + result.errors)
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - self.started:.3f}s)", flush=True)
+        self._tmp.cleanup()
+
+    def command(self, mode="text", **options):
+        args = {
+            "mode": mode, "lang": "python", "raw": self.raw, "txt": self.text,
+            "json": self.summary, "findings": self.findings, "source": self.project,
+            "project": self.project, "require-marker": "1", "timestamp": "fixed",
+            "helpers-dir": REPO_ROOT / "modules" / "helpers",
+        }
+        args.update(options)
+        command = [sys.executable, str(self.root / "postprocess.py")]
+        for key, value in args.items():
+            command.extend([f"--{key}", str(value)])
+        return command
+
+    def process(self, mode="text", expected_code=0, **options):
+        result = run_helper(self.command(mode, **options), text=True)
+        self.assertEqual(result.returncode, expected_code,
+                         f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+        return result
+
+    def test_stream_preserves_counts_partial_paths_suppression_and_permalinks(self) -> None:
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        source = "value = 1  # ubs:ignore[py.example]\nvalue = 2\n"
+        (workspace / "sample.py").write_text(source, encoding="utf-8")
+        (self.project / "sample.py").write_text(source, encoding="utf-8")
+        raw = (
+            "\x1b[34mUBS module: python (contract v2)\x1b[0m\r\n"
+            "Files: 9\r\nWarning issues: 88\r\n"
+            f"  {workspace}/sample.py:1:3 py.example hidden\r\n"
+            f"  {workspace}/sample.py:2:3 py.example visible\r\n"
+            "\x1b[31mPartial: [AST_UNAVAILABLE] analyzer unavailable\x1b[0m\r\n"
+            "Partial: [OTHER_FAILURE] later reason\r\n"
+            "Files scanned: 0\r\nCritical issues: 3\r\n"
+            "Warning issues: 2\r\nInfo items: 1\x00\r\nfooter without newline"
+        )
+        self.raw.write_bytes(raw.encode("utf-8"))
+        metrics = self.root / "metrics"
+        metrics.mkdir()
+        (metrics / "timings.json").write_text('{"elapsed_ms":123}', encoding="utf-8")
+        blob = "https://example.test/repo/blob/revision"
+        self.process(**{"workspace": workspace, "blob-base": blob,
+                        "toplevel": self.project, "metrics-dir": metrics})
+        expected = raw.replace("\r\n", "\n").replace(
+            f"  {workspace}/sample.py:1:3 py.example hidden\n", ""
+        ).replace(str(workspace), str(self.project)).replace(
+            "py.example visible\n", f"py.example visible ({blob}/sample.py#L2)\n"
+        )
+        self.assertEqual(self.text.read_text(encoding="utf-8"), expected)
+        self.assertEqual(json.loads(self.summary.read_text(encoding="utf-8")), {
+            "language": "python", "project": str(self.project), "files": 9,
+            "critical": 3, "warning": 2, "info": 1, "timestamp": "fixed",
+            "status": "partial", "module_error": "AST_UNAVAILABLE",
+            "message": "analyzer unavailable", "extras": {"elapsed_ms": 123},
+        })
+
+    def test_contract_rejection_preserves_text_without_inventing_summary(self) -> None:
+        raw = "Critical issues: 99\nThis is not a contract report.\n"
+        self.raw.write_text(raw, encoding="utf-8")
+        self.process(expected_code=3)
+        self.assertEqual(self.text.read_text(encoding="utf-8"), raw)
+        self.assertFalse(self.summary.exists())
+
+    def test_suppression_remains_correct_after_source_cache_eviction(self) -> None:
+        rows = ["UBS module: python (contract v2)\n"]
+        kept = []
+        for number in [*range(12), 0]:
+            path = self.project / f"source{number}.py"
+            path.write_text("value = 1  # ubs:ignore[py.hidden]\n", encoding="utf-8")
+            rows.append(f"{path}:1:1 py.hidden omitted\n")
+            visible = f"{path}:1:1 py.visible retained\n"
+            rows.append(visible)
+            kept.append(visible)
+        self.raw.write_text("".join(rows), encoding="utf-8")
+        self.process()
+        self.assertEqual(self.text.read_text(encoding="utf-8"), rows[0] + "".join(kept))
+
+    def test_ndjson_restores_each_single_file_record_without_changing_messages(self) -> None:
+        source = self.project / "nested" / 'quoted"name.py'
+        source.parent.mkdir()
+        source.write_text("value = 1\n", encoding="utf-8")
+        records = [
+            {"rule": "py.first", "path": source.name, "line": 1,
+             "message": f"keep the literal {source.name} and {source}"},
+            {"rule": "py.second", "path": str(source), "line": 1,
+             "samples": [{"file": source.name, "uri": str(source)}]},
+            {"rule": "py.third", "path": "other.py", "line": 1},
+        ]
+        self.findings.write_text("".join(json.dumps(record) + "\n" for record in records),
+                                 encoding="utf-8")
+        self.summary.write_text('{"files":1,"critical":0,"warning":3,"info":0}',
+                                encoding="utf-8")
+        self.process("json", **{"single-file": source})
+        restored = [json.loads(line) for line in self.findings.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record["path"] for record in restored],
+                         ['nested/quoted"name.py', 'nested/quoted"name.py', "other.py"])
+        self.assertEqual(restored[0]["message"], records[0]["message"])
+        self.assertEqual(restored[1]["samples"],
+                         [{"file": 'nested/quoted"name.py', "uri": 'nested/quoted"name.py'}])
+
+    def test_ndjson_workspace_mirrors_take_precedence_and_keep_malformed_lines(self) -> None:
+        workspace = self.root / "workspace"
+        mirror = workspace / "external" / "sample.py"
+        outside = self.root / "outside.py"
+        mapping = self.root / "mirrors.0"
+        mapping.write_bytes(f"{mirror}\0{outside}\0".encode("utf-8"))
+        raw = (json.dumps({"rule": "py.a", "path": str(mirror), "line": 1}) + "\n\n"
+               + "malformed line\n"
+               + json.dumps({"rule": "py.b", "path": str(workspace / "local.py"), "line": 2}))
+        self.findings.write_text(raw, encoding="utf-8")
+        self.summary.write_text('{"files":2,"critical":0,"warning":2,"info":0}',
+                                encoding="utf-8")
+        self.process("json", **{"workspace": workspace, "mirror-map": mapping})
+        self.assertEqual(self.findings.read_text(encoding="utf-8"),
+                         raw.replace(str(mirror), str(outside)).replace(str(workspace), str(self.project)))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "peak RSS units are Linux KiB")
+    def test_large_reports_stay_below_128_mib_and_preserve_every_byte(self) -> None:
+        import hashlib
+
+        # 400K physical output lines exercise the formerly unbounded raw-text,
+        # split-lines and suppression buffers. This is a postprocessor probe,
+        # not a claim about total memory of a 400K-line source-tree scan.
+        with self.raw.open("w", encoding="utf-8") as stream:
+            stream.write("UBS module: python (contract v2)\n")
+            row = "  source.py:9:2 py.example " + "long diagnostic detail " * 6 + "\n"
+            block = row * 1000
+            for _ in range(400):
+                stream.write(block)
+            stream.write("Files scanned: 1\nCritical issues: 0\nWarning issues: 400000\nInfo items: 0\n")
+        peak = self.root / "peak-rss.txt"
+        wrapper = (
+            "import pathlib, resource, runpy, sys\n"
+            "peak = pathlib.Path(sys.argv.pop(1))\n"
+            "sys.argv = sys.argv[1:]\n"
+            "try:\n"
+            "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+            "finally:\n"
+            "    peak.write_text(str(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))\n"
+        )
+        result = run_helper([sys.executable, "-c", wrapper, str(peak),
+                             *self.command(**{"no-suppress": "1"})[1:]], text=True)
+        self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+        self.assertLess(int(peak.read_text()), 128 * 1024)
+
+        def digest(path):
+            with path.open("rb") as stream:
+                return hashlib.file_digest(stream, "sha256").hexdigest()
+
+        self.assertEqual(digest(self.raw), digest(self.text))
+        doc = json.loads(self.summary.read_text(encoding="utf-8"))
+        self.assertEqual((doc["files"], doc["critical"], doc["warning"], doc["info"]),
+                         (1, 0, 400000, 0))
+
+        # JSON scans used to read their NDJSON sink in full, then try to parse
+        # it as one document. No restoration is needed for source-tree scans.
+        with self.findings.open("w", encoding="utf-8") as stream:
+            row = json.dumps({"rule": "py.example", "path": "sample.py", "line": 9,
+                              "message": "long diagnostic detail " * 6}) + "\n"
+            for _ in range(400):
+                stream.write(row * 1000)
+        expected_digest = digest(self.findings)
+        result = run_helper([sys.executable, "-c", wrapper, str(peak),
+                             *self.command("json")[1:]], text=True)
+        self.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+        self.assertLess(int(peak.read_text()), 128 * 1024)
+        self.assertEqual(digest(self.findings), expected_digest)
+        self.assertEqual(json.loads(self.summary.read_text(encoding="utf-8")), doc)
 
 
 if __name__ == "__main__":

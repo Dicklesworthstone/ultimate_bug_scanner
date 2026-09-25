@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -33,6 +34,44 @@ DEFAULT_COEFFICIENTS: dict[str, dict[str, float]] = {
     "kotlin": {"a": 55.0, "b": 1000.0},
 }
 FALLBACK_COEFFICIENT: dict[str, float] = {"a": 60.0, "b": 1000.0}
+
+
+def module_timeout_seconds(estimated_ms: float) -> int:
+    """Allow three estimated scan durations, with the existing 300s floor.
+
+    Estimates guide the automatic budget only. The runner keeps an explicit
+    UBS_MODULE_TIMEOUT unchanged, including zero (no time limit).
+    """
+    seconds = estimated_ms / 1000.0 * 3.0
+    if not math.isfinite(seconds) or seconds < 0:
+        return 300
+    return max(300, math.ceil(seconds))
+
+
+def count_file_list(path: Path) -> int:
+    """Count NUL-delimited source paths without interpreting their bytes.
+
+    The dispatcher writes NUL lists, so counting lines treats a whole project
+    as one file and counts newlines *inside* a filename as extra files. Legacy
+    newline lists remain accepted, just as in the scanner's file-list reader.
+    """
+    with path.open("rb") as source:
+        delimiter = b"\n"
+        while chunk := source.read(65536):
+            if b"\0" in chunk:
+                delimiter = b"\0"
+                break
+        source.seek(0)
+        count = 0
+        pending = False
+        while chunk := source.read(65536):
+            parts = chunk.split(delimiter)
+            for part in parts[:-1]:
+                if pending or part.strip():
+                    count += 1
+                pending = False
+            pending = pending or bool(parts[-1].strip())
+        return count + int(pending)
 
 
 @dataclass
@@ -60,8 +99,24 @@ class CostModel:
             if cp.is_file():
                 try:
                     data = json.loads(cp.read_text(encoding="utf-8"))
+                    if not isinstance(data, dict):
+                        continue
                     coeffs = data.get("coefficients", {})
                     default = data.get("default", FALLBACK_COEFFICIENT)
+                    if not isinstance(coeffs, dict) or not isinstance(default, dict):
+                        continue
+                    values = [default, *coeffs.values()]
+                    if any(
+                        not isinstance(value, dict) or any(
+                            isinstance(number, bool)
+                            or not isinstance(number, (int, float))
+                            or not math.isfinite(number)
+                            or number < 0
+                            for key, number in value.items() if key in ("a", "b")
+                        )
+                        for value in values
+                    ):
+                        continue
                     return cls(coefficients=coeffs, default=default)
                 except (OSError, ValueError):
                     pass
@@ -238,9 +293,7 @@ def main(argv: list[str] | None = None) -> int:
                 fpath = fdir / f"{lang}.files"
                 if fpath.is_file():
                     try:
-                        # Count lines in <lang>.files
-                        lines = [line for line in fpath.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()]
-                        counts[lang] = len(lines)
+                        counts[lang] = count_file_list(fpath)
                     except OSError:
                         pass
 
@@ -252,6 +305,8 @@ def main(argv: list[str] | None = None) -> int:
             "ordered_langs": [lang for lang, _ in result.ordered_jobs],
             "slots": args.slots,
             "estimates": {lang: round(cost, 1) for lang, cost in result.ordered_jobs},
+            "file_counts": {lang: counts.get(lang, 0) for lang in langs},
+            "timeouts": {lang: module_timeout_seconds(cost) for lang, cost in result.ordered_jobs},
             "makespan_estimate": round(result.makespan, 1),
             "slot_utilization_estimate": result.slot_utilization,
         }

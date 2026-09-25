@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='18d5f75da3af716a92a291b92c2be8cc4efa00e24cc3132564c57581acc503b8'
-  [cpp]='42b06f29bf09647fc81638eef2e64fe1a0d2cd9337517e9868377a2ae1fc1304'
-  [csharp]='9fcbdb8f8ad74ec5f4b055367478b58cdcad61c8a32d55bf781f8df936519737'
-  [elixir]='bc409ebebaee0f901a3c7b82ed964f3a1032882df172b7aa017f1b15291804a6'
-  [golang]='21742b5dba34fb402cc16b3b700d2309839c76b7ec823c43b430adc4b2bf3cae'
-  [java]='3f13f344842796012dbbd6507acaaf7f90fc0b4c7b5fbee259342940cb07aacf'
-  [js]='4cd517bcfa5c99b66d66d9e049a92646c8934145145610041bd527c779872898'
-  [kotlin]='c158f6c1afcac7279c3e8787cfa34962651ace80ac8220d75580f4ae96d3d902'
-  [python]='6a567edc39b30d106f29a4ee33dea0cee2179d592437ebd94644d55b05eb962f'
-  [ruby]='e26662edcc8a56ad97c0345082216e53be183aeb86155364b8ef5b430eaaebee'
-  [rust]='bc7a2b83ac01f925af1245923d56ab2de80b548491c73396d9417550d8b79156'
-  [swift]='5c6c9ab0dc33ed9a08b94a6e51b5d94b4652477a83f67d544305a0cdc1e7668b'
+  [bash]='6e621d85462a30de8507237713a1a31e39f7f3f66d98273746b8e16497a07faa'
+  [cpp]='95520257f4dc28e0295cbc5546b48f767cf35130e3db7c375997c5996862cc0c'
+  [csharp]='274a117f6776af403755fe22b1d55eea26f238295f25f1d3ae054ecbda9ef893'
+  [elixir]='4c69688259186ffdab870a5eb8356f16a8fb594b95235cc0e62b1a72d2912cc3'
+  [golang]='c4de44492025a605e825da7120774b323b65fb6718c677abc61ff9d495cb79cc'
+  [java]='2437a4cd5b3eaa9cf0a89ed1ed40832c24025a6561dca1ed2d338acd37dc4806'
+  [js]='cc9d331646629ca148725ff7c6beface360dba71204218ffb42e34f5d1c9a705'
+  [kotlin]='71f9f6696129c0a3e07b136b9e06f825b635485c2805e44b9c5dbaf9a2927b5c'
+  [python]='2883c32bf5ee0ab806580fc021d6b51bb366d1b9c2386ac70f3cf1bc403569d0'
+  [ruby]='43a2e1dc64e5b2749f6bf84e4e76f48ad9974e1513acee0f4761e6d7324d1378'
+  [rust]='883c65552b01550a0521cd0a8621a9fb12340f9ac8be089cf5f6027dea39a693'
+  [swift]='51a39437421ea0682ff052bfde91920fac4633c67db1ec85c49fe5b262fcc889'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -392,7 +392,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
   ['helpers/ubs_core/rust_scan.py']='ed646a24756848373110f4126531f187815609b71b8b4edf2975a7071febbc76'
-  ['helpers/ubs_core/scheduler.py']='9d4d936984f308c82d80d108b006a65ccd2eeb1d41e07325b621fc39147a94ed'
+  ['helpers/ubs_core/scheduler.py']='662a2555f571e9cc6fba5755103948fa8b8e8b87f8d9038686225ccf6b6405bb'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
   ['helpers/ubs_core/suppression.py']='10c9827d17ab590cfa7bbc13bbdc4b8466262e7f0ae90bc7f9ccf4bc049b9595'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='7febc1ef2ba236fb1107a5499f582e48fc6166cbe331fe893c0a2543105edaea'
+  ['lib/ubs-common.sh']='32651cd094125d650545915f82f1b88f83c6ed8c93b483b5fc086baec70f1615'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1488,7 +1488,7 @@ Environment Variables:
   UBS_NO_CACHE=1              Disable scan caching (like --no-cache)
   UBS_CACHE_DIR=PATH          Override root directory for scan cache (like --cache-dir)
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
-  UBS_MODULE_TIMEOUT=SECS     Per-module timeout (default: 300)
+  UBS_MODULE_TIMEOUT=SECS     Override automatic per-module timeout (minimum 300s; 0 disables)
   UBS_PROFILE=1               Add phase timings (copy, fan-out, per module, merge, total ms)
                               as a "profile" block in json/toon output and a Profile line in text
   UBS_ALLOW_PARTIAL=1         Exit on findings even when a module timed out or crashed
@@ -1620,7 +1620,7 @@ cat <<'JSON'
   },
   "env": [
     {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
-    {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Per-module timeout (default 300)."},
+    {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Override automatic per-module timeout (3x estimated cost, minimum 300s); 0 disables."},
     {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
     {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, list_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
@@ -5620,8 +5620,13 @@ elif command -v gtimeout >/dev/null 2>&1; then
   UBS_TIMEOUT_BIN="$(command -v gtimeout)"
 fi
 # Wall-clock budget per module (seconds) and grace before SIGKILL after SIGTERM.
-# Override via env: UBS_MODULE_TIMEOUT / UBS_MODULE_TIMEOUT_GRACE. A budget of 0
-# disables the bound.
+# Automatic budgets use three times the cost estimate, with a 300s floor.
+# An explicit UBS_MODULE_TIMEOUT overrides that estimate, even below the floor;
+# zero disables the bound. Invalid values retain the automatic default.
+UBS_MODULE_TIMEOUT_EXPLICIT=0
+if [[ "${UBS_MODULE_TIMEOUT:-}" =~ ^[0-9]+$ ]]; then
+  UBS_MODULE_TIMEOUT_EXPLICIT=1
+fi
 UBS_MODULE_TIMEOUT="${UBS_MODULE_TIMEOUT:-300}"
 UBS_MODULE_TIMEOUT_GRACE="${UBS_MODULE_TIMEOUT_GRACE:-15}"
 [[ "$UBS_MODULE_TIMEOUT" =~ ^[0-9]+$ ]] || UBS_MODULE_TIMEOUT=300
@@ -6518,6 +6523,7 @@ import json
 import os
 import re
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -6542,7 +6548,7 @@ _RULE_HINT = re.compile(r"\b(?:js|ts|py|rs|rust|go|java|kt|kotlin|rb|swift|cs|cp
 _RULE_METADATA = re.compile(r"^\s+\[rule:([A-Za-z][A-Za-z0-9_.-]*)\](?:\s|$)")
 
 
-def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
+def suppress(lines, lang: str = "", helpers_dir: str = ""):
     """Drop finding lines carrying an ubs:ignore marker (GH #91 semantics).
 
     When the ubs_core suppression engine is importable, findings are checked
@@ -6554,31 +6560,38 @@ def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
     the source index is unavailable; raw source text cannot prove suppression.
     """
     core = _load_ubs_core(helpers_dir)
-    indexes: dict = {}
-    out = []
-    for line in raw.splitlines(keepends=True):
+
+    # Repeated samples reuse their index without retaining every source tree
+    # in a multi-language report. Eviction changes only the amount of reuse.
+    @lru_cache(maxsize=8)
+    def source_index(path):
+        if core is None:
+            return None
+        try:
+            p = Path(path)
+            if not p.is_file():
+                return None
+            source = p.read_text(encoding="utf-8", errors="replace")
+            if not core.suppression.may_have_markers(source):
+                return None
+            return core.suppression.build_index(source, lang=lang or "python")
+        except Exception:
+            return None
+
+    for line in lines:
         m = FINDING.match(ANSI.sub("", line))
         if not m:
-            out.append(line)
+            yield line
             continue
         path = (m.group(1) or "").strip()
         try:
             lineno = int(m.group(2))
         except ValueError:
-            out.append(line)
+            yield line
             continue
         suppressed = False
-        index = None
-        if core is not None and path not in indexes:
-            try:
-                p = Path(path)
-                indexes[path] = core.suppression.build_index(
-                    p.read_text(encoding="utf-8", errors="replace"), lang=lang or "python"
-                ) if p.is_file() else None
-            except Exception:
-                indexes[path] = None
         if core is not None:
-            index = indexes.get(path)
+            index = source_index(path)
             if index is not None:
                 suffix = ANSI.sub("", line)[m.end():]
                 if lang in {"cpp", "rust", "java", "swift", "csharp"}:
@@ -6593,8 +6606,7 @@ def suppress(raw: str, lang: str = "", helpers_dir: str = "") -> str:
                 if index.is_suppressed(lineno, rule_id):
                     suppressed = True
         if not suppressed:
-            out.append(line)
-    return "".join(out)
+            yield line
 
 
 _MIRROR_PAIRS = None
@@ -6687,15 +6699,34 @@ def restore_json_file(path: str, a):
         return None
 
 
-def last_number(lines, pattern):
-    found = None
-    rx = re.compile(pattern)
-    for ln in lines:
-        if rx.search(ln):
-            nums = re.findall(r"[0-9]+", ln)
-            if nums:
-                found = nums[-1]
-    return int(found) if found is not None else 0
+def restore_findings_file(path: str, a):
+    """Restore the NDJSON sink one record at a time, without loading it all.
+
+    A normal source-tree scan has no paths to restore. In particular, do not
+    read its potentially large sink just to discover it is not one JSON
+    document. Single-file sinks also need key-based restoration: a bare
+    basename in a JSON string is not a text ``file:line`` reference.
+    """
+    if not path or not os.path.isfile(path):
+        return
+    if not a.single_file and not a.workspace and not mirror_pairs(a):
+        return
+    target = Path(path)
+    staged = target.with_name(target.name + ".paths.tmp")
+    with target.open(encoding="utf-8", errors="replace") as source, staged.open("w", encoding="utf-8") as output:
+        for line in source:
+            if a.single_file:
+                try:
+                    doc = json.loads(line)
+                except json.JSONDecodeError:
+                    output.write(restore_text(line, a))
+                else:
+                    json.dump(restore_json_doc(doc, a), output)
+                    if line.endswith("\n"):
+                        output.write("\n")
+            else:
+                output.write(restore_workspace(line, a))
+    os.replace(staged, target)
 
 
 # A contract-v2 module announces itself on one line of its text output. The
@@ -6706,36 +6737,65 @@ def last_number(lines, pattern):
 CONTRACT_V2_TEXT_MARKER = re.compile(r"^\s*UBS module:.*\(contract v2\)", re.MULTILINE)
 
 
-def has_contract_v2_marker(text: str) -> bool:
-    return bool(CONTRACT_V2_TEXT_MARKER.search(ANSI.sub("", text)))
+def summary_from_text(lines, a):
+    """Accumulate the same last-counter/first-partial semantics in one pass."""
+    doc = {"language": a.lang, "project": a.project, "files": 0, "critical": 0,
+           "warning": 0, "info": 0, "timestamp": a.timestamp}
+    counters = [(key, re.compile(pattern)) for key, pattern in (
+        ("critical", r"Critical issues:|CRITICAL"),
+        ("warning", r"Warning issues:|Warning"),
+        ("info", r"Info items:|Info"),
+        ("files", r"Files scanned:"),
+    )]
+    fallback_files = None
+    conforming = a.require_marker != "1"
+    for text in lines:
+        plain = ANSI.sub("", text)
+        conforming = conforming or bool(CONTRACT_V2_TEXT_MARKER.search(plain))
+        if "status" not in doc:
+            apply_partial(doc, text)
+        for line in plain.replace("\r", "").replace("\0", "").splitlines():
+            for key, pattern in counters:
+                if pattern.search(line):
+                    numbers = re.findall(r"[0-9]+", line)
+                    if numbers:
+                        doc[key] = int(numbers[-1])
+            if fallback_files is None:
+                match = re.search(r"Files:\s*([0-9]+)", line)
+                if match:
+                    fallback_files = int(match.group(1))
+    if not doc["files"]:
+        doc["files"] = fallback_files or 0
+    return doc, conforming
 
 
-def summary_from_text(text: str, a) -> dict:
-    cleaned = ANSI.sub("", text).replace("\r", "").replace("\0", "")
-    lines = cleaned.splitlines()
-    critical = last_number(lines, r"Critical issues:|CRITICAL")
-    warning = last_number(lines, r"Warning issues:|Warning")
-    info = last_number(lines, r"Info items:|Info")
-    files = last_number(lines, r"Files scanned:")
-    if not files:
-        for ln in lines:
-            m = re.search(r"Files:\s*([0-9]+)", ln)
-            if m:
-                files = int(m.group(1))
-                break
-    return {"language": a.lang, "project": a.project, "files": files, "critical": critical,
-            "warning": warning, "info": info, "timestamp": a.timestamp}
+def text_lines(path: str):
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8", errors="replace") as source:
+            for line in source:
+                yield from line.splitlines(keepends=True)
+
+
+def render_text_lines(lines, output, a):
+    for line in lines:
+        restored = restore_text(line, a)
+        output.write(add_permalinks(restored, a))
+        yield restored
 
 
 PERMALINK = re.compile(r"^(\s*)((?:[A-Za-z]:)?[^:]+?):(\d+)(?::(\d+))?")
+
+
+@lru_cache(maxsize=1)
+def permalink_roots(source, toplevel):
+    return Path(source).resolve(), Path(toplevel or source).resolve()
 
 
 def add_permalinks(text: str, a) -> str:
     """Append ' (<blob>/<path>#L<n>)' to file:line references (bead B5 text form)."""
     if not a.blob_base:
         return text
-    root = Path(a.source).resolve()
-    top = Path(a.toplevel or a.source).resolve()
+    root, top = permalink_roots(a.source, a.toplevel)
     blob = a.blob_base.rstrip("/")
     out = []
     for raw in text.splitlines(keepends=True):
@@ -6796,30 +6856,30 @@ def main() -> int:
         ap.add_argument("--" + name.replace("_", "-"), default="")
     a = ap.parse_args()
     if a.mode == "text":
-        raw = Path(a.raw).read_text(encoding="utf-8", errors="replace") if os.path.isfile(a.raw) else ""
-        text = restore_text(raw if a.no_suppress == "1" else suppress(raw, a.lang, a.helpers_dir), a)
+        lines = text_lines(a.raw)
+        if a.no_suppress != "1":
+            lines = suppress(lines, a.lang, a.helpers_dir)
         # The module's text is kept either way — a human still gets to see what
         # it printed — but counts are only scraped from text that proves it came
         # from a contract-v2 module. Exit 3 is the same signal the json mode
         # uses for a non-conforming document (#110).
-        conforming = a.require_marker != "1" or has_contract_v2_marker(text)
-        doc = summary_from_text(text, a)
-        text = add_permalinks(text, a)
-        Path(a.txt).write_text(text, encoding="utf-8")
+        with open(a.txt, "w", encoding="utf-8") as output:
+            doc, conforming = summary_from_text(render_text_lines(lines, output, a), a)
         if not conforming:
             return 3
-        apply_partial(doc, text)
         attach_metrics(doc, a.metrics_dir)
-        Path(a.json).write_text(json.dumps(doc), encoding="utf-8")
+        with open(a.json, "w", encoding="utf-8") as output:
+            json.dump(doc, output)
         return 0
     if a.mode == "json":
         doc = restore_json_file(a.json, a)
-        restore_json_file(a.findings, a)
+        restore_findings_file(a.findings, a)
         if not is_summary(doc):
             return 3
         doc["language"] = a.lang
         attach_metrics(doc, a.metrics_dir)
-        Path(a.json).write_text(json.dumps(doc), encoding="utf-8")
+        with open(a.json, "w", encoding="utf-8") as output:
+            json.dump(doc, output)
         return 0
     if a.mode == "sarif":
         restore_json_file(a.sarif, a)
@@ -6933,6 +6993,9 @@ run_lang(){
   start_ms="$(now_ms)"
   local MODULE_TIMED_OUT=0
   local MODULE_RUN_STATUS=0
+  # Bash's dynamic scoping makes run_module and the timeout error envelope
+  # use the same per-language budget, without changing concurrent jobs.
+  local UBS_MODULE_TIMEOUT="${MODULE_TIMEOUTS[$lang]:-$UBS_MODULE_TIMEOUT}"
   # run_lang always executes in a backgrounded subshell (see the dispatcher), so
   # exporting these for the module is isolated to this job. run_module launches
   # the module as a grandchild (via `timeout`), which inherits the environment.
@@ -7775,8 +7838,10 @@ fi
 [[ "$NUM_SLOTS" -gt "${#langs[@]}" ]] && NUM_SLOTS="${#langs[@]}"
 [[ "$NUM_SLOTS" -lt 1 ]] && NUM_SLOTS=1
 
-# Order languages longest-expected-first via cost model (Graham's LPT, bead C5)
-if [[ ${#langs[@]} -gt 1 ]] && need_cmd python3; then
+# Estimate every selected language, including a single-language project: its
+# scan can exceed 300s too. The same costs drive dispatch order and time bounds.
+declare -A MODULE_TIMEOUTS=()
+if need_cmd python3; then
   _sched_hdir="$(dirname "${BASH_SOURCE[0]}")/modules/helpers"
   [[ ! -d "$_sched_hdir" && -d "${MODULE_DIR:-}/helpers" ]] && _sched_hdir="${MODULE_DIR:-}/helpers"
   _sched_langs="$(IFS=,; echo "${langs[*]}")"
@@ -7786,6 +7851,13 @@ if [[ ${#langs[@]} -gt 1 ]] && need_cmd python3; then
     readarray -t _ordered_langs < <(jq -r '.ordered_langs[]' <<<"$_ordered_json" 2>/dev/null || true)
     if [[ ${#_ordered_langs[@]} -eq ${#langs[@]} ]]; then
       langs=("${_ordered_langs[@]}")
+    fi
+    if [[ "$UBS_MODULE_TIMEOUT_EXPLICIT" -eq 0 ]]; then
+      while IFS=$'\t' read -r _timeout_lang _timeout_secs; do
+        if [[ "$_timeout_secs" =~ ^[0-9]+$ && -n "${MODULE_PATHS[$_timeout_lang]:-}" ]]; then
+          MODULE_TIMEOUTS["$_timeout_lang"]="$_timeout_secs"
+        fi
+      done < <(jq -r '.timeouts | to_entries[] | [.key, .value] | @tsv' <<<"$_ordered_json" 2>/dev/null || true)
     fi
   fi
 fi

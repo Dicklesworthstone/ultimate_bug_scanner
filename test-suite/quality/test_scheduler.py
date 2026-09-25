@@ -19,8 +19,10 @@ import json
 import math
 import os
 import random
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -43,8 +45,10 @@ from ubs_core.scheduler import (  # noqa: E402
     ScheduleResult,
     brute_force_optimal_makespan,
     calculate_slot_utilization,
+    count_file_list,
     graham_theoretical_bound,
     order_languages_lpt,
+    module_timeout_seconds,
     schedule_lpt,
 )
 from ubs_core.shards import (  # noqa: E402
@@ -169,6 +173,43 @@ class CostModelTests(unittest.TestCase):
         ordered_names = [name for name, _ in ordered]
         self.assertEqual(ordered_names, ["python", "js", "bash", "rust"])
 
+    def test_automatic_timeout_tracks_cost_with_floor(self) -> None:
+        self.assertEqual(module_timeout_seconds(0), 300)
+        self.assertEqual(module_timeout_seconds(100_000), 300)
+        self.assertEqual(module_timeout_seconds(100_001), 301)
+        self.assertEqual(module_timeout_seconds(400_000), 1200)
+        for invalid in (float("inf"), float("nan"), -1):
+            self.assertEqual(module_timeout_seconds(invalid), 300)
+
+    def test_invalid_cost_models_fall_back_to_finite_estimates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = Path(tmp) / "model.json"
+            for data in ([], {"coefficients": []}, {"default": None},
+                         {"coefficients": {"python": {"a": "slow"}}},
+                         {"default": {"a": float("nan")}},
+                         {"coefficients": {"python": {"a": -1}}}):
+                with self.subTest(data=data):
+                    model.write_text(json.dumps(data), encoding="utf-8")
+                    estimate = CostModel.load(model).estimate_cost("python", 10)
+                    self.assertTrue(math.isfinite(estimate))
+                    self.assertGreater(estimate, 0)
+
+    def test_file_list_counts_preserve_filename_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = Path(tmp) / "python.files"
+            cases = (
+                (b"one.py\0two.py\0three.py\0", 3),
+                (b"line\nbreak.py\0invalid-\xff.py\0 space.py\0", 3),
+                (b"\0\0one.py\0\0two.py", 2),
+                (b"one.py\r\ntwo.py\n\nthree.py", 3),
+                (b"", 0),
+                (b"a" * 65535 + b"\n.py\0second.py\0", 2),
+            )
+            for content, expected in cases:
+                with self.subTest(content=content[:40]):
+                    paths.write_bytes(content)
+                    self.assertEqual(count_file_list(paths), expected)
+
 
 class SlotUtilizationTests(unittest.TestCase):
     """Test per-slot utilisation metric calculation."""
@@ -262,6 +303,32 @@ class SchedulerCLITests(unittest.TestCase):
         self.assertIn("makespan_estimate", data)
         self.assertIn("slot_utilization_estimate", data)
 
+    def test_nul_lists_drive_scheduling_and_large_project_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Previously each of these NUL lists was counted as one file.
+            (root / "python.files").write_bytes(b"".join(
+                f"source-{i}.py\0".encode() for i in range(3000)
+            ))
+            (root / "bash.files").write_bytes(b"first.sh\0second.sh\0")
+            (root / "cost.json").write_text(json.dumps({
+                "coefficients": {"python": {"a": 180, "b": 1500},
+                                 "bash": {"a": 120, "b": 1000}},
+            }), encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, "-m", "ubs_core.scheduler", "order",
+                 "--langs=bash,python", f"--files-dir={root}",
+                 f"--cost-model={root / 'cost.json'}", "--slots=2"],
+                capture_output=True, text=True, check=True,
+                env={**os.environ, "PYTHONPATH": str(HELPERS_DIR)},
+                timeout=CHILD_TIMEOUT_SECONDS,
+            )
+            data = json.loads(proc.stdout)
+            self.assertEqual(data["file_counts"], {"bash": 2, "python": 3000})
+            self.assertEqual(data["ordered_langs"], ["python", "bash"])
+            self.assertEqual(data["estimates"]["python"], 541500)
+            self.assertEqual(data["timeouts"], {"python": 1625, "bash": 300})
+
     def test_cli_profile_command(self) -> None:
         cmd = [
             sys.executable, "-m", "ubs_core.scheduler", "profile",
@@ -284,6 +351,71 @@ class SchedulerCLITests(unittest.TestCase):
 
 class E2ESchedulerIntegrationTests(unittest.TestCase):
     """Verify ./ubs execution profile outputs slots and slot_utilization."""
+
+    def test_runner_applies_language_budgets_and_explicit_overrides(self) -> None:
+        real_timeout = shutil.which("timeout") or shutil.which("gtimeout")
+        if real_timeout is None:
+            self.skipTest("timeout utility required to observe module time bounds")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            for index in range(4):
+                (source / f"source-{index}.py").write_text("answer = 42\n", encoding="utf-8")
+            (source / "run.sh").write_text("#!/bin/sh\nprintf '%s\\n' ok\n", encoding="utf-8")
+            model = root / "cost.json"
+            model.write_text(json.dumps({
+                "coefficients": {"python": {"a": 100000, "b": 0},
+                                 "bash": {"a": 1000, "b": 0}},
+            }), encoding="utf-8")
+            binary_dir = root / "bin"
+            binary_dir.mkdir()
+            recorder = binary_dir / "timeout"
+            # Observe real module launches, then delegate to the host utility.
+            # An injected timeout also proves the report uses the chosen budget.
+            recorder.write_text("""#!/usr/bin/env bash
+if [[ "$1" == "-k" && "$5" == *ubs-*.sh ]]; then
+  printf '%s\\t%s\\n' "${5##*/}" "$3" >> "$UBS_TEST_TIMEOUT_LOG"
+  if [[ "${UBS_TEST_EXPIRE:-0}" == 1 ]]; then exit 124; fi
+fi
+exec "$UBS_TEST_REAL_TIMEOUT" "$@"
+""", encoding="utf-8")
+            recorder.chmod(0o755)
+            env = {**os.environ, "PATH": str(binary_dir) + os.pathsep + os.environ.get("PATH", ""),
+                   "UBS_TEST_REAL_TIMEOUT": real_timeout, "UBS_COST_MODEL_PATH": str(model),
+                   "UBS_NO_AUTO_UPDATE": "1", "UBS_NO_CACHE": "1", "NO_COLOR": "1"}
+            env.pop("UBS_MODULE_TIMEOUT", None)
+            cases = (
+                ("single-auto", "python", None, False, {"ubs-python.sh": "1200s"}),
+                ("mixed-auto", "python,bash", None, False,
+                 {"ubs-python.sh": "1200s", "ubs-bash.sh": "300s"}),
+                ("override", "python,bash", "7", False,
+                 {"ubs-python.sh": "7s", "ubs-bash.sh": "7s"}),
+                ("disabled", "python", "0", False, {}),
+                ("timeout-envelope", "python", None, True, {"ubs-python.sh": "1200s"}),
+            )
+            for name, langs, override, expire, expected in cases:
+                with self.subTest(case=name):
+                    log = root / f"{name}.log"
+                    case_env = {**env, "UBS_TEST_TIMEOUT_LOG": str(log),
+                                "UBS_TEST_EXPIRE": str(int(expire))}
+                    if override is not None:
+                        case_env["UBS_MODULE_TIMEOUT"] = override
+                    proc = subprocess.run(
+                        [str(REPO_ROOT / "ubs"), str(source), f"--only={langs}",
+                         "--ci", "--format=json"],
+                        cwd=root, capture_output=True, text=True, env=case_env,
+                        timeout=CHILD_TIMEOUT_SECONDS,
+                    )
+                    self.assertEqual(proc.returncode, 2 if expire else 0,
+                                     f"stdout={proc.stdout}\nstderr={proc.stderr}")
+                    launches = dict(line.split("\t") for line in
+                                    log.read_text().splitlines()) if log.exists() else {}
+                    self.assertEqual(launches, expected)
+                    report = json.loads(proc.stdout)
+                    self.assertEqual(report["status"], "partial" if expire else "ok")
+                    if expire:
+                        self.assertEqual(report["scanners"][0]["module_timeout_secs"], 1200)
 
     def test_ubs_profile_json_contains_slots_and_utilization(self) -> None:
         cmd = [

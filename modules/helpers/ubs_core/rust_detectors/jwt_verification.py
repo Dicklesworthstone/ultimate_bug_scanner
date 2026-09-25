@@ -15,10 +15,12 @@ over up to 180; ``ubs:ignore`` on a line, the previous line, or the
 assembled statement suppresses it. Findings dedupe per (file, line) and
 keep file order.
 
-JWT decode calls are qualified by the crate name or resolved from file-level
-Rust use trees (including aliases and globs). Unrelated binary decoders and
-function declarations do not establish JWT use. This is lexical import
-resolution, not a Rust type checker or cross-file re-export analysis.
+JWT decoder calls are qualified by the crate name or resolved from scoped
+Rust use trees (including aliases and globs). Imports do not escape their
+module or block, and local declarations can shadow imported callables.
+Unrelated binary decoders and function declarations do not establish JWT
+use. This is lexical import resolution, not a Rust type checker or
+cross-file re-export analysis.
 
 The legacy UBS_RUST_FILE_LIST branch yielded entries unresolved and
 printed them as-is; ``find(files)`` therefore iterates the entries
@@ -28,9 +30,12 @@ is documentation-only: the orchestrator passes the already-filtered list.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.suppression import has_suppression_marker
 
 RULE_ID = "rust.security.jwt-verification"
@@ -50,14 +55,6 @@ DESCRIPTION = (
 skip_dirs = {".git", "target", ".cargo", "node_modules"}
 call_suffix = r"(?:\s*::\s*<[^>\n]+>)?\s*\("
 
-decode_only_re = re.compile(
-    r"\b(?:jsonwebtoken::)?dangerous::insecure_decode\s*"
-    + call_suffix
-    + r"|(?:^|[^\w:])insecure_decode\s*"
-    + call_suffix
-    + r"|\bdangerous_unsafe_decode\s*"
-    + call_suffix
-)
 signature_disabled_re = re.compile(r"\.insecure_disable_signature_validation\s*\(")
 claim_validation_disabled_re = re.compile(
     r"\bvalidate_(?:exp|aud)\s*(?::|=)\s*false\b"
@@ -300,8 +297,7 @@ def source_line(lines, line_no):
 def risky_jwt_statement(statement: str) -> bool:
     code = block_comment_re.sub(" ", mask_string_literals(statement))
     return bool(
-        decode_only_re.search(code)
-        or signature_disabled_re.search(code)
+        signature_disabled_re.search(code)
         or claim_validation_disabled_re.search(code)
     )
 
@@ -315,6 +311,8 @@ def imported_paths(source: str) -> Iterator[tuple[tuple[str, ...], str]]:
         tokens = iter(re.findall(r"[A-Za-z_][A-Za-z_0-9]*|::|[{},*]", statement[1]) + [","])
         for token in tokens:
             if token == "::":
+                if not path and not prefixes[-1]:
+                    path.append("")
                 continue
             if token == "as":
                 alias = next(tokens, None)
@@ -335,32 +333,194 @@ def imported_paths(source: str) -> Iterator[tuple[tuple[str, ...], str]]:
                 path.append(token)
 
 
-def jwt_decode_pattern(source: str) -> re.Pattern[str]:
-    source = mask_string_literals(source)
-    namespaces = {"jsonwebtoken"}
-    names: set[str] = set()
-    imports = list(imported_paths(source))
-    for alias in re.findall(r"\bextern\s+crate\s+jsonwebtoken\s+as\s+(\w+)\s*;", source):
-        namespaces.add(alias)
-    # Imports can refer to a crate alias declared later in the file. Each pass
-    # must add a namespace, so resolution is bounded by the number of imports.
-    for _ in range(len(imports) + 1):
-        before = len(namespaces)
-        for path, alias in imports:
-            if path[0] not in namespaces:
+_SCOPE_TOKEN_RE = re.compile(
+    r"(?P<use>\buse\s+[^;]+;)"
+    r"|(?P<extern>\bextern\s+crate\s+(?P<crate>\w+)(?:\s+as\s+(?P<alias>\w+))?\s*;)"
+    r"|\b(?P<kind>fn|mod|struct|enum|union|type|const|static)\s+(?P<item>\w+)"
+    r"|\blet\s+(?:(?:mut|ref)\s+)*(?P<local>\w+)"
+    r"|(?P<brace>[{};])"
+)
+_CALL_RE = re.compile(
+    r"(?<![\w:.])(?P<path>(?:::)?[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*)"
+    + call_suffix
+)
+_JWT_DECODERS = {
+    ("jsonwebtoken", "decode"): False,
+    ("jsonwebtoken", "dangerous_unsafe_decode"): True,
+    ("jsonwebtoken", "dangerous", "insecure_decode"): True,
+}
+
+
+@dataclass
+class _Scope:
+    start: int
+    end: int
+    parent: int | None = None
+    module: bool = False
+    imports: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    globs: list[tuple[str, ...]] = field(default_factory=list)
+    items: dict[str, int | None] = field(default_factory=dict)
+    values: set[str] = field(default_factory=set)
+    locals: dict[str, int] = field(default_factory=dict)
+
+
+class _JwtSymbols:
+    """Resolve callable names without letting one scope contaminate another.
+
+    Use items apply throughout their containing scope; let bindings apply only
+    after their initializer. Module boundaries stop lexical inheritance, with
+    explicit self/super/crate paths handled separately. Unknown local symbols
+    shadow imports instead of being treated as JWT evidence.
+    """
+
+    def __init__(self, source: str):
+        self.source = source
+        self.scopes = [_Scope(0, len(source), module=True)]
+        current = 0
+        pending: tuple[str, str, int] | None = None
+        for token in _SCOPE_TOKEN_RE.finditer(source):
+            scope = self.scopes[current]
+            if token["use"]:
+                for path, alias in imported_paths(token["use"]):
+                    if alias == "*":
+                        scope.globs.append(path[:-1])
+                    else:
+                        scope.imports[alias] = path
+            elif token["extern"]:
+                scope.imports[token["alias"] or token["crate"]] = ("", token["crate"])
+            elif token["kind"]:
+                if token["kind"] in {"mod", "struct", "enum", "union", "type"}:
+                    scope.items[token["item"]] = None
+                if token["kind"] in {"fn", "struct", "const", "static"}:
+                    scope.values.add(token["item"])
+                pending = (token["kind"], token["item"], token.end())
+            elif token["local"]:
+                # Do not hide a real decode in `let decode = decode(...)`.
+                depth = 0
+                end = token.end()
+                for end in range(end, len(source)):
+                    char = source[end]
+                    if char in "([{":
+                        depth += 1
+                    elif char in ")]}":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    elif char == ";" and depth == 0:
+                        break
+                scope.locals.setdefault(token["local"], end + 1)
+            elif token["brace"] == "{":
+                child = _Scope(token.end(), len(source), current,
+                               module=bool(pending and pending[0] == "mod"))
+                if pending and pending[0] == "mod":
+                    scope.items[pending[1]] = len(self.scopes)
+                elif pending and pending[0] == "fn":
+                    header = source[pending[2]:token.start()]
+                    start = header.find("(")
+                    depth = 0
+                    end = start
+                    for end in range(max(0, start), len(header)):
+                        if header[end] == "(":
+                            depth += 1
+                        elif header[end] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                    parameters = header[start + 1:end] if start >= 0 else ""
+                    for name in re.findall(r"(?:^|,)\s*(?:mut\s+)?(\w+)\s*:", parameters):
+                        child.locals[name] = child.start
+                self.scopes.append(child)
+                current = len(self.scopes) - 1
+                pending = None
+            elif token["brace"] == "}":
+                scope.end = token.start()
+                current = scope.parent if scope.parent is not None else 0
+                pending = None
+            elif token["brace"] == ";":
+                pending = None
+        self.starts = [scope.start for scope in self.scopes]
+
+    def scope_at(self, offset: int) -> int:
+        index = bisect_right(self.starts, offset) - 1
+        while self.scopes[index].end <= offset and self.scopes[index].parent is not None:
+            index = self.scopes[index].parent
+        return index
+
+    def _module(self, scope: int) -> int:
+        while not self.scopes[scope].module:
+            scope = self.scopes[scope].parent or 0
+        return scope
+
+    def _lookup(self, name: str, scope: int, offset: int,
+                seen: frozenset[tuple[int, str, bool]], *,
+                namespace: bool = False) -> tuple[str, ...] | int | None:
+        key = (scope, name, namespace)
+        if key in seen or len(seen) >= 100:
+            return None
+        seen = seen | {key}
+        local = self.scopes[scope]
+        if not namespace and (local.locals.get(name, len(self.source) + 1) <= offset
+                              or name in local.values):
+            return None
+        if namespace and name in local.items:
+            return local.items[name]
+        if name in local.imports:
+            path = local.imports[name]
+            if path == ("jsonwebtoken",):
+                return path
+            return self._resolve(path, scope, offset, seen, namespace=namespace)
+        for path in local.globs:
+            target = self._resolve(path, scope, offset, seen, namespace=True)
+            if isinstance(target, tuple):
+                result = target + (name,)
+                if result in _JWT_DECODERS or result == ("jsonwebtoken", "dangerous"):
+                    return result
+            elif isinstance(target, int):
+                result = self._lookup(name, target, offset, seen, namespace=namespace)
+                if result is not None:
+                    return result
+        if local.parent is not None and not local.module:
+            return self._lookup(name, local.parent, offset, seen, namespace=namespace)
+        return ("jsonwebtoken",) if name == "jsonwebtoken" else None
+
+    def _resolve(self, path: tuple[str, ...], scope: int, offset: int,
+                 seen: frozenset[tuple[int, str, bool]], *,
+                 namespace: bool = False) -> tuple[str, ...] | int | None:
+        if not path:
+            return None
+        if path[0] == "":
+            return path[1:] if len(path) > 1 and path[1] == "jsonwebtoken" else None
+        if path[0] in {"crate", "self", "super"}:
+            scope = 0 if path[0] == "crate" else self._module(scope)
+            while path and path[0] in {"crate", "self", "super"}:
+                if path[0] == "super":
+                    parent = self.scopes[scope].parent
+                    if parent is None:
+                        return None
+                    scope = self._module(parent)
+                path = path[1:]
+            if not path:
+                return scope
+        resolved = self._lookup(path[0], scope, offset, seen,
+                                namespace=namespace or len(path) > 1)
+        for index, name in enumerate(path[1:], start=1):
+            if isinstance(resolved, tuple):
+                resolved += (name,)
+            elif isinstance(resolved, int):
+                resolved = self._lookup(name, resolved, offset, seen,
+                                        namespace=namespace or index < len(path) - 1)
+            else:
+                return None
+        return resolved
+
+    def calls(self) -> Iterator[tuple[re.Match[str], bool]]:
+        for call in _CALL_RE.finditer(self.source):
+            if re.search(r"\bfn\s*$", self.source[max(0, call.start() - 8):call.start()]):
                 continue
-            if len(path) == 1:
-                namespaces.add(alias)
-            elif len(path) == 2 and path[1] == "decode":
-                names.add(alias)
-            elif len(path) == 2 and path[1] == "*":
-                names.add("decode")
-        if len(namespaces) == before:
-            break
-    qualified = "|".join(re.escape(name) for name in sorted(namespaces))
-    alternatives = [rf"(?:::)?(?:{qualified})\s*::\s*decode"]
-    alternatives.extend(re.escape(name) for name in sorted(names))
-    return re.compile(r"(?<![\w:.])(?:" + "|".join(alternatives) + ")" + call_suffix)
+            path = tuple(re.split(r"\s*::\s*", call["path"]))
+            resolved = self._resolve(path, self.scope_at(call.start()), call.start(), frozenset())
+            if resolved in _JWT_DECODERS:
+                yield call, _JWT_DECODERS[resolved]
 
 
 def jwt_decode_call(code: str, pattern: re.Pattern[str]) -> re.Match[str] | None:
@@ -368,16 +528,6 @@ def jwt_decode_call(code: str, pattern: re.Pattern[str]) -> re.Match[str] | None
         if not re.search(r"\bfn\s*$", code[:match.start()]):
             return match
     return None
-
-
-def line_has_jwt_candidate(line: str, pattern: re.Pattern[str]) -> bool:
-    code = block_comment_re.sub(" ", mask_string_literals(line))
-    return bool(
-        decode_only_re.search(code)
-        or signature_disabled_re.search(code)
-        or claim_validation_disabled_re.search(code)
-        or jwt_decode_call(code, pattern)
-    )
 
 
 def lacks_claim_binding(context: str) -> bool:
@@ -427,23 +577,32 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
             continue
         source_lines = text.splitlines()
         scan_lines = mask_block_comments_preserve_lines(text).splitlines()
-        decode_pattern = jwt_decode_pattern("\n".join(strip_line_comments(line) for line in scan_lines))
+        masked = strip_comments_and_strings(text, lang="rust")
+        line_starts = [0] + [match.end() for match in re.finditer("\n", masked)]
+        calls_by_line: dict[int, list[tuple[re.Pattern[str], bool]]] = {}
+        for call, insecure in _JwtSymbols(masked).calls():
+            line = bisect_right(line_starts, call.start())
+            path_pattern = r"\s*::\s*".join(re.escape(part) for part in
+                                            re.split(r"\s*::\s*", call["path"]))
+            pattern = re.compile(r"(?<![\w:.])" + path_pattern + call_suffix)
+            calls_by_line.setdefault(line, []).append((pattern, insecure))
         seen = set()
         for line_no, raw in enumerate(scan_lines, start=1):
             if has_ignore(source_lines, line_no):
                 continue
             stripped = strip_line_comments(raw).strip()
-            if not stripped or not line_has_jwt_candidate(stripped, decode_pattern):
+            calls = calls_by_line.get(line_no, [])
+            if not stripped or not (calls or risky_jwt_statement(stripped)):
                 continue
             statement = statement_from(scan_lines, line_no)
             if not statement or has_suppression_marker(statement, RULE_ID):
                 continue
             context = function_context(scan_lines, line_no)
-            binding_context = binding_context_for_decode(statement, context, decode_pattern)
-            code = block_comment_re.sub(" ", mask_string_literals(statement))
             if not (
                 risky_jwt_statement(statement)
-                or (jwt_decode_call(code, decode_pattern) and lacks_claim_binding(binding_context))
+                or any(insecure or lacks_claim_binding(binding_context_for_decode(
+                    statement, context, pattern,
+                )) for pattern, insecure in calls)
             ):
                 continue
             key = (str(rust_file), line_no)

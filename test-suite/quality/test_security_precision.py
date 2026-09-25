@@ -1365,6 +1365,7 @@ class RustJwtDecoderIdentityTests(unittest.TestCase):
             ("extern crate jsonwebtoken as jwt;", "jwt::decode"),
             ("use jsonwebtoken::*;", "decode"),
             ("use jsonwebtoken as jwt; use jwt::decode as parse_token;", "parse_token"),
+            ("use ::jsonwebtoken::{decode as parse_token};", "parse_token"),
         ]
         for imports, call in cases:
             with self.subTest(imports=imports, call=call):
@@ -1396,10 +1397,112 @@ class RustJwtDecoderIdentityTests(unittest.TestCase):
             "mod binary { fn decode(bytes: &[u8]) {} }\n"
         ), [])
 
+    def test_imports_do_not_escape_their_rust_scope(self) -> None:
+        cases = [
+            "mod auth { use jsonwebtoken::decode; }\n"
+            "mod binary {\n"
+            "    fn decode(bytes: &[u8]) {}\n"
+            "    fn run(bytes: &[u8]) { decode(bytes); }\n"
+            "}\n",
+            "fn auth(token: &str) { use jsonwebtoken::decode; }\n"
+            "fn decode(bytes: &[u8]) {}\n"
+            "fn binary(bytes: &[u8]) { decode(bytes); }\n",
+            "use jsonwebtoken::decode;\n"
+            "mod binary {\n"
+            "    fn decode(bytes: &[u8]) {}\n"
+            "    fn run(bytes: &[u8]) { decode(bytes); }\n"
+            "}\n",
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(self.hits(source), [])
+
+    def test_local_bindings_shadow_imports_only_in_their_scope(self) -> None:
+        source = (
+            "use jsonwebtoken::decode;\n"
+            "fn auth(token: &str, key: &DecodingKey) {\n"
+            "    decode::<Claims>(token, key, &Validation::default());\n"
+            "    {\n"
+            "        let decode = |bytes: &[u8]| bytes.len();\n"
+            "        decode(b\"binary\");\n"
+            "    }\n"
+            "    decode::<Claims>(token, key, &Validation::default());\n"
+            "}\n"
+            "fn binary(decode: fn(&[u8]), bytes: &[u8]) { decode(bytes); }\n"
+        )
+        self.assertEqual(self.hits(source), [3, 8])
+
+    def test_value_bindings_do_not_hide_crate_namespaces_or_initializers(self) -> None:
+        self.assertEqual(self.hits(
+            "use jsonwebtoken::{self as jwt, decode};\n"
+            "fn auth(token: &str, key: &DecodingKey) {\n"
+            "    let jwt = 7;\n"
+            "    jwt::decode::<Claims>(token, key, &Validation::default());\n"
+            "    let decode = decode::<Claims>(token, key, &Validation::default());\n"
+            "}\n"
+        ), [4, 5])
+
+    def test_local_module_names_do_not_impersonate_external_crates(self) -> None:
+        self.assertEqual(self.hits(
+            "mod jsonwebtoken { pub fn decode(bytes: &[u8]) {} }\n"
+            "fn binary(bytes: &[u8]) { jsonwebtoken::decode(bytes); }\n"
+            "use ::jsonwebtoken::decode as parse_token;\n"
+            "fn auth(token: &str, key: &DecodingKey) {\n"
+            "    parse_token::<Claims>(token, key, &Validation::default());\n"
+            "}\n"
+        ), [5])
+
+    def test_unsafe_decoder_names_require_jwt_identity(self) -> None:
+        self.assertEqual(self.hits(
+            "fn insecure_decode(bytes: &[u8]) {}\n"
+            "fn dangerous_unsafe_decode(bytes: &[u8]) {}\n"
+            "fn run(bytes: &[u8]) {\n"
+            "    insecure_decode(bytes);\n"
+            "    dangerous_unsafe_decode(bytes);\n"
+            "    binary::dangerous::insecure_decode(bytes);\n"
+            "}\n"
+        ), [])
+
+    def test_unsafe_jwt_decoder_aliases_and_globs_still_report(self) -> None:
+        cases = [
+            ("", "jsonwebtoken::dangerous::insecure_decode"),
+            ("use jsonwebtoken::dangerous::insecure_decode as parse;", "parse"),
+            ("use jsonwebtoken::{dangerous::{insecure_decode as parse}};", "parse"),
+            ("use jsonwebtoken::dangerous as unchecked;", "unchecked::insecure_decode"),
+            ("use jsonwebtoken::dangerous::*;", "insecure_decode"),
+            ("use jsonwebtoken::dangerous_unsafe_decode as parse;", "parse"),
+            ("use jsonwebtoken::*;", "dangerous_unsafe_decode"),
+            ("extern crate jsonwebtoken as jwt; use jwt::dangerous as unchecked;", "unchecked::insecure_decode"),
+        ]
+        for imports, call in cases:
+            with self.subTest(imports=imports, call=call):
+                self.assertEqual(self.hits(
+                    imports + "\n"
+                    "fn auth(token: &str) {\n"
+                    f"    {call}::<Claims>(token);\n"
+                    "}\n"
+                ), [3])
+
+    def test_nested_module_explicit_imports_keep_jwt_identity(self) -> None:
+        source = (
+            "use jsonwebtoken as jwt;\n"
+            "mod auth {\n"
+            "    use super::jwt::{decode as verify, dangerous::insecure_decode as parse};\n"
+            "    fn run(token: &str, key: &DecodingKey) {\n"
+            "        verify::<Claims>(token, key, &jwt::Validation::default());\n"
+            "        parse::<Claims>(token);\n"
+            "    }\n"
+            "}\n"
+        )
+        self.assertEqual(self.hits(source), [5, 6])
+
     def test_original_jwt_security_fixtures_remain_classified(self) -> None:
         rust = REPO_ROOT / "test-suite" / "rust"
         self.assertEqual(list(jwt_verification.find([rust / "clean/jwt_verification.rs"])), [])
-        self.assertGreaterEqual(len(list(jwt_verification.find([rust / "buggy/jwt_verification.rs"]))), 6)
+        self.assertEqual(
+            [line for _, line, _, _ in jwt_verification.find([rust / "buggy/jwt_verification.rs"])],
+            [11, 15, 23, 24, 32, 33, 41, 44, 52, 65],
+        )
 
 
 def expected_lines(path: Path, marker: str) -> list[int]:

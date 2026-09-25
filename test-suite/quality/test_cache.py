@@ -199,6 +199,211 @@ class IncrementalCacheTests(unittest.TestCase):
         except ValueError as exc:
             self.fail(f"Invalid JSON: {exc}\n{context}\nJSON payload:\n{payload}")
 
+    def _assert_js_warning_mode_cache_order(self, first_strict: bool, case_id: str) -> None:
+        from ubs_core.js_rules import generate
+
+        # Freeze helper sources so simultaneous development cannot invalidate
+        # the cache between the cold scan and the replay being checked.
+        helpers, run_env = self._copy_helpers()
+        rules = self.test_root / "js-rules"
+        generate(rules)
+        source = self.project_dir / "async.js"
+        source.write_text(
+            "async function run(tasks) { await Promise.all(tasks); }\n",
+            encoding="utf-8",
+        )
+        before = source.read_bytes()
+        evidence: list[dict[str, Any]] = []
+
+        def scan(label: str, strict: bool, *, uncached: bool = False):
+            sink = self.test_root / f"{label}.ndjson"
+            summary = self.test_root / f"{label}.json"
+            env = dict(run_env)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            if uncached:
+                env[ENV_NO_CACHE] = "1"
+            command = [
+                sys.executable, "-m", "ubs_core.js_scan", "--sink", str(sink),
+                "--json-out", str(summary), "--project-dir", str(self.project_dir),
+                "--ast-rule-dir", str(rules),
+            ]
+            if strict:
+                command.append("--fail-on-warning")
+            proc = subprocess.run(
+                command, input=str(source) + "\0", capture_output=True, text=True,
+                cwd=helpers, env=env, timeout=120,
+            )
+            context = f"{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            entry = {"label": label, "strict": strict, "uncached": uncached,
+                     "exit": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+            evidence.append(entry)
+            self.assertIn(proc.returncode, (0, 1), context)
+            self.assertTrue(summary.is_file(), context)
+            doc = self._decode_json(summary.read_text(encoding="utf-8"), context)
+            entry["summary"] = doc
+            context += "\nsummary:\n" + json.dumps(doc, indent=2)
+            self.assertEqual(doc["status"], "ok", context)
+            self.assertEqual(doc["files"], 1, context)
+            self.assertEqual(proc.returncode, int(strict), context)
+            self.assertEqual((doc["critical"], doc["warning"], doc["info"]),
+                             (0, int(strict), 2 - int(strict)), context)
+            self.assertEqual(
+                {(rec["rule"], rec["severity"]) for rec in doc["findings"]},
+                {("js.async.promiseall-no-try", "warning" if strict else "info"),
+                 ("js.async.await-no-try", "info")}, context,
+            )
+            records = [self._decode_json(line, context)
+                       for line in sink.read_text(encoding="utf-8").splitlines() if line.strip()]
+            # ast-grep can report different rules in either order. Compare
+            # complete records without making its scheduling part of parity.
+            canonical = lambda recs: sorted(json.dumps(rec, sort_keys=True) for rec in recs)
+            self.assertEqual(canonical(records), canonical(doc["findings"]), context)
+            self.assertEqual(source.read_bytes(), before, "only scan mode may change")
+            return proc.returncode, canonical(records), doc["profile"], context
+
+        def compare(actual, expected, hits: int) -> None:
+            context = actual[3]
+            self.assertEqual(actual[:2], expected[:2], context)
+            self.assertEqual(actual[2]["cache_hits"], hits, context)
+            self.assertEqual(actual[2]["cache_misses"], 1 - hits, context)
+
+        try:
+            oracles = {strict: scan(f"oracle-{strict}", strict, uncached=True)
+                       for strict in (False, True)}
+            second_strict = not first_strict
+            compare(scan("first-cold", first_strict), oracles[first_strict], 0)
+            compare(scan("first-warm", first_strict), oracles[first_strict], 1)
+            compare(scan("changed-mode", second_strict), oracles[second_strict], 0)
+            compare(scan("changed-mode-warm", second_strict), oracles[second_strict], 1)
+            compare(scan("original-mode-warm", first_strict), oracles[first_strict], 1)
+        finally:
+            record_artifact(case_id, {"scans": evidence})
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "requires real ast-grep")
+    def test_js_strict_scan_cannot_replay_non_strict_async_severities(self) -> None:
+        case_id = "cache-js-loose-to-strict"
+        self._run_with_logging(
+            case_id, lambda: self._assert_js_warning_mode_cache_order(False, case_id),
+        )
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "requires real ast-grep")
+    def test_js_non_strict_scan_cannot_replay_strict_async_severities(self) -> None:
+        case_id = "cache-js-strict-to-loose"
+        self._run_with_logging(
+            case_id, lambda: self._assert_js_warning_mode_cache_order(True, case_id),
+        )
+
+    def _js_pattern_selection(
+        self, helpers: Path, run_env: dict[str, str], files: list[Path],
+        hits: int, label: str, skip: str = "",
+    ) -> list[dict]:
+        def scan(uncached: bool):
+            sink = self.test_root / "js-patterns.ndjson"
+            summary = self.test_root / "js-patterns.json"
+            report = self.test_root / "js-patterns.txt"
+            env = dict(run_env)
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            if uncached:
+                env[ENV_NO_CACHE] = "1"
+            proc = subprocess.run(
+                [sys.executable, "-m", "ubs_core.js_scan", "--sink", str(sink),
+                 "--json-out", str(summary), "--text-out", str(report),
+                 "--project-dir", str(self.project_dir), "--fail-on-warning", "--skip", skip],
+                input="\0".join(map(str, files)), capture_output=True, text=True,
+                cwd=helpers, env=env, timeout=120,
+            )
+            context = f"{label} uncached={uncached}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            self.assertIn(proc.returncode, (0, 1), context)
+            self.assertTrue(summary.is_file(), context)
+            doc = self._decode_json(summary.read_text(encoding="utf-8"), context)
+            context += "\nsummary:\n" + json.dumps(doc, indent=2)
+            self.assertEqual(doc["status"], "ok", context)
+            self.assertEqual(doc["files"], len(files), context)
+            self.assertEqual(proc.returncode, int(doc["critical"] + doc["warning"] > 0), context)
+            for path in (sink, summary, report):
+                self.assertNotIn("_ubs_js_pattern", path.read_text(encoding="utf-8"), context)
+            records = doc["findings"]
+            for severity in ("critical", "warning", "info"):
+                self.assertEqual(doc[severity], sum(rec["severity"] == severity for rec in records), context)
+            self.assertEqual(
+                [self._decode_json(line, context) for line in sink.read_text(encoding="utf-8").splitlines()],
+                records, context,
+            )
+            return proc.returncode, records, doc["profile"], context
+
+        actual = scan(False)
+        expected = scan(True)
+        self.assertEqual(actual[:2], expected[:2], actual[3] + "\nUncached oracle:\n" + expected[3])
+        self.assertEqual(actual[2]["cache_hits"], hits, actual[3])
+        self.assertEqual(actual[2]["cache_misses"], len(files) - hits, actual[3])
+        return actual[1]
+
+    def test_js_pattern_thresholds_reconcile_selected_cached_matches(self) -> None:
+        def check_scenario() -> None:
+            helpers, env = self._copy_helpers()
+            a, b, c = [self.project_dir / name for name in ("a.js", "b.js", "c.js")]
+            lengths = {a: 20, b: 1, c: 30}
+            for path, count in lengths.items():
+                path.write_text("console.log(value);\n" * count, encoding="utf-8")
+
+            def check(files: list[Path], hits: int, severity: str | None, label: str) -> None:
+                records = self._js_pattern_selection(helpers, env, files, hits, label)
+                expected = [("js.debug.console", str(path), line, severity)
+                            for path in files for line in range(1, lengths[path] + 1)] if severity else []
+                self.assertEqual([(r["rule"], r["path"], r["line"], r["severity"]) for r in records],
+                                 expected, label)
+
+            check([a], 0, None, "prime silent 20")
+            check([b], 0, None, "prime silent 1")
+            check([c], 0, "info", "prime info 30")
+            check([a, b, c], 3, "warning", "51 cached")
+            check([a], 1, None, "20 cached")
+            check([a, b], 2, "info", "21 cached")
+            check([a, c], 2, "info", "50 cached")
+            lengths[c] = 29
+            c.write_text("console.log(value);\n" * lengths[c], encoding="utf-8")
+            check([a, b, c], 2, "info", "50 partial")
+            lengths[c] = 31
+            c.write_text("console.log(value);\n" * lengths[c], encoding="utf-8")
+            check([a, b, c], 2, "warning", "52 partial")
+            check([a, b, c], 3, "warning", "52 warm")
+            for hits in (0, 3):
+                self.assertEqual(self._js_pattern_selection(helpers, env, [a, b, c], hits,
+                                                            "skip debug", "11"), [])
+
+        self._run_with_logging("cache-js-pattern-thresholds", check_scenario)
+
+    def test_js_pattern_gates_and_suppressors_follow_selected_cached_files(self) -> None:
+        def check_scenario() -> None:
+            helpers, env = self._copy_helpers()
+            body, gate, parser = [self.project_dir / name for name in ("body.js", "gate.js", "parser.js")]
+            body.write_text("const value = req.body;\n", encoding="utf-8")
+            gate.write_text('import express from "express";\n', encoding="utf-8")
+            parser.write_text("app.use(express.json());\n", encoding="utf-8")
+
+            def check(files: list[Path], hits: int, warning: bool, label: str) -> None:
+                records = self._js_pattern_selection(helpers, env, files, hits, label)
+                expected = {(rule, str(body), 1, "warning") for rule in (
+                    "js.node.express-body-no-parser", "js.node.express-body-no-validation",
+                )} if warning else set()
+                self.assertEqual({(r["rule"], r["path"], r["line"], r["severity"]) for r in records},
+                                 expected, label)
+
+            check([body], 0, False, "body without framework")
+            check([gate], 0, False, "framework without body")
+            check([parser], 0, False, "parser without body")
+            check([body, gate], 2, True, "cached framework enables warning")
+            check([body, gate, parser], 3, False, "cached parser suppresses warning")
+            check([body, gate], 2, True, "removing parser restores warning")
+            check([body], 1, False, "removing framework removes warning")
+            parser.write_text("const ready = true;\n", encoding="utf-8")
+            check([body, gate, parser], 2, True, "edited parser restores warning")
+            parser.write_text("app.use(express.urlencoded({ extended: true }));\n", encoding="utf-8")
+            check([body, gate, parser], 2, False, "edited parser suppresses warning")
+            check([body, gate, parser], 3, False, "edited parser warm")
+
+        self._run_with_logging("cache-js-pattern-context", check_scenario)
+
     def _python_pattern_selection(
         self, files: list[Path], cache_dir: Path, hits: int, label: str, skip: str = "",
     ) -> tuple[bytes, dict, list[dict]]:

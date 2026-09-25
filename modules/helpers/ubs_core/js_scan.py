@@ -35,6 +35,7 @@ from ubs_core.registry import RunContext
 from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
+_PATTERN_CACHE_KIND = "_ubs_js_pattern"
 
 _CATEGORY_SLUGS = {
     1: "null-undefined", 2: "equality", 3: "proto-object", 4: "type-coercion",
@@ -156,6 +157,8 @@ def scan_patterns(
     sink,
     skip: set[int],
     prefilter: Any = None,
+    *,
+    defer_global_checks: bool = False,
 ) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
@@ -168,6 +171,9 @@ def scan_patterns(
     suppress_when_regex go silent when any file satisfies it.
 
     Returns severity counters ({"critical": n, "warning": n, "info": n}).
+    The cache-backed path retains source-local matches and condition facts
+    with ``defer_global_checks``; selected-input reconciliation sets their
+    severity only after combining cached and freshly scanned files.
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
     active = [p for p in patterns if p.category not in skip]
@@ -180,14 +186,29 @@ def scan_patterns(
         except OSError:
             continue
     for pattern in active:
-        if pattern.gate_regex is not None and not any(
-            pattern.gate_regex.search(text) for text in texts.values()
-        ):
-            continue
-        if pattern.suppress_when_regex is not None and any(
-            pattern.suppress_when_regex.search(text) for text in texts.values()
-        ):
-            continue
+        if defer_global_checks:
+            if pattern.gate_regex is not None or pattern.suppress_when_regex is not None:
+                # A file with no candidate match can still enable or suppress
+                # another file's findings. Retain its context independently.
+                for path, text in texts.items():
+                    sink.write(json.dumps({
+                        "rule": pattern.rule_id,
+                        "path": str(path),
+                        _PATTERN_CACHE_KIND: "context",
+                        "gate": bool(pattern.gate_regex is not None
+                                     and pattern.gate_regex.search(text)),
+                        "suppress": bool(pattern.suppress_when_regex is not None
+                                         and pattern.suppress_when_regex.search(text)),
+                    }, ensure_ascii=False) + "\n")
+        else:
+            if pattern.gate_regex is not None and not any(
+                pattern.gate_regex.search(text) for text in texts.values()
+            ):
+                continue
+            if pattern.suppress_when_regex is not None and any(
+                pattern.suppress_when_regex.search(text) for text in texts.values()
+            ):
+                continue
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
@@ -201,12 +222,13 @@ def scan_patterns(
                 hits.append((path, line_no, line_text))
         if not hits:
             continue
-        severity = resolve_severity(pattern, len(hits))
-        if severity is None:
+        severity = None if defer_global_checks else resolve_severity(pattern, len(hits))
+        if severity is None and not defer_global_checks:
             continue
-        counters[severity] = counters.get(severity, 0) + len(hits)
+        if severity is not None:
+            counters[severity] = counters.get(severity, 0) + len(hits)
         for path, line_no, line_text in hits:
-            sink.write(json.dumps({
+            record = {
                 "rule": pattern.rule_id,
                 "category_id": f"js.{slug_for_category(pattern.category)}",
                 "path": str(path),
@@ -215,8 +237,59 @@ def scan_patterns(
                 "severity": severity,
                 "message": f"{pattern.title} — {line_text}",
                 "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+            }
+            if defer_global_checks:
+                record[_PATTERN_CACHE_KIND] = "match"
+            sink.write(json.dumps(record, ensure_ascii=False) + "\n")
     return counters
+
+
+def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dict]) -> list[dict]:
+    """Evaluate pattern thresholds and conditions for this complete selection.
+
+    Cache source-local facts, including currently silent matches, rather than
+    another invocation's final decision. Other analysis layers pass through.
+    """
+    pattern_by_id = {pattern.rule_id: pattern for pattern in patterns}
+    counts: dict[str, int] = {}
+    gates: set[str] = set()
+    suppressors: set[str] = set()
+    for record in records:
+        rule = record.get("rule", "")
+        kind = record.get(_PATTERN_CACHE_KIND)
+        if kind == "context":
+            if record.get("gate"):
+                gates.add(rule)
+            if record.get("suppress"):
+                suppressors.add(rule)
+        elif kind == "match":
+            counts[rule] = counts.get(rule, 0) + 1
+
+    severities: dict[str, str | None] = {}
+    for rule, count in counts.items():
+        pattern = pattern_by_id.get(rule)
+        if pattern is None:
+            continue
+        if pattern.gate_regex is not None and rule not in gates:
+            continue
+        if pattern.suppress_when_regex is not None and rule in suppressors:
+            continue
+        severities[rule] = resolve_severity(pattern, count)
+
+    result: list[dict] = []
+    for record in records:
+        kind = record.get(_PATTERN_CACHE_KIND)
+        if kind == "context":
+            continue
+        if kind == "match":
+            severity = severities.get(record.get("rule", ""))
+            if severity is None:
+                continue
+            record = dict(record)
+            record.pop(_PATTERN_CACHE_KIND)
+            record["severity"] = severity
+        result.append(record)
+    return result
 
 
 
@@ -404,6 +477,10 @@ def main(argv: list[str] | None = None) -> int:
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
+        # Async AST findings are calibrated to info in non-strict mode.
+        # Replaying those records in a strict scan would suppress its warning
+        # exit; the reverse transition would retain inflated severities.
+        extra=f"fail_on_warning={args.fail_on_warning}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
 
@@ -440,7 +517,8 @@ def main(argv: list[str] | None = None) -> int:
         prefilter_res = run_prefilter(files_to_scan, prefilter_index)
 
         capturing_sink = CapturingSink()
-        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip,
+                                 prefilter=prefilter_res, defer_global_checks=True)
         run_analyzers(files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         if args.ast_rule_dir:
             from ubs_core.js_ast import scan_all
@@ -505,14 +583,18 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
+    all_recs: list[dict] = []
+    for f in files:
+        recs = cached_findings.get(f)
+        if recs is None and capturing_sink is not None:
+            recs = capturing_sink.get_for_file(f)
+        if recs:
+            all_recs.extend(recs)
+    all_recs = reconcile_pattern_records(patterns, all_recs)
+
     with open(args.sink, "w", encoding="utf-8") as sink_file:
-        for f in files:
-            recs = cached_findings.get(f)
-            if recs is None and capturing_sink is not None:
-                recs = capturing_sink.get_for_file(f)
-            if recs:
-                for r in recs:
-                    sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+        for r in all_recs:
+            sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)

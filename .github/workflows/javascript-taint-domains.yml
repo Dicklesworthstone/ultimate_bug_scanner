@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   validate-candidate:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     # Only publish content-addressed blobs. Never change refs, branches or tags.
     permissions:
@@ -30,45 +30,51 @@ jobs:
         run: |
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = cee7dd2b3c454022027f789688409366c22a8aa6
           echo "JS_TAINT_BASE $(git rev-parse HEAD)"
-          if python3 test-suite/js/test_taint_domains.py > "$RUNNER_TEMP/js-before.log" 2>&1; then
+          if python3 test-suite/js/test_taint_domains.py \
+            JavaScriptTaintDomainTests.test_html_escape_does_not_sanitize_other_sink_domains \
+            JavaScriptTaintDomainTests.test_template_interpolations_are_executable_input \
+            > "$RUNNER_TEMP/js-before.log" 2>&1; then
             cat "$RUNNER_TEMP/js-before.log"
             echo 'The candidate base no longer reproduces the defects.' >&2
             exit 1
           fi
           cat "$RUNNER_TEMP/js-before.log"
-          grep -q 'FAILED (failures=22)' "$RUNNER_TEMP/js-before.log"
+          grep -q 'FAILED (failures=5)' "$RUNNER_TEMP/js-before.log"
       - name: Apply reviewed implementation and regenerate integrity chain
         run: |
           git apply --check test-suite/patches/javascript-taint-domains.patch
           git apply test-suite/patches/javascript-taint-domains.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 31fd7f879de3bf4badc4ab394a31b5215b621678
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --check
       - name: Validate source regressions
-        run: |
-          python3 test-suite/js/test_taint_domains.py
-          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+        run: python3 test-suite/js/test_taint_domains.py
       - name: Install end-to-end dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
+      - name: Run existing JavaScript quality tests
+        run: python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
       - name: Validate real scanner findings and clean controls
         run: |
           python3 - <<'PY'
           import json
-          import os
           import subprocess
           import tempfile
           from pathlib import Path
           root = Path.cwd()
           cases = [
-              ('eval-domain', 'eval(DOMPurify.sanitize(req.query.value));', 'javascript.taint.eval'),
-              ('sql-bindings', 'db.query(req.query.sql, [req.query.id]);', 'javascript.taint.sql'),
-              ('html-clean', 'const clean = DOMPurify.sanitize(req.query.value);\nres.send(clean);', None),
+              ('eval-domain', 'eval(DOMPurify.sanitize(req.query.value));', {'js.taint.eval'}, set()),
+              ('sql-bindings', 'db.query(req.query.sql, [req.query.id]);', {'js.taint.sql'}, set()),
+              ('template-command', 'const cmd = `echo ${req.query.value}`;\nshell.exec(cmd);', {'js.taint.command'}, set()),
+              ('multiline-html', 'document.write(\n req.query.html\n);', {'js.taint.xss'}, set()),
+              ('html-clean', 'const clean = DOMPurify.sanitize(req.query.value);\nres.send(clean);', set(), {'js.taint.xss'}),
+              ('sql-clean', 'db.query("SELECT * FROM users WHERE id = ?", [req.query.id]);', set(), {'js.taint.sql'}),
           ]
-          for name, source, expected in cases:
+          for name, source, expected, forbidden in cases:
               with tempfile.TemporaryDirectory(prefix='ubs-js-domains-') as tmp:
                   path = Path(tmp) / 'app.js'
                   path.write_text(source + '\n', encoding='utf-8')
@@ -82,18 +88,15 @@ jobs:
                       if isinstance(value, dict):
                           for key in ('rule', 'rule_id', 'ruleId'):
                               if isinstance(value.get(key), str):
-                                  rules.add(value[key])
+                                  rules.add(value[key].replace('javascript.', 'js.'))
                           for item in value.values():
                               visit(item)
                       elif isinstance(value, list):
                           for item in value:
                               visit(item)
                   visit(data)
-                  aliases = {rule.replace('javascript.', 'js.') for rule in rules}
-                  if expected:
-                      assert expected in rules or expected.replace('javascript.', 'js.') in aliases, (name, rules, data)
-                  else:
-                      assert 'javascript.taint.xss' not in rules and 'js.taint.xss' not in rules, (name, rules)
+                  assert expected <= rules, (name, expected, rules, data)
+                  assert not forbidden & rules, (name, forbidden, rules)
                   print('JS_TAINT_E2E_PASS', name, sorted(rules), flush=True)
           PY
       - name: Verify deterministic regeneration and publish tested blobs
@@ -114,6 +117,8 @@ jobs:
           assert set(changed) <= allowed, changed
           before = {name: Path(name).read_bytes() for name in changed}
           subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          after_names = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert changed == after_names, (changed, after_names)
           assert all(Path(name).read_bytes() == data for name, data in before.items())
           for name in changed:
               data = Path(name).read_bytes()

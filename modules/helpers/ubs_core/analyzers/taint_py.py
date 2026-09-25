@@ -1,12 +1,13 @@
-"""ubs_core.analyzers.taint_py — Python lightweight taint analysis (bead A2).
+"""Function-scoped Python taint analysis with local call summaries (bead D6).
 
-Logic moved verbatim from the taint heredoc in modules/ubs-python.sh
-(run_taint_analysis_checks), which keeps its own copy until that module's
-port bead. Also exposes a structured `run(ctx)` for the `python3 -m ubs_core`
-CLI.
+The AST transfer functions use strong assignment updates, join control-flow
+branches, and iterate loops and recursive function summaries to a fixpoint.
+Facts retain source provenance and sink-specific sanitizers. Local helpers
+summarize both returned values and parameters reaching a sink; analyzed code
+is never imported or executed. Cross-file and dynamic dispatch are not modeled.
 
 Emit dialects:
-- main(argv) reproduces the heredoc byte-for-byte: one
+- main(argv) emits the legacy tabular dialect: one
   `rule_id<TAB>count<TAB>sample,sample,...` row per rule with hits
   (rule ids `py.taint.*`, at most 3 comma-joined samples per rule).
 - run(ctx) yields one NDJSON finding per detection with rule ids
@@ -14,14 +15,16 @@ Emit dialects:
 """
 from __future__ import annotations
 
-import os
+import ast
 import re
 import sys
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import build_index
 
 ROOT: Path = Path()
 BASE_DIR: Path = Path()
@@ -41,31 +44,587 @@ SOURCE_PATTERNS = [
     re.compile(r"params\[[^\]]+\]", re.IGNORECASE),
 ]
 
-SANITIZER_REGEXES = [
-    re.compile(r"html\.escape"),
-    re.compile(r"django\.utils\.html\.escape"),
-    re.compile(r"flask\.escape"),
-    re.compile(r"mark_safe"),
-    re.compile(r"bleach\.clean"),
-    re.compile(r"shlex\.quote"),
-    re.compile(r"urllib\.parse\.quote"),
-]
+SANITIZERS = {
+    'html.escape': 'xss', 'django.utils.html.escape': 'xss',
+    'django.utils.html.conditional_escape': 'xss', 'flask.escape': 'xss',
+    'markupsafe.escape': 'xss', 'bleach.clean': 'xss',
+    'shlex.quote': 'command',
+}
 
-SINKS = [
-    (re.compile(r"render_template(?:_string)?\s*\((.+)\)"), 'py.taint.xss', 'render_template'),
-    (re.compile(r"HttpResponse\((.+)\)"), 'py.taint.xss', 'HttpResponse'),
-    (re.compile(r"Response\((.+)\)"), 'py.taint.xss', 'Flask Response'),
-    (re.compile(r"(?:cursor|session|conn)\.(?:execute|executemany)\s*\((.+)\)"), 'py.taint.sql', 'SQL execute'),
-    (re.compile(r"(?:engine|db)\.(?:execute|text)\s*\((.+)\)"), 'py.taint.sql', 'SQL engine execute'),
-    (re.compile(r"subprocess\.(?:run|Popen|call|check_output|check_call)\s*\((.+)\)"), 'py.taint.command', 'subprocess execution'),
-    (re.compile(r"os\.(?:system|popen|execv)\s*\((.+)\)"), 'py.taint.command', 'os command execution'),
-    (re.compile(r"eval\s*\((.+)\)"), 'py.taint.eval', 'eval'),
-    (re.compile(r"exec\s*\((.+)\)"), 'py.taint.eval', 'exec'),
-]
+KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval')}
 
-ASSIGN_SIMPLE = re.compile(r"^(?P<targets>[A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)\s*=\s*(?P<expr>.+)")
 
-KIND_BY_RULE = {rule: rule.rsplit('.', 1)[-1] for _regex, rule, _label in SINKS}
+@dataclass(frozen=True)
+class TaintTrace:
+    source: str
+    parameter: str | None = None
+    sanitizers: frozenset[str] = frozenset()
+    # Evidence is not part of the lattice. Growing a recursive provenance
+    # path cannot keep a semantically stable fixpoint running indefinitely.
+    path: tuple[str, ...] = field(default=(), compare=False)
+
+
+Fact = frozenset[TaintTrace]
+CLEAN: Fact = frozenset()
+
+
+def join_facts(*facts: Fact) -> Fact:
+    """Finite powerset join, retaining deterministic shortest evidence."""
+    traces: dict[TaintTrace, TaintTrace] = {}
+    for fact in facts:
+        for trace in fact:
+            previous = traces.get(trace)
+            if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
+                traces[trace] = trace
+    return frozenset(traces.values())
+
+
+def _advance(fact: Fact, *steps: str) -> Fact:
+    traces = []
+    for trace in fact:
+        path = list(trace.path)
+        for step in steps:
+            if not path or path[-1] != step:
+                path.append(step)
+        if len(path) > PATH_LIMIT:
+            path = [path[0], *path[-(PATH_LIMIT - 1):]]
+        traces.append(TaintTrace(trace.source, trace.parameter, trace.sanitizers, tuple(path)))
+    return frozenset(traces)
+
+
+def _sanitize(fact: Fact, kind: str) -> Fact:
+    return frozenset(TaintTrace(t.source, t.parameter, t.sanitizers | {kind}, t.path) for t in fact)
+
+
+def _safe_for(trace: TaintTrace, kind: str, label: str) -> bool:
+    if kind == 'command' and label in {'subprocess executable', 'os executable'}:
+        return False  # Quoting does not authorize an attacker-chosen executable.
+    return kind in trace.sanitizers
+
+
+class _State(dict):
+    """Value facts and definitely-known callable identities at one program point."""
+
+    def __init__(self, values=(), bindings=None):
+        super().__init__(values)
+        self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
+
+    def copy(self):
+        return _State(self)
+
+    def replace(self, other):
+        self.clear()
+        self.update(other)
+        self.bindings = dict(other.bindings)
+
+    def __eq__(self, other):
+        return isinstance(other, _State) and dict.__eq__(self, other) and self.bindings == other.bindings
+
+
+def _join_states(*states):
+    reachable = [state for state in states if state is not None]
+    if not reachable:
+        return None
+    names = set().union(*(state.keys() for state in reachable))
+    bindings = {}
+    for name in set().union(*(state.bindings.keys() for state in reachable)):
+        candidates = [state.bindings.get(name) for state in reachable]
+        bindings[name] = candidates[0] if all(value == candidates[0] for value in candidates) else None
+    return _State({name: join_facts(*(state.get(name, CLEAN) for state in reachable)) for name in names}, bindings)
+
+
+def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
+    if isinstance(node, ast.Name):
+        if node.id in aliases:
+            target = aliases[node.id]
+            if isinstance(target, str):
+                return target
+            if node.id in {'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex',
+                           'subprocess', 'os', 'builtins', 'eval', 'exec', 'input', 'raw_input'}:
+                return ''
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _qualified(node.value, aliases)
+        return f'{base}.{node.attr}' if base else ''
+    return ''
+
+
+def _scope_nodes(scope):
+    """Walk a lexical scope without reading the bodies of child scopes."""
+    todo = list(reversed(scope.body))
+    while todo:
+        node = todo.pop()
+        yield node
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            todo.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
+def _local_names(scope) -> set[str]:
+    names = set()
+    for node in _scope_nodes(scope):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = scope.args
+        names.update(arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs))
+        names.update(arg.arg for arg in (args.vararg, args.kwarg) if arg is not None)
+        for node in _scope_nodes(scope):
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                names.difference_update(node.names)
+    return names
+
+
+def _irrefutable_pattern(pattern) -> bool:
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _irrefutable_pattern(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(_irrefutable_pattern(alternative) for alternative in pattern.patterns)
+    return False
+
+
+@dataclass(frozen=True)
+class FunctionSummary:
+    returned: Fact = CLEAN
+    # (kind, line, column, label, data). Symbolic parameters are substituted
+    # at call sites; concrete request sources also stand alone in handlers.
+    effects: tuple = ()
+
+
+class _Flow:
+    def __init__(self, engine, scope):
+        self.engine = engine
+        self.scope = scope
+        self.returned = CLEAN
+        self.effects = {}
+        self.breaks = []
+        self.continues = []
+        self.exception_states = []
+        self.stopped = []
+        self.expression_facts = {}
+        self.expression_bindings = {}
+
+    def effect(self, kind, node, label, fact):
+        unsafe = frozenset(trace for trace in fact if not _safe_for(trace, kind, label))
+        key = (kind, node.lineno, node.col_offset + 1, label)
+        if unsafe:
+            self.effects[key] = join_facts(self.effects.get(key, CLEAN), unsafe)
+
+    def assign(self, target, fact, state, value=None):
+        if isinstance(target, ast.Name):
+            state[target.id] = _advance(fact, target.id)
+            state.bindings[target.id] = self.expression_bindings.get(value)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                for item, expression in zip(target.elts, value.elts):
+                    self.assign(item, self.expression_facts.get(expression, CLEAN), state, expression)
+            else:
+                for item in target.elts:
+                    self.assign(item, fact, state)
+        elif isinstance(target, ast.Starred):
+            self.assign(target.value, fact, state)
+        elif isinstance(target, (ast.Subscript, ast.Attribute)):
+            base = target.value
+            while isinstance(base, (ast.Subscript, ast.Attribute)):
+                base = base.value
+            if isinstance(base, ast.Name):
+                state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
+
+    def source(self, node, state):
+        candidate = _qualified(node, state.bindings)
+        if isinstance(node, ast.Call):
+            candidate = _qualified(node.func, state.bindings) + '('
+        elif isinstance(node, ast.Subscript):
+            base = _qualified(node.value, state.bindings)
+            if base == 'params':
+                candidate = 'params[...]'
+            elif base == 'event' and isinstance(node.slice, ast.Constant) and node.slice.value == 'body':
+                candidate = "event['body']"
+        for pattern in SOURCE_PATTERNS:
+            match = pattern.search(candidate)
+            if match:
+                source = match.group(0)
+                return frozenset({TaintTrace(source, path=(source,))})
+        return CLEAN
+
+    def bind(self, function, node, arguments, keywords, state):
+        positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
+        bound = {name: fact for name, fact in zip(positional, arguments)}
+        for name, fact in keywords.items():
+            if name is not None:
+                bound[name] = fact
+        defaults = dict(zip(positional[-len(function.args.defaults):], function.args.defaults)) if function.args.defaults else {}
+        defaults.update((arg.arg, default) for arg, default in zip(function.args.kwonlyargs, function.args.kw_defaults)
+                        if default is not None)
+        for name, default in defaults.items():
+            if name not in bound:
+                bound[name] = self.engine.defaults.get(function, {}).get(name, CLEAN)
+        expanded = join_facts(*(fact for arg, fact in zip(node.args, arguments) if isinstance(arg, ast.Starred)),
+                              keywords.get(None, CLEAN))
+        if expanded:
+            for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
+                bound[arg.arg] = join_facts(bound.get(arg.arg, CLEAN), expanded)
+        if function.args.vararg:
+            bound[function.args.vararg.arg] = join_facts(*arguments[len(positional):], expanded)
+        if function.args.kwarg:
+            accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
+            bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
+        for name in self.engine.closures[function]:
+            bound[f'@free:{name}'] = state.get(name, CLEAN)
+        for name in self.engine.global_names:
+            if (not isinstance(self.scope, ast.Module)
+                    and (name in self.engine.locals.get(self.scope, set())
+                         or name in self.engine.closures.get(self.scope, set()))):
+                # The callee resolves globals in its defining module, not in
+                # the caller's local/closure namespace. Carry that dependency
+                # outward until a module call site supplies the actual value.
+                bound[f'@global:{name}'] = frozenset({
+                    TaintTrace(name, parameter=f'@global:{name}', path=(name,))
+                })
+            else:
+                bound[f'@global:{name}'] = state.get(name, CLEAN)
+        return bound
+
+    @staticmethod
+    def substitute(fact, bound, call_name):
+        result = CLEAN
+        for trace in fact:
+            if trace.parameter is None:
+                incoming = frozenset({trace})
+            else:
+                incoming = bound.get(trace.parameter, CLEAN)
+                for sanitizer in trace.sanitizers:
+                    incoming = _sanitize(incoming, sanitizer)
+                steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
+                incoming = _advance(incoming, call_name, *steps)
+            result = join_facts(result, incoming)
+        return result
+
+    def call(self, node, state):
+        name = _qualified(node.func, state.bindings)
+        function = state.bindings.get(node.func.id) if isinstance(node.func, ast.Name) else None
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = None
+        # Python evaluates the receiver/callable before argument expressions,
+        # which may themselves reassign the receiver or callable name.
+        receiver = self.expr(node.func.value, state) if isinstance(node.func, ast.Attribute) else CLEAN
+        arguments = [self.expr(arg, state) for arg in node.args]
+        keywords = {keyword.arg: self.expr(keyword.value, state) for keyword in node.keywords}
+        if function is not None:
+            bound = self.bind(function, node, arguments, keywords, state)
+            summary = self.engine.summaries.get(function, FunctionSummary())
+            for kind, line, column, label, fact in summary.effects:
+                propagated = self.substitute(fact, bound, f'{function.name}()')
+                propagated = frozenset(trace for trace in propagated if not _safe_for(trace, kind, label))
+                key = (kind, line, column, label)
+                if propagated:
+                    self.effects[key] = join_facts(self.effects.get(key, CLEAN), propagated)
+            return self.substitute(summary.returned, bound, f'{function.name}()')
+        fact = join_facts(receiver, *arguments, *keywords.values(), self.source(node, state))
+        first = arguments[0] if arguments else CLEAN
+        leaf = name.rsplit('.', 1)[-1]
+        if leaf in {'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
+            label = 'render_template' if leaf.startswith('render_template') else ('Flask Response' if leaf == 'Response' else leaf)
+            content = (join_facts(*arguments, *keywords.values()) if leaf.startswith('render_template')
+                       else first if arguments else keywords.get('content', keywords.get('response', CLEAN)))
+            self.effect('xss', node, label, content)
+        elif leaf in {'execute', 'executemany', 'text'} and name.split('.')[0] in {'cursor', 'session', 'conn', 'engine', 'db'}:
+            query = first if arguments else keywords.get('sql', keywords.get('query', keywords.get('statement', CLEAN)))
+            self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
+        elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
+            command = first if arguments else keywords.get('args', CLEAN)
+            command_node = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == 'args'), None)
+            shell = next((kw.value for kw in node.keywords if kw.arg == 'shell'), None)
+            shell_enabled = shell is not None and not (isinstance(shell, ast.Constant) and not shell.value)
+            if not shell_enabled and isinstance(command_node, (ast.List, ast.Tuple)):
+                command = self.expression_facts.get(command_node.elts[0], CLEAN) if command_node.elts else CLEAN
+            self.effect('command', node, 'subprocess execution' if shell_enabled else 'subprocess executable', command)
+        elif name in {'os.system', 'os.popen', 'os.execv', 'os.execve', 'os.execvp', 'os.execvpe'}:
+            self.effect('command', node, 'os executable' if leaf.startswith('exec') else 'os command execution', first)
+        elif name in {'eval', 'exec', 'builtins.eval', 'builtins.exec'}:
+            self.effect('eval', node, leaf, first if arguments else keywords.get('source', CLEAN))
+        configurable_html = name == 'bleach.clean' and (
+            len(node.args) > 1 or any(keyword.arg not in {'text', 'strip', 'strip_comments'} for keyword in node.keywords)
+        )
+        if name in SANITIZERS and not configurable_html:
+            fact = _sanitize(fact, SANITIZERS[name])
+        return fact
+
+    def expr(self, node, state):
+        fact = self.expression(node, state)
+        if node is not None:
+            self.expression_facts[node] = fact
+            binding = state.bindings.get(node.id) if isinstance(node, ast.Name) else None
+            if isinstance(node, ast.Attribute):
+                candidate = _qualified(node, state.bindings)
+                if candidate in SANITIZERS:
+                    binding = candidate
+            self.expression_bindings[node] = binding
+        return fact
+
+    def expression(self, node, state):
+        if node is None or isinstance(node, (ast.Constant, ast.Lambda)):
+            return CLEAN
+        if isinstance(node, ast.Name):
+            return state.get(node.id, CLEAN)
+        if isinstance(node, ast.Call):
+            return self.call(node, state)
+        if isinstance(node, ast.NamedExpr):
+            fact = self.expr(node.value, state)
+            self.assign(node.target, fact, state, node.value)
+            return fact
+        if isinstance(node, ast.IfExp):
+            self.expr(node.test, state)
+            left, right = state.copy(), state.copy()
+            fact = join_facts(self.expr(node.body, left), self.expr(node.orelse, right))
+            state.replace(_join_states(left, right))
+            return fact
+        if isinstance(node, ast.BoolOp):
+            fact = CLEAN
+            exits = []
+            continuation = state.copy()
+            for value in node.values:
+                fact = join_facts(fact, self.expr(value, continuation))
+                exits.append(continuation.copy())
+            state.replace(_join_states(*exits))
+            return fact
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            nested = state.copy()
+            for generator in node.generators:
+                self.assign(generator.target, self.expr(generator.iter, nested), nested)
+                for condition in generator.ifs:
+                    self.expr(condition, nested)
+            values = (node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,)
+            fact = join_facts(*(self.expr(value, nested) for value in values))
+            # Assignment expressions bind in the enclosing scope, while
+            # ordinary comprehension targets remain local to the expression.
+            for child in ast.walk(node):
+                if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
+                    name = child.target.id
+                    state[name] = join_facts(state.get(name, CLEAN), nested.get(name, CLEAN))
+                    state.bindings[name] = None
+            return fact
+        return join_facts(self.source(node, state), *(self.expr(child, state) for child in ast.iter_child_nodes(node)
+                                              if isinstance(child, ast.expr)))
+
+    def block(self, statements, state):
+        for node in statements:
+            if state is None:
+                break
+            if self.exception_states:
+                self.exception_states[-1] = _join_states(self.exception_states[-1], state)
+            state = self.statement(node, state)
+        return state
+
+    def statement(self, node, state):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            positional = [*node.args.posonlyargs, *node.args.args]
+            defaults = dict(zip((arg.arg for arg in positional[-len(node.args.defaults):]), node.args.defaults)) if node.args.defaults else {}
+            defaults.update((arg.arg, default) for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                            if default is not None)
+            self.engine.defaults[node] = {name: self.expr(default, state) for name, default in defaults.items()}
+            for decorator in node.decorator_list:
+                self.expr(decorator, state)
+            state[node.name] = CLEAN
+            state.bindings[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            for expression in (*node.bases, *node.decorator_list):
+                self.expr(expression, state)
+            for keyword in node.keywords:
+                self.expr(keyword.value, state)
+            self.block(node.body, state.copy())
+            state[node.name] = CLEAN
+            state.bindings[node.name] = node
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                local = alias.asname or alias.name.split('.')[0]
+                state.bindings[local] = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
+                                         else alias.name if alias.asname else local)
+                state[local] = CLEAN
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            fact = self.expr(node.value, state)
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                self.assign(target, fact, state, node.value)
+        elif isinstance(node, ast.AugAssign):
+            self.assign(node.target, join_facts(self.expr(node.target, state), self.expr(node.value, state)), state)
+        elif isinstance(node, ast.Expr):
+            self.expr(node.value, state)
+        elif isinstance(node, ast.Return):
+            self.returned = join_facts(self.returned, self.expr(node.value, state))
+            self.stopped.append(state.copy())
+            return None
+        elif isinstance(node, ast.Raise):
+            self.expr(node.exc, state)
+            self.expr(node.cause, state)
+            self.stopped.append(state.copy())
+            return None
+        elif isinstance(node, ast.If):
+            self.expr(node.test, state)
+            return _join_states(self.block(node.body, state.copy()), self.block(node.orelse, state.copy()))
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            return self.loop(node, state)
+        elif isinstance(node, ast.Break):
+            stopped = state.copy()
+            self.breaks.append(stopped)
+            self.stopped.append(stopped)
+            return None
+        elif isinstance(node, ast.Continue):
+            stopped = state.copy()
+            self.continues.append(stopped)
+            self.stopped.append(stopped)
+            return None
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                fact = self.expr(item.context_expr, state)
+                if item.optional_vars is not None:
+                    self.assign(item.optional_vars, fact, state)
+            return self.block(node.body, state)
+        elif isinstance(node, ast.Try) or (hasattr(ast, 'TryStar') and isinstance(node, ast.TryStar)):
+            stopped_start = len(self.stopped)
+            self.exception_states.append(state.copy())
+            normal = self.block(node.body, state.copy())
+            exceptional = self.exception_states.pop()
+            completed = self.block(node.orelse, normal)
+            handlers = [self.block(handler.body, exceptional.copy()) for handler in node.handlers]
+            combined = _join_states(completed, *handlers)
+            if node.finalbody:
+                # Normal continuations and terminated branches each execute
+                # finally. Keeping them separate prevents a return branch's
+                # tainted locals from being lost in the normal-state join.
+                for stopped in self.stopped[stopped_start:]:
+                    final = self.block(node.finalbody, stopped.copy())
+                    if final is not None:
+                        stopped.replace(final)
+                return self.block(node.finalbody, combined)
+            return combined
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    state[target.id] = CLEAN
+                    state.bindings[target.id] = None
+        elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
+            subject = self.expr(node.subject, state)
+            branches = []
+            exhaustive = False
+            for case in node.cases:
+                branch = state.copy()
+                for pattern in ast.walk(case.pattern):
+                    name = getattr(pattern, 'name', None)
+                    if isinstance(name, str):
+                        branch[name] = _advance(subject, name)
+                self.expr(case.guard, branch)
+                branches.append(self.block(case.body, branch))
+                if case.guard is None and _irrefutable_pattern(case.pattern):
+                    exhaustive = True
+                    break
+            if not exhaustive:
+                branches.append(state.copy())
+            return _join_states(*branches)
+        else:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.expr):
+                    self.expr(child, state)
+        return state
+
+    def loop(self, node, state):
+        outer_breaks, outer_continues = self.breaks, self.continues
+        head = state.copy()
+        exits = []
+        while True:
+            self.breaks, self.continues = [], []
+            body = head.copy()
+            if isinstance(node, ast.While):
+                self.expr(node.test, body)
+            else:
+                self.assign(node.target, self.expr(node.iter, body), body)
+            back = self.block(node.body, body)
+            exits.extend(self.breaks)
+            joined = _join_states(state, back, *self.continues)
+            if joined == head:
+                break
+            head = joined
+        self.breaks, self.continues = outer_breaks, outer_continues
+        normal = self.block(node.orelse, head.copy())
+        return _join_states(normal, *exits)
+
+    def summary(self):
+        return FunctionSummary(self.returned, tuple((*key, fact) for key, fact in sorted(self.effects.items())))
+
+
+class _Analysis:
+    def __init__(self, tree):
+        self.tree = tree
+        self.summaries = {}
+        self.defaults = {}
+        self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
+        self.global_names = self.locals[tree]
+        self.closures = {}
+        for function in self.functions:
+            available = set()
+            parent = self.enclosing(function)
+            while parent is not None and not isinstance(parent, ast.Module):
+                available.update(self.locals.get(parent, set()))
+                parent = self.enclosing(parent)
+            self.closures[function] = available - self.locals[function]
+
+    def enclosing(self, node):
+        node = self.parents.get(node)
+        while node is not None and not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            node = self.parents.get(node)
+        return node
+
+    def analyze(self):
+        # A summary contains only finite source/parameter/sanitizer facts.
+        # Equality excludes evidence paths, so recursive helpers terminate
+        # without a depth cap that would silently lose longer call chains.
+        while True:
+            module = _Flow(self, self.tree)
+            globals_ = module.block(self.tree.body, _State())
+            if globals_ is None:
+                globals_ = _State()
+            changed = False
+            flows = [module]
+            for function in self.functions:
+                local = self.locals[function]
+                flow = _Flow(self, function)
+                state = _State({name: frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))})
+                                for name in self.global_names if name not in local},
+                               {name: target for name, target in globals_.bindings.items() if name not in local})
+                for name in local:
+                    state.bindings[name] = None
+                arguments = function.args
+                params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+                params.extend(arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None)
+                for arg in params:
+                    state[arg.arg] = frozenset({TaintTrace(arg.arg, parameter=arg.arg, path=(arg.arg,))})
+                for name in self.closures[function]:
+                    state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
+                    state.bindings[name] = None
+                if function.name not in local and function.name not in state.bindings:
+                    state.bindings[function.name] = function
+                flow.block(function.body, state)
+                summary = flow.summary()
+                if summary != self.summaries.get(function, FunctionSummary()):
+                    self.summaries[function] = summary
+                    changed = True
+                flows.append(flow)
+            if not changed:
+                effects = {}
+                for flow in flows:
+                    for key, fact in flow.effects.items():
+                        if flow is not module:
+                            bound = {f'@global:{name}': value for name, value in globals_.items()}
+                            fact = flow.substitute(fact, bound, flow.scope.name + '()')
+                        concrete = frozenset(trace for trace in fact if trace.parameter is None)
+                        if concrete:
+                            effects[key] = join_facts(effects.get(key, CLEAN), concrete)
+                return effects
 
 
 def should_skip(path: Path) -> bool:
@@ -83,113 +642,20 @@ def iter_files(root: Path):
         if path.suffix.lower() in EXTS: yield path
 
 
-def strip_comments(line: str) -> str:
-    if '#' in line:
-        idx = line.find('#')
-        if idx >= 0: line = line[:idx]
-    return line
-
-
-def parse_assignments(lines):
-    assignments = []
-    for idx, raw in enumerate(lines, start=1):
-        line = strip_comments(raw).strip()
-        if not line or '=' not in line: continue
-        if '==' in line or '>=' in line or '<=' in line or '!=' in line: continue
-        match = ASSIGN_SIMPLE.match(line)
-        if not match: continue
-        lhs = match.group('targets'); expr = match.group('expr')
-        for target in [t.strip() for t in lhs.split(',') if t.strip()]:
-            assignments.append((idx, target, expr))
-    return assignments
-
-
-def find_sources(expr: str):
-    matches = []
-    for regex in SOURCE_PATTERNS:
-        for m in regex.finditer(expr):
-            matches.append(m.group(0))
-    return matches
-
-
-def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
-    expr_lower = expr.lower()
-    for regex in SANITIZER_REGEXES:
-        if regex.search(expr_lower): return True
-    if sink_rule == 'py.taint.sql':
-        if re.search(r'%(?!\()|\.format\(|f["\']', expr): return False
-        if re.search(r",\s*(?:\(|\[|params|data|values|bindings)", expr_lower): return True
-    return False
-
-
-def expr_has_tainted(expr: str, tainted):
-    for name, meta in tainted.items():
-        pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
-        if re.search(pattern, expr): return name, meta
-    return None, None
-
-
-def record_taint(assignments):
-    tainted = {}
-    for line_no, target, expr in assignments:
-        if expr_has_sanitizer(expr, None): continue
-        sources = find_sources(expr)
-        if sources:
-            tainted[target] = {'source': sources[0], 'line': line_no, 'path': [sources[0], target]}
-    for _ in range(5):
-        changed = False
-        for line_no, target, expr in assignments:
-            if target in tainted or expr_has_sanitizer(expr, None): continue
-            ref, meta = expr_has_tainted(expr, tainted)
-            if ref:
-                new_path = list(meta.get('path', [ref]))
-                if len(new_path) >= 5: new_path = new_path[-4:]
-                new_path.append(target)
-                tainted[target] = {'source': meta.get('source', ref), 'line': line_no, 'path': new_path}
-                changed = True
-        if not changed: break
-    return tainted
-
-
 def analyze_file(path, issues):
-    try:
-        text = path.read_text(encoding='utf-8')
-    except Exception:
-        return
-    lines = text.splitlines()
-    assignments = parse_assignments(lines)
-    tainted = record_taint(assignments)
-    for idx, raw in enumerate(lines, start=1):
-        if 'ubs:ignore' in raw: continue
-        if idx > 1 and 'ubs:ignore' in lines[idx-2]: continue
-        stripped = strip_comments(raw)
-        if not stripped: continue
-        for regex, rule, label in SINKS:
-            match = regex.search(stripped)
-            if not match: continue
-            expr = match.group(1)
-            if not expr or expr_has_sanitizer(expr, rule): continue
-            direct = find_sources(expr)
-            if direct:
-                path_desc = f"{direct[0]} -> {label}"
-            else:
-                ref, meta = expr_has_tainted(expr, tainted)
-                if not ref: continue
-                seq = list(meta.get('path', [ref]))
-                if len(seq) >= 5: seq = seq[-4:]
-                seq.append(label)
-                path_desc = ' -> '.join(seq)
-            try: rel = path.relative_to(ROOT)
-            except ValueError: rel = path.name
-            sample = f"{rel}:{idx} {path_desc}"
-            bucket = issues[rule]
-            bucket['count'] += 1
-            if len(bucket['samples']) < 3:
-                bucket['samples'].append(sample)
+    for rule, line, _column, path_desc in scan_file_findings(path):
+        try:
+            rel = path.relative_to(ROOT)
+        except ValueError:
+            rel = path.name
+        bucket = issues[rule]
+        bucket['count'] += 1
+        if len(bucket['samples']) < 3:
+            bucket['samples'].append(f'{rel}:{line} {path_desc}')
 
 
 def main(argv=None) -> int:
-    """Byte-parity entrypoint: same behavior as the heredoc given the same argv."""
+    """Emit the same detections as run(ctx), using the tabular entrypoint."""
     if argv is None:
         argv = sys.argv
     global ROOT, BASE_DIR
@@ -220,36 +686,21 @@ _MESSAGE = {
 
 
 def scan_file_findings(path: Path):
-    """Yield (rule_id, line, col, path_desc) per detection, without the
-    heredoc's 3-sample cap — used by the structured run(ctx) path."""
+    """Yield each reachable source-to-sink flow once at its sink location."""
     try:
         text = path.read_text(encoding='utf-8')
-    except Exception:
+        tree = ast.parse(text, filename=str(path))
+    except (OSError, UnicodeError, SyntaxError, ValueError):
         return
-    lines = text.splitlines()
-    assignments = parse_assignments(lines)
-    tainted = record_taint(assignments)
-    for idx, raw in enumerate(lines, start=1):
-        if 'ubs:ignore' in raw: continue
-        if idx > 1 and 'ubs:ignore' in lines[idx-2]: continue
-        stripped = strip_comments(raw)
-        if not stripped: continue
-        for regex, rule, label in SINKS:
-            match = regex.search(stripped)
-            if not match: continue
-            expr = match.group(1)
-            if not expr or expr_has_sanitizer(expr, rule): continue
-            direct = find_sources(expr)
-            if direct:
-                path_desc = f"{direct[0]} -> {label}"
-            else:
-                ref, meta = expr_has_tainted(expr, tainted)
-                if not ref: continue
-                seq = list(meta.get('path', [ref]))
-                if len(seq) >= 5: seq = seq[-4:]
-                seq.append(label)
-                path_desc = ' -> '.join(seq)
-            yield rule, idx, match.start() + 1, path_desc
+    suppressions = build_index(text, lang='python')
+    effects = _Analysis(tree).analyze()
+    for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
+        rule = f'py.taint.{kind}'
+        if suppressions.is_suppressed(line, rule) or suppressions.is_suppressed(line, f'python.taint.{kind}'):
+            continue
+        trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
+        path_desc = ' -> '.join((*trace.path, label))
+        yield rule, line, column, path_desc
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
@@ -261,6 +712,8 @@ def run(ctx: RunContext) -> Iterable[dict]:
         rel = path.resolve()
         for rule, line, col, path_desc in scan_file_findings(path):
             kind = KIND_BY_RULE[rule]
+            if not ctx.rule_enabled(f'python.taint.{kind}') or not ctx.rule_enabled(rule):
+                continue
             yield {
                 "rule": f"python.taint.{kind}",
                 "path": str(rel),

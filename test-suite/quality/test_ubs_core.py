@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -350,6 +352,393 @@ class UbsCoreLexerTests(unittest.TestCase):
         self.assertNotIn("docstring", stripped)
         self.assertIn("name =", stripped)
         self.assertIn("active = True", stripped)
+
+
+class PythonTaintDataflowTests(unittest.TestCase):
+    """Source-to-sink regressions for the function-scoped Python frontend."""
+
+    def run(self, result=None):
+        result = result if result is not None else self.defaultTestResult()
+        failures = len(result.failures) + len(result.errors)
+        case = self.id().rsplit('.', 1)[-1]
+        start = time.monotonic()
+        print(f'[{case}] RUN', flush=True)
+        super().run(result)
+        status = 'PASS' if len(result.failures) + len(result.errors) == failures else 'FAIL'
+        print(f'[{case}] {status} ({time.monotonic() - start:.3f}s)', flush=True)
+        return result
+
+    def findings(self, source: str) -> tuple[str, list[dict]]:
+        from ubs_core.analyzers import taint_py
+        from ubs_core.registry import RunContext
+
+        source = textwrap.dedent(source).lstrip('\n')
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='python-taint-', dir=artifacts) as tmp:
+            path = Path(tmp) / 'flow.py'
+            path.write_text(source, encoding='utf-8')
+            records = list(taint_py.run(RunContext(lang='python', files=[path])))
+        return source, records
+
+    def assert_sites(self, source: str, expected: dict[str, str]) -> list[dict]:
+        source, records = self.findings(source)
+        wanted = {
+            (f'python.taint.{kind}', number)
+            for marker, kind in expected.items()
+            for number, line in enumerate(source.splitlines(), 1)
+            if f'# {marker}' in line
+        }
+        self.assertEqual(len(wanted), len(expected), f'missing fixture markers: {expected}\n{source}')
+        self.assertEqual({(row['rule'], row['line']) for row in records}, wanted,
+                         f'source:\n{source}\nfindings:\n{json.dumps(records, indent=2)}')
+        self.assertEqual(len(records), len(wanted), records)
+        return records
+
+    def test_same_named_locals_and_assignment_order_are_independent(self) -> None:
+        self.assert_sites('''
+            def dangerous():
+                value = request.args['value']
+                eval(value)  # unsafe-local
+
+            def unrelated(value):
+                eval(value)
+
+            def overwritten():
+                value = request.args['value']
+                value = '1 + 1'
+                eval(value)
+
+            def later_source():
+                value = '1 + 1'
+                eval(value)
+                value = request.args['value']
+
+            def unreachable():
+                return
+                eval(request.args['value'])
+        ''', {'unsafe-local': 'eval'})
+
+    def test_literals_comments_and_multiline_calls_use_python_syntax(self) -> None:
+        self.assert_sites('''
+            documentation = "eval(request.args['value'])"
+            value = 'request.args.get("value")'
+            eval(value)
+            # eval(request.args['comment'])
+            value = (
+                request.args.get('value#still-inside-string')
+            )
+            eval(  # multiline-sink
+                value
+            )
+        ''', {'multiline-sink': 'eval'})
+
+    def test_local_return_and_sink_summaries_bind_keywords_and_defaults(self) -> None:
+        records = self.assert_sites('''
+            def identity(value):
+                return value
+
+            def constant(value):
+                return '1 + 1'
+
+            def source():
+                return request.args.get('code')
+
+            def execute(value, suffix=''):
+                eval(value + suffix)  # helper-sink
+
+            def default_source(value=request.args.get('default')):
+                return value
+
+            payload = request.args.get('code')
+            copied = identity(value=payload)
+            eval(copied)  # returned-value
+            execute(suffix='', value=payload)
+            eval(source())  # source-helper
+            eval(default_source())  # default-value
+            eval(constant(payload))
+            execute(value='1 + 1')
+        ''', {'helper-sink': 'eval', 'returned-value': 'eval', 'source-helper': 'eval', 'default-value': 'eval'})
+        self.assertTrue(any('identity()' in row['message'] for row in records), records)
+        self.assertTrue(any('execute()' in row['message'] for row in records), records)
+        for row in records:
+            self.assertIn('request.args', row['message'])
+            self.assertTrue(row['message'].endswith(' -> eval)'), row)
+
+    def test_branch_joins_keep_only_reachable_unsanitized_values(self) -> None:
+        self.assert_sites('''
+            def partly_clean(flag):
+                value = request.args['value']
+                if flag:
+                    value = html.escape(value)
+                Response(value)  # partly-escaped
+
+            def fully_clean(flag):
+                value = request.args['value']
+                if flag:
+                    value = 'safe'
+                else:
+                    value = html.escape(value)
+                Response(value)
+
+            def returned_branch(flag):
+                value = request.args['value']
+                if flag:
+                    return value
+                else:
+                    value = 'safe'
+                eval(value)
+        ''', {'partly-escaped': 'xss'})
+
+    def test_nested_helpers_capture_only_their_own_enclosing_scope(self) -> None:
+        self.assert_sites('''
+            def handler():
+                value = request.args['code']
+                def read():
+                    return value
+                def execute():
+                    eval(value)  # captured-sink
+                eval(read())  # captured-return
+                execute()
+
+            def unrelated():
+                value = '1 + 1'
+                def read():
+                    return value
+                eval(read())
+        ''', {'captured-sink': 'eval', 'captured-return': 'eval'})
+
+    def test_callable_rebinding_and_branch_imports_revoke_safe_summaries(self) -> None:
+        self.assert_sites('''
+            def clean(value):
+                return 'safe'
+            clean = lambda value: value
+            os.system(clean(request.args['command']))  # rebound-helper
+
+            if flag:
+                from html import escape as escape_text
+            else:
+                escape_text = lambda value: value
+            Response(escape_text(request.args['html']))  # branch-dependent-import
+
+            if flag:
+                from html import escape as other_escape
+            else:
+                Response(other_escape(request.args['html']))  # sibling-branch
+
+            from html import escape as always_escape
+            Response(always_escape(request.args['html']))
+        ''', {'rebound-helper': 'command', 'branch-dependent-import': 'xss', 'sibling-branch': 'xss'})
+
+    def test_global_values_are_bound_at_call_sites_and_finally_keeps_return_paths(self) -> None:
+        self.assert_sites('''
+            value = input()
+            def run():
+                eval(value)  # early-global-call
+            run()
+            value = 'safe'
+
+            def handler(flag):
+                code = 'safe'
+                try:
+                    if flag:
+                        code = input()
+                        return
+                finally:
+                    eval(code)  # finally-after-return
+        ''', {'early-global-call': 'eval', 'finally-after-return': 'eval'})
+
+    def test_conditional_assignments_definition_execution_and_unpacking(self) -> None:
+        self.assert_sites('''
+            value = input()
+            flag and (value := 'safe')
+            eval(value)  # short-circuit-assignment
+            unused = None if flag else (value := 'safe')
+            eval(value)  # conditional-assignment
+
+            def configure(value=eval(input())):  # definition-default
+                pass
+
+            class Initialization:
+                value = input()
+                eval(value)  # class-body
+
+            first = input()
+            second = 'safe'
+            first, second = second, first
+            eval(second)  # simultaneous-unpacking
+            eval(first)
+
+            last = 'safe'
+            [(last := input()) for _ in range(1)]
+            eval(last)  # enclosing-comprehension-assignment
+
+            pattern = input()
+            formatted = pattern.format(pattern := 'safe')
+            eval(formatted)  # receiver-before-arguments
+        ''', {'short-circuit-assignment': 'eval', 'conditional-assignment': 'eval',
+              'definition-default': 'eval', 'class-body': 'eval', 'simultaneous-unpacking': 'eval',
+              'enclosing-comprehension-assignment': 'eval', 'receiver-before-arguments': 'eval'})
+
+    def test_loop_and_recursive_summary_fixpoints_terminate_and_propagate(self) -> None:
+        self.assert_sites('''
+            def recursive(value, stop):
+                if stop:
+                    return value
+                return recursive(value, True)
+
+            eval(recursive(request.args['value'], False))  # recursive-return
+
+            value = '1 + 1'
+            while keep_going():
+                eval(value)  # loop-carried
+                value = request.args['next']
+                if finished():
+                    break
+
+            value = request.args['code']
+            while keep_going():
+                value = 'safe'
+                eval(value)
+                continue
+                eval(request.args['dead'])
+        ''', {'recursive-return': 'eval', 'loop-carried': 'eval'})
+
+    def test_local_helper_chains_have_no_five_assignment_limit(self) -> None:
+        source = '\n'.join(
+            f'def helper_{index}(value):\n    return helper_{index + 1}(value)\n'
+            for index in range(12)
+        )
+        source += "def helper_12(value):\n    return value\n"
+        source += "eval(helper_0(request.args['value']))  # long-chain\n"
+        records = self.assert_sites(source, {'long-chain': 'eval'})
+        self.assertIn('request.args', records[0]['message'])
+
+    def test_sanitizers_are_specific_to_the_sink_and_each_flow(self) -> None:
+        self.assert_sites('''
+            import html as markup
+            from shlex import quote as shell_quote
+            from django.utils.safestring import mark_safe
+
+            def render(value):
+                Response(value)  # helper-html
+
+            def clean_html(value):
+                return markup.escape(value)
+
+            value = request.args['value']
+            escaped = clean_html(value)
+            Response(escaped)
+            cursor.execute(escaped)  # html-is-not-sql-escaping
+            eval(escaped)  # html-is-not-code-escaping
+            Response(mark_safe(value))  # trust-is-not-escaping
+            Response(markup.escape(value) + request.args['raw'])  # mixed-flow
+            render(escaped)
+            render(value)
+            os.system('printf %s ' + shell_quote(value))
+            eval(shell_quote(value))  # shell-is-not-code-escaping
+        ''', {'helper-html': 'xss', 'html-is-not-sql-escaping': 'sql', 'html-is-not-code-escaping': 'eval',
+              'trust-is-not-escaping': 'xss', 'mixed-flow': 'xss', 'shell-is-not-code-escaping': 'eval'})
+        self.assert_sites('''
+            def render(value):
+                Response(value)
+            render(html.escape(request.args['value']))
+        ''', {})
+
+    def test_sql_parameters_and_fixed_subprocess_argv_are_data(self) -> None:
+        self.assert_sites('''
+            import subprocess as process
+            from subprocess import run as execute_process
+            value = request.args['value']
+            cursor.execute('SELECT * FROM users WHERE name = ?', (value,))
+            cursor.execute(query='SELECT * FROM users WHERE name = ?', parameters=[value])
+            cursor.execute('SELECT * FROM ' + value, ())  # dynamic-query-with-params
+            process.run(['printf', '%s', value], timeout=5)
+            execute_process(args=['printf', '%s', value], shell=False, timeout=5)
+            process.run([value, '--version'], timeout=5)  # executable
+            execute_process(value, shell=True, timeout=5)  # shell-command
+        ''', {'dynamic-query-with-params': 'sql', 'executable': 'command', 'shell-command': 'command'})
+
+    def test_suppression_requires_real_comment_and_matching_rule(self) -> None:
+        self.assert_sites('''
+            value = request.args['value']
+            text = 'ubs:ignore'
+            eval(value)  # string-marker-is-not-suppression
+            eval(value)  # wrong-rule ubs:ignore[python.taint.sql]
+            eval(
+                value  # ubs:ignore[python.taint.eval]
+            )
+            # ubs:ignore[py.taint.eval]
+            eval(value)
+        ''', {'string-marker-is-not-suppression': 'eval', 'wrong-rule': 'eval'})
+
+    def test_fact_join_laws_include_sanitizer_variants(self) -> None:
+        from ubs_core.analyzers.taint_py import CLEAN, TaintTrace, join_facts
+
+        facts = [CLEAN, frozenset({TaintTrace('request.args', path=('request.args',))}),
+                 frozenset({TaintTrace('request.args', sanitizers=frozenset({'xss'}), path=('request.args', 'escape'))}),
+                 frozenset({TaintTrace('other', parameter='other', path=('other',))})]
+        for first in facts:
+            self.assertEqual(join_facts(first, first), first)
+            for second in facts:
+                self.assertEqual(join_facts(first, second), join_facts(second, first))
+                for third in facts:
+                    self.assertEqual(join_facts(join_facts(first, second), third),
+                                     join_facts(first, join_facts(second, third)))
+
+    def test_existing_python_taint_fixture_pair(self) -> None:
+        from ubs_core.analyzers.taint_py import scan_file_findings
+
+        buggy = REPO_ROOT / 'test-suite/python/buggy/taint_analysis.py'
+        clean = REPO_ROOT / 'test-suite/python/clean/taint_analysis.py'
+        self.assertEqual([(rule, line) for rule, line, _, _ in scan_file_findings(buggy)],
+                         [('py.taint.sql', 17), ('py.taint.command', 22), ('py.taint.eval', 27)])
+        self.assertEqual(list(scan_file_findings(clean)), [])
+
+    def test_real_python_module_reports_helper_sinks_and_clean_controls(self) -> None:
+        artifacts = REPO_ROOT / 'test-suite/artifacts/python-taint-module'
+        project = artifacts / 'project'
+        project.mkdir(parents=True, exist_ok=True)
+        source = project / 'flow.py'
+        source.write_text(textwrap.dedent('''
+            def transform(value):
+                return value.strip()
+
+            def evaluate(value):
+                eval(value)
+
+            def handler():
+                evaluate(transform(request.args['code']))
+
+            def unrelated():
+                value = 'safe'
+                evaluate(value)
+        ''').lstrip('\n'), encoding='utf-8')
+        report = artifacts / 'findings.ndjson'
+        command = [
+            'bash', str(REPO_ROOT / 'modules/ubs-python.sh'), '--ci', '--no-color',
+            '--format=json', '--skip=1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23',
+            f'--report-json={report}', str(project),
+        ]
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_NO_CACHE='1',
+                   UBS_NO_AUTO_UPDATE='1', UBS_SKIP_TYPE_NARROWING='1')
+        proc = subprocess.run(command, cwd=artifacts, env=env, text=True, capture_output=True, timeout=180)  # ubs:ignore[python.taint.command] - real module over a fixed local source fixture with a bounded timeout
+        (artifacts / 'stdout.log').write_text(proc.stdout, encoding='utf-8')
+        (artifacts / 'stderr.log').write_text(proc.stderr, encoding='utf-8')
+        (artifacts / 'result.json').write_text(proc.stdout, encoding='utf-8')
+        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+        self.assertEqual(proc.returncode, 1, context)
+        try:
+            payload = json.loads(proc.stdout)
+            records = [json.loads(line) for line in report.read_text(encoding='utf-8').splitlines()]
+        except (ValueError, OSError) as exc:
+            self.fail(f'Invalid Python module report: {exc}\n{context}')
+        self.assertEqual(payload['status'], 'ok', context)
+        taint = [row for row in records if row['rule'].startswith('python.taint.')]
+        self.assertEqual([(row['rule'], row['path'], row['line'], row['col']) for row in taint],
+                         [('python.taint.eval', str(source), 5, 5)], context)
+        self.assertIn('request.args', taint[0]['message'], context)
+        self.assertIn('evaluate()', taint[0]['message'], context)
 
 
 class StructuredSourceIdentityTests(unittest.TestCase):

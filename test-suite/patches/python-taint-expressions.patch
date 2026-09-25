@@ -1,0 +1,151 @@
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -272,7 +272,7 @@
+         if function.args.kwarg:
+             accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
+             bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
+-        for name in self.engine.closures[function]:
++        for name in self.engine.closures.get(function, ()):
+             bound[f'@free:{name}'] = state.get(name, CLEAN)
+         for name in self.engine.global_names:
+             if (not isinstance(self.scope, ast.Module)
+@@ -311,8 +311,33 @@
+         # Python evaluates the receiver/callable before argument expressions,
+         # which may themselves reassign the receiver or callable name.
+         receiver = self.expr(node.func.value, state) if isinstance(node.func, ast.Attribute) else CLEAN
++        if isinstance(node.func, ast.Lambda):
++            # Defaults are evaluated when the callable is created, before its
++            # arguments. The body executes only when this lambda is called.
++            self.expr(node.func, state)
+         arguments = [self.expr(arg, state) for arg in node.args]
+-        keywords = {keyword.arg: self.expr(keyword.value, state) for keyword in node.keywords}
++        keywords = {}
++        keyword_nodes = {}
++        for keyword in node.keywords:
++            if keyword.arg is None and isinstance(keyword.value, ast.Dict):
++                for key, value in zip(keyword.value.keys, keyword.value.values):
++                    self.expr(key, state)
++                    key_name = key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else None
++                    keywords[key_name] = join_facts(keywords.get(key_name, CLEAN), self.expr(value, state))
++                    keyword_nodes[key_name] = value
++            else:
++                keywords[keyword.arg] = join_facts(keywords.get(keyword.arg, CLEAN), self.expr(keyword.value, state))
++                keyword_nodes[keyword.arg] = keyword.value
++        if isinstance(node.func, ast.Lambda):
++            bound = self.bind(node.func, node, arguments, keywords, state)
++            local = state.copy()
++            signature = node.func.args
++            for arg in (*signature.posonlyargs, *signature.args, *signature.kwonlyargs,
++                        signature.vararg, signature.kwarg):
++                if arg is not None:
++                    local[arg.arg] = _advance(bound.get(arg.arg, CLEAN), arg.arg)
++                    local.bindings[arg.arg] = None
++            return self.expr(node.func.body, local)
+         if function is not None:
+             bound = self.bind(function, node, arguments, keywords, state)
+             summary = self.engine.summaries.get(function, FunctionSummary())
+@@ -325,27 +350,46 @@
+             return self.substitute(summary.returned, bound, f'{function.name}()')
+         fact = join_facts(receiver, *arguments, *keywords.values(), self.source(node, state))
+         first = arguments[0] if arguments else CLEAN
++
++        def source_argument(*names):
++            if arguments:
++                return first
++            return join_facts(keywords.get(None, CLEAN), *(keywords.get(key, CLEAN) for key in names))
++
+         leaf = name.rsplit('.', 1)[-1]
+         if leaf in {'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
+             label = 'render_template' if leaf.startswith('render_template') else ('Flask Response' if leaf == 'Response' else leaf)
+             content = (join_facts(*arguments, *keywords.values()) if leaf.startswith('render_template')
+-                       else first if arguments else keywords.get('content', keywords.get('response', CLEAN)))
++                       else source_argument('content', 'response', 'body'))
+             self.effect('xss', node, label, content)
+         elif leaf in {'execute', 'executemany', 'text'} and name.split('.')[0] in {'cursor', 'session', 'conn', 'engine', 'db'}:
+-            query = first if arguments else keywords.get('sql', keywords.get('query', keywords.get('statement', CLEAN)))
++            query = source_argument('sql', 'query', 'statement', 'operation')
+             self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
+         elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
+-            command = first if arguments else keywords.get('args', CLEAN)
+-            command_node = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == 'args'), None)
+-            shell = next((kw.value for kw in node.keywords if kw.arg == 'shell'), None)
+-            shell_enabled = shell is not None and not (isinstance(shell, ast.Constant) and not shell.value)
+-            if not shell_enabled and isinstance(command_node, (ast.List, ast.Tuple)):
++            command = source_argument('args')
++            command_node = node.args[0] if node.args else keyword_nodes.get('args')
++            shell = keyword_nodes.get('shell')
++            shell_true = isinstance(shell, ast.Constant) and bool(shell.value)
++            shell_unknown = (shell is not None and not isinstance(shell, ast.Constant)) or None in keywords
++            if isinstance(command_node, (ast.List, ast.Tuple)):
++                # A list's first item selects the program or shell command;
++                # later argument side effects must not re-evaluate that item.
+                 command = self.expression_facts.get(command_node.elts[0], CLEAN) if command_node.elts else CLEAN
+-            self.effect('command', node, 'subprocess execution' if shell_enabled else 'subprocess executable', command)
++            executable = join_facts(keywords.get('executable', CLEAN), keywords.get(None, CLEAN))
++            executable_node = keyword_nodes.get('executable')
++            fixed_executable = isinstance(executable_node, ast.Constant) and executable_node.value is not None
++            if (not shell_true or shell_unknown) and not fixed_executable:
++                executable = join_facts(executable, command)
++            shell_code = command if shell_true or shell_unknown else CLEAN
++            if executable:
++                unsafe_shell = frozenset(trace for trace in shell_code if not _safe_for(trace, 'command', 'subprocess execution'))
++                self.effect('command', node, 'subprocess executable', join_facts(executable, unsafe_shell))
++            else:
++                self.effect('command', node, 'subprocess execution', shell_code)
+         elif name in {'os.system', 'os.popen', 'os.execv', 'os.execve', 'os.execvp', 'os.execvpe'}:
+             self.effect('command', node, 'os executable' if leaf.startswith('exec') else 'os command execution', first)
+         elif name in {'eval', 'exec', 'builtins.eval', 'builtins.exec'}:
+-            self.effect('eval', node, leaf, first if arguments else keywords.get('source', CLEAN))
++            self.effect('eval', node, leaf, source_argument('source', 'object'))
+         configurable_html = name == 'bleach.clean' and (
+             len(node.args) > 1 or any(keyword.arg not in {'text', 'strip', 'strip_comments'} for keyword in node.keywords)
+         )
+@@ -366,7 +410,27 @@
+         return fact
+ 
+     def expression(self, node, state):
+-        if node is None or isinstance(node, (ast.Constant, ast.Lambda)):
++        if node is None or isinstance(node, ast.Constant):
++            return CLEAN
++        if isinstance(node, ast.Lambda):
++            signature = node.args
++            positional = [*signature.posonlyargs, *signature.args]
++            defaults = {arg.arg: self.expr(value, state) for arg, value in
++                        zip(positional[len(positional) - len(signature.defaults):], signature.defaults)}
++            defaults.update({arg.arg: self.expr(value, state) for arg, value in
++                             zip(signature.kwonlyargs, signature.kw_defaults) if value is not None})
++            self.engine.defaults[node] = defaults
++            return CLEAN
++        if isinstance(node, ast.Compare):
++            self.expr(node.left, state)
++            self.expr(node.comparators[0], state)
++            for comparator in node.comparators[1:]:
++                executed = state.copy()
++                self.expr(comparator, executed)
++                state.replace(_join_states(state, executed))
++            return CLEAN  # A comparison produces a bool, not executable text.
++        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
++            self.expr(node.operand, state)
+             return CLEAN
+         if isinstance(node, ast.Name):
+             return state.get(node.id, CLEAN)
+@@ -445,12 +509,19 @@
+                                          else alias.name if alias.asname else local)
+                 state[local] = CLEAN
+         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
++            if node.value is None:
++                return state  # An annotation alone does not assign a value.
+             fact = self.expr(node.value, state)
+             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+             for target in targets:
+                 self.assign(target, fact, state, node.value)
+         elif isinstance(node, ast.AugAssign):
+             self.assign(node.target, join_facts(self.expr(node.target, state), self.expr(node.value, state)), state)
++        elif isinstance(node, ast.Assert):
++            self.expr(node.test, state)
++            # The message runs only on a raising path. Its sinks matter, but
++            # its assignments cannot sanitize the normal continuation.
++            self.expr(node.msg, state.copy())
+         elif isinstance(node, ast.Expr):
+             self.expr(node.value, state)
+         elif isinstance(node, ast.Return):

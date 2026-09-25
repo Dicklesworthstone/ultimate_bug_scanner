@@ -5,37 +5,18 @@ on:
     branches: [main]
     paths:
       - .github/workflows/python-taint-summaries.yml
+      - test-suite/patches/python-taint-expressions.patch
   workflow_dispatch:
 
-# Preparation only: store verified Git blobs; never update a branch or tag.
+# Validate an exact incremental patch over the landed implementation. This job
+# stores tested Git objects only: it never changes a branch or tag.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  source-snapshot:
-    runs-on: ubuntu-slim
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: main
-          persist-credentials: false
-      - name: Package the current tracked source for offline integration
-        run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/taint-source-head.txt"
-          git ls-files -s > "$RUNNER_TEMP/taint-source-index.txt"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/taint-source-snapshot.tar.gz"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: python-taint-source-snapshot
-          path: ${{ runner.temp }}/taint-source-*
-          retention-days: 3
-
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write
     env:
       UBS_NO_AUTO_UPDATE: '1'
       PYTHONDONTWRITEBYTECODE: '1'
@@ -44,68 +25,49 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Refresh concurrent Go/Rust integrity changes when a queued run starts.
           ref: main
           fetch-depth: 0
           persist-credentials: false
-      - name: Install test dependencies
+      - name: Install scanner dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
           npm install --global @ast-grep/cli
-      - name: Reproduce the defect and install the exact locally tested candidate
+      - name: Check current base and apply the reviewed incremental patch
         run: |
           python3 - <<'PY'
-          import base64
           import hashlib
-          import json
           import os
           import subprocess
           from pathlib import Path
-
           scratch = Path(os.environ['RUNNER_TEMP'])
           source = Path('modules/helpers/ubs_core/analyzers/taint_py.py')
+          patch = Path('test-suite/patches/python-taint-expressions.patch')
           print('TAINT_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
-
-          def blob(sha, digest):
-              payload = json.loads(subprocess.check_output(['gh', 'api', f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True))
-              assert payload['encoding'] == 'base64', payload
-              data = base64.b64decode(payload['content'])
-              actual = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              assert actual == sha, (actual, sha)
-              assert hashlib.sha256(data).hexdigest() == digest
-              return data
-
-          original = subprocess.check_output(['git', 'hash-object', str(source)], text=True).strip()
-          final_sha = '452b1f1d5cc20b6e8935ee75409fdbc97960d75e'
-          assert original in {'015bab0cb85ff614ac22b2bf45dc759be82242a7', final_sha}, original
-          lint_args = ['shellcheck', '-S', 'warning', 'ubs', 'modules/lib/ubs-common.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          lint = subprocess.run(lint_args, text=True, capture_output=True)
+          assert hashlib.sha256(patch.read_bytes()).hexdigest() == '5904fb09f83501a8fd3bef2c2e36e9b145e5b1fd181df4cab25ed1e2942bc081'
+          actual = subprocess.check_output(['git', 'hash-object', str(source)], text=True).strip()
+          original = '4d9f3848eb1f999ea553b91987642d983718f1d5'
+          candidate = 'db1903210787528f7017793e8a5d5c2cfa7f9e9f'
+          assert actual in {original, candidate}, f'Refusing to overwrite concurrent analyzer changes: {actual}'
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          lint = subprocess.run(['shellcheck', '-S', 'warning', *scripts], text=True, capture_output=True)
           (scratch / 'taint-lint-before.log').write_text(lint.stdout + lint.stderr)
-          if original != final_sha:
-              baseline = subprocess.run(['python3', '-m', 'unittest', 'test_taint_python_dataflow.SanitizerDomainTests.test_html_escaping_is_not_sql_command_or_eval_sanitization', '-v'],
-                                        env=dict(os.environ, PYTHONPATH='test-suite/quality'), text=True, capture_output=True)
-              (scratch / 'taint-before.log').write_text(baseline.stdout + baseline.stderr)
-              print(baseline.stdout + baseline.stderr, flush=True)
-              assert baseline.returncode != 0 and 'FAIL: test_html_escaping_is_not_sql_command_or_eval_sanitization' in baseline.stderr
-              source.write_bytes(blob('e1ba1b65fad0b2f06aaad04c450f6846fba507bc', '87db9606ff53b24986089d21faecb9fbc1f176b5a6de8dd3a8545bbab944fe09'))
-              patches = (
-                  ('370ee09b7c0479238b6f368338bcfde39fd3c5cc', '85222634f663786a5589de542b1674bbe384ae846057e3c97acffa27d71ab92e', 'cc800e864e1b0340d600eb6219dccb9cf28cd403f8f0083e1d701cf613ea0c6a'),
-                  ('ace148adf9fa55e3941c9023b092981dcf09a0ff', '2a65b5bae742af83755487166f5acf20287836831cd6b7362dd93617244e6da1', 'd470030808b64c0f08cda10a4fbe977af38d7618dc07e3e06f158494b3bb00f0'),
-                  ('e5ee73815dbcf8123ebe1b8e79984fd83fd1b0b1', '0449bf751821a61bad8fd97be523c2aabac8416e3ec769582619f065aeb6f15d', '1c07d019e6cea4a84cf71a29a37ec818896b397204c6b55c333eaa36cc4af05a'),
-              )
-              for index, (sha, digest, expected_source) in enumerate(patches):
-                  patch = scratch / f'taint-candidate-{index}.patch'
-                  patch.write_bytes(blob(sha, digest))
-                  subprocess.run(['git', 'apply', '--unidiff-zero', '--check', str(patch)], check=True)
-                  subprocess.run(['git', 'apply', '--unidiff-zero', str(patch)], check=True)
-                  assert hashlib.sha256(source.read_bytes()).hexdigest() == expected_source
-          assert hashlib.sha256(source.read_bytes()).hexdigest() == '1c07d019e6cea4a84cf71a29a37ec818896b397204c6b55c333eaa36cc4af05a'
+          if actual == original:
+              before = subprocess.run(['python3', '-m', 'unittest', 'test_taint_python_expressions', '-v'],
+                                      env=dict(os.environ, PYTHONPATH='test-suite/quality'), text=True, capture_output=True)
+              (scratch / 'taint-before.log').write_text(before.stdout + before.stderr)
+              print(before.stdout + before.stderr, flush=True)
+              assert before.returncode != 0
+              assert 'FAIL: test_annotation_only_does_not_assign_a_clean_value' in before.stderr
+              assert 'FAIL: test_subprocess_executable_override_is_a_separate_sink' in before.stderr
+              subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
+              subprocess.run(['git', 'apply', str(patch)], check=True)
+          assert hashlib.sha256(source.read_bytes()).hexdigest() == '106c22cbc29fa499bfc52abfc835d8701f6ede08f9cd09099de0cf56285ed2f8'
           compile(source.read_bytes(), str(source), 'exec')
           PY
           ./scripts/update_checksums.sh
           ./scripts/update_sha256sums.sh
-      - name: Run source controls, legacy self-tests, and real scanner integration
+      - name: Run source regressions, original self-tests, and actual scanner
         run: |
           UBS_TAINT_E2E=1 python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v
           PYTHONPATH=modules/helpers python3 - <<'PY'
@@ -133,7 +95,7 @@ jobs:
               args.extend(['--case', name])
           subprocess.run(args, check=True)
           PY
-      - name: Verify the entire integrity chain and store tested blobs only
+      - name: Verify the complete checksum closure and store tested blobs
         run: |
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
@@ -145,14 +107,14 @@ jobs:
           import subprocess
           from pathlib import Path
           scratch = Path(os.environ['RUNNER_TEMP'])
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
           for script in scripts:
               subprocess.run(['bash', '-n', script], check=True)
           lint = subprocess.run(['shellcheck', '-S', 'warning', *scripts], text=True, capture_output=True)
-          lint_text = lint.stdout + lint.stderr
-          (scratch / 'taint-lint-after.log').write_text(lint_text)
+          text = lint.stdout + lint.stderr
+          (scratch / 'taint-lint-after.log').write_text(text)
           before = (scratch / 'taint-lint-before.log').read_text()
-          assert sorted(re.findall(r'\bSC\d+\b', lint_text)) == sorted(re.findall(r'\bSC\d+\b', before)), 'ShellCheck diagnostic codes changed'
+          assert sorted(re.findall(r'\bSC\d+\b', text)) == sorted(re.findall(r'\bSC\d+\b', before)), 'ShellCheck diagnostic codes changed'
           subprocess.run(['git', 'diff', '--check'], check=True)
           diff = subprocess.check_output(['git', 'diff'])
           (scratch / 'taint-tested.diff').write_bytes(diff)
@@ -170,8 +132,8 @@ jobs:
               sha = json.loads(result.stdout)['sha']
               assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
               mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
-              print('TAINT_FINAL_TESTED_BLOB', mode, name, sha, flush=True)
-          print('TAINT_FINAL_VALIDATION_PASS', flush=True)
+              print('TAINT_INCREMENTAL_TESTED_BLOB', mode, name, sha, flush=True)
+          print('TAINT_INCREMENTAL_VALIDATION_PASS', flush=True)
           PY
       - name: Package tracked source and diagnostics
         if: always()
@@ -182,7 +144,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: python-taint-final-validation
+          name: python-taint-incremental-validation
           path: |
             ${{ runner.temp }}/taint-source-*
             ${{ runner.temp }}/taint-*.log

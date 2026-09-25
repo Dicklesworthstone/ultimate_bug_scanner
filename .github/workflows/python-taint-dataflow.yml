@@ -4,167 +4,34 @@ on:
   push:
     branches: [main]
     paths:
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - test-suite/quality/test_taint_python_dataflow.py
+      - test-suite/quality/test_taint_python_summaries.py
+      - test-suite/quality/test_taint_python_expressions.py
       - .github/workflows/python-taint-dataflow.yml
   workflow_dispatch:
 
-# The preparation run stores tested Git blobs, never changes a branch or tag.
-# Publication is a separate fast-forward commit after reviewing these results.
+# The original preparation candidate was superseded by the implementation in
+# 266a647. Validate the checked-in source, never reinstall that older candidate.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+  source-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
-      UBS_NO_AUTO_UPDATE: "1"
-      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
           persist-credentials: false
-      - name: Install test dependencies
+      - name: Check the actual committed analyzer
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
-          npm install --global @ast-grep/cli
-      - name: Record Beads priorities and reproduce the security defects
-        run: |
-          echo "TAINT_BASE $(git rev-parse HEAD)"
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          for line in Path('.beads/issues.jsonl').read_text().splitlines():
-              issue = json.loads(line)
-              if issue.get('status') in {'open', 'in_progress'}:
-                  print('OPEN_BEAD', issue['id'], issue.get('priority'), issue['title'])
-                  if 'taint' in issue['title'].lower() or 'dataflow' in issue['title'].lower():
-                      print(issue.get('description', ''))
-          PY
-          if PYTHONPATH=test-suite/quality python3 -m unittest test_taint_python_dataflow.SanitizerDomainTests.test_html_escaping_is_not_sql_command_or_eval_sanitization -v > "$RUNNER_TEMP/taint-before.log" 2>&1; then
-            cat "$RUNNER_TEMP/taint-before.log"
-            echo 'Expected the original sanitizer-domain defect to reproduce' >&2
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/taint-before.log"
-          grep -q '^FAIL: test_html_escaping_is_not_sql_command_or_eval_sanitization' "$RUNNER_TEMP/taint-before.log"
-          shellcheck -S warning ubs modules/lib/ubs-common.sh modules/ubs-*.sh > "$RUNNER_TEMP/taint-lint-before.log" 2>&1 || true
-      - name: Install the exact reviewed candidate in the validation checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import base64
-          import hashlib
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-          name = 'modules/helpers/ubs_core/analyzers/taint_py.py'
-          before = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
-          assert before == '015bab0cb85ff614ac22b2bf45dc759be82242a7', before
-          sha = 'e1ba1b65fad0b2f06aaad04c450f6846fba507bc'
-          raw = subprocess.check_output(['gh', 'api', f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True)
-          blob = json.loads(raw)
-          assert blob['encoding'] == 'base64'
-          data = base64.b64decode(blob['content'])
-          assert hashlib.sha256(data).hexdigest() == '87db9606ff53b24986089d21faecb9fbc1f176b5a6de8dd3a8545bbab944fe09'
-          compile(data, name, 'exec')
-          Path(name).write_bytes(data)
-          PY
-          ./scripts/update_checksums.sh
-          ./scripts/update_sha256sums.sh
-      - name: Run source regressions, original self-tests, and real-runner integration
-        run: |
-          UBS_TAINT_E2E=1 python3 -m unittest discover -s test-suite/quality -p test_taint_python_dataflow.py -v
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v
           PYTHONPATH=modules/helpers python3 - <<'PY'
           from ubs_core.analyzers.taint_py import SELF_TESTS
           for name, test in SELF_TESTS:
               test()
               print('LEGACY_SELFTEST_PASS', name)
           PY
-          python3 -m unittest discover -s test-suite/quality -p test_suppression_intervals.py -v
-          python3 -m unittest discover -s test-suite/quality -p test_ubs_core.py -v
-      - name: Run Python taint manifest cases without changing expectations
-        run: |
-          python3 - <<'PY'
-          import json
-          import subprocess
-          from pathlib import Path
-          cases = json.loads(Path('test-suite/manifest.json').read_text())['cases']
-          selected = [case['id'] for case in cases if case.get('enabled', True)
-                      and ('python' in case['id'] or case['id'].startswith('py-'))
-                      and 'taint' in json.dumps(case).lower()]
-          print('TAINT_MANIFEST_CASES', selected, flush=True)
-          assert selected, 'No Python taint manifest cases found'
-          args = ['python3', 'test-suite/run_manifest.py']
-          for name in selected:
-              args.extend(['--case', name])
-          subprocess.run(args, check=True)
-          PY
-      - name: Verify the complete integrity chain and lint parity
-        run: |
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-          bash -n ubs
-          bash -n modules/lib/ubs-common.sh
-          for module in modules/ubs-*.sh; do bash -n "$module"; done
-          shellcheck -S warning ubs modules/lib/ubs-common.sh modules/ubs-*.sh > "$RUNNER_TEMP/taint-lint-after.log" 2>&1 || true
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP'])
-          before = re.findall(r'\bSC\d+\b', (root / 'taint-lint-before.log').read_text())
-          after = re.findall(r'\bSC\d+\b', (root / 'taint-lint-after.log').read_text())
-          assert sorted(before) == sorted(after), (before, after)
-          print('ShellCheck diagnostic codes unchanged from baseline:', len(after))
-          PY
-          git diff --check
-          git diff > "$RUNNER_TEMP/taint-tested.diff"
-          ./scripts/update_checksums.sh
-          ./scripts/update_sha256sums.sh
-          git diff > "$RUNNER_TEMP/taint-idempotent.diff"
-          cmp "$RUNNER_TEMP/taint-tested.diff" "$RUNNER_TEMP/taint-idempotent.diff"
-      - name: Store fully tested blobs without changing any branch
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'modules/helpers/ubs_core/analyzers/taint_py.py'}
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert changed <= allowed, changed - allowed
-          assert 'modules/helpers/ubs_core/analyzers/taint_py.py' in changed
-          for name in sorted(changed):
-              data = Path(name).read_bytes()
-              payload = json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'})
-              result = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                                      input=payload, text=True, capture_output=True, check=True, timeout=90)
-              blob = json.loads(result.stdout)
-              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              assert blob['sha'] == expected, (name, blob)
-              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
-              print('TAINT_TESTED_BLOB', mode, name, blob['sha'], flush=True)
-          PY
-      - name: Package the public source snapshot and diagnostic logs
-        if: always()
-        run: |
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/taint-source-snapshot.tar.gz"
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: python-taint-validation
-          path: |
-            ${{ runner.temp }}/taint-source-snapshot.tar.gz
-            ${{ runner.temp }}/taint-*.log
-            ${{ runner.temp }}/taint-*.diff
-          retention-days: 3

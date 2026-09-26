@@ -152,6 +152,103 @@ def check_rules_dir_custom_rule_in_sarif() -> None:
         report("rules_dir_custom_rule_in_sarif", "custom.no-console" in rule_ids, f"exit={proc.returncode} rule_ids={sorted(rule_ids)[:6]}", proc)
 
 
+def write_js_rule(directory: Path, rule_id: str, pattern: str, severity: str = "warning") -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{rule_id.rsplit('.', 1)[-1]}.yml").write_text(
+        f"id: {rule_id}\nlanguage: javascript\nseverity: {severity}\n"
+        f"message: {rule_id} fired\nrule:\n  pattern: {pattern}\n",
+        encoding="utf-8",
+    )
+
+
+def custom_rule_ids(proc: subprocess.CompletedProcess) -> set[str]:
+    try:
+        doc = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        proc.stderr += f"\n[test] {exc}"
+        return set()
+    return {f.get("rule_id", "") for f in doc.get("findings", []) if f.get("rule_id", "").startswith(("custom.", "pack."))}
+
+
+def check_rules_sources_repeatable_and_env() -> None:
+    # Every --rules source contributes; UBS_RULES supplies the sources when no
+    # --rules is given, and an explicit --rules wins over it.
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        write_js_rule(root / "a", "custom.log", "console.log($$$)")
+        write_js_rule(root / "b" / "nested", "custom.alert", "alert($$$)")
+        target = root / "app.js"
+        target.write_text('console.log("x");\nalert("y");\n', encoding="utf-8")
+        args = ["--only=js", "--ci", "--format=json"]
+        both = {"custom.log", "custom.alert"}
+        cli = run([*args, f"--rules={root / 'a'}", f"--rules={root / 'b'}", str(target)], env={"UBS_RULES": None})
+        env = run([*args, str(target)], env={"UBS_RULES": f"{root / 'a'},{root / 'b'}"})
+        override = run([*args, f"--rules={root / 'a'}", str(target)], env={"UBS_RULES": str(root / "b")})
+        results = {"cli": custom_rule_ids(cli), "env": custom_rule_ids(env), "override": custom_rule_ids(override)}
+        ok = results["cli"] == both and results["env"] == both and results["override"] == {"custom.log"}
+        report("rules_sources_repeatable_and_env", ok, f"{results}", cli if results["cli"] != both else env)
+
+
+def check_rules_duplicate_id_refused() -> None:
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        write_js_rule(root / "a", "custom.log", "console.log($$$)")
+        write_js_rule(root / "b", "custom.log", "console.info($$$)")
+        target = root / "app.js"
+        target.write_text('console.log("x");\n', encoding="utf-8")
+        proc = run(["--only=js", "--ci", "--format=json", f"--rules={root / 'a'}", f"--rules={root / 'b'}", str(target)], env={"UBS_RULES": None})
+        try:
+            reason = json.loads(proc.stdout).get("reason")
+        except json.JSONDecodeError:
+            reason = None
+        report("rules_duplicate_id_refused", proc.returncode == 2 and reason == "duplicate-rule-id", f"exit={proc.returncode} reason={reason}", proc)
+
+
+def check_rules_git_pack() -> None:
+    # A git rule pack is fetched once, honours sgconfig.yml ruleDirs (its
+    # rule-tests are not rules), and keeps working from the cache when the
+    # remote is gone; without a cached copy the scan is refused.
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        pack = root / "pack"
+        write_js_rule(pack / "rules" / "js", "pack.no-fetch-user", "fetchUser($$$)", severity="error")
+        (pack / "sgconfig.yml").write_text("ruleDirs:\n  - rules\n", encoding="utf-8")
+        (pack / "rule-tests").mkdir()
+        (pack / "rule-tests" / "no-fetch-user-test.yml").write_text(
+            "id: pack.no-fetch-user\nvalid:\n  - loadUser(1)\ninvalid:\n  - fetchUser(1)\n", encoding="utf-8")
+        run_git(["init", "--quiet", "-b", "main"], cwd=pack)
+        run_git(["add", "-A"], cwd=pack)
+        run_git(["-c", "user.name=UBS Test", "-c", "user.email=ubs-test@example.invalid", "-c", "commit.gpgsign=false",
+                 "commit", "--quiet", "-m", "pack"], cwd=pack)
+        run_git(["tag", "v1"], cwd=pack)
+        sha = run_git(["rev-parse", "HEAD"], cwd=pack).stdout.decode().strip()
+        target = root / "app.js"
+        target.write_text("fetchUser(1);\n", encoding="utf-8")
+        env = {"UBS_RULES": None, "UBS_CACHE_DIR": str(root / "cache"), "UBS_RULES_TTL": "0"}
+        args = ["--only=js", "--ci", "--format=json"]
+        url = f"git+{pack.as_uri()}"
+        tag = run([*args, f"--rules={url}@v1", str(target)], env=env)
+        pinned = run([*args, f"--rules={url}@{sha}", str(target)], env=env)
+        subdir = run([*args, f"--rules={url}#subdirectory=rules/js", str(target)], env=env)
+        shutil.move(str(pack), str(root / "gone"))
+        offline = run([*args, f"--rules={url}@v1", str(target)], env=env)
+        missing = run([*args, f"--rules={url}@v2", str(target)], env=env)
+        try:
+            missing_reason = json.loads(missing.stdout).get("reason")
+        except json.JSONDecodeError:
+            missing_reason = None
+        want = {"pack.no-fetch-user"}
+        results = {name: (proc.returncode, sorted(custom_rule_ids(proc))) for name, proc in
+                   (("tag", tag), ("pinned", pinned), ("subdir", subdir), ("offline", offline))}
+        ok = (
+            all(rc == 1 and set(ids) == want for rc, ids in results.values())
+            and "using cached commit" in offline.stderr
+            and missing.returncode == 2 and missing_reason == "rules-source-unavailable"
+        )
+        failed = next((p for p in (tag, pinned, subdir, offline) if custom_rule_ids(p) != want), missing)
+        report("rules_git_pack", ok, f"{results} missing={missing.returncode}/{missing_reason}", failed)
+
+
 def check_include_ext_forwarded() -> None:
     with tempfile.TemporaryDirectory(prefix="ubs-ext-") as tmp:
         proj = Path(tmp) / "proj"
@@ -2207,6 +2304,9 @@ def main() -> int:
         check_output_file_positional,
         check_output_flag_json,
         check_rules_dir_custom_rule_in_sarif,
+        check_rules_sources_repeatable_and_env,
+        check_rules_duplicate_id_refused,
+        check_rules_git_pack,
         check_include_ext_forwarded,
         check_list_categories,
         check_env_skip_type_narrowing,

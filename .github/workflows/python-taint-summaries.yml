@@ -12,8 +12,8 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-slim
-    timeout-minutes: 15
+    runs-on: macos-14
+    timeout-minutes: 30
     permissions:
       contents: write
     env:
@@ -25,6 +25,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install actual-scanner dependencies
+        run: |
+          brew install bash jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+          echo "$(brew --prefix bash)/bin" >> "$GITHUB_PATH"
       - name: Validate reviewed runtime and store its complete integrity tree
         run: |
           python3 - <<'PY'
@@ -65,7 +73,7 @@ jobs:
                   return json.load(response)
 
           def run(command, label, **kwargs):
-              result = subprocess.run(command, text=True, capture_output=True, timeout=240, **kwargs)
+              result = subprocess.run(command, text=True, capture_output=True, timeout=600, **kwargs)
               output = result.stdout + result.stderr
               (scratch / ('runtime-' + label + '.log')).write_text(output)
               print(label, 'exit', result.returncode, flush=True)
@@ -78,8 +86,8 @@ jobs:
           actual_ids = {name: git('hash-object', name) for name in before_ids}
           if actual_ids != after_ids:
               assert actual_ids == before_ids, ('Upstream source changed; reconcile before applying', actual_ids)
-              # Binary transport of a reviewed source patch. Verify each Git
-              # object and both complete digests before parsing or applying it.
+              # Verify every immutable chunk and both complete digests before
+              # parsing or applying the reviewed three-file source patch.
               chunks = '''
               92b00645c2ebc1c618b0a4432700141612f039d7
               674d322c41254bda94e704c73f458fb535024705
@@ -128,12 +136,15 @@ jobs:
               subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
               subprocess.run(['git', 'apply', str(patch)], check=True)
           assert {name: git('hash-object', name) for name in after_ids} == after_ids
-          run([sys.executable, '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
-               '-p', 'test_taint_python_*.py', '-v'], 'source-tests')
-          run([sys.executable, '-c', 'from ubs_core.analyzers.taint_py import SELF_TESTS\nfor name, test in SELF_TESTS:\n test(); print(name, "PASS")'],
-              'legacy-tests', env=dict(os.environ, PYTHONPATH='modules/helpers'))
           run([sys.executable, 'scripts/update_checksums.py'], 'generate-checksums')
           run(['./scripts/update_sha256sums.sh'], 'generate-release-checksums')
+          run([sys.executable, '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
+               '-p', 'test_taint_python_*.py', '-v'], 'source-and-runner-tests',
+              env=dict(os.environ, UBS_TAINT_E2E='1'))
+          run([sys.executable, '-c', 'from ubs_core.analyzers.taint_py import SELF_TESTS\nfor name, test in SELF_TESTS:\n test(); print(name, "PASS")'],
+              'legacy-tests', env=dict(os.environ, PYTHONPATH='modules/helpers'))
+          run([sys.executable, 'test-suite/run_manifest.py', '--case', 'python-taint-buggy',
+               '--case', 'python-taint-clean'], 'manifest')
           run(['./scripts/verify_checksums.sh'], 'verify-assets')
           run(['./scripts/verify_sha256sums.sh'], 'verify-release')
           for script in scripts:

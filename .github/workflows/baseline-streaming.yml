@@ -1,0 +1,150 @@
+name: Baseline Streaming
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/findings_merge.py
+      - test-suite/quality/test_findings*.py
+      - .github/workflows/baseline-streaming.yml
+  workflow_dispatch:
+
+# Store tested immutable objects only; never write refs, tags or commits.
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Apply exact reviewed streaming implementation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          before = {
+              'modules/helpers/ubs_core/findings_merge.py': '59540b8fbcd899faa6d9729117b1b55eb1b2246d',
+              'test-suite/quality/test_findings_integrity.py': '89544800a8c3895e7d9d38a48f3af926274a8db1',
+          }
+          after = {
+              'modules/helpers/ubs_core/findings_merge.py': 'b284c368544445b6fb13423d4b11610d5a613b97',
+              'test-suite/quality/test_findings_integrity.py': 'e5283a7a762fdf7a407244ac0cc0b249d906f69f',
+          }
+          def identities():
+              return {name: subprocess.check_output(['git', 'hash-object', name], text=True).strip()
+                      for name in before}
+          assert identities() == before, ('Source changed; reconcile before applying', identities())
+          chunks = '''
+          925cc7eff355f6fc39d56c51b8b315b4143a125b
+          f4eb2a23afdb762e81e3ff89cf98a6cb249489de
+          43ac77e3a720a47ec0b327600b8ee91cbefe8558
+          a109db4f3ed77db5be1a0adf7edc808df74461b7
+          37e0417049113ceca8a9223b7f3d3172065a0531
+          f227abe053d2d7046366cbdb38251d052608e9d7
+          '''.split()
+          pieces = []
+          for sha in chunks:
+              payload = json.loads(subprocess.check_output(
+                  ['gh', 'api', f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True, timeout=90))
+              raw = base64.b64decode(payload['content'])
+              assert hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest() == sha
+              pieces.append(raw)
+          archive = b''.join(pieces)
+          assert hashlib.sha1(b'blob ' + str(len(archive)).encode() + b'\0' + archive).hexdigest() == '9a5fea2e785d04c8c0c675b4c2baa7da3d431cf8'
+          patch = gzip.decompress(archive)
+          assert hashlib.sha256(patch).hexdigest() == '5fe4acc08c2233b4f68ad51b11ccf9f43f63450773ac27b29e409741d1bd8c87'
+          Path(os.environ['RUNNER_TEMP'], 'stream-reviewed.patch').write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          assert identities() == after, identities()
+          PY
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Validate streaming memory and real scanner integration
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/stream-findings-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/stream-core-tests.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/stream-manifest.log"
+      - name: Verify lint and deterministic integrity closure
+        run: |
+          git diff --check
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff > "$RUNNER_TEMP/stream-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/stream-regenerated.diff"
+          cmp "$RUNNER_TEMP/stream-tested.diff" "$RUNNER_TEMP/stream-regenerated.diff"
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Store only tested immutable objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/findings_merge.py', 'test-suite/quality/test_findings_integrity.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, sorted(set(changed) - allowed)
+          def store(kind, payload):
+              response = subprocess.check_output(
+                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/{kind}", '--input', '-'],
+                  input=json.dumps(payload), text=True, timeout=90)
+              return json.loads(response)['sha']
+          records = []
+          for name in changed:
+              raw = Path(name).read_bytes()
+              expected = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              sha = store('blobs', {'content': raw.decode('utf-8'), 'encoding': 'utf-8'})
+              assert sha == expected, (name, sha, expected)
+              mode, before = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[:2]
+              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before})
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          tree = store('trees', {'base_tree': base_tree,
+                                'tree': [{k: v for k, v in record.items() if k != 'before'} for record in records]})
+          manifest = {'base': base, 'tree': tree, 'files': records}
+          Path(os.environ['RUNNER_TEMP'], 'stream-publication.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          print('STREAM_VERIFIED_TREE', json.dumps(manifest))
+          PY
+      - name: Preserve diagnostics
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/stream-final.diff"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/stream-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-streaming-${{ github.sha }}
+          path: ${{ runner.temp }}/stream-*
+          retention-days: 3

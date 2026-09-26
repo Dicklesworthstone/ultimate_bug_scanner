@@ -41,7 +41,7 @@ SINK_PY = "\n".join([
         "suppressed": False,
     }),
     "",  # blank lines are skipped
-    "not json at all",  # malformed lines are skipped
+    # Malformed payloads have their own fail-closed regression cases.
     json.dumps({"language": "python", "files": 1, "critical": 0}),  # summary object: skipped
 ]) + "\n"
 
@@ -196,7 +196,12 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertEqual([f["fingerprint"] for f in self.read_report(combined)["findings"]], expected)
             baseline = root / "baseline.json"
             baseline.write_text(json.dumps(expected[:4200]), encoding="utf-8")
-            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            # This ledger contains Python warnings, not the shared fixture's
+            # unrelated JavaScript critical finding.
+            counts = {"files": 1, "critical": 0, "warning": len(indices), "info": 0}
+            combined.write_text(json.dumps({
+                "scanners": [{"language": "python", **counts}], "totals": counts,
+            }), encoding="utf-8")
             self.assertEqual(merge(root, combined, baseline_path=baseline, new_only=True), 5)
             doc = self.read_report(combined)
             self.assertEqual([f["fingerprint"] for f in doc["findings"]], expected[4200:])
@@ -699,7 +704,7 @@ class FindingsMergeTests(unittest.TestCase):
                     for has_scanner in (True, False):
                         with self.subTest(severity=severity, suppressed=suppressed, has_scanner=has_scanner):
                             original_totals = {"files": 1, "critical": 0, "warning": 0, "info": 0}
-                            original_totals[severity] = 3
+                            original_totals[severity] = 0 if suppressed else 3
                             combined.write_text(json.dumps({
                                 "scanners": [{"language": "swift", **original_totals}] if has_scanner else [],
                                 "totals": original_totals,
@@ -862,7 +867,9 @@ class FindingsMergeTests(unittest.TestCase):
             sink = tmp_dir / "python.findings.json"
             sink.write_text(SINK_PY, encoding="utf-8")
             combined = tmp_dir / "combined.json"
-            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            counts = {"files": 1, "critical": 0, "warning": 1, "info": 0}
+            summary = {"scanners": [{"language": "python", **counts}], "totals": counts}
+            combined.write_text(json.dumps(summary), encoding="utf-8")
 
             # First merge: save as baseline
             merge(tmp_dir, combined)
@@ -872,7 +879,7 @@ class FindingsMergeTests(unittest.TestCase):
 
             # Second merge with new_only=True and same finding: should filter out
             combined2 = tmp_dir / "combined2.json"
-            combined2.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            combined2.write_text(json.dumps(summary), encoding="utf-8")
             count = merge(tmp_dir, combined2, baseline_path=base_file, new_only=True)
             self.assertEqual(count, 0)
             doc2 = self.read_report(combined2)
@@ -890,7 +897,9 @@ class FindingsMergeTests(unittest.TestCase):
             }) + "\n"
             sink.write_text(sink2_content, encoding="utf-8")
             combined3 = tmp_dir / "combined3.json"
-            combined3.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            counts = {"files": 2, "critical": 1, "warning": 1, "info": 0}
+            summary = {"scanners": [{"language": "python", **counts}], "totals": counts}
+            combined3.write_text(json.dumps(summary), encoding="utf-8")
             count = merge(tmp_dir, combined3, baseline_path=base_file, new_only=True)
             self.assertEqual(count, 1)
             doc3 = self.read_report(combined3)

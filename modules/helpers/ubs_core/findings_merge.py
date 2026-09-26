@@ -20,6 +20,7 @@ import re
 import sqlite3
 import tempfile
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -52,7 +53,9 @@ def normalize_statement(statement: str) -> str:
 
 
 def _relative_path(path: str, project_dir: str | Path = "", *, resolve_links: bool = True) -> str:
-    p_str = str(path or "").strip()
+    # Whitespace is valid filename data. Stripping it aliases distinct source
+    # files and can make a baseline suppress a genuinely new file.
+    p_str = str(path or "")
     if p_str.startswith("file://"):
         p_str = p_str[7:]
     if not project_dir:
@@ -91,7 +94,9 @@ def _extract_statement(
             p = None if relative.is_absolute() or ".." in relative.parts else Path(source_root, relative)
         else:
             p = Path(path)
-            if not p.is_file() and project_dir:
+            # The scan root owns relative paths, not the caller's cwd. A
+            # same-named unrelated file must never supply the fingerprint.
+            if not p.is_absolute() and project_dir:
                 p = Path(project_dir, path)
         if p is not None and p.is_file():
             try:
@@ -124,31 +129,128 @@ def _ast_report_sources(doc: dict) -> list[tuple[str, list[dict]]]:
     return reports
 
 
-def load_baseline_fingerprints(baseline_path: str | Path) -> set[str]:
-    fps: set[str] = set()
+def _baseline_records(baseline_path: str | Path) -> list[tuple[str, dict]]:
+    """Read baseline identities without discarding their accounting metadata."""
     if not baseline_path:
-        return fps
+        return []
     p = Path(baseline_path)
-    if not p.is_file():
-        return fps
     try:
-        data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return fps
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read baseline {p}: {exc}") from exc
     if isinstance(data, dict):
-        items = list(data.get("findings", []))
+        records = data.get("findings", [])
+        if not isinstance(records, list):
+            raise ValueError(f"baseline {p}: findings must be an array")
+        items = [("counted", record) for record in records]
         for _, records in _ast_report_sources(data):
-            items.extend(records)
-        for item in items:
-            if isinstance(item, dict) and item.get("fingerprint"):
-                fps.add(str(item["fingerprint"]))
+            items.extend(("report", record) for record in records)
     elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict) and item.get("fingerprint"):
-                fps.add(str(item["fingerprint"]))
-            elif isinstance(item, str):
-                fps.add(item)
-    return fps
+        # An explicit fingerprint list has no producer/channel metadata. Its
+        # identities remain usable for single source occurrences, not for
+        # arbitrary positive project weights.
+        items = [("*" if isinstance(record, str) else "counted", record) for record in data]
+    else:
+        raise ValueError(f"baseline {p}: expected a report object or fingerprint array")
+    records = []
+    for channel, item in items:
+        fp = item.get("fingerprint") if isinstance(item, dict) else item
+        if not isinstance(fp, str) or not fp:
+            raise ValueError(f"baseline {p}: every finding requires a nonempty fingerprint")
+        records.append((channel, item if isinstance(item, dict) else {"fingerprint": fp}))
+    return records
+
+
+def load_baseline_fingerprints(baseline_path: str | Path) -> set[str]:
+    """Return recorded identities; merge uses their richer matching policy below."""
+    return {record["fingerprint"] for _, record in _baseline_records(baseline_path)}
+
+
+@dataclass(frozen=True)
+class _BaselineAllowance:
+    scope: str | None
+    severity: int | None
+    count: int
+
+
+class _BaselineFilter:
+    """Match already-known occurrences, not just equal fingerprint strings.
+
+    Suppressed baseline records cannot license active findings. A severity
+    increase is a new diagnostic, and an aggregate can only subtract the
+    recorded number of occurrences. Counted and report-only AST channels are
+    separate so advisory evidence cannot suppress a newly counted defect.
+    """
+
+    _LEVELS = {"info": 0, "warning": 1, "critical": 2}
+
+    def __init__(self, baseline_path: str | Path = "") -> None:
+        self._allowances: dict[tuple[str, str, str], _BaselineAllowance] = {}
+        self._remaining: dict[tuple[str, str, str], int] = {}
+        for channel, record in _baseline_records(baseline_path):
+            suppressed = record.get("suppressed", False)
+            if not isinstance(suppressed, bool):
+                raise ValueError("baseline finding suppressed must be a boolean")
+            if suppressed:
+                continue
+            severity = record.get("severity")
+            if "severity" in record and severity not in ("info", "warning", "critical"):
+                raise ValueError("baseline finding severity must be critical, warning or info")
+            scope = record.get("scope", "source")
+            if scope not in ("source", "project", "project_aggregate"):
+                raise ValueError("baseline finding has an invalid scope")
+            if scope in ("project", "project_aggregate"):
+                count = record.get("count")
+                if (not isinstance(count, int) or isinstance(count, bool)
+                        or (count != 0 if scope == "project" else count <= 0)):
+                    raise ValueError("baseline project finding has an invalid occurrence count")
+            else:
+                count = 1
+                if set(record) == {"fingerprint"}:
+                    scope = None
+            key = (channel, str(record.get("lang") or ""), record["fingerprint"])
+            allowance = _BaselineAllowance(scope, self._LEVELS.get(severity), count)
+            if key in self._allowances and self._allowances[key] != allowance:
+                raise ValueError(f"baseline has conflicting records for fingerprint {key[-1]}")
+            # Duplicate records are not additional occurrence credit.
+            self._allowances[key] = allowance
+            self._remaining[key] = count
+
+    def retain(self, finding: dict, channel: str = "counted") -> dict | None:
+        if not self._allowances:
+            # Nothing can be removed. Preserve unfiltered, already-normalized
+            # AST reports that historically allow an omitted fingerprint.
+            return finding
+        fp = finding.get("fingerprint")
+        if not isinstance(fp, str) or not fp:
+            raise ValueError("finding requires a nonempty fingerprint before baseline filtering")
+        lang = str(finding.get("lang") or "")
+        key = next((key for key in ((channel, lang, fp), (channel, "", fp),
+                                   ("*", lang, fp), ("*", "", fp))
+                    if key in self._allowances), None)
+        if key is None:
+            return finding
+        allowance = self._allowances[key]
+        scope = finding.get("scope", "source")
+        if allowance.scope is not None and allowance.scope != scope:
+            return finding
+        severity = finding.get("severity", "warning")
+        if severity not in ("info", "warning", "critical"):
+            raise ValueError("finding severity must be critical, warning or info")
+        if allowance.severity is not None and self._LEVELS[severity] > allowance.severity:
+            return finding
+        if scope == "project":
+            return None  # Zero-count notes never consume occurrence credit.
+        if scope == "project_aggregate" and allowance.scope != scope:
+            return finding  # A bare fingerprint cannot prove any project weight.
+        count = _occurrence_count(finding)
+        matched = min(count, self._remaining[key])
+        self._remaining[key] -= matched
+        if matched == count:
+            return None
+        if matched and scope == "project_aggregate":
+            return {**finding, "count": count - matched}
+        return finding
 
 
 def _looks_like_finding(rec: object) -> bool:
@@ -160,20 +262,31 @@ def _looks_like_finding(rec: object) -> bool:
 
 
 def load_sink(sink: Path) -> Iterator[dict]:
-    """Read one record at a time, skipping blank/malformed/non-finding lines."""
+    """Stream findings, accepting blanks and summaries but rejecting corrupt data.
+
+    A truncated record is not an empty result. In particular, silently
+    skipping it lets baseline filtering publish zero counts for a failed
+    producer. Include the physical line in errors and let merge's atomic
+    publication preserve the original summary.
+    """
     try:
-        with sink.open(encoding="utf-8", errors="replace") as source:
-            for line in source:
+        with sink.open(encoding="utf-8") as source:
+            for line_no, line in enumerate(source, 1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     rec = json.loads(line)
-                except ValueError:
-                    continue
+                except ValueError as exc:
+                    raise ValueError(f"invalid findings sink {sink}:{line_no}: {exc}") from exc
                 if _looks_like_finding(rec):
                     yield rec
-    except OSError as exc:
+                elif not (isinstance(rec, dict) and "language" in rec
+                          and any(key in rec for key in ("files", "critical", "warning", "info"))
+                          and not any(key in rec for key in ("rule", "rule_id", "path", "file"))):
+                    raise ValueError(f"invalid findings sink {sink}:{line_no}: "
+                                     "expected a finding with rule/path or a module summary")
+    except (OSError, UnicodeError) as exc:
         raise ValueError(f"cannot read findings sink {sink}: {exc}") from exc
 
 
@@ -246,6 +359,41 @@ def _occurrence_count(finding: dict) -> int:
     return 1
 
 
+def _validate_baseline_coverage(doc: dict, observed: dict[str, dict[str, int]]) -> None:
+    """Do not erase occurrences for which no fingerprint was actually read.
+
+    Weighted project aggregates account for all their active occurrences,
+    even when the baseline removes them. Suppressed records and report-only
+    AST evidence never supply proof of the summary's active counts.
+    A summary may undercount its ledger, but never the reverse: unseen
+    occurrences cannot be declared pre-existing (or absent).
+    """
+    severities = ("critical", "warning", "info")
+
+    def check(summary: dict, available: dict[str, int], label: str) -> None:
+        for severity in severities:
+            declared = summary.get(severity, 0)
+            if not isinstance(declared, int) or isinstance(declared, bool) or declared < 0:
+                raise ValueError(f"cannot apply baseline: {label} {severity} count "
+                                 "must be a nonnegative integer")
+            accounted = available.get(severity, 0)
+            if declared > accounted:
+                raise ValueError(f"cannot apply baseline: {label} reports {declared} {severity} "
+                                 f"occurrences but the findings ledger accounts for {accounted}")
+
+    scanners = doc.get("scanners", []) or []
+    if not isinstance(scanners, list) or any(not isinstance(s, dict) for s in scanners):
+        raise ValueError("cannot apply baseline: scanners must be an array of objects")
+    for scanner in scanners:
+        lang = str(scanner.get("language") or "")
+        check(scanner, observed.get(lang, {}), lang or "unnamed scanner")
+    totals = doc.get("totals", {})
+    if not isinstance(totals, dict):
+        raise ValueError("cannot apply baseline: totals must be an object")
+    check(totals, {severity: sum(counts.get(severity, 0) for counts in observed.values())
+                   for severity in severities}, "combined summary")
+
+
 def _normalize(
     rec: dict,
     lang: str,
@@ -259,6 +407,14 @@ def _normalize(
         # Validate original types before ordinary source normalization can
         # turn malformed line/count metadata into an apparently valid zero.
         _validate_project_record(rec)
+    if not isinstance(rec.get("rule"), str) or not rec["rule"].strip():
+        raise ValueError("finding requires a nonempty rule id")
+    if not isinstance(rec.get("path"), str):
+        raise ValueError("finding requires a string source path")
+    if rec.get("severity", "warning") not in ("critical", "warning", "info"):
+        raise ValueError("finding severity must be critical, warning or info")
+    if not isinstance(rec.get("suppressed", False), bool):
+        raise ValueError("finding suppressed must be a boolean")
     rule = str(rec.get("rule", ""))
     path = str(rec.get("path", ""))
     try:
@@ -317,6 +473,8 @@ def merge(
         raise ValueError(f"combined summary is not valid JSON: {combined_path}: {exc}") from exc
     if not isinstance(doc, dict):
         raise ValueError("combined summary is not a JSON object")
+    if new_only and not baseline_path:
+        raise ValueError("new-only filtering requires a baseline path")
 
     # A monolith may contribute thousands of findings. Decode and split it
     # once, rather than once per finding. Keep only eight recent source files,
@@ -328,7 +486,8 @@ def merge(
     ordinals = _OccurrenceOrdinals()
     count = 0
     counts_by_lang: dict[str, dict[str, int]] = {}
-    base_fps = load_baseline_fingerprints(baseline_path) if baseline_path and new_only else set()
+    observed_by_lang: dict[str, dict[str, int]] = {}
+    baseline = _BaselineFilter(baseline_path if new_only else "")
     try:
         # The normalized ledger can be much larger than its source tree. Keep
         # it on disk throughout: neither raw records, normalized records nor
@@ -341,9 +500,15 @@ def merge(
                     saw_record = True
                     finding = _normalize(rec, lang, source_lines, project_dir=project_dir,
                                          ordinals=ordinals, source_root=source_root)
+                    observed = observed_by_lang.setdefault(lang, {"critical": 0, "warning": 0, "info": 0})
+                    # Summary counts are suppression-aware. A suppressed
+                    # record cannot account for missing active diagnostics.
+                    if not finding["suppressed"]:
+                        observed[finding["severity"]] += _occurrence_count(finding)
                     # Assign occurrence ordinals BEFORE filtering. Otherwise
                     # duplicates after a baseline match acquire its identity.
-                    if finding["fingerprint"] in base_fps:
+                    finding = baseline.retain(finding)
+                    if finding is None:
                         continue
                     findings.write(json.dumps(finding) + "\n")
                     count += 1
@@ -366,11 +531,13 @@ def merge(
                                              ordinals=ordinals, source_root=source_root)
                     else:
                         raise ValueError("AST report finding requires a rule id and source path")
-                    if not base_fps or finding["fingerprint"] not in base_fps:
+                    finding = baseline.retain(finding, "report")
+                    if finding is not None:
                         normalized.append(finding)
                 records[:] = normalized
 
             if baseline_path and new_only:
+                _validate_baseline_coverage(doc, observed_by_lang)
                 # Accumulate the same weighted totals without grouping copies
                 # of every finding by language. Report-only AST evidence never
                 # contributes to these counters.
@@ -382,8 +549,10 @@ def merge(
                 if not isinstance(doc.get("totals"), dict):
                     doc["totals"] = {}
                 for severity in ("critical", "warning", "info"):
-                    totals_source = doc.get("scanners") or counts_by_lang.values()
-                    doc["totals"][severity] = sum(int(s.get(severity, 0) or 0) for s in totals_source)
+                    # Include every producer, even if its scanner metadata is
+                    # absent; the ledger, not a partial metadata list, defines
+                    # the retained findings.
+                    doc["totals"][severity] = sum(counts[severity] for counts in counts_by_lang.values())
                 # Execution state is invariant under baseline filtering (#104).
 
             if count or ast_reports or (baseline_path and new_only):

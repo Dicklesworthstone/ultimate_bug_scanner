@@ -873,7 +873,10 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
     """
     packages = defaultdict(list)
     seen = set()
-    for path in sorted(files, key=lambda item: str(item.resolve())):
+    # Keep independent packages in the caller's selection order, like the
+    # other structured analyzers. Sorting the entire selection reorders
+    # unrelated source files (and the legacy entrypoint's capped samples).
+    for path in files:
         identity = path.resolve()
         if path.suffix.lower() not in EXTS or identity in seen:
             continue
@@ -888,6 +891,9 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
         packages[(identity.parent, package)].append((path, source, code))
 
     for units in packages.values():
+        # Package initialization and synthetic offsets must still be stable
+        # when the caller presents the same package files in another order.
+        units.sort(key=lambda unit: str(unit[0].resolve()))
         sources, codes, starts, locations, functions, global_nodes = [], [], [], [], [], []
         offset = 0
         for path, source, code in units:

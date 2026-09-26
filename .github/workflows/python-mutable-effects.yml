@@ -4,17 +4,20 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/python-mutable-effects.patch
-      - test-suite/patches/python-callable-effects.patch
-      - test-suite/patches/python-interpreter-processes.patch
-      - test-suite/patches/python-process-vectors-stdin.patch
-      - test-suite/patches/baseline-integrity.patch.gz
+      - ubs
+      - modules/ubs-*.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/test_taint_python_*.py
+      - test-suite/quality/test_taint_go_*.py
+      - test-suite/quality/test_findings*.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_ubs_core.py
       - .github/workflows/python-mutable-effects.yml
   workflow_dispatch:
 
-# Publish immutable verified objects only. No branch, tag, or commit writes.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -28,49 +31,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Record exact input source
+      - name: Record exact production source
         run: |
           git rev-parse HEAD > "$RUNNER_TEMP/mutable-base.txt"
           git ls-files -s > "$RUNNER_TEMP/mutable-base-index.txt"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/mutable-source-before.tar.gz"
       - name: Install real scanner dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
           npm install --global @ast-grep/cli
-      - name: Apply reviewed mutation, callable, process, and argv/stdin implementations
+      - name: Verify the committed integrity chain before testing
         run: |
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = bd8aa2c2b515df2da74a1e665e63d9a9802dad00
-          test "$(git hash-object test-suite/patches/python-mutable-effects.patch)" = cea449f50962c96301557faeb825660ecc164078
-          test "$(git hash-object test-suite/patches/python-callable-effects.patch)" = 8019041f1f888b00df60ca42aa92b31ac2ad44f2
-          test "$(git hash-object test-suite/patches/python-interpreter-processes.patch)" = 1ff2642a881314b32f67203d8706bed00e66c879
-          test "$(git hash-object test-suite/patches/python-process-vectors-stdin.patch)" = 062e8b0e8ed50194847278e281e2f33a8c12e171
-          for patch in python-mutable-effects python-callable-effects python-interpreter-processes python-process-vectors-stdin; do
-            git apply --check "test-suite/patches/$patch.patch"
-            git apply "test-suite/patches/$patch.patch"
-          done
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ea327a121f4a00ff07d29f68f4d6163689b9b66d
-      - name: Apply reviewed baseline integrity and regression implementation
-        run: |
-          python3 - <<'PY'
-          import gzip
-          import hashlib
-          from pathlib import Path
-          import subprocess
-          before = {
-              'modules/helpers/ubs_core/findings_merge.py': '4c38c48653ca6bbeadc0702f1c8205d8298ca63d',
-              'test-suite/quality/test_findings_merge.py': '62f03a91ae2d8e8abb6576435d1e6633a9150069',
-          }
-          for name, expected in before.items():
-              actual = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
-              assert actual == expected, (name, actual, expected)
-          patch = gzip.decompress(Path('test-suite/patches/baseline-integrity.patch.gz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == '149de7483ecc0542b12016c94d15c6969282747965e8021c722b65725652dd06'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          PY
-          python3 scripts/update_checksums.py
-          ./scripts/update_sha256sums.sh
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
       - name: Run all current Python taint and real JSON/SARIF regressions
@@ -88,6 +59,7 @@ jobs:
           set -o pipefail
           python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-findings-tests.log"
           python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-suppression-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go_*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-go-tests.log"
           python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-core-tests.log"
           python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/mutable-manifest.log"
       - name: Verify deterministic complete integrity closure
@@ -102,65 +74,6 @@ jobs:
           cmp "$RUNNER_TEMP/mutable-tested.diff" "$RUNNER_TEMP/mutable-regenerated.diff"
           for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
           shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
-      - name: Store only verified objects for atomic publication
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          scratch = Path(os.environ['RUNNER_TEMP'])
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          tests = {f'test-suite/quality/test_taint_python_{name}.py' for name in ('effects', 'callables', 'processes')}
-          tests.add('test-suite/quality/test_findings_integrity.py')
-          changed.update(tests)
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_py.py',
-                     'modules/helpers/ubs_core/findings_merge.py',
-                     'test-suite/quality/test_findings_merge.py'} | tests
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert changed <= allowed, sorted(changed - allowed)
-          def store(endpoint, payload):
-              response = subprocess.run(
-                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/{endpoint}", '--input', '-'],
-                  input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=90)
-              return json.loads(response.stdout)['sha']
-          records = []
-          for name in sorted(changed):
-              raw = Path(name).read_bytes()
-              expected = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
-              index = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
-              mode, before = (index[0], index[1]) if index else ('100644', None)
-              sha = store('blobs', {'content': raw.decode('utf-8'), 'encoding': 'utf-8'})
-              assert sha == expected, (name, sha, expected)
-              record = {'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before}
-              records.append(record)
-              print('MUTABLE_TESTED_BLOB', json.dumps(record), flush=True)
-          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-          tree = store('trees', {'base_tree': base_tree,
-                                'tree': [{key: value for key, value in record.items() if key != 'before'} for record in records]})
-          manifest = {'base': base, 'tree': tree, 'source': 'ea327a121f4a00ff07d29f68f4d6163689b9b66d', 'files': records}
-          (scratch / 'mutable-publication.json').write_text(json.dumps(manifest, indent=2) + '\n')
-          print('MUTABLE_TESTED_TREE', json.dumps(manifest), flush=True)
-          PY
-      - name: Preserve source and diagnostics
-        if: always()
-        run: |
-          git diff > "$RUNNER_TEMP/mutable-final.diff"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/mutable-source-after.tar.gz"
-          for name in effects callables processes; do
-            if [[ -f "test-suite/quality/test_taint_python_$name.py" ]]; then
-              cp "test-suite/quality/test_taint_python_$name.py" "$RUNNER_TEMP/mutable-$name-tests.py"
-            fi
-          done
-          if [[ -f test-suite/quality/test_findings_integrity.py ]]; then
-            cp test-suite/quality/test_findings_integrity.py "$RUNNER_TEMP/mutable-findings-integrity-tests.py"
-          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

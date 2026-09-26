@@ -215,6 +215,33 @@ class PackageFlowTests(PackageTestCase):
         self.assertEqual(normal[0]['col'], 12)
         self.assertEqual(self.scan([second, first, second]), normal)
 
+    def test_independent_packages_preserve_selection_order_and_deduplicate(self):
+        body = 'package app\nfunc h() { db.Query(r.FormValue("q")) }\n'
+        first = self.source('z/same.go', body)
+        second = self.source('a/same.go', '// another selected source\n' + body)
+        for selected in ([first, second, first], [second, first, second]):
+            with self.subTest(selected=selected):
+                findings = self.scan(iter(selected))
+                expected = list(dict.fromkeys(selected))
+                self.assertEqual([f['path'] for f in findings], [str(p) for p in expected])
+                self.assertEqual([f['line'] for f in findings],
+                                 [2 if p == first else 3 for p in expected])
+                self.assertEqual([f['rule'] for f in findings], ['go.taint.sql'] * 2)
+
+    def test_package_local_analysis_remains_stable_under_reversed_selection(self):
+        source = self.source('a.go', '''
+            package app
+            var query = r.FormValue("q")
+            func source() string { return query }
+        ''')
+        sink = self.source('z.go', '''
+            package app
+            func handler() { db.Query(source()) }
+            func output() { fmt.Fprint(w, source()) }
+        ''')
+        expected = self.assert_hits([('z.go', 2, 'go.taint.sql'), ('z.go', 3, 'go.taint.xss')])
+        self.assertEqual(self.scan([sink, source, sink]), expected)
+
     def test_profile_can_disable_package_finding(self):
         self.source('a.go', 'package app\nfunc h() { db.Query(r.FormValue("q")) }\n')
         self.assertEqual(self.scan(profile={'disabled_rules': ['go.taint.sql']}), [])

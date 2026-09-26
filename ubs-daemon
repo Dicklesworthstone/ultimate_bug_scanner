@@ -16,8 +16,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import selectors
 import signal
+import selectors
 import shutil
 import socket
 import stat
@@ -348,34 +348,68 @@ def run_scanner(root: Path, scanner: Path, paths: list[Path], options: list[str]
             **{name: data.decode('utf-8', 'replace') for name, data in output.items()}}
 
 
+class _Cancellation:
+    """Combine service shutdown and one client's cancellation without a monitor thread."""
+
+    def __init__(self, *events):
+        self.events = tuple(event for event in events if event is not None)
+
+    def is_set(self):
+        return any(event.is_set() for event in self.events)
+
+
 class ScanService:
-    def __init__(self, root: Path, scanner: Path, timeout: float, cache_bytes: int):
+    def __init__(self, root: Path, scanner: Path, timeout: float, cache_bytes: int, jobs: int = 1):
         self.root, self.scanner = root, scanner
         self.root_identity = identity(root)
         self.environment = environment_key()
         self.timeout, self.cache_bytes = timeout, cache_bytes
         self.cache = OrderedDict()
         self.cache_size = 0
-        self.stopping = False
+        self.jobs = jobs
+        self._stop = threading.Event()
+        self._cache_lock = threading.Lock()
+
+    @property
+    def stopping(self):
+        return self._stop.is_set()
+
+    @stopping.setter
+    def stopping(self, value):
+        if value:
+            self._stop.set()
+
+    def stop(self):
+        self._stop.set()
+
+    def check_root(self):
+        try:
+            unchanged = identity(self.root) == self.root_identity
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            self.stop()
+            raise ServiceError('Served repository root has been replaced')
 
     def handle(self, request: dict, *, cancel: threading.Event | None = None) -> dict:
         if type(request.get('protocol')) is not int or request['protocol'] != PROTOCOL or request.get('root') != str(self.root):
             raise ServiceError('Protocol or repository mismatch')
-        if identity(self.root) != self.root_identity:
-            self.stopping = True
-            raise ServiceError('Served repository root has been replaced')
+        self.check_root()
         op = request.get('op')
         if not isinstance(op, str):
             raise ServiceError('Invalid service operation')
         if op in {'status', 'stop'}:
+            if set(request) - {'protocol', 'op', 'root'}:
+                raise ServiceError('Unknown lifecycle request fields')
             if op == 'stop':
-                self.stopping = True
+                self.stop()
             return {'protocol': PROTOCOL, 'root': str(self.root), 'pid': os.getpid(), 'status': 'stopping' if self.stopping else 'ready'}
         if op != 'scan':
             raise ServiceError('Unknown service operation')
-        check_cancelled(cancel)
-        if self.stopping:
-            raise ServiceError('Scanner cancelled: service is stopping')
+        cancellation = _Cancellation(self._stop, cancel)
+        cancelled = cancellation.is_set
+        if cancelled():
+            raise ServiceError('Scanner request cancelled')
         paths, options = validate_scan(self.root, request)
         if request.get('environment') != self.environment or request.get('scanner') != str(self.scanner):
             return {'protocol': PROTOCOL, 'unavailable': 'Invocation environment or scanner differs from the daemon'}
@@ -385,31 +419,38 @@ class ScanService:
         # reuse only when callers explicitly disable those optional tools.
         live_audit = request.get('format', 'json') == 'text' and os.environ.get('ENABLE_UV_TOOLS') != '0' \
             and any(path.suffix.lower() in {'.py', '.pyi', '.pyw', '.ipynb'} for path in paths)
-        before = snapshot(self.root, self.scanner, cancel=cancel) if self.cache_bytes and not live_audit else None
-        check_cancelled(cancel)
+        before = snapshot(self.root, self.scanner, cancel=cancellation) if self.cache_bytes and not live_audit else None
+        check_cancelled(cancellation)
         key = (tuple(map(str, paths)), tuple(options), before)
-        cached = self.cache.pop(key, None) if before is not None else None
+        with self._cache_lock:
+            cached = self.cache.pop(key, None) if before is not None else None
+            if cached is not None:
+                self.cache[key] = cached
         if cached is not None:
-            self.cache[key] = cached
             result = dict(cached[0], cached=True)
         else:
-            result = run_scanner(self.root, self.scanner, paths, options, self.timeout, cancel=cancel)
-            check_cancelled(cancel)
-            if identity(self.root) != self.root_identity:
-                self.stopping = True
-                raise ServiceError('Served repository root changed during the scan')
+            result = run_scanner(self.root, self.scanner, paths, options, self.timeout,
+                                 cancel=cancellation)
+            check_cancelled(cancellation)
+            self.check_root()
             # Never cache environment failures or scans spanning a source edit.
-            after = snapshot(self.root, self.scanner, cancel=cancel) if before is not None else None
-            check_cancelled(cancel)
+            after = snapshot(self.root, self.scanner, cancel=cancellation) if before is not None else None
+            check_cancelled(cancellation)
             result['cached'] = False
-            if before is not None and before == after and result['exit_code'] in (0, 1):
+            if before is not None and before == after and result['exit_code'] in (0, 1) and not cancelled():
                 size = len(json.dumps(result).encode())
-                while self.cache and self.cache_size + size > self.cache_bytes:
-                    _, (_, removed) = self.cache.popitem(last=False)
-                    self.cache_size -= removed
-                if size <= self.cache_bytes:
-                    self.cache[key] = (result.copy(), size)
-                    self.cache_size += size
+                with self._cache_lock:
+                    previous = self.cache.pop(key, None)
+                    if previous is not None:
+                        self.cache_size -= previous[1]
+                    while self.cache and self.cache_size + size > self.cache_bytes:
+                        _, (_, removed) = self.cache.popitem(last=False)
+                        self.cache_size -= removed
+                    if size <= self.cache_bytes:
+                        self.cache[key] = (result.copy(), size)
+                        self.cache_size += size
+        if cancelled():
+            raise ServiceError('Scanner request cancelled')
         return dict(result, protocol=PROTOCOL, elapsed_ms=round((time.monotonic() - started) * 1000, 3))
 
 
@@ -426,22 +467,22 @@ class ServiceConnection:
         self.sent = 0
         self.scan = False
         self.cancel = threading.Event()
+        self.scan_key = None
 
 
 def serve_connections(service: ScanService, listener: socket.socket, idle_timeout: float) -> None:
-    """Keep controls responsive while one worker owns scanning and the LRU.
+    """Bound scan concurrency and retain at most one reply per configured worker.
 
-    Request frames and replies never block the listener. Bound connections,
-    admitted scans, queue wait and absolute I/O time. Retain at most one scan
-    reply in the transport: a stalled reader cannot accumulate large reports.
-    Queue overload is exit 2, not 'unavailable' (which would trigger fallback).
+    Lifecycle and framing stay on the selector thread. Identical requests are
+    serialized, not blindly given another client's result: each waiter still
+    validates its inputs and the complete cache snapshot when it starts.
     """
     peers = set()
     pending = deque()
-    active = None
+    active = {}
     last_request = time.monotonic()
     listener.setblocking(False)
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='ubs-scan')
+    executor = ThreadPoolExecutor(max_workers=service.jobs, thread_name_prefix='ubs-scan')
     with selectors.DefaultSelector() as selector:
         selector.register(listener, selectors.EVENT_READ)
 
@@ -485,18 +526,18 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                         selector.unregister(listener)
                     except KeyError:
                         pass
-                    if active is not None:
-                        active[0].cancel.set()
+                    for peer in active:
+                        peer.cancel.set()
                     for peer in list(peers):
                         if peer.phase in {'read', 'queued'}:
                             peer.cancel.set()
                             reply(peer, failure('Scanner cancelled: service is stopping'))
-                if active is not None and active[1].done():
-                    peer, future = active
-                    active = None
-                    if peer in peers and peer.phase == 'running':
-                        reply(peer, future.result())
-                    last_request = now
+                for peer, future in list(active.items()):
+                    if future.done():
+                        del active[peer]
+                        if peer in peers and peer.phase == 'running':
+                            reply(peer, future.result())
+                        last_request = now
                 for peer in list(peers):
                     if now >= peer.deadline:
                         if peer.phase == 'write':
@@ -506,19 +547,30 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                             message = 'Scanner queue wait exceeded service limit' if peer.phase == 'queued' \
                                 else 'Service request timed out'
                             reply(peer, failure(message))
-                # Do not retain stale/disconnected entries in the pending deque.
                 pending = deque(peer for peer in pending if peer in peers and peer.phase == 'queued')
-                if not service.stopping and active is None and pending \
-                        and not any(peer.scan and peer.phase == 'write' for peer in peers):
+                # Count undelivered replies as worker reservations. A stalled
+                # reader cannot accumulate unbounded reports by cycling jobs.
+                occupied = len(active) + sum(peer.scan and peer.phase == 'write' for peer in peers)
+                busy_keys = {peer.scan_key for peer in active}
+                for _ in range(len(pending)):
+                    if service.stopping or occupied >= service.jobs:
+                        break
                     peer = pending.popleft()
+                    if peer.scan_key in busy_keys:
+                        pending.append(peer)
+                        continue
                     peer.phase = 'running'
-                    peer.deadline = float('inf')  # The supervisor owns the scan deadline.
-                    active = (peer, executor.submit(scan, peer))
-                if not peers and active is None:
+                    peer.deadline = float('inf')
+                    active[peer] = executor.submit(scan, peer)
+                    occupied += 1
+                    busy_keys.add(peer.scan_key)
+                if not peers and not active:
                     if service.stopping or now - last_request >= idle_timeout:
                         break
                 for key, _ in selector.select(min(0.05, idle_timeout)):
                     if key.fileobj is listener:
+                        if service.stopping:
+                            continue
                         try:
                             connection, _ = listener.accept()
                         except BlockingIOError:
@@ -557,8 +609,7 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                             if peer.socket.recv(1):
                                 peer.cancel.set()
                                 raise ServiceError('Only one request is allowed per connection')
-                            # A write-half-close is valid after a complete frame.
-                            # Register for writes again when its response is ready.
+                            # Preserve the established write-half-close contract.
                             selector.unregister(peer.socket)
                             continue
                         chunk = peer.socket.recv(min(65536, peer.expected - len(peer.input)))
@@ -581,13 +632,18 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                                 raise ServiceError('Scanner queue is full; retry later')
                             peer.scan = True
                             peer.request = request
+                            # Scheduling only: this key never authorizes reuse.
+                            # Canonical validation and byte snapshots remain in
+                            # the worker so queued edits are seen when it runs.
+                            peer.scan_key = json.dumps(request, sort_keys=True, separators=(',', ':'))
                             peer.phase = 'queued'
                             peer.deadline = time.monotonic() + QUEUE_TIMEOUT
                             pending.append(peer)
                         else:
                             response = service.handle(request)
                             if request.get('op') == 'status':
-                                response.update(active_scans=int(active is not None), queued_scans=len(pending))
+                                response.update(active_scans=len(active), queued_scans=len(pending),
+                                                max_scans=service.jobs)
                             reply(peer, response)
                     except BlockingIOError:
                         continue
@@ -596,9 +652,9 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                     except OSError:
                         close(peer)
         finally:
-            service.stopping = True
-            if active is not None:
-                active[0].cancel.set()
+            service.stop()
+            for peer in active:
+                peer.cancel.set()
             for peer in list(peers):
                 close(peer)
             executor.shutdown(wait=True, cancel_futures=True)
@@ -673,12 +729,15 @@ def main(argv=None) -> int:
     parser.add_argument('--idle-timeout', type=float, default=900)
     parser.add_argument('--scan-timeout', type=float, default=120)
     parser.add_argument('--cache-mib', type=int, default=32, help='bounded report cache; 0 disables reuse')
+    parser.add_argument('--jobs', type=int, default=1, help='concurrent scanner processes for serve (1 to 8)')
     args = parser.parse_intermixed_args(argv)
     try:
         if os.name != 'posix' or fcntl is None:
             raise ServiceError('The local scan service requires a POSIX Unix-socket platform')
         if not 0 < args.idle_timeout <= 86400 or not 0 < args.scan_timeout <= 3600 or not 0 <= args.cache_mib <= 256:
             raise ServiceError('Timeouts/cache size are outside permitted bounds')
+        if not 1 <= args.jobs <= 8 or (args.command != 'serve' and args.jobs != 1):
+            raise ServiceError('--jobs applies to serve and must be between 1 and 8')
         if args.command != 'client' and (args.profile is not None or args.fail_on_warning
                                          or args.require_daemon or args.format != 'json'):
             raise ServiceError('Scan policy and report options apply to client requests, not service lifecycle commands')
@@ -689,7 +748,7 @@ def main(argv=None) -> int:
         if args.command == 'serve':
             if args.files:
                 raise ServiceError('serve does not accept source files')
-            service = ScanService(root, scanner, args.scan_timeout, args.cache_mib * 1024 * 1024)
+            service = ScanService(root, scanner, args.scan_timeout, args.cache_mib * 1024 * 1024, args.jobs)
             def stop(_signal, _frame):
                 raise KeyboardInterrupt
             signal.signal(signal.SIGTERM, stop)

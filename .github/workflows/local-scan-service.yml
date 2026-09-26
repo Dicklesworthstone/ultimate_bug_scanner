@@ -6,7 +6,7 @@ on:
     paths:
       - ubs-daemon
       - .claude/hooks/on-file-write.sh
-      - test-suite/quality/test_daemon.py
+      - test-suite/quality/test_daemon*.py
       - .github/workflows/local-scan-service.yml
   workflow_dispatch:
 
@@ -37,7 +37,7 @@ jobs:
         run: |
           bash -n .claude/hooks/on-file-write.sh
           shellcheck -S warning .claude/hooks/on-file-write.sh
-          python3 -m unittest discover -s test-suite/quality -p test_daemon.py -v
+          python3 -m unittest discover -s test-suite/quality -p 'test_daemon*.py' -v
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --exit-code

@@ -618,6 +618,7 @@ class _Scope:
     children: list = field(default_factory=list)
     code: str = ''
     statements: list = field(default_factory=list)
+    parameter_sources: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -653,6 +654,10 @@ def _chunks(code, start, end, separator=','):
             cursor = pairs[cursor] + 1
             continue
         if code[cursor] == separator:
+            if separator == '=' and (code[cursor:cursor + 2] in {'=>', '=='}
+                                     or code[cursor - 1:cursor] in {'=', '!', '<', '>'}):
+                cursor += 1
+                continue
             yield part, cursor
             part = cursor + 1
         cursor += 1
@@ -674,22 +679,42 @@ def _parameters(text, code, start, end):
     return tuple(result)
 
 
-def _binding_names(target):
+def _binding_paths(target, prefix=()):
+    """Keep destructured property names separate from their local aliases."""
     target = target.strip()
     if target.startswith(('{', '[')):
-        names = []
+        bindings = []
         code = lexical_views(target)[1]
         end = target.rfind('}' if target[0] == '{' else ']')
-        for left, right in _chunks(code, 1, end):
+        for index, (left, right) in enumerate(_chunks(code, 1, end)):
             _, equals = next(_chunks(code, left, right, '='))
+            component = str(index)
             if target[0] == '{':
                 _, colon = next(_chunks(code, left, equals, ':'))
+                component = target[left:colon].strip().strip('\'"')
                 if colon < equals:
                     left = colon + 1
-            names.extend(_binding_names(target[left:equals]))
-        return names
+            bindings.extend(_binding_paths(target[left:equals], (*prefix, component)))
+        return bindings
     name = target.removeprefix('...').split(':', 1)[0].rstrip('?').strip()
-    return [name] if re.fullmatch(r'[A-Za-z_$][\w$]*', name) else []
+    return [(name, prefix)] if re.fullmatch(r'[A-Za-z_$][\w$]*', name) else []
+
+
+def _binding_names(target):
+    return [name for name, _ in _binding_paths(target)]
+
+
+def _parameter_sources(text, code, start, end):
+    sources = {}
+    for left, right in _chunks(code, start, end):
+        _, equals = next(_chunks(code, left, right, '='))
+        for name, path in _binding_paths(text[left:equals]):
+            if not path or not all(re.fullmatch(r'[A-Za-z_$][\w$]*', part) for part in path):
+                continue
+            matches = assignment_sources('.'.join(path))
+            if matches:
+                sources[name] = matches[0][0]
+    return sources
 
 
 def _declaration_entries(text, code, start, end):
@@ -704,10 +729,122 @@ def _declaration_entries(text, code, start, end):
     return entries
 
 
+def _signature_body(code, pairs, closing):
+    """Find the implementation body, not a brace inside a TS return type."""
+    cursor = closing + 1
+    while cursor < len(code) and code[cursor].isspace():
+        cursor += 1
+    if code[cursor:cursor + 1] == '{':
+        return cursor
+    if code[cursor:cursor + 1] != ':':
+        return None
+    start, angle = cursor + 1, 0
+    cursor = start
+    while cursor < len(code):
+        char = code[cursor]
+        if char == ';' and not angle:
+            return None
+        if char in '([' and cursor in pairs:
+            cursor = pairs[cursor] + 1
+            continue
+        if char == '<':
+            angle += 1
+        elif char == '>' and code[cursor - 1:cursor] != '=':
+            angle = max(0, angle - 1)
+        elif char == '{':
+            before = code[start:cursor].rstrip()
+            if angle or not before or before[-1:] in {'|', '&', '?', ':'} or before.endswith('=>'):
+                if cursor not in pairs:
+                    return None
+                cursor = pairs[cursor] + 1
+                continue
+            return cursor
+        cursor += 1
+    return None
+
+
+def _type_parameters_end(code, pairs, opening):
+    """Return the end of a balanced generic parameter list, if complete."""
+    depth, cursor = 1, opening + 1
+    while cursor < len(code):
+        char = code[cursor]
+        if char in '([{' and cursor in pairs:
+            cursor = pairs[cursor] + 1
+            continue
+        if char == '<':
+            depth += 1
+        elif char == '>' and code[cursor - 1:cursor] != '=':
+            depth -= 1
+            if depth == 0:
+                return cursor + 1
+        elif char == ';' and depth == 1:
+            return None
+        cursor += 1
+    return None
+
+
+def _signature_arrow(code, pairs, closing):
+    cursor = closing + 1
+    while cursor < len(code) and code[cursor].isspace():
+        cursor += 1
+    if code[cursor:cursor + 2] == '=>':
+        return cursor
+    if code[cursor:cursor + 1] != ':':
+        return None
+    cursor += 1
+    while cursor < len(code):
+        char = code[cursor]
+        if char in '([{' and cursor in pairs:
+            cursor = pairs[cursor] + 1
+            continue
+        if char == '<':
+            after = _type_parameters_end(code, pairs, cursor)
+            if after is None:
+                return None
+            cursor = after
+            continue
+        if code[cursor:cursor + 2] == '=>':
+            return cursor
+        if char in ';=' or (char == '}' and cursor not in pairs):
+            return None
+        cursor += 1
+    return None
+
+
 def _function_scopes(text, code):
     """Recognize bounded lexical function forms; never import scanned code."""
     pairs = _pairs(code)
     scopes, body_starts = [], set()
+    type_ranges = []
+    arrow_parameters = {}
+
+    def parameter_types(start, end):
+        for left, right in _chunks(code, start, end):
+            _, equals = next(_chunks(code, left, right, '='))
+            _, colon = next(_chunks(code, left, equals, ':'))
+            if colon < equals:
+                type_ranges.append((colon + 1, equals))
+
+    for match in re.finditer(r'\b(?:const|let|var)\s+[A-Za-z_$][\w$]*', code):
+        end = expression_end(code, match.start())
+        _, equals = next(_chunks(code, match.end(), end, '='))
+        if code[match.end():equals].lstrip().startswith(':'):
+            type_ranges.append((match.end(), equals))
+    # Callback parameter types must be known before visiting any arrow in
+    # their enclosing signature; they are not executable nested functions.
+    for opening, closing in pairs.items():
+        if opening < closing and code[opening] == '(':
+            if any(left <= opening < right for left, right in type_ranges):
+                continue
+            body = _signature_body(code, pairs, closing)
+            arrow = _signature_arrow(code, pairs, closing)
+            if body is not None or arrow is not None:
+                parameter_types(opening + 1, closing)
+            if body is not None:
+                type_ranges.append((closing + 1, body))
+            elif arrow is not None:
+                type_ranges.append((closing + 1, arrow))
+                arrow_parameters[arrow] = (opening, closing)
 
     def add(start, params_start, params_end, body, name='', declaration=False, concise=False):
         if body in body_starts:
@@ -724,21 +861,32 @@ def _function_scopes(text, code):
         else:
             return
         body_starts.add(body if concise else body - 1)
-        scopes.append(_Scope(start, end, body, body_end, name,
-                             _parameters(text, code, params_start, params_end), declaration, concise))
+        scope = _Scope(start, end, body, body_end, name,
+                       _parameters(text, code, params_start, params_end), declaration, concise)
+        scope.parameter_sources = _parameter_sources(text, code, params_start, params_end)
+        scopes.append(scope)
 
-    for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(', code):
-        opening = match.end() - 1
+    for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?', code):
+        opening = match.end()
+        while opening < len(code) and code[opening].isspace():
+            opening += 1
+        if code[opening:opening + 1] == '<':
+            after = _type_parameters_end(code, pairs, opening)
+            if after is None:
+                continue
+            type_ranges.append((opening, after))
+            opening = after
+            while opening < len(code) and code[opening].isspace():
+                opening += 1
+        if code[opening:opening + 1] != '(':
+            continue
         closing = pairs.get(opening)
         if closing is None:
             continue
-        body = closing + 1
-        while body < len(code) and code[body].isspace():
-            body += 1
-        if code[body:body + 1] == ':':
-            body = code.find('{', body)
-        if body < 0:
+        body = _signature_body(code, pairs, closing)
+        if body is None:
             continue
+        type_ranges.append((closing + 1, body))
         prefix = code[:match.start()].rstrip()
         declaration = not prefix or prefix[-1] in ';{}' or bool(re.search(r'\b(?:export|default|async)\s*$', prefix))
         if '\n' in code[max(prefix.rfind(';'), prefix.rfind('}')) + 1:match.start()] and not re.search(r'=\s*$', prefix):
@@ -746,9 +894,14 @@ def _function_scopes(text, code):
         add(match.start(), opening + 1, closing, body, match.group(1) or '', declaration)
 
     for match in re.finditer(r'=>', code):
+        if any(left <= match.start() < right for left, right in type_ranges):
+            continue
         before = code[:match.start()].rstrip()
         end = len(before)
-        if before.endswith(')') and end - 1 in pairs:
+        if match.start() in arrow_parameters:
+            opening, closing = arrow_parameters[match.start()]
+            start, params_start, params_end = opening, opening + 1, closing
+        elif before.endswith(')') and end - 1 in pairs:
             opening = pairs[end - 1]
             start, params_start, params_end = opening, opening + 1, end - 1
         else:
@@ -762,6 +915,11 @@ def _function_scopes(text, code):
                     continue
                 start = params_start = parameter.start()
                 params_end = parameter.end()
+        # A generic arrow's type-parameter prefix belongs to the function
+        # value, not to its enclosing declaration or a comma-separated RHS.
+        generic = re.search(r'<[^;={}]*>\s*$', code[:start])
+        if generic:
+            start = generic.start()
         body = match.end()
         while body < len(code) and code[body].isspace():
             body += 1
@@ -777,10 +935,8 @@ def _function_scopes(text, code):
         closing = pairs.get(match.end() - 1)
         if closing is None:
             continue
-        body = closing + 1
-        while body < len(code) and code[body].isspace():
-            body += 1
-        if code[body:body + 1] == '{' and body not in body_starts:
+        body = _signature_body(code, pairs, closing)
+        if body is not None and body not in body_starts:
             add(match.start(), match.end(), closing, body)
 
     root = _Scope(0, len(text), 0, len(text), '<module>')
@@ -930,6 +1086,19 @@ class _Flow:
         return frozenset()
 
     def callable(self, start, end, state):
+        # Parentheses around an arrow do not turn it into an unknown callee.
+        # Trim original whitespace: the scope mask also blanks real functions.
+        text = self.engine.text
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        while self.scope.code[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
+            start, end = start + 1, end - 1
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
         for child in self.scope.children:
             if start <= child.start and child.end <= end and self.scope.code[start:child.start].strip() in {'', 'async'}:
                 return child
@@ -1398,6 +1567,17 @@ class _Engine:
         for trace in fact:
             if trace.origin[0] == 'source':
                 result = _join(result, frozenset({trace}))
+            elif trace.origin[0] == 'parameter':
+                _, scope, name = trace.origin
+                source = scope.parameter_sources.get(name)
+                if source:
+                    # Framework entrypoint parameters supply external input.
+                    # Known local calls substitute their actual arguments
+                    # before this point, so a safe call remains safe.
+                    resolved = frozenset({_Trace(('source', source), (source,))})
+                    for step in trace.path:
+                        resolved = _step(resolved, step)
+                    result = _join(result, resolved)
             elif trace.origin[0] == 'free' and trace.origin not in visited:
                 _, scope, name = trace.origin
                 parent = scope.parent

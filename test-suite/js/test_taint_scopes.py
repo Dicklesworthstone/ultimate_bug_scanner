@@ -239,6 +239,119 @@ class JavaScriptScopeTests(unittest.TestCase):
     def test_return_property_is_not_a_return_statement(self):
         self.scan('function f() { iterator.return(req.query.html); }\nres.send(f());')
 
+    def test_function_type_annotation_is_not_an_executable_arrow(self):
+        self.scan('const read: () => string = () => req.query.html;\nres.send(read());', 'xss')
+        self.scan('const clean: (x: string) => string = x => "hello";\nres.send(clean(req.query.html));')
+
+    def test_callback_type_does_not_change_lexical_parent(self):
+        self.scan('const html = req.query.html;\nfunction outer(cb: () => string) {\n'
+                  'function inner() { res.send(html); } }', 'xss')
+
+    def test_generic_arrow_binding_has_return_summary(self):
+        self.scan('const read = <T,>(value: T) => req.query.html;\nres.send(read("hello"));', 'xss')
+
+    def test_parenthesized_arrow_binding_has_return_summary(self):
+        self.scan('const read = ((() => req.query.html));\nres.send(read());', 'xss')
+        self.scan('const clean = ((x => "hello"));\nres.send(clean(req.query.html));')
+
+    def test_object_return_type_is_not_a_function_body(self):
+        self.scan('function identity(x): {html: string} { return x; }\n'
+                  'res.send(identity(req.query));', 'xss')
+
+    def test_nested_generic_object_return_type(self):
+        self.scan('function identity(x): Promise<{html: string}> { return x; }\n'
+                  'res.send(identity(req.query));', 'xss')
+
+    def test_typed_parameter_does_not_gain_a_phantom_default(self):
+        text = 'callback: () => string'
+        params = taint_js._parameters(text, taint_js.lexical_views(text)[1], 0, len(text))
+        self.assertEqual(params, ((('callback',), False, None),))
+
+    def test_typed_parameter_preserves_its_real_default(self):
+        text = 'callback: () => string = fallback'
+        params = taint_js._parameters(text, taint_js.lexical_views(text)[1], 0, len(text))
+        names, rest, default = params[0]
+        self.assertEqual(names, ('callback',))
+        self.assertFalse(rest)
+        self.assertEqual(text[slice(*default)].strip(), 'fallback')
+
+    def test_typed_declaration_preserves_its_real_initializer(self):
+        text = 'const read: () => string = () => req.query.html'
+        entries = taint_js._declaration_entries(text, taint_js.lexical_views(text)[1], 0, len(text))
+        self.assertEqual(len(entries), 1)
+        _, names, begin, end = entries[0]
+        self.assertEqual(names, ['read'])
+        self.assertEqual(text[begin:end].strip(), '() => req.query.html')
+
+    def test_type_arrows_do_not_create_phantom_scopes(self):
+        text = 'const read: () => string = () => req.query.html;'
+        root, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
+        self.assertEqual(len(scopes), 1)
+        self.assertIs(scopes[0].parent, root)
+        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end], 'req.query.html')
+
+    def test_function_return_type_does_not_create_phantom_scopes(self):
+        text = 'function identity(x): () => string { return x; }'
+        _, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end].strip(), 'return x;')
+
+    def test_typed_tuple_and_union_return_bodies(self):
+        for annotation in ('[string, string]', '{html: string} | null',
+                           'Promise<{html: string} | null>', '{html: string} & {id: number}'):
+            with self.subTest(annotation=annotation):
+                self.scan(f'function identity(x): {annotation} {{ return x; }}\n'
+                          'res.send(identity(req.query));', 'xss')
+
+    def test_typed_constant_return_remains_clean(self):
+        self.scan('function clean(x): {html: string} { return {html: "hello"}; }\n'
+                  'res.send(clean(req.query).html);')
+
+    def test_typed_wrapper_keeps_sanitizer_domain(self):
+        self.scan('function escape(x: string): string { return DOMPurify.sanitize(x); }\n'
+                  'res.send(escape(req.query.html)); eval(escape(req.query.html));', 'eval')
+
+    def test_typed_method_has_the_real_body(self):
+        text = 'class Example { read(): {html: string} { return req.query; } }'
+        _, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end].strip(), 'return req.query;')
+
+    def test_parenthesized_named_function_keeps_return_summary(self):
+        self.scan('const read = (function named() { return req.query.html; });\nres.send(read());', 'xss')
+
+    def test_typed_method_function_return_type_has_no_phantom_arrow(self):
+        text = 'class Example { read(): () => string { return value; } }'
+        _, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
+        self.assertEqual(len(scopes), 1)
+        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end].strip(), 'return value;')
+        self.scan('class Example { read(): () => string { res.send(req.query.html); return callback; } }', 'xss')
+        self.scan('class Example { read(): () => string { res.send("hello"); return callback; } }')
+
+    def test_arrow_object_return_type_keeps_argument_and_constant_summaries(self):
+        for annotation in ('{html: string}', 'Promise<{html: string}>', '{html: string} | null'):
+            with self.subTest(annotation=annotation):
+                self.scan(f'const read = (value): {annotation} => ({{html: value}});\n'
+                          'res.send(read(req.query.html));', 'xss')
+                self.scan(f'const clean = (value): {annotation} => ({{html: "hello"}});\n'
+                          'res.send(clean(req.query.html));')
+
+    def test_generic_named_helpers_keep_parameter_and_constant_summaries(self):
+        self.scan('function identity<T>(value: T): T { return value; }\n'
+                  'res.send(identity(req.query.html));', 'xss')
+        self.scan('function clean<T>(value: T): string { return "hello"; }\n'
+                  'res.send(clean(req.query.html));')
+        self.scan('const read = function<T>(value: T): string { return req.query.html; };\n'
+                  'res.send(read("hello"));', 'xss')
+
+    def test_generic_constraints_do_not_create_runtime_arrow_scopes(self):
+        text = 'function read<T extends {callback: () => string}>(value: T): string { return req.query.html; }'
+        _, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
+        self.assertEqual(len(scopes), 1)
+        self.scan(text + '\nres.send(read({}));', 'xss')
+        self.scan('function clean<T extends {html: string}>(value: T): {html: string} '
+                  '{ return {html: "hello"}; }\nres.send(clean(req.query).html);')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

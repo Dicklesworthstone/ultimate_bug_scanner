@@ -422,6 +422,35 @@ class JavaScriptTaintDomainTests(unittest.TestCase):
         self.assert_rules('let value = "safe"; flag ? (value = req.query.value) : 0; eval(value);', 'eval')
         self.assert_rules('let value = req.query.value; flag ? (value = "safe") : (value = "safe"); eval(value);')
 
+    def test_nested_route_parameter_is_a_framework_source(self):
+        findings = self.assert_rules(
+            'export async function route(_request: Request, { params: { tenant } }: Context, db: Database) {\n'
+            '  return db.query("SELECT * FROM memberships WHERE tenant = " + tenant);\n}', 'sql')
+        self.assertEqual((findings[0]['line'], findings[0]['col']), (2, 10))
+        self.assertIn('params.tenant -> tenant', findings[0]['message'])
+
+    def test_nested_route_alias_uses_property_identity_not_local_name(self):
+        findings = self.assert_rules(
+            'const route = (_request, { params: { tenant: selected } }, db) => { db.query(selected); };', 'sql')
+        self.assertIn('params.tenant -> selected', findings[0]['message'])
+        self.assert_rules('function route({ settings: { tenant } }, db) { db.query(tenant); }')
+        self.assert_rules('function route({ params: { unrelated: tenant } }, db) { db.query(tenant); }')
+
+    def test_nested_route_bound_values_and_html_escaping_remain_safe(self):
+        self.assert_rules('function route({ params: { tenant } }, db) { '
+                          'db.query("SELECT * FROM users WHERE tenant = ?", [tenant]); }')
+        self.assert_rules('function route({ params: { tenant } }, res) { res.send(DOMPurify.sanitize(tenant)); }')
+
+    def test_explicit_local_calls_substitute_nested_route_parameters(self):
+        helper = 'function execute({ params: { tenant } }) { db.query(tenant); }\n'
+        self.assert_rules(helper + 'execute({ params: { tenant: "SELECT 1" } });')
+        self.assert_rules(helper + 'execute({ params: { tenant: req.query.sql } });', 'sql')
+
+    def test_existing_nested_route_sql_fixture_remains_detected(self):
+        findings = list(taint_js.scan_file_findings(ROOT / 'test-suite/js/security/sql-injection-buggy.ts'))
+        self.assertIn(('js.taint.sql', 53), [(rule, line) for rule, line, _, _ in findings])
+        self.assertEqual(list(taint_js.scan_file_findings(ROOT / 'test-suite/js/security/sql-injection-clean.ts')), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

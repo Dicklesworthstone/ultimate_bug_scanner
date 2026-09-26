@@ -28,6 +28,7 @@ Parity notes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -249,7 +250,7 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     for analyzer in analyzers_for_lang("go"):
         if analyzer.layer in ("guards", "narrowing") and not enable_new:
             continue
-        if prefilter is not None:
+        if prefilter is not None and analyzer.name != "taint_go":
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:
             target_files = list(files)
@@ -269,6 +270,36 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                 "message": finding.get("message", ""),
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")
+
+
+def _package_cache_context(files: Sequence[Path]) -> str:
+    """Bind cached answers to the selected Go universe, including deletions.
+
+    No directory walks: --files-from/--staged/excludes remain authoritative.
+    Contents are already hashed by ScanCache. This additional key prevents a
+    file hit from a previous, larger or smaller selection reusing stale calls.
+    """
+    selected = sorted({str(path.resolve()) for path in files if path.suffix.lower() == '.go'})
+    payload = json.dumps(selected, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
+
+
+def _expand_package_misses(files, cached_findings, files_to_scan, cache):
+    """A changed helper invalidates every selected Go file in its directory.
+
+    Package names may themselves have changed. Invalidating the directory is
+    conservative and preserves file-local caching for other directories. The
+    analyzer then partitions by the actual package clause before resolving.
+    """
+    changed = {path.resolve().parent for path in files_to_scan if path.suffix.lower() == '.go'}
+    for path in files:
+        if path.suffix.lower() == '.go' and path.resolve().parent in changed:
+            cached_findings.pop(path, None)
+    pending = [path for path in files if path not in cached_findings]
+    hits, total = len(cached_findings), len(files)
+    cache.stats.update(hits=hits, misses=len(pending), total=total,
+                       hit_rate=round(hits / total, 4) if total else 0.0)
+    return pending
 
 
 def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
@@ -916,9 +947,10 @@ def main(argv: list[str] | None = None) -> int:
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
-        extra=f"new_analyzers={args.enable_new_analyzers}",
+        extra=f"new_analyzers={args.enable_new_analyzers};package_inputs={_package_cache_context(files)}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    files_to_scan = _expand_package_misses(files, cached_findings, files_to_scan, cache)
 
     capturing_sink = None
     ast_tally: Counter = Counter()

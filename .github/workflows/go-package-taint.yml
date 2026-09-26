@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - .github/workflows/go-package-taint.yml
-      - test-suite/patches/go-package-taint.patch
-      - test-suite/patches/go-package-tests.py
-      - test-suite/patches/go-initializers.patch
-      - test-suite/patches/go-initializers-tests.py
+      - modules/helpers/ubs_core/analyzers/taint_go.py
+      - modules/helpers/ubs_core/go_scan.py
+      - test-suite/quality/test_taint_go*.py
+      - modules/lib/ubs-common.sh
+      - modules/ubs-golang.sh
+      - ubs
   workflow_dispatch:
 
 permissions:
@@ -18,8 +20,6 @@ jobs:
   package-dataflow:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    permissions:
-      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -27,55 +27,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Retain the exact base sources
-        run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/go-package-source-head.txt"
-          git ls-files -s > "$RUNNER_TEMP/go-package-source-index.txt"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/go-package-source.tar.gz" HEAD
-      - uses: actions/upload-artifact@v4
-        with:
-          name: go-package-base-source
-          path: ${{ runner.temp }}/go-package-source*
-          retention-days: 3
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply reviewed package summaries and initializer fixpoint
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import subprocess
-          def blob(path):
-              return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-          def apply(path):
-              subprocess.run(['git', 'apply', '--check', path], check=True)
-              subprocess.run(['git', 'apply', path], check=True)
-          source = 'modules/helpers/ubs_core/analyzers/taint_go.py'
-          runner = 'modules/helpers/ubs_core/go_scan.py'
-          state = (blob(source), blob(runner))
-          original = ('842527e589c080ad4d93e85c8ad4491ee577096e', 'e253f1628f8bf8067a478abae4b6dc30202fd93c')
-          package = ('30746d92467d897880be6bec6fac04cca07d7fe7', 'bcf9f29e9c926f424229b556ad4dfea5104f3fab')
-          final = ('c0c49d10da545f147813899f997302cf4fefcfbf', 'bcf9f29e9c926f424229b556ad4dfea5104f3fab')
-          assert state in (original, package, final), ('Reconcile changed Go sources before applying', state)
-          if state == original:
-              apply('test-suite/patches/go-package-taint.patch')
-              assert (blob(source), blob(runner)) == package
-          if (blob(source), blob(runner)) == package:
-              apply('test-suite/patches/go-initializers.patch')
-          assert (blob(source), blob(runner)) == final
-          for pending, name, sha in (
-              ('go-package-tests.py', 'test_taint_go_packages.py', '45aa4fa43e65be6e36b436aed27f7908e8889ce7'),
-              ('go-initializers-tests.py', 'test_taint_go_initializers.py', '5992315ddf71eef5d98add44d7e7639754e4d6f8'),
-          ):
-              target = Path('test-suite/quality') / name
-              reviewed = Path('test-suite/patches') / pending
-              assert blob(str(reviewed)) == sha
-              if target.exists():
-                  assert target.read_bytes() == reviewed.read_bytes(), 'Do not overwrite newer tests'
-              else:
-                  target.write_bytes(reviewed.read_bytes())
-          PY
-      - name: Run actual analyzer and incremental-cache regressions
+      - name: Run production analyzer and incremental-cache regressions
         run: |
           python3 -m unittest discover -s test-suite/quality -p 'test_taint_go*.py' -v 2>&1 | tee "$RUNNER_TEMP/go-package-tests.log"
           PYTHONPATH=modules/helpers python3 - <<'PY'
@@ -84,18 +39,21 @@ jobs:
               test()
               print(name, 'PASS')
           PY
-          git diff --check
       - name: Install real scanner dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Regenerate the complete verified runtime chain
+      - name: Verify the committed runtime integrity chain
         run: |
-          python3 scripts/update_checksums.py
-          ./scripts/update_sha256sums.sh
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff --exit-code
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do
+            bash -n "$script"
+          done
       - name: Exercise the real scanner on cross-file source and sink pairs
         run: |
           python3 - <<'PY'
@@ -150,60 +108,6 @@ jobs:
                   print('GO_PACKAGE_E2E_PASS', name, sorted(rules), flush=True)
           PY
           python3 test-suite/run_manifest.py --case golang-taint-buggy --case golang-taint-clean
-      - name: Store only validated content-addressed runtime objects
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          import urllib.request
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          sources = ['modules/helpers/ubs_core/analyzers/taint_go.py', 'modules/helpers/ubs_core/go_scan.py',
-                     'test-suite/quality/test_taint_go_packages.py', 'test-suite/quality/test_taint_go_initializers.py']
-          allowed = set(scripts + sources + ['SHA256SUMS'])
-          changed = set(git('diff', '--name-only').splitlines())
-          untracked = set(git('ls-files', '--others', '--exclude-standard').splitlines())
-          assert changed | untracked <= allowed, (changed | untracked) - allowed
-          for script in scripts:
-              subprocess.run(['bash', '-n', script], check=True)
-          previous = {path: Path(path).read_bytes() for path in allowed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
-          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
-          assert all(Path(path).read_bytes() == data for path, data in previous.items()), 'Non-idempotent checksums'
-          subprocess.run(['./scripts/verify_checksums.sh'], check=True)
-          subprocess.run(['./scripts/verify_sha256sums.sh'], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          subprocess.run(['git', 'add', '--', *sorted(changed | untracked)], check=True)
-          entries = []
-          for path in sorted(changed | untracked):
-              mode = git('ls-files', '-s', '--', path).split()[0]
-              entries.append(dict(path=path, mode=mode, type='blob', sha=git('hash-object', path)))
-          elements = [dict(path=e['path'], mode=e['mode'], type='blob', content=Path(e['path']).read_text()) for e in entries]
-          payload = dict(base_tree=git('rev-parse', 'HEAD^{tree}'), tree=elements)
-          request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + '/git/trees',
-              data=json.dumps(payload).encode(), method='POST',
-              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
-                       'Content-Type': 'application/json'})
-          with urllib.request.urlopen(request, timeout=120) as response:
-              tree = json.load(response)['sha']
-          assert tree == git('write-tree')
-          result = dict(base=git('rev-parse', 'HEAD'), tree=tree, files=entries)
-          (Path(os.environ['RUNNER_TEMP']) / 'go-package-result.json').write_text(json.dumps(result, indent=2))
-          print('GO_PACKAGE_TREE_VALIDATED', json.dumps(result), flush=True)
-          PY
-      - name: Retain exact candidate sources and diagnostics
-        if: always()
-        run: |
-          git diff HEAD > "$RUNNER_TEMP/go-package-runtime.diff"
-          git ls-files -s > "$RUNNER_TEMP/go-package-candidate-index.txt"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/go-package-candidate.tar.gz"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

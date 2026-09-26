@@ -1,11 +1,12 @@
-"""Function-scoped Go taint analysis with local helper summaries (bead D6).
+"""Function-scoped Go taint analysis with package helper summaries (bead D6).
 
 The lexical front end preserves source locations and Go string semantics.
 Statement transfers strongly update assignments, join branches and iterate
-loops and local call summaries to convergence. Sanitizers are specific to the
+loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
-Go type checker; cross-file calls and dynamically invoked closures are not
-resolved. Both output entrypoints consume the same finding stream.
+Go type checker; imported-package calls and dynamically invoked closures are
+not resolved. Only explicitly selected files in the same directory AND package
+share summaries. Both output entrypoints consume the same finding stream.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import ast
 import re
 from bisect import bisect_right
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -313,6 +314,16 @@ class _Parser:
         return tuple(statements)
 
     def statement(self, start: int, end: int):
+        declaration = re.match(r'(var|const)\s*\(', self.code[start:end])
+        if declaration:
+            opening = start + declaration.end() - 1
+            close = self.pairs.get(opening)
+            if close is not None:
+                # A declaration group is not a lexical block. Its individual
+                # specs retain their original offsets and share the scope.
+                body = tuple(replace(node, kind=declaration.group(1))
+                             for node in self.block(opening + 1, close))
+                return _Statement(start, close + 1, 'declarations', body), close + 1
         if self.code[start] == '{' and start in self.pairs:
             close = self.pairs[start]
             return _Statement(start, close + 1, 'block', self.block(start + 1, close)), close + 1
@@ -419,6 +430,33 @@ class _Summary:
     returns: tuple[_Fact, ...] = ()
     effects: dict[tuple[int, str], _Fact] = field(default_factory=dict)
     variadic: int | None = None
+
+
+def _join_summaries(summaries: list[_Summary]) -> _Summary:
+    """Conservatively union selected build variants, never choose by filename.
+
+    Build-tag and GOOS selection belong to the caller's file selection. When
+    mutually exclusive definitions are both selected, neither is proof that a
+    call is clean. Variadic differences are widened rather than dropping args.
+    """
+    variadics = [summary.variadic for summary in summaries if summary.variadic is not None]
+    variadic = min(variadics) if variadics else None
+
+    def widen(fact):
+        if variadic is None:
+            return fact
+        return frozenset(_Trace(trace.source,
+                                min(trace.parameter, variadic) if trace.parameter is not None else None,
+                                trace.path) for trace in fact)
+
+    count = max((len(summary.returns) for summary in summaries), default=0)
+    returns = tuple(_join(*(widen(summary.returns[index]) for summary in summaries
+                            if index < len(summary.returns))) for index in range(count))
+    effects = {}
+    for summary in summaries:
+        for key, fact in summary.effects.items():
+            effects[key] = _join(effects.get(key, _CLEAN), widen(fact))
+    return _Summary(returns, effects, variadic)
 
 
 @dataclass
@@ -597,8 +635,9 @@ class _Analysis:
             facts.append(state.get(scope.bindings.get(name, name), _CLEAN))
         return _join(*facts)
 
-    def simple(self, start: int, end: int, state, scope) -> _Flow:
-        code = self.code[start:end]
+    def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
+        prefix = declaration_kind + ' ' if declaration_kind else ''
+        code = prefix + self.code[start:end]
         keyword = re.match(r'\s*(return|break|continue)\b', code)
         if keyword:
             if keyword.group(1) == 'break':
@@ -620,7 +659,7 @@ class _Analysis:
             if match is None:
                 continue
             targets = [name.strip() for name in match.group('targets').split(',')]
-            expr_start = start + match.start('expr')
+            expr_start = start + match.start('expr') - len(prefix)
             values = self.values(self.source[expr_start:end], expr_start, state, scope)
             declaration = match.group('op') == ':=' or bool(re.match(r'\s*(?:var|const)\b', code))
             updates = {}
@@ -655,6 +694,10 @@ class _Analysis:
         return _Flow(state, breaks, continues)
 
     def statement(self, node, state, scope) -> _Flow:
+        if node.kind in {'var', 'const'}:
+            return self.simple(node.start, node.end, state, scope, node.kind)
+        if node.kind == 'declarations':
+            return self.block(node.body, state, scope)
         if node.kind == 'simple':
             return self.simple(node.start, node.end, state, scope)
         if node.kind == 'block':
@@ -712,18 +755,39 @@ class _Analysis:
         return _Flow(_join_states(*branches), continues=continues)
 
 
-def _summaries(source: str, code: str, functions: list[_Function], parser: _Parser, rule: str):
+def _summaries(source: str, code: str, functions: list[_Function], parser: _Parser, rule: str,
+               global_nodes=None):
     summaries = {function.name: _Summary(tuple(_CLEAN for _ in function.results), variadic=function.variadic)
                  for function in functions}
-    global_nodes, cursor = [], 0
-    for function in functions:
-        global_nodes.extend(parser.block(cursor, function.start))
-        cursor = function.end
-    global_nodes.extend(parser.block(cursor, len(code)))
+    if global_nodes is None:
+        global_nodes, cursor = [], 0
+        for function in functions:
+            global_nodes.extend(parser.block(cursor, function.start))
+            cursor = function.end
+        global_nodes.extend(parser.block(cursor, len(code)))
     globals_scope = _Scope()
+    def declare_globals(nodes):
+        for node in nodes:
+            if node.kind == 'declarations':
+                declare_globals(node.body)
+                continue
+            prefix = node.kind + ' ' if node.kind in {'var', 'const'} else ''
+            declaration = re.match(r'\s*(?:var|const)\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
+                                   prefix + code[node.start:node.end])
+            if declaration:
+                for target in declaration.group(1).split(','):
+                    target = target.strip()
+                    if target != '_':
+                        globals_scope.declare(target, node.start)
+    # Package declarations are in scope even before their initializer appears.
+    # Pre-bind their stable cells so a forward reference cannot accidentally
+    # read a different, unbound name on the first pass.
+    declare_globals(global_nodes)
     global_analysis = _Analysis(source, code, rule, summaries)
     global_state = {}
-    by_name = {function.name: function for function in functions}
+    by_name = defaultdict(list)
+    for function in functions:
+        by_name[function.name].append(function)
     dependents = defaultdict(set)
     for function in functions:
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code[function.start:function.end]):
@@ -738,29 +802,34 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
         name = pending.popleft()
         queued.discard(name)
         if name == '@globals':
-            globals_scope = _Scope()
             global_analysis = _Analysis(source, code, rule, summaries)
-            updated = global_analysis.block(global_nodes, {}, globals_scope).normal or {}
+            updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
+            updated = _join_states(global_state, updated)
             if updated != global_state:
                 global_state = updated
-                for caller in summaries:
+                # Initializers can depend on later variables, including through
+                # local helper calls. Join finite facts and revisit both sides
+                # until stable, not for an arbitrary number of file passes.
+                for caller in ('@globals', *summaries):
                     if caller not in queued:
                         pending.append(caller)
                         queued.add(caller)
             continue
-        function = by_name[name]
-        analysis = _Analysis(source, code, rule, summaries)
-        state, scope = dict(global_state), globals_scope.child()
-        for index, parameter in enumerate(function.parameters):
-            if parameter and parameter != '_':
-                key = scope.declare(parameter, function.start)
-                state[key] = frozenset({_Trace(parameter, index, (parameter,))})
-        for result in function.results:
-            if result:
-                state[scope.declare(result, function.start)] = _CLEAN
-        analysis.named_returns = function.results
-        analysis.block(function.body, state, scope)
-        summary = _Summary(analysis.returns, analysis.effects, function.variadic)
+        variants = []
+        for function in by_name[name]:
+            analysis = _Analysis(source, code, rule, summaries)
+            state, scope = dict(global_state), globals_scope.child()
+            for index, parameter in enumerate(function.parameters):
+                if parameter and parameter != '_':
+                    key = scope.declare(parameter, function.start)
+                    state[key] = frozenset({_Trace(parameter, index, (parameter,))})
+            for result in function.results:
+                if result:
+                    state[scope.declare(result, function.start)] = _CLEAN
+            analysis.named_returns = function.results
+            analysis.block(function.body, state, scope)
+            variants.append(_Summary(analysis.returns, analysis.effects, function.variadic))
+        summary = _join_summaries(variants)
         if summary != summaries[name]:
             summaries[name] = summary
             for caller in sorted(dependents[name]):
@@ -770,20 +839,12 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
     return summaries, global_analysis.effects
 
 
-def iter_file_hits(path: Path, base_dir: Path):
-    """Yield every concrete source-to-sink flow without truncating findings."""
-    try:
-        source = path.read_text(encoding='utf-8')
-    except (UnicodeDecodeError, OSError):
-        return
-    source = _masked_source(source, strings=False)
-    code = _masked_source(source)
-    parser = _Parser(code)
-    functions = _functions(code, parser)
-    line_starts = [0] + [match.end() for match in re.finditer('\n', code)]
+def _source_hits(source, code, functions, global_nodes):
+    """Analyze a package image; offsets are mapped back to files by its owner."""
     hits = {}
     for rule in dict.fromkeys(rule for _regex, rule, _label in SINKS):
-        summaries, globals_effects = _summaries(source, code, functions, parser, rule)
+        summaries, globals_effects = _summaries(source, code, functions, _Parser(code), rule,
+                                               global_nodes=global_nodes)
         for effects in [globals_effects, *(summary.effects for summary in summaries.values())]:
             for (offset, label), fact in effects.items():
                 concrete = [trace for trace in fact if trace.parameter is None]
@@ -792,13 +853,78 @@ def iter_file_hits(path: Path, base_dir: Path):
                 trace = min(concrete, key=lambda trace: (len(trace.path), trace.path, trace.source))
                 path_desc = ' -> '.join(next(iter(_advance(frozenset({trace}), label))).path)
                 hits[(offset, rule)] = path_desc
-    try:
-        rel = str(path.relative_to(base_dir))
-    except ValueError:
-        rel = path.name
     for (offset, rule), path_desc in sorted(hits.items()):
-        line = bisect_right(line_starts, offset)
-        yield rule, rel, line, offset - line_starts[line - 1] + 1, path_desc
+        yield rule, offset, path_desc
+
+
+def _shift_statement(node: _Statement, offset: int) -> _Statement:
+    return replace(node, start=node.start + offset, end=node.end + offset,
+                   body=tuple(_shift_statement(child, offset) for child in node.body),
+                   otherwise=tuple(_shift_statement(child, offset) for child in node.otherwise))
+
+
+def iter_project_hits(files: Iterable[Path], base_dir: Path):
+    """Resolve package-local calls without discovering or reading extra files.
+
+    Parse each file independently before assigning package-wide offsets. An
+    unterminated string/comment/block in one editor buffer cannot consume the
+    next file. Package clauses and directory identities both isolate bindings;
+    a missing clause stays file-local rather than inventing package membership.
+    """
+    packages = defaultdict(list)
+    seen = set()
+    for path in sorted(files, key=lambda item: str(item.resolve())):
+        identity = path.resolve()
+        if path.suffix.lower() not in EXTS or identity in seen:
+            continue
+        seen.add(identity)
+        try:
+            source = _masked_source(path.read_text(encoding='utf-8'), strings=False)
+        except (UnicodeError, OSError):
+            continue
+        code = _masked_source(source)
+        clause = re.match(r'\s*\ufeff?\s*package\s+([A-Za-z_]\w*)\s*(?:;|\n|$)', code)
+        package = clause.group(1) if clause and clause.group(1) != '_' else identity
+        packages[(identity.parent, package)].append((path, source, code))
+
+    for units in packages.values():
+        sources, codes, starts, locations, functions, global_nodes = [], [], [], [], [], []
+        offset = 0
+        for path, source, code in units:
+            starts.append(offset)
+            locations.append((path, [0] + [match.end() for match in re.finditer('\n', code)]))
+            parser = _Parser(code)
+            cursor = 0
+            for function in _functions(code, parser):
+                global_nodes.extend(_shift_statement(node, offset)
+                                    for node in parser.block(cursor, function.start))
+                cursor = function.end
+                name = function.name
+                if name.startswith(('@init:', '@method:')):
+                    name = name.split(':', 1)[0] + ':' + str(function.start + offset)
+                functions.append(replace(function, name=name,
+                                         start=function.start + offset, end=function.end + offset,
+                                         body=tuple(_shift_statement(node, offset) for node in function.body)))
+            global_nodes.extend(_shift_statement(node, offset) for node in parser.block(cursor, len(code)))
+            sources.append(source + '\n;\n')
+            codes.append(code + '\n;\n')
+            offset += len(source) + 3
+        for rule, position, path_desc in _source_hits(''.join(sources), ''.join(codes), functions, global_nodes):
+            index = bisect_right(starts, position) - 1
+            path, line_starts = locations[index]
+            position -= starts[index]
+            line = bisect_right(line_starts, position)
+            yield rule, path, line, position - line_starts[line - 1] + 1, path_desc
+
+
+def iter_file_hits(path: Path, base_dir: Path):
+    """Single-file compatibility entrypoint; never expands to sibling files."""
+    for rule, source, line, col, path_desc in iter_project_hits([path], base_dir):
+        try:
+            rel = str(source.relative_to(base_dir))
+        except ValueError:
+            rel = source.name
+        yield rule, rel, line, col, path_desc
 
 
 def main() -> int:
@@ -807,13 +933,13 @@ def main() -> int:
     root = Path(sys.argv[1]).resolve()
     base_dir = root if root.is_dir() else root.parent
     issues: dict[str, dict] = defaultdict(lambda: {'count': 0, 'samples': []})
-    for file_path in iter_files(root):
-        for rule, rel, line, _col, path_desc in iter_file_hits(file_path, base_dir):
-            sample = f"{rel}:{line} {path_desc}"
-            bucket = issues[rule]
-            bucket['count'] += 1
-            if len(bucket['samples']) < 3:
-                bucket['samples'].append(sample)
+    for rule, path, line, _col, path_desc in iter_project_hits(iter_files(root), base_dir):
+        rel = path.relative_to(base_dir)
+        sample = f"{rel}:{line} {path_desc}"
+        bucket = issues[rule]
+        bucket['count'] += 1
+        if len(bucket['samples']) < 3:
+            bucket['samples'].append(sample)
     for rule_id, data in issues.items():
         samples = ','.join(data['samples'])
         print(f"{rule_id}\t{data['count']}\t{samples}")
@@ -834,19 +960,17 @@ _MESSAGE = {
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    base_dir = Path.cwd()
-    for path in ctx.files:
-        if path.suffix.lower() not in EXTS:
+    for rule, path, line, col, path_desc in iter_project_hits(ctx.files, Path.cwd()):
+        if not ctx.rule_enabled(rule):
             continue
-        for rule, _rel, line, col, path_desc in iter_file_hits(path, base_dir):
-            yield {
-                "rule": rule,
-                "path": str(path.resolve()),
-                "line": line,
-                "col": col,
-                "severity": _SEVERITY[rule],
-                "message": f"{_MESSAGE[rule]} ({path_desc})",
-            }
+        yield {
+            "rule": rule,
+            "path": str(path.resolve()),
+            "line": line,
+            "col": col,
+            "severity": _SEVERITY[rule],
+            "message": f"{_MESSAGE[rule]} ({path_desc})",
+        }
 
 
 def _write_go(tmp_dir: Path, body: str) -> Path:

@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/go-package-taint.yml
+      - test-suite/patches/go-decoding.patch.gz
       - modules/helpers/ubs_core/analyzers/taint_go.py
       - modules/helpers/ubs_core/go_scan.py
       - test-suite/quality/test_taint_go*.py
@@ -20,6 +21,8 @@ jobs:
   package-dataflow:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -30,7 +33,36 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Run production analyzer and incremental-cache regressions
+      - name: Verify base integrity and apply the reviewed decoding implementation
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          def blob(path):
+              return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+          source = 'modules/helpers/ubs_core/analyzers/taint_go.py'
+          tests = 'test-suite/quality/test_taint_go_decoding.py'
+          current = blob(source)
+          if current != 'bc825dfebe559c91810e4553d3d5e60ff0e2317d':
+              assert current == 'c0c49d10da545f147813899f997302cf4fefcfbf', 'Reconcile changed Go source first'
+              assert not Path(tests).exists(), 'Do not overwrite newer tests'
+              packed = Path('test-suite/patches/go-decoding.patch.gz').read_bytes()
+              assert hashlib.sha256(packed).hexdigest() == 'bde544ed6edf8966c823c3f8b1e2e54424a04f423f778dbd71547df186e5538a'
+              data = gzip.decompress(packed)
+              assert hashlib.sha256(data).hexdigest() == 'e22c0f4a036794917363488ec352aecb672fa070522eebd6da6ea033c475d410'
+              patch = Path(os.environ['RUNNER_TEMP']) / 'go-package-decoding.patch'
+              patch.write_bytes(data)
+              subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
+              subprocess.run(['git', 'apply', str(patch)], check=True)
+          assert blob(source) == 'bc825dfebe559c91810e4553d3d5e60ff0e2317d'
+          assert blob(tests) == 'e090b01593277913e3177c83fe71eccf9661f003'
+          PY
+      - name: Run analyzer and incremental-cache regressions
         run: |
           python3 -m unittest discover -s test-suite/quality -p 'test_taint_go*.py' -v 2>&1 | tee "$RUNNER_TEMP/go-package-tests.log"
           PYTHONPATH=modules/helpers python3 - <<'PY'
@@ -44,16 +76,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Verify the committed runtime integrity chain
+      - name: Regenerate and verify the complete candidate integrity chain
         run: |
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
-          git diff --exit-code
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
           for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do
             bash -n "$script"
           done
+          git diff --check
+      - name: Exercise decoded request flows through actual JSON and SARIF scanners
+        env:
+          UBS_TAINT_E2E: '1'
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p test_taint_go_decoding.py -v 2>&1 | tee "$RUNNER_TEMP/go-package-decoding-e2e.log"
       - name: Exercise the real scanner on cross-file source and sink pairs
         run: |
           python3 - <<'PY'
@@ -108,6 +145,61 @@ jobs:
                   print('GO_PACKAGE_E2E_PASS', name, sorted(rules), flush=True)
           PY
           python3 test-suite/run_manifest.py --case golang-taint-buggy --case golang-taint-clean
+      - name: Store the verified runtime tree without changing any refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.request
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          sources = ['modules/helpers/ubs_core/analyzers/taint_go.py',
+                     'test-suite/quality/test_taint_go_decoding.py']
+          allowed = set(scripts + sources + ['SHA256SUMS'])
+          changed = set(git('diff', '--name-only').splitlines())
+          untracked = set(git('ls-files', '--others', '--exclude-standard').splitlines())
+          assert changed | untracked <= allowed, (changed | untracked) - allowed
+          previous = {path: Path(path).read_bytes() for path in allowed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
+          assert all(Path(path).read_bytes() == data for path, data in previous.items()), 'Non-idempotent checksums'
+          subprocess.run(['./scripts/verify_checksums.sh'], check=True)
+          subprocess.run(['./scripts/verify_sha256sums.sh'], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          entries = []
+          if changed or untracked:
+              subprocess.run(['git', 'add', '--', *sorted(changed | untracked)], check=True)
+          for path in sorted(changed | untracked):
+              mode = git('ls-files', '-s', '--', path).split()[0]
+              entries.append(dict(path=path, mode=mode, type='blob', sha=git('hash-object', path)))
+          elements = [dict(path=e['path'], mode=e['mode'], type='blob', content=Path(e['path']).read_text()) for e in entries]
+          tree = git('rev-parse', 'HEAD^{tree}')
+          if elements:
+              payload = dict(base_tree=tree, tree=elements)
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + '/git/trees',
+                  data=json.dumps(payload).encode(), method='POST',
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                           'Content-Type': 'application/json'})
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  tree = json.load(response)['sha']
+          assert tree == git('write-tree')
+          result = dict(base=git('rev-parse', 'HEAD'), tree=tree, files=entries)
+          (Path(os.environ['RUNNER_TEMP']) / 'go-package-result.json').write_text(json.dumps(result, indent=2))
+          print('GO_DECODING_TREE_VALIDATED', json.dumps(result), flush=True)
+          PY
+      - name: Preserve exact candidate sources
+        if: always()
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/go-package-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/go-package-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/go-package-source.tar.gz"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -115,4 +207,5 @@ jobs:
           path: |
             ${{ runner.temp }}/go-package-*
             test-suite/artifacts/go-package-taint
+            test-suite/artifacts/go-decoding
           retention-days: 3

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -70,6 +71,7 @@ actual = hashlib.sha256(pathlib.Path(args[-1]).read_bytes()).hexdigest()
 expected = 'https://github.com/Dicklesworthstone/ultimate_bug_scanner/.github/workflows/release.yml@refs/tags/v' + os.environ.get('EXPECT_VERSION', '1.2.3')
 if os.environ.get('REJECT_SIGNATURE') or bundle != actual: sys.exit(1)
 if args[args.index('--certificate-identity')+1] != expected: sys.exit(1)
+if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_bytes(b'keep the concurrent output')
 ''')
         self.assets = {'contract.json': b'{"schema":"fixture"}\n', 'helpers/tool.py': b'raise SystemExit(91)\n'}
         self.rebuild()
@@ -251,6 +253,19 @@ if args[args.index('--certificate-identity')+1] != expected: sys.exit(1)
         result = self.run_verify(expected=1)
         self.assertIn('library pin', result.stderr.lower())
 
+    def test_conflicting_library_helper_pins_are_rejected(self):
+        library = self.origin / 'modules/lib/ubs-common.sh'
+        original = library.read_bytes()
+        modified = original.replace(digest(self.assets['helpers/tool.py']).encode(), b'0' * 64)
+        library.write_bytes(modified)
+        module = self.origin / 'modules/ubs-python.sh'
+        before = module.read_bytes()
+        after = before.replace(digest(original).encode(), digest(modified).encode())
+        module.write_bytes(after)
+        self.change_runner(lambda s: s.replace(digest(original), digest(modified)).replace(digest(before), digest(after)))
+        result = self.run_verify(expected=1)
+        self.assertIn('shared-library helper pins', result.stderr)
+
     def test_mirror_still_requires_authenticated_checksums(self):
         self.env['UBS_MODULE_ARTIFACT_BASE'] = 'https://mirror.invalid/pinned/modules'
         self.run_verify(local=False)
@@ -273,6 +288,192 @@ if args[args.index('--certificate-identity')+1] != expected: sys.exit(1)
         self.seal()
         result = self.run_verify()
         self.assertIn('Runtime verified: 12 modules,', result.stdout)
+
+    def export(self, output, expected=0, extra=()):
+        result = subprocess.run(['bash', str(VERIFY), '--version', self.version,
+                                 '--artifact-dir', str(self.origin), '--bundle-output', str(output), *extra],
+                                cwd=self.work, env=self.env, text=True, capture_output=True, timeout=45)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        self.assertFalse(list(self.stage.iterdir()), 'Private verification staging leaked')
+        self.assertFalse(list(self.work.glob('.ubs-bundle-*.tmp')), 'Partial output archive leaked')
+        return result
+
+    def test_plain_verification_still_accepts_a_release_without_runtime_metadata(self):
+        self.write('ubs', b'#!/usr/bin/env bash\nUBS_VERSION="1.2.3"\nexit 93\n')
+        self.seal()
+        result = subprocess.run(['bash', str(VERIFY), '--version', VERSION, '--artifact-dir', str(self.origin),
+                                 '--verify-only'], cwd=self.work, env=self.env, text=True,
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('Runtime verified', result.stdout)
+        self.assertFalse(list(self.stage.iterdir()))
+
+    def test_plain_installer_exit_status_and_cleanup_are_preserved(self):
+        result = subprocess.run(['bash', str(VERIFY), '--version', VERSION, '--artifact-dir', str(self.origin)],
+                                cwd=self.work, env=self.env, text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 94, result.stdout + result.stderr)
+        self.assertFalse(list(self.stage.iterdir()))
+
+    def test_bundle_minisign_preserves_original_signature_for_reverification(self):
+        self.env.update(UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY='fixture-key')
+        self.write('SHA256SUMS.minisig', digest((self.origin / 'SHA256SUMS').read_bytes()).encode())
+        self.tool('minisign', '''
+import hashlib, pathlib, sys
+args = sys.argv[1:]
+expected = pathlib.Path(args[args.index('-x')+1]).read_text().strip()
+actual = hashlib.sha256(pathlib.Path(args[args.index('-Vm')+1]).read_bytes()).hexdigest()
+sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' else 1)
+''')
+        output = self.work / 'minisign.tar.gz'
+        self.export(output)
+        unpacked = self.work / 'minisign-unpacked'
+        unpacked.mkdir()
+        with tarfile.open(output) as archive:
+            self.assertIn('SHA256SUMS.minisig', archive.getnames())
+            self.assertNotIn('SHA256SUMS.sigstore.json', archive.getnames())
+            archive.extractall(unpacked, filter='data')
+        self.origin = unpacked
+        self.run_verify()
+
+    def test_bundle_contains_only_authenticated_runtime_and_safe_metadata(self):
+        output = self.work / 'portable runtime.tar.gz'
+        self.write('unrelated-secret.txt', b'must not be exported')
+        self.write('modules/helpers/unlisted.py', b'must not be exported')
+        self.export(output)
+        with tarfile.open(output) as archive:
+            expected = {'SHA256SUMS', 'SHA256SUMS.sigstore.json', 'ubs', 'install.sh',
+                        'git_safety_guard.py', '.claude/hooks/git_safety_guard.py', 'VERSION',
+                        'modules/ubs-python.sh', 'modules/lib/ubs-common.sh',
+                        'modules/contract.json', 'modules/helpers/tool.py'}
+            self.assertEqual(set(archive.getnames()), expected)
+            for member in archive.getmembers():
+                self.assertTrue(member.isfile(), member)
+                self.assertEqual((member.uid, member.gid, member.mtime), (0, 0, 0))
+                if member.name == 'ubs' or member.name.endswith(('.sh', '.py')):
+                    self.assertEqual(member.mode, 0o755)
+                if member.name not in {'VERSION', '.claude/hooks/git_safety_guard.py'}:
+                    self.assertEqual(archive.extractfile(member).read(), (self.origin / member.name).read_bytes())
+
+    def test_bundle_round_trip_revalidates_entire_runtime_offline(self):
+        output = self.work / 'bundle.tar.gz'
+        self.export(output)
+        unpacked = self.work / 'unpacked'
+        unpacked.mkdir()
+        with tarfile.open(output) as archive:
+            archive.extractall(unpacked, filter='data')
+        self.origin = unpacked
+        self.run_verify()
+        self.assertFalse(any(event[0] == 'fetch' for event in self.events()))
+
+    def test_bundle_export_is_byte_reproducible(self):
+        first, second = self.work / 'one.tar.gz', self.work / 'two.tar.gz'
+        self.export(first)
+        self.export(second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_bundle_output_never_overwrites_existing_file_or_symlink(self):
+        output = self.work / 'existing.tar.gz'
+        output.write_bytes(b'keep this artifact')
+        self.export(output, expected=2)
+        self.assertEqual(output.read_bytes(), b'keep this artifact')
+        link = self.work / 'link.tar.gz'
+        link.symlink_to(output)
+        self.export(link, expected=2)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(output.read_bytes(), b'keep this artifact')
+        self.assertEqual(self.events(), [])
+
+    def test_bundle_atomic_publish_preserves_concurrent_output(self):
+        output = self.work / 'raced.tar.gz'
+        self.env['LATE_OUTPUT'] = str(output)
+        result = self.export(output, expected=1)
+        self.assertIn('File exists', result.stderr)
+        self.assertEqual(output.read_bytes(), b'keep the concurrent output')
+
+    def test_bundle_failed_authentication_or_tampering_publishes_nothing(self):
+        output = self.work / 'rejected.tar.gz'
+        self.env['REJECT_SIGNATURE'] = '1'
+        self.export(output, expected=1)
+        self.assertFalse(output.exists())
+        self.env.pop('REJECT_SIGNATURE')
+        self.write('modules/helpers/tool.py', b'tampered')
+        self.export(output, expected=1)
+        self.assertFalse(output.exists())
+
+    def test_bundle_rejects_insecure_or_silently_discarded_install_args(self):
+        for args in (('--insecure',), ('--', '--skip-hooks')):
+            with self.subTest(args=args):
+                output = self.work / 'invalid.tar.gz'
+                self.export(output, expected=2, extra=args)
+                self.assertFalse(output.exists())
+        self.export(self.work / 'absent' / 'bundle.tar.gz', expected=2)
+        self.assertEqual(self.events(), [])
+
+    def test_bundle_local_export_needs_no_downloader(self):
+        isolated = self.work / 'no-network-tools'
+        isolated.mkdir()
+        for tool in ('bash', 'dirname', 'cat', 'awk', 'mktemp', 'rm', 'cp', 'mkdir', 'sha256sum', 'python3'):
+            actual = shutil.which(tool)
+            self.assertIsNotNone(actual, tool)
+            (isolated / tool).symlink_to(actual)
+        (isolated / 'cosign').symlink_to(self.bin / 'cosign')
+        self.env['PATH'] = str(isolated)
+        output = self.work / 'offline.tar.gz'
+        self.export(output)
+        self.assertTrue(output.is_file())
+        self.assertFalse(any(event[0] == 'fetch' for event in self.events()))
+
+    def test_bundle_actual_scanner_runs_with_empty_cache_and_downloads_blocked(self):
+        self.version = (ROOT / 'VERSION').read_text().strip().removeprefix('v')
+        self.env['EXPECT_VERSION'] = self.version
+        for name in ('ubs', 'install.sh'):
+            self.write(name, (ROOT / name).read_bytes())
+        self.write('git_safety_guard.py', (ROOT / '.claude/hooks/git_safety_guard.py').read_bytes())
+        shutil.copytree(ROOT / 'modules', self.origin / 'modules', dirs_exist_ok=True)
+        self.seal()
+        output = self.work / 'real-scanner.tar.gz'
+        self.export(output)
+        unpacked = self.work / 'portable'
+        unpacked.mkdir()
+        with tarfile.open(output) as archive:
+            archive.extractall(unpacked, filter='data')
+        self.origin = unpacked
+        self.run_verify()
+        for name in ('curl', 'wget'):
+            self.tool(name, '''
+import json, os, sys
+with open(os.environ['EVENT_LOG'], 'a') as f: f.write(json.dumps(['blocked-network', sys.argv]) + '\\n')
+sys.exit(97)
+''')
+        source = self.work / 'view.py'
+        source.write_text('eval(input())\n', encoding='utf-8')
+        self.env.update(UBS_NO_AUTO_UPDATE='1', XDG_DATA_HOME=str(self.home / 'data'),
+                        XDG_CACHE_HOME=str(self.home / 'cache'))
+        result = subprocess.run([str(unpacked / 'ubs'), str(source), '--only=python', '--ci',
+                                 '--format=json', '--module-dir=' + str(unpacked / 'modules')],
+                                cwd=self.work, env=self.env, text=True, capture_output=True, timeout=120)
+        artifacts = ROOT / 'test-suite/artifacts/verified-runtime-e2e'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / 'scan.json').write_text(result.stdout)
+        (artifacts / 'scan.stderr.log').write_text(result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report.get('status'), 'ok', report)
+        self.assertEqual(report['totals']['files'], 1, report)
+        self.assertTrue(any(f['rule_id'] == 'python.taint.eval' and f['line'] == 1
+                            for f in report['findings']), report)
+        clean = subprocess.run([str(unpacked / 'ubs'), str(VERIFY), '--only=bash', '--ci',
+                                '--format=json', '--module-dir=' + str(unpacked / 'modules')],
+                               cwd=self.work, env=self.env, text=True, capture_output=True, timeout=120)
+        (artifacts / 'clean.json').write_text(clean.stdout)
+        (artifacts / 'clean.stderr.log').write_text(clean.stderr)
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        clean_report = json.loads(clean.stdout)
+        self.assertEqual(clean_report.get('status'), 'ok', clean_report)
+        self.assertEqual(clean_report['totals']['files'], 1, clean_report)
+        self.assertEqual(clean_report['totals']['critical'], 0, clean_report)
+        self.assertEqual(clean_report['totals']['warning'], 0, clean_report)
+        self.assertFalse(any(e[0] in {'fetch', 'blocked-network'} for e in self.events()), self.events())
 
 
 if __name__ == '__main__':

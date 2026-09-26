@@ -14,7 +14,8 @@ usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 usage() {
   cat <<'USAGE'
 Usage: verify.sh [--version X.Y.Z|vX.Y.Z] [--artifact-dir DIR] [--verify-only]
-                 [--with-modules] [--insecure] [-- INSTALLER_ARGS...]
+                 [--with-modules] [--bundle-output FILE.tar.gz]
+                 [--insecure] [-- INSTALLER_ARGS...]
 
 Authenticate SHA256SUMS, verify install.sh, ubs and git_safety_guard.py against
 that same manifest, and install the verified local payload. The caller's
@@ -26,6 +27,8 @@ Options:
   --artifact-dir DIR      Read a local release bundle; do not download assets.
   --verify-only           Verify the complete release WITHOUT running it.
   --with-modules          Also verify every pinned module/helper (requires --verify-only).
+  --bundle-output FILE    Export a complete verified portable runtime as .tar.gz.
+                          Implies --verify-only --with-modules; never overwrites FILE.
   --install-args "ARGS"   Legacy whitespace-separated arguments (no shell eval).
   -- ARGS...              Pass installer arguments without splitting or eval.
   --insecure              Explicitly skip ALL signature and checksum checks.
@@ -53,6 +56,12 @@ listed in the authenticated runner. Missing assets never fall back to a network
 download. Remote runtime assets come only from the selected release tag (or the
 explicit module mirror), never mutable main. Runtime metadata is parsed as data,
 not sourced as shell code. Host dependencies are not part of this verification.
+Bundle export includes the original signature, manifest, runner, installer,
+hook and verified modules. It never executes them. Extract into an empty
+directory, re-verify with --artifact-dir DIR --verify-only --with-modules, then
+run DIR/ubs --module-dir=DIR/modules PROJECT. Bash, Python, jq, ripgrep and other
+host tools must already be installed. Export is deterministic for identical
+inputs, and the final archive appears only after validation and compression.
 USAGE
 }
 
@@ -64,6 +73,7 @@ VERIFY_WITH="${UBS_VERIFY_WITH:-}"
 INSECURE=0
 VERIFY_ONLY=0
 WITH_MODULES=0
+BUNDLE_OUTPUT=''
 ARTIFACT_DIR=''
 INSTALL_ARGS=()
 
@@ -82,6 +92,13 @@ while [[ $# -gt 0 ]]; do
       shift ;;
     --verify-only) VERIFY_ONLY=1; shift ;;
     --with-modules) WITH_MODULES=1; shift ;;
+    --bundle-output)
+      [[ $# -ge 2 && -n "$2" ]] || usage_error '--bundle-output requires an output file'
+      BUNDLE_OUTPUT="$2"; shift 2 ;;
+    --bundle-output=*)
+      BUNDLE_OUTPUT="${1#*=}"
+      [[ -n "$BUNDLE_OUTPUT" ]] || usage_error '--bundle-output requires an output file'
+      shift ;;
     --install-args)
       [[ $# -ge 2 ]] || usage_error '--install-args requires a value'
       legacy_args=()
@@ -94,6 +111,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$BUNDLE_OUTPUT" ]]; then
+  [[ ! -e "$BUNDLE_OUTPUT" && ! -L "$BUNDLE_OUTPUT" ]] || usage_error '--bundle-output must not already exist'
+  [[ -d "$(dirname -- "$BUNDLE_OUTPUT")" ]] || usage_error '--bundle-output parent directory must exist'
+  VERIFY_ONLY=1
+  WITH_MODULES=1
+fi
 if [[ "$WITH_MODULES" -eq 1 ]]; then
   [[ "$VERIFY_ONLY" -eq 1 ]] || usage_error '--with-modules requires --verify-only'
   command -v python3 >/dev/null 2>&1 || die 'python3 is required to verify the runtime asset graph'
@@ -215,7 +238,8 @@ verify_asset() {
 verify_runtime() {
   # Only invoke the host Python, never the downloaded runner or its helpers.
   # Its signed checksum tables are a restricted literal format, not a script.
-  python3 - "$VERIFY_DIR" "$ARTIFACT_DIR" "$MODULE_ARTIFACT_BASE" <<'PY'
+  python3 - "$VERIFY_DIR" "$ARTIFACT_DIR" "$MODULE_ARTIFACT_BASE" "$BUNDLE_OUTPUT" "$VERIFY_WITH" <<'PY'
+import gzip
 import hashlib
 import json
 import os
@@ -224,8 +248,11 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 
 stage, local, base = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+bundle_output, signature_kind = sys.argv[4], sys.argv[5]
 MAX_ASSET_BYTES = 64 * 1024 * 1024
 
 
@@ -333,6 +360,35 @@ def verify_nested_pins(modules, helpers):
         raise ValueError('runtime shared-library helper pins do not match the authenticated runner')
 
 
+def export_bundle(files):
+    destination = Path(bundle_output).absolute()
+    signature = 'SHA256SUMS.minisig' if signature_kind == 'minisign' else 'SHA256SUMS.sigstore.json'
+    names = ['SHA256SUMS', signature, 'install.sh', 'ubs', 'git_safety_guard.py',
+             'VERSION', '.claude/hooks/git_safety_guard.py']
+    names.extend('modules/' + name for name in files)
+    # Build in the destination filesystem. Atomic hard-link publication refuses
+    # an existing file, directory or symlink, including one created after argv
+    # validation. Never fall back to overwriting or partially copying the output.
+    with tempfile.NamedTemporaryFile(prefix='.ubs-bundle-', suffix='.tmp', dir=destination.parent) as output:
+        with gzip.GzipFile(filename='', mode='wb', fileobj=output, mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode='w|', format=tarfile.PAX_FORMAT) as archive:
+                for name in sorted(names):
+                    path = stage / name
+                    with path.open('rb') as payload:
+                        metadata = os.fstat(payload.fileno())
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ValueError('cannot export a nonregular runtime asset: ' + name)
+                        member = tarfile.TarInfo(name)
+                        member.size = metadata.st_size
+                        member.mode = 0o755 if name == 'ubs' or name.endswith(('.sh', '.py', '.js')) else 0o644
+                        member.mtime = 0
+                        archive.addfile(member, payload)
+        output.flush()
+        os.fsync(output.fileno())
+        os.link(output.name, destination)
+    print('Portable runtime bundle written: ' + str(destination), flush=True)
+
+
 try:
     modules, helpers, files = runtime_graph()
     for name, expected in sorted(files.items()):
@@ -358,7 +414,9 @@ try:
     verify_nested_pins(modules, helpers)
     (stage / 'runtime-assets.json').write_text(json.dumps(files, sort_keys=True) + '\n', encoding='utf-8')
     print(f'Runtime verified: {len(modules)} modules, {len(helpers)} helper assets', flush=True)
-except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as error:
+    if bundle_output:
+        export_bundle(files)
+except (OSError, UnicodeError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
     print('ERROR: runtime verification failed: ' + str(error), file=sys.stderr)
     sys.exit(1)
 PY

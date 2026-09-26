@@ -86,6 +86,79 @@ policy: checksums are enforced, but manifest authentication requires a configure
 minisign key. Use `scripts/verify.sh` for the authenticated Cosign installation
 path. The verifier's explicit `--insecure` mode is not an authenticated install.
 
+## Complete runtime verification and portable bundles
+
+The three release executables alone do not provide an offline scanner: the
+runner also needs its language modules, shared library, contract, and helper
+package. Verify all of those before deployment with:
+
+```bash
+scripts/verify.sh --version vX.Y.Z --verify-only --with-modules
+scripts/verify.sh --version vX.Y.Z --artifact-dir ./release-bundle \
+  --verify-only --with-modules
+```
+
+The authenticated runner's literal `MODULE_CHECKSUMS`, `HELPER_CHECKSUMS`, and
+`HELPER_ASSETS` define the complete inventory. They are parsed as data; neither
+the runner nor any module/helper is executed during verification. Every listed
+asset must have exactly one checksum, and every helper checksum must be listed.
+The module-to-library pins and library-to-helper pins must agree with the
+authenticated runner as well. Duplicate/nonliteral metadata, unsafe paths,
+case-insensitive path collisions, symlinks, special files, missing assets, and
+checksum mismatches fail closed. Runtime assets are read in bounded chunks and
+limited to 64 MiB each.
+
+Remote runtime files are fetched from the selected `vX.Y.Z` tag, with no fallback
+to mutable `main`. `UBS_MODULE_ARTIFACT_BASE` can point to an HTTPS mirror of the
+tag's `modules/` directory without weakening any checksum checks. A local bundle
+must contain all required files under `modules/`; missing local files are never
+downloaded. `--with-modules` requires a nonexecuting verification mode, and it
+does not silently install a module cache into an existing scanner installation.
+
+To retain and transfer the verified runtime instead of discarding private
+staging, export it as a portable archive:
+
+```bash
+scripts/verify.sh --version vX.Y.Z --bundle-output ./ubs-runtime.tar.gz
+
+# Or export from a complete local bundle without artifact downloads:
+scripts/verify.sh --version vX.Y.Z --artifact-dir ./release-bundle \
+  --bundle-output ./ubs-runtime.tar.gz
+```
+
+`--bundle-output` implies `--verify-only --with-modules` and rejects `--insecure`
+and installer arguments. Its parent directory must exist and its destination
+must not exist. Compression finishes in a private temporary file on the same
+filesystem, then an atomic hard link publishes the complete archive. A file,
+directory, or symlink created concurrently at the destination is not replaced;
+filesystems without hard-link support fail rather than falling back to a
+partial output. Repeated exports of identical inputs with the same toolchain
+are byte-identical: archive ordering, ownership, timestamps, and gzip headers
+are normalized. Only verified payloads, the original signed manifest/signature,
+and the derived version and hook-layout files are included, not arbitrary files
+from the input bundle or private staging diagnostics.
+
+Transfer the archive and extract it into an empty directory. Using a separately
+trusted copy of the verifier, authenticate it again before running its scanner:
+
+```bash
+mkdir ./ubs-runtime
+tar -xzf ./ubs-runtime.tar.gz -C ./ubs-runtime
+scripts/verify.sh --version vX.Y.Z --artifact-dir ./ubs-runtime \
+  --verify-only --with-modules
+UBS_NO_AUTO_UPDATE=1 ./ubs-runtime/ubs --module-dir="$PWD/ubs-runtime/modules" \
+  /path/to/project --ci --format=json
+```
+
+The explicit module directory avoids dependence on a prewarmed user cache.
+The signature inside the archive authenticates the release manifest, and the
+runner authenticated by that manifest pins the runtime assets. The archive is
+not independently signed, so do not treat successful decompression as
+verification. Host dependencies (Bash, Python, jq, ripgrep, Git, optional language
+tools) must be provisioned separately; this is not a hermetic OS image. Cosign
+may still need trust-metadata access. Preparing, verifying, and exporting a
+bundle never runs the installer, scanner, or hook.
+
 ## Key handling
 
 - **Minisign public key** (current, key id `97732BB3E99E8CBE`):

@@ -1,0 +1,127 @@
+name: Python Mutable Effect Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/python-mutable-effects.patch
+      - .github/workflows/python-mutable-effects.yml
+  workflow_dispatch:
+
+# Build content-addressed tested objects only. The reviewed main update is a
+# separate fast-forward operation; this job never writes a ref, tag, or commit.
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Record exact input source
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/mutable-base.txt"
+          git ls-files -s > "$RUNNER_TEMP/mutable-base-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/mutable-source-before.tar.gz"
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
+          npm install --global @ast-grep/cli
+      - name: Apply exact reviewed mutation implementation
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = bd8aa2c2b515df2da74a1e665e63d9a9802dad00
+          echo '0a8fe1ac02e8c09493abe6ff3975b78fdc6aa83683750ff6125dc665d8b0f824  test-suite/patches/python-mutable-effects.patch' | sha256sum -c -
+          git apply --check test-suite/patches/python-mutable-effects.patch
+          git apply test-suite/patches/python-mutable-effects.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = 392761a8f5805260ffa1efcf92d5daad9b2bc975
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Run all current Python taint and real JSON/SARIF regressions
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-taint-tests.log"
+          PYTHONPATH=modules/helpers python3 - <<'PY'
+          from ubs_core.analyzers.taint_py import SELF_TESTS
+          for name, test in SELF_TESTS:
+              test()
+              print('ORIGINAL_SELFTEST_PASS', name)
+          PY
+      - name: Preserve suppression, registry, and shipped fixture behavior
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-suppression-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-core-tests.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/mutable-manifest.log"
+      - name: Verify deterministic complete integrity closure
+        run: |
+          git diff --check
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff > "$RUNNER_TEMP/mutable-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/mutable-regenerated.diff"
+          cmp "$RUNNER_TEMP/mutable-tested.diff" "$RUNNER_TEMP/mutable-regenerated.diff"
+          bash -n ubs modules/lib/ubs-common.sh modules/ubs-python.sh
+      - name: Store only verified blobs for atomic publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          root = Path.cwd()
+          scratch = Path(os.environ['RUNNER_TEMP'])
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          changed.add('test-suite/quality/test_taint_python_effects.py')
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_py.py', 'test-suite/quality/test_taint_python_effects.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert changed <= allowed, sorted(changed - allowed)
+          records = []
+          for name in sorted(changed):
+              raw = Path(name).read_bytes()
+              expected = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+              index = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
+              mode, before = (index[0], index[1]) if index else ('100644', None)
+              response = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=json.dumps({'content': raw.decode('utf-8'), 'encoding': 'utf-8'}),
+                  text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == expected, (name, sha, expected)
+              record = {'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before}
+              records.append(record)
+              print('MUTABLE_TESTED_BLOB', json.dumps(record), flush=True)
+          manifest = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                      'source': '392761a8f5805260ffa1efcf92d5daad9b2bc975', 'files': records}
+          (scratch / 'mutable-publication.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+      - name: Preserve source and diagnostics
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/mutable-final.diff"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/mutable-source-after.tar.gz"
+          cp test-suite/quality/test_taint_python_effects.py "$RUNNER_TEMP/mutable-effects-tests.py" 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-mutable-effects-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/mutable-*
+            test-suite/artifacts/python-mutable-effects/
+          retention-days: 3

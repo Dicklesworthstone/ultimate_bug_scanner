@@ -1,0 +1,815 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index bd8aa2c..392761a 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -5,6 +5,8 @@ branches, and iterate loops and recursive function summaries to a fixpoint.
+ Facts retain source provenance and sink-specific sanitizers. Local helpers
+ summarize both returned values and parameters reaching a sink; analyzed code
+ is never imported or executed. Cross-file and dynamic dispatch are not modeled.
++Mutable objects use a finite, field-insensitive heap: aliases share writes,
++and local call summaries propagate output-parameter and captured-object writes.
+ 
+ Emit dialects:
+ - main(argv) emits the legacy tabular dialect: one
+@@ -167,6 +169,10 @@ class TaintTrace:
+ 
+ Fact = frozenset[TaintTrace]
+ CLEAN: Fact = frozenset()
++# Allocation sites are AST nodes, while strings name symbolic argument,
++# closure, or module objects. Both sets are finite even inside recursion.
++References = frozenset[ast.AST | str]
++NO_REFERENCES: References = frozenset()
+ 
+ 
+ def join_facts(*facts: Fact) -> Fact:
+@@ -204,11 +210,21 @@ def _safe_for(trace: TaintTrace, kind: str, label: str) -> bool:
+ 
+ 
+ class _State(dict):
+-    """Value facts and definitely-known callable identities at one program point."""
++    """Value facts, callable identities, and a field-insensitive object heap.
++
++    Copying a variable copies references, not the object. Branches copy the
++    heap map so writes on one branch cannot leak into an unrelated branch.
++    """
+ 
+     def __init__(self, values=(), bindings=None):
+         super().__init__(values)
+         self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
++        self.references = dict(getattr(values, 'references', {}))
++        self.heap = dict(getattr(values, 'heap', {}))
++
++    def value(self, name):
++        return join_facts(self.get(name, CLEAN), *(self.heap.get(ref, CLEAN)
++                          for ref in self.references.get(name, NO_REFERENCES)))
+ 
+     def copy(self):
+         return _State(self)
+@@ -217,9 +233,13 @@ class _State(dict):
+         self.clear()
+         self.update(other)
+         self.bindings = dict(other.bindings)
++        self.references = dict(other.references)
++        self.heap = dict(other.heap)
+ 
+     def __eq__(self, other):
+-        return isinstance(other, _State) and dict.__eq__(self, other) and self.bindings == other.bindings
++        return (isinstance(other, _State) and dict.__eq__(self, other)
++                and self.bindings == other.bindings and self.references == other.references
++                and self.heap == other.heap)
+ 
+ 
+ def _join_states(*states):
+@@ -231,7 +251,12 @@ def _join_states(*states):
+     for name in set().union(*(state.bindings.keys() for state in reachable)):
+         candidates = [state.bindings.get(name) for state in reachable]
+         bindings[name] = candidates[0] if all(value == candidates[0] for value in candidates) else None
+-    return _State({name: join_facts(*(state.get(name, CLEAN) for state in reachable)) for name in names}, bindings)
++    joined = _State({name: join_facts(*(state.get(name, CLEAN) for state in reachable)) for name in names}, bindings)
++    for name in set().union(*(state.references for state in reachable)):
++        joined.references[name] = frozenset().union(*(state.references.get(name, NO_REFERENCES) for state in reachable))
++    for ref in set().union(*(state.heap for state in reachable)):
++        joined.heap[ref] = join_facts(*(state.heap.get(ref, CLEAN) for state in reachable))
++    return joined
+ 
+ 
+ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
+@@ -296,6 +321,11 @@ class FunctionSummary:
+     # A generator's final return is StopIteration.value, not its yielded data.
+     # Dependencies and ordinary iteration consume only the yielded values.
+     yielded: Fact = CLEAN
++    # A mutation is separate from a returned value or a sink effect: callers
++    # can ignore the return and still observe writes through an output object.
++    mutations: tuple = ()
++    returned_references: frozenset[str] = frozenset()
++    yielded_references: frozenset[str] = frozenset()
+ 
+ 
+ class _Flow:
+@@ -312,6 +342,20 @@ class _Flow:
+         self.expression_facts = {}
+         self.expression_bindings = {}
+         self.generator_returns = {}
++        self.generator_return_references = {}
++        self.expression_references = {}
++        self.mutations = {}
++        self.returned_references = set()
++        self.yielded_references = set()
++
++    def mutate(self, references, fact, state):
++        # Weak updates preserve other fields and possible aliases. A write of
++        # clean data to one field is not proof that the whole object is safe.
++        if not fact:
++            return
++        for ref in references:
++            state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
++            self.mutations[ref] = join_facts(self.mutations.get(ref, CLEAN), fact)
+ 
+     def effect(self, kind, node, label, fact):
+         unsafe = frozenset(trace for trace in fact if not _safe_for(trace, kind, label))
+@@ -319,10 +363,11 @@ class _Flow:
+         if unsafe:
+             self.effects[key] = join_facts(self.effects.get(key, CLEAN), unsafe)
+ 
+-    def assign(self, target, fact, state, value=None):
++    def assign(self, target, fact, state, value=None, *, target_references=None):
+         if isinstance(target, ast.Name):
+             state[target.id] = _advance(fact, target.id)
+             state.bindings[target.id] = self.expression_bindings.get(value)
++            state.references[target.id] = self.expression_references.get(value, NO_REFERENCES)
+         elif isinstance(target, (ast.Tuple, ast.List)):
+             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+                 for item, expression in zip(target.elts, value.elts):
+@@ -333,11 +378,24 @@ class _Flow:
+         elif isinstance(target, ast.Starred):
+             self.assign(target.value, fact, state)
+         elif isinstance(target, (ast.Subscript, ast.Attribute)):
++            if target_references is None:
++                self.expr(target.value, state)
++                target_references = self.expression_references.get(target.value, NO_REFERENCES)
++                # The receiver precedes an index that can rebind its name.
++                if isinstance(target, ast.Subscript):
++                    self.expr(target.slice, state)
++            if target_references:
++                self.mutate(target_references, fact, state)
++                return
+             base = target.value
+             while isinstance(base, (ast.Subscript, ast.Attribute)):
+                 base = base.value
+             if isinstance(base, ast.Name):
+-                state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
++                references = state.references.get(base.id, NO_REFERENCES)
++                if references:
++                    self.mutate(references, _advance(fact, base.id), state)
++                else:
++                    state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
+ 
+     def source(self, node, state):
+         candidate = _qualified(node, state.bindings)
+@@ -373,7 +431,9 @@ class _Flow:
+                         if default is not None)
+         for name, default in defaults.items():
+             if name not in bound:
+-                bound[name] = self.engine.defaults.get(function, {}).get(name, CLEAN)
++                references = self.engine.default_references.get(function, {}).get(name, NO_REFERENCES)
++                bound[name] = join_facts(self.engine.defaults.get(function, {}).get(name, CLEAN),
++                                         *(state.heap.get(ref, CLEAN) for ref in references))
+         expanded = join_facts(*(fact for arg, fact in zip(node.args, arguments) if isinstance(arg, ast.Starred)),
+                               keywords.get(None, CLEAN))
+         if expanded:
+@@ -385,7 +445,7 @@ class _Flow:
+             accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
+             bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
+         for name in self.engine.closures.get(function, ()):
+-            bound[f'@free:{name}'] = state.get(name, CLEAN)
++            bound[f'@free:{name}'] = state.value(name)
+         for name in self.engine.global_names:
+             if (not isinstance(self.scope, ast.Module)
+                     and (name in self.engine.locals.get(self.scope, set())
+@@ -397,7 +457,39 @@ class _Flow:
+                     TaintTrace(name, parameter=f'@global:{name}', path=(name,))
+                 })
+             else:
+-                bound[f'@global:{name}'] = state.get(name, CLEAN)
++                bound[f'@global:{name}'] = state.value(name)
++        return bound
++
++    def bind_references(self, function, node, keyword_nodes, state):
++        """Bind references from evaluated argument snapshots, never re-read names.
++
++        Variadic packs are new Python containers, not aliases to their values.
++        Ordinary positional/keyword parameters and literal ** maps retain
++        object identity. Unknown expansion is conservatively a may-alias set.
++        """
++        positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
++        accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
++        bound = {name: self.expression_references.get(arg, NO_REFERENCES)
++                 for name, arg in zip(positional, node.args)}
++        for name, expression in keyword_nodes.items():
++            if name in accepted:
++                bound[name] = self.expression_references.get(expression, NO_REFERENCES)
++        for name, references in self.engine.default_references.get(function, {}).items():
++            bound.setdefault(name, references)
++        expanded = frozenset().union(*(self.expression_references.get(arg, NO_REFERENCES)
++                                      for arg in node.args if isinstance(arg, ast.Starred)))
++        if expanded:
++            for name in positional:
++                bound[name] = bound.get(name, NO_REFERENCES) | expanded
++        for name in self.engine.closures.get(function, ()):
++            bound[f'@free:{name}'] = state.references.get(name, NO_REFERENCES)
++        for name in self.engine.global_names:
++            if (not isinstance(self.scope, ast.Module)
++                    and (name in self.engine.locals.get(self.scope, set())
++                         or name in self.engine.closures.get(self.scope, set()))):
++                bound[f'@global:{name}'] = frozenset({f'@global:{name}'})
++            else:
++                bound[f'@global:{name}'] = state.references.get(name, NO_REFERENCES)
+         return bound
+ 
+     @staticmethod
+@@ -423,6 +515,8 @@ class _Flow:
+         # Python evaluates the receiver/callable before argument expressions,
+         # which may themselves reassign the receiver or callable name.
+         receiver = self.expr(node.func.value, state) if isinstance(node.func, ast.Attribute) else CLEAN
++        receiver_refs = (self.expression_references.get(node.func.value, NO_REFERENCES)
++                         if isinstance(node.func, ast.Attribute) else NO_REFERENCES)
+         if isinstance(node.func, ast.Lambda):
+             # Defaults execute when the callable is created, before arguments.
+             # The body executes only once the lambda is actually called.
+@@ -440,8 +534,16 @@ class _Flow:
+             else:
+                 keywords[keyword.arg] = join_facts(keywords.get(keyword.arg, CLEAN), self.expr(keyword.value, state))
+                 keyword_nodes[keyword.arg] = keyword.value
++        # Scalars are snapshots, but passed objects observe mutations performed
++        # while evaluating later arguments. Never re-evaluate the source AST.
++        def live_argument(expression, fact):
++            return join_facts(fact, *(state.heap.get(ref, CLEAN)
++                              for ref in self.expression_references.get(expression, NO_REFERENCES)))
++        arguments = [live_argument(expression, fact) for expression, fact in zip(node.args, arguments)]
++        keywords = {key: live_argument(keyword_nodes.get(key), fact) for key, fact in keywords.items()}
+         if isinstance(node.func, ast.Lambda):
+             bound = self.bind(node.func, node, arguments, keywords, state)
++            references = self.bind_references(node.func, node, keyword_nodes, state)
+             local = state.copy()
+             signature = node.func.args
+             for arg in (*signature.posonlyargs, *signature.args, *signature.kwonlyargs,
+@@ -449,9 +551,15 @@ class _Flow:
+                 if arg is not None:
+                     local[arg.arg] = _advance(bound.get(arg.arg, CLEAN), arg.arg)
+                     local.bindings[arg.arg] = None
+-            return self.expr(node.func.body, local)
++                    local.references[arg.arg] = references.get(arg.arg, NO_REFERENCES)
++            returned = self.expr(node.func.body, local)
++            for ref, fact in local.heap.items():
++                state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
++            self.expression_references[node] = self.expression_references.get(node.func.body, NO_REFERENCES)
++            return returned
+         if function is not None:
+             bound = self.bind(function, node, arguments, keywords, state)
++            references = self.bind_references(function, node, keyword_nodes, state)
+             summary = self.engine.summaries.get(function, FunctionSummary())
+             for kind, line, column, label, fact in summary.effects:
+                 propagated = self.substitute(fact, bound, f'{function.name}()')
+@@ -459,9 +567,18 @@ class _Flow:
+                 key = (kind, line, column, label)
+                 if propagated:
+                     self.effects[key] = join_facts(self.effects.get(key, CLEAN), propagated)
++            for parameter, written in summary.mutations:
++                fact = self.substitute(written, bound, f'{function.name}()')
++                self.mutate(references.get(parameter, NO_REFERENCES), fact, state)
++            returned_refs = frozenset().union(*(references.get(parameter, NO_REFERENCES)
++                                               for parameter in summary.returned_references))
++            self.expression_references[node] = returned_refs or frozenset({node})
+             returned = self.substitute(summary.returned, bound, f'{function.name}()')
+             if function in self.engine.generators:
+                 self.generator_returns[node] = returned
++                self.generator_return_references[node] = returned_refs
++                self.expression_references[node] = frozenset().union(*(
++                    references.get(parameter, NO_REFERENCES) for parameter in summary.yielded_references))
+                 return self.substitute(summary.yielded, bound, f'{function.name}()')
+             return returned
+         fact = join_facts(receiver, *arguments, *keywords.values(), self.source(node, state))
+@@ -473,6 +590,15 @@ class _Flow:
+             return join_facts(keywords.get(None, CLEAN), *(keywords.get(key, CLEAN) for key in names))
+ 
+         leaf = name.rsplit('.', 1)[-1]
++        if isinstance(node.func, ast.Attribute) and receiver_refs:
++            written = CLEAN
++            if leaf in {'append', 'add'}:
++                written = first
++            elif leaf == 'insert':
++                written = arguments[1] if len(arguments) > 1 else CLEAN
++            elif leaf in {'extend', 'update', 'setdefault'}:
++                written = join_facts(*arguments, *keywords.values())
++            self.mutate(receiver_refs, written, state)
+         if leaf in {'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
+             label = 'render_template' if leaf.startswith('render_template') else ('Flask Response' if leaf == 'Response' else leaf)
+             content = (join_facts(*arguments, *keywords.values()) if leaf.startswith('render_template')
+@@ -517,6 +643,7 @@ class _Flow:
+         # Callable identity belongs to the point before its arguments execute:
+         # Query(alias := other) still constructs the originally bound marker.
+         imported_call = _imported_name(node.func, state.bindings) if isinstance(node, ast.Call) else ''
++        self.expression_references.pop(node, None)
+         fact = self.expression(node, state)
+         if node is not None:
+             self.expression_facts[node] = fact
+@@ -546,6 +673,14 @@ class _Flow:
+                 if any(isinstance(marker, _FrameworkInput) for marker in markers):
+                     binding = markers
+             self.expression_bindings[node] = binding
++            if isinstance(node, ast.Name):
++                self.expression_references[node] = state.references.get(node.id, NO_REFERENCES)
++            elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred, ast.Await)):
++                self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
++            elif isinstance(node, ast.NamedExpr):
++                self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
++            elif isinstance(node, (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Call)):
++                self.expression_references.setdefault(node, frozenset({node}))
+         return fact
+ 
+     def expression(self, node, state):
+@@ -553,6 +688,9 @@ class _Flow:
+             return CLEAN
+         if isinstance(node, (ast.Yield, ast.YieldFrom)):
+             self.yielded = join_facts(self.yielded, self.expr(node.value, state))
++            self.yielded_references.update(self.expression_references.get(node.value, NO_REFERENCES))
++            if isinstance(node, ast.YieldFrom):
++                self.expression_references[node] = self.generator_return_references.get(node.value, NO_REFERENCES)
+             # yield-from evaluates to the delegate's final return; an ordinary
+             # yield expression instead receives a future send() value.
+             return self.generator_returns.get(node.value, CLEAN) if isinstance(node, ast.YieldFrom) else CLEAN
+@@ -564,6 +702,11 @@ class _Flow:
+             defaults.update({arg.arg: self.expr(value, state) for arg, value in
+                              zip(signature.kwonlyargs, signature.kw_defaults) if value is not None})
+             self.engine.defaults[node] = defaults
++            self.engine.default_references[node] = {
++                arg.arg: self.expression_references.get(value, NO_REFERENCES)
++                for arg, value in (*zip(positional[len(positional) - len(signature.defaults):], signature.defaults),
++                                   *zip(signature.kwonlyargs, signature.kw_defaults)) if value is not None
++            }
+             return CLEAN
+         if isinstance(node, ast.Compare):
+             self.expr(node.left, state)
+@@ -577,7 +720,7 @@ class _Flow:
+             self.expr(node.operand, state)
+             return CLEAN
+         if isinstance(node, ast.Name):
+-            return state.get(node.id, CLEAN)
++            return state.value(node.id)
+         if isinstance(node, ast.Call):
+             return self.call(node, state)
+         if isinstance(node, ast.NamedExpr):
+@@ -588,6 +731,8 @@ class _Flow:
+             self.expr(node.test, state)
+             left, right = state.copy(), state.copy()
+             fact = join_facts(self.expr(node.body, left), self.expr(node.orelse, right))
++            self.expression_references[node] = (self.expression_references.get(node.body, NO_REFERENCES)
++                                                | self.expression_references.get(node.orelse, NO_REFERENCES))
+             state.replace(_join_states(left, right))
+             return fact
+         if isinstance(node, ast.BoolOp):
+@@ -597,6 +742,8 @@ class _Flow:
+             for value in node.values:
+                 fact = join_facts(fact, self.expr(value, continuation))
+                 exits.append(continuation.copy())
++            self.expression_references[node] = frozenset().union(*(self.expression_references.get(value, NO_REFERENCES)
++                                                                   for value in node.values))
+             state.replace(_join_states(*exits))
+             return fact
+         if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+@@ -656,9 +803,12 @@ class _Flow:
+                 if isinstance(description, _FrameworkInput):
+                     default_inputs[name] = description
+             self.engine.defaults[node] = default_facts
++            self.engine.default_references[node] = {name: self.expression_references.get(default, NO_REFERENCES)
++                                                    for name, default in defaults.items()}
+             self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
+             state[node.name] = CLEAN
+             state.bindings[node.name] = node
++            state.references[node.name] = NO_REFERENCES
+         elif isinstance(node, ast.ClassDef):
+             for expression in (*node.bases, *node.decorator_list):
+                 self.expr(expression, state)
+@@ -667,12 +817,14 @@ class _Flow:
+             self.block(node.body, state.copy())
+             state[node.name] = CLEAN
+             state.bindings[node.name] = node
++            state.references[node.name] = NO_REFERENCES
+         elif isinstance(node, (ast.Import, ast.ImportFrom)):
+             for alias in node.names:
+                 local = alias.asname or alias.name.split('.')[0]
+                 state.bindings[local] = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
+                                          else alias.name if alias.asname else local)
+                 state[local] = CLEAN
++                state.references[local] = NO_REFERENCES
+         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+             if node.value is None:
+                 return state  # An annotation alone does not assign a value.
+@@ -681,7 +833,10 @@ class _Flow:
+             for target in targets:
+                 self.assign(target, fact, state, node.value)
+         elif isinstance(node, ast.AugAssign):
+-            self.assign(node.target, join_facts(self.expr(node.target, state), self.expr(node.value, state)), state)
++            previous = self.expr(node.target, state)
++            references = self.expression_references.get(node.target, NO_REFERENCES)
++            fact = join_facts(previous, self.expr(node.value, state))
++            self.assign(node.target, fact, state, target_references=references)
+         elif isinstance(node, ast.Assert):
+             self.expr(node.test, state)
+             # The message runs only on a raising path. Its sinks matter, but
+@@ -691,6 +846,7 @@ class _Flow:
+             self.expr(node.value, state)
+         elif isinstance(node, ast.Return):
+             self.returned = join_facts(self.returned, self.expr(node.value, state))
++            self.returned_references.update(self.expression_references.get(node.value, NO_REFERENCES))
+             self.stopped.append(state.copy())
+             return None
+         elif isinstance(node, ast.Raise):
+@@ -742,6 +898,7 @@ class _Flow:
+                 if isinstance(target, ast.Name):
+                     state[target.id] = CLEAN
+                     state.bindings[target.id] = None
++                    state.references[target.id] = NO_REFERENCES
+         elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
+             subject = self.expr(node.subject, state)
+             branches = []
+@@ -788,7 +945,15 @@ class _Flow:
+         return _join_states(normal, *exits)
+ 
+     def summary(self):
+-        return FunctionSummary(self.returned, tuple((*key, fact) for key, fact in sorted(self.effects.items())), self.yielded)
++        returned = join_facts(self.returned, *(self.mutations.get(ref, CLEAN) for ref in self.returned_references))
++        yielded = join_facts(self.yielded, *(self.mutations.get(ref, CLEAN) for ref in self.yielded_references))
++        mutations = tuple(sorted((ref, fact) for ref, fact in self.mutations.items() if isinstance(ref, str)))
++        return FunctionSummary(
++            returned=returned, effects=tuple((*key, fact) for key, fact in sorted(self.effects.items())),
++            yielded=yielded, mutations=mutations,
++            returned_references=frozenset(ref for ref in self.returned_references if isinstance(ref, str)),
++            yielded_references=frozenset(ref for ref in self.yielded_references if isinstance(ref, str)),
++        )
+ 
+ 
+ class _Analysis:
+@@ -798,6 +963,7 @@ class _Analysis:
+         self.defaults = {}
+         self.framework_inputs = {}
+         self.framework_dependencies = {}
++        self.default_references = {}
+         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+         self.generators = {function for function in self.functions
+@@ -848,7 +1014,7 @@ class _Analysis:
+                        if description.kind == 'source' or (description.kind == 'implicit' and function in providers)}
+             for function, inputs in self.framework_inputs.items()
+         }
+-        global_bound = {f'@global:{name}': value for name, value in globals_.items()}
++        global_bound = {f'@global:{name}': globals_.value(name) for name in globals_}
+         while True:
+             changed = False
+             for function, inputs in self.framework_inputs.items():
+@@ -884,6 +1050,7 @@ class _Analysis:
+                 state = _State({name: frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))})
+                                 for name in self.global_names if name not in local},
+                                {name: target for name, target in globals_.bindings.items() if name not in local})
++                state.references.update({name: frozenset({f'@global:{name}'}) for name in self.global_names if name not in local})
+                 for name in local:
+                     state.bindings[name] = None
+                 arguments = function.args
+@@ -894,9 +1061,11 @@ class _Analysis:
+                     description = self.framework_inputs.get(function, {}).get(arg.arg)
+                     if description is not None and description.kind == 'request':
+                         state.bindings[arg.arg] = '@request:' + description.name
++                    state.references[arg.arg] = frozenset({arg.arg})
+                 for name in self.closures[function]:
+                     state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
+                     state.bindings[name] = None
++                    state.references[name] = frozenset({f'@free:{name}'})
+                 if function.name not in local and function.name not in state.bindings:
+                     state.bindings[function.name] = function
+                 flow.block(function.body, state)
+@@ -911,7 +1080,7 @@ class _Analysis:
+                 for flow in flows:
+                     for key, fact in flow.effects.items():
+                         if flow is not module:
+-                            bound = {f'@global:{name}': value for name, value in globals_.items()}
++                            bound = {f'@global:{name}': globals_.value(name) for name in globals_}
+                             # Framework invocation is a separate entry point;
+                             # summaries remain symbolic for ordinary callers.
+                             bound.update(framework_bound.get(flow.scope, {}))
+diff --git a/test-suite/quality/test_taint_python_effects.py b/test-suite/quality/test_taint_python_effects.py
+new file mode 100644
+index 0000000..237a77b
+--- /dev/null
++++ b/test-suite/quality/test_taint_python_effects.py
+@@ -0,0 +1,331 @@
++"""Mutable-object and framework integration regressions; fixtures are not executed."""
++from __future__ import annotations
++
++import unittest
++import json
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import time
++
++from test_taint_python_dataflow import ROOT, SourceTest
++
++
++class MutableObjectEffectsTests(SourceTest):
++    def test_aliases_observe_subscript_and_attribute_writes(self):
++        for create, write, read in (("{}", "alias['code'] = input()", "box['code']"),
++                                    ("[]", "alias.append(input())", "box[0]"),
++                                    ("Object()", "alias.code = input()", "box.code")):
++            with self.subTest(write=write):
++                self.assert_rules(f'box = {create}\nalias = box\n{write}\neval({read})\n', 'eval')
++
++    def test_output_parameter_writes_reach_caller(self):
++        for write in ("target['code'] = value", "target.append(value)", "target.code = value"):
++            with self.subTest(write=write):
++                self.assert_rules(f'''\
++                    def fill(target, value):
++                        {write}
++                    box = {{}}
++                    fill(box, input())
++                    eval(box['code'])
++                ''', 'eval')
++                self.assert_rules(f'''\
++                    def fill(target, value):
++                        {write}
++                    box = {{}}
++                    fill(box, 'safe')
++                    eval(box['code'])
++                ''')
++
++    def test_nested_helpers_propagate_effects_without_using_the_return(self):
++        self.assert_rules('''
++            def fill(target, value):
++                target['code'] = value
++            def forward(output, query):
++                fill(output, query)
++            box = {}
++            forward(box, input())
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_recursive_helpers_converge_with_mutation_effects(self):
++        self.assert_rules('''
++            def first(target, value):
++                if condition:
++                    second(target, value)
++                target['code'] = value
++            def second(target, value):
++                first(target, value)
++            box = {}
++            second(box, input())
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_returned_parameter_alias_keeps_caller_identity(self):
++        self.assert_rules('''
++            def identity(target):
++                return target
++            box = {}
++            alias = identity(box)
++            alias['code'] = input()
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_returned_local_object_retains_its_mutations(self):
++        self.assert_rules('''
++            def build(value):
++                box = {}
++                alias = box
++                alias['code'] = value
++                return box
++            eval(build(input())['code'])
++        ''', 'eval')
++        self.assert_rules('''
++            def build(unused):
++                box = {'code': 'safe'}
++                return box
++            eval(build(input())['code'])
++        ''')
++
++    def test_rebinding_does_not_mutate_the_original_object(self):
++        self.assert_rules('''
++            box = {'code': 'safe'}
++            alias = box
++            alias = {}
++            alias['code'] = input()
++            eval(box['code'])
++        ''')
++        self.assert_rules('''
++            def replace(target, value):
++                target = {}
++                target['code'] = value
++            box = {'code': 'safe'}
++            replace(box, input())
++            eval(box['code'])
++        ''')
++
++    def test_different_allocations_are_not_conflated(self):
++        self.assert_rules('''
++            left = {}
++            right = {'code': 'safe'}
++            left['code'] = input()
++            eval(right['code'])
++        ''')
++
++    def test_conditional_alias_preserves_both_possible_targets(self):
++        self.assert_rules('''
++            left = {}
++            right = {}
++            alias = left if condition else right
++            alias['code'] = input()
++            eval(left['code'])
++            eval(right['code'])
++        ''', 'eval', 'eval')
++
++    def test_mutation_after_a_read_does_not_retroactively_taint_it(self):
++        self.assert_rules('''
++            box = {'code': 'safe'}
++            eval(box['code'])
++            alias = box
++            alias['code'] = input()
++        ''')
++
++    def test_partial_clean_write_does_not_clean_the_whole_object(self):
++        self.assert_rules('''
++            box = {}
++            box['code'] = input()
++            box['other'] = 'safe'
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_mutation_sanitizers_remain_sink_specific(self):
++        self.assert_rules('''
++            def fill(target, value):
++                target['html'] = html.escape(value)
++            box = {}
++            fill(box, input())
++            HttpResponse(box['html'])
++            cursor.execute(box['html'])
++        ''', 'sql')
++
++    def test_closure_and_global_object_writes_reach_the_owner(self):
++        self.assert_rules('''
++            box = {}
++            def fill(value):
++                box['code'] = value
++            fill(input())
++            eval(box['code'])
++        ''', 'eval')
++        self.assert_rules('''
++            def outer(value):
++                box = {}
++                def fill():
++                    box['code'] = value
++                fill()
++                eval(box['code'])
++            outer(input())
++        ''', 'eval')
++
++    def test_mutable_default_uses_definition_time_identity(self):
++        self.assert_rules('''
++            box = {}
++            def fill(value, target=box):
++                target['code'] = value
++            fill(input())
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_literal_keyword_maps_preserve_output_identity(self):
++        self.assert_rules('''
++            def fill(*, target, value):
++                target['code'] = value
++            box = {}
++            fill(**{'target': box, 'value': input()})
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_argument_rebinding_does_not_retarget_an_earlier_argument(self):
++        self.assert_rules('''
++            def fill(target, unused):
++                target['code'] = input()
++            box = {}
++            original = box
++            fill(box, box := {})
++            eval(original['code'])
++            eval(box['code'])
++        ''', 'eval')
++
++    def test_later_argument_mutation_is_visible_to_the_callee(self):
++        self.assert_rules('''
++            def run(target, unused):
++                eval(target[0])
++            box = []
++            run(box, box.append(input()))
++        ''', 'eval')
++
++    def test_assignment_target_expressions_are_evaluated(self):
++        self.assert_rules("box = {}\nbox[eval(input())] = 'safe'\n", 'eval')
++        self.assert_rules("Object(eval(input())).value = 'safe'\n", 'eval')
++
++
++class FrameworkMutationEffectsTests(SourceTest):
++    def test_request_parameter_reaches_a_mutated_output(self):
++        self.assert_rules('''
++            from fastapi import Query
++            def fill(target, value):
++                target['code'] = value
++            def route(code=Query()):
++                box = {}
++                fill(box, code)
++                eval(box['code'])
++        ''', 'eval')
++
++    def test_dependency_returns_a_mutated_local_object(self):
++        self.assert_rules('''
++            from fastapi import Query, Depends
++            def fill(target, value):
++                target['code'] = value
++            def provider(code=Query()):
++                box = {}
++                fill(box, code)
++                return box
++            def route(box=Depends(provider)):
++                eval(box['code'])
++        ''', 'eval')
++
++    def test_dependency_sanitization_keeps_its_domain(self):
++        self.assert_rules('''
++            from fastapi import Query, Depends
++            def provider(code=Query()):
++                box = {}
++                alias = box
++                alias['html'] = html.escape(code)
++                return box
++            def route(box=Depends(provider)):
++                HttpResponse(box['html'])
++                cursor.execute(box['html'])
++        ''', 'sql')
++
++    def test_yielded_and_returned_object_values_remain_distinct(self):
++        for yielded, returned, expected in (("{'code': 'safe'}", "{'code': code}", ()),
++                                           ("{'code': code}", "{'code': 'safe'}", ('eval',))):
++            with self.subTest(yielded=yielded):
++                self.assert_rules(f'''\
++                    from fastapi import Query, Depends
++                    def provider(code=Query()):
++                        yield {yielded}
++                        return {returned}
++                    def route(box=Depends(provider)):
++                        eval(box['code'])
++                ''', *expected)
++
++    def test_dependency_yields_a_mutated_object(self):
++        self.assert_rules('''
++            from fastapi import Query, Depends
++            def provider(code=Query()):
++                box = {}
++                alias = box
++                alias['code'] = code
++                yield box
++                return {'code': 'safe'}
++            def route(box=Depends(provider)):
++                eval(box['code'])
++        ''', 'eval')
++
++    def test_safe_provider_does_not_inherit_unused_input(self):
++        self.assert_rules('''
++            from fastapi import Query, Depends
++            def provider(code=Query()):
++                box = {'code': 'safe'}
++                scratch = {}
++                scratch['code'] = code
++                return box
++            def route(box=Depends(provider)):
++                eval(box['code'])
++        ''')
++
++
++@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'Set UBS_TAINT_E2E=1 for real CLI scans')
++class MutableObjectCliTests(unittest.TestCase):
++    def test_real_json_and_sarif_report_mutable_flows_without_alias_false_positives(self):
++        cases = {
++            'alias': ("box = {}\nalias = box\nalias['code'] = input()\neval(box['code'])\n", True),
++            'helper': ("def fill(box, code):\n    box['code'] = code\nbox = {}\nfill(box, input())\neval(box['code'])\n", True),
++            'safe-rebind': ("box = {'code': 'safe'}\nalias = box\nalias = {}\nalias['code'] = input()\neval(box['code'])\n", False),
++            'provider': ("from fastapi import Query, Depends\ndef provider(code=Query()):\n    box = {}\n    alias = box\n    alias['code'] = code\n    return box\ndef route(box=Depends(provider)):\n    eval(box['code'])\n", True),
++        }
++        artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-mutable-effects'
++        artifacts.mkdir(parents=True, exist_ok=True)
++
++        def rule_ids(value):
++            if isinstance(value, dict):
++                found = {str(value[key]) for key in ('rule', 'ruleId') if key in value}
++                return found | set().union(*(rule_ids(child) for child in value.values()))
++            if isinstance(value, list):
++                return set().union(*(rule_ids(child) for child in value))
++            return set()
++
++        with tempfile.TemporaryDirectory(prefix='ubs-mutable-cli-') as directory:
++            target = Path(directory) / 'route.py'
++            for name, (source, unsafe) in cases.items():
++                target.write_text(source, encoding='utf-8')
++                for output in ('json', 'sarif'):
++                    with self.subTest(case=name, format=output):
++                        started = time.monotonic()
++                        print(f'[python-mutable-{name}-{output}] RUN', flush=True)
++                        result = subprocess.run(
++                            [str(ROOT / 'ubs'), str(target), '--only=python', '--ci', f'--format={output}'],
++                            cwd=directory, capture_output=True, text=True, timeout=90,
++                            env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_SKIP_SIZE_CHECK='1', UBS_NO_CACHE='1'))
++                        (artifacts / f'{name}-{output}.json').write_text(result.stdout, encoding='utf-8')
++                        (artifacts / f'{name}-{output}.stderr.log').write_text(result.stderr, encoding='utf-8')
++                        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
++                        report = json.loads(result.stdout)
++                        ids = rule_ids(report)
++                        self.assertEqual(bool(ids & {'py.taint.eval', 'python.taint.eval'}), unsafe, report)
++                        print(f'[python-mutable-{name}-{output}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
++
++
++if __name__ == '__main__':
++    unittest.main(verbosity=2)

@@ -1,0 +1,233 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 477c8ac..bef2e7c 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -1097,6 +1097,7 @@ class _Flow:
+         self.returned = frozenset()
+         self.effects = {}
+         self.exit_states = []
++        self.throw_states = []
+         self.parameter_context = False
+         self.breaks, self.continues = [], []
+         self.pairs = _pairs(scope.code, scope.body_start, scope.body_end)
+@@ -1158,10 +1159,10 @@ class _Flow:
+             return self.engine.lookup(self.scope, name)
+         return None
+ 
+-    def bind(self, callee, arguments, ranges, state):
++    def bind(self, callee, arguments, ranges, state, argument_states):
+         actual, uncertain = [], None
+ 
+-        def expand(fact, left, right):
++        def expand(fact, left, right, replay):
+             nonlocal uncertain
+             raw = self.scope.code[left:right].strip()
+             if raw.startswith('...'):
+@@ -1175,17 +1176,22 @@ class _Flow:
+                             if begin == finish == closing:
+                                 continue  # a trailing comma creates no argument
+                             if self.scope.code[begin:finish].strip():
+-                                expand(self.value(begin, finish, state), begin, finish)
++                                expand(None, begin, finish, replay)
+                             else:
+                                 actual.append((frozenset(), True))  # an array hole is undefined
+                     return
+                 if uncertain is None:
+                     uncertain = len(actual)
+-                fact = self.value(opening, right, state)
++                if fact is None:
++                    fact = self.value(opening, right, replay)
++            elif fact is None:
++                fact = self.value(left, right, replay)
+             actual.append((fact, raw in {'undefined', 'void 0'}))
+ 
+-        for fact, (left, right) in zip(arguments, ranges):
+-            expand(fact, left, right)
++        for fact, (left, right), entry in zip(arguments, ranges, argument_states):
++            # Recover individual spread elements from the original program
++            # point, never by executing their writes again in the caller.
++            expand(fact, left, right, entry)
+         bound = {}
+         default_flow = None
+         default_state = None
+@@ -1204,7 +1210,10 @@ class _Flow:
+                 for name in bound:
+                     default_state.owners[name] = self.engine.binding(callee, name)
+                 default_flow.pairs.update(_pairs(callee.code, *default))
++                before_default = default_state.copy()
+                 incoming = _join(incoming, default_flow.value(*default, default_state))
++                if uncertain is not None and index >= uncertain:
++                    default_state = _join_states(before_default, default_state)
+             for name in names:
+                 bound[name] = incoming
+         if default_flow is not None:
+@@ -1248,6 +1257,8 @@ class _Flow:
+             end -= 1
+         if start >= end:
+             return frozenset()
++        if code[start:start + 3] == '...':
++            return self.value(start + 3, end, state)
+         if code[start] == '(' and self.pairs.get(start) == end - 1:
+             return self.value(start + 1, end - 1, state)
+         assignment = re.match(r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[start:end])
+@@ -1324,7 +1335,11 @@ class _Flow:
+                 continue
+             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                          if code[left:right].strip()]
+-            argument_facts = [self.value(left, right, state) for left, right in arguments]
++            argument_facts, argument_states = [], []
++            for left, right in arguments:
++                # Only spread decomposition needs to replay an expression.
++                argument_states.append(state.copy() if code[left:right].lstrip().startswith('...') else None)
++                argument_facts.append(self.value(left, right, state))
+             callee_name = re.sub(r'\s+', '', match.group(1))
+             callee = None
+             if '.' not in callee_name:
+@@ -1332,8 +1347,8 @@ class _Flow:
+             if isinstance(callee, _Scope):
+                 self.engine.dependents[(callee, self.rule)].add(self.scope)
+                 returned, effects, writes = self.engine.summaries.get((callee, self.rule), (frozenset(), {}, {}))
+-                bound = self.bind(callee, argument_facts, arguments, state)
+-                incoming = state.copy()
++                bound = self.bind(callee, argument_facts, arguments, state, argument_states)
++                incoming = state.copy() if writes else state
+                 call_fact = self.substitute(returned, callee, bound, incoming)
+                 for (location, label), fact in effects.items():
+                     self.effect(location, label, self.substitute(fact, callee, bound, incoming))
+@@ -1481,6 +1496,7 @@ class _Flow:
+             # Join prefix states so a later overwrite cannot erase that path.
+             entry = state.copy()
+             exit_count, break_count, continue_count = len(self.exit_states), len(self.breaks), len(self.continues)
++            throw_count = len(self.throw_states)
+             body = node.body[0].body if node.body and node.body[0].kind == 'block' else node.body
+             prefix, current = entry.copy(), entry.copy()
+             for statement in body:
+@@ -1488,6 +1504,11 @@ class _Flow:
+                     break
+                 current = self.statement(statement, current)
+                 prefix = _join_states(prefix, current)
++            prefix = _join_states(prefix, *self.throw_states[throw_count:])
++            if node.alternate:
++                # Caught throws no longer leave the function before the
++                # handler. Retaining those snapshots would defeat cleanup.
++                self.throw_states[throw_count:] = []
+             handler = self.block(node.alternate, prefix) if node.alternate else None
+             merged = _join_states(current, handler)
+             if node.extra:
+@@ -1495,12 +1516,14 @@ class _Flow:
+                 # return/throw/break/continue. Do not keep pre-finally cells in
+                 # the write summary: a definite cleanup can replace them.
+                 exits, breaks, continues = (self.exit_states[exit_count:], self.breaks[break_count:],
+-                                             self.continues[continue_count:])
++                                            self.continues[continue_count:])
++                throws = self.throw_states[throw_count:]
+                 self.exit_states[exit_count:] = []
++                self.throw_states[throw_count:] = []
+                 self.breaks[break_count:] = []
+                 self.continues[continue_count:] = []
+-                for destination, pending in ((self.exit_states, exits), (self.breaks, breaks),
+-                                             (self.continues, continues)):
++                for destination, pending in ((self.exit_states, exits), (self.throw_states, throws),
++                                             (self.breaks, breaks), (self.continues, continues)):
+                     for exit_state in pending:
+                         tail = self.block(node.extra, exit_state.copy())
+                         if tail is not None:
+@@ -1581,7 +1604,7 @@ class _Flow:
+             return None
+         if node.kind == 'throw':
+             self.value(node.start, node.end, state)
+-            self.exit_states.append(state.copy())
++            self.throw_states.append(state.copy())
+             return None
+         if node.kind in {'break', 'continue'}:
+             (self.breaks if node.kind == 'break' else self.continues).append(state.copy())
+@@ -1697,9 +1720,10 @@ class _Engine:
+             final = state
+         else:
+             final = flow.block(scope.statements, state)
+-        self.final_states[(scope, rule)] = final or state
+-        exits = [*flow.exit_states, *([final] if final is not None else [])]
++        exits = [*flow.exit_states, *flow.throw_states, *([final] if final is not None else [])]
+         joined = _join_states(*exits)
++        # An empty visible environment can still hold captured block cells.
++        self.final_states[(scope, rule)] = joined if joined is not None else state
+         writes = {} if joined is None else {key: value for key, value in joined.cells.items() if key[0] is not scope}
+         return flow.returned, flow.effects, writes
+ 
+diff --git a/test-suite/js/test_taint_effects.py b/test-suite/js/test_taint_effects.py
+index 4f00a4d..dc93a9b 100644
+--- a/test-suite/js/test_taint_effects.py
++++ b/test-suite/js/test_taint_effects.py
+@@ -223,6 +223,72 @@ class CapturedWriteTests(unittest.TestCase):
+         self.scan('let result = req.query.html; function clear() { result = "hello"; }\n'
+                   'function trigger(value = clear()) {} trigger(); res.send(result);')
+ 
++    def test_unknown_spread_does_not_guarantee_default_cleanup(self):
++        self.scan('let result = req.query.html; function clear() { result = "hello"; }\n'
++                  'function trigger(value = clear()) {} trigger(...args); res.send(result);', 'xss')
++
++    def test_literal_spread_default_cleanup_is_definite(self):
++        self.scan('let result = req.query.html; function clear() { result = "hello"; }\n'
++                  'function trigger(value = clear()) {} trigger(...[]); res.send(result);')
++
++    def test_spread_argument_side_effect_runs_once(self):
++        self.scan('let a = req.query.html, b = "hello";\n'
++                  'function swap() { const saved = a; a = b; b = saved; }\n'
++                  'function ignore(x) {} ignore(...[swap()]); res.send(a);')
++
++    def test_nested_spread_argument_side_effect_runs_once(self):
++        self.scan('let a = req.query.html, b = "hello";\n'
++                  'function swap() { const saved = a; a = b; b = saved; }\n'
++                  'function ignore(...x) {} ignore(...[...[swap()]]); res.send(a);')
++
++    def test_spread_result_observes_pre_argument_capture(self):
++        self.scan('let result = req.query.html;\n'
++                  'function take() { const before = result; result = "hello"; return before; }\n'
++                  'function first(x) { return x; } res.send(first(...[take()]));', 'xss')
++
++    def test_default_reads_state_left_by_previous_default(self):
++        self.scan('let result; function store(x) { result = x; }\n'
++                  'function read(a = store(req.query.html), b = result) { return b; }\n'
++                  'res.send(read());', 'xss')
++
++    def test_default_resolves_capture_before_body_shadow(self):
++        self.scan('const result = req.query.html;\n'
++                  'function read(value = result) { let result = "hello"; return value; }\n'
++                  'res.send(read());', 'xss')
++
++    def test_caught_throw_then_cleanup_replaces_written_taint(self):
++        self.scan('let result; function store(x) {\n'
++                  'try { result = x; throw error; } catch (e) { result = "hello"; } }\n'
++                  'store(req.query.html); res.send(result);')
++
++    def test_throwing_write_reaches_catch_read(self):
++        self.scan('let result; function store(x) {\n'
++                  'try { result = x; throw error; } catch (e) { res.send(result); } }\n'
++                  'store(req.query.html);', 'xss')
++
++    def test_finally_cleanup_covers_throw_state(self):
++        self.scan('let result; function store(x) {\n'
++                  'try { result = x; throw error; } finally { result = "hello"; } }\n'
++                  'try { store(req.query.html); } catch (e) {} res.send(result);')
++
++    def test_nested_catch_and_finally_keep_external_write(self):
++        self.scan('let result; function store(x) { try {\n'
++                  'try { throw error; } catch(e) { result = x; return; }\n'
++                  '} finally { result += "suffix"; } }\n'
++                  'store(req.query.html); res.send(result);', 'xss')
++
++    def test_unknown_spread_propagates_stored_argument_values(self):
++        self.scan('let result; function store(a, b) { result = b; }\n'
++                  'const args = ["hello", req.query.html]; store(...args); res.send(result);', 'xss')
++
++    def test_block_capture_survives_empty_visible_parent_state(self):
++        self.scan('function outer() { if (flag) { const value = req.query.html;\n'
++                  'function inner() { res.send(value); } } }', 'xss')
++
++    def test_block_capture_survives_parent_return_paths(self):
++        self.scan('function outer() { if (flag) { const value = req.query.html;\n'
++                  'function inner() { res.send(value); } return; } else { return; } }', 'xss')
++
+ 
+ if __name__ == '__main__':
+     unittest.main(verbosity=2)

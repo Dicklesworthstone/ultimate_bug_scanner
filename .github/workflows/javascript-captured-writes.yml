@@ -4,7 +4,10 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/javascript-captured-writes.patch
+      - ubs
+      - modules/helpers/ubs_core/**
+      - modules/lib/ubs-common.sh
+      - modules/ubs-js.sh
       - test-suite/js/test_taint_effects.py
       - .github/workflows/javascript-captured-writes.yml
   workflow_dispatch:
@@ -16,8 +19,6 @@ jobs:
   captured-write-regressions:
     runs-on: macos-15
     timeout-minutes: 20
-    permissions:
-      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -26,38 +27,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Retain exact source for reproducible local validation
-        run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/js-effects-source-head.txt"
-          git ls-files -s > "$RUNNER_TEMP/js-effects-source-index.txt"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/js-effects-source.tar.gz" HEAD
-      - uses: actions/upload-artifact@v4
-        with:
-          name: js-effects-source
-          path: ${{ runner.temp }}/js-effects-source*
-          retention-days: 3
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
-      - name: Reproduce the missing write-summary behavior
+      - name: Test the production write-summary implementation
         run: |
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 38a50392b5540131d25ade30664b883ec28b4005
-          if python3 test-suite/js/test_taint_effects.py > "$RUNNER_TEMP/js-effects-before.log" 2>&1; then
-            cat "$RUNNER_TEMP/js-effects-before.log"
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/js-effects-before.log"
-          grep -q 'FAILED (failures=26)' "$RUNNER_TEMP/js-effects-before.log"
-      - name: Apply the reviewed scalar-write implementation
-        run: |
-          git apply --check test-suite/patches/javascript-captured-writes.patch
-          git apply test-suite/patches/javascript-captured-writes.patch
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 477c8ac86895e19afdf6dacc96834c93cb90b736
           python3 test-suite/js/test_taint_effects.py
           python3 test-suite/js/test_taint_scopes.py
           python3 test-suite/js/test_taint_domains.py
-          python3 scripts/update_checksums.py
-          git diff --check
       - name: Install real-scanner dependencies
         run: |
           brew install bash jq ripgrep shellcheck
@@ -115,48 +92,19 @@ jobs:
                   assert rules == expected, (name, rules, expected, report)
                   print('JS_EFFECTS_E2E_PASS', name, sorted(rules), flush=True)
           PY
-      - name: Verify integrity idempotence and publish tested content only
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Verify production integrity regeneration is byte-identical
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert set(changed) <= allowed, changed
-          before = {path: Path(path).read_bytes() for path in changed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
-          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
-          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          assert all(Path(path).read_bytes() == content for path, content in before.items())
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          entries = []
-          for path in changed:
-              content = Path(path).read_bytes()
-              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                                        input=json.dumps({'content': content.decode('utf-8'), 'encoding': 'utf-8'}),
-                                        text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(response.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
-              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', path], text=True).split()[0]
-              entries.append({'path': path, 'sha': sha, 'mode': mode, 'type': 'blob'})
-              print('JS_EFFECTS_BLOB', path, sha, mode, flush=True)
-          result = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': entries}
-          Path(os.environ['RUNNER_TEMP'], 'js-effects-validated.json').write_text(json.dumps(result, indent=2))
-          PY
+          git diff --check
+          git diff > "$RUNNER_TEMP/js-effects-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/js-effects-regenerated.diff"
+          cmp "$RUNNER_TEMP/js-effects-tested.diff" "$RUNNER_TEMP/js-effects-regenerated.diff"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: javascript-captured-writes
           path: |
-            ${{ runner.temp }}/js-effects-*.log
-            ${{ runner.temp }}/js-effects-validated.json
+            ${{ runner.temp }}/js-effects-*.diff
             test-suite/artifacts/javascript-captured-writes/
           retention-days: 3

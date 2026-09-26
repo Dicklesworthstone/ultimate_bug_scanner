@@ -8,13 +8,19 @@ on:
       - test-suite/patches/javascript-heap-calls.patch.gz
       - .github/workflows/javascript-heap.yml
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Supported runner pool for the unchanged validation gates
+        type: choice
+        options: [ubuntu-latest, macos-15]
+        default: ubuntu-latest
 
 permissions:
   contents: read
 
 jobs:
   heap-regressions:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 20
     # Store tested immutable Git blobs only. No commit, branch or tag writes.
     permissions:
@@ -42,8 +48,13 @@ jobs:
           retention-days: 3
       - name: Install actual scanner dependencies before Bash integrity gates
         run: |
-          brew install bash jq ripgrep shellcheck
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install bash jq ripgrep shellcheck
+            echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          else
+            sudo apt-get update
+            sudo apt-get install -y bash jq ripgrep rsync shellcheck
+          fi
           npm install --global @ast-grep/cli
       - name: Apply the exact local and interprocedural heap implementations
         run: |

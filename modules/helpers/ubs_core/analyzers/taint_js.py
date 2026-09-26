@@ -1,12 +1,11 @@
-"""ubs_core.analyzers.taint_js — JavaScript/TypeScript lightweight taint analysis (bead A2).
+"""JavaScript/TypeScript taint analysis with sink-specific sanitizer effects.
 
-Logic moved verbatim from the taint heredoc in modules/ubs-js.sh
-(run_taint_analysis_checks), which keeps its own copy until that module's
-port bead. Also exposes a structured `run(ctx)` for the `python3 -m ubs_core`
-CLI.
+Executable-expression masks retain template interpolation and source offsets.
+Propagation is still flow-insensitive within a file; this is not a complete
+interprocedural or control-flow analysis (the remaining D6 work).
 
 Emit dialects:
-- main(argv) reproduces the heredoc byte-for-byte: one
+- main(argv) preserves the legacy output dialect: one
   `rule_id<TAB>count<TAB>sample,sample,...` row per rule with hits
   (rule ids `js.taint.*`, at most 3 comma-joined samples per rule).
 - run(ctx) yields one NDJSON finding per detection with rule ids
@@ -16,7 +15,8 @@ from __future__ import annotations
 
 import re
 import sys
-from collections import defaultdict
+from bisect import bisect_right
+from collections import defaultdict, deque
 from copy import deepcopy
 from pathlib import Path
 from typing import Iterable
@@ -44,38 +44,35 @@ SOURCE_PATTERNS = [
     (re.compile(r"\bURLSearchParams\s*\([^)]*\)", re.IGNORECASE), 'URLSearchParams payload'),
 ]
 
-SANITIZER_REGEXES = [
-    re.compile(r"DOMPurify\.sanitize"),
-    re.compile(r"sanitizeHtml"),
-    re.compile(r"escapeHtml"),
-    re.compile(r"xssFilters"),
-    re.compile(r"encodeURIComponent"),
-    re.compile(r"he\.escape"),
-    re.compile(r"(?:lodash|_)\.escape"),
-    re.compile(r"validator\.escape"),
-    re.compile(r"stripTags"),
-    re.compile(r"sanitizeInput"),
-    re.compile(r"sanitizeUrl"),
-    re.compile(r"shellescape"),
-    re.compile(r"db\.escape|pool\.escape|connection\.escape|mysql\.escape|sqlstring\.escape"),
-]
+# Escaping for one interpreter is not escaping for another. Unknown helpers,
+# URL encoders and tag strippers are deliberately not universal sanitizers.
+SANITIZERS_BY_RULE = {
+    'js.taint.xss': re.compile(
+        r'(?<![\w$.])(?:DOMPurify\.sanitize|sanitizeHtml|escapeHtml|'
+        r'he\.escape|(?:lodash|_)\.escape|validator\.escape)\s*\('
+    ),
+    'js.taint.command': re.compile(r'(?<![\w$.])shellescape\s*\('),
+    'js.taint.sql': re.compile(
+        r'(?<![\w$.])(?:db|pool|connection|mysql|sqlstring)\.escape\s*\('
+    ),
+}
 
 CHILD_PROCESS_APIS = ('execFileSync', 'execFile', 'execSync', 'spawnSync', 'spawn', 'exec')
 CHILD_PROCESS_API_RE = r"(?:execFileSync|execFile|execSync|spawnSync|spawn|exec)"
 CHILD_PROCESS_MODULE_RE = r"['\"](?:node:)?child_process['\"]"
 
 SINKS = [
-    (re.compile(r"\.innerHTML\s*=\s*(.+)"), 'js.taint.xss', 'innerHTML write'),
-    (re.compile(r"\.outerHTML\s*=\s*(.+)"), 'js.taint.xss', 'outerHTML write'),
-    (re.compile(r"dangerouslySetInnerHTML\s*=\s*(.+)"), 'js.taint.xss', 'dangerouslySetInnerHTML'),
-    (re.compile(r"insertAdjacentHTML\s*\((.+)\)"), 'js.taint.xss', 'insertAdjacentHTML'),
-    (re.compile(r"document\.write\s*\((.+)\)"), 'js.taint.xss', 'document.write'),
-    (re.compile(r"res(?:ponse)?\.send\s*\((.+)\)"), 'js.taint.xss', 'HTTP send'),
-    (re.compile(r"res(?:ponse)?\.json\s*\((.+)\)"), 'js.taint.xss', 'HTTP json send'),
-    (re.compile(r"eval\s*\((.+)\)"), 'js.taint.eval', 'eval'),
-    (re.compile(r"new\s+Function\s*\((.+)\)"), 'js.taint.eval', 'Function constructor'),
-    (re.compile(r"shell\.exec\s*\((.+)\)"), 'js.taint.command', 'shell.exec'),
-    (re.compile(r"(?:db|pool|connection|client|knex|sequelize|prisma)\.(?:query|execute|raw)\s*\((.+)\)"), 'js.taint.sql', 'SQL execution'),
+    (re.compile(r"\.innerHTML\s*=(?!=)"), 'js.taint.xss', 'innerHTML write', False),
+    (re.compile(r"\.outerHTML\s*=(?!=)"), 'js.taint.xss', 'outerHTML write', False),
+    (re.compile(r"\bdangerouslySetInnerHTML\s*=(?!=)"), 'js.taint.xss', 'dangerouslySetInnerHTML', False),
+    (re.compile(r"\binsertAdjacentHTML\s*\("), 'js.taint.xss', 'insertAdjacentHTML', True),
+    (re.compile(r"\bdocument\.write\s*\("), 'js.taint.xss', 'document.write', True),
+    (re.compile(r"\bres(?:ponse)?\.send\s*\("), 'js.taint.xss', 'HTTP send', True),
+    (re.compile(r"\bres(?:ponse)?\.json\s*\("), 'js.taint.xss', 'HTTP json send', True),
+    (re.compile(r"\beval\s*\("), 'js.taint.eval', 'eval', True),
+    (re.compile(r"\bnew\s+Function\s*\("), 'js.taint.eval', 'Function constructor', True),
+    (re.compile(r"\bshell\.exec\s*\("), 'js.taint.command', 'shell.exec', True),
+    (re.compile(r"\b(?:db|pool|connection|client|knex|sequelize|prisma)\.(?:query|execute|raw)\s*\("), 'js.taint.sql', 'SQL execution', True),
 ]
 
 ASSIGN_DECL = re.compile(r"^(?:const|let|var)\s+(.+?)\s*=\s*(.+)")
@@ -83,7 +80,7 @@ ASSIGN_SIMPLE = re.compile(r"^([A-Za-z_$][\w$]*)\s*=\s*(?![=])(.+)")
 DESTRUCT_OBJECT = re.compile(r"^(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(.+)")
 DESTRUCT_ARRAY = re.compile(r"^(?:const|let|var)\s*\[([^]]*)\]\s*=\s*(.+)")
 
-KIND_BY_RULE = {rule: rule.rsplit('.', 1)[-1] for _regex, rule, _label in SINKS}
+KIND_BY_RULE = {rule: rule.rsplit('.', 1)[-1] for _regex, rule, _label, _call in SINKS}
 
 
 def should_skip(path: Path) -> bool:
@@ -108,44 +105,159 @@ def iter_js_files(root: Path):
             yield path
 
 
-def strip_comments(line: str) -> str:
-    out, quote, escape = [], '', False
+def lexical_views(text: str) -> tuple[str, str]:
+    """Return comment-free source and executable code at original offsets.
+
+    Template text is inert, but ${expressions} (including nested templates)
+    are executable. Synthetic parentheses keep their boundaries balanced for
+    argument scanning. No source text is evaluated. Regex recognition is
+    intentionally lexical, not a claim to implement the JavaScript grammar.
+    """
+    source, code = list(text), list(text)
+    frames = [['code', 0]]
+
+    def mask(output, start, end):
+        for pos in range(start, end):
+            output[pos] = '\n' if text[pos] == '\n' else ' '
+
+    def regex_allowed(pos):
+        previous = pos - 1
+        while previous >= 0 and code[previous].isspace():
+            previous -= 1
+        if previous < 0 or code[previous] in '=(:,[!&|?;{}':
+            return True
+        if previous > 0 and text[previous - 1:previous + 1] == '=>':
+            return True
+        end = previous + 1
+        while previous >= 0 and (code[previous].isalnum() or code[previous] in '_$'):
+            previous -= 1
+        return ''.join(code[previous + 1:end]) in {'return', 'throw', 'yield', 'case', 'void', 'typeof', 'delete'}
+
     i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            if escape:
-                escape = False
-            elif ch == '\\':
-                escape = True
-            elif ch == quote:
-                quote = ''
-            i += 1
-            continue
-        if ch in ('"', "'", '`'):
-            quote = ch
-            i += 1
-            continue
-        if ch == '/' and i + 1 < len(line):
-            nxt = line[i + 1]
-            if nxt == '/':
-                break
-            if nxt == '*':
-                end = line.find('*/', i + 2)
-                if end == -1:
-                    break
-                i = end + 2
+    while i < len(text):
+        ch = text[i]
+        if frames[-1][0] == 'template':
+            code[i] = '\n' if ch == '\n' else ' '
+            if ch == '\\':
+                mask(code, i, min(i + 2, len(text)))
+                i += 2
                 continue
-        out.append(ch)
+            if ch == '`':
+                code[i] = ')'
+                frames.pop()
+            elif text.startswith('${', i):
+                code[i + 1] = '('
+                frames.append(['expression', 0])
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if text.startswith('//', i):
+            end = text.find('\n', i + 2)
+            end = len(text) if end < 0 else end
+            mask(source, i, end)
+            mask(code, i, end)
+            i = end
+            continue
+        if text.startswith('/*', i):
+            end = text.find('*/', i + 2)
+            end = len(text) if end < 0 else end + 2
+            mask(source, i, end)
+            mask(code, i, end)
+            i = end
+            continue
+        if ch in ('"', "'"):
+            end = i + 1
+            while end < len(text):
+                if text[end] == '\\':
+                    end += 2
+                elif text[end] == ch:
+                    end += 1
+                    break
+                elif text[end] == '\n':
+                    break
+                else:
+                    end += 1
+            end = min(end, len(text))
+            mask(code, i, end)
+            code[i] = '0'  # an inert value, not missing syntax
+            i = end
+            continue
+        if ch == '`':
+            code[i] = '('
+            frames.append(['template', 0])
+            i += 1
+            continue
+        if ch == '/' and regex_allowed(i):
+            end, character_class = i + 1, False
+            while end < len(text) and text[end] != '\n':
+                if text[end] == '\\':
+                    end += 2
+                    continue
+                if text[end] == '[':
+                    character_class = True
+                elif text[end] == ']':
+                    character_class = False
+                elif text[end] == '/' and not character_class:
+                    end += 1
+                    while end < len(text) and text[end].isalpha():
+                        end += 1
+                    mask(code, i, end)
+                    code[i] = '0'
+                    i = end
+                    break
+                end += 1
+            else:
+                end = -1
+            if end >= 0:
+                continue
+        if frames[-1][0] == 'expression':
+            if ch == '{':
+                frames[-1][1] += 1
+            elif ch == '}':
+                if frames[-1][1] == 0:
+                    code[i] = ')'
+                    frames.pop()
+                else:
+                    frames[-1][1] -= 1
         i += 1
-    return ''.join(out).strip()
+    return ''.join(source), ''.join(code)
+
+
+def strip_comments(text: str) -> str:
+    return lexical_views(text)[0]
+
+
+def expression_end(code: str, start: int, *, call: bool = False) -> int:
+    """Find a balanced call argument list or assignment expression boundary."""
+    stack = []
+    closing = {')': '(', ']': '[', '}': '{'}
+    previous = ''
+    for index in range(start, len(code)):
+        char = code[index]
+        if char in '([{':
+            stack.append(char)
+        elif char in closing:
+            if not stack:
+                return index
+            if stack[-1] == closing[char]:
+                stack.pop()
+        elif char == ';' and not stack:
+            return index
+        elif char == '\n' and not call and not stack and previous not in '=+-,.?:*/&|':
+            return index
+        if not char.isspace():
+            previous = char
+    return len(code)
 
 
 def split_statements(line: str):
     if ';' not in line:
         return [line]
     parts, buf, depth = [], [], 0
-    for ch in line:
+    code = lexical_views(line)[1]
+    for index, ch in enumerate(code):
         if ch in '([{':
             depth += 1
         elif ch in ')]}':
@@ -156,7 +268,7 @@ def split_statements(line: str):
                 parts.append(token)
             buf = []
             continue
-        buf.append(ch)
+        buf.append(line[index])
     token = ''.join(buf).strip()
     if token:
         parts.append(token)
@@ -211,87 +323,80 @@ def source_line(raw: str) -> str:
 
 
 def child_process_bindings(lines):
+    text, code = lexical_views('\n'.join(lines))
     module_aliases = {'child_process', 'cp'}
     function_aliases = set()
     api_group = CHILD_PROCESS_API_RE
 
-    for raw in lines:
-        line = source_line(raw)
-        if not line:
-            continue
-        m = re.search(rf"\b(?:const|let|var)\s*\{{([^}}]+)\}}\s*=\s*require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)", line)
-        if m:
-            function_aliases.update(parse_child_process_members(m.group(1)))
-        m = re.search(rf"\bimport\s*\{{([^}}]+)\}}\s*from\s*{CHILD_PROCESS_MODULE_RE}", line)
-        if m:
-            function_aliases.update(parse_child_process_members(m.group(1)))
-        m = re.search(rf"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)", line)
-        if m:
-            module_aliases.add(m.group(1))
-        m = re.search(rf"\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+{CHILD_PROCESS_MODULE_RE}", line)
-        if m:
-            module_aliases.add(m.group(1))
-        m = re.search(rf"\bimport\s+([A-Za-z_$][\w$]*)\s+from\s+{CHILD_PROCESS_MODULE_RE}", line)
-        if m:
-            module_aliases.add(m.group(1))
-        m = re.search(rf"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)\.{api_group}\b", line)
-        if m:
-            function_aliases.add(m.group(1))
+    def bindings(pattern):
+        for match in re.finditer(pattern, text):
+            if code[match.start()] == text[match.start()]:
+                yield match.group(1)
+
+    for pattern in (
+        rf"\b(?:const|let|var)\s*\{{([^}}]+)\}}\s*=\s*require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)",
+        rf"\bimport\s*\{{([^}}]+)\}}\s*from\s+{CHILD_PROCESS_MODULE_RE}",
+    ):
+        for members in bindings(pattern):
+            function_aliases.update(parse_child_process_members(members))
+    for pattern in (
+        rf"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)",
+        rf"\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+{CHILD_PROCESS_MODULE_RE}",
+        rf"\bimport\s+([A-Za-z_$][\w$]*)\s+from\s+{CHILD_PROCESS_MODULE_RE}",
+    ):
+        module_aliases.update(bindings(pattern))
+    function_aliases.update(bindings(
+        rf"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)\.{api_group}\b"
+    ))
 
     alias_group = '|'.join(re.escape(alias) for alias in sorted(module_aliases, key=len, reverse=True))
     if alias_group:
-        for raw in lines:
-            line = source_line(raw)
-            if not line:
-                continue
-            m = re.search(rf"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:{alias_group})\.{api_group}\b", line)
-            if m:
-                function_aliases.add(m.group(1))
+        function_aliases.update(bindings(
+            rf"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:{alias_group})\.{api_group}\b"
+        ))
 
     return module_aliases, function_aliases
 
 
 def parse_assignments(lines):
+    text, code = lexical_views('\n'.join(lines))
     assignments = []
-    for idx, raw in enumerate(lines, start=1):
-        stripped = strip_comments(raw)
-        if not stripped:
+    seen = set()
+    line_starts = [0] + [m.end() for m in re.finditer('\n', text)]
+    for boundary in re.finditer(r'(?:^|[;\n{}])\s*', code):
+        start = boundary.end()
+        statement = text[start:]
+        match = None
+        for pattern in (DESTRUCT_OBJECT, DESTRUCT_ARRAY, ASSIGN_DECL, ASSIGN_SIMPLE):
+            match = pattern.match(statement)
+            if match:
+                break
+        if match is None:
             continue
-        for stmt in split_statements(stripped):
-            stmt = stmt.strip()
-            if not stmt:
-                continue
-            m = DESTRUCT_OBJECT.match(stmt)
-            if m:
-                targets = parse_targets(m.group(1))
-                expr = m.group(2)
-            else:
-                m = DESTRUCT_ARRAY.match(stmt)
-                if m:
-                    targets = parse_targets(m.group(1))
-                    expr = m.group(2)
-                else:
-                    m = ASSIGN_DECL.match(stmt)
-                    if m:
-                        targets = parse_targets(m.group(1))
-                        expr = m.group(2)
-                    else:
-                        m = ASSIGN_SIMPLE.match(stmt)
-                        if m:
-                            targets = [m.group(1)]
-                            expr = m.group(2)
-                        else:
-                            continue
-            expr = expr.strip()
-            for target in targets:
-                assignments.append((idx, target, expr))
+        expr_start = start + match.start(2)
+        if expr_start in seen:
+            continue
+        seen.add(expr_start)
+        raw_target = match.group(1)
+        # A declaration's colon is a TypeScript annotation, whereas an object
+        # destructuring colon introduces the local binding name.
+        if pattern is ASSIGN_DECL:
+            raw_target = raw_target.split(':', 1)[0]
+        targets = parse_targets(raw_target)
+        end = expression_end(code, expr_start)
+        expr = text[expr_start:end].strip()
+        for target in targets:
+            assignments.append((bisect_right(line_starts, start), target, expr))
     return assignments
 
 
 def find_sources(expr: str):
     matches = []
+    code = lexical_views(expr)[1]
     for regex, label in SOURCE_PATTERNS:
         for match in regex.finditer(expr):
+            if code[match.start():match.start() + 1] != expr[match.start():match.start() + 1]:
+                continue
             snippet = match.group(0).strip()
             if snippet:
                 matches.append((snippet, label))
@@ -308,40 +413,90 @@ def assignment_sources(expr: str):
     return []
 
 
-def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
-    for regex in SANITIZER_REGEXES:
-        if regex.search(expr):
-            return True
-    if sink_rule == 'js.taint.sql' and re.search(r",\s*(?:\[[^\]]+\]|params|values|bindings)", expr, re.IGNORECASE):
-        return True
-    return False
+def unsanitized_expression(expr: str, sink_rule: str | None) -> str:
+    """Mask only complete sanitizer call results, not their unsafe siblings.
+
+    Replacing complete calls with spaces preserves offsets and cannot join
+    identifiers. Delimiters in strings and comments do not close calls.
+    An incomplete call is not evidence of sanitization.
+    """
+    regex = SANITIZERS_BY_RULE.get(sink_rule)
+    if regex is None:
+        return expr
+    code = lexical_views(expr)[1]
+    out = list(expr)
+    stack, closes = [], {}
+    for index, char in enumerate(code):
+        if char == '(':
+            stack.append(index)
+        elif char == ')' and stack:
+            closes[stack.pop()] = index
+    covered_until = 0
+    for match in regex.finditer(code):
+        if match.start() < covered_until:
+            continue
+        previous = match.start() - 1
+        while previous >= 0 and code[previous].isspace():
+            previous -= 1
+        if previous >= 0 and code[previous] == '.':
+            continue
+        end = closes.get(match.end() - 1)
+        if end is None:
+            continue
+        following = end + 1
+        while following < len(code) and code[following].isspace():
+            following += 1
+        if following < len(code) and code[following] in '.[':
+            # Slicing SQL quotes or reversing HTML escaping invalidates the
+            # sanitizer guarantee. Unknown chained transformations stay tainted.
+            continue
+        covered_until = end + 1
+        out[match.start():covered_until] = [
+            '\n' if char == '\n' else ' ' for char in expr[match.start():covered_until]
+        ]
+    return ''.join(out)
+
+
+def query_argument(expr: str) -> str:
+    """Isolate SQL text: bound data never makes a dynamic query safe."""
+    stack = []
+    closing = {')': '(', ']': '[', '}': '{'}
+    for index, char in enumerate(lexical_views(expr)[1]):
+        if char in '([{':
+            stack.append(char)
+        elif char in closing:
+            if not stack or stack[-1] != closing[char]:
+                # Malformed syntax is not evidence for excluding the rest.
+                return expr
+            stack.pop()
+        elif char == ',' and not stack:
+            return expr[:index]
+    return expr
 
 
 def expr_has_tainted(expr: str, tainted):
+    expr = lexical_views(expr)[1]
     for name, meta in tainted.items():
         if re.search(rf"(?<![A-Za-z0-9_$]){re.escape(name)}(?![A-Za-z0-9_$])", expr):
             return name, meta
     return None, None
 
 
-def find_child_process_sink(line: str, module_aliases, function_aliases):
-    direct = re.search(rf"require\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)\.{CHILD_PROCESS_API_RE}\s*\((.*)", line)
-    if direct:
-        return direct.group(1), 'child_process exec'
-
+def child_process_sinks(text: str, code: str, module_aliases, function_aliases):
+    patterns = [rf"\brequire\s*\(\s*{CHILD_PROCESS_MODULE_RE}\s*\)\.{CHILD_PROCESS_API_RE}\s*\("]
     alias_group = '|'.join(re.escape(alias) for alias in sorted(module_aliases, key=len, reverse=True))
     if alias_group:
-        member = re.search(rf"(?<![A-Za-z0-9_$])(?:{alias_group})\.{CHILD_PROCESS_API_RE}\s*\((.*)", line)
-        if member:
-            return member.group(1), 'child_process exec'
-
+        patterns.append(rf"(?<![A-Za-z0-9_$])(?:{alias_group})\.{CHILD_PROCESS_API_RE}\s*\(")
     function_group = '|'.join(re.escape(name) for name in sorted(function_aliases, key=len, reverse=True))
     if function_group:
-        bare = re.search(rf"(?<![A-Za-z0-9_$])(?:{function_group})\s*\((.*)", line)
-        if bare:
-            return bare.group(1), 'child_process exec'
-
-    return None
+        patterns.append(rf"(?<![A-Za-z0-9_$])(?:{function_group})\s*\(")
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            if code[match.start()] != text[match.start()] or match.end() in seen:
+                continue
+            seen.add(match.end())
+            yield match.start(), match.end(), 'js.taint.command', 'child_process exec', True
 
 
 def extend_path(meta, new_node):
@@ -354,9 +509,15 @@ def extend_path(meta, new_node):
     return clone
 
 
-def record_taint(assignments):
+def record_taint(assignments, sink_rule: str | None = None):
+    assignments = [(line, target, unsanitized_expression(expr, sink_rule))
+                   for line, target, expr in assignments]
     tainted = {}
+    dependents = defaultdict(list)
     for line_no, target, expr in assignments:
+        code = lexical_views(expr)[1]
+        for name in set(re.findall(r'[A-Za-z_$][\w$]*', code)):
+            dependents[name].append((line_no, target))
         sources = assignment_sources(expr)
         if sources:
             snippet, label = sources[0]
@@ -366,30 +527,18 @@ def record_taint(assignments):
                 'line': line_no,
                 'path': [snippet.strip(), target]
             }
-    for _ in range(6):
-        changed = False
-        for line_no, target, expr in assignments:
-            if target in tainted or expr_has_sanitizer(expr):
-                continue
-            ref, meta = expr_has_tainted(expr, tainted)
-            if ref:
-                clone = extend_path(meta, target)
+    # A monotone worklist visits each newly tainted binding once. Unlike a
+    # whole-file rescan loop this handles long reverse-ordered chains without
+    # either a hop cutoff or quadratic numbers of assignment visits.
+    pending = deque(tainted)
+    while pending:
+        ref = pending.popleft()
+        for line_no, target in dependents[ref]:
+            if target not in tainted:
+                clone = extend_path(tainted[ref], target)
                 clone['line'] = line_no
                 tainted[target] = clone
-                changed = True
-                continue
-            sources = assignment_sources(expr)
-            if sources:
-                snippet, label = sources[0]
-                tainted[target] = {
-                    'source': snippet,
-                    'source_label': label,
-                    'line': line_no,
-                    'path': [snippet.strip(), target]
-                }
-                changed = True
-        if not changed:
-            break
+                pending.append(target)
     return tainted
 
 
@@ -402,67 +551,16 @@ def format_path(path, sink_label):
 
 
 def analyze_file(path, issues):
-    try:
-        text = path.read_text(encoding='utf-8')
-    except (UnicodeDecodeError, OSError):
-        return
-    lines = text.splitlines()
-    assignments = parse_assignments(lines)
-    tainted = record_taint(assignments)
-    child_process_modules, child_process_functions = child_process_bindings(lines)
-    for idx, raw in enumerate(lines, start=1):
-        stripped = strip_comments(raw)
-        if not stripped:
-            continue
-        command_sink = find_child_process_sink(source_line(raw), child_process_modules, child_process_functions)
-        if command_sink:
-            expr, sink_label = command_sink
-            if expr and not expr_has_sanitizer(expr, 'js.taint.command'):
-                literal = find_sources(expr)
-                if literal:
-                    snippet, _ = literal[0]
-                    path_desc = f"{snippet.strip()} -> {sink_label}"
-                else:
-                    ref, meta = expr_has_tainted(expr, tainted)
-                    if ref:
-                        path_desc = format_path(meta.get('path', [ref]), sink_label)
-                    else:
-                        path_desc = ''
-                if path_desc:
-                    try:
-                        rel = path.relative_to(BASE_DIR)
-                    except ValueError:
-                        rel = path.name
-                    sample = f"{rel}:{idx} {path_desc}"
-                    bucket = issues['js.taint.command']
-                    bucket['count'] += 1
-                    if len(bucket['samples']) < 3:
-                        bucket['samples'].append(sample)
-        for regex, rule, sink_label in SINKS:
-            match = regex.search(stripped)
-            if not match:
-                continue
-            expr = match.group(1).strip()
-            if not expr or expr_has_sanitizer(expr, rule):
-                continue
-            literal = find_sources(expr)
-            if literal:
-                snippet, _ = literal[0]
-                path_desc = f"{snippet.strip()} -> {sink_label}"
-            else:
-                ref, meta = expr_has_tainted(expr, tainted)
-                if not ref:
-                    continue
-                path_desc = format_path(meta.get('path', [ref]), sink_label)
-            try:
-                rel = path.relative_to(BASE_DIR)
-            except ValueError:
-                rel = path.name
-            sample = f"{rel}:{idx} {path_desc}"
-            bucket = issues[rule]
-            bucket['count'] += 1
-            if len(bucket['samples']) < 3:
-                bucket['samples'].append(sample)
+    # Both public entrypoints consume the same uncapped finding stream.
+    for rule, line, _col, path_desc in scan_file_findings(path):
+        try:
+            rel = path.relative_to(BASE_DIR)
+        except ValueError:
+            rel = path.name
+        bucket = issues[rule]
+        bucket['count'] += 1
+        if len(bucket['samples']) < 3:
+            bucket['samples'].append(f"{rel}:{line} {path_desc}")
 
 
 def main(argv=None) -> int:
@@ -503,50 +601,31 @@ def scan_file_findings(path: Path):
         text = path.read_text(encoding='utf-8')
     except (UnicodeDecodeError, OSError):
         return
+    text, code = lexical_views(text)
     lines = text.splitlines()
+    line_starts = [0] + [match.end() for match in re.finditer('\n', text)]
     assignments = parse_assignments(lines)
-    tainted = record_taint(assignments)
+    tainted_by_rule = {rule: record_taint(assignments, rule) for rule in KIND_BY_RULE}
     child_process_modules, child_process_functions = child_process_bindings(lines)
-    for idx, raw in enumerate(lines, start=1):
-        stripped = strip_comments(raw)
-        if not stripped:
-            continue
-        line = source_line(raw)
-        command_sink = find_child_process_sink(line, child_process_modules, child_process_functions)
-        if command_sink:
-            expr, sink_label = command_sink
-            if expr and not expr_has_sanitizer(expr, 'js.taint.command'):
-                literal = find_sources(expr)
-                if literal:
-                    snippet, _ = literal[0]
-                    path_desc = f"{snippet.strip()} -> {sink_label}"
-                else:
-                    ref, meta = expr_has_tainted(expr, tainted)
-                    if ref:
-                        path_desc = format_path(meta.get('path', [ref]), sink_label)
-                    else:
-                        path_desc = ''
-                if path_desc:
-                    # every child-process sink regex ends in `\((.*)`, so the
-                    # captured expr is a suffix of the searched line
-                    yield 'js.taint.command', idx, len(line) - len(expr) + 1, path_desc
-        for regex, rule, sink_label in SINKS:
-            match = regex.search(stripped)
-            if not match:
+    sinks = list(child_process_sinks(text, code, child_process_modules, child_process_functions))
+    for regex, rule, label, call in SINKS:
+        sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
+    for start, expr_start, rule, sink_label, call in sorted(sinks):
+        expr = text[expr_start:expression_end(code, expr_start, call=call)]
+        if rule == 'js.taint.sql':
+            expr = query_argument(expr)
+        expr = unsanitized_expression(expr, rule)
+        literal = find_sources(expr)
+        if literal:
+            snippet, _ = literal[0]
+            path_desc = f"{snippet.strip()} -> {sink_label}"
+        else:
+            ref, meta = expr_has_tainted(expr, tainted_by_rule[rule])
+            if not ref:
                 continue
-            expr = match.group(1).strip()
-            if not expr or expr_has_sanitizer(expr, rule):
-                continue
-            literal = find_sources(expr)
-            if literal:
-                snippet, _ = literal[0]
-                path_desc = f"{snippet.strip()} -> {sink_label}"
-            else:
-                ref, meta = expr_has_tainted(expr, tainted)
-                if not ref:
-                    continue
-                path_desc = format_path(meta.get('path', [ref]), sink_label)
-            yield rule, idx, match.start() + 1, path_desc
+            path_desc = format_path(meta.get('path', [ref]), sink_label)
+        line = bisect_right(line_starts, start)
+        yield rule, line, start - line_starts[line - 1] + 1, path_desc
 
 
 def run(ctx: RunContext) -> Iterable[dict]:

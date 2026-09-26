@@ -13,7 +13,8 @@ usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
 usage() {
   cat <<'USAGE'
-Usage: verify.sh [--version X.Y.Z|vX.Y.Z] [--artifact-dir DIR] [--verify-only]
+Usage: verify.sh [--version X.Y.Z|vX.Y.Z]
+                 [--artifact-dir DIR | --artifact-archive FILE.tar.gz] [--verify-only]
                  [--with-modules] [--bundle-output FILE.tar.gz]
                  [--insecure] [-- INSTALLER_ARGS...]
 
@@ -25,6 +26,8 @@ missing or ambiguous checksums, and different release versions fail closed.
 Options:
   --version VERSION       Select an exact release, including prerelease tags.
   --artifact-dir DIR      Read a local release bundle; do not download assets.
+  --artifact-archive FILE Read a gzip-compressed release tar archive privately.
+                          Reject unsafe paths, links, duplicates and oversized input.
   --verify-only           Verify the complete release WITHOUT running it.
   --with-modules          Also verify every pinned module/helper (requires --verify-only).
   --bundle-output FILE    Export a complete verified portable runtime as .tar.gz.
@@ -62,6 +65,12 @@ directory, re-verify with --artifact-dir DIR --verify-only --with-modules, then
 run DIR/ubs --module-dir=DIR/modules PROJECT. Bash, Python, jq, ripgrep and other
 host tools must already be installed. Export is deterministic for identical
 inputs, and the final archive appears only after validation and compression.
+Use --artifact-archive FILE --verify-only --with-modules to authenticate an
+exported archive without extracting it yourself. Archive import never executes
+archive members while unpacking or falls back to network assets. It accepts at
+most 128 MiB compressed, 512 MiB expanded, 16,384 entries and 64 MiB per file.
+Archive import cannot be combined with --artifact-dir or --insecure. Signature
+verification still requires the selected version and a trusted host verifier.
 USAGE
 }
 
@@ -75,6 +84,7 @@ VERIFY_ONLY=0
 WITH_MODULES=0
 BUNDLE_OUTPUT=''
 ARTIFACT_DIR=''
+ARTIFACT_ARCHIVE=''
 INSTALL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -89,6 +99,13 @@ while [[ $# -gt 0 ]]; do
     --artifact-dir=*)
       ARTIFACT_DIR="${1#*=}"
       [[ -n "$ARTIFACT_DIR" ]] || usage_error '--artifact-dir requires a directory'
+      shift ;;
+    --artifact-archive)
+      [[ $# -ge 2 && -n "$2" ]] || usage_error '--artifact-archive requires a file'
+      ARTIFACT_ARCHIVE="$2"; shift 2 ;;
+    --artifact-archive=*)
+      ARTIFACT_ARCHIVE="${1#*=}"
+      [[ -n "$ARTIFACT_ARCHIVE" ]] || usage_error '--artifact-archive requires a file'
       shift ;;
     --verify-only) VERIFY_ONLY=1; shift ;;
     --with-modules) WITH_MODULES=1; shift ;;
@@ -111,6 +128,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -n "$ARTIFACT_ARCHIVE" ]]; then
+  [[ -z "$ARTIFACT_DIR" ]] || usage_error '--artifact-archive and --artifact-dir are mutually exclusive'
+  [[ "$INSECURE" -eq 0 ]] || usage_error '--artifact-archive requires authenticated verification'
+  [[ -f "$ARTIFACT_ARCHIVE" && ! -L "$ARTIFACT_ARCHIVE" ]] \
+    || usage_error '--artifact-archive must name a regular non-symlink file'
+  command -v python3 >/dev/null 2>&1 || die 'python3 is required to import a release archive'
+fi
 if [[ -n "$BUNDLE_OUTPUT" ]]; then
   [[ ! -e "$BUNDLE_OUTPUT" && ! -L "$BUNDLE_OUTPUT" ]] || usage_error '--bundle-output must not already exist'
   [[ -d "$(dirname -- "$BUNDLE_OUTPUT")" ]] || usage_error '--bundle-output parent directory must exist'
@@ -141,7 +165,7 @@ COSIGN_IDENTITY="https://github.com/Dicklesworthstone/ultimate_bug_scanner/.gith
 COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 MODULE_ARTIFACT_BASE="${UBS_MODULE_ARTIFACT_BASE:-https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/v${VERSION}/modules}"
 MODULE_ARTIFACT_BASE="${MODULE_ARTIFACT_BASE%/}"
-if [[ "$WITH_MODULES" -eq 1 && -z "$ARTIFACT_DIR" ]]; then
+if [[ "$WITH_MODULES" -eq 1 && -z "$ARTIFACT_DIR" && -z "$ARTIFACT_ARCHIVE" ]]; then
   [[ "$MODULE_ARTIFACT_BASE" == https://* && "$MODULE_ARTIFACT_BASE" != *$'\n'* && "$MODULE_ARTIFACT_BASE" != *$'\r'* ]] \
     || usage_error 'UBS_MODULE_ARTIFACT_BASE must be an HTTPS module URL'
 fi
@@ -171,7 +195,7 @@ if [[ "$INSECURE" -eq 0 ]]; then
 fi
 # curl is already a UBS runtime dependency. Restrict both the initial URL and
 # redirects: a nominal HTTPS URL must not redirect an executable to HTTP/FTP.
-if [[ -z "$ARTIFACT_DIR" ]]; then
+if [[ -z "$ARTIFACT_DIR" && -z "$ARTIFACT_ARCHIVE" ]]; then
   command -v curl >/dev/null 2>&1 || die 'curl is required to download release artifacts'
 fi
 
@@ -188,6 +212,113 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+if [[ -n "$ARTIFACT_ARCHIVE" ]]; then
+  # Unpack only into our private staging directory. Authenticate the copied
+  # manifest and payloads afterwards through the same path as directory input.
+  python3 - "$ARTIFACT_ARCHIVE" "$VERIFY_DIR" <<'PY'
+import gzip
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tarfile
+import zlib
+
+source, stage = Path(sys.argv[1]), Path(sys.argv[2])
+root = stage / 'archive-input'
+max_compressed, max_expanded = 128 * 1024 * 1024, 512 * 1024 * 1024
+max_member, max_entries = 64 * 1024 * 1024, 16384
+
+
+class BoundedReads:
+    """Cap metadata allocations and optionally total compressed bytes read."""
+    def __init__(self, stream, remaining=None):
+        self.stream = stream
+        self.remaining = remaining
+
+    def read(self, size):
+        if not 0 <= size <= 1024 * 1024:
+            raise ValueError('oversized archive metadata')
+        data = self.stream.read(size)
+        if self.remaining is not None:
+            self.remaining -= len(data)
+            if self.remaining < 0:
+                raise ValueError('archive exceeds 128 MiB compressed')
+        return data
+
+    def seek(self, *args):
+        return self.stream.seek(*args)
+
+    def tell(self):
+        return self.stream.tell()
+
+
+try:
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    descriptor = os.open(source, flags)
+    # Decompression is bounded independently of tar headers. Finish the gzip
+    # stream before verification so a damaged trailer cannot be ignored.
+    with os.fdopen(descriptor, 'rb') as packed, (stage / 'input.tar').open('xb') as expanded:
+        metadata = os.fstat(packed.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > max_compressed:
+            raise ValueError('archive must be a regular file of at most 128 MiB')
+        size = 0
+        with gzip.GzipFile(fileobj=BoundedReads(packed, max_compressed), mode='rb') as compressed:
+            while chunk := compressed.read(1024 * 1024):
+                size += len(chunk)
+                if size > max_expanded:
+                    raise ValueError('archive exceeds 512 MiB expanded')
+                expanded.write(chunk)
+    root.mkdir(mode=0o700)
+    entries, paths = set(), {}
+    with (stage / 'input.tar').open('rb') as incoming:
+        with tarfile.open(fileobj=BoundedReads(incoming), mode='r:') as archive:
+            for member in archive:
+                name = member.name
+                if member.isdir() and name.endswith('/'):
+                    name = name[:-1]
+                parts = name.split('/')
+                if (len(name) > 4096 or re.fullmatch(r'[A-Za-z0-9_./-]+', name) is None
+                        or any(part in {'', '.', '..'} or part.endswith('.')
+                               or re.match(r'(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)', part)
+                               for part in parts)):
+                    raise ValueError('unsafe archive path: ' + name)
+                if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE) or member.sparse is not None:
+                    raise ValueError('archive links, sparse and special files are not allowed: ' + name)
+                if any(key.startswith('GNU.sparse') for key in member.pax_headers):
+                    raise ValueError('sparse archive metadata is not allowed')
+                if not 0 <= member.size <= max_member or (member.isdir() and member.size):
+                    raise ValueError('archive member exceeds 64 MiB or has an invalid size: ' + name)
+                key = name.casefold()
+                if key in entries or len(entries) >= max_entries:
+                    raise ValueError('duplicate archive path or more than 16384 entries: ' + name)
+                entries.add(key)
+                for index in range(1, len(parts) + 1):
+                    prefix = '/'.join(parts[:index])
+                    kind = 'directory' if index < len(parts) or member.isdir() else 'file'
+                    previous = paths.get(prefix.casefold())
+                    if previous is not None and previous != (prefix, kind):
+                        raise ValueError('colliding archive paths: ' + name)
+                    paths[prefix.casefold()] = (prefix, kind)
+                target = root.joinpath(*parts)
+                if member.isdir():
+                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                with archive.extractfile(member) as payload, target.open('xb') as output:
+                    while chunk := payload.read(1024 * 1024):
+                        output.write(chunk)
+                target.chmod(0o600)
+    if not entries:
+        raise ValueError('empty release archive')
+except (OSError, EOFError, ValueError, RecursionError, tarfile.TarError, zlib.error) as error:
+    print('ERROR: release archive rejected: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+  ARTIFACT_DIR="$VERIFY_DIR/archive-input"
+fi
 
 fetch_asset() {
   local name="$1"

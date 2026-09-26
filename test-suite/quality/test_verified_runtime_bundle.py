@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
+import io
 import json
 import os
 from pathlib import Path
@@ -370,6 +372,195 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
         self.export(first)
         self.export(second)
         self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def import_archive(self, archive, expected=0, extra=(), verify_only=True):
+        flags = ['--verify-only', '--with-modules'] if verify_only else []
+        result = subprocess.run(['bash', str(VERIFY), '--version', self.version,
+                                 '--artifact-archive', str(archive), *flags, *extra],
+                                cwd=self.work, env=self.env, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        self.assertFalse(list(self.stage.iterdir()), 'Private archive staging leaked')
+        self.assertFalse(any(event[0] == 'fetch' for event in self.events()), self.events())
+        return result
+
+    def archive_with(self, name, members, include_release=True):
+        output = self.work / name
+        with tarfile.open(output, 'w:gz', format=tarfile.PAX_FORMAT) as archive:
+            if include_release:
+                for path in sorted(self.origin.rglob('*')):
+                    if path.is_file():
+                        archive.add(path, arcname=str(path.relative_to(self.origin)), recursive=False)
+            for member, content in members:
+                archive.addfile(member, io.BytesIO(content))
+        return output
+
+    def test_archive_import_round_trip_rechecks_entire_runtime_without_network(self):
+        original, replay = self.work / 'portable runtime.tar.gz', self.work / 'replayed.tar.gz'
+        self.export(original)
+        before = {str(path.relative_to(self.origin)): path.read_bytes()
+                  for path in self.origin.rglob('*') if path.is_file()}
+        result = self.import_archive(original.name, extra=('--bundle-output', str(replay)))
+        self.assertIn('Runtime verified: 1 modules, 3 helper assets', result.stdout)
+        self.assertEqual(replay.read_bytes(), original.read_bytes())
+        self.assertEqual(before, {str(path.relative_to(self.origin)): path.read_bytes()
+                                 for path in self.origin.rglob('*') if path.is_file()})
+
+    def test_archive_import_authenticates_signature_and_every_runtime_pin(self):
+        output = self.work / 'signed.tar.gz'
+        self.export(output)
+        self.env['REJECT_SIGNATURE'] = '1'
+        self.import_archive(output, expected=1)
+        self.env.pop('REJECT_SIGNATURE')
+        self.write('modules/helpers/tool.py', b'tampered after signing')
+        altered = self.archive_with('altered.tar.gz', [])
+        result = self.import_archive(altered, expected=1)
+        self.assertIn('checksum mismatch', result.stderr)
+
+    def test_archive_import_installer_status_and_arguments_are_preserved(self):
+        self.write('install.sh', b'''#!/usr/bin/env bash
+[[ "$UBS_INSTALLER_SELF_UPDATED" == 1 && "$UBS_NO_AUTO_UPDATE" == 1 ]] || exit 99
+[[ "$1" == '--label' && "$2" == 'space ; $literal' ]] || exit 98
+[[ "$PWD" == "$EXPECTED_CWD" ]] || exit 97
+exit 37
+''')
+        self.env['EXPECTED_CWD'] = str(self.work)
+        self.seal()
+        output = self.work / 'installer.tar.gz'
+        self.export(output)
+        self.import_archive(output, expected=37, verify_only=False,
+                            extra=('--', '--label', 'space ; $literal'))
+
+    def test_archive_import_supports_minisign_and_does_not_require_curl(self):
+        self.env.update(UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY='fixture-key')
+        self.write('SHA256SUMS.minisig', digest((self.origin / 'SHA256SUMS').read_bytes()).encode())
+        self.tool('minisign', '''
+import hashlib, pathlib, sys
+args = sys.argv[1:]
+expected = pathlib.Path(args[args.index('-x')+1]).read_text().strip()
+actual = hashlib.sha256(pathlib.Path(args[args.index('-Vm')+1]).read_bytes()).hexdigest()
+sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' else 1)
+''')
+        output = self.work / 'offline.tar.gz'
+        self.export(output)
+        isolated = self.work / 'archive-offline-tools'
+        isolated.mkdir()
+        for tool in ('bash', 'dirname', 'cat', 'awk', 'mktemp', 'rm', 'cp', 'mkdir', 'sha256sum', 'python3'):
+            (isolated / tool).symlink_to(shutil.which(tool))
+        (isolated / 'minisign').symlink_to(self.bin / 'minisign')
+        self.env['PATH'] = str(isolated)
+        self.import_archive(output)
+
+    def test_archive_import_rejects_paths_outside_private_staging(self):
+        for index, name in enumerate(('../outside', '/absolute', 'modules/../outside',
+                                      'modules//tool.py', 'modules/./tool.py', 'C:/outside',
+                                      'modules\\outside', 'modules/tool.py.', './ubs',
+                                      'modules/CON', 'modules/nul.py', 'modules/Lpt1.txt')):
+            with self.subTest(path=name):
+                member = tarfile.TarInfo(name)
+                output = self.archive_with(f'unsafe-{index}.tar.gz', [(member, b'')])
+                result = self.import_archive(output, expected=1)
+                self.assertIn('unsafe archive path', result.stderr)
+                self.assertEqual(self.events(), [], 'Rejected archive reached authentication')
+        self.assertFalse((self.work / 'outside').exists())
+
+    def test_archive_import_rejects_links_and_special_files_before_authentication(self):
+        for index, kind in enumerate((tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE,
+                                      tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.GNUTYPE_SPARSE)):
+            with self.subTest(kind=kind):
+                member = tarfile.TarInfo('modules/linked')
+                member.type, member.linkname = kind, '../../outside'
+                output = self.archive_with(f'special-{index}.tar.gz', [(member, b'')])
+                self.import_archive(output, expected=1)
+                self.assertEqual(self.events(), [])
+
+    def test_archive_import_rejects_duplicate_case_and_file_directory_collisions(self):
+        variants = (
+            [tarfile.TarInfo('ubs')],
+            [tarfile.TarInfo('UBS')],
+            [tarfile.TarInfo('Modules/extra.py')],
+            [tarfile.TarInfo('modules')],
+            [tarfile.TarInfo('ubs/extra.py')],
+        )
+        for index, members in enumerate(variants):
+            with self.subTest(index=index):
+                output = self.archive_with(f'collision-{index}.tar.gz', [(m, b'') for m in members])
+                self.import_archive(output, expected=1)
+                self.assertEqual(self.events(), [])
+
+    def test_archive_import_accepts_directories_and_bounded_long_path_metadata(self):
+        name = 'helpers/' + 'nested/' * 20 + 'test.py'
+        self.assets[name] = b'raise SystemExit(96)\n'
+        self.rebuild()
+        directory = tarfile.TarInfo('modules/helpers/')
+        directory.type = tarfile.DIRTYPE
+        directory.mode = 0o4777  # permissions/ownership are not trusted
+        output = self.archive_with('directories.tar.gz', [(directory, b'')])
+        self.import_archive(output)
+
+    def test_archive_import_rejects_member_and_metadata_bombs_before_allocation(self):
+        for index, kind in enumerate((tarfile.REGTYPE, tarfile.XHDTYPE, tarfile.GNUTYPE_LONGNAME)):
+            member = tarfile.TarInfo('oversized')
+            member.type, member.size = kind, 65 * 1024 * 1024
+            output = self.work / f'oversized-{index}.tar.gz'
+            # A header alone is enough to assert the size guard. Do not allocate
+            # the advertised body, and do not change production limits for tests.
+            output.write_bytes(gzip.compress(member.tobuf() + b'\0' * 1024))
+            result = self.import_archive(output, expected=1)
+            self.assertTrue('64 MiB' in result.stderr or 'oversized archive metadata' in result.stderr,
+                            result.stderr)
+            self.assertEqual(self.events(), [])
+
+    def test_archive_import_rejects_truncated_and_corrupt_gzip_streams(self):
+        good = self.work / 'good.tar.gz'
+        self.export(good)
+        original = good.read_bytes()
+        for index, data in enumerate((original[:-8], original[:-1] + bytes([original[-1] ^ 1]), b'not gzip')):
+            with self.subTest(index=index):
+                output = self.work / f'corrupt-{index}.tar.gz'
+                output.write_bytes(data)
+                self.import_archive(output, expected=1)
+
+    def test_archive_import_rejects_empty_archives_and_missing_signed_assets(self):
+        empty = self.archive_with('empty.tar.gz', [], include_release=False)
+        self.import_archive(empty, expected=1)
+        incomplete = self.archive_with('incomplete.tar.gz', [(tarfile.TarInfo('VERSION'), b'')],
+                                       include_release=False)
+        self.import_archive(incomplete, expected=1)
+
+    def test_archive_import_rejects_excessive_member_count(self):
+        output = self.work / 'many.tar.gz'
+        with tarfile.open(output, 'w:gz') as archive:
+            for index in range(16385):
+                archive.addfile(tarfile.TarInfo(f'empty-{index}'))
+        result = self.import_archive(output, expected=1)
+        self.assertIn('16384 entries', result.stderr)
+        self.assertEqual(self.events(), [])
+
+    def test_archive_import_rejects_compressed_size_before_decompression(self):
+        output = self.work / 'large.tar.gz'
+        with output.open('wb') as stream:
+            stream.truncate(128 * 1024 * 1024 + 1)
+        result = self.import_archive(output, expected=1)
+        self.assertIn('128 MiB', result.stderr)
+        self.assertEqual(self.events(), [])
+
+    def test_archive_import_usage_errors_and_nonregular_inputs(self):
+        output = self.work / 'valid.tar.gz'
+        self.export(output)
+        self.import_archive(output, expected=2, extra=('--artifact-dir', str(self.origin)))
+        self.import_archive(output, expected=2, extra=('--insecure',))
+        self.import_archive(self.origin, expected=2)
+        link = self.work / 'link.tar.gz'
+        link.symlink_to(output)
+        self.import_archive(link, expected=2)
+        if hasattr(os, 'mkfifo'):
+            fifo = self.work / 'pipe.tar.gz'
+            os.mkfifo(fifo)
+            self.import_archive(fifo, expected=2)
+        for args in (('--artifact-archive',), ('--artifact-archive=',)):
+            result = subprocess.run(['bash', str(VERIFY), *args], cwd=self.work, env=self.env,
+                                    text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
 
     def test_bundle_output_never_overwrites_existing_file_or_symlink(self):
         output = self.work / 'existing.tar.gz'

@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Repository-local UBS scan service. Never imports or executes project code.
+
+The existing scanner is the source of truth. Cache hits require matching
+repository/runtime bytes and invocation environment; misses run the normal CLI.
+This is the first K4 transport/cache increment, not an in-process analysis engine.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import OrderedDict
+import ctypes
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+PROTOCOL = 1
+MAX_REQUEST = 256 * 1024
+MAX_OUTPUT = 8 * 1024 * 1024
+MAX_RESPONSE = 2 * MAX_OUTPUT + 65536
+MAX_SNAPSHOT = 128 * 1024 * 1024
+MAX_SNAPSHOT_ENTRIES = 20000
+FORMATS = {'text', 'json', 'jsonl', 'sarif'}
+TRANSIENT_ENV = {'_', 'SHLVL', 'PWD', 'OLDPWD', 'TERM', 'COLUMNS', 'LINES'}
+
+
+class ServiceError(Exception):
+    pass
+
+
+def identity(path: Path) -> tuple[int, int]:
+    info = path.stat()
+    return info.st_dev, info.st_ino
+
+
+def peer_uid(connection: socket.socket) -> int:
+    """Kernel-authenticated identity on Linux and BSD/macOS; otherwise refuse."""
+    if hasattr(socket, 'SO_PEERCRED'):
+        credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
+        return struct.unpack('3i', credentials)[1]
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, 'getpeereid', None)
+    if function is None:
+        raise ServiceError('This platform has no supported Unix peer-credential API')
+    uid, gid = ctypes.c_uint(), ctypes.c_uint()
+    function.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+    function.restype = ctypes.c_int
+    if function(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
+        raise OSError(ctypes.get_errno(), 'getpeereid failed')
+    return uid.value
+
+
+def private_directory(path: Path) -> Path:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ServiceError(f'Service directory must be owned by this uid with mode 0700: {path}')
+    return path
+
+
+def socket_path(root: Path, *, create: bool = False) -> Path:
+    runtime = os.environ.get('XDG_RUNTIME_DIR')
+    base = Path(runtime) if runtime else Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache')))
+    directory = base / 'ubs-daemon'
+    if create:
+        private_directory(directory)
+    elif directory.exists() or directory.is_symlink():
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ServiceError(f'Unsafe service directory: {directory}')
+    key = hashlib.sha256(os.fsencode(str(root))).hexdigest()[:24]
+    path = directory / (key + '.sock')
+    if len(os.fsencode(str(path))) > 100:
+        raise ServiceError('Unix socket path is too long; select a shorter XDG_RUNTIME_DIR')
+    return path
+
+
+def environment_key() -> str:
+    # Do not transmit environment values (which may contain credentials).
+    # Unknown variables participate, so tool-specific policy cannot be reused
+    # across differing callers. Ignore only shell/terminal bookkeeping.
+    environment = {key: value for key, value in os.environ.items() if key not in TRANSIENT_ENV}
+    return hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest()
+
+
+def receive(connection: socket.socket, limit: int) -> dict:
+    def reject_constant(value):
+        raise ValueError(value)
+
+    def exact(size: int) -> bytes:
+        chunks = bytearray()
+        while len(chunks) < size:
+            data = connection.recv(size - len(chunks))
+            if not data:
+                raise ServiceError('Incomplete service message')
+            chunks.extend(data)
+        return bytes(chunks)
+    size = struct.unpack('!I', exact(4))[0]
+    if size == 0 or size > limit:
+        raise ServiceError('Service message exceeds the permitted size')
+    try:
+        value = json.loads(exact(size), parse_constant=reject_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ServiceError('Invalid JSON service message') from exc
+    if not isinstance(value, dict):
+        raise ServiceError('Service message must be an object')
+    return value
+
+
+def send(connection: socket.socket, value: dict) -> None:
+    raw = json.dumps(value, ensure_ascii=True, separators=(',', ':')).encode()
+    if len(raw) > MAX_RESPONSE:
+        raise ServiceError('Encoded scanner response exceeds the permitted size')
+    connection.sendall(struct.pack('!I', len(raw)) + raw)
+
+
+def validate_scan(root: Path, request: dict) -> tuple[list[Path], list[str]]:
+    allowed = {'protocol', 'op', 'root', 'environment', 'scanner', 'paths', 'format', 'profile', 'fail_on_warning'}
+    if set(request) - allowed:
+        raise ServiceError('Unknown scan request fields')
+    paths = request.get('paths')
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 256:
+        raise ServiceError('A scan requires 1 to 256 explicit source files')
+    selected = []
+    for name in paths:
+        if not isinstance(name, str) or not name or '\x00' in name:
+            raise ServiceError('Invalid source path')
+        path = (root / name).resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ServiceError(f'Source file is outside the served repository or is not regular: {name}')
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ServiceError(f'Source is not a regular file: {name}')
+        if path not in selected:
+            selected.append(path)
+    format_ = request.get('format', 'json')
+    profile = request.get('profile')
+    warnings = request.get('fail_on_warning', False)
+    if not isinstance(format_, str) or format_ not in FORMATS:
+        raise ServiceError('Unsupported report format')
+    if profile not in (None, 'strict', 'loose') or type(warnings) is not bool:
+        raise ServiceError('Invalid scan policy')
+    options = ['--ci', '--no-auto-update', '--no-color', '--format=' + format_]
+    if profile:
+        options.append('--profile=' + profile)
+    if warnings:
+        options.append('--fail-on-warning')
+    return selected, options
+
+
+def snapshot(root: Path, scanner: Path) -> str | None:
+    """Conservative bounded content snapshot, not an mtime-only clean shortcut.
+
+    Include the entire repository and runtime, even ignored project files. Git
+    object storage is immutable and not a scan input; HEAD/index/config/refs
+    are included. External symlinks or large/special-file trees disable reuse.
+    Any uncertainty is a cache miss, never a clean result.
+    """
+    if os.environ.get('UBS_MODULE_DIR') or os.environ.get('UBS_VERIFIED_ASSET_DIR'):
+        return None  # The override can select runtime assets outside this graph.
+    digest = hashlib.sha256()
+    total = 0
+    seen = set()
+    roots = [root, scanner, scanner.parent / 'modules']
+    config = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config')))
+    # Global Git excludes can change file selection without a project edit.
+    for extra in (Path.home() / '.gitconfig', Path.home() / '.gitignore', config / 'git'):
+        digest.update(os.fsencode(str(extra)) + (b'1' if extra.exists() else b'0'))
+        if extra.exists():
+            roots.append(extra)
+    # Track tool replacement and ordinary in-place upgrades (ctime cannot be
+    # restored with utime). Source/runtime inputs themselves are byte-hashed.
+    for name in ('bash', 'python3', 'jq', 'rg', 'ast-grep', 'node', 'go', 'ruff', 'semgrep', 'shellcheck', 'typos'):
+        executable = shutil.which(name)
+        digest.update(name.encode() + b'\0' + os.fsencode(executable or '') + b'\0')
+        if executable:
+            try:
+                info = Path(executable).stat()
+                digest.update(str((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)).encode())
+            except OSError:
+                return None
+    try:
+        for base in roots:
+            if not base.exists():
+                return None
+            pending = [base]
+            while pending:
+                path = pending.pop()
+                if path in seen:
+                    continue
+                seen.add(path)
+                if len(seen) > MAX_SNAPSHOT_ENTRIES:
+                    return None
+                info = path.lstat()
+                digest.update(os.fsencode(str(path)) + b'\0')
+                digest.update(str((info.st_dev, info.st_ino, info.st_mode, info.st_size)).encode() + b'\0')
+                if stat.S_ISLNK(info.st_mode):
+                    # A symlink can point at changing input outside this graph.
+                    return None
+                if stat.S_ISDIR(info.st_mode):
+                    if path.parent.name == '.git' and path.name in {'objects', 'logs'}:
+                        continue
+                    children = []
+                    remaining = MAX_SNAPSHOT_ENTRIES - len(seen) - len(pending)
+                    for child in path.iterdir():
+                        if len(children) >= remaining:
+                            return None
+                        children.append(child)
+                    pending.extend(sorted(children, reverse=True))
+                elif stat.S_ISREG(info.st_mode):
+                    if info.st_size > MAX_SNAPSHOT - total:
+                        return None
+                    before = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    with path.open('rb') as stream:
+                        while chunk := stream.read(65536):
+                            total += len(chunk)
+                            if total > MAX_SNAPSHOT:
+                                return None
+                            digest.update(chunk)
+                    info = path.stat()
+                    if before != (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns):
+                        return None
+                    digest.update(b'\0')
+                else:
+                    return None
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def run_scanner(root: Path, scanner: Path, paths: list[Path], options: list[str], timeout: float) -> dict:
+    """Bound output and wall time, preserving actual scanner streams and status."""
+    env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', NO_COLOR='1')
+    command = [str(scanner), *options, '--', *map(str, paths)]
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        process = subprocess.Popen(command, cwd=root, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
+        started = time.monotonic()
+        error = None
+        try:
+            while process.poll() is None:
+                if time.monotonic() - started > timeout:
+                    error = 'Scanner timed out'
+                    break
+                if max(os.fstat(stdout.fileno()).st_size, os.fstat(stderr.fileno()).st_size) > MAX_OUTPUT:
+                    error = 'Scanner output exceeded service limit'
+                    break
+                time.sleep(0.02)
+            if max(os.fstat(stdout.fileno()).st_size, os.fstat(stderr.fileno()).st_size) > MAX_OUTPUT:
+                error = 'Scanner output exceeded service limit'
+        finally:
+            # Kill descendants as well as the runner on failures/interruption.
+            # The process owns a new session; never signal the caller's group.
+            if error or process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait()
+        if error:
+            return {'exit_code': 2, 'stdout': '', 'stderr': error + '\n'}
+        stdout.seek(0)
+        stderr.seek(0)
+        return {'exit_code': process.returncode if process.returncode >= 0 else 128 - process.returncode,
+                'stdout': stdout.read(MAX_OUTPUT).decode('utf-8', 'replace'),
+                'stderr': stderr.read(MAX_OUTPUT).decode('utf-8', 'replace')}
+
+
+class ScanService:
+    def __init__(self, root: Path, scanner: Path, timeout: float, cache_bytes: int):
+        self.root, self.scanner = root, scanner
+        self.root_identity = identity(root)
+        self.environment = environment_key()
+        self.timeout, self.cache_bytes = timeout, cache_bytes
+        self.cache = OrderedDict()
+        self.cache_size = 0
+        self.stopping = False
+
+    def handle(self, request: dict) -> dict:
+        if type(request.get('protocol')) is not int or request['protocol'] != PROTOCOL or request.get('root') != str(self.root):
+            raise ServiceError('Protocol or repository mismatch')
+        if identity(self.root) != self.root_identity:
+            self.stopping = True
+            raise ServiceError('Served repository root has been replaced')
+        op = request.get('op')
+        if not isinstance(op, str):
+            raise ServiceError('Invalid service operation')
+        if op in {'status', 'stop'}:
+            if op == 'stop':
+                self.stopping = True
+            return {'protocol': PROTOCOL, 'root': str(self.root), 'pid': os.getpid(), 'status': 'stopping' if self.stopping else 'ready'}
+        if op != 'scan':
+            raise ServiceError('Unknown service operation')
+        paths, options = validate_scan(self.root, request)
+        if request.get('environment') != self.environment or request.get('scanner') != str(self.scanner):
+            return {'protocol': PROTOCOL, 'unavailable': 'Invocation environment or scanner differs from the daemon'}
+        started = time.monotonic()
+        before = snapshot(self.root, self.scanner) if self.cache_bytes else None
+        key = (tuple(map(str, paths)), tuple(options), before)
+        cached = self.cache.pop(key, None) if before is not None else None
+        if cached is not None:
+            self.cache[key] = cached
+            result = dict(cached[0], cached=True)
+        else:
+            result = run_scanner(self.root, self.scanner, paths, options, self.timeout)
+            if identity(self.root) != self.root_identity:
+                self.stopping = True
+                raise ServiceError('Served repository root changed during the scan')
+            # Never cache environment failures or scans spanning a source edit.
+            after = snapshot(self.root, self.scanner) if before is not None else None
+            result['cached'] = False
+            if before is not None and before == after and result['exit_code'] in (0, 1):
+                size = len(json.dumps(result).encode())
+                while self.cache and self.cache_size + size > self.cache_bytes:
+                    _, (_, removed) = self.cache.popitem(last=False)
+                    self.cache_size -= removed
+                if size <= self.cache_bytes:
+                    self.cache[key] = (result.copy(), size)
+                    self.cache_size += size
+        return dict(result, protocol=PROTOCOL, elapsed_ms=round((time.monotonic() - started) * 1000, 3))
+
+
+def serve(service: ScanService, idle_timeout: float) -> int:
+    path = socket_path(service.root, create=True)
+    lock_path = path.with_suffix('.lock')
+    if lock_path.is_symlink():
+        raise ServiceError('Refusing a symlinked service lock')
+    flags = os.O_CREAT | os.O_RDWR | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    with os.fdopen(descriptor, 'r+b') as lock, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise ServiceError('Unsafe service lock')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ServiceError('A daemon already owns this repository') from exc
+        if path.exists() or path.is_symlink():
+            info = path.lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+                raise ServiceError('Refusing to replace a non-socket or foreign service path')
+            path.unlink()
+        old_mask = os.umask(0o177)
+        try:
+            listener.bind(str(path))
+        finally:
+            os.umask(old_mask)
+        socket_identity = identity(path)
+        try:
+            os.chmod(path, 0o600)
+            listener.listen(16)
+            listener.settimeout(min(0.25, idle_timeout))
+            last_request = time.monotonic()
+            while not service.stopping and time.monotonic() - last_request < idle_timeout:
+                try:
+                    connection, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                with connection:
+                    connection.settimeout(3)
+                    try:
+                        if peer_uid(connection) != os.getuid():
+                            raise ServiceError('Peer uid does not match daemon uid')
+                        request = receive(connection, MAX_REQUEST)
+                        response = service.handle(request)
+                        last_request = time.monotonic()
+                        connection.settimeout(3)
+                        send(connection, response)
+                    except (ServiceError, OSError, ValueError) as exc:
+                        try:
+                            send(connection, {'protocol': PROTOCOL, 'exit_code': 2, 'stdout': '', 'stderr': str(exc) + '\n'})
+                        except (OSError, ServiceError):
+                            pass
+        finally:
+            try:
+                if identity(path) == socket_identity:
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+    return 0
+
+
+def request_service(root: Path, request: dict, timeout: float) -> dict:
+    path = socket_path(root)
+    info = path.lstat()
+    if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ServiceError('Unsafe daemon socket')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(str(path))
+        if peer_uid(connection) != os.getuid():
+            raise ServiceError('Server uid does not match client uid')
+        send(connection, request)
+        response = receive(connection, MAX_RESPONSE)
+        if response.get('protocol') != PROTOCOL:
+            raise ServiceError('Unsupported service response')
+        return response
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('serve', 'client', 'status', 'stop'))
+    parser.add_argument('files', nargs='*', help='source files relative to --repo')
+    parser.add_argument('--repo', default='.', help='repository root (default: current directory)')
+    parser.add_argument('--scanner', default=str(Path(__file__).resolve().with_name('ubs')))
+    parser.add_argument('--format', default='json', choices=sorted(FORMATS))
+    parser.add_argument('--profile', choices=('strict', 'loose'))
+    parser.add_argument('--fail-on-warning', action='store_true')
+    parser.add_argument('--require-daemon', action='store_true', help='do not fall back to one-shot scanning')
+    parser.add_argument('--idle-timeout', type=float, default=900)
+    parser.add_argument('--scan-timeout', type=float, default=120)
+    parser.add_argument('--cache-mib', type=int, default=32, help='bounded report cache; 0 disables reuse')
+    args = parser.parse_intermixed_args(argv)
+    try:
+        if os.name != 'posix' or fcntl is None:
+            raise ServiceError('The local scan service requires a POSIX Unix-socket platform')
+        if not 0 < args.idle_timeout <= 86400 or not 0 < args.scan_timeout <= 3600 or not 0 <= args.cache_mib <= 256:
+            raise ServiceError('Timeouts/cache size are outside permitted bounds')
+        root = Path(args.repo).resolve(strict=True)
+        scanner = Path(args.scanner).resolve(strict=True)
+        if not root.is_dir() or not scanner.is_file() or not os.access(scanner, os.X_OK):
+            raise ServiceError('Repository must be a directory and scanner must be executable')
+        if args.command == 'serve':
+            if args.files:
+                raise ServiceError('serve does not accept source files')
+            service = ScanService(root, scanner, args.scan_timeout, args.cache_mib * 1024 * 1024)
+            def stop(_signal, _frame):
+                raise KeyboardInterrupt
+            signal.signal(signal.SIGTERM, stop)
+            return serve(service, args.idle_timeout)
+        request = {'protocol': PROTOCOL, 'op': 'scan' if args.command == 'client' else args.command, 'root': str(root)}
+        if args.command == 'client':
+            request.update(paths=args.files, format=args.format, profile=args.profile, fail_on_warning=args.fail_on_warning,
+                           environment=environment_key(), scanner=str(scanner))
+            paths, options = validate_scan(root, request)
+        elif args.files:
+            raise ServiceError('status/stop do not accept source files')
+        try:
+            response = request_service(root, request, args.scan_timeout + 10)
+        except OSError as exc:
+            if exc.errno not in (errno.ENOENT, errno.ECONNREFUSED):
+                raise
+            response = {'unavailable': 'No daemon is running'}
+        if 'unavailable' in response:
+            if args.command != 'client' or args.require_daemon:
+                raise ServiceError(response['unavailable'])
+            response = run_scanner(root, scanner, paths, options, args.scan_timeout)
+        if 'exit_code' in response:
+            if type(response['exit_code']) is not int or not 0 <= response['exit_code'] <= 255:
+                raise ServiceError('Invalid scanner exit status')
+            if not isinstance(response.get('stdout'), str) or not isinstance(response.get('stderr'), str):
+                raise ServiceError('Invalid scanner output streams')
+            sys.stdout.write(response['stdout'])
+            sys.stderr.write(response['stderr'])
+            return response['exit_code']
+        if args.command == 'client' or response.get('root') != str(root) or response.get('status') not in {'ready', 'stopping'}:
+            raise ServiceError('Incomplete service response; no scan result is available')
+        print(json.dumps(response))
+        return 0
+    except (ServiceError, OSError, ValueError) as exc:
+        print(f'ubs-daemon: {exc}', file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

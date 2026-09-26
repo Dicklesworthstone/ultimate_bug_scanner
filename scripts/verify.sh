@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Authenticate one release manifest, then stage every executable the installer
+# Authenticate one release manifest, then stage every release executable the installer
 # consumes. The downloaded installer must not re-fetch an unsigned manifest or
 # install a different runner after its own signature has been checked.
 
@@ -13,7 +13,8 @@ usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
 usage() {
   cat <<'USAGE'
-Usage: verify.sh [--version X.Y.Z|vX.Y.Z] [--insecure] [-- INSTALLER_ARGS...]
+Usage: verify.sh [--version X.Y.Z|vX.Y.Z] [--artifact-dir DIR] [--verify-only]
+                 [--insecure] [-- INSTALLER_ARGS...]
 
 Authenticate SHA256SUMS, verify install.sh, ubs and git_safety_guard.py against
 that same manifest, and install the verified local payload. The caller's
@@ -22,6 +23,8 @@ missing or ambiguous checksums, and different release versions fail closed.
 
 Options:
   --version VERSION       Select an exact release, including prerelease tags.
+  --artifact-dir DIR      Read a local release bundle; do not download assets.
+  --verify-only           Verify the complete release WITHOUT running it.
   --install-args "ARGS"   Legacy whitespace-separated arguments (no shell eval).
   -- ARGS...              Pass installer arguments without splitting or eval.
   --insecure              Explicitly skip ALL signature and checksum checks.
@@ -37,6 +40,12 @@ Environment:
 Cosign requires this repository's release.yml certificate on the EXACT selected
 vVERSION tag, issued by GitHub Actions. Minisign additionally binds the requested
 version to the authenticated runner's literal UBS_VERSION declaration.
+
+Local bundles contain SHA256SUMS, its .minisig or .sigstore.json signature,
+install.sh, ubs, and git_safety_guard.py. Only regular, non-symlink files are
+accepted; private copies are authenticated, never executed from the input
+directory. Cosign may still refresh its trust metadata. Installing a local
+bundle can fetch third-party dependencies; --verify-only never runs installers.
 USAGE
 }
 
@@ -46,6 +55,8 @@ VERSION="${UBS_VERSION:-$(cat "$VERSION_FILE" 2>/dev/null || true)}"
 MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"
 VERIFY_WITH="${UBS_VERIFY_WITH:-}"
 INSECURE=0
+VERIFY_ONLY=0
+ARTIFACT_DIR=''
 INSTALL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -54,6 +65,14 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && -n "$2" ]] || usage_error '--version requires a value'
       VERSION="$2"; shift 2 ;;
     --version=*) VERSION="${1#*=}"; shift ;;
+    --artifact-dir)
+      [[ $# -ge 2 && -n "$2" ]] || usage_error '--artifact-dir requires a directory'
+      ARTIFACT_DIR="$2"; shift 2 ;;
+    --artifact-dir=*)
+      ARTIFACT_DIR="${1#*=}"
+      [[ -n "$ARTIFACT_DIR" ]] || usage_error '--artifact-dir requires a directory'
+      shift ;;
+    --verify-only) VERIFY_ONLY=1; shift ;;
     --install-args)
       [[ $# -ge 2 ]] || usage_error '--install-args requires a value'
       legacy_args=()
@@ -66,6 +85,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+  [[ "$INSECURE" -eq 0 ]] || usage_error '--verify-only cannot be combined with --insecure'
+  [[ "${#INSTALL_ARGS[@]}" -eq 0 ]] || usage_error '--verify-only does not accept installer arguments'
+fi
+if [[ -n "$ARTIFACT_DIR" ]]; then
+  [[ -d "$ARTIFACT_DIR" ]] || usage_error '--artifact-dir must name an existing directory'
+  ARTIFACT_DIR="$(cd -- "$ARTIFACT_DIR" && pwd -P)" || usage_error 'Cannot read artifact directory'
+fi
 VERSION="$(normalize_version "$VERSION")"
 version_pattern='^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z][0-9A-Za-z.+-]*)?$'
 [[ "$VERSION" =~ $version_pattern ]] \
@@ -102,7 +129,9 @@ if [[ "$INSECURE" -eq 0 ]]; then
 fi
 # curl is already a UBS runtime dependency. Restrict both the initial URL and
 # redirects: a nominal HTTPS URL must not redirect an executable to HTTP/FTP.
-command -v curl >/dev/null 2>&1 || die 'curl is required to download release artifacts'
+if [[ -z "$ARTIFACT_DIR" ]]; then
+  command -v curl >/dev/null 2>&1 || die 'curl is required to download release artifacts'
+fi
 
 mktemp_dir() {
   local base="${TMPDIR:-/tmp}"
@@ -120,6 +149,12 @@ trap 'exit 143' TERM
 
 fetch_asset() {
   local name="$1"
+  if [[ -n "$ARTIFACT_DIR" ]]; then
+    [[ -f "$ARTIFACT_DIR/$name" && ! -L "$ARTIFACT_DIR/$name" ]] \
+      || die "Local release asset must be a regular non-symlink file: $name"
+    cp -- "$ARTIFACT_DIR/$name" "$VERIFY_DIR/$name" || die "Could not stage local release asset: $name"
+    return 0
+  fi
   curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
     --connect-timeout 20 --max-time 180 --retry 3 --retry-delay 1 --compressed \
     -o "$VERIFY_DIR/$name" "$ARTIFACT_BASE/$name" \
@@ -159,7 +194,11 @@ verify_asset() {
 }
 
 info "Version: $VERSION"
-info "Release base: $ARTIFACT_BASE"
+if [[ -n "$ARTIFACT_DIR" ]]; then
+  info "Local release bundle: $ARTIFACT_DIR"
+else
+  info "Release base: $ARTIFACT_BASE"
+fi
 if [[ "$INSECURE" -eq 0 ]]; then
   fetch_asset SHA256SUMS
   case "$VERIFY_WITH" in
@@ -204,6 +243,10 @@ else
   fetch_asset install.sh
 fi
 
+if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+  ok "Release v${VERSION} verified; no installer or scanner was executed"
+  exit 0
+fi
 ok 'Executing installer'
 status=0
 UBS_ARTIFACT_BASE="$ARTIFACT_BASE" UBS_NO_AUTO_UPDATE=1 \

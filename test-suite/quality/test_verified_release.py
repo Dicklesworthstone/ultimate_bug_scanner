@@ -29,7 +29,7 @@ log = pathlib.Path(os.environ['FETCH_LOG'])
 with log.open('a') as stream:
     stream.write(json.dumps({'name': name, 'args': args}) + '\n')
 source = pathlib.Path(os.environ['RELEASE_FIXTURE']) / name
-if not source.is_file():
+if not source.is_file() or os.environ.get('MISSING_ASSET') == name:
     sys.exit(22)
 output = args[args.index('-o') + 1]
 pathlib.Path(output).write_bytes(source.read_bytes())
@@ -54,6 +54,13 @@ else:
     bundle = json.loads(pathlib.Path(args[args.index('-x') + 1]).read_text())
     valid = bundle['digest'] == hashlib.sha256(pathlib.Path(args[args.index('-Vm') + 1]).read_bytes()).hexdigest()
     valid &= args[args.index('-P') + 1] == 'test-public-key'
+if valid and os.environ.get('SWAP_AFTER_SIGNATURE') == '1':
+    root = pathlib.Path(os.environ['RELEASE_FIXTURE'])
+    replacement = b'#!/usr/bin/env bash\nUBS_VERSION="' + os.environ['UBS_VERSION'].encode() + b'"\nexit 99\n'
+    (root / 'ubs').write_bytes(replacement)
+    sums = (root / 'SHA256SUMS').read_text().splitlines()
+    sums = [hashlib.sha256(replacement).hexdigest() + '  ubs' if line.endswith('  ubs') else line for line in sums]
+    (root / 'SHA256SUMS').write_text('\n'.join(sums) + '\n')
 sys.exit(0 if valid else 1)
 '''
 
@@ -217,11 +224,17 @@ class VerifiedReleaseTests(unittest.TestCase):
                 self.run_verify(expected=1)
                 self.assert_not_executed()
 
-    def test_missing_signature_does_not_fall_back_to_checksums(self):
+    def test_invalid_verifier_fails_before_network_access(self):
         self.env['UBS_VERIFY_WITH'] = 'unsupported'
         self.run_verify(expected=1)
         self.assert_not_executed()
         self.assertFalse(self.fetches())
+
+    def test_missing_signature_does_not_fall_back_to_checksums(self):
+        self.env['MISSING_ASSET'] = 'SHA256SUMS.sigstore.json'
+        self.run_verify(expected=1)
+        self.assert_not_executed()
+        self.assertEqual([item['name'] for item in self.fetches()], ['SHA256SUMS', 'SHA256SUMS.sigstore.json'])
 
     def test_installer_failure_status_and_cleanup_are_preserved(self):
         self.env['INSTALL_EXIT'] = '37'
@@ -266,6 +279,9 @@ class VerifiedReleaseTests(unittest.TestCase):
         (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
         (self.bundle / 'ubs').write_bytes((ROOT / 'ubs').read_bytes())
         self.sign()
+        # A file planted in the user's project must not override the signed
+        # runner sitting next to the authenticated installer.
+        (self.project / 'ubs').write_text('#!/usr/bin/env bash\nexit 99\n')
         # The existing installer rejects spaces in its destination; argument
         # fidelity is covered separately without changing that policy here.
         destination = self.home / 'bin'
@@ -278,6 +294,112 @@ class VerifiedReleaseTests(unittest.TestCase):
         self.assertEqual((destination / 'ubs').read_bytes(), (self.bundle / 'ubs').read_bytes())
         self.assertEqual([item['name'] for item in self.fetches()].count('SHA256SUMS'), 1, result.stdout)
         self.assertEqual([item['name'] for item in self.fetches()].count('ubs'), 1, result.stdout)
+
+    def test_verify_only_downloads_and_checks_but_never_executes_payloads(self):
+        result = self.run_verify('--verify-only')
+        self.assert_not_executed()
+        self.assertIn('no installer or scanner was executed', result.stdout)
+        self.assertEqual({item['name'] for item in self.fetches()},
+                         {'SHA256SUMS', 'SHA256SUMS.sigstore.json', 'install.sh', 'ubs', 'git_safety_guard.py'})
+        self.assertEqual(list(self.temp_root.iterdir()), [])
+
+    def test_verify_only_cannot_be_an_insecure_success_or_discard_install_flags(self):
+        for args in (('--verify-only', '--insecure'), ('--verify-only', '--', '--easy-mode'),
+                     ('--verify-only', '--install-args', '--easy-mode')):
+            with self.subTest(args=args):
+                self.run_verify(*args, expected=2)
+                self.assert_not_executed()
+                self.assertFalse(self.fetches())
+
+    def test_local_bundle_verification_does_not_download_or_execute(self):
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only')
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+        self.assertTrue(Path(self.env['SIGNATURE_LOG']).exists())
+        self.assertEqual(list(self.temp_root.iterdir()), [])
+
+    def test_local_bundle_can_install_from_private_verified_copies(self):
+        before = {p.name: p.read_bytes() for p in self.bundle.iterdir()}
+        self.run_verify('--artifact-dir', str(self.bundle))
+        self.assertFalse(self.fetches())
+        self.assertNotEqual(self.execution()['source'], str(self.bundle))
+        self.assertEqual(self.execution()['files']['ubs'], hashlib.sha256(before['ubs']).hexdigest())
+        self.assertEqual(before, {p.name: p.read_bytes() for p in self.bundle.iterdir()})
+
+    def test_local_bundle_paths_with_spaces_and_relative_paths(self):
+        destination = self.project / 'bundle with spaces'
+        shutil.copytree(self.bundle, destination)
+        self.run_verify('--artifact-dir=bundle with spaces', '--verify-only')
+        self.assertFalse(self.fetches())
+        self.assert_not_executed()
+
+    def test_local_bundle_rejects_tampered_runner(self):
+        (self.bundle / 'ubs').write_text('#!/usr/bin/env bash\nexit 99\n')
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only', expected=1)
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+
+    def test_local_bundle_rejects_symlinks_even_for_valid_signed_payloads(self):
+        original = self.bundle / 'ubs'
+        original.rename(self.bundle / 'real-ubs')
+        original.symlink_to(self.bundle / 'real-ubs')
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only', expected=1)
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+
+    def test_local_bundle_rejects_missing_assets_without_network_fallback(self):
+        (self.bundle / 'git_safety_guard.py').rename(self.bundle / 'saved-guard.py')
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only', expected=1)
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+
+    def test_local_manifest_cannot_be_replaced_after_signature_verification(self):
+        self.env['SWAP_AFTER_SIGNATURE'] = '1'
+        self.run_verify('--artifact-dir', str(self.bundle), expected=1)
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+
+    def test_local_bundle_minisign_path(self):
+        self.env.update(UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY='test-public-key')
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only')
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+
+    def test_local_bundle_does_not_require_a_downloader(self):
+        offline_bin = self.root / 'offline-bin'
+        offline_bin.mkdir()
+        digest_tool = next(name for name in ('sha256sum', 'shasum', 'openssl') if shutil.which(name))
+        for name in ('bash', 'dirname', 'cat', 'mktemp', 'awk', digest_tool, 'cp', 'rm', 'mkdir', 'python3'):
+            executable = shutil.which(name)
+            self.assertIsNotNone(executable, name)
+            (offline_bin / name).symlink_to(executable)
+        (offline_bin / 'minisign').symlink_to(self.bin / 'minisign')
+        self.env.update(PATH=str(offline_bin), UBS_VERIFY_WITH='minisign', UBS_MINISIGN_PUBKEY='test-public-key')
+        self.run_verify('--artifact-dir', str(self.bundle), '--verify-only')
+        self.assert_not_executed()
+        self.assertFalse(self.fetches())
+
+    def test_artifact_directory_usage_errors_do_not_download(self):
+        for args in (('--artifact-dir',), ('--artifact-dir=',),
+                     ('--artifact-dir', str(self.root / 'missing')),
+                     ('--artifact-dir', str(self.bundle / 'ubs'))):
+            with self.subTest(args=args):
+                self.run_verify(*args, expected=2)
+                self.assert_not_executed()
+                self.assertFalse(self.fetches())
+
+    def test_real_project_hook_install_uses_authenticated_local_guard(self):
+        (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
+        self.sign()
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env,
+                       capture_output=True, timeout=20)
+        self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'hook-installer-work')
+        self.run_verify('--artifact-dir', str(self.bundle), '--', '--setup-claude-hook',
+                        '--non-interactive', '--skip-version-check', '--no-path-modify')
+        guard = self.project / '.claude' / 'hooks' / 'git_safety_guard.py'
+        self.assertEqual(guard.read_bytes(), (self.bundle / 'git_safety_guard.py').read_bytes())
+        self.assertFalse(self.fetches())
+        self.assertTrue((self.project / '.claude' / 'settings.json').is_file())
 
 
 if __name__ == '__main__':

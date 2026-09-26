@@ -1,0 +1,349 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index 8fe74d8..4aaa996 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -79,6 +79,7 @@ _REQUEST_MEMBERS = {'args', 'get_json', 'json', 'form', 'values', 'data', 'body'
+ class _FrameworkInput:
+     kind: str
+     name: str
++    dependency: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+ 
+ 
+ def _imported_name(node, bindings):
+@@ -116,7 +117,12 @@ def _framework_input(node, bindings):
+             return _FrameworkInput('source', name)
+         if name in _DEPENDENCY_MARKERS:
+             # A dependency may supply a trusted service, not request data.
+-            return _FrameworkInput('dependency', name)
++            argument = node.args[0] if node.args else next(
++                (kw.value for kw in node.keywords if kw.arg == 'dependency'), None)
++            target = bindings.get(argument.id) if isinstance(argument, ast.Name) else None
++            if not isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                target = None
++            return _FrameworkInput('dependency', name, target)
+     if isinstance(node, ast.Subscript) and _imported_name(node.value, bindings) in {
+             'typing.Annotated', 'typing_extensions.Annotated'}:
+         parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+@@ -499,6 +505,11 @@ class _Flow:
+     def expression(self, node, state):
+         if node is None or isinstance(node, ast.Constant):
+             return CLEAN
++        if isinstance(node, (ast.Yield, ast.YieldFrom)):
++            self.returned = join_facts(self.returned, self.expr(node.value, state))
++            # The result of a yield expression is a subsequently sent value,
++            # not the value being yielded to a caller or dependency consumer.
++            return CLEAN
+         if isinstance(node, ast.Lambda):
+             signature = node.args
+             positional = [*signature.posonlyargs, *signature.args]
+@@ -720,6 +731,7 @@ class _Analysis:
+         self.summaries = {}
+         self.defaults = {}
+         self.framework_inputs = {}
++        self.framework_dependencies = {}
+         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+         self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
+@@ -748,17 +760,59 @@ class _Analysis:
+         for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
+             description = (_framework_input(defaults.get(arg.arg), bindings)
+                            or _framework_input(arg.annotation, bindings))
+-            if description is None and route:
+-                description = _FrameworkInput('source', 'fastapi.request')
++            if description is None:
++                description = _FrameworkInput('source' if route else 'implicit', 'fastapi.request')
+             if description is not None:
+                 inputs[arg.arg] = description
+         # Capture import identities at the definition, before later rebinding.
+         self.framework_inputs[function] = inputs
+-
+-    def framework_bound(self, function):
+-        return {name: frozenset({TaintTrace(description.name, path=(description.name, name))})
+-                for name, description in self.framework_inputs.get(function, {}).items()
+-                if description.kind == 'source'}
++        dependencies = []
++        if route:
++            for decorator in function.decorator_list:
++                if not isinstance(decorator, ast.Call):
++                    continue
++                for keyword in decorator.keywords:
++                    if keyword.arg == 'dependencies' and isinstance(keyword.value, (ast.List, ast.Tuple)):
++                        for item in keyword.value.elts:
++                            description = _framework_input(item, bindings)
++                            if description is not None and description.dependency is not None:
++                                dependencies.append(description.dependency)
++        self.framework_dependencies[function] = tuple(dependencies)
++
++    def framework_bound(self, globals_):
++        """Solve local dependency return values using the existing finite lattice.
++
++        Only framework entry contexts get these bindings. Ordinary calls keep
++        their actual arguments, and a dependency returning a constant remains
++        clean even when its unused parameters come from the request.
++        """
++        providers = {description.dependency for inputs in self.framework_inputs.values()
++                     for description in inputs.values() if description.dependency is not None}
++        providers.update(provider for values in self.framework_dependencies.values() for provider in values)
++        bound = {
++            function: {name: frozenset({TaintTrace(description.name, path=(description.name, name))})
++                       for name, description in inputs.items()
++                       if description.kind == 'source' or (description.kind == 'implicit' and function in providers)}
++            for function, inputs in self.framework_inputs.items()
++        }
++        global_bound = {f'@global:{name}': value for name, value in globals_.items()}
++        while True:
++            changed = False
++            for function, inputs in self.framework_inputs.items():
++                for name, description in inputs.items():
++                    provider = description.dependency
++                    if provider is None:
++                        continue
++                    summary = self.summaries.get(provider, FunctionSummary())
++                    incoming = _Flow.substitute(summary.returned,
++                                                {**global_bound, **bound.get(provider, {})}, provider.name + '()')
++                    previous = bound[function].get(name, CLEAN)
++                    updated = join_facts(previous, incoming)
++                    if updated != previous:
++                        bound[function][name] = updated
++                        changed = True
++            if not changed:
++                return bound
+ 
+     def analyze(self):
+         # A summary contains only finite source/parameter/sanitizer facts.
+@@ -800,15 +854,17 @@ class _Analysis:
+                 flows.append(flow)
+             if not changed:
+                 effects = {}
++                framework_bound = self.framework_bound(globals_)
+                 for flow in flows:
+                     for key, fact in flow.effects.items():
+                         if flow is not module:
+                             bound = {f'@global:{name}': value for name, value in globals_.items()}
+                             # Framework invocation is a separate entry point;
+                             # summaries remain symbolic for ordinary callers.
+-                            bound.update(self.framework_bound(flow.scope))
++                            bound.update(framework_bound.get(flow.scope, {}))
+                             fact = flow.substitute(fact, bound, flow.scope.name + '()')
+-                        concrete = frozenset(trace for trace in fact if trace.parameter is None)
++                        concrete = frozenset(trace for trace in fact if trace.parameter is None
++                                             and not _safe_for(trace, key[0], key[3]))
+                         if concrete:
+                             effects[key] = join_facts(effects.get(key, CLEAN), concrete)
+                 return effects
+ diff --git a/test-suite/quality/test_taint_python_frameworks.py b/test-suite/quality/test_taint_python_frameworks.py
+index 0214a08..4790e0c 100644
+--- a/test-suite/quality/test_taint_python_frameworks.py
++++ b/test-suite/quality/test_taint_python_frameworks.py
+@@ -130,6 +130,162 @@ class FastAPIInputTests(SourceTest):
+         ''')
+ 
+ 
++class DependencyInputTests(SourceTest):
++    def test_local_dependency_return_becomes_a_handler_input(self):
++        self.assert_rules('''
++            from fastapi import Depends, Query
++            def obtain(q=Query()):
++                return q
++            def endpoint(code=Depends(obtain)):
++                eval(code)
++        ''', 'eval')
++
++    def test_plain_dependency_arguments_are_request_parameters(self):
++        self.assert_rules('''
++            from fastapi import Depends
++            def obtain(q: str = 'default'):
++                return q
++            def endpoint(code=Depends(obtain)):
++                cursor.execute(code)
++        ''', 'sql')
++        self.assert_rules("def ordinary(q: str = 'default'):\n    eval(q)\n")
++
++    def test_annotated_dependency_alias_and_keyword_callable(self):
++        self.assert_rules('''
++            from fastapi import Depends as D
++            from typing import Annotated as A
++            def obtain(q: str):
++                return q
++            Code = A[str, D(dependency=obtain)]
++            def endpoint(code: Code):
++                eval(code)
++        ''', 'eval')
++
++    def test_nested_dependencies_preserve_source_provenance(self):
++        findings = self.assert_rules('''
++            from fastapi import Depends, Cookie
++            def obtain(q=Cookie()):
++                return q
++            async def decorate(code=Depends(obtain)):
++                return 'select ' + code
++            async def endpoint(query=Depends(decorate)):
++                cursor.execute(query)
++        ''', 'sql')
++        self.assertIn('Cookie', findings[0]['message'])
++        self.assertIn('decorate()', findings[0]['message'])
++
++    def test_deep_dependency_chain_has_no_arbitrary_depth_cutoff(self):
++        code = 'from fastapi import Depends\ndef d0(q: str):\n    return q\n'
++        for i in range(1, 24):
++            code += f'def d{i}(q=Depends(d{i-1})):\n    return q\n'
++        code += 'def endpoint(code=Depends(d23)):\n    eval(code)\n'
++        self.assert_rules(code, 'eval')
++
++    def test_dependency_sink_side_effects_are_analyzed(self):
++        self.assert_rules('''
++            from fastapi import Depends
++            def validate(q: str):
++                eval(q)
++                return 'safe'
++            def endpoint(code=Depends(validate)):
++                pass
++        ''', 'eval')
++
++    def test_route_decorator_dependencies_are_invocations(self):
++        self.assert_rules('''
++            from fastapi import Depends, FastAPI
++            app = FastAPI()
++            def validate(q: str):
++                eval(q)
++            @app.get('/', dependencies=[Depends(validate)])
++            def endpoint():
++                pass
++        ''', 'eval')
++
++    def test_constant_dependency_return_does_not_inherit_unused_input(self):
++        self.assert_rules('''
++            from fastapi import Depends, Query
++            def obtain(q=Query()):
++                return 'trusted'
++            def endpoint(code=Depends(obtain)):
++                eval(code)
++        ''')
++
++    def test_returned_sanitizer_is_only_valid_in_its_sink_domain(self):
++        code = '''
++            from fastapi import Depends, Query
++            def obtain(q=Query()):
++                return html.escape(q)
++            def endpoint(code=Depends(obtain)):
++                SINK
++        '''
++        self.assert_rules(code.replace('SINK', 'HttpResponse(code)'))
++        self.assert_rules(code.replace('SINK', 'cursor.execute(code)'), 'sql')
++
++    def test_yielding_dependency_exposes_the_yielded_value(self):
++        self.assert_rules('''
++            from fastapi import Depends, Query
++            def obtain(q=Query()):
++                yield q
++            def endpoint(code=Depends(obtain)):
++                eval(code)
++        ''', 'eval')
++        self.assert_rules('''
++            from fastapi import Depends, Query
++            def obtain(q=Query()):
++                yield 'trusted'
++            def endpoint(code=Depends(obtain)):
++                eval(code)
++        ''')
++
++    def test_security_uses_the_same_dependency_summary(self):
++        self.assert_rules('''
++            from fastapi import Security, Header
++            def obtain(q=Header()):
++                return q
++            def endpoint(code=Security(obtain, scopes=['read'])):
++                eval(code)
++        ''', 'eval')
++
++    def test_rebinding_does_not_change_a_captured_dependency(self):
++        self.assert_rules('''
++            from fastapi import Depends
++            def obtain(q: str):
++                return q
++            def endpoint(code=Depends(obtain)):
++                eval(code)
++            obtain = other
++        ''', 'eval')
++        self.assert_rules('''
++            from fastapi import Depends
++            def obtain(q: str):
++                return q
++            obtain = other
++            def endpoint(code=Depends(obtain)):
++                eval(code)
++        ''')
++
++    def test_generator_return_summary_propagates_to_ordinary_consumers(self):
++        self.assert_rules('''
++            def values(q):
++                yield q
++            for code in values(input()):
++                eval(code)
++        ''', 'eval')
++
++    def test_sanitized_global_is_rechecked_after_summary_substitution(self):
++        self.assert_rules('''
++            value = html.escape(input())
++            def endpoint():
++                HttpResponse(value)
++        ''')
++        self.assert_rules('''
++            value = html.escape(input())
++            def endpoint():
++                cursor.execute(value)
++        ''', 'sql')
++
++
+ class TypedRequestTests(SourceTest):
+     def test_request_members_are_sources_regardless_of_parameter_name(self):
+         for import_ in ('from fastapi import Request', 'from starlette.requests import Request'):
+@@ -184,25 +340,32 @@ class FrameworkRunnerTests(unittest.TestCase):
+             ('typed-request', 'from fastapi import Request\ndef endpoint(incoming: Request):\n    HttpResponse(incoming.query_params["q"])\n', 'xss', 3),
+             ('safe-sql', 'from fastapi import Query\ndef endpoint(q=Query()):\n    cursor.execute("select ?", (q,))\n', None, None),
+             ('safe-html', 'from fastapi import Query\ndef endpoint(q=Query()):\n    HttpResponse(html.escape(q))\n', None, None),
++            ('dependency-sql', 'from fastapi import Depends\ndef obtain(q: str):\n    return q\ndef endpoint(code=Depends(obtain)):\n    cursor.execute(code)\n', 'sql', 5),
++            ('dependency-safe-html', 'from fastapi import Depends\ndef obtain(q: str):\n    return html.escape(q)\ndef endpoint(code=Depends(obtain)):\n    HttpResponse(code)\n', None, None),
++            ('dependency-yield', 'from fastapi import Depends\ndef obtain(q: str):\n    yield q\ndef endpoint(code=Depends(obtain)):\n    eval(code)\n', 'eval', 5),
++            ('dependency-side-effect', 'from fastapi import Depends, FastAPI\napp = FastAPI()\ndef validate(q: str):\n    eval(q)\n@app.get("/", dependencies=[Depends(validate)])\ndef endpoint():\n    pass\n', 'eval', 4),
+         )
+         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-framework-sources'
+         artifacts.mkdir(parents=True, exist_ok=True)
+-        for name, code, kind, line in cases:
+-            with self.subTest(case=name), tempfile.TemporaryDirectory(prefix='ubs-framework-e2e-') as tmp:
+-                source = Path(tmp) / 'view.py'
+-                source.write_text(code, encoding='utf-8')
+-                result = subprocess.run([str(ROOT / 'ubs'), str(source), '--only=python', '--ci', '--format=json'],
+-                                        cwd=tmp, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1'),
+-                                        capture_output=True, text=True, timeout=180)
+-                (artifacts / f'{name}.json').write_text(result.stdout)
+-                (artifacts / f'{name}.stderr.log').write_text(result.stderr)
+-                self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+-                report = json.loads(result.stdout)
+-                self.assertEqual(report.get('status'), 'ok', result.stdout + result.stderr)
+-                findings = [f for f in report['findings'] if f['rule_id'].startswith('python.taint.')]
+-                expected = [(f'python.taint.{kind}', line)] if kind else []
+-                self.assertEqual([(f['rule_id'], f['line']) for f in findings], expected, report)
+-                print(f'[framework-{name}] PASS', flush=True)
++        with tempfile.TemporaryDirectory(prefix='ubs-framework-e2e-') as tmp:
++            for name, code, _kind, _line in cases:
++                (Path(tmp) / f'{name}.py').write_text(code, encoding='utf-8')
++            result = subprocess.run([str(ROOT / 'ubs'), tmp, '--only=python', '--ci', '--format=json'],
++                                    cwd=tmp, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1'),
++                                    capture_output=True, text=True, timeout=180)
++            (artifacts / 'result.json').write_text(result.stdout)
++            (artifacts / 'stderr.log').write_text(result.stderr)
++            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
++            report = json.loads(result.stdout)
++            self.assertEqual(report.get('status'), 'ok', result.stdout + result.stderr)
++            self.assertEqual(report['totals']['files'], len(cases), report)
++            for name, _code, kind, line in cases:
++                with self.subTest(case=name):
++                    findings = [f for f in report['findings'] if f['rule_id'].startswith('python.taint.')
++                                and Path(f['file']).name == f'{name}.py']
++                    expected = [(f'python.taint.{kind}', line)] if kind else []
++                    self.assertEqual([(f['rule_id'], f['line']) for f in findings], expected, report)
++                    print(f'[framework-{name}] PASS', flush=True)
+ 
+ 
+ if __name__ == '__main__':

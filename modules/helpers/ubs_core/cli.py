@@ -80,6 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fm.add_argument("--tmp-dir", required=True, help="run temp dir holding <lang>.findings.json sinks")
     fm.add_argument("--combined", required=True, help="combined summary JSON document")
     fm.add_argument("--project-dir", default="", help="project directory for relative path resolution")
+    fm.add_argument("--source-root", default="", help="source snapshot used to scan the reported project paths")
     fm.add_argument("--baseline", default="", help="baseline JSON document to compare against")
     fm.add_argument("--new-only", action="store_true", help="report only findings absent from baseline")
     fs = sub.add_parser(
@@ -208,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.tmp_dir),
                 Path(args.combined),
                 project_dir=args.project_dir,
+                source_root=args.source_root,
                 baseline_path=args.baseline,
                 new_only=args.new_only,
             )

@@ -17,7 +17,9 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Callable
+import sqlite3
+import tempfile
+from collections.abc import Callable, Iterator
 from functools import lru_cache
 from pathlib import Path
 
@@ -49,7 +51,7 @@ def normalize_statement(statement: str) -> str:
     return re.sub(r"\s+", " ", stmt).strip()
 
 
-def _relative_path(path: str, project_dir: str | Path = "") -> str:
+def _relative_path(path: str, project_dir: str | Path = "", *, resolve_links: bool = True) -> str:
     p_str = str(path or "").strip()
     if p_str.startswith("file://"):
         p_str = p_str[7:]
@@ -57,10 +59,11 @@ def _relative_path(path: str, project_dir: str | Path = "") -> str:
         return p_str
     try:
         p_path = Path(p_str)
-        proj_path = Path(project_dir).resolve()
+        proj_path = Path(project_dir).resolve() if resolve_links else Path(os.path.abspath(project_dir))
         if p_path.is_absolute():
-            return str(p_path.resolve().relative_to(proj_path))
-        full = (proj_path / p_path).resolve()
+            full = p_path.resolve() if resolve_links else Path(os.path.abspath(p_path))
+            return str(full.relative_to(proj_path))
+        full = (proj_path / p_path).resolve() if resolve_links else Path(os.path.abspath(proj_path / p_path))
         if full.is_relative_to(proj_path):
             return str(full.relative_to(proj_path))
         return p_str
@@ -72,6 +75,7 @@ def _extract_statement(
     rec: dict,
     project_dir: str | Path,
     source_lines: Callable[[Path], list[str]],
+    source_root: str | Path = "",
 ) -> str:
     path = str(rec.get("path", ""))
     try:
@@ -79,10 +83,17 @@ def _extract_statement(
     except (TypeError, ValueError):
         line_no = 0
     if path and line_no > 0:
-        p = Path(path)
-        if not p.is_file() and project_dir:
-            p = Path(project_dir, path)
-        if p.is_file():
+        if source_root:
+            # A staged scan reports worktree names but analyzed index bytes.
+            # Resolve lexically: an unstaged symlink or deletion must neither
+            # redirect fingerprints nor fall back to different worktree bytes.
+            relative = Path(_relative_path(path, project_dir, resolve_links=False))
+            p = None if relative.is_absolute() or ".." in relative.parts else Path(source_root, relative)
+        else:
+            p = Path(path)
+            if not p.is_file() and project_dir:
+                p = Path(project_dir, path)
+        if p is not None and p.is_file():
             try:
                 lines = source_lines(p)
                 if 1 <= line_no <= len(lines):
@@ -148,24 +159,61 @@ def _looks_like_finding(rec: object) -> bool:
     return not (SCANNER_SUMMARY_KEYS >= set(rec.keys()) and "rule_id" not in rec)
 
 
-def load_sink(sink: Path) -> list[dict]:
-    """Parse one NDJSON sink, skipping blank/malformed/non-finding lines."""
-    records: list[dict] = []
+def load_sink(sink: Path) -> Iterator[dict]:
+    """Read one record at a time, skipping blank/malformed/non-finding lines."""
     try:
-        raw_lines = sink.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return records
-    for line in raw_lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        if _looks_like_finding(rec):
-            records.append(rec)
-    return records
+        with sink.open(encoding="utf-8", errors="replace") as source:
+            for line in source:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if _looks_like_finding(rec):
+                    yield rec
+    except OSError as exc:
+        raise ValueError(f"cannot read findings sink {sink}: {exc}") from exc
+
+
+class _OccurrenceOrdinals:
+    """Preserve duplicate fingerprints without retaining every distinct key.
+
+    Small scans stay in memory. After 4096 distinct statements, an ephemeral
+    on-disk SQLite table holds the counters, including statements seen before
+    the spill. The table lasts for exactly one merge and never caches findings.
+    """
+
+    def __init__(self) -> None:
+        self._counts: dict[tuple[str, str, str], int] = {}
+        self._db: sqlite3.Connection | None = None
+
+    def next(self, path: str, rule: str, statement: str) -> int:
+        key = (path, rule, statement)
+        if self._db is None:
+            if key in self._counts or len(self._counts) < 4096:
+                ordinal = self._counts.get(key, 0)
+                self._counts[key] = ordinal + 1
+                return ordinal
+            # An empty filename requests a private temporary database, not an
+            # in-memory database; sqlite removes it when the connection closes.
+            self._db = sqlite3.connect("")
+            self._db.execute("PRAGMA cache_size = -2048")
+            self._db.execute("CREATE TABLE counts (path TEXT, rule TEXT, statement TEXT, n INTEGER, "
+                             "PRIMARY KEY (path, rule, statement)) WITHOUT ROWID")
+            self._db.executemany("INSERT INTO counts VALUES (?, ?, ?, ?)",
+                                 ((*key, count) for key, count in self._counts.items()))
+            self._counts.clear()
+        row = self._db.execute("SELECT n FROM counts WHERE path = ? AND rule = ? AND statement = ?",
+                               key).fetchone()
+        ordinal = row[0] if row is not None else 0
+        self._db.execute("INSERT OR REPLACE INTO counts VALUES (?, ?, ?, ?)", (*key, ordinal + 1))
+        return ordinal
+
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
 
 
 def _validate_project_record(rec: dict) -> None:
@@ -203,7 +251,8 @@ def _normalize(
     lang: str,
     source_lines: Callable[[Path], list[str]],
     project_dir: str | Path = "",
-    ordinals: dict | None = None,
+    ordinals: _OccurrenceOrdinals | None = None,
+    source_root: str | Path = "",
 ) -> dict:
     project_scoped = rec.get("scope") in ("project", "project_aggregate")
     if project_scoped:
@@ -220,15 +269,10 @@ def _normalize(
         col = int(rec.get("col", 1) or 1)
     except (TypeError, ValueError):
         col = 1
-    rel_path = _relative_path(path, project_dir)
-    stmt = _extract_statement(rec, project_dir, source_lines)
+    rel_path = _relative_path(path, project_dir, resolve_links=not bool(source_root))
+    stmt = _extract_statement(rec, project_dir, source_lines, source_root)
     norm_stmt = normalize_statement(stmt)
-    key = (rule, norm_stmt)
-    ordinal = 0
-    if ordinals is not None:
-        file_map = ordinals.setdefault(rel_path, {})
-        ordinal = file_map.get(key, 0)
-        file_map[key] = ordinal + 1
+    ordinal = ordinals.next(rel_path, rule, norm_stmt) if ordinals is not None else 0
     fp = _fingerprint(rule, rel_path, norm_stmt, ordinal)
     normalized = {
         "lang": lang,
@@ -256,6 +300,7 @@ def merge(
     combined_path: Path,
     *,
     project_dir: str | Path = "",
+    source_root: str | Path = "",
     baseline_path: str | Path = "",
     new_only: bool = False,
 ) -> int:
@@ -280,71 +325,94 @@ def merge(
     def source_lines(path: Path) -> list[str]:
         return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
-    ordinals: dict[str, dict[tuple[str, str], int]] = {}
-    findings: list[dict] = []
-    for sink in sorted(Path(tmp_dir).glob("*.findings.json")):
-        lang = sink.name.split(".", 1)[0]
-        records = load_sink(sink)
-        if not records:
-            continue
-        for rec in records:
-            findings.append(_normalize(rec, lang, source_lines, project_dir=project_dir, ordinals=ordinals))
-        for scanner in doc.get("scanners", []) or []:
-            if isinstance(scanner, dict) and scanner.get("language") == lang:
-                scanner["findings_sink"] = True
+    ordinals = _OccurrenceOrdinals()
+    count = 0
+    counts_by_lang: dict[str, dict[str, int]] = {}
+    base_fps = load_baseline_fingerprints(baseline_path) if baseline_path and new_only else set()
+    try:
+        # The normalized ledger can be much larger than its source tree. Keep
+        # it on disk throughout: neither raw records, normalized records nor
+        # the final serialized document need a whole-report in-memory copy.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as findings:
+            for sink in sorted(Path(tmp_dir).glob("*.findings.json")):
+                lang = sink.name.split(".", 1)[0]
+                saw_record = False
+                for rec in load_sink(sink):
+                    saw_record = True
+                    finding = _normalize(rec, lang, source_lines, project_dir=project_dir,
+                                         ordinals=ordinals, source_root=source_root)
+                    # Assign occurrence ordinals BEFORE filtering. Otherwise
+                    # duplicates after a baseline match acquire its identity.
+                    if finding["fingerprint"] in base_fps:
+                        continue
+                    findings.write(json.dumps(finding) + "\n")
+                    count += 1
+                    if not finding["suppressed"] and finding["severity"] in ("critical", "warning", "info"):
+                        counts = counts_by_lang.setdefault(lang, {"critical": 0, "warning": 0, "info": 0})
+                        counts[finding["severity"]] += _occurrence_count(finding)
+                if saw_record:
+                    for scanner in doc.get("scanners", []) or []:
+                        if isinstance(scanner, dict) and scanner.get("language") == lang:
+                            scanner["findings_sink"] = True
 
-    ast_reports = _ast_report_sources(doc)
-    for lang, records in ast_reports:
-        normalized = []
-        for record in records:
-            if "rule_id" in record and "file" in record:
-                normalized.append(record)
-            elif _looks_like_finding(record):
-                normalized.append(_normalize(record, lang, source_lines, project_dir=project_dir, ordinals=ordinals))
-            else:
-                raise ValueError("AST report finding requires a rule id and source path")
-        records[:] = normalized
+            ast_reports = _ast_report_sources(doc)
+            for lang, records in ast_reports:
+                normalized = []
+                for record in records:
+                    if "rule_id" in record and "file" in record:
+                        finding = record
+                    elif _looks_like_finding(record):
+                        finding = _normalize(record, lang, source_lines, project_dir=project_dir,
+                                             ordinals=ordinals, source_root=source_root)
+                    else:
+                        raise ValueError("AST report finding requires a rule id and source path")
+                    if not base_fps or finding["fingerprint"] not in base_fps:
+                        normalized.append(finding)
+                records[:] = normalized
 
-    if baseline_path and new_only:
-        base_fps = load_baseline_fingerprints(baseline_path)
-        if base_fps:
-            findings = [f for f in findings if f["fingerprint"] not in base_fps]
-            for _, records in ast_reports:
-                records[:] = [f for f in records if f["fingerprint"] not in base_fps]
-        # Recompute scanner and total counts to reflect new-only findings
-        findings_by_lang: dict[str, list[dict]] = {}
-        for f in findings:
-            slang = str(f.get("lang") or "")
-            findings_by_lang.setdefault(slang, []).append(f)
-        for scanner in doc.get("scanners", []) or []:
-            if isinstance(scanner, dict):
-                slang = str(scanner.get("language") or "")
-                s_list = findings_by_lang.get(slang, [])
-                scanner["critical"] = sum(_occurrence_count(f) for f in s_list if f.get("severity") == "critical" and not f.get("suppressed"))
-                scanner["warning"] = sum(_occurrence_count(f) for f in s_list if f.get("severity") == "warning" and not f.get("suppressed"))
-                scanner["info"] = sum(_occurrence_count(f) for f in s_list if f.get("severity") == "info" and not f.get("suppressed"))
-        tot_crit = sum(int(s.get("critical", 0) or 0) for s in doc.get("scanners", []))
-        tot_warn = sum(int(s.get("warning", 0) or 0) for s in doc.get("scanners", []))
-        tot_info = sum(int(s.get("info", 0) or 0) for s in doc.get("scanners", []))
-        if not doc.get("scanners"):
-            tot_crit = sum(_occurrence_count(f) for f in findings if f.get("severity") == "critical" and not f.get("suppressed"))
-            tot_warn = sum(_occurrence_count(f) for f in findings if f.get("severity") == "warning" and not f.get("suppressed"))
-            tot_info = sum(_occurrence_count(f) for f in findings if f.get("severity") == "info" and not f.get("suppressed"))
-        if "totals" not in doc or not isinstance(doc["totals"], dict):
-            doc["totals"] = {}
-        doc["totals"]["critical"] = tot_crit
-        doc["totals"]["warning"] = tot_warn
-        doc["totals"]["info"] = tot_info
-        # `status` is execution state, not a findings verdict. Filtering out
-        # findings that were already in the baseline cannot turn a run in which
-        # a scanner timed out or crashed into a complete one (issue #104): a
-        # zero-new-findings result with a non-empty failed_modules[] used to be
-        # relabelled "ok", contradicting the same document's own evidence.
+            if baseline_path and new_only:
+                # Accumulate the same weighted totals without grouping copies
+                # of every finding by language. Report-only AST evidence never
+                # contributes to these counters.
+                for scanner in doc.get("scanners", []) or []:
+                    if isinstance(scanner, dict):
+                        counts = counts_by_lang.get(str(scanner.get("language") or ""), {})
+                        for severity in ("critical", "warning", "info"):
+                            scanner[severity] = counts.get(severity, 0)
+                if not isinstance(doc.get("totals"), dict):
+                    doc["totals"] = {}
+                for severity in ("critical", "warning", "info"):
+                    totals_source = doc.get("scanners") or counts_by_lang.values()
+                    doc["totals"][severity] = sum(int(s.get(severity, 0) or 0) for s in totals_source)
+                # Execution state is invariant under baseline filtering (#104).
 
-    if findings or ast_reports or (baseline_path and new_only):
-        doc["findings"] = findings
-        combined_path.write_text(json.dumps(doc), encoding="utf-8")
-    return len(findings)
+            if count or ast_reports or (baseline_path and new_only):
+                # Publish only after all records have been normalized and the
+                # full JSON is written. A read, validation or disk-write error
+                # must leave the original summary usable for a partial report.
+                with tempfile.TemporaryDirectory(prefix=".ubs-findings-", dir=combined_path.parent) as stage_dir:
+                    staged = Path(stage_dir) / "combined.json"
+                    with staged.open("w", encoding="utf-8") as output:
+                        output.write("{")
+                        for key, value in doc.items():
+                            if key == "findings":
+                                continue
+                            output.write(json.dumps(key) + ": ")
+                            json.dump(value, output)
+                            output.write(", ")
+                        output.write('"findings": [')
+                        findings.seek(0)
+                        for index, line in enumerate(findings):
+                            if index:
+                                output.write(", ")
+                            output.write(line.rstrip("\n"))
+                        output.write("]}")
+                    os.replace(staged, combined_path)
+    except (OSError, sqlite3.Error) as exc:
+        raise ValueError(f"cannot assemble findings: {exc}") from exc
+    finally:
+        ordinals.close()
+    return count
 
 
 def to_sarif(

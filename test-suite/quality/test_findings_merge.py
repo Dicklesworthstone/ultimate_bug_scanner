@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import hashlib
 import io
+import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -139,11 +143,133 @@ class FindingsMergeTests(unittest.TestCase):
                 ).hexdigest()[:16]
                 self.assertEqual(finding["fingerprint"], expected)
 
+    def test_snapshot_fingerprints_use_index_bytes_and_logical_worktree_paths(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-snapshot-") as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            snapshot = root / "snapshot"
+            (project / "src").mkdir(parents=True)
+            (snapshot / "src").mkdir(parents=True)
+            (project / "src" / "changed.py").write_text("value = 999\n", encoding="utf-8")
+            (snapshot / "src" / "changed.py").write_text("value = 1\n", encoding="utf-8")
+            (snapshot / "src" / "deleted.py").write_text("value = 2\n", encoding="utf-8")
+            (snapshot / "src" / "linked.py").write_text("value = 3\n", encoding="utf-8")
+            (project / "src" / "linked.py").symlink_to(project / "src" / "changed.py")
+            (project / "src" / "unscanned.py").write_text("value = 999\n", encoding="utf-8")
+            paths = [str(project / "src" / "changed.py"), "src/changed.py",
+                     str(project / "src" / "deleted.py"), str(project / "src" / "linked.py"),
+                     str(project / "src" / "unscanned.py")]
+            (root / "python.findings.json").write_text("".join(
+                json.dumps({"rule": "py.snapshot", "path": path, "line": 1, "message": "missing source"}) + "\n"
+                for path in paths), encoding="utf-8")
+            combined = root / "combined.json"
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            self.assertEqual(merge(root, combined, project_dir=project, source_root=snapshot), 5)
+            findings = self.read_report(combined)["findings"]
+            expected = [hashlib.sha256(f"py.snapshot\x1f{path}\x1f{statement}\x1f{ordinal}".encode()).hexdigest()[:16]
+                        for path, statement, ordinal in [
+                            ("src/changed.py", "_ID_ = 1", 0), ("src/changed.py", "_ID_ = 1", 1),
+                            ("src/deleted.py", "_ID_ = 2", 0), ("src/linked.py", "_ID_ = 3", 0),
+                            ("src/unscanned.py", "_ID_ _ID_", 0),
+                        ]]
+            self.assertEqual([f["fingerprint"] for f in findings], expected)
+            self.assertEqual([f["file"] for f in findings], paths)
+
+    def test_ordinal_spill_preserves_duplicates_before_and_after_baseline_filter(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-ordinals-") as tmp:
+            root = Path(tmp)
+            indices = [*range(4200), 0, 4095, 4096, 4199, 0]
+            (root / "python.findings.json").write_text("".join(
+                json.dumps({"rule": "py.spill", "path": "absent.py", "line": 0,
+                            "severity": "warning", "message": f"statement {index}"}) + "\n"
+                for index in indices), encoding="utf-8")
+            expected = []
+            seen = {}
+            for index in indices:
+                ordinal = seen.get(index, 0)
+                seen[index] = ordinal + 1
+                expected.append(hashlib.sha256(
+                    f"py.spill\x1fabsent.py\x1f_ID_ {index}\x1f{ordinal}".encode()).hexdigest()[:16])
+            combined = root / "combined.json"
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            self.assertEqual(merge(root, combined), len(indices))
+            self.assertEqual([f["fingerprint"] for f in self.read_report(combined)["findings"]], expected)
+            baseline = root / "baseline.json"
+            baseline.write_text(json.dumps(expected[:4200]), encoding="utf-8")
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            self.assertEqual(merge(root, combined, baseline_path=baseline, new_only=True), 5)
+            doc = self.read_report(combined)
+            self.assertEqual([f["fingerprint"] for f in doc["findings"]], expected[4200:])
+            self.assertEqual(doc["totals"]["warning"], 5)
+
+    def test_read_validation_and_publish_failures_preserve_original_summary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-atomic-") as tmp:
+            root = Path(tmp)
+            combined = root / "combined.json"
+            original = json.dumps(SUMMARY_DOC)
+            combined.write_text(original, encoding="utf-8")
+            sink = root / "python.findings.json"
+            sink.write_text(json.dumps({"rule": "py.invalid", "path": "", "line": 0,
+                                        "scope": "project_aggregate", "count": "1", "severity": "warning"}) + "\n",
+                            encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid project aggregate"):
+                merge(root, combined)
+            self.assertEqual(combined.read_text(encoding="utf-8"), original)
+            sink.write_text(SINK_PY, encoding="utf-8")
+            with patch("ubs_core.findings_merge.os.replace", side_effect=OSError("disk unavailable")):
+                with self.assertRaisesRegex(ValueError, "disk unavailable"):
+                    merge(root, combined)
+            self.assertEqual(combined.read_text(encoding="utf-8"), original)
+            (root / "rust.findings.json").mkdir()
+            with self.assertRaisesRegex(ValueError, "cannot read findings sink"):
+                merge(root, combined)
+            self.assertEqual(combined.read_text(encoding="utf-8"), original)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "peak RSS units are Linux KiB")
+    def test_large_findings_ledger_stays_below_64_mib(self) -> None:
+        # Measures the merger, not the entire scanner or later JSON consumers.
+        # Distinct statements also exercise the counter spill; repeating one
+        # fingerprint key would not bound memory for real diverse diagnostics.
+        started = time.monotonic()
+        print("[findings-merge-memory] RUN 120000 distinct findings", flush=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-memory-") as tmp:
+            root = Path(tmp)
+            with (root / "python.findings.json").open("w", encoding="utf-8") as stream:
+                for number in range(120_000):
+                    stream.write(json.dumps({"rule": "py.memory", "path": "missing.py", "line": 0,
+                                             "severity": "warning", "message": f"diagnostic {number} " + "detail " * 35}) + "\n")
+            combined = root / "combined.json"
+            combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            code = (
+                "import json, pathlib, resource, sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from ubs_core.findings_merge import merge\n"
+                "count = merge(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))\n"
+                "print(json.dumps({'count':count,'rss':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))\n"
+            )
+            proc = subprocess.run([sys.executable, "-c", code, str(HELPERS_DIR), str(root), str(combined)],
+                                  capture_output=True, text=True, timeout=120, check=False)
+            self.assertEqual(proc.returncode, 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+            measured = json.loads(proc.stdout)
+            self.assertEqual(measured["count"], 120_000)
+            self.assertLess(measured["rss"], 64 * 1024, measured)
+            # JSON parsing is outside the measured merger process. Verify the
+            # entire record count, both endpoints and preserved summary totals.
+            doc = self.read_report(combined)
+            self.assertEqual(len(doc["findings"]), 120_000)
+            self.assertEqual(doc["totals"], SUMMARY_DOC["totals"])
+            for index in (0, 119_999):
+                fingerprint = hashlib.sha256(
+                    f"py.memory\x1fmissing.py\x1f_ID_ {index} {'_ID_ ' * 35}".rstrip().encode() + b"\x1f0"
+                ).hexdigest()[:16]
+                self.assertEqual(doc["findings"][index]["fingerprint"], fingerprint)
+        print(f"[findings-merge-memory] PASS {measured['rss']} KiB ({time.monotonic() - started:.2f}s)", flush=True)
+
     def test_load_sink_skips_non_findings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-fm-") as tmp:
             sink = Path(tmp) / "s.json"
             sink.write_text(SINK_PY, encoding="utf-8")
-            records = load_sink(sink)
+            records = list(load_sink(sink))
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["rule"], "python.narrowing.partial_none_guard")
 
@@ -251,7 +377,7 @@ class FindingsMergeTests(unittest.TestCase):
                 scan_patterns([task_pattern], ctx, stream, set())
                 for record in _packaging(ctx):
                     _write_record(stream, record, set())
-            records = load_sink(sink)
+            records = list(load_sink(sink))
             expected = {
                 "swift.concurrency.task-usages": "Task usages",
                 "swift.packaging.no-manifest": "Package.swift not found in selected files",
@@ -348,7 +474,7 @@ class FindingsMergeTests(unittest.TestCase):
             ctx = ScanContext(files=[source], project_dir=root)
             with sink.open("w", encoding="utf-8") as stream:
                 scan_patterns([task_pattern], ctx, stream, set())
-            located = load_sink(sink)
+            located = list(load_sink(sink))
             self.assertEqual(len(located), 1)
             self.assertEqual((located[0]["path"], located[0]["line"], located[0]["count"]),
                              (str(source), 1, 1))
@@ -413,7 +539,7 @@ class FindingsMergeTests(unittest.TestCase):
                                  _main_actor_presence, _storyboards, _packaging):
                     for record in producer(ctx):
                         _write_record(stream, record, set())
-            records = load_sink(sink)
+            records = list(load_sink(sink))
             expected = {
                 "swift.concurrency.unawaited-async": ("info", 3, "Possible un-awaited async paths"),
                 "swift.files.filehandle": ("warning", 2, "FileHandle open without matching close"),
@@ -541,7 +667,7 @@ class FindingsMergeTests(unittest.TestCase):
                         stream = io.StringIO()
                         _write_record(stream, record, set())
                         sink.write_text(stream.getvalue(), encoding="utf-8")
-                        forwarded = load_sink(sink)
+                        forwarded = list(load_sink(sink))
                         self.assertEqual(len(forwarded), 1)
                         with self.assertRaisesRegex(ValueError, "invalid project note"):
                             to_sarif({"language": "swift", "findings": forwarded})
@@ -619,7 +745,7 @@ class FindingsMergeTests(unittest.TestCase):
                         stream = io.StringIO()
                         _write_record(stream, record, set())
                         sink.write_text(stream.getvalue(), encoding="utf-8")
-                        forwarded = load_sink(sink)
+                        forwarded = list(load_sink(sink))
                         self.assertEqual(len(forwarded), 1)
                         with self.assertRaisesRegex(ValueError, "invalid project aggregate"):
                             to_sarif({"language": "swift", "findings": forwarded})
@@ -767,6 +893,159 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertEqual(len(doc3["findings"]), 1)
             self.assertEqual(doc3["findings"][0]["rule_id"], "python.security.eval")
             self.assertEqual(doc3["totals"]["critical"], 1)
+
+
+class FindingsMergeFailureIntegrationTests(unittest.TestCase):
+    """Drive the real runner with a module whose ledger fails validation."""
+
+    def test_default_text_baseline_filters_existing_bugs_and_keeps_new_ones(self) -> None:
+        started = time.monotonic()
+        print("[findings-merge-text-baseline] RUN real bash scanner", flush=True)
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-text-baseline-") as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            source = project / "existing.sh"
+            source.write_text('#!/bin/bash\neval "$command"\n', encoding="utf-8")
+            baseline = root / "baseline.json"
+            env = {**os.environ, "NO_COLOR": "1", "UBS_NO_AUTO_UPDATE": "1", "UBS_ENABLE_AUTO_UPDATE": "0",
+                   "UBS_NO_CACHE": "1", "UBS_ALLOW_PARTIAL": "0"}
+
+            def scan(*args):
+                return subprocess.run([str(REPO_ROOT / "ubs"), "--ci", "--only=bash", *args, str(project)],
+                                      cwd=root, env=env, capture_output=True, text=True, timeout=120, check=False)
+
+            initial = scan(f"--save-baseline={baseline}")
+            self.assertEqual(initial.returncode, 1, initial.stdout + initial.stderr)
+            known = json.loads(baseline.read_text(encoding="utf-8"))
+            self.assertTrue(any(f["rule_id"] == "bash.security.eval_variable" for f in known["findings"]), known)
+            unchanged = scan("--format=json", f"--baseline={baseline}", "--new-only")
+            self.assertEqual(unchanged.returncode, 0, unchanged.stdout + unchanged.stderr)
+            self.assertEqual(json.loads(unchanged.stdout)["findings"], [])
+            (project / "new.sh").write_text('#!/bin/bash\neval "$other"\n', encoding="utf-8")
+            changed = scan("--format=json", f"--baseline={baseline}", "--new-only")
+            self.assertEqual(changed.returncode, 1, changed.stdout + changed.stderr)
+            findings = json.loads(changed.stdout)["findings"]
+            self.assertTrue(any(f["rule_id"] == "bash.security.eval_variable" for f in findings), findings)
+            self.assertTrue(all(Path(f["file"]).name == "new.sh" for f in findings), findings)
+        print(f"[findings-merge-text-baseline] PASS ({time.monotonic() - started:.2f}s)", flush=True)
+
+    def test_staged_text_baseline_restores_paths_and_uses_snapshot_fingerprints(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-staged-baseline-") as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            (project / "src").mkdir(parents=True)
+            source = project / "src" / "active.sh"
+            source.write_text('#!/bin/bash\neval "$command"\n', encoding="utf-8")
+            for args in (["init", "-b", "main"], ["add", "src/active.sh"]):
+                subprocess.run(["git", "-C", str(project), *args], capture_output=True,
+                               text=True, check=True, timeout=30)
+            source.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+            baseline = root / "baseline.json"
+            env = {**os.environ, "NO_COLOR": "1", "UBS_NO_AUTO_UPDATE": "1", "UBS_ENABLE_AUTO_UPDATE": "0",
+                   "UBS_NO_CACHE": "1", "UBS_ALLOW_PARTIAL": "0"}
+
+            def scan(*args):
+                return subprocess.run([str(REPO_ROOT / "ubs"), "--ci", "--only=bash", "--staged",
+                                       *args, str(project)], cwd=root, env=env, capture_output=True,
+                                      text=True, timeout=120, check=False)
+
+            initial = scan(f"--save-baseline={baseline}")
+            self.assertEqual(initial.returncode, 1, initial.stdout + initial.stderr)
+            findings = json.loads(baseline.read_text(encoding="utf-8"))["findings"]
+            self.assertTrue(findings)
+            self.assertTrue(all(Path(f["file"]) == source for f in findings), findings)
+            unchanged = scan("--format=json", f"--baseline={baseline}", "--new-only")
+            self.assertEqual(unchanged.returncode, 0, unchanged.stdout + unchanged.stderr)
+            self.assertEqual(json.loads(unchanged.stdout)["findings"], [])
+
+    def test_failed_ledger_cannot_pass_or_replace_a_baseline(self) -> None:
+        stub_source = r'''#!/usr/bin/env bash
+if [[ "${1:-}" == "--help" ]]; then echo "contract: v2"; exit 0; fi
+format=text
+report=
+for arg in "$@"; do
+  case "$arg" in
+    --format=*) format="${arg#*=}" ;;
+    --report-json=*) report="${arg#*=}" ;;
+  esac
+done
+count='"invalid"'
+[[ "${UBS_TEST_MERGE_MODE:-}" == valid ]] && count=1
+if [[ -n "$report" ]]; then
+  printf '{"rule":"py.aggregate","path":"","line":0,"scope":"project_aggregate","count":%s,"severity":"warning","message":"aggregate evidence"}\n' "$count" > "$report"
+fi
+if [[ "$format" == json ]]; then
+  printf '{"language":"python","project":".","files":1,"critical":0,"warning":1,"info":0,"timestamp":"2026-01-01T00:00:00Z","status":"ok"}\n'
+else
+  printf 'UBS module: python (contract v2)\nFiles scanned: 1\nCritical issues: 0\nWarning issues: 1\nInfo items: 0\n'
+fi
+'''
+        with tempfile.TemporaryDirectory(prefix="ubs-fm-failure-") as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            (project / "clean.py").write_text("value = 1\n", encoding="utf-8")
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            stub = bin_dir / "ubs-python"
+            stub.write_text(stub_source, encoding="utf-8")
+            stub.chmod(0o755)
+            baseline = root / "baseline.json"
+            saved_bytes = b'{"status":"ok","findings":[],"sentinel":"known-good"}\n'
+            baseline.write_bytes(saved_bytes)
+            report = root / "report.json"
+
+            def scan(fmt, *args, valid=False, allow_partial=False):
+                env = {**os.environ, "NO_COLOR": "1", "UBS_NO_AUTO_UPDATE": "1",
+                       "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_NO_CACHE": "1",
+                       "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                       "UBS_TEST_MERGE_MODE": "valid" if valid else "invalid",
+                       "UBS_ALLOW_PARTIAL": "1" if allow_partial else "0"}
+                return subprocess.run([str(REPO_ROOT / "ubs"), "--ci", "--only=python", f"--format={fmt}",
+                                       *args, str(project)], cwd=root, env=env, capture_output=True,
+                                      text=True, timeout=120, check=False)
+
+            control = scan("json", valid=True)
+            self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+            control_doc = json.loads(control.stdout)
+            self.assertEqual(control_doc["status"], "ok")
+            self.assertEqual(control_doc["findings"][0]["count"], 1)
+            cases = [
+                ("json", [], False),
+                ("json", [f"--baseline={baseline}", "--new-only"], False),
+                ("json", [], True),
+                ("jsonl", [], False),
+                ("sarif", [], False),
+                ("text", [f"--save-baseline={baseline}"], False),
+                ("json", [f"--save-baseline={baseline}", f"--report-json={report}"], False),
+            ]
+            for fmt, args, allow_partial in cases:
+                with self.subTest(format=fmt, args=args, allow_partial=allow_partial):
+                    started = time.monotonic()
+                    print(f"[findings-merge-failure:{fmt}] RUN {args}", flush=True)
+                    proc = scan(fmt, *args, allow_partial=allow_partial)
+                    detail = f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+                    self.assertEqual(proc.returncode, 2, detail)
+                    self.assertIn("FINDINGS_MERGE_ERROR", proc.stderr, detail)
+                    self.assertEqual(baseline.read_bytes(), saved_bytes, detail)
+                    if fmt == "json":
+                        doc = json.loads(proc.stdout)
+                        self.assertEqual(doc["status"], "partial", detail)
+                        self.assertEqual(doc["reason"], "findings-merge-failed", detail)
+                        self.assertEqual(doc["exit_code"], 2, detail)
+                        self.assertEqual(doc["failed_modules"][-1]["module_error"], "FINDINGS_MERGE_ERROR", detail)
+                        self.assertEqual(doc["scanners"][0]["warning"], 1, detail)
+                    elif fmt == "jsonl":
+                        rows = [json.loads(line) for line in proc.stdout.splitlines()]
+                        self.assertTrue(any(row.get("status") == "partial" for row in rows), detail)
+                    elif fmt == "sarif":
+                        doc = json.loads(proc.stdout)
+                        invocation = doc["runs"][0]["invocations"][0]
+                        self.assertFalse(invocation["executionSuccessful"], detail)
+                        self.assertEqual(invocation["exitCode"], 2, detail)
+                    print(f"[findings-merge-failure:{fmt}] PASS ({time.monotonic() - started:.2f}s)", flush=True)
+            self.assertEqual(json.loads(report.read_text(encoding="utf-8"))["status"], "partial")
 
 
 if __name__ == "__main__":

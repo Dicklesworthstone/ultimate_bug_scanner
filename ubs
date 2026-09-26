@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='6ed5bcf5d16677bfbd298ba4c88cf630cf2ee36dc301c624dc6f2b497ee84d2c'
-  [cpp]='fbdbcf3a1565d5ee35ddd8335d7c70b9e4cd0f913471842135c64e49e2278366'
-  [csharp]='09e99657a89c8a66c6bbab76719a27e48c9930f03b4af9d25a2537bdb695e803'
-  [elixir]='b0c10860912b4eeceb0e015225edb611f56087ebe939e9909ff32dd3dc6c2a39'
-  [golang]='116824f2edf70de21f59cbc756836293963f3a12e589aa466021dd769d60d60e'
-  [java]='4c2f602ca825722dc26e49f838bdc0076ceeaed4c34cb36ba5399783e6f8a5f8'
-  [js]='d2174bc1cbe3504176efb223ff0a2e41f681b5e9a35b81deaeb96e1ffa411256'
-  [kotlin]='f24b76bddb7d8f92e80d02f6d88fc741c79b2018fcb212f41a25a3fb855f5964'
-  [python]='688f3ffb9067111f8ff9477f13a47d9d866d5e6b8a21fd69b9baa0d1b47579d6'
-  [ruby]='71a226d28398adcaf3b28ed3bbc5e76ed72f2376c224c30e247df7455e2b375b'
-  [rust]='0667211574116b89316c4c514f4e38acb23e3e887366a807029fc4a4b9f58d38'
-  [swift]='f4345a8ec3af410a8cae8dcb5fb792db187eaa4ceb0c0103dacc0fe05aefa17a'
+  [bash]='00991678587eefe0fb5bf892272a755a26116a953b6494014e446fbff39338cd'
+  [cpp]='1a3a8b733bd0f18f41af8454d4c140889768ea4a3cbf0d82f87e50280a8e4e6d'
+  [csharp]='b5737742576fd51e666b59912992a0513d43c043d0dbd4a0b09eaac75b78e552'
+  [elixir]='607d1c58dac21f173856c6a7a1cfad1ccedb888c7a5c5fd94e5fb1b2b15d7536'
+  [golang]='d85c4792b5106722e748d180430486d3d6146f88bfb85dc1713ec28180cc078a'
+  [java]='90a798d8596cb0d4e9193339e07e9a613fdc7cf702649f84bf63fd8f1b724ce1'
+  [js]='d108126d5a118417acf73609b4a8c22c1c0ded2b11bde642ee12781c4d700175'
+  [kotlin]='270f025d0046be819f2f9f45a1b3453bc00c3e2af46517e8c5c9a37880ce26c9'
+  [python]='45b63d79b09def70fff0efc8608bbe0f2f8056e45fa75a53acf9628640499f8a'
+  [ruby]='da4dac1e4fb3b8f0c1fc60b9c293579c3febe477dc2ee03641b9a2cf93f7e3c0'
+  [rust]='15f622caa0c65f16d40153be83b8a4a60d23c7b1e539dd7b35fa20c49d6a091c'
+  [swift]='afb05d5a595d9aa086f9753a60862af0dbb8e4960c90d0ae5fb040af48e74a91'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -170,7 +170,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/bash_rules.py']='17eda47be732993bb1f636cf0375823042c1701646cd656cf9735ae8dc298882'
   ['helpers/ubs_core/bash_scan.py']='a2c65de4e90a4c1aad47068b83a030ff2abd42214f1e1c6dc30f3a01f4cc04d4'
   ['helpers/ubs_core/cache.py']='121008fdd270030ea2ab8108bd16bbb82598750baa1b6e5d40ab48442afe2458'
-  ['helpers/ubs_core/cli.py']='e51b45718093dd0c03b4e85756365ec821619ee0dce38e416be44244fb555151'
+  ['helpers/ubs_core/cli.py']='2d1c49737d8318d2dc8ba583e360168ca0e77fe7850437029031bf101cfa3be9'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='adb8693a5ac0370aa0bc9f7aabbb05eb63da64fac792e1451f15b352f870a114'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='e3c03636656ec7477e940520806c8080326ec7700b0e0cb6d702c8ef0a0ed713'
@@ -231,7 +231,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_scan.py']='d61aa7f4f865e18858a5cb43c4a51b671345e9505bafc10896c0cec598877ead'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
   ['helpers/ubs_core/external_tools.py']='8aed8e93c5ab5260647b86f9439a0b9443c93d3a53e99a6e963045c68a1b44ba'
-  ['helpers/ubs_core/findings_merge.py']='a5b718082d9a67f586388273eafa589db653c8497801d96be3a4d168a32a35a6'
+  ['helpers/ubs_core/findings_merge.py']='d873e6f459637ba5807624369606a6b560f59237ced9e44a96339c27c78d1edf'
   ['helpers/ubs_core/go_ast.py']='7cb83f089c6fa8b562483c4d84bafa22bb4273c8b5d3dab5079825f74385527b'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='62a91bd98724802dff1b37aa8e96aa8b6129c6b018d7e3130b16731573e4bf76'
+  ['lib/ubs-common.sh']='7ca9d44deb1d5b45375b0a1ce51d9e0b284754e7b87e14901c9aee8c68b70163'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6984,6 +6984,7 @@ def main() -> int:
         attach_metrics(doc, a.metrics_dir)
         with open(a.json, "w", encoding="utf-8") as output:
             json.dump(doc, output)
+        restore_findings_file(a.findings, a)
         return 0
     if a.mode == "json":
         doc = restore_json_file(a.json, a)
@@ -7228,7 +7229,14 @@ JSON
       ;;
     text|*)
       prepare_metrics_dir "$metrics_dir"
-      run_module "$out_raw" "$err" "$module" "${args[@]}" || true
+      local -a text_report_args=()
+      if [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || -n "$BEADS_JSONL_PATH" || "$NEW_ONLY" -eq 1 ]]; then
+        # A baseline/export needs the same uncapped ledger as machine output.
+        # Without requesting it here, the default text --save-baseline path
+        # saved only summary counts and could never recognize existing bugs.
+        text_report_args+=(--report-json="$out_findings")
+      fi
+      run_module "$out_raw" "$err" "$module" "${args[@]}" "${text_report_args[@]}" || true
       module_status=$MODULE_RUN_STATUS
       if [[ -f "$TMPDIR_RUN/postprocess.py" ]]; then
         local text_pp_rc=0
@@ -7543,7 +7551,9 @@ qualify_combined_json(){
     reason="$(incomplete_run_reason)"
     # UBS_ALLOW_PARTIAL=1 is an explicit opt-in to a findings-based exit, so
     # the document must not claim an exit code the process will not return.
-    [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]] || exit_code=2
+    if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 || "${UBS_ALLOW_PARTIAL:-0}" != "1" ]]; then
+      exit_code=2
+    fi
   fi
   jq -c --arg status "$run_status" --argjson failed "$failed" \
         --arg reason "$reason" --arg message "$message" \
@@ -7574,19 +7584,34 @@ generate_combined_json(){
     local need_findings_merge=0
     if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ]]; then
       need_findings_merge=1
-    elif [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || "$NEW_ONLY" -eq 1 ]]; then
+    elif [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || -n "$BEADS_JSONL_PATH" || "$NEW_ONLY" -eq 1 ]]; then
       need_findings_merge=1
     fi
     if [[ "$need_findings_merge" -eq 1 ]]; then
       local -a merge_opts=()
       local proj_dir="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
       [[ -n "$proj_dir" ]] && merge_opts+=(--project-dir "$proj_dir")
+      if [[ "${GIT_MODE:-}" == "staged" && -n "${FILTERED_PROJECT_DIR:-}" ]]; then
+        merge_opts+=(--source-root "$FILTERED_PROJECT_DIR")
+      fi
       if [[ -n "$COMPARISON_FILE" && "$NEW_ONLY" -eq 1 ]]; then
         merge_opts+=(--baseline "$COMPARISON_FILE" --new-only)
       fi
-      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
+      if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-merge \
         --tmp-dir "$TMPDIR_RUN" --combined "$COMBINED_JSON_FILE" \
-        "${merge_opts[@]}" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err" || true
+        "${merge_opts[@]}" >/dev/null 2>"$TMPDIR_RUN/findings-merge.err"; then
+        # A ledger that could not be assembled is incomplete evidence. Keep
+        # the atomic merger's original scanner summaries, but never advertise
+        # a complete scan or allow --new-only to turn this into a clean pass.
+        FINDINGS_MERGE_FAILED=1
+        RUN_STATUS="partial"
+        status=2
+        local merge_message="Could not assemble per-finding results; scanner summaries are preserved, but the findings ledger is incomplete"
+        FAILED_MODULES_JSON="$(printf '%s' "${FAILED_MODULES_JSON:-[]}" | jq -c --arg message "$merge_message" \
+          '. + [{language:"ubs",status:"error",module_error:"FINDINGS_MERGE_ERROR",message:$message}]')"
+        say_err "${RED}${X}${RESET} FINDINGS_MERGE_ERROR: $merge_message"
+        [[ ! -s "$TMPDIR_RUN/findings-merge.err" ]] || tail -n 20 "$TMPDIR_RUN/findings-merge.err" >&2
+      fi
     fi
   fi
   qualify_combined_json
@@ -8195,10 +8220,15 @@ env_error_langs_json(){
 }
 
 incomplete_run_reason(){
+  if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 ]]; then printf 'findings-merge-failed'; return; fi
   if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then printf 'module-failed'; else printf 'module-incomplete'; fi
 }
 
 incomplete_run_message(){
+  if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 ]]; then
+    printf 'Could not assemble per-finding results; scanner summaries are preserved, but the findings ledger is incomplete'
+    return
+  fi
   if [[ "${HAS_ENV_ERROR:-0}" -eq 1 ]]; then
     printf 'One or more scanner modules could not run (tooling/dependency problem, not a code-quality failure): %s' "${ENV_ERROR_LANGS[*]}"
   else
@@ -8392,7 +8422,10 @@ case "$FORMAT" in
 	# from the healthy modules stay in the envelope and in every requested
 	# export (issue #105) — losing them was never part of failing the run.
 	if [[ "$RUN_STATUS" != "ok" ]]; then
-	  if [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
+	  if [[ "${FINDINGS_MERGE_FAILED:-0}" -eq 1 ]]; then
+	    say_err "${RED}${X}${RESET} Findings assembly failed. Exit 2 — the requested results are incomplete."
+	    status=2
+	  elif [[ "${UBS_ALLOW_PARTIAL:-0}" == "1" ]]; then
 	    say_err "${YELLOW}${WARN}${RESET} Partial run accepted because UBS_ALLOW_PARTIAL=1 ($(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}")); exit code reflects the modules that completed."
 	  else
 	    say_err "${RED}${X}${RESET} Partial run: $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")' 2>/dev/null || printf '%s' "${ENV_ERROR_LANGS[*]:-}"). Exit 2 — not every requested language was scanned. Set UBS_ALLOW_PARTIAL=1 to accept partial results."
@@ -8679,7 +8712,14 @@ if [[ -n "$SAVE_BASELINE_FILE" ]]; then
     # would overwrite a complete baseline that is still valid (issue #104).
     say_err "${RED}${X}${RESET} Not saving a baseline: this scan is ${RUN_STATUS} (${SAVE_BASELINE_FILE} left unchanged). Re-run once every requested language completes."
   elif generate_combined_json; then
-    deliver_file "$COMBINED_JSON_FILE" "$SAVE_BASELINE_FILE" "baseline" || status=2
+    # Text scans can assemble their ledger for the first time here, after
+    # the earlier completion check. Recheck before replacing a good baseline.
+    if [[ "$RUN_STATUS" != "ok" ]]; then
+      say_err "${RED}${X}${RESET} Not saving a baseline: findings assembly failed (${SAVE_BASELINE_FILE} left unchanged)."
+      status=2
+    else
+      deliver_file "$COMBINED_JSON_FILE" "$SAVE_BASELINE_FILE" "baseline" || status=2
+    fi
   else
     say_err "${RED}${X}${RESET} Could not build the combined result; the requested baseline was not saved"
     status=2

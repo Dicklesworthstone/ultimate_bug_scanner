@@ -8,6 +8,7 @@ on:
       - test-suite/patches/python-callable-effects.patch
       - test-suite/patches/python-interpreter-processes.patch
       - test-suite/patches/python-process-vectors-stdin.patch
+      - test-suite/patches/baseline-integrity.patch.gz
       - .github/workflows/python-mutable-effects.yml
   workflow_dispatch:
 
@@ -49,6 +50,25 @@ jobs:
             git apply "test-suite/patches/$patch.patch"
           done
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ea327a121f4a00ff07d29f68f4d6163689b9b66d
+      - name: Apply reviewed baseline integrity and regression implementation
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          from pathlib import Path
+          import subprocess
+          before = {
+              'modules/helpers/ubs_core/findings_merge.py': '4c38c48653ca6bbeadc0702f1c8205d8298ca63d',
+              'test-suite/quality/test_findings_merge.py': '62f03a91ae2d8e8abb6576435d1e6633a9150069',
+          }
+          for name, expected in before.items():
+              actual = subprocess.check_output(['git', 'hash-object', name], text=True).strip()
+              assert actual == expected, (name, actual, expected)
+          patch = gzip.decompress(Path('test-suite/patches/baseline-integrity.patch.gz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == '149de7483ecc0542b12016c94d15c6969282747965e8021c722b65725652dd06'
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          PY
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
           ./scripts/verify_checksums.sh
@@ -66,6 +86,7 @@ jobs:
       - name: Preserve suppression, registry, and shipped fixture behavior
         run: |
           set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-findings-tests.log"
           python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-suppression-tests.log"
           python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-core-tests.log"
           python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/mutable-manifest.log"
@@ -95,9 +116,12 @@ jobs:
           scratch = Path(os.environ['RUNNER_TEMP'])
           changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
           tests = {f'test-suite/quality/test_taint_python_{name}.py' for name in ('effects', 'callables', 'processes')}
+          tests.add('test-suite/quality/test_findings_integrity.py')
           changed.update(tests)
           allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_py.py'} | tests
+                     'modules/helpers/ubs_core/analyzers/taint_py.py',
+                     'modules/helpers/ubs_core/findings_merge.py',
+                     'test-suite/quality/test_findings_merge.py'} | tests
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert changed <= allowed, sorted(changed - allowed)
           def store(endpoint, payload):
@@ -134,6 +158,9 @@ jobs:
               cp "test-suite/quality/test_taint_python_$name.py" "$RUNNER_TEMP/mutable-$name-tests.py"
             fi
           done
+          if [[ -f test-suite/quality/test_findings_integrity.py ]]; then
+            cp test-suite/quality/test_findings_integrity.py "$RUNNER_TEMP/mutable-findings-integrity-tests.py"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

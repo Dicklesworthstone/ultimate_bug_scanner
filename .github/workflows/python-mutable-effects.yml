@@ -8,7 +8,9 @@ on:
       - test-suite/patches/python-callable-effects.patch
       - test-suite/patches/python-interpreter-processes.patch
       - test-suite/patches/python-process-vectors-stdin.patch
+      - test-suite/patches/python-integrated-completions.patch.gz
       - test-suite/patches/baseline-integrity.patch.gz
+      - test-suite/patches/go-package-order.patch
       - .github/workflows/python-mutable-effects.yml
   workflow_dispatch:
 
@@ -50,6 +52,19 @@ jobs:
             git apply "test-suite/patches/$patch.patch"
           done
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ea327a121f4a00ff07d29f68f4d6163689b9b66d
+          test "$(git hash-object test-suite/patches/python-integrated-completions.patch.gz)" = 93ead362ae3691c9259eae6342377241dc554683
+          gzip -dc test-suite/patches/python-integrated-completions.patch.gz > "$RUNNER_TEMP/mutable-completions.patch"
+          git apply --check "$RUNNER_TEMP/mutable-completions.patch"
+          git apply "$RUNNER_TEMP/mutable-completions.patch"
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = bb2199a28ccc526160ec11d185288a154bfa3530
+      - name: Preserve caller-selected Go package order without changing initialization order
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_go.py)" = c0c49d10da545f147813899f997302cf4fefcfbf
+          test "$(git hash-object test-suite/quality/test_taint_go_packages.py)" = 45aa4fa43e65be6e36b436aed27f7908e8889ce7
+          git apply --check test-suite/patches/go-package-order.patch
+          git apply test-suite/patches/go-package-order.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_go.py)" = e2ac4eee26786c0438fa7fd8be22941db3303757
+          test "$(git hash-object test-suite/quality/test_taint_go_packages.py)" = 3de2c09f2653f38f06b51648c16921aa5a436618
       - name: Apply reviewed baseline integrity and regression implementation
         run: |
           python3 - <<'PY'
@@ -88,6 +103,7 @@ jobs:
           set -o pipefail
           python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-findings-tests.log"
           python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-suppression-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go_*.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-go-tests.log"
           python3 -m unittest discover -s test-suite/quality -p 'test_ubs_core.py' -v 2>&1 | tee "$RUNNER_TEMP/mutable-core-tests.log"
           python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean --case js-taint-buggy --case js-taint-clean --case golang-taint-buggy --case golang-taint-clean 2>&1 | tee "$RUNNER_TEMP/mutable-manifest.log"
       - name: Verify deterministic complete integrity closure
@@ -115,11 +131,13 @@ jobs:
           import subprocess
           scratch = Path(os.environ['RUNNER_TEMP'])
           changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          tests = {f'test-suite/quality/test_taint_python_{name}.py' for name in ('effects', 'callables', 'processes')}
+          tests = {f'test-suite/quality/test_taint_python_{name}.py' for name in ('effects', 'callables', 'processes', 'completions')}
           tests.add('test-suite/quality/test_findings_integrity.py')
           changed.update(tests)
           allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
                      'modules/helpers/ubs_core/analyzers/taint_py.py',
+                     'modules/helpers/ubs_core/analyzers/taint_go.py',
+                     'test-suite/quality/test_taint_go_packages.py',
                      'modules/helpers/ubs_core/findings_merge.py',
                      'test-suite/quality/test_findings_merge.py'} | tests
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
@@ -144,7 +162,7 @@ jobs:
           base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
           tree = store('trees', {'base_tree': base_tree,
                                 'tree': [{key: value for key, value in record.items() if key != 'before'} for record in records]})
-          manifest = {'base': base, 'tree': tree, 'source': 'ea327a121f4a00ff07d29f68f4d6163689b9b66d', 'files': records}
+          manifest = {'base': base, 'tree': tree, 'source': 'bb2199a28ccc526160ec11d185288a154bfa3530', 'files': records}
           (scratch / 'mutable-publication.json').write_text(json.dumps(manifest, indent=2) + '\n')
           print('MUTABLE_TESTED_TREE', json.dumps(manifest), flush=True)
           PY
@@ -153,7 +171,7 @@ jobs:
         run: |
           git diff > "$RUNNER_TEMP/mutable-final.diff"
           git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/mutable-source-after.tar.gz"
-          for name in effects callables processes; do
+          for name in effects callables processes completions; do
             if [[ -f "test-suite/quality/test_taint_python_$name.py" ]]; then
               cp "test-suite/quality/test_taint_python_$name.py" "$RUNNER_TEMP/mutable-$name-tests.py"
             fi

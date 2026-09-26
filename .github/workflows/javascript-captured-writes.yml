@@ -1,0 +1,162 @@
+name: JavaScript Captured Writes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/javascript-captured-writes.patch
+      - test-suite/js/test_taint_effects.py
+      - .github/workflows/javascript-captured-writes.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  captured-write-regressions:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retain exact source for reproducible local validation
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/js-effects-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/js-effects-source-index.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/js-effects-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: js-effects-source
+          path: ${{ runner.temp }}/js-effects-source*
+          retention-days: 3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Reproduce the missing write-summary behavior
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 38a50392b5540131d25ade30664b883ec28b4005
+          if python3 test-suite/js/test_taint_effects.py > "$RUNNER_TEMP/js-effects-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/js-effects-before.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/js-effects-before.log"
+          grep -q 'FAILED (failures=26)' "$RUNNER_TEMP/js-effects-before.log"
+      - name: Apply the reviewed scalar-write implementation
+        run: |
+          git apply --check test-suite/patches/javascript-captured-writes.patch
+          git apply test-suite/patches/javascript-captured-writes.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 477c8ac86895e19afdf6dacc96834c93cb90b736
+          python3 test-suite/js/test_taint_effects.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+          python3 scripts/update_checksums.py
+          git diff --check
+      - name: Install real-scanner dependencies
+        run: |
+          brew install bash jq ripgrep shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          npm install --global @ast-grep/cli
+      - name: Check real scanner and existing JavaScript suites
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          artifacts = root / 'test-suite/artifacts/javascript-captured-writes'
+          cases = [
+              ('setter-source', 'let result; function store(x) { result = x; } store(req.query.html); res.send(result);', {'xss'}),
+              ('captured-local', 'function wrap(x) { let value; function set(y) { value = y; } set(x); return value; } eval(wrap(req.query.code));', {'eval'}),
+              ('recursive-setter', 'let result; function a(x) { if (flag) return b(x); result = x; } function b(y) { a(y); } b(req.query.html); res.send(result);', {'xss'}),
+              ('finally-write', 'let result; function store(x) { try { return; } finally { result = x; } } store(req.query.html); res.send(result);', {'xss'}),
+              ('default-write', 'let result; function store(x) { result = x; } function trigger(v = store(req.query.html)) {} trigger(); res.send(result);', {'xss'}),
+              ('clean-overwrite', 'let result = req.query.html; function clear() { result = "hello"; } clear(); res.send(result);', set()),
+              ('uncalled-clean', 'let result = "hello"; function store() { result = req.query.html; } res.send(result);', set()),
+              ('call-isolation', 'function wrap(x) { let v; function set(y) { v = y; } set(x); return v; } const bad = wrap(req.query.html); res.send(wrap("hello"));', set()),
+          ]
+          for name, code, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-effects-e2e-') as tmp:
+                  source = Path(tmp) / 'handler.js'
+                  source.write_text(code + '\n')
+                  result = subprocess.run([str(root / 'ubs'), str(source), '--ci', '--only=js', '--format=json'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=120)
+                  folder = artifacts / name
+                  folder.mkdir(parents=True, exist_ok=True)
+                  (folder / 'stdout.log').write_text(result.stdout)
+                  (folder / 'stderr.log').write_text(result.stderr)
+                  assert result.returncode in (0, 1), (name, result.stdout, result.stderr)
+                  report = json.loads(result.stdout)
+                  (folder / 'result.json').write_text(json.dumps(report, indent=2))
+                  assert report['status'] == 'ok', report
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              rule = value.get(key)
+                              if isinstance(rule, str) and rule.startswith(('javascript.taint.', 'js.taint.')):
+                                  rules.add(rule.rsplit('.', 1)[-1])
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(report)
+                  assert rules == expected, (name, rules, expected, report)
+                  print('JS_EFFECTS_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+      - name: Verify integrity idempotence and publish tested content only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, changed
+          before = {path: Path(path).read_bytes() for path in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
+          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert all(Path(path).read_bytes() == content for path, content in before.items())
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          entries = []
+          for path in changed:
+              content = Path(path).read_bytes()
+              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                                        input=json.dumps({'content': content.decode('utf-8'), 'encoding': 'utf-8'}),
+                                        text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', path], text=True).split()[0]
+              entries.append({'path': path, 'sha': sha, 'mode': mode, 'type': 'blob'})
+              print('JS_EFFECTS_BLOB', path, sha, mode, flush=True)
+          result = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': entries}
+          Path(os.environ['RUNNER_TEMP'], 'js-effects-validated.json').write_text(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-captured-writes
+          path: |
+            ${{ runner.temp }}/js-effects-*.log
+            ${{ runner.temp }}/js-effects-validated.json
+            test-suite/artifacts/javascript-captured-writes/
+          retention-days: 3

@@ -1,0 +1,203 @@
+name: Go Package Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/go-package-taint.yml
+      - test-suite/patches/go-package-taint.patch
+      - test-suite/patches/go-package-tests.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-dataflow:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retain the exact base sources
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/go-package-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/go-package-source-index.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/go-package-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-package-base-source
+          path: ${{ runner.temp }}/go-package-source*
+          retention-days: 3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Apply reviewed package analysis and cache invalidation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+          def blob(path):
+              return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
+          before = {
+              'modules/helpers/ubs_core/analyzers/taint_go.py': '842527e589c080ad4d93e85c8ad4491ee577096e',
+              'modules/helpers/ubs_core/go_scan.py': 'e253f1628f8bf8067a478abae4b6dc30202fd93c',
+          }
+          after = {
+              'modules/helpers/ubs_core/analyzers/taint_go.py': '30746d92467d897880be6bec6fac04cca07d7fe7',
+              'modules/helpers/ubs_core/go_scan.py': 'bcf9f29e9c926f424229b556ad4dfea5104f3fab',
+          }
+          actual = {path: blob(path) for path in before}
+          if actual != after:
+              assert actual == before, ('Reconcile changed Go sources before applying', actual)
+              subprocess.run(['git', 'apply', '--check', 'test-suite/patches/go-package-taint.patch'], check=True)
+              subprocess.run(['git', 'apply', 'test-suite/patches/go-package-taint.patch'], check=True)
+          assert {path: blob(path) for path in after} == after
+          target = Path('test-suite/quality/test_taint_go_packages.py')
+          reviewed = Path('test-suite/patches/go-package-tests.py')
+          assert blob(str(reviewed)) == '45aa4fa43e65be6e36b436aed27f7908e8889ce7'
+          if target.exists():
+              assert target.read_bytes() == reviewed.read_bytes(), 'Do not overwrite newer tests'
+          else:
+              target.write_bytes(reviewed.read_bytes())
+          PY
+      - name: Run actual analyzer and incremental-cache regressions
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go*.py' -v 2>&1 | tee "$RUNNER_TEMP/go-package-tests.log"
+          PYTHONPATH=modules/helpers python3 - <<'PY'
+          from ubs_core.analyzers.taint_go import SELF_TESTS
+          for name, test in SELF_TESTS:
+              test()
+              print(name, 'PASS')
+          PY
+          git diff --check
+      - name: Install real scanner dependencies
+        run: |
+          brew install bash jq ripgrep rsync shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          npm install --global @ast-grep/cli
+      - name: Regenerate the complete verified runtime chain
+        run: |
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Exercise the real scanner on cross-file source and sink pairs
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+          root = Path.cwd()
+          artifacts = root / 'test-suite/artifacts/go-package-taint'
+          cases = [
+              ('returned-input', 'func source() string { return r.FormValue("q") }', 'func h() { db.Query(source()) }', {'sql'}),
+              ('helper-sink', 'func send(v string) { exec.Command("sh", "-c", v) }', 'func h() { send(r.FormValue("q")) }', {'command'}),
+              ('html-clean', 'func escape(v string) string { return html.EscapeString(v) }', 'func h() { fmt.Fprint(w, escape(r.FormValue("q"))) }', set()),
+              ('html-not-sql', 'func escape(v string) string { return html.EscapeString(v) }', 'func h() { db.Query(escape(r.FormValue("q"))) }', {'sql'}),
+              ('safe-constant', 'func send(v string) { exec.Command("sh", "-c", v) }', 'func h() { send("echo safe") }', set()),
+              ('parameterized-sql', 'func lookup(v string) { db.Query("SELECT $1", v) }', 'func h() { lookup(r.FormValue("q")) }', set()),
+          ]
+          for name, helper, caller, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-go-package-e2e-') as tmp:
+                  project = Path(tmp)
+                  (project / 'helper.go').write_text('package app\n' + helper + '\n')
+                  (project / 'handler.go').write_text('package app\n' + caller + '\n')
+                  result = subprocess.run([str(root / 'ubs'), str(project), '--ci', '--only=golang', '--format=json'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=180,
+                                          env=dict(os.environ, UBS_CACHE_DIR=str(project / 'cache')))
+                  folder = artifacts / name
+                  folder.mkdir(parents=True, exist_ok=True)
+                  (folder / 'stdout.log').write_text(result.stdout)
+                  (folder / 'stderr.log').write_text(result.stderr)
+                  assert result.returncode in (0, 1), (name, result.stdout, result.stderr)
+                  report = json.loads(result.stdout)
+                  assert report['status'] == 'ok', report
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              rule = value.get(key)
+                              if isinstance(rule, str) and rule.startswith(('go.taint.', 'golang.taint.')):
+                                  rules.add(rule.rsplit('.', 1)[-1])
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(report)
+                  assert rules == expected, (name, rules, expected, report)
+                  print('GO_PACKAGE_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+          python3 test-suite/run_manifest.py --case golang-taint-buggy --case golang-taint-clean
+      - name: Store only validated content-addressed runtime objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import urllib.request
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          sources = ['modules/helpers/ubs_core/analyzers/taint_go.py', 'modules/helpers/ubs_core/go_scan.py',
+                     'test-suite/quality/test_taint_go_packages.py']
+          allowed = set(scripts + sources + ['SHA256SUMS'])
+          changed = set(git('diff', '--name-only').splitlines())
+          untracked = set(git('ls-files', '--others', '--exclude-standard').splitlines())
+          assert changed | untracked <= allowed, (changed | untracked) - allowed
+          for script in scripts:
+              subprocess.run(['bash', '-n', script], check=True)
+          previous = {path: Path(path).read_bytes() for path in allowed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
+          assert all(Path(path).read_bytes() == data for path, data in previous.items()), 'Non-idempotent checksums'
+          subprocess.run(['./scripts/verify_checksums.sh'], check=True)
+          subprocess.run(['./scripts/verify_sha256sums.sh'], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          subprocess.run(['git', 'add', '--', *sorted(changed | untracked)], check=True)
+          entries = []
+          for path in sorted(changed | untracked):
+              mode = git('ls-files', '-s', '--', path).split()[0]
+              entries.append(dict(path=path, mode=mode, type='blob', sha=git('hash-object', path)))
+          elements = [dict(path=e['path'], mode=e['mode'], type='blob', content=Path(e['path']).read_text()) for e in entries]
+          payload = dict(base_tree=git('rev-parse', 'HEAD^{tree}'), tree=elements)
+          request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + '/git/trees',
+              data=json.dumps(payload).encode(), method='POST',
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json',
+                       'Content-Type': 'application/json'})
+          with urllib.request.urlopen(request, timeout=120) as response:
+              tree = json.load(response)['sha']
+          assert tree == git('write-tree')
+          result = dict(base=git('rev-parse', 'HEAD'), tree=tree, files=entries)
+          (Path(os.environ['RUNNER_TEMP']) / 'go-package-result.json').write_text(json.dumps(result, indent=2))
+          print('GO_PACKAGE_TREE_VALIDATED', json.dumps(result), flush=True)
+          PY
+      - name: Retain exact candidate sources and diagnostics
+        if: always()
+        run: |
+          git diff HEAD > "$RUNNER_TEMP/go-package-runtime.diff"
+          git ls-files -s > "$RUNNER_TEMP/go-package-candidate-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/go-package-candidate.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: go-package-validation
+          path: |
+            ${{ runner.temp }}/go-package-*
+            test-suite/artifacts/go-package-taint
+          retention-days: 3

@@ -1,0 +1,441 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 477c8ac..5b63ffe 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -1,7 +1,9 @@
+ """JavaScript/TypeScript taint analysis with sink-specific sanitizer effects.
+ 
+ Executable-expression masks retain template interpolation and source offsets.
+-Local functions use finite return/sink summaries and ordered assignment state.
++Local functions summarize returns, sinks and writes separately for normal and
++exceptional completion. Finalizers transform each pending exit; expression
++reads and callee identities are resolved before later argument side effects.
+ The lexical front end handles ordinary functions, arrows and structured blocks;
+ cross-file calls, dynamic dispatch and the full JavaScript grammar are not modeled.
+ 
+@@ -588,6 +590,7 @@ class _State(dict):
+         # local must never redirect a callee's write into its lexical parent.
+         self.owners = dict(getattr(values, 'owners', {}))
+         self.cells = dict(getattr(values, 'cells', {}))
++        self.reachable = getattr(values, 'reachable', True)
+ 
+     def copy(self):
+         return _State(self)
+@@ -595,7 +598,17 @@ class _State(dict):
+     def __eq__(self, other):
+         return (isinstance(other, _State) and dict.__eq__(self, other)
+                 and self.bindings == other.bindings and self.owners == other.owners
+-                and self.cells == other.cells)
++                and self.cells == other.cells and self.reachable == other.reachable)
++
++    def replace(self, other):
++        if other is None:
++            self.reachable = False
++            return
++        self.clear()
++        self.update(other)
++        self.bindings = dict(other.bindings)
++        self.owners, self.cells = dict(other.owners), dict(other.cells)
++        self.reachable = other.reachable
+ 
+ 
+ def _cell_input(key):
+@@ -609,7 +622,7 @@ def _cell_value(key, state):
+ 
+ 
+ def _join_states(*states):
+-    states = [state for state in states if state is not None]
++    states = [state for state in states if state is not None and state.reachable]
+     if not states:
+         return None
+     names = set().union(*(state.keys() for state in states))
+@@ -630,6 +643,22 @@ def _join_states(*states):
+     return result
+ 
+ 
++@dataclass(frozen=True)
++class _Summary:
++    returned: frozenset = frozenset()
++    effects: dict = field(default_factory=dict)
++    writes: dict = field(default_factory=dict)
++    raised: dict = field(default_factory=dict)
++    normal: bool = False
++    exceptional: bool = False
++
++
++@dataclass
++class _Return:
++    state: _State
++    fact: frozenset
++
++
+ @dataclass(eq=False)
+ class _Scope:
+     start: int
+@@ -1096,7 +1125,8 @@ class _Flow:
+         self.engine, self.scope, self.rule = engine, scope, rule
+         self.returned = frozenset()
+         self.effects = {}
+-        self.exit_states = []
++        self.returns, self.throws = [], []
++        self.exception_states = []
+         self.parameter_context = False
+         self.breaks, self.continues = [], []
+         self.pairs = _pairs(scope.code, scope.body_start, scope.body_end)
+@@ -1116,6 +1146,8 @@ class _Flow:
+         return frozenset()
+ 
+     def assign(self, name, fact, state, position, binding=None):
++        if not state.reachable:
++            return
+         state[name] = _step(fact, name)
+         state.bindings[name] = binding
+         if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
+@@ -1213,6 +1245,12 @@ class _Flow:
+                 self.effect(location, label, self.substitute(fact, callee, bound, incoming))
+             writes = {key: value for key, value in default_state.cells.items() if key[0] is not callee}
+             self.apply_writes(writes, callee, bound, state, incoming)
++            for thrown in default_flow.throws:
++                exceptional = incoming.copy()
++                writes = {key: value for key, value in thrown.cells.items() if key[0] is not callee}
++                self.apply_writes(writes, callee, bound, exceptional, incoming)
++                self.throws.append(exceptional)
++            state.reachable = default_state.reachable
+             for dependency, callers in self.engine.dependents.items():
+                 if dependency[1] == self.rule and callee in callers:
+                     callers.add(self.scope)
+@@ -1241,6 +1279,8 @@ class _Flow:
+         return result
+ 
+     def value(self, start, end, state):
++        if not state.reachable:
++            return frozenset()
+         text, code = self.engine.text, self.scope.code
+         while start < end and code[start].isspace():
+             start += 1
+@@ -1254,9 +1294,10 @@ class _Flow:
+         if assignment:
+             target = assignment.group(1)
+             rhs = start + assignment.end()
++            previous = self.reference(target, state)
+             fact = self.value(rhs, end, state)
+             if assignment.group(2) != '=':
+-                fact = _join(self.reference(target, state), fact)
++                fact = _join(previous, fact)
+             self.assign(target, fact, state, start, self.callable(rhs, end, state))
+             for location, expr_start, rule, label in self.engine.write_sinks:
+                 if rule == self.rule and start <= location < rhs <= expr_start:
+@@ -1288,10 +1329,7 @@ class _Flow:
+             left, right = state.copy(), state.copy()
+             facts = (self.value(question + 1, colon, left), self.value(colon + 1, end, right))
+             merged = _join_states(left, right)
+-            state.clear()
+-            state.update(merged)
+-            state.bindings = dict(merged.bindings)
+-            state.owners, state.cells = dict(merged.owners), dict(merged.cells)
++            state.replace(merged)
+             return _join(*facts)
+         if operators:
+             _, operator = min(operators, key=lambda item: (item[0], -item[1]))
+@@ -1299,17 +1337,32 @@ class _Flow:
+             branch = state.copy()
+             right = self.value(operator + 2, end, branch)
+             merged = _join_states(state, branch)
+-            state.clear()
+-            state.update(merged)
+-            state.bindings = dict(merged.bindings)
+-            state.owners, state.cells = dict(merged.owners), dict(merged.cells)
++            state.replace(merged)
+             return _join(left, right)
+-        remainder = list(code[start:end])
+         source_remainder = list(text[start:end])
+         for child in self.scope.children:
+             left, right = max(start, child.start), min(end, child.end)
+             if left < right:
+                 source_remainder[left - start:right - start] = [' '] * (right - left)
++
++        def references(left, right):
++            # Resolve reads when they execute, before the next mutating call.
++            # Reading every bare name after all calls loses `out + clear()`.
++            plain = code[left:right]
++            result = []
++            for source, _ in assignment_sources(''.join(source_remainder[left - start:right - start])):
++                result.append(frozenset({_Trace(('source', source), (source,))}))
++            for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*', plain):
++                name = re.sub(r'\s+', '', match.group(0))
++                if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
++                    continue
++                if plain[match.end():].lstrip().startswith(':'):
++                    continue  # object literal keys are not variable references
++                result.append(self.reference(name.split('.')[0], state))
++                if '.' in name and name in state:
++                    result.append(state[name])
++            return _join(*result)
++
+         facts = []
+         call_pattern = re.compile(r'(?<![\w$])(?:new\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(')
+         cursor = start
+@@ -1320,29 +1373,45 @@ class _Flow:
+             opening = match.end() - 1
+             closing = self.pairs.get(opening)
+             if closing is None or closing >= end:
++                facts.append(references(cursor, match.end()))
+                 cursor = match.end()
+                 continue
++            facts.append(references(cursor, match.start()))
+             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                          if code[left:right].strip()]
+-            argument_facts = [self.value(left, right, state) for left, right in arguments]
+             callee_name = re.sub(r'\s+', '', match.group(1))
++            receiver = callee_name.split('.')[0]
++            receiver_fact = self.reference(receiver, state)
++            receiver_binding = state.bindings.get(receiver, 'imported')
++            call_binding = state.bindings.get(callee_name, 'imported')
+             callee = None
+             if '.' not in callee_name:
+                 callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
++            argument_facts = [self.value(left, right, state) for left, right in arguments]
++            if not state.reachable:
++                return frozenset()
+             if isinstance(callee, _Scope):
+                 self.engine.dependents[(callee, self.rule)].add(self.scope)
+-                returned, effects, writes = self.engine.summaries.get((callee, self.rule), (frozenset(), {}, {}))
++                summary = self.engine.summaries.get((callee, self.rule), _Summary())
+                 bound = self.bind(callee, argument_facts, arguments, state)
++                if not state.reachable:
++                    return frozenset()
+                 incoming = state.copy()
+-                call_fact = self.substitute(returned, callee, bound, incoming)
+-                for (location, label), fact in effects.items():
++                call_fact = self.substitute(summary.returned, callee, bound, incoming)
++                for (location, label), fact in summary.effects.items():
+                     self.effect(location, label, self.substitute(fact, callee, bound, incoming))
+-                self.apply_writes(writes, callee, bound, state, incoming)
++                if summary.exceptional:
++                    thrown = incoming.copy()
++                    self.apply_writes(summary.raised, callee, bound, thrown, incoming)
++                    self.throws.append(thrown)
++                if not summary.normal:
++                    state.reachable = False
++                    return frozenset()
++                self.apply_writes(summary.writes, callee, bound, state, incoming)
+             else:
+                 call_fact = _join(*argument_facts)
+-                receiver = callee_name.split('.')[0]
+                 if '.' in callee_name:
+-                    call_fact = _join(call_fact, self.reference(receiver, state))
++                    call_fact = _join(call_fact, receiver_fact)
+                 # Argument facts already retain precise local-call returns.
+                 # Only a source in the callee itself introduces new input.
+                 candidate = text[match.start():closing + 1]
+@@ -1352,34 +1421,18 @@ class _Flow:
+                         source = source_match.group(0)
+                         call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
+                 sink = self.engine.call_sinks.get(match.start())
+-                binding = state.bindings.get(receiver, 'imported')
+-                if sink and sink[0] == self.rule and state.bindings.get(callee_name, 'imported') == 'imported':
++                if sink and sink[0] == self.rule and call_binding == 'imported':
+                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
+                     self.effect(match.start(), sink[1], _join(*selected))
+                 regex = SANITIZERS_BY_RULE.get(self.rule)
+                 following = code[closing + 1:end].lstrip()
+                 if regex and regex.match(candidate) and not following.startswith(('.', '[')):
+                     previous = code[:match.start()].rstrip()
+-                    if not previous.endswith('.') and binding == 'imported':
++                    if not previous.endswith('.') and receiver_binding == 'imported' and call_binding == 'imported':
+                         call_fact = frozenset()
+             facts.append(call_fact)
+-            remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+-            source_remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+             cursor = closing + 1
+-        remaining = ''.join(remainder)
+-        for source, _ in assignment_sources(''.join(source_remainder)):
+-            facts.append(frozenset({_Trace(('source', source), (source,))}))
+-        for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*', remaining):
+-            name = match.group(0)
+-            name = re.sub(r'\s+', '', name)
+-            if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
+-                continue
+-            after = remaining[match.end():].lstrip()
+-            if after.startswith(':'):
+-                continue  # object literal keys are not variable references
+-            facts.append(self.reference(name.split('.')[0], state))
+-            if '.' in name and name in state:
+-                facts.append(state[name])
++        facts.append(references(cursor, end))
+         result = _join(*facts)
+         for location, expr_start, rule, label in self.engine.write_sinks:
+             if rule == self.rule and start <= location < end:
+@@ -1403,8 +1456,9 @@ class _Flow:
+         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
+         if compound:
+             name = compound.group(1)
++            previous = self.reference(name, state)
+             fact = self.value(offset + compound.start(3), end, state)
+-            self.assign(name, _join(self.reference(name, state), fact), state, start)
++            self.assign(name, _join(previous, fact), state, start)
+             return state
+         declaration = None
+         for pattern in (DESTRUCT_OBJECT, DESTRUCT_ARRAY, ASSIGN_DECL, ASSIGN_SIMPLE):
+@@ -1428,10 +1482,14 @@ class _Flow:
+ 
+     def block(self, statements, state):
+         for statement in statements:
+-            if state is None:
++            if state is None or not state.reachable:
+                 break
++            if self.exception_states:
++                self.exception_states[-1] = _join_states(self.exception_states[-1], state)
+             state = self.statement(statement, state)
+-        return state
++            if self.exception_states:
++                self.exception_states[-1] = _join_states(self.exception_states[-1], state)
++        return state if state is not None and state.reachable else None
+ 
+     @staticmethod
+     def restore(state, outer, names):
+@@ -1458,6 +1516,7 @@ class _Flow:
+             local = self.engine.declarations(node.body, block=True)
+             outer = state.copy()
+             break_count, continue_count = len(self.breaks), len(self.continues)
++            return_count, throw_count = len(self.returns), len(self.throws)
+             for name in local:
+                 state[name], state.bindings[name] = frozenset(), None
+                 state.owners[name] = self.engine.binding(self.scope, name, node.start + 1)
+@@ -1467,7 +1526,8 @@ class _Flow:
+                     captured = result if result is not None else state
+                     key = (child, self.rule)
+                     self.engine.captures[key] = _join_states(self.engine.captures.get(key), captured)
+-            for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
++            for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:],
++                               *(exit.state for exit in self.returns[return_count:]), *self.throws[throw_count:]):
+                 self.restore(exit_state, outer, local)
+             return self.restore(result, outer, local)
+         if node.kind == 'if':
+@@ -1479,27 +1539,32 @@ class _Flow:
+         if node.kind == 'try':
+             # An exception may interrupt any statement before the handler.
+             # Join prefix states so a later overwrite cannot erase that path.
+-            entry = state.copy()
+-            exit_count, break_count, continue_count = len(self.exit_states), len(self.breaks), len(self.continues)
+-            body = node.body[0].body if node.body and node.body[0].kind == 'block' else node.body
+-            prefix, current = entry.copy(), entry.copy()
+-            for statement in body:
+-                if current is None:
+-                    break
+-                current = self.statement(statement, current)
+-                prefix = _join_states(prefix, current)
+-            handler = self.block(node.alternate, prefix) if node.alternate else None
++            return_count, throw_count = len(self.returns), len(self.throws)
++            break_count, continue_count = len(self.breaks), len(self.continues)
++            self.exception_states.append(state.copy())
++            current = self.block(node.body, state.copy())
++            prefix = self.exception_states.pop()
++            handler = None
++            if node.alternate:
++                exceptional = _join_states(prefix, *self.throws[throw_count:])
++                del self.throws[throw_count:]
++                handler = self.block(node.alternate, exceptional)
+             merged = _join_states(current, handler)
+             if node.extra:
+                 # Finally transforms every completion, including pending
+                 # return/throw/break/continue. Do not keep pre-finally cells in
+                 # the write summary: a definite cleanup can replace them.
+-                exits, breaks, continues = (self.exit_states[exit_count:], self.breaks[break_count:],
+-                                             self.continues[continue_count:])
+-                self.exit_states[exit_count:] = []
+-                self.breaks[break_count:] = []
+-                self.continues[continue_count:] = []
+-                for destination, pending in ((self.exit_states, exits), (self.breaks, breaks),
++                returns, throws = self.returns[return_count:], self.throws[throw_count:]
++                breaks, continues = self.breaks[break_count:], self.continues[continue_count:]
++                del self.returns[return_count:]
++                del self.throws[throw_count:]
++                del self.breaks[break_count:]
++                del self.continues[continue_count:]
++                for exit in returns:
++                    tail = self.block(node.extra, exit.state.copy())
++                    if tail is not None:
++                        self.returns.append(_Return(tail, exit.fact))
++                for destination, pending in ((self.throws, throws), (self.breaks, breaks),
+                                              (self.continues, continues)):
+                     for exit_state in pending:
+                         tail = self.block(node.extra, exit_state.copy())
+@@ -1509,6 +1574,8 @@ class _Flow:
+             return merged
+         if node.kind == 'switch':
+             self.value(node.start, node.end, state)
++            if not state.reachable:
++                return None
+             previous_breaks = self.breaks
+             self.breaks = []
+             fallthrough, exits = None, [] if node.extra else [state.copy()]
+@@ -1535,6 +1602,8 @@ class _Flow:
+                 for name in loop_names:
+                     state.owners[name] = self.engine.binding(self.scope, name, node.start)
+                 state = self.expression(*header[0], state)
++                if not state.reachable:
++                    return None
+                 condition, update = header[1], header[2]
+             else:
+                 condition, update = (node.start, node.end), None
+@@ -1556,6 +1625,9 @@ class _Flow:
+             while True:
+                 self.breaks, self.continues = [], []
+                 self.value(*condition, current)
++                if not current.reachable:
++                    self.breaks, self.continues = outer_breaks, outer_continues
++                    return self.restore(_join_states(*exits), outer, loop_names)
+                 body_state = current.copy()
+                 if iteration:
+                     names, left, right = iteration
+@@ -1576,12 +1648,14 @@ class _Flow:
+             self.breaks, self.continues = outer_breaks, outer_continues
+             return self.restore(_join_states(current, *exits), outer, loop_names)
+         if node.kind == 'return':
+-            self.returned = _join(self.returned, self.value(node.start, node.end, state))
+-            self.exit_states.append(state.copy())
++            fact = self.value(node.start, node.end, state)
++            if state.reachable:
++                self.returns.append(_Return(state.copy(), fact))
+             return None
+         if node.kind == 'throw':
+             self.value(node.start, node.end, state)
+-            self.exit_states.append(state.copy())
++            if state.reachable:
++                self.throws.append(state.copy())
+             return None
+         if node.kind in {'break', 'continue'}:
+             (self.breaks if node.kind == 'break' else self.continues).append(state.copy())
+@@ -1697,11 +1771,17 @@ class _Engine:
+             final = state
+         else:
+             final = flow.block(scope.statements, state)
+-        self.final_states[(scope, rule)] = final or state
+-        exits = [*flow.exit_states, *([final] if final is not None else [])]
+-        joined = _join_states(*exits)
+-        writes = {} if joined is None else {key: value for key, value in joined.cells.items() if key[0] is not scope}
+-        return flow.returned, flow.effects, writes
++        normal = _join_states(final, *(exit.state for exit in flow.returns))
++        exceptional = _join_states(*flow.throws)
++        self.final_states[(scope, rule)] = _join_states(normal, exceptional) or state
++
++        def writes(completion):
++            return {} if completion is None else {key: value for key, value in completion.cells.items()
++                                                  if key[0] is not scope}
++
++        returned = _join(flow.returned, *(exit.fact for exit in flow.returns))
++        return _Summary(returned, flow.effects, writes(normal), writes(exceptional),
++                        normal is not None, exceptional is not None)
+ 
+     def concrete(self, fact, rule, visited=frozenset()):
+         result = frozenset()
+@@ -1752,7 +1832,7 @@ class _Engine:
+                             pending.append(caller)
+                             queued.add(caller)
+             for scope in self.scopes:
+-                for (location, label), fact in self.summaries[(scope, rule)][1].items():
++                for (location, label), fact in self.summaries[(scope, rule)].effects.items():
+                     if self.dependents[(scope, rule)]:
+                         # Known call sites already instantiated captures at
+                         # their program points. Rebinding them to end-of-scope

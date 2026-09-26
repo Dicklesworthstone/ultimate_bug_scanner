@@ -1,0 +1,118 @@
+name: JavaScript Call Completions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/javascript-call-completions.patch
+      - test-suite/js/test_taint_call_completions.py
+      - .github/workflows/javascript-call-completions.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  completion-regressions:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Retain exact source identities
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/js-completion-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/js-completion-source-index.txt"
+          git archive --format=tar.gz --output="$RUNNER_TEMP/js-completion-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: js-completion-source
+          path: ${{ runner.temp }}/js-completion-source*
+          retention-days: 3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Apply incremental completion semantics to reviewed scalar writes
+        run: |
+          source=modules/helpers/ubs_core/analyzers/taint_js.py
+          if test "$(git hash-object "$source")" = 38a50392b5540131d25ade30664b883ec28b4005; then
+            git apply --check test-suite/patches/javascript-captured-writes.patch
+            git apply test-suite/patches/javascript-captured-writes.patch
+          fi
+          test "$(git hash-object "$source")" = 477c8ac86895e19afdf6dacc96834c93cb90b736
+          if python3 test-suite/js/test_taint_call_completions.py > "$RUNNER_TEMP/js-completion-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/js-completion-before.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/js-completion-before.log"
+          grep -q 'FAILED (failures=14, errors=1, skipped=1)' "$RUNNER_TEMP/js-completion-before.log"
+          git apply --check test-suite/patches/javascript-call-completions.patch
+          git apply test-suite/patches/javascript-call-completions.patch
+          test "$(git hash-object "$source")" = 5b63ffeb31da94c9aa7088078e51be1b78cfd31e
+          python3 -m unittest discover -s test-suite/js -p 'test_taint*.py' -v
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff --check
+      - name: Install real scanner dependencies
+        run: |
+          brew install bash jq ripgrep shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          npm install --global @ast-grep/cli
+      - name: Validate actual scanner and existing JavaScript quality gates
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          UBS_TAINT_E2E=1 python3 test-suite/js/test_taint_call_completions.py
+      - name: Publish verified immutable blobs without changing any ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, changed
+          before = {path: Path(path).read_bytes() for path in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
+          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert all(Path(path).read_bytes() == content for path, content in before.items())
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          files = []
+          for path in changed:
+              content = Path(path).read_bytes()
+              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                                        input=json.dumps({'content': content.decode('utf-8'), 'encoding': 'utf-8'}),
+                                        text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', path], text=True).split()[0]
+              files.append({'path': path, 'sha': sha, 'mode': mode, 'type': 'blob'})
+              print('JS_COMPLETION_BLOB', path, sha, mode, flush=True)
+          result = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': files}
+          Path(os.environ['RUNNER_TEMP'], 'js-completion-validated.json').write_text(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-call-completions
+          path: |
+            ${{ runner.temp }}/js-completion-*.log
+            ${{ runner.temp }}/js-completion-validated.json
+            test-suite/artifacts/javascript-call-completions/
+          retention-days: 3

@@ -104,6 +104,25 @@ class ListFilesTests(unittest.TestCase):
             proc = bash('ubs_list_files "$1" --files-from "$2"', tmp, str(listing))
             self.assertEqual([p for p in proc.stdout.decode().split("\0") if p], [str(root / "a.py")])
 
+    def test_nul_files_from_preserves_embedded_and_trailing_newlines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            names = ["ordinary.py", "odd\nname.py", "trailing.py\n", "\nleading.py"]
+            absolute = root / "absolute\npath.py"
+            expected = [root / name for name in names] + [absolute]
+            for path in expected:
+                path.write_text("")
+            # A splitter or newline trimmer would select these real decoys,
+            # rather than merely dropping the requested paths.
+            for name in ("odd", "name.py", "trailing.py", "leading.py"):
+                (root / name).write_text("")
+            listing = root / "files.0"
+            entries = [*names, str(absolute), "missing.py"]
+            listing.write_bytes(b"\0".join(os.fsencode(name) for name in entries) + b"\0")
+            proc = bash('ubs_list_files "$1" --files-from "$2"', tmp, str(listing))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, b"".join(os.fsencode(path) + b"\0" for path in expected))
+
 
 class LocaleTests(unittest.TestCase):
     def test_export_locale_reaches_children(self) -> None:

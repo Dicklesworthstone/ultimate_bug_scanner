@@ -369,17 +369,14 @@ def check_version_identity(tmpdir: Path) -> None:
 
 
 def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
-    """Issue #98 regression guard: the staged/diff shadow-copy rsync used to
-    run with `>/dev/null 2>&1`, so every failure collapsed into the generic
-    "Failed to prepare shadow workspace" with no way to tell permission
-    errors, missing paths, ENOSPC or bad file-list entries apart. Worse, the
-    staged file list came from non-NUL `git diff --name-only`, which C-quotes
-    paths containing backslashes (e.g. systemd mount-unit names like
-    `var-tmp-ai\\x2dmachine.mount`), so such repos failed deterministically.
+    """Index scans tolerate absent worktree files; diff copy errors stay loud.
 
-    Two guards: (a) a staged backslash-named file must no longer break
-    workspace preparation at all; (b) a real rsync failure must exit non-zero
-    AND surface rsync's own exit status and stderr."""
+    Issue #98's NUL-safe filenames and rsync diagnostics remain required.
+    Staged scans now materialize Git blobs, so their success must not depend
+    on worktree read permissions or rsync. The copy-failure controls run via
+    --diff, which still scans worktree bytes and must surface the real rsync
+    exit status and stderr when a source vanishes after enumeration.
+    """
     env = {"NO_COLOR": "1", "UBS_ENABLE_AUTO_UPDATE": "0"}
     repo = tmpdir / "staged_repo"
     repo.mkdir(parents=True)
@@ -394,28 +391,37 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
         "-C",
         str(repo),
     ]
-    subprocess.run([*git_base, "init", "--quiet"], check=True, capture_output=True, timeout=30)
+    subprocess.run([*git_base, "init", "--quiet", "-b", "main"],
+                   check=True, capture_output=True, timeout=30)
+    subprocess.run([*git_base, "commit", "--quiet", "--allow-empty", "-m", "initial"],
+                   check=True, capture_output=True, timeout=30)
     mount_unit = repo / "var-tmp-ai\\x2dmachine.mount"
     mount_unit.write_text("[Mount]\nWhere=/var/tmp/ai-machine\n")
+    (repo / "clean.py").write_text("value = 1\n")
     subprocess.run([*git_base, "add", "-A"], check=True, capture_output=True, timeout=30)
 
-    def run_staged() -> subprocess.CompletedProcess[str]:
+    def scan(mode="--staged", extra_env=None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(UBS_BIN), "--staged"],
+            [str(UBS_BIN), mode, "--format=json", "--ci"],
             cwd=repo,
             capture_output=True,
             text=True,
-            env={**os.environ, **env},
+            env={**os.environ, **env, **(extra_env or {})},
             check=False,
             timeout=180,
         )
 
-    # (a) Backslash-named staged file: the C-quoted git record used to poison
-    # the rsync --files-from list; with -z parsing the workspace must prepare.
-    res = run_staged()
-    output = res.stdout + res.stderr
-    assert "Failed to prepare shadow workspace" not in output, output
-    assert "Scanning shadow workspace" in output, output
+    def require_index_scan(result: subprocess.CompletedProcess[str]) -> None:
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert "Failed to prepare shadow workspace" not in output, output
+        assert "Scanning shadow workspace" in output, output
+        document = json.loads(result.stdout)
+        assert document["status"] == "ok", output
+        assert document["totals"]["files"] == 1, output
+
+    # Backslash names must survive Git enumeration and materialization.
+    require_index_scan(scan())
 
     def require_copy_failure(result: subprocess.CompletedProcess[str]) -> None:
         output = result.stdout + result.stderr
@@ -424,22 +430,58 @@ def check_staged_rsync_diagnostics(tmpdir: Path) -> None:
         assert "rsync exited with status" in output, output
         assert "rsync:" in output, output
 
-    # (b) A staged path missing from the worktree forces a real rsync failure
-    # even when the suite runs as root (which can read chmod(0) files).
-    # Preserve the fixture under another name and restore it after the run.
+    # A missing or unreadable worktree source cannot invalidate an index scan.
     parked_unit = repo / "parked-mount-unit"
     mount_unit.rename(parked_unit)
     try:
-        require_copy_failure(run_staged())
+        require_index_scan(scan())
     finally:
         parked_unit.rename(mount_unit)
 
-    # Also retain the permission-error case wherever the OS enforces it for
-    # this user. The missing-path negative above is required on every host.
+    mount_unit.chmod(0)
+    try:
+        require_index_scan(scan())
+    finally:
+        mount_unit.chmod(0o644)
+
+    # Cause an actual rsync failure, including on root-run CI: move the source
+    # only after --diff has enumerated it, immediately before real rsync reads
+    # it. This retains the original diagnostic gate instead of dropping it
+    # when --staged stops using the worktree copy path.
+    real_rsync = shutil.which("rsync")
+    assert real_rsync, "rsync is required to verify its failure diagnostics"
+    stub_dir = tmpdir / "rsync-vanishing-source"
+    stub_dir.mkdir()
+    wrapper = stub_dir / "rsync"
+    wrapper.write_text(
+        '#!/usr/bin/env bash\n'
+        'mv -- "$UBS_TEST_RSYNC_SOURCE" "$UBS_TEST_RSYNC_PARKED" || exit 70\n'
+        'exec "$UBS_TEST_REAL_RSYNC" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    failure_env = {
+        "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "UBS_TEST_REAL_RSYNC": real_rsync,
+        "UBS_TEST_RSYNC_SOURCE": str(mount_unit),
+        "UBS_TEST_RSYNC_PARKED": str(parked_unit),
+    }
+    # This same destructive-on-read shim must remain completely untouched by
+    # --staged, proving that the index path never calls the copy backend.
+    require_index_scan(scan(extra_env=failure_env))
+    assert mount_unit.exists() and not parked_unit.exists()
+    try:
+        require_copy_failure(scan("--diff", failure_env))
+        assert parked_unit.exists(), "negative control did not reach real rsync"
+    finally:
+        if parked_unit.exists():
+            parked_unit.rename(mount_unit)
+
+    # Retain the real permission-error control wherever this user cannot read
+    # chmod(0) files. The vanished-source control above is required everywhere.
     mount_unit.chmod(0)
     try:
         if not os.access(mount_unit, os.R_OK):
-            require_copy_failure(run_staged())
+            require_copy_failure(scan("--diff"))
     finally:
         mount_unit.chmod(0o644)
 
@@ -776,8 +818,8 @@ def main() -> None:
         # Issue #79: --version identity must belong to UBS, not the caller's cwd.
         check_version_identity(tmpdir)
 
-        # Issue #98: staged rsync failures must surface rsync's stderr, and
-        # backslash-named staged files must not break workspace preparation.
+        # Issue #98: staged blobs survive absent/backslash worktree paths;
+        # --diff retains real rsync error diagnostics.
         check_staged_rsync_diagnostics(tmpdir)
 
         # Issue #99: Rust cargo phases must really run (sentinel positive

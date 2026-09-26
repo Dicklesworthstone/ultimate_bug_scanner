@@ -317,6 +317,194 @@ class GitShadowFilterTest(unittest.TestCase):
         self.assertNotIn(str(self.root / "ignored/bad.py"), reported_files(result))
 
 
+class GitIndexSelectionTest(unittest.TestCase):
+    """A pre-commit scan checks the index, including partially staged files."""
+
+    CLEAN = "value = 1\n"
+
+    def setUp(self) -> None:
+        self.started = time.monotonic()
+        print(f"[{self.id()}] RUN", flush=True)
+        self._tmp = tempfile.TemporaryDirectory(prefix="ubs-git-index-")
+        self.root = Path(self._tmp.name) / "repo"
+        self.root.mkdir()
+        self.artifacts = REPO_ROOT / "test-suite" / "artifacts" / "git-index-selection" / self._testMethodName
+        self.artifacts.mkdir(parents=True, exist_ok=True)
+        self.git("init", "--quiet", "-b", "main")
+
+    def tearDown(self) -> None:
+        result = self._outcome.result
+        failed = any(test is self for test, _ in result.failures + result.errors)
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - self.started:.3f}s)", flush=True)
+        self._tmp.cleanup()
+
+    def git(self, *args, check=True):
+        return run_helper(
+            ["git", "-c", "user.name=UBS Test", "-c", "user.email=ubs-test@example.invalid",
+             "-c", "commit.gpgsign=false", "-C", str(self.root), *args],
+            text=True, check=check,
+        )
+
+    def write(self, relative, content):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def initial_commit(self, files=None):
+        for relative, content in (files or {"sample.py": "value = 0\n"}).items():
+            self.write(relative, content)
+        self.git("add", "-A")
+        self.git("commit", "--quiet", "-m", "initial fixture")
+
+    def scan(self, label="staged", *, mode="--staged", target=".", cwd=None, env=None):
+        result = run_ubs(
+            ["--ci", "--only=python", mode, target], cwd or self.root,
+            {"UBS_NO_CACHE": "1", "UBS_ENABLE_AUTO_UPDATE": "0", **(env or {})},
+        )
+        (self.artifacts / f"{label}.stdout.log").write_text(result.stdout, encoding="utf-8")
+        (self.artifacts / f"{label}.stderr.log").write_text(result.stderr, encoding="utf-8")
+        return result
+
+    def assert_report(self, result, *, files, buggy=()):
+        details = f"exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        self.assertEqual(result.returncode, 1 if buggy else 0, details)
+        doc = summary(result)
+        self.assertEqual(doc.get("status"), "ok", details)
+        self.assertFalse(doc.get("failed_modules"), details)
+        self.assertEqual(doc["totals"]["files"], len(files), details)
+        self.assertEqual(reported_files(result), {str(self.root / name) for name in buggy}, details)
+        tainted = {finding["file"] for finding in doc.get("findings", [])
+                   if finding.get("rule_id") == "python.taint.eval"}
+        self.assertEqual(tainted, {str(self.root / name) for name in buggy}, details)
+        if not buggy:
+            self.assertEqual(doc["totals"]["critical"], 0, details)
+            self.assertEqual(doc["totals"]["warning"], 0, details)
+
+    def test_staged_hazard_survives_unstaged_fix(self) -> None:
+        self.initial_commit()
+        self.write("sample.py", FINDING_SOURCE)
+        self.git("add", "sample.py")
+        self.write("sample.py", self.CLEAN)
+        self.assert_report(self.scan(), files=["sample.py"], buggy=["sample.py"])
+        self.assert_report(self.scan("diff", mode="--diff"), files=["sample.py"])
+
+    def test_unstaged_hazard_is_not_part_of_staged_scan(self) -> None:
+        self.initial_commit()
+        self.write("sample.py", self.CLEAN)
+        self.git("add", "sample.py")
+        self.write("sample.py", FINDING_SOURCE)
+        self.assert_report(self.scan(), files=["sample.py"])
+        self.assert_report(self.scan("diff", mode="--diff"),
+                           files=["sample.py"], buggy=["sample.py"])
+
+    def test_staged_source_missing_from_worktree_is_still_scanned(self) -> None:
+        self.initial_commit()
+        source = self.write("sample.py", FINDING_SOURCE)
+        self.git("add", "sample.py")
+        source.rename(Path(self._tmp.name) / "parked.py")
+        self.assertFalse(source.exists())
+        self.assert_report(self.scan(), files=["sample.py"], buggy=["sample.py"])
+
+    def test_initial_commit_scans_the_index_without_head(self) -> None:
+        self.write("sample.py", FINDING_SOURCE)
+        self.git("add", "sample.py")
+        self.assertNotEqual(self.git("rev-parse", "--verify", "HEAD", check=False).returncode, 0)
+        self.write("sample.py", self.CLEAN)
+        self.assert_report(self.scan(), files=["sample.py"], buggy=["sample.py"])
+
+    def test_staged_rename_and_add_report_index_destinations(self) -> None:
+        self.initial_commit({"old.py": FINDING_SOURCE})
+        renamed = 'renamed "ü"\\name.py'
+        added = "new source.py"
+        self.git("mv", "old.py", renamed)
+        self.write(added, FINDING_SOURCE)
+        self.git("add", added)
+        self.write(renamed, self.CLEAN)
+        self.write(added, self.CLEAN)
+        self.assert_report(self.scan(), files=[renamed, added], buggy=[renamed, added])
+
+    def test_subdirectory_scope_does_not_scan_sibling_changes(self) -> None:
+        self.initial_commit({"scope/sample.py": self.CLEAN, "sibling.py": self.CLEAN})
+        for name in ("scope/sample.py", "sibling.py"):
+            self.write(name, FINDING_SOURCE)
+        self.git("add", "-A")
+        for name in ("scope/sample.py", "sibling.py"):
+            self.write(name, self.CLEAN)
+        self.assert_report(self.scan(target="scope"),
+                           files=["scope/sample.py"], buggy=["scope/sample.py"])
+        self.assert_report(self.scan("scoped-cwd", cwd=self.root / "scope"),
+                           files=["scope/sample.py"], buggy=["scope/sample.py"])
+
+    def test_ignore_filter_preserves_newline_names_and_root_scope(self) -> None:
+        self.write(".ubsignore", "/ignored/**\n")
+        names = ["line\nbreak.py", "ignored/bad.py", "nested/ignored/keep.py"]
+        for name in names:
+            self.write(name, FINDING_SOURCE)
+        self.git("add", "-A")
+        for name in names:
+            self.write(name, self.CLEAN)
+        expected = ["line\nbreak.py", "nested/ignored/keep.py"]
+        self.assert_report(self.scan(), files=expected, buggy=expected)
+
+    def test_git_enumeration_failure_cannot_report_clean(self) -> None:
+        self.initial_commit()
+        self.write("sample.py", FINDING_SOURCE)
+        self.git("add", "sample.py")
+        real_git = shutil.which("git")
+        self.assertIsNotNone(real_git)
+        stub_dir = Path(self._tmp.name) / "bin"
+        stub_dir.mkdir()
+        wrapper = stub_dir / "git"
+        wrapper.write_text(
+            '#!/usr/bin/env bash\n'
+            'for arg in "$@"; do\n'
+            '  case "$arg" in diff|diff-index|diff-tree)\n'
+            '    printf "%s\\n" "fatal: index enumeration test failure" >&2; exit 71;;\n'
+            '  esac\n'
+            'done\n'
+            'exec "$UBS_TEST_REAL_GIT" "$@"\n', encoding="utf-8",
+        )
+        wrapper.chmod(0o755)
+        env = {"PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+               "UBS_TEST_REAL_GIT": real_git}
+        for mode in ("--staged", "--diff"):
+            with self.subTest(mode=mode):
+                result = self.scan(mode[2:], mode=mode, env=env)
+                details = result.stdout + result.stderr
+                self.assertEqual(result.returncode, 2, details)
+                self.assertIn("index enumeration test failure", details)
+                self.assertNotIn("No changed files to scan", details)
+
+    def test_unmerged_index_cannot_report_clean(self) -> None:
+        self.initial_commit()
+        self.git("switch", "--quiet", "-c", "conflicting")
+        self.write("sample.py", FINDING_SOURCE)
+        self.git("add", "sample.py")
+        self.git("commit", "--quiet", "-m", "conflicting change")
+        self.git("switch", "--quiet", "main")
+        self.write("sample.py", self.CLEAN)
+        self.git("add", "sample.py")
+        self.git("commit", "--quiet", "-m", "main change")
+        self.assertEqual(self.git("merge", "--no-edit", "conflicting", check=False).returncode, 1)
+        self.assertTrue(self.git("ls-files", "--unmerged").stdout)
+        result = self.scan()
+        details = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, details)
+        self.assertRegex(details.lower(), r"unmerged|unresolved|conflict")
+        self.assertNotIn("No changed files to scan", details)
+
+    def test_diff_without_head_fails_instead_of_reporting_clean(self) -> None:
+        self.write("sample.py", FINDING_SOURCE)
+        self.git("add", "sample.py")
+        result = self.scan("diff", mode="--diff")
+        details = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, details)
+        self.assertIn("HEAD", details)
+        self.assertNotIn("No changed files to scan", details)
+
+
 class ExternalTargetTest(unittest.TestCase):
     """Targets outside the scan root are staged, scanned and named correctly."""
 

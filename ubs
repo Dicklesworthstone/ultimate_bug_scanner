@@ -415,7 +415,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='2fee40d122f355b7007736570dd25488469184d2ef8075a797326096e9aa12bb'
+  ['lib/ubs-common.sh']='62a91bd98724802dff1b37aa8e96aa8b6129c6b018d7e3130b16731573e4bf76'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3463,11 +3463,129 @@ report_rsync_failure(){
   fi
 }
 
+# Stage the immutable index tree, without checkout filters, worktree reads, or
+# symlink traversal. A pre-commit scan must inspect the bytes being committed:
+# an unstaged fix must never make a staged vulnerability disappear.
+prepare_index_workspace(){
+  local repo_root="$1" scan_rel="$2" dest="$TMPDIR_RUN/git_scan"
+  local snapshot base raw="$TMPDIR_RUN/index_changes.0" err="$TMPDIR_RUN/index_stderr.txt"
+  local count rc=0
+  if ! snapshot="$(git -C "$repo_root" write-tree 2>"$err")"; then
+    report_copy_failure git 2 "$err"
+    refuse_scan "git-index-failed" "Could not snapshot the Git index; resolve unmerged entries before scanning" ""
+  fi
+  # An unborn branch has no HEAD tree. Comparing its index to an empty tree
+  # still scans every staged addition, including a first commit.
+  if ! base="$(git -C "$repo_root" rev-parse --verify 'HEAD^{tree}' 2>/dev/null)"; then
+    base="$(git -C "$repo_root" hash-object -t tree --stdin </dev/null)" || \
+      refuse_scan "git-index-failed" "Could not compute the empty Git tree" ""
+  fi
+  # Raw records include the destination object id and mode. Disabling rename
+  # detection makes every record one path and treats a rename as delete/add.
+  # Reading object ids from this snapshot also tolerates concurrent git adds.
+  if ! git -C "$repo_root" diff --raw -z --no-abbrev --no-renames --no-ext-diff \
+       --diff-filter=ACMRT "$base" "$snapshot" -- >"$raw" 2>"$err"; then
+    report_copy_failure git 2 "$err"
+    refuse_scan "git-index-failed" "Could not enumerate staged changes" ""
+  fi
+  ensure_ignore_matcher
+  ensure_dir "$dest"
+  count=$(UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 - \
+    "$repo_root" "$scan_rel" "$raw" "$dest" "$GLOBAL_EXCLUDE_PATTERNS" <<'PY' 2>"$err"
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.environ['UBS_IGNORE_MATCHER_DIR'])
+from ubs_ignore import IgnoreMatcher
+
+repo, scope, raw_path, dest, excludes = sys.argv[1:]
+matcher = IgnoreMatcher(excludes)
+
+try:
+    with open(raw_path, 'rb') as stream:
+        records = stream.read().split(b'\0')
+    if records[-1] != b'' or (len(records) - 1) % 2:
+        raise ValueError('incomplete Git raw diff')
+    selected = []
+    for offset in range(0, len(records) - 1, 2):
+        fields = records[offset].split()
+        if len(fields) != 5 or not fields[0].startswith(b':'):
+            raise ValueError('invalid Git raw diff record')
+        mode, oid = fields[1], fields[3]
+        # Symlinks and submodules are not source blobs. Never follow them to
+        # files outside the snapshot, even when their names end in .py/.js.
+        if mode not in (b'100644', b'100755'):
+            continue
+        path = os.fsdecode(records[offset + 1])
+        if scope:
+            if not path.startswith(scope + '/'):
+                continue
+            path = path[len(scope) + 1:]
+        if not path or os.path.isabs(path) or any(p in ('.', '..') for p in path.split('/')):
+            raise ValueError(f'unsafe staged path: {path!r}')
+        if not matcher.excluded(path):
+            selected.append((path, mode, oid))
+
+    if selected:
+        # One bounded streaming process for all blobs, with object ids as the
+        # protocol keys so spaces, tabs and newlines in paths remain literal.
+        with subprocess.Popen(['git', '-C', repo, 'cat-file', '--batch'],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+            try:
+                for path, mode, oid in selected:
+                    process.stdin.write(oid + b'\n')
+                    process.stdin.flush()
+                    header = process.stdout.readline().split()
+                    if len(header) != 3 or header[:2] != [oid, b'blob']:
+                        raise ValueError(f'could not read staged blob for {path!r}')
+                    remaining = int(header[2])
+                    if remaining < 0:
+                        raise ValueError('invalid Git blob size')
+                    target = os.path.join(dest, path)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, 'xb') as output:
+                        while remaining:
+                            chunk = process.stdout.read(min(remaining, 1024 * 1024))
+                            if not chunk:
+                                raise ValueError(f'truncated staged blob for {path!r}')
+                            output.write(chunk)
+                            remaining -= len(chunk)
+                    if process.stdout.read(1) != b'\n':
+                        raise ValueError('invalid Git batch record terminator')
+                    os.chmod(target, 0o755 if mode == b'100755' else 0o644)
+                process.stdin.close()
+                if process.wait(timeout=30):
+                    raise ValueError('git cat-file failed')
+            except BaseException:
+                process.kill()
+                process.wait()
+                raise
+    print(len(selected))
+except (OSError, ValueError, subprocess.SubprocessError) as exc:
+    print(f'Git index workspace: {exc}', file=sys.stderr)
+    sys.exit(1)
+PY
+  ) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    report_copy_failure git "$rc" "$err"
+    refuse_scan "git-index-failed" "Failed to prepare staged index workspace" ""
+  fi
+  if [[ "$count" -eq 0 ]]; then
+    say "${GREEN}${CHECK} No changed files to scan.${RESET}"
+    exit 0
+  fi
+  FILTERED_PROJECT_DIR="$dest"
+  PROJECT_DIR="$dest"
+  say "${BLUE}${INFO} Preparing shadow workspace from Git index (${count} files)${RESET}"
+  say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
+}
+
 prepare_git_workspace(){
   local mode="$1"
   if ! need_cmd git; then
     say "${RED}$X git not found; cannot run --$mode${RESET}"
-    exit 1
+    exit 2
   fi
 
   local scan_root="$SOURCE_PROJECT_DIR"
@@ -3478,7 +3596,7 @@ prepare_git_workspace(){
   local repo_root
   if ! repo_root="$(git -C "$scan_root" rev-parse --show-toplevel 2>/dev/null)"; then
     say "${RED}$X not a git repository; cannot run --$mode${RESET}"
-    exit 1
+    exit 2
   fi
 
   local scan_rel=""
@@ -3488,23 +3606,25 @@ prepare_git_workspace(){
     scan_rel="${scan_root#"$repo_root"/}"
   else
     say "${RED}$X scan path is outside git root; cannot run --$mode${RESET}"
-    exit 1
+    exit 2
+  fi
+
+  if [[ "$mode" == "staged" ]]; then
+    prepare_index_workspace "$repo_root" "$scan_rel"
+    return
   fi
 
   # Read NUL-separated names (-z): plain --name-only C-quotes paths with
   # backslashes or non-ASCII bytes (e.g. systemd mount-unit names like
   # var-tmp-ai\x2dmachine.mount), and the quoted record then poisons the
   # rsync --files-from list with a nonexistent path (issue #98).
-  local raw_files=()
-  if [[ "$mode" == "staged" ]]; then
-    while IFS= read -r -d '' file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
-      git -C "$repo_root" diff --name-only -z --cached --diff-filter=ACMR
-    )
-  else
-    while IFS= read -r -d '' file; do [[ -n "$file" ]] && raw_files+=("$file"); done < <(
-      git -C "$repo_root" diff --name-only -z --diff-filter=ACMR HEAD
-    )
+  local raw_files=() file
+  local raw_list="$TMPDIR_RUN/git_changes.0" git_err="$TMPDIR_RUN/git_changes.err"
+  if ! git -C "$repo_root" diff --name-only -z --no-ext-diff --diff-filter=ACMRT HEAD -- >"$raw_list" 2>"$git_err"; then
+    report_copy_failure git 2 "$git_err"
+    refuse_scan "git-diff-failed" "Could not enumerate changes against HEAD" ""
   fi
+  while IFS= read -r -d '' file; do [[ -n "$file" ]] && raw_files+=("$file"); done < "$raw_list"
 
   local files=()
   if [[ -n "$scan_rel" ]]; then
@@ -3520,27 +3640,22 @@ prepare_git_workspace(){
   # Apply .ubsignore / GLOBAL_EXCLUDE_PATTERNS filtering to the staged file list
   # so that ignored paths are never copied into the shadow workspace.
   if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#files[@]} -gt 0 ]] && need_cmd python3; then
-    local filtered_csv
+    local filtered_list="$TMPDIR_RUN/git_filtered.0"
     ensure_ignore_matcher
-    filtered_csv=$(printf '%s\n' "${files[@]}" | UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 -c "
+    if ! printf '%s\0' "${files[@]}" | UBS_IGNORE_MATCHER_DIR="$IGNORE_MATCHER_DIR" python3 -c "
 import os, sys
 sys.path.insert(0, os.environ['UBS_IGNORE_MATCHER_DIR'])
 from ubs_ignore import IgnoreMatcher
 matcher = IgnoreMatcher(sys.argv[1])
-for line in sys.stdin:
-    f = line.rstrip('\n')
+for raw in sys.stdin.buffer.read().split(b'\0'):
+    f = os.fsdecode(raw)
     if f and not matcher.excluded(f):
-        print(f)
-" "$GLOBAL_EXCLUDE_PATTERNS" 2>/dev/null) || true
-    if [[ -n "$filtered_csv" ]]; then
-      local filtered_files=()
-      while IFS= read -r f; do
-        [[ -n "$f" ]] && filtered_files+=("$f")
-      done <<<"$filtered_csv"
-      files=("${filtered_files[@]}")
-    else
-      files=()
+        sys.stdout.buffer.write(raw + b'\0')
+" "$GLOBAL_EXCLUDE_PATTERNS" >"$filtered_list"; then
+      refuse_scan "git-diff-failed" "Could not filter changed files" ""
     fi
+    files=()
+    while IFS= read -r -d '' file; do files+=("$file"); done < "$filtered_list"
   fi
 
   if [[ ${#files[@]} -eq 0 ]]; then
@@ -3549,7 +3664,6 @@ for line in sys.stdin:
   fi
   
   local dest="$TMPDIR_RUN/git_scan"
-  rm -rf "$dest" 2>/dev/null || true
   ensure_dir "$dest"
 
   say "${BLUE}${INFO} Preparing shadow workspace for $mode files (${#files[@]} detected)${RESET}"

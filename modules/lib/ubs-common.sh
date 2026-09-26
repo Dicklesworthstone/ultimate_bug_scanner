@@ -762,16 +762,18 @@ ubs_list_files(){
   done
   [[ -d "$dir" ]] || return 0
   if [[ -n "$files_from" && -f "$files_from" ]]; then
-    local f
-    while IFS= read -r -d '' f || [[ -n "$f" ]]; do
-      f="${f%$'\n'}"
+    local f delimiter=$'\n'
+    # Detect the list's delimiter before reading it. Translating all newlines
+    # to NUL corrupts an already NUL-delimited filename containing a newline.
+    if IFS= read -r -d '' f < "$files_from"; then delimiter=''; fi
+    while IFS= read -r -d "$delimiter" f || [[ -n "$f" ]]; do
       [[ -z "$f" ]] && continue
       if [[ "$f" == /* ]]; then
         [[ -f "$f" ]] && printf '%s\0' "$f"
       elif [[ -f "$dir/$f" ]]; then
         printf '%s\0' "$dir/$f"
       fi
-    done < <(tr '\n' '\0' < "$files_from"; printf '\0')
+    done < "$files_from"
     return 0
   fi
   local -a rg_args=(--files -0 --no-messages)

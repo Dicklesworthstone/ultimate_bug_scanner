@@ -240,12 +240,16 @@ class FindingsMergeTests(unittest.TestCase):
                                              "severity": "warning", "message": f"diagnostic {number} " + "detail " * 35}) + "\n")
             combined = root / "combined.json"
             combined.write_text(json.dumps(SUMMARY_DOC), encoding="utf-8")
+            # Linux ru_maxrss can retain the parent runner's resident size
+            # across fork/exec. VmHWM measures the child's current executable
+            # image and retains peaks even after its allocations are freed.
             code = (
-                "import json, pathlib, resource, sys\n"
+                "import json, pathlib, sys\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "from ubs_core.findings_merge import merge\n"
                 "count = merge(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))\n"
-                "print(json.dumps({'count':count,'rss':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}))\n"
+                "peak = next(int(line.split()[1]) for line in pathlib.Path('/proc/self/status').read_text().splitlines() if line.startswith('VmHWM:'))\n"
+                "print(json.dumps({'count':count,'rss':peak}))\n"
             )
             proc = subprocess.run([sys.executable, "-c", code, str(HELPERS_DIR), str(root), str(combined)],
                                   capture_output=True, text=True, timeout=120, check=False)

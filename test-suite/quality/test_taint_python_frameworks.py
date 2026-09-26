@@ -130,6 +130,297 @@ class FastAPIInputTests(SourceTest):
         ''')
 
 
+class DependencyInputTests(SourceTest):
+    def test_local_dependency_return_becomes_a_handler_input(self):
+        self.assert_rules('''
+            from fastapi import Depends, Query
+            def obtain(q=Query()):
+                return q
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''', 'eval')
+
+    def test_plain_dependency_arguments_are_request_parameters(self):
+        self.assert_rules('''
+            from fastapi import Depends
+            def obtain(q: str = 'default'):
+                return q
+            def endpoint(code=Depends(obtain)):
+                cursor.execute(code)
+        ''', 'sql')
+        self.assert_rules("def ordinary(q: str = 'default'):\n    eval(q)\n")
+
+    def test_annotated_dependency_alias_and_keyword_callable(self):
+        self.assert_rules('''
+            from fastapi import Depends as D
+            from typing import Annotated as A
+            def obtain(q: str):
+                return q
+            Code = A[str, D(dependency=obtain)]
+            def endpoint(code: Code):
+                eval(code)
+        ''', 'eval')
+
+    def test_nested_dependencies_preserve_source_provenance(self):
+        findings = self.assert_rules('''
+            from fastapi import Depends, Cookie
+            def obtain(q=Cookie()):
+                return q
+            async def decorate(code=Depends(obtain)):
+                return 'select ' + code
+            async def endpoint(query=Depends(decorate)):
+                cursor.execute(query)
+        ''', 'sql')
+        self.assertIn('Cookie', findings[0]['message'])
+        self.assertIn('decorate()', findings[0]['message'])
+
+    def test_deep_dependency_chain_has_no_arbitrary_depth_cutoff(self):
+        code = 'from fastapi import Depends\ndef d0(q: str):\n    return q\n'
+        for i in range(1, 24):
+            code += f'def d{i}(q=Depends(d{i-1})):\n    return q\n'
+        code += 'def endpoint(code=Depends(d23)):\n    eval(code)\n'
+        self.assert_rules(code, 'eval')
+
+    def test_dependency_sink_side_effects_are_analyzed(self):
+        self.assert_rules('''
+            from fastapi import Depends
+            def validate(q: str):
+                eval(q)
+                return 'safe'
+            def endpoint(code=Depends(validate)):
+                pass
+        ''', 'eval')
+
+    def test_route_decorator_dependencies_are_invocations(self):
+        self.assert_rules('''
+            from fastapi import Depends, FastAPI
+            app = FastAPI()
+            def validate(q: str):
+                eval(q)
+            @app.get('/', dependencies=[Depends(validate)])
+            def endpoint():
+                pass
+        ''', 'eval')
+
+    def test_constant_dependency_return_does_not_inherit_unused_input(self):
+        self.assert_rules('''
+            from fastapi import Depends, Query
+            def obtain(q=Query()):
+                return 'trusted'
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''')
+
+    def test_returned_sanitizer_is_only_valid_in_its_sink_domain(self):
+        code = '''
+            from fastapi import Depends, Query
+            def obtain(q=Query()):
+                return html.escape(q)
+            def endpoint(code=Depends(obtain)):
+                SINK
+        '''
+        self.assert_rules(code.replace('SINK', 'HttpResponse(code)'))
+        self.assert_rules(code.replace('SINK', 'cursor.execute(code)'), 'sql')
+
+    def test_yielding_dependency_exposes_the_yielded_value(self):
+        self.assert_rules('''
+            from fastapi import Depends, Query
+            def obtain(q=Query()):
+                yield q
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            from fastapi import Depends, Query
+            def obtain(q=Query()):
+                yield 'trusted'
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''')
+
+    def test_security_uses_the_same_dependency_summary(self):
+        self.assert_rules('''
+            from fastapi import Security, Header
+            def obtain(q=Header()):
+                return q
+            def endpoint(code=Security(obtain, scopes=['read'])):
+                eval(code)
+        ''', 'eval')
+
+    def test_rebinding_does_not_change_a_captured_dependency(self):
+        self.assert_rules('''
+            from fastapi import Depends
+            def obtain(q: str):
+                return q
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+            obtain = other
+        ''', 'eval')
+        self.assert_rules('''
+            from fastapi import Depends
+            def obtain(q: str):
+                return q
+            obtain = other
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''')
+
+    def test_generator_return_summary_propagates_to_ordinary_consumers(self):
+        self.assert_rules('''
+            def values(q):
+                yield q
+            for code in values(input()):
+                eval(code)
+        ''', 'eval')
+
+    def test_sanitized_global_is_rechecked_after_summary_substitution(self):
+        self.assert_rules('''
+            value = html.escape(input())
+            def endpoint():
+                HttpResponse(value)
+        ''')
+        self.assert_rules('''
+            value = html.escape(input())
+            def endpoint():
+                cursor.execute(value)
+        ''', 'sql')
+
+    def test_dependency_callable_binding_is_captured_before_later_arguments(self):
+        code = '''
+            from fastapi import Depends
+            def unsafe(q: str):
+                return q
+            def trusted(q: str):
+                return 'trusted'
+            provider = FIRST
+            def endpoint(code=Depends(provider, use_cache=(provider := SECOND))):
+                eval(code)
+        '''
+        self.assert_rules(code.replace('FIRST', 'unsafe').replace('SECOND', 'trusted'), 'eval')
+        self.assert_rules(code.replace('FIRST', 'trusted').replace('SECOND', 'unsafe'))
+
+    def test_constructed_and_annotated_dependencies_retain_callable_identity(self):
+        code = '''
+            from fastapi import Depends
+            from typing import Annotated
+            def unsafe(q: str):
+                return q
+            def trusted(q: str):
+                return 'trusted'
+            provider = FIRST
+            marker = Depends(provider)
+            Code = Annotated[str, marker, (provider := SECOND)]
+            def endpoint(code: Code):
+                eval(code)
+        '''
+        self.assert_rules(code.replace('FIRST', 'unsafe').replace('SECOND', 'trusted'), 'eval')
+        self.assert_rules(code.replace('FIRST', 'trusted').replace('SECOND', 'unsafe'))
+
+    def test_literal_keyword_mappings_preserve_dependency_invocations(self):
+        for marker in ('Depends', 'Security'):
+            with self.subTest(marker=marker):
+                code = f'''
+                    from fastapi import {marker}
+                    def obtain(q: str):
+                        return VALUE
+                    def endpoint(code={marker}(**{{'dependency': obtain}})):
+                        eval(code)
+                '''
+                self.assert_rules(code.replace('VALUE', 'q'), 'eval')
+                self.assert_rules(code.replace('VALUE', "'trusted'"))
+        code = '''
+            from fastapi import Depends, FastAPI
+            app = ROUTER
+            def validate(q: str):
+                eval(q)
+            @app.get('/', **{'dependencies': [Depends(validate)]})
+            def endpoint():
+                pass
+        '''
+        self.assert_rules(code.replace('ROUTER', 'FastAPI()'), 'eval')
+        self.assert_rules(code.replace('ROUTER', 'cache'))
+
+    def test_assignment_expressions_retain_dependency_and_metadata_bindings(self):
+        code = '''
+            from fastapi import Depends
+            from typing import Annotated
+            def unsafe(q: str):
+                return q
+            def trusted(q: str):
+                return 'trusted'
+            def endpoint(code=Depends((provider := PROVIDER))):
+                eval(code)
+        '''
+        self.assert_rules(code.replace('PROVIDER', 'unsafe'), 'eval')
+        self.assert_rules(code.replace('PROVIDER', 'trusted'))
+        code = code[:code.index('            def endpoint')] + '''
+            Code = Annotated[str, Depends(unsafe), (marker := Depends(PROVIDER))]
+            def endpoint(code: Code):
+                eval(code)
+        '''
+        self.assert_rules(code.replace('PROVIDER', 'unsafe'), 'eval')
+        self.assert_rules(code.replace('PROVIDER', 'trusted'))
+
+    def test_route_dependency_binding_precedes_later_keyword_reassignment(self):
+        code = '''
+            from fastapi import Depends, FastAPI
+            app = FastAPI()
+            def unsafe(q: str):
+                eval(q)
+            def trusted(q: str):
+                pass
+            provider = FIRST
+            @app.get('/', dependencies=[Depends(provider)], openapi_extra=(provider := SECOND))
+            def endpoint():
+                pass
+        '''
+        self.assert_rules(code.replace('FIRST', 'unsafe').replace('SECOND', 'trusted'), 'eval')
+        self.assert_rules(code.replace('FIRST', 'trusted').replace('SECOND', 'unsafe'))
+        self.assert_rules('''
+            from fastapi import Depends, FastAPI
+            app = FastAPI()
+            def validate(q: str):
+                eval(q)
+            @app.get('/')
+            @cache.get(dependencies=[Depends(validate)])
+            def endpoint():
+                pass
+        ''')
+
+    def test_generator_return_is_separate_from_injected_yielded_value(self):
+        self.assert_rules('''
+            from fastapi import Depends
+            def obtain(q: str):
+                yield 'trusted'
+                return q
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''')
+        findings = self.assert_rules('''
+            from fastapi import Depends
+            def child(q):
+                yield 'trusted'
+                return q
+            def obtain(q: str):
+                value = yield from child(q)
+                eval(value)
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+        ''', 'eval')
+        self.assertEqual([finding['line'] for finding in findings], [7])
+
+    def test_framework_provider_inputs_do_not_taint_ordinary_clean_calls(self):
+        findings = self.assert_rules('''
+            from fastapi import Depends
+            def obtain(q: str):
+                return q
+            def endpoint(code=Depends(obtain)):
+                eval(code)
+            eval(obtain('trusted'))
+        ''', 'eval')
+        self.assertEqual([finding['line'] for finding in findings], [5])
+
+
 class TypedRequestTests(SourceTest):
     def test_request_members_are_sources_regardless_of_parameter_name(self):
         for import_ in ('from fastapi import Request', 'from starlette.requests import Request'):
@@ -184,6 +475,10 @@ class FrameworkRunnerTests(unittest.TestCase):
             ('typed-request', 'from fastapi import Request\ndef endpoint(incoming: Request):\n    HttpResponse(incoming.query_params["q"])\n', 'xss', 3),
             ('safe-sql', 'from fastapi import Query\ndef endpoint(q=Query()):\n    cursor.execute("select ?", (q,))\n', None, None),
             ('safe-html', 'from fastapi import Query\ndef endpoint(q=Query()):\n    HttpResponse(html.escape(q))\n', None, None),
+            ('dependency-sql', 'from fastapi import Depends\ndef obtain(q: str):\n    return q\ndef endpoint(code=Depends(obtain)):\n    cursor.execute(code)\n', 'sql', 5),
+            ('dependency-safe-html', 'from fastapi import Depends\ndef obtain(q: str):\n    return html.escape(q)\ndef endpoint(code=Depends(obtain)):\n    HttpResponse(code)\n', None, None),
+            ('dependency-yield', 'from fastapi import Depends\ndef obtain(q: str):\n    yield q\ndef endpoint(code=Depends(obtain)):\n    eval(code)\n', 'eval', 5),
+            ('dependency-side-effect', 'from fastapi import Depends, FastAPI\napp = FastAPI()\ndef validate(q: str):\n    eval(q)\n@app.get("/", dependencies=[Depends(validate)])\ndef endpoint():\n    pass\n', 'eval', 4),
         )
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-framework-sources'
         artifacts.mkdir(parents=True, exist_ok=True)

@@ -79,6 +79,7 @@ _REQUEST_MEMBERS = {'args', 'get_json', 'json', 'form', 'values', 'data', 'body'
 class _FrameworkInput:
     kind: str
     name: str
+    dependency: ast.FunctionDef | ast.AsyncFunctionDef | None = None
 
 
 def _imported_name(node, bindings):
@@ -92,8 +93,31 @@ def _imported_name(node, bindings):
     return ''
 
 
-def _framework_input(node, bindings, *, annotation_strings=False):
+def _keyword_argument(node, name):
+    """Find an explicit keyword or its equivalent in a literal ** mapping."""
+    for keyword in node.keywords:
+        if keyword.arg == name:
+            return keyword.value
+        if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+            for key, value in zip(keyword.value.keys, keyword.value.values):
+                if isinstance(key, ast.Constant) and key.value == name:
+                    return value
+    return None
+
+
+def _dependency_target(node, bindings, evaluated=None):
+    argument = node.args[0] if node.args else _keyword_argument(node, 'dependency')
+    if evaluated is not None:
+        target = evaluated.get(argument)
+    else:
+        target = bindings.get(argument.id) if isinstance(argument, ast.Name) else None
+    return target if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+
+
+def _framework_input(node, bindings, *, annotation_strings=False, evaluated=None):
     """Interpret parameter metadata without evaluating annotations or imports."""
+    if evaluated is not None and isinstance(evaluated.get(node), _FrameworkInput):
+        return evaluated[node]
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         if not annotation_strings:
             return None
@@ -118,14 +142,14 @@ def _framework_input(node, bindings, *, annotation_strings=False):
             return _FrameworkInput('source', name)
         if name in _DEPENDENCY_MARKERS:
             # A dependency may supply a trusted service, not request data.
-            return _FrameworkInput('dependency', name)
+            return _FrameworkInput('dependency', name, _dependency_target(node, bindings, evaluated))
     if isinstance(node, ast.Subscript) and _imported_name(node.value, bindings) in {
             'typing.Annotated', 'typing_extensions.Annotated'}:
         parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
         for index in reversed(range(len(parts))):
             # Only the type position accepts a forward reference. Metadata
             # strings such as "Depends(service)" remain inert Python values.
-            found = _framework_input(parts[index], bindings, annotation_strings=index == 0)
+            found = _framework_input(parts[index], bindings, annotation_strings=index == 0, evaluated=evaluated)
             if found is not None:
                 return found
     return None
@@ -269,6 +293,9 @@ class FunctionSummary:
     # (kind, line, column, label, data). Symbolic parameters are substituted
     # at call sites; concrete request sources also stand alone in handlers.
     effects: tuple = ()
+    # A generator's final return is StopIteration.value, not its yielded data.
+    # Dependencies and ordinary iteration consume only the yielded values.
+    yielded: Fact = CLEAN
 
 
 class _Flow:
@@ -276,6 +303,7 @@ class _Flow:
         self.engine = engine
         self.scope = scope
         self.returned = CLEAN
+        self.yielded = CLEAN
         self.effects = {}
         self.breaks = []
         self.continues = []
@@ -283,6 +311,7 @@ class _Flow:
         self.stopped = []
         self.expression_facts = {}
         self.expression_bindings = {}
+        self.generator_returns = {}
 
     def effect(self, kind, node, label, fact):
         unsafe = frozenset(trace for trace in fact if not _safe_for(trace, kind, label))
@@ -430,7 +459,11 @@ class _Flow:
                 key = (kind, line, column, label)
                 if propagated:
                     self.effects[key] = join_facts(self.effects.get(key, CLEAN), propagated)
-            return self.substitute(summary.returned, bound, f'{function.name}()')
+            returned = self.substitute(summary.returned, bound, f'{function.name}()')
+            if function in self.engine.generators:
+                self.generator_returns[node] = returned
+                return self.substitute(summary.yielded, bound, f'{function.name}()')
+            return returned
         fact = join_facts(receiver, *arguments, *keywords.values(), self.source(node, state))
         first = arguments[0] if arguments else CLEAN
 
@@ -502,15 +535,27 @@ class _Flow:
                 elif imported_call in _PARAMETER_MARKERS:
                     binding = _FrameworkInput('source', imported_call)
                 elif imported_call in _DEPENDENCY_MARKERS:
-                    binding = _FrameworkInput('dependency', imported_call)
+                    binding = _FrameworkInput('dependency', imported_call,
+                                              _dependency_target(node, state.bindings, self.expression_bindings))
             if isinstance(node, ast.Subscript):
-                binding = _framework_input(node, state.bindings)
+                binding = _framework_input(node, state.bindings, evaluated=self.expression_bindings)
+            if isinstance(node, ast.NamedExpr):
+                binding = self.expression_bindings.get(node.value)
+            if isinstance(node, (ast.Tuple, ast.List)):
+                markers = tuple(self.expression_bindings.get(item) for item in node.elts)
+                if any(isinstance(marker, _FrameworkInput) for marker in markers):
+                    binding = markers
             self.expression_bindings[node] = binding
         return fact
 
     def expression(self, node, state):
         if node is None or isinstance(node, ast.Constant):
             return CLEAN
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            self.yielded = join_facts(self.yielded, self.expr(node.value, state))
+            # yield-from evaluates to the delegate's final return; an ordinary
+            # yield expression instead receives a future send() value.
+            return self.generator_returns.get(node.value, CLEAN) if isinstance(node, ast.YieldFrom) else CLEAN
         if isinstance(node, ast.Lambda):
             signature = node.args
             positional = [*signature.posonlyargs, *signature.args]
@@ -587,11 +632,18 @@ class _Flow:
             # Decorator expressions run before defaults. Preserve the real
             # router identity even if a later default rebinds its name.
             route = False
+            route_dependencies = []
             for decorator in node.decorator_list:
-                if isinstance(decorator, ast.Call) and _imported_name(decorator.func, state.bindings) in {
-                        f'@fastapi.router.{method}' for method in _ROUTE_METHODS}:
-                    route = True
+                is_route = isinstance(decorator, ast.Call) and _imported_name(decorator.func, state.bindings) in {
+                    f'@fastapi.router.{method}' for method in _ROUTE_METHODS}
+                route = route or is_route
                 self.expr(decorator, state)
+                if is_route:
+                    markers = self.expression_bindings.get(_keyword_argument(decorator, 'dependencies'))
+                    if isinstance(markers, tuple):
+                        route_dependencies.extend(marker.dependency for marker in markers
+                                                  if isinstance(marker, _FrameworkInput)
+                                                  and marker.dependency is not None)
             positional = [*node.args.posonlyargs, *node.args.args]
             defaults = dict(zip((arg.arg for arg in positional[-len(node.args.defaults):]), node.args.defaults)) if node.args.defaults else {}
             defaults.update((arg.arg, default) for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
@@ -604,7 +656,7 @@ class _Flow:
                 if isinstance(description, _FrameworkInput):
                     default_inputs[name] = description
             self.engine.defaults[node] = default_facts
-            self.engine.describe_framework(node, default_inputs, state.bindings, route)
+            self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
             state[node.name] = CLEAN
             state.bindings[node.name] = node
         elif isinstance(node, ast.ClassDef):
@@ -736,7 +788,7 @@ class _Flow:
         return _join_states(normal, *exits)
 
     def summary(self):
-        return FunctionSummary(self.returned, tuple((*key, fact) for key, fact in sorted(self.effects.items())))
+        return FunctionSummary(self.returned, tuple((*key, fact) for key, fact in sorted(self.effects.items())), self.yielded)
 
 
 class _Analysis:
@@ -745,8 +797,11 @@ class _Analysis:
         self.summaries = {}
         self.defaults = {}
         self.framework_inputs = {}
+        self.framework_dependencies = {}
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        self.generators = {function for function in self.functions
+                           if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in _scope_nodes(function))}
         self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
         self.global_names = self.locals[tree]
         self.closures = {}
@@ -764,22 +819,53 @@ class _Analysis:
             node = self.parents.get(node)
         return node
 
-    def describe_framework(self, function, default_inputs, bindings, route):
+    def describe_framework(self, function, default_inputs, bindings, route, route_dependencies):
         inputs = {}
         for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
             description = (default_inputs.get(arg.arg)
                            or _framework_input(arg.annotation, bindings, annotation_strings=True))
-            if description is None and route:
-                description = _FrameworkInput('source', 'fastapi.request')
+            if description is None:
+                description = _FrameworkInput('source' if route else 'implicit', 'fastapi.request')
             if description is not None:
                 inputs[arg.arg] = description
         # Capture import identities at the definition, before later rebinding.
         self.framework_inputs[function] = inputs
+        self.framework_dependencies[function] = tuple(route_dependencies)
 
-    def framework_bound(self, function):
-        return {name: frozenset({TaintTrace(description.name, path=(description.name, name))})
-                for name, description in self.framework_inputs.get(function, {}).items()
-                if description.kind == 'source'}
+    def framework_bound(self, globals_):
+        """Solve local dependency values on the same finite taint lattice.
+
+        Framework invocation is distinct from ordinary Python calls: provider
+        parameters may be request inputs, but their callers receive only the
+        provider's returned/yielded value, including its sanitizer domain.
+        """
+        providers = {description.dependency for inputs in self.framework_inputs.values()
+                     for description in inputs.values() if description.dependency is not None}
+        providers.update(provider for values in self.framework_dependencies.values() for provider in values)
+        bound = {
+            function: {name: frozenset({TaintTrace(description.name, path=(description.name, name))})
+                       for name, description in inputs.items()
+                       if description.kind == 'source' or (description.kind == 'implicit' and function in providers)}
+            for function, inputs in self.framework_inputs.items()
+        }
+        global_bound = {f'@global:{name}': value for name, value in globals_.items()}
+        while True:
+            changed = False
+            for function, inputs in self.framework_inputs.items():
+                for name, description in inputs.items():
+                    provider = description.dependency
+                    if provider is None:
+                        continue
+                    summary = self.summaries.get(provider, FunctionSummary())
+                    delivered = summary.yielded if provider in self.generators else summary.returned
+                    incoming = _Flow.substitute(delivered, {**global_bound, **bound.get(provider, {})}, provider.name + '()')
+                    previous = bound[function].get(name, CLEAN)
+                    updated = join_facts(previous, incoming)
+                    if updated != previous:
+                        bound[function][name] = updated
+                        changed = True
+            if not changed:
+                return bound
 
     def analyze(self):
         # A summary contains only finite source/parameter/sanitizer facts.
@@ -821,15 +907,17 @@ class _Analysis:
                 flows.append(flow)
             if not changed:
                 effects = {}
+                framework_bound = self.framework_bound(globals_)
                 for flow in flows:
                     for key, fact in flow.effects.items():
                         if flow is not module:
                             bound = {f'@global:{name}': value for name, value in globals_.items()}
                             # Framework invocation is a separate entry point;
                             # summaries remain symbolic for ordinary callers.
-                            bound.update(self.framework_bound(flow.scope))
+                            bound.update(framework_bound.get(flow.scope, {}))
                             fact = flow.substitute(fact, bound, flow.scope.name + '()')
-                        concrete = frozenset(trace for trace in fact if trace.parameter is None)
+                        concrete = frozenset(trace for trace in fact if trace.parameter is None
+                                             and not _safe_for(trace, key[0], key[3]))
                         if concrete:
                             effects[key] = join_facts(effects.get(key, CLEAN), concrete)
                 return effects

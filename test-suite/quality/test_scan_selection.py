@@ -728,14 +728,17 @@ class PostprocessStreamingTests(unittest.TestCase):
                 stream.write(block)
             stream.write("Files scanned: 1\nCritical issues: 0\nWarning issues: 400000\nInfo items: 0\n")
         peak = self.root / "peak-rss.txt"
+        # Linux ru_maxrss can include the test runner's resident size before
+        # exec. VmHWM retains this executable's peak, including freed buffers.
         wrapper = (
-            "import pathlib, resource, runpy, sys\n"
+            "import pathlib, runpy, sys\n"
             "peak = pathlib.Path(sys.argv.pop(1))\n"
             "sys.argv = sys.argv[1:]\n"
             "try:\n"
             "    runpy.run_path(sys.argv[0], run_name='__main__')\n"
             "finally:\n"
-            "    peak.write_text(str(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))\n"
+            "    high_water = next(line.split()[1] for line in pathlib.Path('/proc/self/status').read_text().splitlines() if line.startswith('VmHWM:'))\n"
+            "    peak.write_text(high_water)\n"
         )
         result = run_helper([sys.executable, "-c", wrapper, str(peak),
                              *self.command(**{"no-suppress": "1"})[1:]], text=True)

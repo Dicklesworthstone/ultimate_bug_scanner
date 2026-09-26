@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import stat
 import struct
@@ -33,6 +34,7 @@ if os.environ.get('SCAN_SLEEP'): time.sleep(float(os.environ['SCAN_SLEEP']))
 records = [(p, pathlib.Path(p).read_text()) for p in files]
 code = 1 if any('BUG' in text for _, text in records) else 0
 if os.environ.get('SCAN_ERROR'): code = 2
+code = int(os.environ.get('SCAN_STATUS', code))
 print(json.dumps({'files': records, 'args': args, 'cwd': os.getcwd()}))
 print('scanner diagnostics', file=sys.stderr)
 sys.exit(code)
@@ -57,9 +59,12 @@ class ServiceTests(unittest.TestCase):
         (self.work / 'modules').mkdir()
         self.source = self.root / 'a.py'
         self.source.write_text('clean')
-        self.env = dict(os.environ, XDG_RUNTIME_DIR=str(self.runtime), HOME=str(self.home),
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'CLAUDE_', 'SCAN_'))
+                    and key not in {'ENABLE_UV_TOOLS', 'UV_TOOLS'}}
+        self.env.update(XDG_RUNTIME_DIR=str(self.runtime), HOME=str(self.home),
                         XDG_CONFIG_HOME=str(self.home / '.config'), XDG_CACHE_HOME=str(self.work / 'cache'),
-                        SCAN_COUNT=str(self.work / 'count'), PYTHONDONTWRITEBYTECODE='1')
+                        SCAN_COUNT=str(self.work / 'count'), PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1')
         self.environment = patch.dict(os.environ, self.env, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
@@ -255,11 +260,44 @@ class ServiceTests(unittest.TestCase):
         with patch.dict(os.environ, {'UBS_MODULE_DIR': str(self.work / 'custom')}):
             self.assertIsNone(daemon.snapshot(self.root, self.scanner))
 
+    def test_external_git_metadata_and_inherited_root_disable_reuse(self):
+        with patch.dict(os.environ, {'GIT_INDEX_FILE': '/outside/index'}):
+            self.assertIsNone(daemon.snapshot(self.root, self.scanner))
+        (self.root / '.git').write_text('gitdir: ../external-metadata\n')
+        self.assertIsNone(daemon.snapshot(self.root, self.scanner))
+        child = self.root / 'nested'
+        child.mkdir()
+        self.assertIsNone(daemon.snapshot(child, self.scanner))
+
+    def test_git_config_external_includes_and_excludes_disable_reuse(self):
+        git_config = self.home / '.gitconfig'
+        for content in ('[include]\npath = /outside/config\n', '[core]\nexcludesFile = /outside/ignore\n',
+                        '#' * 65530 + '\n[include]\npath = /outside/config\n'):
+            with self.subTest(content=content):
+                git_config.write_text(content)
+                self.assertIsNone(daemon.snapshot(self.root, self.scanner))
+
+    def test_live_dependency_audits_are_not_reused_as_source_only_reports(self):
+        request = self.request(format='text')
+        self.assertFalse(self.service.handle(request)['cached'])
+        self.assertFalse(self.service.handle(request)['cached'])
+        with patch.dict(os.environ, {'ENABLE_UV_TOOLS': '0'}):
+            native = daemon.ScanService(self.root, self.scanner, 10, 1024 * 1024)
+            request = self.request(format='text')
+            self.assertFalse(native.handle(request)['cached'])
+            self.assertTrue(native.handle(request)['cached'])
+
     def test_directory_inventory_limit_is_bounded(self):
         for index in range(12):
             (self.root / str(index)).write_text('')
         with patch.object(daemon, 'MAX_SNAPSHOT_ENTRIES', 5):
             self.assertIsNone(daemon.snapshot(self.root, self.scanner))
+
+    def test_lifecycle_commands_cannot_silently_ignore_scan_policy(self):
+        for option in ('--profile=strict', '--fail-on-warning', '--format=text', '--require-daemon'):
+            with self.subTest(option=option), patch.object(daemon, 'serve', return_value=0):
+                self.assertEqual(daemon.main(['serve', '--repo', str(self.root),
+                                               '--scanner', str(self.scanner), option]), 2)
 
     def test_client_falls_back_only_when_daemon_is_absent_or_context_differs(self):
         self.assertEqual(self.cli('client', 'a.py').returncode, 0)
@@ -307,6 +345,155 @@ class RealScannerTests(unittest.TestCase):
         self.assertEqual(changed['exit_code'], 0, changed['stderr'])
         self.assertEqual(json.loads(changed['stdout']).get('findings', []), [])
         print(f'[daemon-real] warm_request_ms={warm["elapsed_ms"]} cold_request_ms={cold["elapsed_ms"]}', flush=True)
+
+    def test_actual_save_hook_uses_a_warm_service_then_rescans_the_edit(self):
+        # Exercise native source analysis, not online dependency auditing.
+        # The environment is identical for the daemon, client and scanner.
+        self.env['ENABLE_UV_TOOLS'] = '0'
+        os.environ['ENABLE_UV_TOOLS'] = '0'
+        self.env['PATH'] = str(ROOT) + os.pathsep + self.env['PATH']
+        os.environ['PATH'] = self.env['PATH']
+        self.env['CLAUDE_PROJECT_DIR'] = str(self.root)
+        os.environ['CLAUDE_PROJECT_DIR'] = str(self.root)
+        self.source.write_text('eval(input())\n')
+        self.start(scanner=ROOT / 'ubs')
+        payload = json.dumps({'tool_name': 'Write', 'tool_input': {'file_path': str(self.source)}})
+        def invoke():
+            return subprocess.run(['bash', str(ROOT / '.claude/hooks/on-file-write.sh')],
+                                  input=payload, env=self.env, cwd=self.root,
+                                  capture_output=True, text=True, timeout=130)
+        result = invoke()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('UBS found critical issues', result.stderr)
+        self.assertNotIn('NOT been verified', result.stderr)
+        self.assertEqual(result.stdout, '')
+        cached = daemon.request_service(self.root, self.request(scanner=str(ROOT / 'ubs'), format='text'), 130)
+        self.assertTrue(cached['cached'], cached)
+        self.assertEqual(cached['exit_code'], 1, cached)
+        self.source.write_text('value = 1\n')
+        clean = invoke()
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertEqual(clean.stdout + clean.stderr, '')
+        print('[daemon-real-hook] finding, warm service reuse, edited clean result PASS', flush=True)
+
+
+@unittest.skipUnless(os.name == 'posix', 'The save-hook daemon integration requires POSIX')
+class SaveHookTests(unittest.TestCase):
+    start = ServiceTests.start
+
+    def setUp(self):
+        ServiceTests.setUp(self)
+        self.env['ENABLE_UV_TOOLS'] = '0'
+        os.environ['ENABLE_UV_TOOLS'] = '0'
+        subprocess.run(['git', 'init', '-q', str(self.root)], env=self.env, check=True)
+        self.bin = self.work / 'bin'
+        self.bin.mkdir()
+        (self.bin / 'ubs').symlink_to(self.scanner)
+        (self.bin / 'ubs-daemon').symlink_to(DAEMON)
+        self.env['PATH'] = str(self.bin) + os.pathsep + self.env['PATH']
+        os.environ['PATH'] = self.env['PATH']
+
+    def hook(self, source=None, *, env=None, payload=None):
+        if payload is None:
+            payload = json.dumps({'tool_name': 'Write', 'tool_input': {'file_path': str(source or self.source)}})
+        return subprocess.run([shutil.which('bash'), str(ROOT / '.claude/hooks/on-file-write.sh')],
+                              input=payload, env=env or self.env, cwd=self.root,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_hook_uses_live_service_and_repeated_edit_reuses_report(self):
+        self.source.write_text('BUG')
+        self.start()
+        for _ in range(2):
+            result = self.hook()
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('UBS found critical issues', result.stderr)
+            self.assertEqual(result.stdout, '')
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+        self.source.write_text('clean')
+        result = self.hook()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout + result.stderr, '')
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\nscan\n')
+
+    def test_missing_daemon_falls_back_to_real_one_shot_contract(self):
+        self.source.write_text('BUG')
+        result = self.hook()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('UBS found critical issues', result.stderr)
+        self.assertIn('--format=text', result.stderr)
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_no_frontend_on_path_still_scans_and_preserves_policy(self):
+        plain = self.work / 'one-shot-bin'
+        plain.mkdir()
+        (plain / 'ubs').symlink_to(self.scanner)
+        for name in ('cat', 'jq', 'python3', 'tail'):
+            found = shutil.which(name)
+            if found:
+                (plain / name).symlink_to(found)
+        result = self.hook(env=dict(self.env, PATH=str(plain)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_scan_failures_are_not_reported_as_findings_or_clean(self):
+        result = self.hook(env=dict(self.env, SCAN_ERROR='1'))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('NOT been verified', result.stderr)
+        self.assertNotIn('found critical issues', result.stderr)
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_protocol_error_does_not_trigger_a_second_scanner(self):
+        # An owned but wrong service path is a protocol/security failure, not
+        # an absent daemon. The hook must surface it rather than run UBS again.
+        path = daemon.socket_path(self.root, create=True)
+        path.write_text('not a socket')
+        result = self.hook()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('NOT been verified', result.stderr)
+        self.assertFalse(Path(self.env['SCAN_COUNT']).exists())
+
+    def test_missing_scanner_is_a_visible_verification_failure(self):
+        plain = self.work / 'missing-scanner-bin'
+        plain.mkdir()
+        for name in ('bash', 'cat', 'jq', 'python3', 'tail'):
+            found = shutil.which(name)
+            if found:
+                (plain / name).symlink_to(found)
+        result = self.hook(env=dict(self.env, PATH=str(plain)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('could not scan this edit', result.stderr)
+
+    def test_no_targets_and_non_source_writes_are_silent(self):
+        result = self.hook(env=dict(self.env, SCAN_STATUS='3'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout + result.stderr, '')
+        note = self.root / 'notes.md'
+        note.write_text('BUG')
+        result = self.hook(note)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout + result.stderr, '')
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_explicit_agent_project_root_confines_the_request(self):
+        outside = self.work / 'outside.py'
+        outside.write_text('BUG')
+        result = self.hook(outside, env=dict(self.env, CLAUDE_PROJECT_DIR=str(self.root)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('NOT been verified', result.stderr)
+        self.assertFalse(Path(self.env['SCAN_COUNT']).exists())
+
+    def test_paths_and_shell_sources_keep_argument_boundaries(self):
+        nested = self.root / 'nested\n'
+        nested.mkdir()
+        self.start()
+        for name in ('has space.py', 'has\nnewline.py', '--update.sh'):
+            source = nested / name
+            source.write_text('BUG')
+            with self.subTest(name=name):
+                result = self.hook(source)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('UBS found critical issues', result.stderr)
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n' * 3)
 
 
 if __name__ == '__main__':

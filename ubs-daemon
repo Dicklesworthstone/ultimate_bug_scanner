@@ -173,6 +173,10 @@ def snapshot(root: Path, scanner: Path) -> str | None:
     """
     if os.environ.get('UBS_MODULE_DIR') or os.environ.get('UBS_VERIFIED_ASSET_DIR'):
         return None  # The override can select runtime assets outside this graph.
+    if any(name.startswith('GIT_') for name in os.environ):
+        return None  # Git can redirect its index, metadata or config externally.
+    if any((parent / '.git').exists() for parent in root.parents):
+        return None  # A subdirectory can inherit selection policy outside root.
     digest = hashlib.sha256()
     total = 0
     seen = set()
@@ -223,15 +227,28 @@ def snapshot(root: Path, scanner: Path) -> str | None:
                         children.append(child)
                     pending.extend(sorted(children, reverse=True))
                 elif stat.S_ISREG(info.st_mode):
+                    if path.name == '.git':
+                        return None  # Linked worktree metadata is outside root.
                     if info.st_size > MAX_SNAPSHOT - total:
                         return None
                     before = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    git_config = (path.name == '.gitconfig' or path == config / 'git' / 'config'
+                                  or path.parent.name == '.git' and path.name in {'config', 'config.worktree'})
+                    config_tail = b''
                     with path.open('rb') as stream:
                         while chunk := stream.read(65536):
                             total += len(chunk)
                             if total > MAX_SNAPSHOT:
                                 return None
                             digest.update(chunk)
+                            if git_config:
+                                # Include/exclude targets are outside this
+                                # graph. Keep token matching bounded even for
+                                # oversized or concurrently growing config.
+                                contents = (config_tail + chunk).lower()
+                                if b'include' in contents or b'excludesfile' in contents:
+                                    return None
+                                config_tail = contents[-16:]
                     info = path.stat()
                     if before != (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns):
                         return None
@@ -309,7 +326,12 @@ class ScanService:
         if request.get('environment') != self.environment or request.get('scanner') != str(self.scanner):
             return {'protocol': PROTOCOL, 'unavailable': 'Invocation environment or scanner differs from the daemon'}
         started = time.monotonic()
-        before = snapshot(self.root, self.scanner) if self.cache_bytes else None
+        # The Python text producer can include live dependency-audit results.
+        # Its external environment/advisory database is not a source snapshot;
+        # reuse only when callers explicitly disable those optional tools.
+        live_audit = request.get('format', 'json') == 'text' and os.environ.get('ENABLE_UV_TOOLS') != '0' \
+            and any(path.suffix.lower() in {'.py', '.pyi', '.pyw', '.ipynb'} for path in paths)
+        before = snapshot(self.root, self.scanner) if self.cache_bytes and not live_audit else None
         key = (tuple(map(str, paths)), tuple(options), before)
         cached = self.cache.pop(key, None) if before is not None else None
         if cached is not None:
@@ -430,6 +452,9 @@ def main(argv=None) -> int:
             raise ServiceError('The local scan service requires a POSIX Unix-socket platform')
         if not 0 < args.idle_timeout <= 86400 or not 0 < args.scan_timeout <= 3600 or not 0 <= args.cache_mib <= 256:
             raise ServiceError('Timeouts/cache size are outside permitted bounds')
+        if args.command != 'client' and (args.profile is not None or args.fail_on_warning
+                                         or args.require_daemon or args.format != 'json'):
+            raise ServiceError('Scan policy and report options apply to client requests, not service lifecycle commands')
         root = Path(args.repo).resolve(strict=True)
         scanner = Path(args.scanner).resolve(strict=True)
         if not root.is_dir() or not scanner.is_file() or not os.access(scanner, os.X_OK):

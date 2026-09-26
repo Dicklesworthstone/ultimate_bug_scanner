@@ -1,0 +1,43 @@
+name: Local Scan Service
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs-daemon
+      - .claude/hooks/on-file-write.sh
+      - test-suite/quality/test_daemon.py
+      - .github/workflows/local-scan-service.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-service:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_DAEMON_E2E: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep shellcheck
+          npm install --global @ast-grep/cli
+      - name: Validate active service, hook, and scanner parity
+        run: |
+          bash -n .claude/hooks/on-file-write.sh
+          shellcheck -S warning .claude/hooks/on-file-write.sh
+          python3 -m unittest discover -s test-suite/quality -p test_daemon.py -v
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code

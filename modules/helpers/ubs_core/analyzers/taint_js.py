@@ -1,8 +1,9 @@
 """JavaScript/TypeScript taint analysis with sink-specific sanitizer effects.
 
 Executable-expression masks retain template interpolation and source offsets.
-Propagation is still flow-insensitive within a file; this is not a complete
-interprocedural or control-flow analysis (the remaining D6 work).
+Local functions use finite return/sink summaries and ordered assignment state.
+The lexical front end handles ordinary functions, arrows and structured blocks;
+cross-file calls, dynamic dispatch and the full JavaScript grammar are not modeled.
 
 Emit dialects:
 - main(argv) preserves the legacy output dialect: one
@@ -18,6 +19,7 @@ import sys
 from bisect import bisect_right
 from collections import defaultdict, deque
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -545,9 +547,897 @@ def record_taint(assignments, sink_rule: str | None = None):
 def format_path(path, sink_label):
     seq = list(path)
     if len(seq) >= PATH_LIMIT:
-        seq = seq[-(PATH_LIMIT-1):]
+        seq = [seq[0], *seq[-(PATH_LIMIT-2):]]
     seq.append(sink_label)
     return ' -> '.join(seq)
+
+
+@dataclass(frozen=True)
+class _Trace:
+    origin: tuple
+    # Evidence is deliberately outside equality: recursive calls cannot grow
+    # the finite fact lattice by repeatedly appending their names to a path.
+    path: tuple[str, ...] = field(default=(), compare=False)
+
+
+def _join(*facts):
+    traces = {}
+    for fact in facts:
+        for trace in fact:
+            previous = traces.get(trace)
+            if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
+                traces[trace] = trace
+    return frozenset(traces.values())
+
+
+def _step(fact, name):
+    traces = []
+    for trace in fact:
+        path = (*trace.path, name)
+        if len(path) > PATH_LIMIT:
+            path = (path[0], *path[-(PATH_LIMIT - 1):])
+        traces.append(_Trace(trace.origin, path))
+    return frozenset(traces)
+
+
+class _State(dict):
+    def __init__(self, values=(), bindings=None):
+        super().__init__(values)
+        self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
+
+    def copy(self):
+        return _State(self)
+
+    def __eq__(self, other):
+        return isinstance(other, _State) and dict.__eq__(self, other) and self.bindings == other.bindings
+
+
+def _join_states(*states):
+    states = [state for state in states if state is not None]
+    if not states:
+        return None
+    names = set().union(*(state.keys() for state in states))
+    bindings = {}
+    for name in set().union(*(state.bindings.keys() for state in states)):
+        candidates = [state.bindings.get(name) for state in states]
+        bindings[name] = candidates[0] if all(value is candidates[0] for value in candidates) else None
+    return _State({name: _join(*(state.get(name, frozenset()) for state in states)) for name in names}, bindings)
+
+
+@dataclass(eq=False)
+class _Scope:
+    start: int
+    end: int
+    body_start: int
+    body_end: int
+    name: str = ''
+    params: tuple = ()
+    declaration: bool = False
+    concise: bool = False
+    parent: object = None
+    children: list = field(default_factory=list)
+    code: str = ''
+    statements: list = field(default_factory=list)
+
+
+@dataclass
+class _Statement:
+    kind: str
+    start: int
+    end: int
+    body: list = field(default_factory=list)
+    alternate: list = field(default_factory=list)
+    extra: object = None
+
+
+def _pairs(code, start=0, end=None):
+    stack, pairs = [], {}
+    close_to_open = {')': '(', ']': '[', '}': '{'}
+    for index in range(start, len(code) if end is None else end):
+        char = code[index]
+        if char in '([{':
+            stack.append((char, index))
+        elif char in close_to_open and stack and stack[-1][0] == close_to_open[char]:
+            _, start = stack.pop()
+            pairs[start] = index
+            pairs[index] = start
+    return pairs
+
+
+def _chunks(code, start, end, separator=','):
+    """Split balanced lists without splitting strings or template expressions."""
+    pairs = _pairs(code, start, end)
+    cursor = part = start
+    while cursor < end:
+        if code[cursor] in '([{' and cursor in pairs:
+            cursor = pairs[cursor] + 1
+            continue
+        if code[cursor] == separator:
+            yield part, cursor
+            part = cursor + 1
+        cursor += 1
+    yield part, end
+
+
+def _parameters(text, code, start, end):
+    result = []
+    for left, right in _chunks(code, start, end):
+        parameter = text[left:right].strip()
+        if not parameter:
+            continue
+        rest = parameter.startswith('...')
+        _, equals = next(_chunks(code, left, right, '='))
+        declaration = text[left:equals].strip().removeprefix('...')
+        targets = _binding_names(declaration)
+        default = (equals + 1, right) if equals < right else None
+        result.append((tuple(targets), rest, default))
+    return tuple(result)
+
+
+def _binding_names(target):
+    target = target.strip()
+    if target.startswith(('{', '[')):
+        names = []
+        code = lexical_views(target)[1]
+        end = target.rfind('}' if target[0] == '{' else ']')
+        for left, right in _chunks(code, 1, end):
+            _, equals = next(_chunks(code, left, right, '='))
+            if target[0] == '{':
+                _, colon = next(_chunks(code, left, equals, ':'))
+                if colon < equals:
+                    left = colon + 1
+            names.extend(_binding_names(target[left:equals]))
+        return names
+    name = target.removeprefix('...').split(':', 1)[0].rstrip('?').strip()
+    return [name] if re.fullmatch(r'[A-Za-z_$][\w$]*', name) else []
+
+
+def _declaration_entries(text, code, start, end):
+    head = re.match(r'\s*(const|let|var)\b\s*', text[start:end])
+    if head is None:
+        return []
+    entries = []
+    for left, right in _chunks(code, start + head.end(), end):
+        _, equals = next(_chunks(code, left, right, '='))
+        entries.append((head.group(1), _binding_names(text[left:equals]),
+                        equals + 1 if equals < right else None, right))
+    return entries
+
+
+def _function_scopes(text, code):
+    """Recognize bounded lexical function forms; never import scanned code."""
+    pairs = _pairs(code)
+    scopes, body_starts = [], set()
+
+    def add(start, params_start, params_end, body, name='', declaration=False, concise=False):
+        if body in body_starts:
+            return
+        if concise:
+            end = expression_end(code, body)
+            for left, right in _chunks(code, body, end):
+                end = right
+                break
+            body_end = end
+        elif code[body:body + 1] == '{' and body in pairs:
+            body_end, end = pairs[body], pairs[body] + 1
+            body += 1
+        else:
+            return
+        body_starts.add(body if concise else body - 1)
+        scopes.append(_Scope(start, end, body, body_end, name,
+                             _parameters(text, code, params_start, params_end), declaration, concise))
+
+    for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(', code):
+        opening = match.end() - 1
+        closing = pairs.get(opening)
+        if closing is None:
+            continue
+        body = closing + 1
+        while body < len(code) and code[body].isspace():
+            body += 1
+        if code[body:body + 1] == ':':
+            body = code.find('{', body)
+        if body < 0:
+            continue
+        prefix = code[:match.start()].rstrip()
+        declaration = not prefix or prefix[-1] in ';{}' or bool(re.search(r'\b(?:export|default|async)\s*$', prefix))
+        if '\n' in code[max(prefix.rfind(';'), prefix.rfind('}')) + 1:match.start()] and not re.search(r'=\s*$', prefix):
+            declaration = True
+        add(match.start(), opening + 1, closing, body, match.group(1) or '', declaration)
+
+    for match in re.finditer(r'=>', code):
+        before = code[:match.start()].rstrip()
+        end = len(before)
+        if before.endswith(')') and end - 1 in pairs:
+            opening = pairs[end - 1]
+            start, params_start, params_end = opening, opening + 1, end - 1
+        else:
+            typed = re.search(r'\)\s*:\s*[A-Za-z_$][\w$<>\[\]| &.?]*$', before)
+            if typed and typed.start() in pairs:
+                opening = pairs[typed.start()]
+                start, params_start, params_end = opening, opening + 1, typed.start()
+            else:
+                parameter = re.search(r'[A-Za-z_$][\w$]*$', before)
+                if not parameter:
+                    continue
+                start = params_start = parameter.start()
+                params_end = parameter.end()
+        body = match.end()
+        while body < len(code) and code[body].isspace():
+            body += 1
+        name_match = re.search(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;\n]+)?\s*=\s*(?:async\s+)?$', code[:start])
+        add(start, params_start, params_end, body, name_match.group(1) if name_match else '',
+            concise=code[body:body + 1] != '{')
+
+    # Methods are analyzed as isolated scopes even when dynamic receiver
+    # dispatch cannot be resolved to a local summary.
+    for match in re.finditer(r'\b([A-Za-z_$][\w$]*)\s*\(', code):
+        if match.group(1) in {'if', 'for', 'while', 'switch', 'catch', 'with', 'function'}:
+            continue
+        closing = pairs.get(match.end() - 1)
+        if closing is None:
+            continue
+        body = closing + 1
+        while body < len(code) and code[body].isspace():
+            body += 1
+        if code[body:body + 1] == '{' and body not in body_starts:
+            add(match.start(), match.end(), closing, body)
+
+    root = _Scope(0, len(text), 0, len(text), '<module>')
+    for scope in sorted(scopes, key=lambda item: (item.start, -item.end)):
+        containers = [parent for parent in scopes if parent is not scope
+                      and parent.body_start <= scope.start < scope.end <= parent.body_end]
+        scope.parent = min(containers, key=lambda item: item.end - item.start) if containers else root
+        scope.parent.children.append(scope)
+    for scope in [root, *scopes]:
+        if not scope.children:
+            scope.code = code
+            continue
+        masked = list(code)
+        for child in scope.children:
+            masked[child.start:child.end] = ['\n' if char == '\n' else ' ' for char in code[child.start:child.end]]
+        scope.code = ''.join(masked)
+    return root, scopes
+
+
+class _Parser:
+    def __init__(self, scope):
+        self.code = scope.code
+        self.pairs = _pairs(self.code, scope.body_start, scope.body_end)
+
+    def skip(self, start, end):
+        while start < end and (self.code[start].isspace() or self.code[start] == ';'):
+            start += 1
+        return start
+
+    def sequence(self, start, end):
+        statements = []
+        while (start := self.skip(start, end)) < end:
+            statement, after = self.statement(start, end)
+            statements.append(statement)
+            start = max(start + 1, after)
+        return statements
+
+    def statement(self, start, end):
+        code = self.code
+        if code[start] == '{' and start in self.pairs:
+            closing = self.pairs[start]
+            return _Statement('block', start, closing + 1, self.sequence(start + 1, closing)), closing + 1
+        keyword = re.match(r'(if|while|for|do|try|switch|return|throw|break|continue)\b', code[start:])
+        if keyword and keyword.group(1) == 'try':
+            body_start = self.skip(start + keyword.end(), end)
+            if code[body_start:body_start + 1] == '{':
+                body, after = self.statement(body_start, end)
+                handlers, final = [], []
+                lookahead = self.skip(after, end)
+                if re.match(r'catch\b', code[lookahead:]):
+                    handler_start = self.skip(lookahead + 5, end)
+                    if code[handler_start:handler_start + 1] == '(' and handler_start in self.pairs:
+                        handler_start = self.skip(self.pairs[handler_start] + 1, end)
+                    if code[handler_start:handler_start + 1] == '{':
+                        handler, after = self.statement(handler_start, end)
+                        handlers = [handler]
+                    lookahead = self.skip(after, end)
+                if re.match(r'finally\b', code[lookahead:]):
+                    final_start = self.skip(lookahead + 7, end)
+                    if code[final_start:final_start + 1] == '{':
+                        tail, after = self.statement(final_start, end)
+                        final = [tail]
+                return _Statement('try', start, after, [body], handlers, final), after
+        if keyword and keyword.group(1) == 'do':
+            body_start = self.skip(start + keyword.end(), end)
+            if body_start < end:
+                body, after = self.statement(body_start, end)
+                lookahead = self.skip(after, end)
+                if re.match(r'while\b', code[lookahead:]):
+                    opening = self.skip(lookahead + 5, end)
+                    if code[opening:opening + 1] == '(' and opening in self.pairs:
+                        closing = self.pairs[opening]
+                        return _Statement('do', opening + 1, closing, [body]), closing + 1
+        if keyword and keyword.group(1) == 'switch':
+            opening = self.skip(start + keyword.end(), end)
+            if code[opening:opening + 1] == '(' and opening in self.pairs:
+                closing = self.pairs[opening]
+                body_start = self.skip(closing + 1, end)
+                if code[body_start:body_start + 1] == '{' and body_start in self.pairs:
+                    body_end = self.pairs[body_start]
+                    arms, cursor, default = [], body_start + 1, False
+                    while cursor < body_end:
+                        label = re.search(r'\b(case|default)\b', code[cursor:body_end])
+                        if label is None:
+                            break
+                        left = cursor + label.start()
+                        colon = code.find(':', cursor + label.end(), body_end)
+                        if colon < 0:
+                            break
+                        default |= label.group(1) == 'default'
+                        if arms:
+                            arms[-1].end = left
+                            arms[-1].body = self.sequence(arms[-1].start, left)
+                        arms.append(_Statement('case', colon + 1, body_end))
+                        cursor = colon + 1
+                        while cursor < body_end:
+                            if code[cursor] in '([{' and cursor in self.pairs:
+                                cursor = self.pairs[cursor] + 1
+                            elif re.match(r'(case|default)\b', code[cursor:]):
+                                break
+                            else:
+                                cursor += 1
+                    if arms:
+                        arms[-1].body = self.sequence(arms[-1].start, body_end)
+                    return _Statement('switch', opening + 1, closing, arms, extra=default), body_end + 1
+        if keyword and keyword.group(1) in {'if', 'while', 'for'}:
+            opening = self.skip(start + keyword.end(), end)
+            if code[opening:opening + 1] == '(' and opening in self.pairs:
+                closing = self.pairs[opening]
+                body_start = self.skip(closing + 1, end)
+                if body_start < end:
+                    body, after = self.statement(body_start, end)
+                    alternate = []
+                    lookahead = self.skip(after, end)
+                    if keyword.group(1) == 'if' and re.match(r'else\b', code[lookahead:]):
+                        other_start = self.skip(lookahead + 4, end)
+                        if other_start < end:
+                            other, after = self.statement(other_start, end)
+                            alternate = [other]
+                    return _Statement(keyword.group(1), opening + 1, closing, [body], alternate), after
+        finish = min(expression_end(code, start), end)
+        if finish <= start:
+            finish = start + 1
+        kind = keyword.group(1) if keyword else 'expression'
+        expression_start = start + keyword.end() if keyword else start
+        return _Statement(kind, expression_start, finish), finish + (code[finish:finish + 1] == ';')
+
+
+class _Flow:
+    def __init__(self, engine, scope, rule):
+        self.engine, self.scope, self.rule = engine, scope, rule
+        self.returned = frozenset()
+        self.effects = {}
+        self.breaks, self.continues = [], []
+        self.pairs = _pairs(scope.code, scope.body_start, scope.body_end)
+
+    def effect(self, start, label, fact):
+        if fact:
+            key = (start, label)
+            self.effects[key] = _join(self.effects.get(key, frozenset()), fact)
+
+    def reference(self, name, state):
+        if name in state:
+            return state[name]
+        if self.scope.parent is not None:
+            return frozenset({_Trace(('free', self.scope, name), (name,))})
+        return frozenset()
+
+    def callable(self, start, end, state):
+        for child in self.scope.children:
+            if start <= child.start and child.end <= end and self.scope.code[start:child.start].strip() in {'', 'async'}:
+                return child
+        name = self.engine.text[start:end].strip()
+        if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
+            if name in state.bindings:
+                return state.bindings[name]
+            return self.engine.lookup(self.scope, name)
+        return None
+
+    def bind(self, callee, arguments, ranges, state):
+        actual, uncertain = [], None
+
+        def expand(fact, left, right):
+            nonlocal uncertain
+            raw = self.scope.code[left:right].strip()
+            if raw.startswith('...'):
+                opening = left + self.scope.code[left:right].index('...') + 3
+                while opening < right and self.scope.code[opening].isspace():
+                    opening += 1
+                if self.scope.code[opening:opening + 1] == '[' and self.pairs.get(opening) is not None:
+                    closing = self.pairs[opening]
+                    if self.scope.code[opening + 1:closing].strip():
+                        for begin, finish in _chunks(self.scope.code, opening + 1, closing):
+                            if begin == finish == closing:
+                                continue  # a trailing comma creates no argument
+                            if self.scope.code[begin:finish].strip():
+                                expand(self.value(begin, finish, state), begin, finish)
+                            else:
+                                actual.append((frozenset(), True))  # an array hole is undefined
+                    return
+                if uncertain is None:
+                    uncertain = len(actual)
+                fact = self.value(opening, right, state)
+            actual.append((fact, raw in {'undefined', 'void 0'}))
+
+        for fact, (left, right) in zip(arguments, ranges):
+            expand(fact, left, right)
+        bound = {}
+        default_flow = None
+        for index, (names, rest, default) in enumerate(callee.params):
+            incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
+            missing = index >= len(actual) or actual[index][1]
+            if uncertain is not None and index >= uncertain:
+                incoming = _join(incoming, *(fact for fact, _ in actual[uncertain:]))
+                missing = True
+            if default is not None and missing and not rest:
+                if default_flow is None:
+                    default_flow = _Flow(self.engine, callee, self.rule)
+                default_flow.pairs.update(_pairs(callee.code, *default))
+                incoming = _join(incoming, default_flow.value(*default, _State(bound)))
+            for name in names:
+                bound[name] = incoming
+        if default_flow is not None:
+            for (location, label), fact in default_flow.effects.items():
+                self.effect(location, label, self.substitute(fact, callee, bound, state))
+            for dependency, callers in self.engine.dependents.items():
+                if dependency[1] == self.rule and callee in callers:
+                    callers.add(self.scope)
+        return bound
+
+    def substitute(self, fact, callee, bound, state):
+        result = frozenset()
+        for trace in fact:
+            kind, owner, name = trace.origin if trace.origin[0] != 'source' else ('source', None, None)
+            if kind == 'parameter' and owner is callee:
+                incoming = bound.get(name, frozenset())
+            elif kind == 'free' and owner is callee and callee.parent is self.scope:
+                incoming = self.reference(name, state)
+            else:
+                incoming = frozenset({trace})
+            if incoming:
+                incoming = _step(incoming, (callee.name or '<callback>') + '()')
+                if kind in {'parameter', 'free'}:
+                    for name in trace.path[1:]:
+                        incoming = _step(incoming, name)
+            result = _join(result, incoming)
+        return result
+
+    def value(self, start, end, state):
+        text, code = self.engine.text, self.scope.code
+        while start < end and code[start].isspace():
+            start += 1
+        while end > start and code[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            return frozenset()
+        if code[start] == '(' and self.pairs.get(start) == end - 1:
+            return self.value(start + 1, end - 1, state)
+        assignment = re.match(r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[start:end])
+        if assignment:
+            target = assignment.group(1)
+            rhs = start + assignment.end()
+            fact = self.value(rhs, end, state)
+            if assignment.group(2) != '=':
+                fact = _join(self.reference(target, state), fact)
+            state[target] = _step(fact, target)
+            state.bindings[target] = self.callable(rhs, end, state)
+            for location, expr_start, rule, label in self.engine.write_sinks:
+                if rule == self.rule and start <= location < rhs <= expr_start:
+                    self.effect(location, label, fact)
+            return fact
+        operators, question, colon, depth = [], None, None, 0
+        cursor = start
+        while cursor < end:
+            if code[cursor] in '([{' and cursor in self.pairs:
+                cursor = self.pairs[cursor] + 1
+                continue
+            operator = code[cursor:cursor + 2]
+            if operator in {'&&', '||', '??'}:
+                operators.append((1 if operator in {'||', '??'} else 2, cursor))
+                cursor += 2
+                continue
+            if code[cursor] == '?' and operator != '?.':
+                if question is None:
+                    question = cursor
+                depth += 1
+            elif code[cursor] == ':' and depth:
+                depth -= 1
+                if depth == 0:
+                    colon = cursor
+                    break
+            cursor += 1
+        if question is not None and colon is not None:
+            self.value(start, question, state)
+            left, right = state.copy(), state.copy()
+            facts = (self.value(question + 1, colon, left), self.value(colon + 1, end, right))
+            merged = _join_states(left, right)
+            state.clear()
+            state.update(merged)
+            state.bindings = dict(merged.bindings)
+            return _join(*facts)
+        if operators:
+            _, operator = min(operators, key=lambda item: (item[0], -item[1]))
+            left = self.value(start, operator, state)
+            branch = state.copy()
+            right = self.value(operator + 2, end, branch)
+            merged = _join_states(state, branch)
+            state.clear()
+            state.update(merged)
+            state.bindings = dict(merged.bindings)
+            return _join(left, right)
+        remainder = list(code[start:end])
+        source_remainder = list(text[start:end])
+        for child in self.scope.children:
+            left, right = max(start, child.start), min(end, child.end)
+            if left < right:
+                source_remainder[left - start:right - start] = [' '] * (right - left)
+        facts = []
+        call_pattern = re.compile(r'(?<![\w$])(?:new\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(')
+        cursor = start
+        while cursor < end:
+            match = call_pattern.search(code, cursor, end)
+            if match is None:
+                break
+            opening = match.end() - 1
+            closing = self.pairs.get(opening)
+            if closing is None or closing >= end:
+                cursor = match.end()
+                continue
+            arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                         if code[left:right].strip()]
+            argument_facts = [self.value(left, right, state) for left, right in arguments]
+            callee_name = re.sub(r'\s+', '', match.group(1))
+            callee = None
+            if '.' not in callee_name:
+                callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
+            if isinstance(callee, _Scope):
+                self.engine.dependents[(callee, self.rule)].add(self.scope)
+                returned, effects = self.engine.summaries.get((callee, self.rule), (frozenset(), {}))
+                bound = self.bind(callee, argument_facts, arguments, state)
+                call_fact = self.substitute(returned, callee, bound, state)
+                for (location, label), fact in effects.items():
+                    self.effect(location, label, self.substitute(fact, callee, bound, state))
+            else:
+                call_fact = _join(*argument_facts)
+                receiver = callee_name.split('.')[0]
+                if '.' in callee_name:
+                    call_fact = _join(call_fact, self.reference(receiver, state))
+                # Argument facts already retain precise local-call returns.
+                # Only a source in the callee itself introduces new input.
+                candidate = text[match.start():closing + 1]
+                for pattern, _ in SOURCE_PATTERNS:
+                    source_match = pattern.search(candidate)
+                    if source_match and source_match.start() <= opening - match.start():
+                        source = source_match.group(0)
+                        call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
+                sink = self.engine.call_sinks.get(match.start())
+                binding = state.bindings.get(receiver, 'imported')
+                if sink and sink[0] == self.rule and state.bindings.get(callee_name, 'imported') == 'imported':
+                    selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
+                    self.effect(match.start(), sink[1], _join(*selected))
+                regex = SANITIZERS_BY_RULE.get(self.rule)
+                following = code[closing + 1:end].lstrip()
+                if regex and regex.match(candidate) and not following.startswith(('.', '[')):
+                    previous = code[:match.start()].rstrip()
+                    if not previous.endswith('.') and binding == 'imported':
+                        call_fact = frozenset()
+            facts.append(call_fact)
+            remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+            source_remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+            cursor = closing + 1
+        remaining = ''.join(remainder)
+        for source, _ in assignment_sources(''.join(source_remainder)):
+            facts.append(frozenset({_Trace(('source', source), (source,))}))
+        for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*', remaining):
+            name = match.group(0)
+            name = re.sub(r'\s+', '', name)
+            if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
+                continue
+            after = remaining[match.end():].lstrip()
+            if after.startswith(':'):
+                continue  # object literal keys are not variable references
+            facts.append(self.reference(name.split('.')[0], state))
+            if '.' in name and name in state:
+                facts.append(state[name])
+        result = _join(*facts)
+        for location, expr_start, rule, label in self.engine.write_sinks:
+            if rule == self.rule and start <= location < end:
+                self.effect(location, label, self.value(expr_start, end, state))
+        return result
+
+    def expression(self, start, end, state):
+        text = self.engine.text
+        raw = text[start:end].strip()
+        offset = start + len(text[start:end]) - len(text[start:end].lstrip())
+        entries = _declaration_entries(text, self.scope.code, start, end)
+        if entries:
+            for _, names, rhs, finish in entries:
+                fact = self.value(rhs, finish, state) if rhs is not None else frozenset()
+                binding = self.callable(rhs, finish, state) if rhs is not None else None
+                if rhs is not None and binding is None and re.match(r"\s*require\s*\(\s*['\"][^'\"]+['\"]\s*\)", text[rhs:finish]):
+                    binding = 'imported'
+                for name in names:
+                    state[name] = _step(fact, name)
+                    state.bindings[name] = binding
+            return state
+        compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
+        if compound:
+            name = compound.group(1)
+            fact = self.value(offset + compound.start(3), end, state)
+            state[name] = _step(_join(self.reference(name, state), fact), name)
+            state.bindings[name] = None
+            return state
+        declaration = None
+        for pattern in (DESTRUCT_OBJECT, DESTRUCT_ARRAY, ASSIGN_DECL, ASSIGN_SIMPLE):
+            match = pattern.match(raw)
+            if match:
+                declaration = (pattern, match)
+                break
+        if declaration:
+            pattern, match = declaration
+            rhs = offset + match.start(2)
+            fact = self.value(rhs, end, state)
+            target = match.group(1).split(':', 1)[0] if pattern is ASSIGN_DECL else match.group(1)
+            binding = self.callable(rhs, end, state)
+            if binding is None and re.match(r"\s*require\s*\(\s*['\"][^'\"]+['\"]\s*\)", text[rhs:end]):
+                binding = 'imported'
+            for name in parse_targets(target):
+                state[name] = _step(fact, name)
+                state.bindings[name] = binding
+        else:
+            self.value(start, end, state)
+        return state
+
+    def block(self, statements, state):
+        for statement in statements:
+            if state is None:
+                break
+            state = self.statement(statement, state)
+        return state
+
+    @staticmethod
+    def restore(state, outer, names):
+        if state is None:
+            return None
+        for name in names:
+            if name in outer:
+                state[name] = outer[name]
+            else:
+                state.pop(name, None)
+            if name in outer.bindings:
+                state.bindings[name] = outer.bindings[name]
+            else:
+                state.bindings.pop(name, None)
+        return state
+
+    def statement(self, node, state):
+        if node.kind == 'block':
+            local = self.engine.declarations(node.body, block=True)
+            outer = state.copy()
+            break_count, continue_count = len(self.breaks), len(self.continues)
+            for name in local:
+                state[name], state.bindings[name] = frozenset(), None
+            result = self.block(node.body, state)
+            for child in self.scope.children:
+                if node.start <= child.start < child.end <= node.end:
+                    captured = result if result is not None else state
+                    key = (child, self.rule)
+                    self.engine.captures[key] = _join_states(self.engine.captures.get(key), captured)
+            for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
+                self.restore(exit_state, outer, local)
+            return self.restore(result, outer, local)
+        if node.kind == 'if':
+            self.value(node.start, node.end, state)
+            condition = self.scope.code[node.start:node.end].strip()
+            left = self.block(node.body, state.copy()) if condition != 'false' else None
+            right = self.block(node.alternate, state.copy()) if condition != 'true' else None
+            return _join_states(left, right)
+        if node.kind == 'try':
+            # An exception may interrupt any statement before the handler.
+            # Join prefix states so a later overwrite cannot erase that path.
+            entry = state.copy()
+            body = node.body[0].body if node.body and node.body[0].kind == 'block' else node.body
+            prefix, current = entry.copy(), entry.copy()
+            for statement in body:
+                if current is None:
+                    break
+                current = self.statement(statement, current)
+                prefix = _join_states(prefix, current)
+            handler = self.block(node.alternate, prefix) if node.alternate else None
+            merged = _join_states(current, handler)
+            if node.extra:
+                # finally also runs for a pending return/throw. Its sink
+                # effects must survive even if normal flow has terminated.
+                tail = self.block(node.extra, (merged or prefix).copy())
+                return tail if merged is not None else None
+            return merged
+        if node.kind == 'switch':
+            self.value(node.start, node.end, state)
+            previous_breaks = self.breaks
+            self.breaks = []
+            fallthrough, exits = None, [] if node.extra else [state.copy()]
+            for arm in node.body:
+                fallthrough = self.block(arm.body, _join_states(state.copy(), fallthrough))
+            exits.extend(self.breaks)
+            self.breaks = previous_breaks
+            return _join_states(fallthrough, *exits)
+        if node.kind in {'while', 'for', 'do'}:
+            header = list(_chunks(self.scope.code, node.start, node.end, ';'))
+            outer = state.copy()
+            loop_names = set()
+            iteration = None
+            if node.kind == 'for' and len(header) == 1:
+                iterator = re.match(r'\s*(?:(const|let|var)\s+)?(.+?)\s+(?:of|in)\s+(.+)',
+                                    self.engine.text[node.start:node.end], re.S)
+                if iterator:
+                    iteration = (_binding_names(iterator.group(2)), node.start + iterator.start(3), node.end)
+                    if iterator.group(1) in {'const', 'let'}:
+                        loop_names.update(iteration[0])
+            if node.kind == 'for' and len(header) == 3:
+                loop_names.update(name for kind, names, _, _ in _declaration_entries(
+                    self.engine.text, self.scope.code, *header[0]) if kind != 'var' for name in names)
+                state = self.expression(*header[0], state)
+                condition, update = header[1], header[2]
+            else:
+                condition, update = (node.start, node.end), None
+            outer_breaks, outer_continues = self.breaks, self.continues
+            exits = []
+            entry, current = state.copy(), state.copy()
+            if node.kind == 'do':
+                self.breaks, self.continues = [], []
+                current = self.block(node.body, current)
+                exits.extend(self.breaks)
+                current = _join_states(current, *self.continues)
+                if current is None:
+                    self.breaks, self.continues = outer_breaks, outer_continues
+                    return self.restore(_join_states(*exits), outer, loop_names)
+                entry = current.copy()
+            if self.scope.code[condition[0]:condition[1]].strip() == 'false':
+                self.breaks, self.continues = outer_breaks, outer_continues
+                return self.restore(_join_states(current, *exits), outer, loop_names)
+            while True:
+                self.breaks, self.continues = [], []
+                self.value(*condition, current)
+                body_state = current.copy()
+                if iteration:
+                    names, left, right = iteration
+                    fact = self.value(left, right, body_state)
+                    for name in names:
+                        body_state[name] = _step(fact, name)
+                        body_state.bindings[name] = None
+                after = self.block(node.body, body_state)
+                after = _join_states(after, *self.continues)
+                if after is not None and update is not None:
+                    after = self.expression(*update, after)
+                exits.extend(self.breaks)
+                merged = _join_states(entry, after)
+                if merged == current:
+                    break
+                current = merged
+            self.breaks, self.continues = outer_breaks, outer_continues
+            return self.restore(_join_states(current, *exits), outer, loop_names)
+        if node.kind == 'return':
+            self.returned = _join(self.returned, self.value(node.start, node.end, state))
+            return None
+        if node.kind == 'throw':
+            self.value(node.start, node.end, state)
+            return None
+        if node.kind in {'break', 'continue'}:
+            (self.breaks if node.kind == 'break' else self.continues).append(state.copy())
+            return None
+        return self.expression(node.start, node.end, state)
+
+
+class _Engine:
+    def __init__(self, text, code):
+        self.text, self.code = text, code
+        self.root, self.functions = _function_scopes(text, code)
+        self.scopes = [self.root, *self.functions]
+        self.summaries, self.final_states = {}, {}
+        self.captures = {}
+        self.dependents = defaultdict(set)
+        modules, functions = child_process_bindings(text.splitlines())
+        sinks = list(child_process_sinks(text, code, modules, functions))
+        for regex, rule, label, call in SINKS:
+            sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
+        self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
+        self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
+        for scope in self.scopes:
+            scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
+
+    def lookup(self, scope, name):
+        while scope is not None:
+            for child in reversed(scope.children):
+                if child.name == name and child.declaration:
+                    return child
+            scope = scope.parent
+        return None
+
+    def declarations(self, statements, block=False):
+        names = set()
+        pending = [(node, True) for node in statements]
+        while pending:
+            node, direct = pending.pop()
+            if node.kind == 'expression':
+                for kind, targets, _, _ in _declaration_entries(self.text, self.code, node.start, node.end):
+                    if (direct and (not block or kind != 'var')) or (not block and kind == 'var'):
+                        names.update(targets)
+            if not block:
+                pending.extend((child, False) for child in (*node.body, *node.alternate))
+        return names
+
+    def analyze(self, scope, rule):
+        state = _State()
+        for name in self.declarations(scope.statements):
+            state[name], state.bindings[name] = frozenset(), None
+        for names, _, _ in scope.params:
+            for name in names:
+                state[name] = frozenset({_Trace(('parameter', scope, name), (name,))})
+                state.bindings[name] = None
+        for child in scope.children:
+            if child.name and child.declaration:
+                state.bindings[child.name] = child
+        flow = _Flow(self, scope, rule)
+        if scope.concise:
+            flow.returned = flow.value(scope.body_start, scope.body_end, state)
+            final = state
+        else:
+            final = flow.block(scope.statements, state)
+        self.final_states[(scope, rule)] = final or state
+        return flow.returned, flow.effects
+
+    def concrete(self, fact, rule, visited=frozenset()):
+        result = frozenset()
+        for trace in fact:
+            if trace.origin[0] == 'source':
+                result = _join(result, frozenset({trace}))
+            elif trace.origin[0] == 'free' and trace.origin not in visited:
+                _, scope, name = trace.origin
+                parent = scope.parent
+                while parent is not None:
+                    state = self.captures.get((scope, rule), self.final_states.get((parent, rule), {}))
+                    if name in state:
+                        result = _join(result, self.concrete(state[name], rule, visited | {trace.origin}))
+                        break
+                    parent = parent.parent
+        return result
+
+    def findings(self):
+        found = {}
+        for rule in KIND_BY_RULE:
+            pending = deque(reversed(self.scopes))
+            queued = set(pending)
+            while pending:
+                scope = pending.popleft()
+                queued.discard(scope)
+                summary = self.analyze(scope, rule)
+                if self.summaries.get((scope, rule)) != summary:
+                    self.summaries[(scope, rule)] = summary
+                    for caller in self.dependents[(scope, rule)]:
+                        if caller not in queued:
+                            pending.append(caller)
+                            queued.add(caller)
+            for scope in self.scopes:
+                for (location, label), fact in self.summaries[(scope, rule)][1].items():
+                    if self.dependents[(scope, rule)]:
+                        # Known call sites already instantiated captures at
+                        # their program points. Rebinding them to end-of-scope
+                        # values here would taint calls that happened earlier.
+                        fact = frozenset(trace for trace in fact if trace.origin[0] == 'source')
+                    concrete = self.concrete(fact, rule)
+                    if concrete:
+                        key = (location, rule, label)
+                        found[key] = _join(found.get(key, frozenset()), concrete)
+        for (location, rule, label), fact in sorted(found.items()):
+            trace = min(fact, key=lambda item: (len(item.path), item.path))
+            yield location, rule, format_path(trace.path, label)
 
 
 def analyze_file(path, issues):
@@ -602,28 +1492,8 @@ def scan_file_findings(path: Path):
     except (UnicodeDecodeError, OSError):
         return
     text, code = lexical_views(text)
-    lines = text.splitlines()
     line_starts = [0] + [match.end() for match in re.finditer('\n', text)]
-    assignments = parse_assignments(lines)
-    tainted_by_rule = {rule: record_taint(assignments, rule) for rule in KIND_BY_RULE}
-    child_process_modules, child_process_functions = child_process_bindings(lines)
-    sinks = list(child_process_sinks(text, code, child_process_modules, child_process_functions))
-    for regex, rule, label, call in SINKS:
-        sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
-    for start, expr_start, rule, sink_label, call in sorted(sinks):
-        expr = text[expr_start:expression_end(code, expr_start, call=call)]
-        if rule == 'js.taint.sql':
-            expr = query_argument(expr)
-        expr = unsanitized_expression(expr, rule)
-        literal = find_sources(expr)
-        if literal:
-            snippet, _ = literal[0]
-            path_desc = f"{snippet.strip()} -> {sink_label}"
-        else:
-            ref, meta = expr_has_tainted(expr, tainted_by_rule[rule])
-            if not ref:
-                continue
-            path_desc = format_path(meta.get('path', [ref]), sink_label)
+    for start, rule, path_desc in _Engine(text, code).findings():
         line = bisect_right(line_starts, start)
         yield rule, line, start - line_starts[line - 1] + 1, path_desc
 

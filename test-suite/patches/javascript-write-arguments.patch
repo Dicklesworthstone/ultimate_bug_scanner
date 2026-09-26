@@ -1,0 +1,238 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 5b63ffe..d2812b7 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -1190,10 +1190,10 @@ class _Flow:
+             return self.engine.lookup(self.scope, name)
+         return None
+ 
+-    def bind(self, callee, arguments, ranges, state):
++    def bind(self, callee, arguments, ranges, state, argument_states):
+         actual, uncertain = [], None
+ 
+-        def expand(fact, left, right):
++        def expand(fact, left, right, replay):
+             nonlocal uncertain
+             raw = self.scope.code[left:right].strip()
+             if raw.startswith('...'):
+@@ -1207,21 +1207,28 @@ class _Flow:
+                             if begin == finish == closing:
+                                 continue  # a trailing comma creates no argument
+                             if self.scope.code[begin:finish].strip():
+-                                expand(self.value(begin, finish, state), begin, finish)
++                                expand(None, begin, finish, replay)
+                             else:
+                                 actual.append((frozenset(), True))  # an array hole is undefined
+                     return
+                 if uncertain is None:
+                     uncertain = len(actual)
+-                fact = self.value(opening, right, state)
++                if fact is None:
++                    fact = self.value(opening, right, replay)
++            elif fact is None:
++                fact = self.value(left, right, replay)
+             actual.append((fact, raw in {'undefined', 'void 0'}))
+ 
+-        for fact, (left, right) in zip(arguments, ranges):
+-            expand(fact, left, right)
++        for fact, (left, right), entry in zip(arguments, ranges, argument_states):
++            # Decompose spreads at the original argument's program point.
++            # Replay only into a private snapshot, never the caller's cells.
++            expand(fact, left, right, entry)
+         bound = {}
+         default_flow = None
+         default_state = None
+         for index, (names, rest, default) in enumerate(callee.params):
++            if default_state is not None and not default_state.reachable:
++                break
+             incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
+             missing = index >= len(actual) or actual[index][1]
+             if uncertain is not None and index >= uncertain:
+@@ -1236,7 +1243,10 @@ class _Flow:
+                 for name in bound:
+                     default_state.owners[name] = self.engine.binding(callee, name)
+                 default_flow.pairs.update(_pairs(callee.code, *default))
++                before_default = default_state.copy()
+                 incoming = _join(incoming, default_flow.value(*default, default_state))
++                if uncertain is not None and index >= uncertain:
++                    default_state = _join_states(before_default, default_state)
+             for name in names:
+                 bound[name] = incoming
+         if default_flow is not None:
+@@ -1288,6 +1298,8 @@ class _Flow:
+             end -= 1
+         if start >= end:
+             return frozenset()
++        if code[start:start + 3] == '...':
++            return self.value(start + 3, end, state)
+         if code[start] == '(' and self.pairs.get(start) == end - 1:
+             return self.value(start + 1, end - 1, state)
+         assignment = re.match(r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[start:end])
+@@ -1387,13 +1399,18 @@ class _Flow:
+             callee = None
+             if '.' not in callee_name:
+                 callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
+-            argument_facts = [self.value(left, right, state) for left, right in arguments]
++            argument_facts, argument_states = [], []
++            for left, right in arguments:
++                # Callee identity was resolved above, before any argument
++                # writes. Only spread decomposition needs a replay snapshot.
++                argument_states.append(state.copy() if code[left:right].lstrip().startswith('...') else None)
++                argument_facts.append(self.value(left, right, state))
+             if not state.reachable:
+                 return frozenset()
+             if isinstance(callee, _Scope):
+                 self.engine.dependents[(callee, self.rule)].add(self.scope)
+                 summary = self.engine.summaries.get((callee, self.rule), _Summary())
+-                bound = self.bind(callee, argument_facts, arguments, state)
++                bound = self.bind(callee, argument_facts, arguments, state, argument_states)
+                 if not state.reachable:
+                     return frozenset()
+                 incoming = state.copy()
+@@ -1773,7 +1790,9 @@ class _Engine:
+             final = flow.block(scope.statements, state)
+         normal = _join_states(final, *(exit.state for exit in flow.returns))
+         exceptional = _join_states(*flow.throws)
+-        self.final_states[(scope, rule)] = _join_states(normal, exceptional) or state
++        joined = _join_states(normal, exceptional)
++        # Empty visible bindings may still contain live captured block cells.
++        self.final_states[(scope, rule)] = joined if joined is not None else state
+ 
+         def writes(completion):
+             return {} if completion is None else {key: value for key, value in completion.cells.items()
+diff --git a/test-suite/js/test_taint_effects.py b/test-suite/js/test_taint_effects.py
+index 4f00a4d..cadfa71 100644
+--- a/test-suite/js/test_taint_effects.py
++++ b/test-suite/js/test_taint_effects.py
+@@ -2,7 +2,10 @@
+ from __future__ import annotations
+ 
+ from collections import Counter
++import json
++import os
+ from pathlib import Path
++import subprocess
+ import sys
+ import tempfile
+ import time
+@@ -223,6 +226,120 @@ class CapturedWriteTests(unittest.TestCase):
+         self.scan('let result = req.query.html; function clear() { result = "hello"; }\n'
+                   'function trigger(value = clear()) {} trigger(); res.send(result);')
+ 
++    def test_unknown_spread_does_not_guarantee_default_cleanup(self):
++        self.scan('let result = req.query.html; function clear() { result = "hello"; }\n'
++                  'function trigger(value = clear()) {} trigger(...args); res.send(result);', 'xss')
++
++    def test_literal_spread_default_cleanup_is_definite(self):
++        self.scan('let result = req.query.html; function clear() { result = "hello"; }\n'
++                  'function trigger(value = clear()) {} trigger(...[]); res.send(result);')
++
++    def test_spread_argument_side_effect_runs_once(self):
++        self.scan('let a = req.query.html, b = "hello";\n'
++                  'function swap() { const saved = a; a = b; b = saved; }\n'
++                  'function ignore(x) {} ignore(...[swap()]); res.send(a);')
++
++    def test_nested_spread_argument_side_effect_runs_once(self):
++        self.scan('let a = req.query.html, b = "hello";\n'
++                  'function swap() { const saved = a; a = b; b = saved; }\n'
++                  'function ignore(...x) {} ignore(...[...[swap()]]); res.send(a);')
++
++    def test_spread_result_observes_pre_argument_capture(self):
++        self.scan('let result = req.query.html;\n'
++                  'function take() { const before = result; result = "hello"; return before; }\n'
++                  'function first(x) { return x; } res.send(first(...[take()]));', 'xss')
++
++    def test_default_reads_state_left_by_previous_default(self):
++        self.scan('let result; function store(x) { result = x; }\n'
++                  'function read(a = store(req.query.html), b = result) { return b; }\n'
++                  'res.send(read());', 'xss')
++
++    def test_default_resolves_capture_before_body_shadow(self):
++        self.scan('const result = req.query.html;\n'
++                  'function read(value = result) { let result = "hello"; return value; }\n'
++                  'res.send(read());', 'xss')
++
++    def test_caught_throw_then_cleanup_replaces_written_taint(self):
++        self.scan('let result; function store(x) {\n'
++                  'try { result = x; throw error; } catch (e) { result = "hello"; } }\n'
++                  'store(req.query.html); res.send(result);')
++
++    def test_throwing_write_reaches_catch_read(self):
++        self.scan('let result; function store(x) {\n'
++                  'try { result = x; throw error; } catch (e) { res.send(result); } }\n'
++                  'store(req.query.html);', 'xss')
++
++    def test_finally_cleanup_covers_throw_state(self):
++        self.scan('let result; function store(x) {\n'
++                  'try { result = x; throw error; } finally { result = "hello"; } }\n'
++                  'try { store(req.query.html); } catch (e) {} res.send(result);')
++
++    def test_nested_catch_and_finally_keep_external_write(self):
++        self.scan('let result; function store(x) { try {\n'
++                  'try { throw error; } catch(e) { result = x; return; }\n'
++                  '} finally { result += "suffix"; } }\n'
++                  'store(req.query.html); res.send(result);', 'xss')
++
++    def test_unknown_spread_propagates_stored_argument_values(self):
++        self.scan('let result; function store(a, b) { result = b; }\n'
++                  'const args = ["hello", req.query.html]; store(...args); res.send(result);', 'xss')
++
++    def test_block_capture_survives_empty_visible_parent_state(self):
++        self.scan('function outer() { if (flag) { const value = req.query.html;\n'
++                  'function inner() { res.send(value); } } }', 'xss')
++
++    def test_block_capture_survives_parent_return_paths(self):
++        self.scan('function outer() { if (flag) { const value = req.query.html;\n'
++                  'function inner() { res.send(value); } return; } else { return; } }', 'xss')
++
++
++@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner checks')
++class CapturedArgumentScannerTests(unittest.TestCase):
++    def test_actual_scanner_argument_and_capture_flows(self):
++        cases = [
++            ('optional-default', 'let result=req.query.html; function clear(){result="safe";} '
++             'function trigger(value=clear()){} trigger(...args); res.send(result);', {'xss'}),
++            ('single-evaluation', 'let a=req.query.html,b="safe"; '
++             'function swap(){const old=a;a=b;b=old;} function ignore(x){} '
++             'ignore(...[swap()]);res.send(a);', set()),
++            ('spread-return', 'let result=req.query.html; '
++             'function take(){const old=result;result="safe";return old;} '
++             'function first(x){return x;} res.send(first(...[take()]));', {'xss'}),
++            ('block-capture', 'function outer(){if(flag){const value=req.query.html; '
++             'function inner(){res.send(value);}}}', {'xss'}),
++        ]
++        for name, source, expected in cases:
++            with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='ubs-arguments-cli-') as tmp:
++                target = Path(tmp) / 'handler.js'
++                target.write_text(source + '\n', encoding='utf-8')
++                result = subprocess.run([str(ROOT / 'ubs'), str(target), '--ci', '--only=js', '--format=json'],
++                                        cwd=tmp, capture_output=True, text=True, timeout=120)
++                artifacts = ROOT / 'test-suite/artifacts/javascript-captured-writes' / name
++                artifacts.mkdir(parents=True, exist_ok=True)
++                (artifacts / 'stdout.log').write_text(result.stdout)
++                (artifacts / 'stderr.log').write_text(result.stderr)
++                self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
++                report = json.loads(result.stdout)
++                (artifacts / 'result.json').write_text(json.dumps(report, indent=2))
++                self.assertEqual(report['status'], 'ok', report)
++                rules = set()
++
++                def visit(value):
++                    if isinstance(value, dict):
++                        for key in ('rule', 'rule_id', 'ruleId'):
++                            rule = value.get(key)
++                            if isinstance(rule, str) and rule.startswith(('javascript.taint.', 'js.taint.')):
++                                rules.add(rule.rsplit('.', 1)[-1])
++                        for child in value.values():
++                            visit(child)
++                    elif isinstance(value, list):
++                        for child in value:
++                            visit(child)
++
++                visit(report)
++                self.assertEqual(rules, expected, (name, source, report))
++                print('JS_ARGUMENTS_E2E_PASS', name, sorted(rules), flush=True)
++
+ 
+ if __name__ == '__main__':
+     unittest.main(verbosity=2)

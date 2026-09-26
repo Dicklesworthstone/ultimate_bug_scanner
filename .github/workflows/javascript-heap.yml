@@ -1,0 +1,100 @@
+name: JavaScript Heap Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/javascript-heap.patch
+      - test-suite/js/test_taint_heap.py
+      - .github/workflows/javascript-heap.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  heap-regressions:
+    runs-on: macos-15
+    timeout-minutes: 20
+    # Temporary publication of tested immutable blobs. No refs are changed.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Verify exact baseline and reproduce missing heap behavior
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 477c8ac86895e19afdf6dacc96834c93cb90b736
+          echo "JS_HEAP_BASE $(git rev-parse HEAD)"
+          if python3 test-suite/js/test_taint_heap.py JavaScriptHeapTests > "$RUNNER_TEMP/heap-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/heap-before.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/heap-before.log"
+          grep -q 'FAILED (failures=26)' "$RUNNER_TEMP/heap-before.log"
+      - name: Apply tested heap implementation and rebuild complete integrity chain
+        run: |
+          git apply --check test-suite/patches/javascript-heap.patch
+          git apply test-suite/patches/javascript-heap.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 8cb2a5d2cdd7d0e09f44253f3c424768300baf02
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Run new and unchanged JavaScript source regressions
+        run: |
+          python3 test-suite/js/test_taint_heap.py JavaScriptHeapTests
+          python3 test-suite/js/test_taint_effects.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+      - name: Install real-scanner dependencies
+        run: |
+          brew install bash jq ripgrep shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          npm install --global @ast-grep/cli
+      - name: Validate actual scanner findings, clean controls and existing JS quality tests
+        run: |
+          UBS_HEAP_E2E=1 python3 test-suite/js/test_taint_heap.py
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Verify deterministic regeneration and publish tested blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, changed
+          before = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
+          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert all(Path(name).read_bytes() == content for name, content in before.items())
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for name in changed:
+              content = Path(name).read_bytes()
+              response = subprocess.run(['gh', 'api', '--method', 'POST',
+                                         f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                                        input=json.dumps({'content': content.decode('utf-8'), 'encoding': 'utf-8'}),
+                                        text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              print('JS_HEAP_BLOB', name, sha, mode, flush=True)
+          PY

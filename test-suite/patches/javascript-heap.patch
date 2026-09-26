@@ -1,0 +1,444 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 477c8ac..8cb2a5d 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -2,6 +2,10 @@
+ 
+ Executable-expression masks retain template interpolation and source offsets.
+ Local functions use finite return/sink summaries and ordered assignment state.
++Fresh object/array identities retain field-sensitive aliases within a scope;
++helper reads project argument fields and escaping allocations retain reachable
++taint. Arbitrary parameter-object mutation and factory heap identity are not
++yet interprocedural heap summaries.
+ The lexical front end handles ordinary functions, arrows and structured blocks;
+ cross-file calls, dynamic dispatch and the full JavaScript grammar are not modeled.
+ 
+@@ -588,6 +592,10 @@ class _State(dict):
+         # local must never redirect a callee's write into its lexical parent.
+         self.owners = dict(getattr(values, 'owners', {}))
+         self.cells = dict(getattr(values, 'cells', {}))
++        # Field maps are copy-on-write. Branches share immutable snapshots,
++        # never a mutable dictionary whose updates leak into a sibling arm.
++        self.heap = dict(getattr(values, 'heap', {}))
++        self.heap_many = frozenset(getattr(values, 'heap_many', ()))
+ 
+     def copy(self):
+         return _State(self)
+@@ -595,7 +603,118 @@ class _State(dict):
+     def __eq__(self, other):
+         return (isinstance(other, _State) and dict.__eq__(self, other)
+                 and self.bindings == other.bindings and self.owners == other.owners
+-                and self.cells == other.cells)
++                and self.cells == other.cells and self.heap == other.heap
++                and self.heap_many == other.heap_many)
++
++
++def _heap_projection(trace, key):
++    origin = trace.origin
++    if origin[0] == 'property':
++        base, path = origin[1:]
++    else:
++        base, path = origin, ()
++    # Recursive helpers can append field names indefinitely. A wildcard tail
++    # summarizes deeper access instead of growing the origin lattice forever.
++    if not path or path[-1] is not None:
++        path = (*path, key) if len(path) < PATH_LIMIT else (*path[:PATH_LIMIT], None)
++    return _Trace(('property', base, path), trace.path)
++
++
++def _heap_read(fact, key, state):
++    values = []
++    for trace in fact:
++        origin = trace.origin
++        fields = state.heap.get(origin)
++        if fields is not None:
++            if key is None:
++                values.extend(fields.values())
++                if origin[0] != 'heap':
++                    values.append(frozenset({_heap_projection(trace, key)}))
++            else:
++                default = (frozenset() if origin[0] == 'heap'
++                           else frozenset({_heap_projection(trace, key)}))
++                values.append(fields.get(key, _join(default, fields.get(None, frozenset()))))
++        elif origin[0] in {'heap', 'parameter', 'capture', 'property'}:
++            values.append(frozenset({_heap_projection(trace, key)}))
++        else:
++            # External input remains unsafe under unknown property selection.
++            values.append(frozenset({trace}))
++    return _join(*values)
++
++
++def _heap_materialize(fact, state, visited=frozenset()):
++    """Snapshot reachable taint at the sink, not at end-of-file heap state."""
++    result = []
++    for trace in fact:
++        origin = trace.origin
++        if origin in state.heap and origin not in visited:
++            result.append(_heap_materialize(_join(*state.heap[origin].values()),
++                                            state, visited | {origin}))
++        if origin[0] != 'heap':
++            result.append(frozenset({trace}))
++    return _join(*result)
++
++
++def _heap_store(base, key, value, state):
++    targets = {trace.origin for trace in base
++               if trace.origin[0] in {'heap', 'parameter', 'capture', 'property'}}
++    strong = len(targets) == 1 and len(base) == 1 and key is not None
++    for origin in targets:
++        fields = dict(state.heap.get(origin, {}))
++        if key is None:
++            # A dynamic write may select any previously known field, but it
++            # cannot definitely replace every field with a clean value.
++            fields = {name: _join(previous, value) for name, previous in fields.items()}
++        if strong and origin not in state.heap_many:
++            fields[key] = value
++        else:
++            previous = _heap_read(frozenset({_Trace(origin)}), key, state)
++            fields[key] = _join(previous, value)
++        state.heap[origin] = fields
++
++
++def _heap_key(raw):
++    raw = raw.strip()
++    if re.fullmatch(r'(?:0|[1-9][0-9]*)', raw):
++        return raw
++    if len(raw) >= 2 and raw[0] in {'"', "'"} and raw[-1] == raw[0] and '\\' not in raw:
++        return raw[1:-1]
++    return None
++
++
++def _heap_access(text, code, pairs, start, end):
++    """Recognize complete member spans while retaining computed-key effects."""
++    match = re.match(r'[A-Za-z_$][\w$]*', code[start:end])
++    if match is None:
++        return None
++    root = match.group()
++    cursor, steps = start + match.end(), []
++    while cursor < end:
++        while cursor < end and code[cursor].isspace():
++            cursor += 1
++        marker = cursor
++        optional = code[cursor:cursor + 2] == '?.'
++        if optional:
++            cursor += 2
++        if code[cursor:cursor + 1] == '[' and cursor in pairs:
++            stop = pairs[cursor]
++            if stop >= end:
++                break
++            steps.append((_heap_key(text[cursor + 1:stop]), cursor + 1, stop, marker))
++            cursor = stop + 1
++        elif optional or code[cursor:cursor + 1] == '.':
++            if not optional:
++                cursor += 1
++            while cursor < end and code[cursor].isspace():
++                cursor += 1
++            field = re.match(r'[A-Za-z_$][\w$]*', code[cursor:end])
++            if field is None:
++                return None
++            steps.append((field.group(), None, None, marker))
++            cursor += field.end()
++        else:
++            break
++    return root, steps, cursor
+ 
+ 
+ def _cell_input(key):
+@@ -627,6 +746,15 @@ def _join_states(*states):
+         # A branch without a write preserves the incoming cell, not bottom.
+         # This also permits a definitely executed clean setter to kill taint.
+         result.cells[key] = _join(*(_cell_value(key, state) for state in states))
++    result.heap_many = frozenset().union(*(state.heap_many for state in states))
++    for origin in set().union(*(state.heap.keys() for state in states)):
++        present = [state for state in states if origin in state.heap]
++        fields = set().union(*(state.heap[origin].keys() for state in present))
++        result.heap[origin] = {
++            key: _join(*(_heap_read(frozenset({_Trace(origin)}), key, state)
++                        for state in (present if origin[0] == 'heap' else states)))
++            for key in fields
++        }
+     return result
+ 
+ 
+@@ -1115,6 +1243,79 @@ class _Flow:
+             return _cell_value(self.engine.binding(scope, name, position), state)
+         return frozenset()
+ 
++    def member(self, root, steps, state):
++        fact = self.reference(root, state)
++        known = any(trace.origin[0] == 'heap' for trace in fact)
++        for key, begin, end, _marker in steps:
++            if begin is not None:
++                self.value(begin, end, state)
++            fact = _heap_read(fact, key, state)
++        if not known:
++            path = root
++            for key, _begin, _end, _marker in steps:
++                if key is None:
++                    break
++                path += '.' + key
++            for source, _ in assignment_sources(path):
++                fact = _join(fact, frozenset({_Trace(('source', source), (source,))}))
++        return fact
++
++    def literal(self, start, end, state):
++        text, code = self.engine.text, self.scope.code
++        origin = ('heap', (self.scope, start))
++        # One allocation site can denote multiple objects across loop
++        # iterations. Never strongly clear all of those objects through one
++        # alias. Allocation identity is finite even in recursive analysis.
++        previous = state.heap.get(origin)
++        fields = {}
++        array = code[start] == '['
++        index = 0
++        for left, right in _chunks(code, start + 1, end - 1):
++            while left < right and code[left].isspace():
++                left += 1
++            if not code[left:right].strip():
++                if array and right < end - 1:
++                    index += 1
++                continue
++            if code[left:left + 3] == '...':
++                value = self.value(left + 3, right, state)
++                for trace in value:
++                    copied = state.heap.get(trace.origin)
++                    if copied is None:
++                        fields[None] = _join(fields.get(None, frozenset()), frozenset({trace}))
++                        for key in list(fields):
++                            fields[key] = _join(fields[key], frozenset({trace}))
++                    elif array:
++                        fields[None] = _join(fields.get(None, frozenset()), *copied.values())
++                    else:
++                        for key, fact in copied.items():
++                            fields[key] = _join(fields.get(key, frozenset()), fact) if key is None else fact
++                continue
++            if array:
++                key, begin = str(index), left
++                index += 1
++            else:
++                _, colon = next(_chunks(code, left, right, ':'))
++                raw_key = text[left:colon].strip()
++                key = raw_key if re.fullmatch(r'[A-Za-z_$][\w$]*', raw_key) else _heap_key(raw_key)
++                begin = colon + 1 if colon < right else left
++                if code[left:left + 1] == '[' and left in self.pairs:
++                    closing = self.pairs[left]
++                    key = _heap_key(text[left + 1:closing])
++                    self.value(left + 1, closing, state)
++            fact = self.value(begin, right, state)
++            if key is None:
++                fields = {name: _join(old, fact) for name, old in fields.items()}
++                fields[None] = _join(fields.get(None, frozenset()), fact)
++            else:
++                fields[key] = fact
++        if previous is not None:
++            state.heap_many |= {origin}
++            fields = {key: _join(previous.get(key, frozenset()), fields.get(key, frozenset()))
++                      for key in previous.keys() | fields.keys()}
++        state.heap[origin] = fields
++        return frozenset({_Trace(origin, ('array' if array else 'object',))})
++
+     def assign(self, name, fact, state, position, binding=None):
+         state[name] = _step(fact, name)
+         state.bindings[name] = binding
+@@ -1210,7 +1411,7 @@ class _Flow:
+         if default_flow is not None:
+             incoming = state.copy()
+             for (location, label), fact in default_flow.effects.items():
+-                self.effect(location, label, self.substitute(fact, callee, bound, incoming))
++                self.effect(location, label, _heap_materialize(self.substitute(fact, callee, bound, incoming), incoming))
+             writes = {key: value for key, value in default_state.cells.items() if key[0] is not callee}
+             self.apply_writes(writes, callee, bound, state, incoming)
+             for dependency, callers in self.engine.dependents.items():
+@@ -1221,6 +1422,16 @@ class _Flow:
+     def substitute(self, fact, callee, bound, state):
+         result = frozenset()
+         for trace in fact:
++            if trace.origin[0] == 'property':
++                _, base, path = trace.origin
++                value = self.substitute(frozenset({_Trace(base, trace.path)}), callee, bound, state)
++                for key in path:
++                    value = _heap_read(value, key, state)
++                result = _join(result, _step(value, (callee.name or '<callback>') + '()'))
++                continue
++            if trace.origin[0] == 'heap':
++                result = _join(result, frozenset({trace}))
++                continue
+             if trace.origin[0] == 'capture':
+                 incoming = _cell_value(trace.origin[1], state)
+                 result = _join(result, _step(incoming, (callee.name or '<callback>') + '()'))
+@@ -1250,6 +1461,27 @@ class _Flow:
+             return frozenset()
+         if code[start] == '(' and self.pairs.get(start) == end - 1:
+             return self.value(start + 1, end - 1, state)
++        access = _heap_access(text, code, self.pairs, start, end)
++        if access is not None:
++            root, steps, after = access
++            operator = re.match(r'\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[after:end])
++            if steps and operator:
++                key, begin, finish, _marker = steps[-1]
++                receiver = self.member(root, steps[:-1], state)
++                if begin is not None:
++                    self.value(begin, finish, state)
++                before = _heap_read(receiver, key, state)
++                rhs = after + operator.end()
++                value = self.value(rhs, end, state)
++                if operator.group(1) != '=':
++                    value = _join(before, value)
++                _heap_store(receiver, key, _step(value, text[start:after].strip()), state)
++                for location, expr_start, rule, label in self.engine.write_sinks:
++                    if rule == self.rule and start <= location < rhs <= expr_start:
++                        self.effect(location, label, _heap_materialize(value, state))
++                return value
++            if steps and after == end:
++                return self.member(root, steps, state)
+         assignment = re.match(r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[start:end])
+         if assignment:
+             target = assignment.group(1)
+@@ -1260,7 +1492,7 @@ class _Flow:
+             self.assign(target, fact, state, start, self.callable(rhs, end, state))
+             for location, expr_start, rule, label in self.engine.write_sinks:
+                 if rule == self.rule and start <= location < rhs <= expr_start:
+-                    self.effect(location, label, fact)
++                    self.effect(location, label, _heap_materialize(fact, state))
+             return fact
+         operators, question, colon, depth = [], None, None, 0
+         cursor = start
+@@ -1292,6 +1524,7 @@ class _Flow:
+             state.update(merged)
+             state.bindings = dict(merged.bindings)
+             state.owners, state.cells = dict(merged.owners), dict(merged.cells)
++            state.heap, state.heap_many = dict(merged.heap), merged.heap_many
+             return _join(*facts)
+         if operators:
+             _, operator = min(operators, key=lambda item: (item[0], -item[1]))
+@@ -1303,7 +1536,18 @@ class _Flow:
+             state.update(merged)
+             state.bindings = dict(merged.bindings)
+             state.owners, state.cells = dict(merged.owners), dict(merged.cells)
++            state.heap, state.heap_many = dict(merged.heap), merged.heap_many
+             return _join(left, right)
++        if code[start] in '[{' and self.pairs.get(start) == end - 1:
++            return self.literal(start, end, state)
++        # Evaluate concatenation operands in source order. A later mutation
++        # cannot retroactively erase taint read from an earlier heap member.
++        for left, right in _chunks(code, start, end, '+'):
++            if right < end and code[right:right + 2] not in {'++', '+='} and code[right - 1:right] != '+':
++                if left == start and code[start:right].strip():
++                    first = self.value(start, right, state)
++                    return _join(first, self.value(right + 1, end, state))
++            break
+         remainder = list(code[start:end])
+         source_remainder = list(text[start:end])
+         for child in self.scope.children:
+@@ -1336,13 +1580,13 @@ class _Flow:
+                 incoming = state.copy()
+                 call_fact = self.substitute(returned, callee, bound, incoming)
+                 for (location, label), fact in effects.items():
+-                    self.effect(location, label, self.substitute(fact, callee, bound, incoming))
++                    self.effect(location, label, _heap_materialize(self.substitute(fact, callee, bound, incoming), incoming))
+                 self.apply_writes(writes, callee, bound, state, incoming)
+             else:
+-                call_fact = _join(*argument_facts)
++                call_fact = _heap_materialize(_join(*argument_facts), state)
+                 receiver = callee_name.split('.')[0]
+                 if '.' in callee_name:
+-                    call_fact = _join(call_fact, self.reference(receiver, state))
++                    call_fact = _join(call_fact, _heap_materialize(self.reference(receiver, state), state))
+                 # Argument facts already retain precise local-call returns.
+                 # Only a source in the callee itself introduces new input.
+                 candidate = text[match.start():closing + 1]
+@@ -1355,17 +1599,39 @@ class _Flow:
+                 binding = state.bindings.get(receiver, 'imported')
+                 if sink and sink[0] == self.rule and state.bindings.get(callee_name, 'imported') == 'imported':
+                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
+-                    self.effect(match.start(), sink[1], _join(*selected))
++                    self.effect(match.start(), sink[1], _heap_materialize(_join(*selected), state))
+                 regex = SANITIZERS_BY_RULE.get(self.rule)
+                 following = code[closing + 1:end].lstrip()
+                 if regex and regex.match(candidate) and not following.startswith(('.', '[')):
+                     previous = code[:match.start()].rstrip()
+                     if not previous.endswith('.') and binding == 'imported':
+                         call_fact = frozenset()
++            # A returned alias can be read through immediately: id(obj).field.
++            stop = closing + 1
++            while stop < end:
++                tail = stop
++                while tail < end and code[tail].isspace():
++                    tail += 1
++                field = re.match(r'\.\s*([A-Za-z_$][\w$]*)', code[tail:end])
++                if field:
++                    next_pos = tail + field.end()
++                    if code[next_pos:end].lstrip().startswith('('):
++                        break
++                    call_fact = _heap_read(call_fact, field.group(1), state)
++                    stop = next_pos
++                elif code[tail:tail + 1] == '[' and tail in self.pairs and self.pairs[tail] < end:
++                    finish = self.pairs[tail]
++                    self.value(tail + 1, finish, state)
++                    call_fact = _heap_read(call_fact, _heap_key(text[tail + 1:finish]), state)
++                    stop = finish + 1
++                else:
++                    break
+             facts.append(call_fact)
+             remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+             source_remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+-            cursor = closing + 1
++            remainder[closing + 1 - start:stop - start] = [' '] * (stop - closing - 1)
++            source_remainder[closing + 1 - start:stop - start] = [' '] * (stop - closing - 1)
++            cursor = stop
+         remaining = ''.join(remainder)
+         for source, _ in assignment_sources(''.join(source_remainder)):
+             facts.append(frozenset({_Trace(('source', source), (source,))}))
+@@ -1383,7 +1649,7 @@ class _Flow:
+         result = _join(*facts)
+         for location, expr_start, rule, label in self.engine.write_sinks:
+             if rule == self.rule and start <= location < end:
+-                self.effect(location, label, self.value(expr_start, end, state))
++                self.effect(location, label, _heap_materialize(self.value(expr_start, end, state), state))
+         return result
+ 
+     def expression(self, start, end, state):
+@@ -1700,14 +1966,41 @@ class _Engine:
+         self.final_states[(scope, rule)] = final or state
+         exits = [*flow.exit_states, *([final] if final is not None else [])]
+         joined = _join_states(*exits)
+-        writes = {} if joined is None else {key: value for key, value in joined.cells.items() if key[0] is not scope}
+-        return flow.returned, flow.effects, writes
++        writes = {} if joined is None else {
++            key: _heap_materialize(value, joined) for key, value in joined.cells.items() if key[0] is not scope
++        }
++        # Local allocations escape as their reachable taint, not a pointer to
++        # storage absent in the caller. Argument aliases remain symbolic until
++        # call-site substitution, retaining precise selected-field reads.
++        returned = flow.returned if joined is None else _heap_materialize(flow.returned, joined)
++        return returned, flow.effects, writes
+ 
+     def concrete(self, fact, rule, visited=frozenset()):
+         result = frozenset()
+         for trace in fact:
+             if trace.origin[0] == 'source':
+                 result = _join(result, frozenset({trace}))
++            elif trace.origin[0] == 'property':
++                _, base, path = trace.origin
++                if base[0] == 'capture':
++                    state = self.final_states.get((base[1][0], rule))
++                    value = _cell_value(base[1], state) if state is not None else frozenset()
++                elif base[0] == 'heap':
++                    state = self.final_states.get((base[1][0], rule))
++                    value = frozenset({_Trace(base, trace.path)})
++                else:
++                    state = None
++                    value = self.concrete(frozenset({_Trace(base, trace.path)}), rule, visited)
++                if state is not None:
++                    for key in path:
++                        value = _heap_read(value, key, state)
++                if trace.origin not in visited:
++                    result = _join(result, self.concrete(value, rule, visited | {trace.origin}))
++            elif trace.origin[0] == 'heap' and trace.origin not in visited:
++                state = self.final_states.get((trace.origin[1][0], rule))
++                if state is not None:
++                    value = _heap_materialize(frozenset({trace}), state)
++                    result = _join(result, self.concrete(value, rule, visited | {trace.origin}))
+             elif trace.origin[0] == 'capture' and trace.origin not in visited:
+                 key = trace.origin[1]
+                 owner = key[0]

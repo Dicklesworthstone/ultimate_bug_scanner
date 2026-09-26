@@ -1,0 +1,461 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -182,11 +182,17 @@
+     references: References
+     receiver: Fact = CLEAN
+ 
++
++@dataclass(frozen=True)
++class _LiteralString:
++    """A value is not an import/callable identity just because it is text."""
++    value: str
++
+ # Preserve the existing conventional unimported names, but never restore one
+ # after a local assignment/parameter has explicitly shadowed it.
+ _IMPLICIT_IDENTITIES = frozenset({
+     'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'builtins',
+-    'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os',
++    'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
+     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
+     'render_template', 'render_template_string', 'HttpResponse', 'Response',
+ })
+@@ -255,9 +261,76 @@
+ 
+ 
+ def _safe_for(trace: TaintTrace, kind: str, label: str) -> bool:
+-    if kind == 'command' and label in {'subprocess executable', 'os executable'}:
+-        return False  # Quoting does not authorize an attacker-chosen executable.
++    if kind == 'command' and label in {'subprocess executable', 'os executable', 'interpreter source'}:
++        # Shell quoting neither authorizes an executable nor escapes Python
++        # source. Keep this distinction when substituting helper parameters.
++        return False
+     return kind in trace.sanitizers
++
++
++def _literal_text(node):
++    if isinstance(node, _LiteralString):
++        return node.value
++    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
++
++
++def _interpreter_kind(program):
++    if program is None:
++        return None
++    leaf = program.replace('\\', '/').rsplit('/', 1)[-1].removesuffix('.exe')
++    if leaf in {'sh', 'bash', 'dash', 'ash', 'zsh', 'ksh', 'mksh'}:
++        return 'shell'
++    if re.fullmatch(r'(?:python|pypy)(?:[0-9]+(?:\.[0-9]+)*)?[dt]?', leaf):
++        return 'python'
++    return None
++
++
++def _interpreter_inputs(kind, arguments):
++    """Return possible code operands, not data following a selected program.
++
++    Arguments are already evaluated (AST expression, fact) snapshots. Unknown
++    options/expansions retain the possibly executable suffix. A literal script,
++    -c program, or -m module consumes option parsing: subsequent -c-looking data
++    must not be reinterpreted as a second command. No analyzed code is executed.
++    """
++    index = 0
++    shell_command = False
++    while index < len(arguments):
++        node, fact = arguments[index]
++        option = _literal_text(node)
++        if option is None:
++            if shell_command and not isinstance(node, ast.Starred):
++                return fact, CLEAN
++            return CLEAN, join_facts(*(value for _node, value in arguments[index:]))
++        if option == '--':
++            value = arguments[index + 1][1] if index + 1 < len(arguments) else CLEAN
++            return (value, CLEAN) if shell_command else (CLEAN, value)
++        if option == '-' or not option.startswith(('-', '+')):
++            # A dynamic script path is executable input; a fixed script path
++            # is clean regardless of what follows in its application argv.
++            return (fact, CLEAN) if shell_command else (CLEAN, fact)
++        takes_value = ({'-o', '+o', '-O', '+O', '--rcfile', '--init-file'} if kind == 'shell'
++                       else {'-W', '-X', '--check-hash-based-pycs'})
++        if option in takes_value:
++            index += 2
++            continue
++        if option.startswith('-') and not option.startswith('--'):
++            if kind == 'python':
++                for position, flag in enumerate(option[1:], 2):
++                    if flag in {'c', 'm'}:
++                        # The rest of this option is code/module text, not
++                        # additional flags. -W/-X values must never supply c.
++                        value = fact if option[position:] else (
++                            arguments[index + 1][1] if index + 1 < len(arguments) else CLEAN)
++                        return CLEAN, value
++                    if flag in {'W', 'X'}:
++                        if not option[position:]:
++                            index += 1
++                        break
++            elif 'c' in option[1:]:
++                shell_command = True
++        index += 1
++    return CLEAN, CLEAN
+ 
+ 
+ class _State(dict):
+@@ -316,7 +389,7 @@
+             if isinstance(target, str):
+                 return target
+             if node.id in {'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex',
+-                           'subprocess', 'os', 'builtins', 'eval', 'exec', 'input', 'raw_input',
++                           'subprocess', 'os', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
+                            'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
+                 return ''
+         return node.id
+@@ -578,6 +651,42 @@
+             else:
+                 choices.append(target)
+         return _join_bindings(*choices)
++
++    def command_operand(self, node, fact):
++        literal = self.expression_bindings.get(node)
++        return (literal if isinstance(literal, _LiteralString) else node), fact
++
++    def command_operands(self, node):
++        """Expand literal argv without evaluating any argument a second time."""
++        if not isinstance(node, (ast.List, ast.Tuple)):
++            return None
++        result = []
++        for item in node.elts:
++            expanded = self.command_operands(item.value) if isinstance(item, ast.Starred) else None
++            if expanded is not None:
++                result.extend(expanded)
++            else:
++                result.append(self.command_operand(item, self.expression_facts.get(item, CLEAN)))
++        return result
++
++    def interpreter_effects(self, program_node, operands):
++        program = _literal_text(self.expression_bindings.get(program_node)) or _literal_text(program_node)
++        # sys.executable denotes this Python interpreter, not a script path.
++        if self.expression_bindings.get(program_node) == 'sys.executable':
++            program = 'python'
++        kind = _interpreter_kind(program)
++        return _interpreter_inputs(kind, operands) if kind is not None else (CLEAN, CLEAN)
++
++    def command_effect(self, node, executable, shell_code=CLEAN, interpreter_code=CLEAN):
++        # One diagnostic at a process call even when more than one operand is
++        # unsafe. Preserve the strict domain in symbolic helper summaries.
++        if interpreter_code or executable:
++            unsafe_shell = frozenset(trace for trace in shell_code
++                                     if not _safe_for(trace, 'command', 'subprocess execution'))
++            self.effect('command', node, 'interpreter source' if interpreter_code else 'subprocess executable',
++                        join_facts(executable, interpreter_code, unsafe_shell))
++        else:
++            self.effect('command', node, 'subprocess execution', shell_code)
+ 
+     def call(self, node, state):
+         # Python evaluates the receiver/callable before argument expressions,
+@@ -699,23 +808,64 @@
+             shell = keyword_nodes.get('shell')
+             shell_true = isinstance(shell, ast.Constant) and bool(shell.value)
+             shell_unknown = (shell is not None and not isinstance(shell, ast.Constant)) or None in keywords
+-            if isinstance(command_node, (ast.List, ast.Tuple)):
++            operands = self.command_operands(command_node)
++            if operands is not None:
+                 # A list's first item selects the program or shell command;
+                 # later argument side effects must not re-evaluate that item.
+-                command = self.expression_facts.get(command_node.elts[0], CLEAN) if command_node.elts else CLEAN
++                command = operands[0][1] if operands else CLEAN
+             executable = join_facts(keywords.get('executable', CLEAN), keywords.get(None, CLEAN))
+             executable_node = keyword_nodes.get('executable')
+-            fixed_executable = isinstance(executable_node, ast.Constant) and executable_node.value is not None
++            executable_literal = self.expression_bindings.get(executable_node)
++            fixed_executable = (isinstance(executable_literal, _LiteralString)
++                                or isinstance(executable_node, ast.Constant) and executable_node.value is not None)
++            has_override = executable_node is not None and not (
++                isinstance(executable_node, ast.Constant) and executable_node.value is None)
+             if (not shell_true or shell_unknown) and not fixed_executable:
+                 executable = join_facts(executable, command)
+             shell_code = command if shell_true or shell_unknown else CLEAN
+-            if executable:
+-                unsafe_shell = frozenset(trace for trace in shell_code if not _safe_for(trace, 'command', 'subprocess execution'))
+-                self.effect('command', node, 'subprocess executable', join_facts(executable, unsafe_shell))
++            interpreter_code = CLEAN
++            if operands and (not shell_true or shell_unknown):
++                program_node = executable_node if fixed_executable else operands[0][0]
++                nested_shell, interpreter_code = self.interpreter_effects(program_node, operands[1:])
++                shell_code = join_facts(shell_code, nested_shell)
++            if (shell_true or shell_unknown) and has_override:
++                # shell=True still passes -c to an explicitly selected shell;
++                # selecting Python does not make shell quoting Python-safe.
++                if _interpreter_kind(_literal_text(executable_literal) or _literal_text(executable_node)) != 'shell':
++                    interpreter_code = join_facts(interpreter_code, command)
++            self.command_effect(node, executable, shell_code, interpreter_code)
++        elif name == 'asyncio.create_subprocess_exec':
++            executable = source_argument('program')
++            program_node = node.args[0] if node.args else keyword_nodes.get('program')
++            override = keyword_nodes.get('executable')
++            if override is not None and not (isinstance(override, ast.Constant) and override.value is None):
++                fixed = isinstance(self.expression_bindings.get(override), _LiteralString) or isinstance(override, ast.Constant)
++                executable = join_facts(keywords.get('executable', CLEAN), CLEAN if fixed else executable)
++                program_node = override
++            operands = [self.command_operand(argument, value) for argument, value in zip(node.args[1:], arguments[1:])]
++            shell_code, interpreter_code = self.interpreter_effects(program_node, operands)
++            self.command_effect(node, executable, shell_code, interpreter_code)
++        elif name in {'os.execv', 'os.execve', 'os.execvp', 'os.execvpe', 'os.execl', 'os.execle',
++                      'os.execlp', 'os.execlpe', 'os.posix_spawn', 'os.posix_spawnp'}:
++            program_node = node.args[0] if node.args else keyword_nodes.get('path', keyword_nodes.get('file'))
++            executable = source_argument('path', 'file')
++            if leaf.startswith('execl'):
++                tail = -1 if leaf.endswith('e') else len(node.args)
++                operands = [self.command_operand(argument, value) for argument, value in zip(node.args[2:tail], arguments[2:tail])]
+             else:
+-                self.effect('command', node, 'subprocess execution', shell_code)
+-        elif name in {'os.system', 'os.popen', 'os.execv', 'os.execve', 'os.execvp', 'os.execvpe'}:
+-            self.effect('command', node, 'os executable' if leaf.startswith('exec') else 'os command execution', first)
++                argv = node.args[1] if len(node.args) > 1 else keyword_nodes.get('argv', keyword_nodes.get('args'))
++                vector = self.command_operands(argv)
++                operands = vector[1:] if vector else []
++            shell_code, interpreter_code = self.interpreter_effects(program_node, operands)
++            self.command_effect(node, executable, shell_code, interpreter_code)
++        elif name in {'os.system', 'os.popen', 'subprocess.getoutput', 'subprocess.getstatusoutput',
++                      'asyncio.create_subprocess_shell'}:
++            command = source_argument('cmd', 'command')
++            override = keyword_nodes.get('executable')
++            has_override = override is not None and not (isinstance(override, ast.Constant) and override.value is None)
++            program = _literal_text(self.expression_bindings.get(override)) or _literal_text(override)
++            raw = command if has_override and _interpreter_kind(program) != 'shell' else CLEAN
++            self.command_effect(node, keywords.get('executable', CLEAN), command, raw)
+         elif name in {'eval', 'exec', 'builtins.eval', 'builtins.exec'}:
+             self.effect('eval', node, leaf, source_argument('source', 'object'))
+         configurable_html = name == 'bleach.clean' and (
+@@ -735,7 +885,9 @@
+         if node is not None:
+             self.expression_facts[node] = fact
+             binding = self.expression_bindings.get(node)
+-            if isinstance(node, ast.Name):
++            if isinstance(node, ast.Constant) and isinstance(node.value, str):
++                binding = _LiteralString(node.value)
++            elif isinstance(node, ast.Name):
+                 binding = state.bindings.get(node.id, _implicit_identity(node.id))
+             elif isinstance(node, ast.Attribute):
+                 candidates = []
+diff --git a/test-suite/quality/test_taint_python_processes.py b/test-suite/quality/test_taint_python_processes.py
+new file mode 100644
+--- /dev/null
++++ b/test-suite/quality/test_taint_python_processes.py
+@@ -0,0 +1,218 @@
++"""Executable source versus argv data in Python process APIs.
++
++All payloads are static-analysis fixtures; the unit tests never execute them.
++"""
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import unittest
++
++from test_taint_python_dataflow import ROOT, SourceTest
++
++
++class InterpreterProcessTests(SourceTest):
++    def test_shell_command_payloads_are_sinks(self):
++        for shell in ('sh', 'bash', '/bin/dash', '/usr/bin/zsh', 'ksh', 'mksh'):
++            for option in ('-c', '-lc'):
++                with self.subTest(shell=shell, option=option):
++                    self.assert_rules(f'subprocess.run([{shell!r}, {option!r}, input()])', 'command')
++
++    def test_python_command_payloads_are_not_ordinary_argv(self):
++        for program in ('python', 'python3', '/usr/bin/python3.14', 'pypy3', 'C:\\Python\\python.exe'):
++            for option in ('-c', '-Ic', '-uc'):
++                with self.subTest(program=program, option=option):
++                    self.assert_rules(f'subprocess.run([{program!r}, {option!r}, input()])', 'command')
++
++    def test_fixed_shell_program_positional_arguments_remain_data(self):
++        self.assert_rules('subprocess.run(["sh", "-c", \'printf "%s" "$1"\', "name", input()])')
++        self.assert_rules('subprocess.run(["bash", "-lc", "echo safe", input()])')
++
++    def test_fixed_python_program_arguments_remain_data(self):
++        self.assert_rules('subprocess.run(["python3", "-c", "import sys; print(sys.argv[1])", input()])')
++        self.assert_rules('subprocess.run(["python3", "script.py", "-c", input()])')
++        self.assert_rules('subprocess.run(["python3", "-m", "package", "-c", input()])')
++
++    def test_option_values_are_not_interpreter_programs(self):
++        self.assert_rules('subprocess.run(["python3", "-W", input(), "-X", input(), "-c", "print(1)"])')
++        self.assert_rules('subprocess.run(["bash", "-o", "noclobber", "-c", "echo safe", input()])')
++        self.assert_rules('subprocess.run(["python3", "--check-hash-based-pycs", "always", "-c", input()])', 'command')
++        self.assert_rules('subprocess.run(["python3", "-Wignore::DeprecationWarning", "-c", input()])', 'command')
++        self.assert_rules('subprocess.run(["python3", "-Xcheck", "-c", input()])', 'command')
++        self.assert_rules('subprocess.run(["python3", "-Impackage", "-c", input()])')
++
++    def test_options_after_bash_c_are_not_the_command(self):
++        self.assert_rules('subprocess.run(["bash", "-c", "-l", input()])', 'command')
++        self.assert_rules('subprocess.run(["bash", "-lc", "-o", "noclobber", input()])', 'command')
++
++    def test_end_of_options_and_script_paths(self):
++        self.assert_rules('subprocess.run(["bash", "--", "script.sh", "-c", input()])')
++        self.assert_rules('subprocess.run(["python3", "--", "script.py", "-c", input()])')
++        self.assert_rules('subprocess.run(["bash", "-c", "--", input()])', 'command')
++        self.assert_rules('subprocess.run(["python3", input()])', 'command')
++
++    def test_shell_quote_is_not_python_source_sanitization(self):
++        self.assert_rules('subprocess.run(["python3", "-c", shlex.quote(input())])', 'command')
++        self.assert_rules('subprocess.run(["bash", "-c", "echo " + shlex.quote(input())])')
++        self.assert_rules('subprocess.run(["python3", "-c", html.escape(input())])', 'command')
++
++    def test_local_helpers_preserve_strict_interpreter_domain(self):
++        self.assert_rules('''
++            def execute(program):
++                subprocess.run(['python3', '-c', program])
++            execute(shlex.quote(input()))
++        ''', 'command')
++        self.assert_rules('''
++            def execute(program):
++                subprocess.run(['bash', '-c', program])
++            execute('echo ' + shlex.quote(input()))
++        ''')
++        self.assert_rules('''
++            def execute(command, data):
++                subprocess.run(['sh', '-c', command, 'name', data])
++            execute('echo "$1"', input())
++        ''')
++
++    def test_all_subprocess_vector_entrypoints(self):
++        for function in ('run', 'Popen', 'call', 'check_call', 'check_output'):
++            with self.subTest(function=function):
++                self.assert_rules(f'subprocess.{function}(["python3", "-c", input()])', 'command')
++                self.assert_rules(f'subprocess.{function}(["echo", input()])')
++
++    def test_keyword_vectors_and_literal_expansion(self):
++        self.assert_rules('subprocess.run(args=["sh", "-c", input()])', 'command')
++        self.assert_rules('subprocess.run(**{"args": ["python3", "-c", input()]})', 'command')
++        self.assert_rules('subprocess.run(["python3", *["-c", input()]])', 'command')
++        self.assert_rules('subprocess.run(["echo", *[input()]])')
++
++    def test_dynamic_option_suffix_is_not_proven_safe(self):
++        self.assert_rules('subprocess.run(["python3", options, input()])', 'command')
++        self.assert_rules('subprocess.run(["sh", *options, input()])', 'command')
++
++    def test_shell_true_does_not_execute_later_vector_items(self):
++        self.assert_rules('subprocess.run(["python3", "-c", input()], shell=True)')
++        self.assert_rules('subprocess.run([input(), "-c", "safe"], shell=True)', 'command')
++
++    def test_executable_override_selects_the_real_interpreter(self):
++        self.assert_rules('subprocess.run(["ignored", "-c", input()], executable="python3")', 'command')
++        self.assert_rules('subprocess.run(["python3", "-c", input()], executable="/bin/echo")')
++        self.assert_rules('subprocess.run([shlex.quote(input())], shell=True, executable="python3")', 'command')
++        self.assert_rules('subprocess.run("echo " + shlex.quote(input()), shell=True, executable="/bin/bash")')
++        self.assert_rules('subprocess.run("echo " + shlex.quote(input()), shell=True, executable=None)')
++        self.assert_rules('program = "echo"\nsubprocess.run(["python3", "-c", input()], executable=program)')
++        self.assert_rules('program = "python3"\nsubprocess.run(["echo", "-c", input()], executable=program)', 'command')
++
++    def test_current_python_interpreter_identity(self):
++        self.assert_rules('import sys\nsubprocess.run([sys.executable, "-c", input()])', 'command')
++
++    def test_qualified_import_and_function_aliases(self):
++        self.assert_rules('from subprocess import run as execute\nexecute(["sh", "-c", input()])', 'command')
++        self.assert_rules('execute = subprocess.run\nexecute(["python3", "-c", input()])', 'command')
++        self.assert_rules('from project import run\nrun(["python3", "-c", input()])')
++
++    def test_asyncio_process_vectors_and_shell_source(self):
++        self.assert_rules('asyncio.create_subprocess_exec("sh", "-c", input())', 'command')
++        self.assert_rules('asyncio.create_subprocess_exec("python3", "-c", input())', 'command')
++        self.assert_rules('asyncio.create_subprocess_exec("echo", input())')
++        self.assert_rules('asyncio.create_subprocess_shell(input())', 'command')
++        self.assert_rules('from asyncio import create_subprocess_exec as run\nrun("python", "-c", input())', 'command')
++
++    def test_async_executable_override(self):
++        self.assert_rules('asyncio.create_subprocess_exec("ignored", "-c", input(), executable="python3")', 'command')
++        self.assert_rules('asyncio.create_subprocess_exec("python3", "-c", input(), executable="echo")')
++        self.assert_rules('asyncio.create_subprocess_exec("echo", executable=input())', 'command')
++        self.assert_rules('asyncio.create_subprocess_exec(input(), executable=maybe_none)', 'command')
++        self.assert_rules('asyncio.create_subprocess_shell("echo " + shlex.quote(input()), executable=None)')
++        self.assert_rules('program = "bash"\nasyncio.create_subprocess_shell("echo " + shlex.quote(input()), executable=program)')
++
++    def test_rebound_api_and_literal_strings_are_not_callables(self):
++        self.assert_rules('asyncio = service\nasyncio.create_subprocess_exec("sh", "-c", input())')
++        self.assert_rules('run = "eval"\nrun(input())')
++        self.assert_rules('read = "input"\neval(read())')
++
++    def test_os_exec_vectors_and_spawn(self):
++        for function in ('execv', 'execvp', 'execve', 'execvpe', 'posix_spawn', 'posix_spawnp'):
++            extra = ', {}' if function.endswith('e') or function.startswith('posix_spawn') else ''
++            with self.subTest(function=function):
++                self.assert_rules(f'os.{function}("python3", ["ignored", "-c", input()]{extra})', 'command')
++                self.assert_rules(f'os.{function}("echo", ["ignored", input()]{extra})')
++
++    def test_os_exec_variadic_arguments(self):
++        for function in ('execl', 'execlp', 'execle', 'execlpe'):
++            extra = ', {}' if function.endswith('e') else ''
++            with self.subTest(function=function):
++                self.assert_rules(f'os.{function}("sh", "ignored", "-c", input(){extra})', 'command')
++                self.assert_rules(f'os.{function}("echo", "ignored", input(){extra})')
++
++    def test_shell_string_helpers_are_sinks(self):
++        for function in ('subprocess.getoutput', 'subprocess.getstatusoutput', 'os.system', 'os.popen'):
++            with self.subTest(function=function):
++                self.assert_rules(f'{function}(input())', 'command')
++                self.assert_rules(f'{function}("echo " + shlex.quote(input()))')
++
++    def test_argument_facts_use_original_evaluation_order(self):
++        self.assert_rules('q = input()\nsubprocess.run(["sh", "-c", q, (q := "safe")])', 'command')
++        self.assert_rules('q = "safe"\nsubprocess.run(["sh", "-c", q, (q := input())])')
++        self.assert_rules('subprocess.run(["python3", "-c", "print(1)", eval(input())])', 'eval')
++
++    def test_framework_input_reaches_interpreter_via_helper(self):
++        self.assert_rules('''
++            from fastapi import Query
++            def execute(code):
++                subprocess.run(['python3', '-c', code])
++            def route(code=Query()):
++                execute(code)
++        ''', 'command')
++
++
++@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'Set UBS_TAINT_E2E=1 for real CLI scans')
++class InterpreterCliTests(unittest.TestCase):
++    def test_python_code(self):
++        self.check_process('python-code', 'subprocess.run(["python3", "-c", input()])', True)
++
++    def test_shell_code(self):
++        self.check_process('shell-code', 'subprocess.run(["sh", "-c", input()])', True)
++
++    def test_python_data(self):
++        self.check_process('python-data', 'subprocess.run(["python3", "-c", "print(1)", input()])', False)
++
++    def test_async_code(self):
++        self.check_process('async-code', 'asyncio.create_subprocess_exec("sh", "-c", input())', True)
++
++    def check_process(self, name, source, unsafe):
++        artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-processes'
++        artifacts.mkdir(parents=True, exist_ok=True)
++
++        def collect(value):
++            if isinstance(value, dict):
++                return {item for key, item in value.items() if key in {'rule', 'rule_id', 'ruleId'}
++                        and isinstance(item, str)} | set().union(*(collect(child) for child in value.values()))
++            if isinstance(value, list):
++                return set().union(*(collect(child) for child in value))
++            return set()
++
++        for output in ('json', 'sarif'):
++            with self.subTest(name=name, format=output), tempfile.TemporaryDirectory(prefix='ubs-process-cli-') as tmp:
++                path = Path(tmp) / 'route.py'
++                path.write_text(source + '\n', encoding='utf-8')
++                result = subprocess.run([str(ROOT / 'ubs'), str(path), '--only=python', '--ci', f'--format={output}'],
++                                        cwd=tmp, text=True, capture_output=True, timeout=90,
++                                        env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1'))
++                (artifacts / f'{name}-{output}.json').write_text(result.stdout, encoding='utf-8')
++                (artifacts / f'{name}-{output}.stderr.log').write_text(result.stderr, encoding='utf-8')
++                self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
++                report = json.loads(result.stdout)
++                if output == 'sarif':
++                    rules = {item.get('ruleId') for run in report.get('runs', []) for item in run.get('results', [])}
++                else:
++                    self.assertEqual(report.get('status'), 'ok', report)
++                    rules = collect(report)
++                self.assertEqual(bool({'python.taint.command', 'py.taint.command'} & rules), unsafe, report)
++                print('PROCESS_CLI_PASS', name, output, flush=True)
++
++
++if __name__ == '__main__':
++    unittest.main(verbosity=2)

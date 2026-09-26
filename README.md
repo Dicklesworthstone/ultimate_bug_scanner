@@ -1033,8 +1033,9 @@ Rule Control:
                            fmt/clippy, check/test --no-run, audit/deny/udeps/outdated). Each skipped
                            category reports "Not evaluated" instead of "clean"; targeted scans
                            (files, --staged, --diff) skip cargo automatically for the same reason.
-  --rules=DIR              Additional ast-grep rules directory
-                           Rules are merged with built-in rules
+  --rules=SOURCE           Additional ast-grep rules, merged with built-in rules. Repeatable.
+                           SOURCE is a directory or a git rule pack
+                           git+URL[@REF][#subdirectory=DIR] (see "Shared rule packs")
   --no-auto-update         Disable automatic self-update
   --suggest-ignore         Print large-directory candidates to add to .ubsignore (no changes applied)
 
@@ -1050,6 +1051,8 @@ Environment Variables:
   UBS_PROFILE=1            Add phase timings (list, fan-out, per module, merge, total ms) to json/toon output and the text summary
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
+  UBS_RULES                Comma-separated rule sources used when no --rules is given
+  UBS_RULES_TTL            Seconds before a git rule pack on a branch or tag is refreshed (default: 3600)
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1074,7 +1077,7 @@ Exit Codes:
 In `--format=json|jsonl|sarif|toon` mode every failure is an object on stdout, never
 just text on stderr, so `ubs … --format=json | jq` always has something to parse:
 
-- Environment errors and refused scans: `{"error":"environment"|"refused","status":"error"|"refused","reason":"ast-grep-missing"|"module-failed"|"directory-too-large"|"home-directory"|"root-directory","exit_code":2,"message":…}` (JSONL adds `"type":"error"`; SARIF emits one run with `invocations[0].executionSuccessful=false` and a `toolExecutionNotifications` entry).
+- Environment errors and refused scans: `{"error":"environment"|"refused","status":"error"|"refused","reason":"ast-grep-missing"|"module-failed"|"directory-too-large"|"home-directory"|"root-directory"|"invalid-rules-directory"|"invalid-rules-source"|"rules-source-unavailable"|"duplicate-rule-id","exit_code":2,"message":…}` (JSONL adds `"type":"error"`; SARIF emits one run with `invocations[0].executionSuccessful=false` and a `toolExecutionNotifications` entry).
 - Incomplete runs: the normal envelope with `"status":"partial"` (or `"error"` when a module could not run at all and no other scanner produced a result) and `failed_modules:[{language,status,module_error,message}]`; each scanner carries its own `status` (`ok`, `timeout`, `error`). A module that exits 2 is reported the same way, with `"error":"environment"`, `"reason":"module-failed"` and `"exit_code":2` added — the results from the scanners that *did* complete stay in the envelope, and every requested `--report-json` / `--html-report` / `--beads-jsonl` is still written. SARIF runs get `invocations[].executionSuccessful=false`, `exitCode: 2` and one notification per failed module.
 - Requested artifacts are a separate outcome from the analysis. If a `--report-json`, `--html-report`, `--save-baseline` or `--beads-jsonl` was requested and could not be written, the run exits 2 and says which path failed; the previous file at that path is never truncated by a failed write.
 - Comparisons are qualified before they are shown. `--comparison` emits `comparison.delta` only when both the current scan and the baseline are complete; otherwise it emits `comparison.status: "unavailable"` with a `reason` (`current_scan_incomplete`, `baseline_incomplete`, `baseline_missing`, `baseline_unreadable`) instead of a number that would read as an improvement. `--save-baseline` refuses to record a baseline from an incomplete scan, leaving any existing baseline in place, and an HTML report from an incomplete scan carries a visible "Incomplete scan" banner.
@@ -1212,9 +1215,38 @@ id: custom.no-direct-state-mutation
 language: typescript
 rule:
   pattern: this.state.$FIELD = $VALUE
-severity: critical
+severity: error
 message: "Never mutate state directly - use setState()"
 ```
+
+`severity` takes ast-grep's levels (`error`, `warning`, `info`, `hint`); UBS reports
+`error` as critical. `critical` is not an ast-grep level and makes the rule unparseable.
+
+#### **Shared rule packs**
+
+`--rules` is repeatable, and `UBS_RULES` (comma-separated) supplies the same sources when
+no `--rules` is given, so a git hook, CI and an agent's manual run load one policy
+without a wrapper script. A source is a directory or a git repository:
+
+```bash
+# A team pack pinned to a tag, plus project-local rules
+ubs . --rules=git+https://github.com/acme/ubs-rules@v3 --rules=.ubs/rules
+
+# The same policy for every invocation
+export UBS_RULES="git+https://github.com/acme/ubs-rules@main#subdirectory=python,.ubs/rules"
+```
+
+- `git+URL[@REF][#subdirectory=DIR]`: REF is a branch, tag or 40-hex commit (default: the
+  remote HEAD). Checkouts are cached under the scan cache root (`rule-sources/`). A branch or
+  tag is refreshed after `UBS_RULES_TTL` seconds (default 3600, `0` = every run); a pinned
+  commit is never refetched. When a refresh fails, the cached commit is used with a warning;
+  with nothing cached the scan is refused (`rules-source-unavailable`).
+- A source that is a standard ast-grep project (an `sgconfig.yml` with `ruleDirs`) contributes
+  only those directories, so its `rule-tests/` stay out of the scan and the pack keeps working
+  with `ast-grep test`. Otherwise every `.yml`/`.yaml` below the source is a rule; hidden
+  paths such as `.github/` are skipped.
+- Rule ids must be unique across all sources: a duplicate refuses the scan
+  (`duplicate-rule-id`) instead of letting one rule silently shadow another.
 
 ### **Excluding False Positives**
 

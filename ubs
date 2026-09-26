@@ -1289,6 +1289,7 @@ SKIP_TYPE_NARROWING=0
 INCLUDE_EXT=""             # csv forwarded to modules as --include-ext=
 USER_RULES_DIR=""          # forwarded to modules as --rules= (custom ast-grep rules)
 USER_RULES_REQUESTED=0     # distinguish an absent option from --rules=
+USER_RULES_SOURCES=()      # every --rules=SOURCE (a directory or a git+URL rule pack)
 OUTPUT_FILE=""             # tee the rendered report to this file (--output / PROJECT_DIR OUTPUT_FILE)
 LIST_CATEGORIES=0
 TEE_PID=""
@@ -1401,8 +1402,11 @@ Options:
   --include-ext=CSV       Extra file extensions forwarded to the language modules
                           (e.g. --include-ext=js,ts,vue); language detection still
                           uses each module's default extensions unless --only is given
-  --rules=DIR             Directory of custom ast-grep rules merged into every module's
-                          built-in rule pack (YAML; see README "Custom AST-Grep Rules")
+  --rules=SOURCE          Custom ast-grep rules merged into every module's built-in rule
+                          pack (YAML; see README "Custom AST-Grep Rules"). Repeatable.
+                          SOURCE is a directory or a git rule pack
+                          git+URL[@REF][#subdirectory=DIR] (cached; the ruleDirs of an
+                          ast-grep project's sgconfig.yml are honoured)
   --list-categories       Print each selected module's category numbers/names and exit
   --version               Print version and exit
   --ci                    CI mode (stable timestamps)
@@ -1487,6 +1491,11 @@ Environment Variables:
   UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
   UBS_NO_CACHE=1              Disable scan caching (like --no-cache)
   UBS_CACHE_DIR=PATH          Override root directory for scan cache (like --cache-dir)
+  UBS_RULES=SRC[,SRC..]       Rule sources used when no --rules is given (same forms as --rules),
+                              so hooks, CI and manual runs share one policy without a wrapper
+  UBS_RULES_TTL=SECS          Refresh a git rule pack on a branch or tag after SECS (default 3600;
+                              0 refreshes every run); a pinned 40-hex commit is never refetched,
+                              and a failed refresh falls back to the cached commit with a warning
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
   UBS_MODULE_TIMEOUT=SECS     Override automatic per-module timeout (minimum 300s; 0 disables)
   UBS_PROFILE=1               Add phase timings (copy, fan-out, per module, merge, total ms)
@@ -1555,7 +1564,7 @@ cat <<'JSON'
       {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
-      {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack."},
+      {"name": "--rules", "args": "SOURCE", "example": "--rules=./rules", "description": "Custom ast-grep YAML rules merged into every module's rule pack. Repeatable; SOURCE is a directory or a git rule pack git+URL[@REF][#subdirectory=DIR]. A rule id defined by two sources refuses the scan."},
       {"name": "--skip", "args": "CSV", "example": "--skip=python.todo", "description": "Skip categories by stable id (e.g. python.todo) or category number."},
       {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|kotlin|ruby|swift|csharp|elixir|bash)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
@@ -1634,6 +1643,8 @@ cat <<'JSON'
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
+    {"name": "UBS_RULES", "value": "SRC[,SRC..]", "description": "Rule sources used when no --rules is given (directories or git+URL[@REF][#subdirectory=DIR] packs)."},
+    {"name": "UBS_RULES_TTL", "value": "SECS", "description": "Refresh interval for git rule packs on a branch or tag (default 3600; 0 = every run). A pinned commit is never refetched."},
     {"name": "CI", "value": "true", "description": "Disables the auto-update check like --ci."},
     {"name": "NO_COLOR", "value": "1", "description": "Disable ANSI colors."},
     {"name": "TOON_TRU_BIN", "value": "PATH", "description": "toon_rust encoder binary for --format=toon."}
@@ -2240,10 +2251,10 @@ else
       --include-ext)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; INCLUDE_EXT="$1"; shift;;
-      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_DIR="${1#*=}"; shift;;
+      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_SOURCES+=("${1#*=}"); shift;;
       --rules)
-        if [[ $# -lt 2 ]]; then say_err "ERROR: --rules requires a directory"; exit 2; fi
-        USER_RULES_REQUESTED=1; shift; USER_RULES_DIR="$1"; shift;;
+        if [[ $# -lt 2 ]]; then say_err "ERROR: --rules requires a directory or git+URL"; exit 2; fi
+        USER_RULES_REQUESTED=1; shift; USER_RULES_SOURCES+=("$1"); shift;;
       --output=*) OUTPUT_FILE="${1#*=}"; shift;;
       --output|-o)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -2379,44 +2390,203 @@ fi
 # A requested policy is part of the scan contract, not an optional hint.
 # Validate before detection so even an empty project cannot silently accept a
 # typo, and anchor relative paths before modules enter their shadow workspace.
+# Every --rules=SOURCE counts; without one, the comma-separated UBS_RULES does,
+# so a git hook and an agent's manual run load the same policy. A source is a
+# directory or a git rule pack (git+URL[@REF][#subdirectory=DIR], cached under
+# the scan cache root and refreshed after UBS_RULES_TTL seconds). All sources are
+# flattened into one directory, because modules load its top-level files only.
+if [[ "$USER_RULES_REQUESTED" -eq 0 && -n "${UBS_RULES:-}" ]]; then
+  IFS=',' read -r -a USER_RULES_SOURCES <<<"$UBS_RULES"
+  USER_RULES_REQUESTED=1
+fi
 if [[ "$USER_RULES_REQUESTED" -eq 1 ]]; then
-  if [[ -z "$USER_RULES_DIR" || ! -d "$USER_RULES_DIR" || ! -r "$USER_RULES_DIR" || ! -x "$USER_RULES_DIR" ]]; then
-    refuse_scan "invalid-rules-directory" "--rules requires a readable directory: $USER_RULES_DIR" "" \
-      "No scan was performed because the requested custom policy could not be loaded."
-  fi
-  if ! USER_RULES_DIR="$(cd -- "$USER_RULES_DIR" && pwd -P)"; then
-    refuse_scan "invalid-rules-directory" "Cannot resolve the --rules directory" ""
-  fi
-  if ! _custom_rule_count="$(python3 - "$USER_RULES_DIR" <<'PYRULES'
+  ensure_tmpdir_run
+  USER_RULES_DIR="$TMPDIR_RUN/custom-rules"
+  _rules_status=0
+  _rules_result="$(python3 - "$USER_RULES_DIR" "${UBS_RULES_TTL:-3600}" "${USER_RULES_SOURCES[@]}" <<'PYRULES'
+import hashlib
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-def failed(exc):
-    raise exc
+RULE_SUFFIXES = {'.yml', '.yaml'}
+ID_RE = re.compile(r'''^id:\s*['"]?([^'"\s#]+)''', re.MULTILINE)
 
-count = 0
-try:
-    for root, directories, files in os.walk(sys.argv[1], onerror=failed):
-        for name in directories + files:
-            path = Path(root) / name
-            if path.suffix not in {'.yml', '.yaml'}:
+
+class Refusal(Exception):
+    def __init__(self, reason, message):
+        super().__init__(message)
+        self.reason = reason
+
+
+def cache_root():
+    override = os.environ.get('UBS_CACHE_DIR')
+    if override:
+        return Path(override).expanduser().resolve()
+    xdg = os.environ.get('XDG_CACHE_HOME')
+    base = Path(xdg).expanduser().resolve() if xdg else Path.home() / '.cache'
+    return base / 'ubs'
+
+
+def git(*args, cwd=None):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+    proc = subprocess.run(['git', *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        lines = (proc.stderr or proc.stdout).strip().splitlines()
+        fatal = [line for line in lines if line.startswith('fatal:')]
+        raise OSError((fatal or lines or [f'git {args[0]} exited {proc.returncode}'])[0])
+    return proc.stdout.strip()
+
+
+def parse_git_source(spec):
+    body, subdir = spec[len('git+'):], ''
+    if '#' in body:
+        body, fragment = body.split('#', 1)
+        if not fragment.startswith('subdirectory='):
+            raise Refusal('invalid-rules-source', f'Unsupported fragment in rule source (use #subdirectory=DIR): {spec}')
+        subdir = fragment[len('subdirectory='):]
+    ref = ''
+    at = body.rfind('@')
+    if at > body.rfind('/'):
+        body, ref = body[:at], body[at + 1:]
+    if not body:
+        raise Refusal('invalid-rules-source', f'Rule source names no repository: {spec}')
+    return body, ref, subdir
+
+
+def fetch_git_source(spec, ttl):
+    url, ref, subdir = parse_git_source(spec)
+    key_dir = cache_root() / 'rule-sources' / hashlib.sha256(f'{url}\0{ref}'.encode()).hexdigest()[:24]
+    pinned = re.fullmatch(r'[0-9a-f]{40}', ref) is not None
+    checkout = None
+    if pinned and (key_dir / ref).is_dir():
+        checkout = key_dir / ref
+    else:
+        current = key_dir / 'current'
+        cached, age = None, None
+        try:
+            sha = current.read_text(encoding='utf-8').strip()
+            if sha and (key_dir / sha).is_dir():
+                cached, age = key_dir / sha, time.time() - current.stat().st_mtime
+        except OSError:
+            pass
+        if cached is not None and age < ttl:
+            checkout = cached
+        else:
+            key_dir.mkdir(parents=True, exist_ok=True)
+            work = Path(tempfile.mkdtemp(prefix='.fetch-', dir=key_dir))
+            try:
+                git('init', '--quiet', cwd=work)
+                git('fetch', '--quiet', '--depth', '1', url, ref or 'HEAD', cwd=work)
+                sha = git('rev-parse', 'FETCH_HEAD^{commit}', cwd=work)
+                git('-c', 'advice.detachedHead=false', 'checkout', '--quiet', '--detach', 'FETCH_HEAD', cwd=work)
+                shutil.rmtree(work / '.git')
+                try:
+                    work.rename(key_dir / sha)
+                except OSError:
+                    shutil.rmtree(work, ignore_errors=True)
+                    if not (key_dir / sha).is_dir():
+                        raise
+                pointer = key_dir / f'.current-{os.getpid()}'
+                pointer.write_text(sha + '\n', encoding='utf-8')
+                os.replace(pointer, current)
+                checkout = key_dir / sha
+            except (OSError, subprocess.SubprocessError) as exc:
+                shutil.rmtree(work, ignore_errors=True)
+                if cached is None:
+                    try:
+                        key_dir.rmdir()
+                    except OSError:
+                        pass
+                    raise Refusal('rules-source-unavailable', f'Cannot fetch rule source {spec}: {exc}')
+                print(f'[ubs] warning: cannot refresh rule source {spec} ({exc}); using cached commit {cached.name[:12]}', file=sys.stderr)
+                checkout = cached
+    root = (checkout / subdir).resolve()
+    if not root.is_relative_to(checkout.resolve()) or not root.is_dir():
+        raise Refusal('invalid-rules-source', f'Rule source has no directory {subdir!r}: {spec}')
+    return root
+
+
+def local_source(spec):
+    path = Path(spec).expanduser()
+    if not spec or not path.is_dir() or not os.access(path, os.R_OK | os.X_OK):
+        raise Refusal('invalid-rules-directory', f'--rules requires a readable directory: {spec}')
+    return path.resolve()
+
+
+def rule_dirs(root):
+    # A standard ast-grep project (sgconfig.yml) names its rule directories;
+    # its rule-tests and utils are not rules.
+    for name in ('sgconfig.yml', 'sgconfig.yaml'):
+        config = root / name
+        if config.is_file():
+            dirs, in_list = [], False
+            for line in config.read_text(encoding='utf-8').splitlines():
+                if re.match(r'^ruleDirs:\s*$', line):
+                    in_list = True
+                elif in_list and (item := re.match(r'''^\s+-\s*['"]?([^'"#]+?)['"]?\s*$''', line)):
+                    dirs.append(root / item.group(1))
+                elif in_list and line.strip() and not line.lstrip().startswith('#'):
+                    in_list = False
+            return dirs
+    return [root]
+
+
+def collect(root):
+    files = []
+    for directory in rule_dirs(root):
+        for path in sorted(directory.rglob('*')):
+            rel = path.relative_to(root)
+            if path.suffix not in RULE_SUFFIXES or any(part.startswith('.') for part in rel.parts):
                 continue
             if not path.is_file() or not os.access(path, os.R_OK):
-                raise ValueError(f'Custom rule is not a readable regular file: {path}')
+                raise Refusal('invalid-rule-file', f'Custom rule is not a readable regular file: {path}')
+            files.append((path, rel))
+    return files
+
+
+def main():
+    out, ttl, specs = Path(sys.argv[1]), float(sys.argv[2]), sys.argv[3:]
+    out.mkdir(parents=True)
+    owners, count = {}, 0
+    for index, spec in enumerate(specs):
+        spec = spec.strip()
+        root = fetch_git_source(spec, ttl) if spec.startswith('git+') else local_source(spec)
+        files = collect(root)
+        if not files:
+            raise Refusal('empty-rules-directory', f'Rule source contains no .yml or .yaml rules: {spec}')
+        for path, rel in files:
+            text = path.read_text(encoding='utf-8')
+            for rule_id in ID_RE.findall(text):
+                if rule_id in owners:
+                    raise Refusal('duplicate-rule-id', f'Rule id {rule_id} is defined twice: {owners[rule_id]} and {path}')
+                owners[rule_id] = path
+            (out / f"{index:02d}-{'__'.join(rel.parts)}").write_text(text, encoding='utf-8')
             count += 1
-except (OSError, ValueError) as exc:
-    print(exc, file=sys.stderr)
+    print(count)
+
+
+try:
+    main()
+except Refusal as exc:
+    print(f'{exc.reason}\t{exc}')
     sys.exit(2)
-print(count)
+except (OSError, UnicodeDecodeError, ValueError) as exc:
+    print(f'invalid-rule-file\tCannot read the requested custom rules: {exc}')
+    sys.exit(2)
 PYRULES
-)"; then
-    refuse_scan "invalid-rule-file" "Cannot read the requested custom rules: $USER_RULES_DIR" ""
+)" || _rules_status=$?
+  if [[ "$_rules_status" -ne 0 ]]; then
+    [[ "$_rules_result" == *$'\t'* ]] || _rules_result=$'invalid-rule-file\tCannot load the requested custom rules'
+    refuse_scan "${_rules_result%%$'\t'*}" "${_rules_result#*$'\t'}" "" \
+      "No scan was performed because the requested custom policy could not be loaded."
   fi
-  if [[ "$_custom_rule_count" -eq 0 ]]; then
-    refuse_scan "empty-rules-directory" "--rules directory contains no .yml or .yaml files: $USER_RULES_DIR" ""
-  fi
-  unset _custom_rule_count
+  unset _rules_status _rules_result
 fi
 
 # Load ignore patterns early so size checks can respect .ubsignore

@@ -39,8 +39,14 @@ jobs:
           name: js-heap-source
           path: ${{ runner.temp }}/js-heap-source*
           retention-days: 3
+      - name: Install actual scanner dependencies before Bash integrity gates
+        run: |
+          brew install bash jq ripgrep shellcheck
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          npm install --global @ast-grep/cli
       - name: Apply the exact source-and-test implementation
         run: |
+          bash -c 'test "$BASH_VERSINFO" -ge 5'
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 477c8ac86895e19afdf6dacc96834c93cb90b736
           test "$(git hash-object test-suite/patches/javascript-heap-source.patch.gz)" = 0dc09146652bec4fc2e991222314081e679a4479
           gzip -dc test-suite/patches/javascript-heap-source.patch.gz > "$RUNNER_TEMP/js-heap-source.patch"
@@ -52,11 +58,6 @@ jobs:
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --check
-      - name: Install actual scanner dependencies
-        run: |
-          brew install bash jq ripgrep shellcheck
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
-          npm install --global @ast-grep/cli
       - name: Run heap regressions including all eight real scanner scenarios
         run: |
           command -v ast-grep

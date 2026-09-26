@@ -33,6 +33,7 @@ args = sys.argv[1:]
 files = args[args.index('--') + 1:]
 with open(os.environ['SCAN_COUNT'], 'a') as out: out.write('scan\\n')
 if os.environ.get('SCAN_SLEEP'): time.sleep(float(os.environ['SCAN_SLEEP']))
+while os.environ.get('SCAN_GATE') and not pathlib.Path(os.environ['SCAN_GATE']).exists(): time.sleep(0.01)
 records = [(p, pathlib.Path(p).read_text()) for p in files]
 code = 1 if any('BUG' in text for _, text in records) else 0
 if os.environ.get('SCAN_ERROR'): code = 2
@@ -416,6 +417,181 @@ class ScannerProcessTests(unittest.TestCase):
                 self.assertEqual(result['exit_code'], 2, result)
                 self.assertIn('output exceeded', result['stderr'])
                 self.assertEqual(result['stdout'], '')
+
+
+@unittest.skipUnless(os.name == 'posix', 'Responsive transport requires Unix sockets')
+class ResponsiveServiceTests(unittest.TestCase):
+    setUp = ServiceTests.setUp
+    start = ServiceTests.start
+    request = ServiceTests.request
+
+    def connect(self, request=None):
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(connection.close)
+        connection.settimeout(10)
+        connection.connect(str(daemon.socket_path(self.root)))
+        if request is not None:
+            daemon.send(connection, request)
+        return connection
+
+    def control(self, op='status'):
+        return daemon.request_service(self.root, {'protocol': 1, 'op': op, 'root': str(self.root)}, 1)
+
+    def gated(self, *options):
+        self.gate = self.work / 'release-scan'
+        self.env['SCAN_GATE'] = str(self.gate)
+        os.environ['SCAN_GATE'] = str(self.gate)
+        self.process = self.start(*options)
+        client = self.connect(self.request())
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            if Path(self.env['SCAN_COUNT']).exists():
+                return client
+            time.sleep(0.01)
+        self.fail('Scanner did not start')
+
+    def queued(self, count):
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            status = self.control()
+            if status['queued_scans'] == count:
+                return
+            time.sleep(0.01)
+        self.fail(f'Expected {count} queued requests: {status}')
+
+    def test_status_and_stop_respond_during_active_scan(self):
+        client = self.gated()
+        status = self.control()
+        self.assertEqual(status['status'], 'ready')
+        self.assertEqual(status['active_scans'], 1)
+        self.assertEqual(self.control('stop')['status'], 'stopping')
+        result = daemon.receive(client, daemon.MAX_RESPONSE)
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertIn('cancelled', result['stderr'])
+        self.process.wait(timeout=5)
+        self.assertFalse(daemon.socket_path(self.root).exists())
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_partial_request_does_not_block_controls(self):
+        self.start()
+        partial = self.connect()
+        partial.sendall(struct.pack('!I', 100) + b'{')
+        self.assertEqual(self.control()['status'], 'ready')
+        partial.shutdown(socket.SHUT_WR)
+        result = daemon.receive(partial, daemon.MAX_RESPONSE)
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertIn('Incomplete', result['stderr'])
+
+    def test_request_deadline_is_absolute_not_reset_by_each_byte(self):
+        self.start()
+        partial = self.connect()
+        partial.sendall(struct.pack('!I', 100))
+        # The original per-recv timeout permits a peer to drip bytes forever.
+        for _ in range(4):
+            time.sleep(0.8)
+            try:
+                partial.sendall(b' ')
+            except BrokenPipeError:
+                break
+        partial.settimeout(1)
+        result = daemon.receive(partial, daemon.MAX_RESPONSE)
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertIn('timed out', result['stderr'])
+        self.assertEqual(self.control()['status'], 'ready')
+
+    def test_queue_is_bounded_and_overload_never_requests_fallback(self):
+        first = self.gated()
+        waiting = [self.connect(self.request()) for _ in range(daemon.MAX_PENDING_SCANS - 1)]
+        self.queued(len(waiting))
+        extra = self.connect(self.request())
+        extra.settimeout(1)
+        rejected = daemon.receive(extra, daemon.MAX_RESPONSE)
+        self.assertEqual(rejected['exit_code'], 2, rejected)
+        self.assertIn('queue is full', rejected['stderr'])
+        self.assertNotIn('unavailable', rejected)
+        self.assertEqual(self.control('stop')['status'], 'stopping')
+        for client in [first, *waiting]:
+            result = daemon.receive(client, daemon.MAX_RESPONSE)
+            self.assertEqual(result['exit_code'], 2, result)
+            self.assertIn('cancelled', result['stderr'])
+        self.process.wait(timeout=5)
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_queued_request_times_out_without_starting_a_second_scanner(self):
+        self.gated()
+        waiting = self.connect(self.request())
+        waiting.settimeout(5)
+        result = daemon.receive(waiting, daemon.MAX_RESPONSE)
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertIn('queue wait', result['stderr'])
+        self.assertNotIn('unavailable', result)
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+        self.assertEqual(self.control()['active_scans'], 1)
+
+    def test_queued_scan_validates_current_source_when_it_executes(self):
+        first = self.gated()
+        other = self.root / 'b.py'
+        other.write_text('clean')
+        queued = self.connect(self.request(['b.py']))
+        self.queued(1)
+        other.write_text('BUG')
+        self.gate.write_text('go')
+        initial = daemon.receive(first, daemon.MAX_RESPONSE)
+        result = daemon.receive(queued, daemon.MAX_RESPONSE)
+        self.assertEqual(initial['exit_code'], 0, initial)
+        self.assertEqual(result['exit_code'], 1, result)
+        self.assertFalse(result['cached'])
+        self.assertEqual(json.loads(result['stdout'])['files'], [[str(other), 'BUG']])
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\nscan\n')
+
+    def test_queued_identical_requests_share_only_a_verified_cache_entry(self):
+        first = self.gated()
+        waiting = self.connect(self.request())
+        self.queued(1)
+        self.gate.write_text('go')
+        initial = daemon.receive(first, daemon.MAX_RESPONSE)
+        result = daemon.receive(waiting, daemon.MAX_RESPONSE)
+        self.assertFalse(initial['cached'])
+        self.assertTrue(result['cached'])
+        for field in ('stdout', 'stderr', 'exit_code'):
+            self.assertEqual(initial[field], result[field])
+        self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n')
+
+    def test_idle_timeout_does_not_interrupt_an_active_scan(self):
+        client = self.gated('--idle-timeout=0.3')
+        time.sleep(0.5)
+        self.assertEqual(self.control()['active_scans'], 1)
+        self.gate.write_text('go')
+        self.assertEqual(daemon.receive(client, daemon.MAX_RESPONSE)['exit_code'], 0)
+        self.process.wait(timeout=5)
+
+    def test_complete_request_may_half_close_without_losing_its_result(self):
+        self.start()
+        client = self.connect(self.request())
+        client.shutdown(socket.SHUT_WR)
+        result = daemon.receive(client, daemon.MAX_RESPONSE)
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertIn('scanner diagnostics', result['stderr'])
+
+    def test_stalled_report_reader_does_not_block_controls(self):
+        self.scanner.write_text('#!/usr/bin/env python3\nimport os\nos.write(1, b"x" * 2000000)\n')
+        self.start()
+        slow = self.connect(self.request())
+        slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        # Read only the frame header: the report must be ready before probing.
+        self.assertEqual(len(slow.recv(4)), 4)
+        self.assertEqual(self.control()['status'], 'ready')
+        self.assertEqual(self.control('stop')['status'], 'stopping')
+
+    def test_cancellation_also_stops_snapshot_and_never_caches_a_report(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        with self.assertRaisesRegex(daemon.ServiceError, 'cancelled'):
+            daemon.snapshot(self.root, self.scanner, cancel=cancelled)
+        with self.assertRaisesRegex(daemon.ServiceError, 'cancelled'):
+            self.service.handle(self.request(), cancel=cancelled)
+        self.assertEqual(self.service.cache_size, 0)
+        self.assertFalse(Path(self.env['SCAN_COUNT']).exists())
 
 
 @unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for actual scanner integration')

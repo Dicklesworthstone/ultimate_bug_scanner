@@ -59,6 +59,35 @@ wall time is bounded (`--scan-timeout`, default 120 seconds); outputs are capped
 at 8 MiB per stream and timeout/overflow yields an environment error, not a
 truncated clean report. Requests and retained report memory are also bounded.
 
+## Responsive requests and shutdown
+
+Socket I/O and lifecycle commands run independently of scanning. `status` stays
+available during scans and includes `active_scans` and `queued_scans`. `stop`
+cancels the active scan, rejects waiting work, and reaps the scan's process group
+before releasing the repository lock. Cancelled scans are errors, not cached
+reports. The idle timeout starts again after work completes; it does not abort
+an active scan.
+
+One worker owns scanning and the report cache, preventing overlapping scanner
+processes or concurrent cache mutation. Up to eight scan requests may be admitted
+at once, including active work and replies awaiting delivery, with at most 32
+client connections. Queued scans have three seconds to start; saturation or an
+expired queue wait returns exit 2 without asking the client to launch a fallback
+scanner. A queued request validates sources and takes its snapshot when it runs,
+not when it joins the queue.
+
+Frames and replies have absolute three-second I/O deadlines, so trickling input
+or a stalled report reader cannot block other clients. Only one large scan reply
+is retained by the transport at a time; further scans wait for its delivery or
+timeout. Each connection carries one length-prefixed request and response. A
+client may close its write half after the complete request; this is not a scan
+cancellation. Use `stop` to cancel service work.
+
+Scanner output is drained through both pipes, including helper output after the
+runner exits. Pipe backpressure enforces stream limits without growing temporary
+files. Deadlines apply while helpers hold the pipes open, and remaining processes
+in the request's process group are terminated even after a successful result.
+
 Validation:
 
 ```bash

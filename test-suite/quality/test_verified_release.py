@@ -23,16 +23,20 @@ ISSUER = 'https://token.actions.githubusercontent.com'
 TRANSPORT = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
-url = args[-1]
+url = next(arg for arg in args if arg.startswith('https://'))
 name = url.rsplit('/', 1)[-1]
 log = pathlib.Path(os.environ['FETCH_LOG'])
 with log.open('a') as stream:
-    stream.write(json.dumps({'name': name, 'args': args}) + '\n')
+    stream.write(json.dumps({'name': name, 'url': url, 'args': args}) + '\n')
 source = pathlib.Path(os.environ['RELEASE_FIXTURE']) / name
+if url.startswith('https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/'):
+    source = pathlib.Path(os.environ['UNSIGNED_UPDATE_FIXTURE']) / name
 if not source.is_file() or os.environ.get('MISSING_ASSET') == name:
     sys.exit(22)
-output = args[args.index('-o') + 1]
-pathlib.Path(output).write_bytes(source.read_bytes())
+if '-o' in args:
+    pathlib.Path(args[args.index('-o') + 1]).write_bytes(source.read_bytes())
+else:
+    sys.stdout.buffer.write(source.read_bytes())
 '''
 
 SIGNATURE = r'''#!/usr/bin/env python3
@@ -71,6 +75,8 @@ python3 - "$source_dir" "$@" <<'CODE'
 import hashlib, json, os, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 result = {'cwd': os.getcwd(), 'source': str(root), 'args': sys.argv[2:],
+          'self_updated': os.environ.get('UBS_INSTALLER_SELF_UPDATED'),
+          'auto_update': os.environ.get('UBS_NO_AUTO_UPDATE'),
           'base': os.environ.get('UBS_ARTIFACT_BASE'), 'files': {}}
 for name in ('ubs', 'VERSION', '.claude/hooks/git_safety_guard.py'):
     path = root / name
@@ -400,6 +406,71 @@ class VerifiedReleaseTests(unittest.TestCase):
         self.assertEqual(guard.read_bytes(), (self.bundle / 'git_safety_guard.py').read_bytes())
         self.assertFalse(self.fetches())
         self.assertTrue((self.project / '.claude' / 'settings.json').is_file())
+
+    def prepare_unsigned_update(self):
+        """Offer newer main code to the real installer's re-exec path."""
+        updates = self.root / 'unsigned-updates'
+        updates.mkdir()
+        (updates / 'VERSION').write_text('99999.0.0\n')
+        (updates / 'install.sh').write_text(
+            '#!/usr/bin/env bash\nprintf "unsigned installer executed\\n" '
+            '> "$UNSIGNED_EXEC_LOG"\nexit 86\n')
+        self.env.update(UNSIGNED_UPDATE_FIXTURE=str(updates),
+                        UNSIGNED_EXEC_LOG=str(self.root / 'unsigned-executed.log'),
+                        UBS_INSTALLER_SELF_UPDATED='', UBS_NO_AUTO_UPDATE='0')
+        (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
+        (self.bundle / 'VERSION').write_text(self.version + '\n')
+        self.sign()
+
+    def test_real_installer_unsigned_update_control_reaches_reexec(self):
+        # This control proves that the transport exercises the actual update
+        # path, rather than succeeding because the newer installer is absent.
+        self.prepare_unsigned_update()
+        self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'unverified-work')
+        result = subprocess.run(['bash', str(self.bundle / 'install.sh'), '--easy-mode'],
+                                cwd=self.project, env=self.env, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 86, result.stdout + result.stderr)
+        self.assertTrue(Path(self.env['UNSIGNED_EXEC_LOG']).is_file())
+        self.assertEqual([item['name'] for item in self.fetches()], ['VERSION', 'install.sh'])
+
+    def test_verified_real_installer_cannot_reexec_unsigned_main(self):
+        self.prepare_unsigned_update()
+        # A persistent config is loaded after early CLI flags. It must not
+        # re-enable the update check inside an authenticated installation.
+        config = self.home / '.config' / 'ubs'
+        config.mkdir(parents=True)
+        (config / 'install.conf').write_text('skip_version_check=false\n')
+        for verifier in ('cosign', 'minisign'):
+            for local in (False, True):
+                with self.subTest(verifier=verifier, local=local):
+                    label = verifier + ('-local' if local else '-remote')
+                    destination = self.home / label
+                    self.env.update(UBS_VERIFY_WITH=verifier, UBS_MINISIGN_PUBKEY='test-public-key',
+                                    UBS_INSTALLER_WORKDIR=str(self.root / (label + '-work')))
+                    # Deliberately do NOT supply --skip-version-check. An
+                    # easy-mode install must keep the selected verified code.
+                    flags = ['--easy-mode', '--skip-ast-grep', '--skip-ripgrep', '--skip-jq',
+                             '--skip-bun', '--skip-type-narrowing', '--skip-typos', '--skip-toon',
+                             '--skip-doctor', '--skip-hooks', '--no-path-modify',
+                             '--install-dir', str(destination)]
+                    args = ['--artifact-dir', str(self.bundle)] if local else []
+                    self.run_verify(*args, '--', *flags)
+                    self.assertEqual((destination / 'ubs').read_bytes(), (self.bundle / 'ubs').read_bytes())
+                    self.assertFalse(Path(self.env['UNSIGNED_EXEC_LOG']).exists())
+                    self.assertFalse([item for item in self.fetches()
+                                      if 'raw.githubusercontent.com' in item['url']])
+
+    def test_authenticated_execution_disables_both_self_update_paths(self):
+        self.env.update(UBS_INSTALLER_SELF_UPDATED='', UBS_NO_AUTO_UPDATE='0')
+        self.run_verify()
+        self.assertEqual(self.execution()['self_updated'], '1')
+        self.assertEqual(self.execution()['auto_update'], '1')
+
+    def test_explicit_insecure_execution_preserves_installer_update_choice(self):
+        self.env['UBS_INSTALLER_SELF_UPDATED'] = ''
+        self.run_verify('--insecure')
+        self.assertEqual(self.execution()['self_updated'], '')
 
 
 if __name__ == '__main__':

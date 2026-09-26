@@ -423,6 +423,13 @@ if [[ "$VERIFY_ONLY" -eq 1 ]]; then
 fi
 ok 'Executing installer'
 status=0
+if [[ "$INSECURE" -eq 0 ]]; then
+  # UBS_NO_AUTO_UPDATE guards the scanner, not install.sh. The installer's
+  # update check can otherwise exec unsigned main/install.sh before parsing
+  # its arguments, including in --easy-mode. Its existing re-exec sentinel
+  # also survives install.conf overriding the early --skip-version-check flag.
+  export UBS_INSTALLER_SELF_UPDATED=1
+fi
 UBS_ARTIFACT_BASE="$ARTIFACT_BASE" UBS_NO_AUTO_UPDATE=1 \
   bash "$VERIFY_DIR/install.sh" "${INSTALL_ARGS[@]}" || status=$?
 # Do not exec: the parent owns staging cleanup on both success and failure.

@@ -153,10 +153,19 @@ def check_cancelled(cancel: threading.Event | None) -> None:
         raise ServiceError('Scanner cancelled')
 
 
+def validate_request_id(value) -> str:
+    if not isinstance(value, str) or not 1 <= len(value) <= 64 \
+            or any(char not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-' for char in value):
+        raise ServiceError('Request id must be 1 to 64 ASCII letters, digits, underscores or hyphens')
+    return value
+
+
 def validate_scan(root: Path, request: dict) -> tuple[list[Path], list[str]]:
-    allowed = {'protocol', 'op', 'root', 'environment', 'scanner', 'paths', 'format', 'profile', 'fail_on_warning'}
+    allowed = {'protocol', 'op', 'root', 'environment', 'scanner', 'paths', 'format', 'profile', 'fail_on_warning', 'request_id'}
     if set(request) - allowed:
         raise ServiceError('Unknown scan request fields')
+    if 'request_id' in request:
+        validate_request_id(request['request_id'])
     paths = request.get('paths')
     if not isinstance(paths, list) or not 1 <= len(paths) <= 256:
         raise ServiceError('A scan requires 1 to 256 explicit source files')
@@ -468,6 +477,7 @@ class ServiceConnection:
         self.scan = False
         self.cancel = threading.Event()
         self.scan_key = None
+        self.request_id = None
 
 
 def serve_connections(service: ScanService, listener: socket.socket, idle_timeout: float) -> None:
@@ -536,7 +546,7 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                     if future.done():
                         del active[peer]
                         if peer in peers and peer.phase == 'running':
-                            reply(peer, future.result())
+                            reply(peer, failure('Scanner cancelled by request') if peer.cancel.is_set() else future.result())
                         last_request = now
                 for peer in list(peers):
                     if now >= peer.deadline:
@@ -630,15 +640,39 @@ def serve_connections(service: ScanService, listener: socket.socket, idle_timeou
                         if request.get('op') == 'scan' and not service.stopping:
                             if sum(client.scan for client in peers) >= MAX_PENDING_SCANS:
                                 raise ServiceError('Scanner queue is full; retry later')
+                            if 'request_id' in request:
+                                request_id = validate_request_id(request['request_id'])
+                                if any(client.request_id == request_id for client in peers | set(active)):
+                                    raise ServiceError('Request id is already in use')
+                                peer.request_id = request_id
                             peer.scan = True
                             peer.request = request
                             # Scheduling only: this key never authorizes reuse.
                             # Canonical validation and byte snapshots remain in
                             # the worker so queued edits are seen when it runs.
-                            peer.scan_key = json.dumps(request, sort_keys=True, separators=(',', ':'))
+                            peer.scan_key = json.dumps({key: value for key, value in request.items() if key != 'request_id'},
+                                                       sort_keys=True, separators=(',', ':'))
                             peer.phase = 'queued'
                             peer.deadline = time.monotonic() + QUEUE_TIMEOUT
                             pending.append(peer)
+                        elif request.get('op') == 'cancel':
+                            # Authenticate the usual protocol/root before any
+                            # state mutation, even though the target owns its
+                            # own scan environment and policy.
+                            if set(request) != {'protocol', 'op', 'root', 'request_id'}:
+                                raise ServiceError('Invalid cancellation request fields')
+                            service.handle({key: value for key, value in request.items() if key != 'request_id'} | {'op': 'status'})
+                            request_id = validate_request_id(request['request_id'])
+                            target = next((client for client in peers if client.request_id == request_id), None)
+                            if target is None or target.phase not in {'queued', 'running'}:
+                                raise ServiceError('No cancellable request has that id')
+                            if target in active and active[target].done():
+                                raise ServiceError('Request has already completed')
+                            target.cancel.set()
+                            if target.phase == 'queued':
+                                reply(target, failure('Scanner cancelled by request'))
+                            reply(peer, {'protocol': PROTOCOL, 'root': str(service.root),
+                                         'status': 'cancelling', 'request_id': request_id})
                         else:
                             response = service.handle(request)
                             if request.get('op') == 'status':
@@ -718,7 +752,7 @@ def request_service(root: Path, request: dict, timeout: float) -> dict:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('serve', 'client', 'status', 'stop'))
+    parser.add_argument('command', choices=('serve', 'client', 'status', 'stop', 'cancel'))
     parser.add_argument('files', nargs='*', help='source files relative to --repo')
     parser.add_argument('--repo', default='.', help='repository root (default: current directory)')
     parser.add_argument('--scanner', default=str(Path(__file__).resolve().with_name('ubs')))
@@ -730,6 +764,7 @@ def main(argv=None) -> int:
     parser.add_argument('--scan-timeout', type=float, default=120)
     parser.add_argument('--cache-mib', type=int, default=32, help='bounded report cache; 0 disables reuse')
     parser.add_argument('--jobs', type=int, default=1, help='concurrent scanner processes for serve (1 to 8)')
+    parser.add_argument('--request-id', help='name a client request or identify one to cancel')
     args = parser.parse_intermixed_args(argv)
     try:
         if os.name != 'posix' or fcntl is None:
@@ -738,6 +773,12 @@ def main(argv=None) -> int:
             raise ServiceError('Timeouts/cache size are outside permitted bounds')
         if not 1 <= args.jobs <= 8 or (args.command != 'serve' and args.jobs != 1):
             raise ServiceError('--jobs applies to serve and must be between 1 and 8')
+        if args.request_id is not None:
+            validate_request_id(args.request_id)
+            if args.command not in {'client', 'cancel'}:
+                raise ServiceError('--request-id applies only to client and cancel')
+        if args.command == 'cancel' and args.request_id is None:
+            raise ServiceError('cancel requires --request-id')
         if args.command != 'client' and (args.profile is not None or args.fail_on_warning
                                          or args.require_daemon or args.format != 'json'):
             raise ServiceError('Scan policy and report options apply to client requests, not service lifecycle commands')
@@ -754,12 +795,14 @@ def main(argv=None) -> int:
             signal.signal(signal.SIGTERM, stop)
             return serve(service, args.idle_timeout)
         request = {'protocol': PROTOCOL, 'op': 'scan' if args.command == 'client' else args.command, 'root': str(root)}
+        if args.request_id is not None:
+            request['request_id'] = args.request_id
         if args.command == 'client':
             request.update(paths=args.files, format=args.format, profile=args.profile, fail_on_warning=args.fail_on_warning,
                            environment=environment_key(), scanner=str(scanner))
             paths, options = validate_scan(root, request)
         elif args.files:
-            raise ServiceError('status/stop do not accept source files')
+            raise ServiceError('Lifecycle commands do not accept source files')
         try:
             response = request_service(root, request, args.scan_timeout + 10)
         except OSError as exc:
@@ -778,8 +821,11 @@ def main(argv=None) -> int:
             sys.stdout.write(response['stdout'])
             sys.stderr.write(response['stderr'])
             return response['exit_code']
-        if args.command == 'client' or response.get('root') != str(root) or response.get('status') not in {'ready', 'stopping'}:
+        valid_status = {'cancelling'} if args.command == 'cancel' else {'ready', 'stopping'}
+        if args.command == 'client' or response.get('root') != str(root) or response.get('status') not in valid_status:
             raise ServiceError('Incomplete service response; no scan result is available')
+        if args.command == 'cancel' and response.get('request_id') != args.request_id:
+            raise ServiceError('Cancellation response does not identify the requested scan')
         print(json.dumps(response))
         return 0
     except (ServiceError, OSError, ValueError) as exc:

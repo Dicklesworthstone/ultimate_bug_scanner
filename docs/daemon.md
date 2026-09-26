@@ -59,40 +59,76 @@ wall time is bounded (`--scan-timeout`, default 120 seconds); outputs are capped
 at 8 MiB per stream and timeout/overflow yields an environment error, not a
 truncated clean report. Requests and retained report memory are also bounded.
 
-## Responsive requests and shutdown
+## Parallel requests, backpressure and shutdown
 
 Socket I/O and lifecycle commands run independently of scanning. `status` stays
-available during scans and includes `active_scans` and `queued_scans`. `stop`
-cancels the active scan, rejects waiting work, and reaps the scan's process group
-before releasing the repository lock. Cancelled scans are errors, not cached
-reports. The idle timeout starts again after work completes; it does not abort
-an active scan.
+available during scans and includes `active_scans`, `queued_scans` and
+`max_scans`. `stop` cancels all active scans, rejects waiting work, and reaps
+their process groups before releasing the repository lock. Cancellation errors
+are never cached as scan results. The idle timeout starts again after work
+completes; it does not abort active scans.
 
-One worker owns scanning and the report cache, preventing overlapping scanner
-processes or concurrent cache mutation. Up to eight scan requests may be admitted
-at once, including active work and replies awaiting delivery, with at most 32
-client connections. Queued scans have three seconds to start; saturation or an
-expired queue wait returns exit 2 without asking the client to launch a fallback
-scanner. A queued request validates sources and takes its snapshot when it runs,
-not when it joins the queue.
+One scanner worker remains the default. Select `serve --jobs=2` (up to 8) to run
+independent requests concurrently. Report-cache access is synchronized.
+Identical requests wait without occupying another worker, so an unrelated scan
+can proceed. Waiting is not permission to reuse a result: the waiter validates
+its current files, policy and complete byte snapshot when it runs. Changes
+during the first scan or uncacheable inputs cause a fresh scan, not borrowed
+success. Request identifiers do not change this scheduling or cache identity.
 
-Frames and replies have absolute three-second I/O deadlines, so trickling input
-or a stalled report reader cannot block other clients. Only one large scan reply
-is retained by the transport at a time; further scans wait for its delivery or
-timeout. Each connection carries one length-prefixed request and response. A
-client may close its write half after the complete request; this is not a scan
-cancellation. Use `stop` to cancel service work.
+Up to eight scan requests may be admitted at once, including active work and
+replies awaiting delivery, with at most 32 client connections. Queued requests
+have three seconds to start. Saturation or an expired queue wait returns exit 2
+without asking the client to launch a fallback scanner. Each undelivered scan
+reply reserves one worker slot; the transport can retain at most `--jobs` scan
+replies, rather than accumulating more large reports behind stalled readers.
+Increasing concurrency also increases the possible scanner and report memory
+footprint; the existing per-stream, cache and admission limits still apply.
+
+Frames and replies have absolute three-second I/O deadlines. Each connection
+carries one length-prefixed request and response. A client may close its write
+half after the complete request without losing the scan result. Disconnects
+are not a portable cancellation signal; use the explicit cancellation command
+below, or `stop` to cancel all service work.
 
 Scanner output is drained through both pipes, including helper output after the
 runner exits. Pipe backpressure enforces stream limits without growing temporary
 files. Deadlines apply while helpers hold the pipes open, and remaining processes
 in the request's process group are terminated even after a successful result.
 
+## Cancel one obsolete scan
+
+Give a client request a unique identifier, then cancel that request from another
+terminal or agent without stopping the daemon or another request:
+
+```bash
+./ubs-daemon client --repo /path/to/project --require-daemon \
+  --request-id edit-42 src/main.py
+./ubs-daemon cancel --repo /path/to/project --request-id edit-42
+```
+
+Identifiers are 1–64 ASCII letters, digits, underscores or hyphens. They are
+optional for ordinary clients and must be unique among outstanding requests.
+Duplicate identifiers are rejected rather than replacing another scan. A
+cancellation acknowledgement reports `status: "cancelling"`; the original
+client subsequently receives exit 2, empty stdout and a cancellation diagnostic.
+The acknowledgement is not a claim that the process group has already exited.
+Queued targets are never launched. Running targets interrupt both snapshot
+work and scanner supervision. Cancelling one identical waiter or its predecessor
+does not cancel the other request or turn an incomplete scan into a cache hit.
+
+Cancellation uses the same private socket, kernel uid check and exact repository
+identity as scans. Unknown or completed identifiers, malformed requests and
+wrong repositories are errors. Cancellation never falls back to one-shot
+execution. `--require-daemon` in the example ensures the named scan is actually
+managed by the service; ordinary clients still retain their existing fallback.
+Unnamed requests remain supported and can be stopped with `stop`.
+
 Validation:
 
 ```bash
 UBS_DAEMON_E2E=1 python3 -m unittest discover \
-  -s test-suite/quality -p test_daemon.py -v
+  -s test-suite/quality -p 'test_daemon*.py' -v
 ```
 
 Protocol tests use an explicitly identified scanner double; the opt-in integration

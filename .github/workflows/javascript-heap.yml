@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/javascript-heap.patch
+      - test-suite/patches/javascript-heap-collections.patch
       - test-suite/js/test_taint_heap.py
       - .github/workflows/javascript-heap.yml
   workflow_dispatch:
@@ -39,12 +40,16 @@ jobs:
             exit 1
           fi
           cat "$RUNNER_TEMP/heap-before.log"
-          grep -q 'FAILED (failures=26)' "$RUNNER_TEMP/heap-before.log"
-      - name: Apply tested heap implementation and rebuild complete integrity chain
+          grep -q 'FAILED (failures=47)' "$RUNNER_TEMP/heap-before.log"
+      - name: Apply tested heap and collection semantics and rebuild integrity chain
         run: |
           git apply --check test-suite/patches/javascript-heap.patch
           git apply test-suite/patches/javascript-heap.patch
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 8cb2a5d2cdd7d0e09f44253f3c424768300baf02
+          git apply --check test-suite/patches/javascript-heap-collections.patch
+          git apply test-suite/patches/javascript-heap-collections.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 5ccdce62c6b78a0964cf65c89bf2b322ab054eca
+          test "$(git hash-object test-suite/js/test_taint_heap.py)" = 162709a4da1a132348b45db1af04ba458bb7c757
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
           ./scripts/verify_checksums.sh

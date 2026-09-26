@@ -193,6 +193,176 @@ class JavaScriptHeapTests(unittest.TestCase):
         self.check('const o = {html: req.query.html};\nres.send(o.html + (o.html = "hello"));', 'xss')
         self.check('const o = {html: "hello"};\nres.send(o.html); o.html = req.query.html;')
 
+    def test_assign_mutates_target_and_returns_its_alias(self):
+        self.check('const o = {}; const alias = o; Object.assign(alias, {html: req.query.html}); '
+                   'res.send(o.html);', 'xss')
+        self.check('const o = {}; const alias = Object.assign(o, {}); '
+                   'alias.code = req.query.code; eval(o.code);', 'eval')
+
+    def test_assign_source_order_and_unrelated_fields(self):
+        self.check('const o = {html: req.query.html}; Object.assign(o, {html: "hello"}); res.send(o.html);')
+        self.check('const o = {}; Object.assign(o, {html: req.query.html}, {html: "hello"}); res.send(o.html);')
+        self.check('const o = {}; Object.assign(o, {html: "hello"}, {html: req.query.html}); res.send(o.html);', 'xss')
+        self.check('const o = {}; Object.assign(o, {safe: "hello", raw: req.query.html}); res.send(o.safe);')
+
+    def test_assign_optional_key_cannot_clear_existing_value(self):
+        self.check('const o = {html: req.query.html}; const other = flag ? {html: "hello"} : {}; '
+                   'Object.assign(o, other); res.send(o.html);', 'xss')
+
+    def test_assign_unknown_source_and_explicit_later_override(self):
+        self.check('const o = {html: "hello"}; Object.assign(o, req.query); res.send(o.html);', 'xss')
+        self.check('const o = {}; Object.assign(o, req.query, {html: "hello"}); res.send(o.html);')
+
+    def test_object_spread_is_shallow_not_an_alias_of_the_outer_object(self):
+        self.check('const o = {html: "hello", child: {}}; const copy = {...o}; '
+                   'copy.html = req.query.html; res.send(o.html);')
+        self.check('const o = {child: {}}; const copy = {...o}; '
+                   'copy.child.html = req.query.html; res.send(o.child.html);', 'xss')
+
+    def test_object_spread_respects_order_and_optional_keys(self):
+        self.check('const o = {html: "hello", ...req.query}; res.send(o.html);', 'xss')
+        self.check('const o = {...req.query, html: "hello"}; res.send(o.html);')
+        self.check('const other = flag ? {html: "hello"} : {}; '
+                   'const o = {html: req.query.html, ...other}; res.send(o.html);', 'xss')
+
+    def test_array_push_mutates_alias_but_returns_clean_length(self):
+        self.check('const o = []; const alias = o; alias.push(req.query.code); eval(o[0]);', 'eval')
+        self.check('const o = []; res.send(o.push(req.query.html));')
+        self.check('const o = [req.query.html]; res.send(o.length);')
+
+    def test_array_push_preserves_existing_safe_element(self):
+        self.check('const o = ["hello"]; o.push(req.query.html); res.send(o[0]);')
+        self.check('const o = []; o.push("hello", req.query.html); res.send(o[1]);', 'xss')
+
+    def test_array_unshift_reindexes_existing_elements(self):
+        self.check('const o = [req.query.html]; o.unshift("hello"); res.send(o[0]);')
+        self.check('const o = [req.query.html]; o.unshift("hello"); res.send(o[1]);', 'xss')
+        self.check('const o = []; res.send(o.unshift(req.query.html));')
+
+    def test_pop_returns_removed_element_and_cleans_array(self):
+        self.check('const o = [req.query.html]; res.send(o.pop());', 'xss')
+        self.check('const o = [req.query.html]; const alias = o; alias.pop(); res.send(o[0]);')
+        self.check('const o = [req.query.html, "hello"]; res.send(o.pop());')
+
+    def test_shift_returns_removed_element_and_reindexes(self):
+        self.check('const o = [req.query.html, "hello"]; res.send(o.shift());', 'xss')
+        self.check('const o = [req.query.html, "hello"]; o.shift(); res.send(o[0]);')
+        self.check('const o = ["hello", req.query.html]; o.shift(); res.send(o[0]);', 'xss')
+
+    def test_empty_array_removals_are_clean(self):
+        self.check('const o = []; res.send(o.pop()); res.send(o.shift());')
+
+    def test_join_uses_elements_not_unrelated_properties(self):
+        self.check('const o = ["hello"]; o.extra = req.query.html; res.send(o.join(""));')
+        self.check('const o = ["hello", req.query.html]; res.send(o.join(""));', 'xss')
+
+    def test_join_separator_only_used_for_multiple_elements(self):
+        self.check('const empty = []; const one = ["hello"]; '
+                   'res.send(empty.join(req.query.html)); res.send(one.join(req.query.html));')
+        self.check('const o = ["a", "b"]; res.send(o.join(req.query.html));', 'xss')
+
+    def test_known_array_spread_preserves_offsets_and_holes(self):
+        self.check('const o = [...[req.query.html], "hello"]; res.send(o[0]);', 'xss')
+        self.check('const o = [...[req.query.html], "hello"]; res.send(o[1]);')
+        self.check('const o = [...[, req.query.html], "hello"]; res.send(o[1]);', 'xss')
+        self.check('const o = [...[, req.query.html], "hello"]; res.send(o[0]);')
+
+    def test_unknown_array_spread_does_not_assign_a_false_fixed_offset(self):
+        self.check('const o = [...req.query.items, "hello"]; res.send(o[0]);', 'xss')
+        self.check('const o = ["hello", ...req.query.items]; res.send(o[0]);')
+
+    def test_array_spread_is_shallow(self):
+        self.check('const original = [{}]; const copy = [...original]; '
+                   'copy[0].html = req.query.html; res.send(original[0].html);', 'xss')
+        self.check('const original = ["hello"]; const copy = [...original]; '
+                   'copy[0] = req.query.html; res.send(original[0]);')
+
+    def test_push_spread_and_nested_spread(self):
+        self.check('const o = []; o.push(...["hello", req.query.html]); res.send(o[1]);', 'xss')
+        self.check('const o = []; o.push(...["hello", ...[req.query.html]]); res.send(o[1]);', 'xss')
+        self.check('const o = ["hello"]; o.push(...req.query.items); res.send(o[0]);')
+        self.check('const o = []; o.push(...req.query.items); res.send(o[index]);', 'xss')
+
+    def test_conditional_pop_does_not_remove_the_bypass_value(self):
+        self.check('const o = [req.query.html]; if (flag) { o.pop(); } res.send(o[0]);', 'xss')
+
+    def test_ambiguous_receiver_pop_does_not_clear_every_array(self):
+        self.check('const a = [req.query.html]; const b = []; '
+                   'const selected = flag ? a : b; selected.pop(); res.send(a[0]);', 'xss')
+
+    def test_loop_pushes_converge_and_retain_added_values(self):
+        self.check('const o = []; while (flag) { o.push(req.query.html); } res.send(o[index]);', 'xss')
+
+    def test_array_method_override_cannot_earn_native_clean_return(self):
+        self.check('const o = []; o.push = external; res.send(o.push(req.query.html));', 'xss')
+        self.check('Array.prototype.push = external; const o = []; res.send(o.push(req.query.html));', 'xss')
+
+    def test_computed_prototype_override_invalidates_native_identity(self):
+        self.check('Array.prototype[key] = external; const o = []; res.send(o.push(req.query.html));', 'xss')
+
+    def test_shadowed_assign_cannot_clear_target(self):
+        self.check('const Object = service; const o = {html: req.query.html}; '
+                   'Object.assign(o, {html: "hello"}); res.send(o.html);', 'xss')
+        self.check('Object.assign = external; const o = {html: req.query.html}; '
+                   'Object.assign(o, {html: "hello"}); res.send(o.html);', 'xss')
+
+    def test_computed_assign_override_cannot_clear_target(self):
+        self.check('Object[key] = external; const o = {html: req.query.html}; '
+                   'Object.assign(o, {html: "hello"}); res.send(o.html);', 'xss')
+
+    def test_logical_heap_assignment_preserves_rhs_bypass(self):
+        self.check('let text = req.query.html; const o = {value: "hello"}; '
+                   'o.value ||= (text = "clean"); res.send(text);', 'xss')
+
+    def test_template_reads_selected_field_not_the_entire_heap(self):
+        self.check('const o = {safe: "hello", raw: req.query.html}; res.send(`${o.safe}`);')
+        self.check('const o = {safe: "hello", raw: req.query.html}; res.send(`${o.raw}`);', 'xss')
+
+    def test_mutator_return_does_not_hide_its_argument_sink_effects(self):
+        self.check('const o = []; o.push(eval(req.query.code));', 'eval')
+
+    def test_branch_optional_source_field_cannot_clear_assign_target(self):
+        self.check('const source = {}; if (flag) { source.html = "hello"; } '
+                   'const target = {html: req.query.html}; Object.assign(target, source); res.send(target.html);', 'xss')
+
+    def test_optional_property_presence_survives_multiple_copies(self):
+        self.check('const source = {}; if (flag) { source.html = "hello"; } '
+                   'const copied = {...source}; const target = {html: req.query.html}; '
+                   'Object.assign(target, copied); res.send(target.html);', 'xss')
+        self.check('const source = {}; if (flag) { source.html = "hello"; } '
+                   'const copied = {}; Object.assign(copied, source); '
+                   'const target = {html: req.query.html, ...copied}; res.send(target.html);', 'xss')
+
+    def test_definite_write_after_branch_makes_copy_key_present(self):
+        self.check('const source = {}; if (flag) { source.html = req.query.html; } '
+                   'source.html = "hello"; const target = {html: req.query.html}; '
+                   'Object.assign(target, source); res.send(target.html);')
+
+    def test_shadowing_global_object_binding_disables_assign_assumptions(self):
+        self.check('Object = external; const o = {html: req.query.html}; '
+                   'Object.assign(o, {html: "hello"}); res.send(o.html);', 'xss')
+
+    def test_length_truncation_changes_the_element_removed_by_pop(self):
+        self.check('const o = [req.query.html, "hello"]; o.length = 1; res.send(o.pop());', 'xss')
+        self.check('const o = [req.query.html]; const a = o; a.length = 0; res.send(o[0]);')
+        self.check('const o = [req.query.html]; o.length = 4; res.send(o.pop());')
+
+    def test_unknown_length_cannot_hide_a_possible_removed_value(self):
+        self.check('const o = [req.query.html, "hello"]; o.length = size; res.send(o.pop());', 'xss')
+
+    def test_length_truncation_does_not_clear_arbitrary_named_properties(self):
+        self.check('const o = []; o[key] = req.query.html; o.length = 0; res.send(o.html);', 'xss')
+
+    def test_prototype_alias_or_reflection_disables_native_clean_return(self):
+        self.check('const prototype = Array.prototype; prototype.push = external; '
+                   'const o = []; res.send(o.push(req.query.html));', 'xss')
+        self.check('Object.defineProperty(Array.prototype, "push", {value: external}); '
+                   'const o = []; res.send(o.push(req.query.html));', 'xss')
+
+    def test_constructor_alias_does_not_preserve_an_obsolete_native(self):
+        self.check('const alias = Object; alias.assign = external; const o = {html: req.query.html}; '
+                   'Object.assign(o, {html: "hello"}); res.send(o.html);', 'xss')
+
     def test_unchanged_legacy_selftests(self):
         for name, check in taint_js.SELF_TESTS:
             with self.subTest(name=name):
@@ -209,6 +379,14 @@ class JavaScriptHeapIntegrationTests(unittest.TestCase):
             ('clean-field', 'const o = {safe: "hello", raw: req.query.html}; res.send(o.safe);', set()),
             ('alias-cleanup', 'const o = {html: req.query.html}; const a = o; a.html = "hello"; res.send(o.html);', set()),
             ('read-helper', 'function get(o) { return o.safe; } const o = {safe: "hello", raw: req.query.html}; res.send(get(o));', set()),
+            ('assign-alias', 'const o = {}; const a = o; Object.assign(a, {html: req.query.html}); res.send(o.html);', {'xss'}),
+            ('push-alias', 'const o = []; const a = o; a.push(req.query.code); eval(o[0]);', {'eval'}),
+            ('push-return-clean', 'const o = []; res.send(o.push(req.query.html));', set()),
+            ('pop-cleanup', 'const o = [req.query.html]; o.pop(); res.send(o[0]);', set()),
+            ('spread-index', 'const o = [...[req.query.html], "hello"]; res.send(o[0]);', {'xss'}),
+            ('spread-clean-index', 'const o = [...[req.query.html], "hello"]; res.send(o[1]);', set()),
+            ('truncate-pop', 'const o = [req.query.html, "hello"]; o.length = 1; res.send(o.pop());', {'xss'}),
+            ('optional-copy', 'const source = {}; if (flag) { source.html = "hello"; } const o = {html: req.query.html}; Object.assign(o, source); res.send(o.html);', {'xss'}),
         ]
         for name, source, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='ubs-heap-e2e-') as tmp:

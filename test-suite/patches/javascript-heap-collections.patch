@@ -1,0 +1,459 @@
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -596,6 +596,9 @@
+         # never a mutable dictionary whose updates leak into a sibling arm.
+         self.heap = dict(getattr(values, 'heap', {}))
+         self.heap_many = frozenset(getattr(values, 'heap_many', ()))
++        self.heap_optional = dict(getattr(values, 'heap_optional', {}))
++        self.array_lengths = dict(getattr(values, 'array_lengths', {}))
++        self.array_dirty = frozenset(getattr(values, 'array_dirty', ()))
+ 
+     def copy(self):
+         return _State(self)
+@@ -604,7 +607,9 @@
+         return (isinstance(other, _State) and dict.__eq__(self, other)
+                 and self.bindings == other.bindings and self.owners == other.owners
+                 and self.cells == other.cells and self.heap == other.heap
+-                and self.heap_many == other.heap_many)
++                and self.heap_optional == other.heap_optional
++                and self.heap_many == other.heap_many and self.array_lengths == other.array_lengths
++                and self.array_dirty == other.array_dirty)
+ 
+ 
+ def _heap_projection(trace, key):
+@@ -625,6 +630,8 @@
+     for trace in fact:
+         origin = trace.origin
+         fields = state.heap.get(origin)
++        if origin in state.array_lengths and key == 'length':
++            continue  # a genuine Array length is an integer, not code/data
+         if fields is not None:
+             if key is None:
+                 values.extend(fields.values())
+@@ -661,16 +668,62 @@
+     strong = len(targets) == 1 and len(base) == 1 and key is not None
+     for origin in targets:
+         fields = dict(state.heap.get(origin, {}))
++        optional = set(state.heap_optional.get(origin, ()))
+         if key is None:
+             # A dynamic write may select any previously known field, but it
+             # cannot definitely replace every field with a clean value.
+             fields = {name: _join(previous, value) for name, previous in fields.items()}
+         if strong and origin not in state.heap_many:
+             fields[key] = value
++            optional.discard(key)
+         else:
++            if key not in fields:
++                optional.add(key)
+             previous = _heap_read(frozenset({_Trace(origin)}), key, state)
+             fields[key] = _join(previous, value)
+         state.heap[origin] = fields
++        state.heap_optional[origin] = frozenset(optional - {None})
++        if origin in state.array_lengths:
++            length = state.array_lengths[origin]
++            if key == 'length':
++                # A caller may later prove an exact numeric length; absent
++                # that evidence removal/index operations must stay uncertain.
++                state.array_lengths[origin] = None
++                fields['length'] = frozenset()
++            elif key is None:
++                state.array_lengths[origin] = None
++                state.array_dirty |= {origin}
++            elif length is not None and key.isdecimal() and len(key) <= 10 and int(key) < 2**32 - 1:
++                state.array_lengths[origin] = max(length, int(key) + 1)
++
++
++def _heap_copy_fields(fact, state):
++    """Join alternative sources, distinguishing guaranteed from optional keys."""
++    alternatives = []
++    guaranteed = []
++    for trace in fact:
++        fields = state.heap.get(trace.origin)
++        alternatives.append(fields if fields is not None else {None: frozenset({trace})})
++        guaranteed.append(set(fields or ()) - set(state.heap_optional.get(trace.origin, ())))
++    if not alternatives:
++        return {}, set()
++    definite = guaranteed[0].intersection(*guaranteed[1:])
++    keys = set().union(*(fields.keys() for fields in alternatives))
++    copied = {key: _join(*(fields.get(key, fields.get(None, frozenset())) for fields in alternatives))
++              for key in keys}
++    return copied, definite - {None}
++
++
++def _heap_spread_into(fields, copied, definite):
++    fields = dict(fields)
++    wildcard = copied.get(None, frozenset())
++    if wildcard:
++        fields = {key: _join(value, wildcard) for key, value in fields.items()}
++        fields[None] = _join(fields.get(None, frozenset()), wildcard)
++    for key, value in copied.items():
++        if key is not None:
++            fields[key] = value if key in definite else _join(fields.get(key, frozenset()), value)
++    return fields
+ 
+ 
+ def _heap_key(raw):
+@@ -747,6 +800,10 @@
+         # This also permits a definitely executed clean setter to kill taint.
+         result.cells[key] = _join(*(_cell_value(key, state) for state in states))
+     result.heap_many = frozenset().union(*(state.heap_many for state in states))
++    result.array_dirty = frozenset().union(*(state.array_dirty for state in states))
++    for origin in set().union(*(state.array_lengths.keys() for state in states)):
++        lengths = [state.array_lengths[origin] for state in states if origin in state.array_lengths]
++        result.array_lengths[origin] = lengths[0] if all(length == lengths[0] for length in lengths) else None
+     for origin in set().union(*(state.heap.keys() for state in states)):
+         present = [state for state in states if origin in state.heap]
+         fields = set().union(*(state.heap[origin].keys() for state in present))
+@@ -755,6 +812,10 @@
+                         for state in (present if origin[0] == 'heap' else states)))
+             for key in fields
+         }
++        result.heap_optional[origin] = frozenset(
++            key for key in fields if key is not None and any(
++                key not in state.heap[origin] or key in state.heap_optional.get(origin, ())
++                for state in present))
+     return result
+ 
+ 
+@@ -1243,11 +1304,11 @@
+             return _cell_value(self.engine.binding(scope, name, position), state)
+         return frozenset()
+ 
+-    def member(self, root, steps, state):
++    def member(self, root, steps, state, *, evaluate_keys=True):
+         fact = self.reference(root, state)
+         known = any(trace.origin[0] == 'heap' for trace in fact)
+         for key, begin, end, _marker in steps:
+-            if begin is not None:
++            if begin is not None and evaluate_keys:
+                 self.value(begin, end, state)
+             fact = _heap_read(fact, key, state)
+         if not known:
+@@ -1268,32 +1329,42 @@
+         # alias. Allocation identity is finite even in recursive analysis.
+         previous = state.heap.get(origin)
+         fields = {}
++        guaranteed = set()
+         array = code[start] == '['
+         index = 0
+         for left, right in _chunks(code, start + 1, end - 1):
+             while left < right and code[left].isspace():
+                 left += 1
+             if not code[left:right].strip():
+-                if array and right < end - 1:
++                if array and index is not None and right < end - 1:
+                     index += 1
+                 continue
+             if code[left:left + 3] == '...':
+                 value = self.value(left + 3, right, state)
+-                for trace in value:
+-                    copied = state.heap.get(trace.origin)
+-                    if copied is None:
+-                        fields[None] = _join(fields.get(None, frozenset()), frozenset({trace}))
+-                        for key in list(fields):
+-                            fields[key] = _join(fields[key], frozenset({trace}))
+-                    elif array:
+-                        fields[None] = _join(fields.get(None, frozenset()), *copied.values())
+-                    else:
++                copied, definite = _heap_copy_fields(value, state)
++                if array:
++                    lengths = [state.array_lengths.get(trace.origin) for trace in value]
++                    length = lengths[0] if lengths and all(n == lengths[0] for n in lengths) else None
++                    if index is not None and length is not None and None not in copied:
+                         for key, fact in copied.items():
+-                            fields[key] = _join(fields.get(key, frozenset()), fact) if key is None else fact
++                            if key is not None and key.isdecimal() and len(key) <= 10 and int(key) < length:
++                                shifted = str(index + int(key))
++                                fields[shifted] = fact
++                                # Array iteration turns a hole into an explicit
++                                # undefined element in the copied array.
++                                guaranteed.add(shifted)
++                        index += length
++                    else:
++                        fields[None] = _join(fields.get(None, frozenset()), *copied.values())
++                        index = None
++                else:
++                    fields = _heap_spread_into(fields, copied, definite)
++                    guaranteed.update(definite)
+                 continue
+             if array:
+-                key, begin = str(index), left
+-                index += 1
++                key, begin = str(index) if index is not None else None, left
++                if index is not None:
++                    index += 1
+             else:
+                 _, colon = next(_chunks(code, left, right, ':'))
+                 raw_key = text[left:colon].strip()
+@@ -1305,17 +1376,128 @@
+                     self.value(left + 1, closing, state)
+             fact = self.value(begin, right, state)
+             if key is None:
+-                fields = {name: _join(old, fact) for name, old in fields.items()}
++                if not array:
++                    fields = {name: _join(old, fact) for name, old in fields.items()}
+                 fields[None] = _join(fields.get(None, frozenset()), fact)
+             else:
+                 fields[key] = fact
++                guaranteed.add(key)
+         if previous is not None:
++            guaranteed.intersection_update(set(previous) - set(state.heap_optional.get(origin, ())))
+             state.heap_many |= {origin}
+             fields = {key: _join(previous.get(key, frozenset()), fields.get(key, frozenset()))
+                       for key in previous.keys() | fields.keys()}
++            if array and state.array_lengths.get(origin) != index:
++                index = None
+         state.heap[origin] = fields
++        state.heap_optional[origin] = frozenset(set(fields) - guaranteed - {None})
++        if array:
++            state.array_lengths[origin] = index
+         return frozenset({_Trace(origin, ('array' if array else 'object',))})
+ 
++    def native_available(self, name, state):
++        root = name.split('.')[0]
++        owner = self.engine.binding(self.scope, root)[0]
++        declared = any(candidate == root for _a, _b, candidate in self.engine.binding_regions[owner])
++        return (not declared and root not in state.bindings and name not in state.bindings
++                and not self.engine.intrinsic_modified(name))
++
++    def native_heap_call(self, name, receiver, arguments, ranges, state, available):
++        """Model only identified native collection operations, never execute JS."""
++        if name == 'Object.assign' and available and arguments:
++            if any(self.scope.code[a:b].lstrip().startswith('...') for a, b in ranges):
++                return None
++            target = arguments[0]
++            for source in arguments[1:]:
++                copied, definite = _heap_copy_fields(source, state)
++                if None in copied:
++                    _heap_store(target, None, copied[None], state)
++                for key, value in copied.items():
++                    if key is not None:
++                        if key not in definite:
++                            value = _join(_heap_read(target, key, state), value)
++                        missing = {trace.origin for trace in target if key not in state.heap.get(trace.origin, {})
++                                   or key in state.heap_optional.get(trace.origin, ())}
++                        _heap_store(target, key, _step(value, 'Object.assign()'), state)
++                        if key not in definite:
++                            for origin in missing:
++                                state.heap_optional[origin] = state.heap_optional.get(origin, frozenset()) | {key}
++            return target
++        method = name.rsplit('.', 1)[-1]
++        if method not in {'push', 'unshift', 'pop', 'shift', 'join'} or not receiver:
++            return None
++        if self.engine.intrinsic_modified('Array.prototype.' + method):
++            return None
++        if any(trace.origin not in state.array_lengths
++               or method in state.heap.get(trace.origin, {})
++               or trace.origin in state.array_dirty for trace in receiver):
++            return None
++        if method == 'join':
++            data = [fact for trace in receiver for key, fact in state.heap[trace.origin].items()
++                    if key is None or (key.isdecimal() and len(key) <= 10)]
++            if any(state.array_lengths[trace.origin] is None or state.array_lengths[trace.origin] >= 2
++                   for trace in receiver):
++                data.extend(arguments[:1])
++            return _heap_materialize(_join(*data), state)
++        items, unknown = [], False
++        for fact, (a, b) in zip(arguments, ranges):
++            if not self.scope.code[a:b].lstrip().startswith('...'):
++                items.append(fact)
++                continue
++            lengths = [state.array_lengths.get(trace.origin) for trace in fact]
++            length = lengths[0] if lengths and all(n == lengths[0] for n in lengths) else None
++            if length is not None and length <= 4096:
++                items.extend(_heap_read(fact, str(index), state) for index in range(length))
++            else:
++                unknown = True
++                items.append(_heap_materialize(fact, state))
++        returned = []
++        single = len(receiver) == 1
++        for trace in receiver:
++            origin = trace.origin
++            fields = dict(state.heap[origin])
++            length = state.array_lengths[origin]
++            precise = single and origin not in state.heap_many and length is not None and not unknown
++            updated = dict(fields)
++            optional = set(state.heap_optional.get(origin, ()))
++            if method in {'pop', 'shift'}:
++                key = str(length - 1) if method == 'pop' and length is not None else '0'
++                returned.append(_heap_read(frozenset({trace}), key if precise else None, state))
++                if precise and length:
++                    if method == 'pop':
++                        updated.pop(key, None)
++                        optional.discard(key)
++                    else:
++                        updated = {str(int(k) - 1) if k.isdecimal() and len(k) <= 10 else k: v
++                                   for k, v in fields.items() if k != '0'}
++                        optional = {str(int(k) - 1) if k.isdecimal() and len(k) <= 10 else k
++                                    for k in optional if k != '0'}
++                    state.array_lengths[origin] = length - 1
++                elif length != 0:
++                    state.array_lengths[origin] = None
++            elif precise:
++                if method == 'unshift':
++                    updated = {str(int(k) + len(items)) if k.isdecimal() and len(k) <= 10 else k: v
++                               for k, v in fields.items()}
++                    optional = {str(int(k) + len(items)) if k.isdecimal() and len(k) <= 10 else k
++                                for k in optional}
++                base = length if method == 'push' else 0
++                for index, fact in enumerate(items):
++                    updated[str(base + index)] = _step(fact, method + '()')
++                    optional.discard(str(base + index))
++                state.array_lengths[origin] = length + len(items)
++            else:
++                additions = _step(_join(*items), method + '()')
++                if method == 'unshift':
++                    additions = _join(additions, *fields.values())
++                    updated = {key: _join(fact, additions) for key, fact in fields.items()}
++                updated[None] = _join(updated.get(None, frozenset()), additions)
++                state.array_lengths[origin] = None
++            state.heap[origin] = updated
++            state.heap_optional[origin] = frozenset(optional)
++        # push/unshift return a length, not the taint of inserted elements.
++        return _join(*returned)
++
+     def assign(self, name, fact, state, position, binding=None):
+         state[name] = _step(fact, name)
+         state.bindings[name] = binding
+@@ -1472,10 +1654,37 @@
+                     self.value(begin, finish, state)
+                 before = _heap_read(receiver, key, state)
+                 rhs = after + operator.end()
+-                value = self.value(rhs, end, state)
++                destination = state.copy() if operator.group(1) in {'||=', '&&=', '??='} else state
++                value = self.value(rhs, end, destination)
+                 if operator.group(1) != '=':
+                     value = _join(before, value)
+-                _heap_store(receiver, key, _step(value, text[start:after].strip()), state)
++                _heap_store(receiver, key, _step(value, text[start:after].strip()), destination)
++                if key == 'length' and operator.group(1) == '=' and len(receiver) == 1:
++                    origin = next(iter(receiver)).origin
++                    raw_length = text[rhs:end].strip()
++                    if (origin in destination.array_lengths and origin not in destination.heap_many
++                            and re.fullmatch(r'(?:0|[1-9][0-9]{0,9})', raw_length)
++                            and int(raw_length) < 2**32):
++                        length = int(raw_length)
++                        destination.array_lengths[origin] = length
++                        kept = {name: fact for name, fact in destination.heap[origin].items()
++                                if name is None or not name.isdecimal() or len(name) > 10 or int(name) < length}
++                        if length == 0 and origin not in destination.array_dirty:
++                            kept.pop(None, None)
++                        destination.heap[origin] = kept
++                        destination.heap_optional[origin] = destination.heap_optional.get(origin, frozenset()) & kept.keys()
++                if destination is not state:
++                    merged = _join_states(state, destination)
++                    state.clear()
++                    state.update(merged)
++                    state.bindings = dict(merged.bindings)
++                    state.owners, state.cells = dict(merged.owners), dict(merged.cells)
++                    state.heap, state.heap_many = dict(merged.heap), merged.heap_many
++                    state.heap_optional = dict(merged.heap_optional)
++                    state.array_lengths, state.array_dirty = dict(merged.array_lengths), merged.array_dirty
++                # Member writes also invalidate intrinsic/sink identities.
++                if all(part is not None for part, _a, _b, _p in steps):
++                    state.bindings[root + ''.join('.' + part for part, _a, _b, _p in steps)] = None
+                 for location, expr_start, rule, label in self.engine.write_sinks:
+                     if rule == self.rule and start <= location < rhs <= expr_start:
+                         self.effect(location, label, _heap_materialize(value, state))
+@@ -1525,6 +1734,8 @@
+             state.bindings = dict(merged.bindings)
+             state.owners, state.cells = dict(merged.owners), dict(merged.cells)
+             state.heap, state.heap_many = dict(merged.heap), merged.heap_many
++            state.heap_optional = dict(merged.heap_optional)
++            state.array_lengths, state.array_dirty = dict(merged.array_lengths), merged.array_dirty
+             return _join(*facts)
+         if operators:
+             _, operator = min(operators, key=lambda item: (item[0], -item[1]))
+@@ -1537,6 +1748,8 @@
+             state.bindings = dict(merged.bindings)
+             state.owners, state.cells = dict(merged.owners), dict(merged.cells)
+             state.heap, state.heap_many = dict(merged.heap), merged.heap_many
++            state.heap_optional = dict(merged.heap_optional)
++            state.array_lengths, state.array_dirty = dict(merged.array_lengths), merged.array_dirty
+             return _join(left, right)
+         if code[start] in '[{' and self.pairs.get(start) == end - 1:
+             return self.literal(start, end, state)
+@@ -1568,8 +1781,13 @@
+                 continue
+             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                          if code[left:right].strip()]
+-            argument_facts = [self.value(left, right, state) for left, right in arguments]
+             callee_name = re.sub(r'\s+', '', match.group(1))
++            access = _heap_access(text, code, self.pairs, match.start(), opening)
++            heap_receiver = frozenset()
++            if access is not None and access[1]:
++                heap_receiver = self.member(access[0], access[1][:-1], state)
++            native_available = self.native_available(callee_name, state)
++            argument_facts = [self.value(left, right, state) for left, right in arguments]
+             callee = None
+             if '.' not in callee_name:
+                 callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
+@@ -1583,9 +1801,11 @@
+                     self.effect(location, label, _heap_materialize(self.substitute(fact, callee, bound, incoming), incoming))
+                 self.apply_writes(writes, callee, bound, state, incoming)
+             else:
+-                call_fact = _heap_materialize(_join(*argument_facts), state)
++                native = self.native_heap_call(callee_name, heap_receiver, argument_facts, arguments,
++                                               state, native_available)
++                call_fact = native if native is not None else _heap_materialize(_join(*argument_facts), state)
+                 receiver = callee_name.split('.')[0]
+-                if '.' in callee_name:
++                if '.' in callee_name and native is None:
+                     call_fact = _join(call_fact, _heap_materialize(self.reference(receiver, state), state))
+                 # Argument facts already retain precise local-call returns.
+                 # Only a source in the callee itself introduces new input.
+@@ -1635,7 +1855,11 @@
+         remaining = ''.join(remainder)
+         for source, _ in assignment_sources(''.join(source_remainder)):
+             facts.append(frozenset({_Trace(('source', source), (source,))}))
++        covered = 0
++        remaining_pairs = _pairs(remaining)
+         for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*', remaining):
++            if match.start() < covered:
++                continue
+             name = match.group(0)
+             name = re.sub(r'\s+', '', name)
+             if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
+@@ -1643,6 +1867,13 @@
+             after = remaining[match.end():].lstrip()
+             if after.startswith(':'):
+                 continue  # object literal keys are not variable references
++            access = _heap_access(text[start:end], remaining, remaining_pairs, match.start(), len(remaining))
++            if access is not None and access[1]:
++                root, steps, covered = access
++                # Calls inside a computed key were evaluated by the call loop.
++                # Replaying them here would mutate the heap a second time.
++                facts.append(self.member(root, steps, state, evaluate_keys=False))
++                continue
+             facts.append(self.reference(name.split('.')[0], state))
+             if '.' in name and name in state:
+                 facts.append(state[name])
+@@ -1872,6 +2103,28 @@
+         for scope in self.scopes:
+             scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
+         self.binding_regions = {scope: self.regions(scope) for scope in self.scopes}
++        self.modified_intrinsics = set()
++        pairs = _pairs(code)
++        for match in re.finditer(r'\b(?:Object|Array|Reflect)\b', code):
++            access = _heap_access(text, code, pairs, match.start(), len(code))
++            if access is not None:
++                root, steps, end = access
++                if re.match(r'\s*(?:=(?!=|>)|\|\|=|&&=|\?\?=)', code[end:]):
++                    name = root + ''.join('.' + (key or '*') for key, _a, _b, _p in steps)
++                    self.modified_intrinsics.add(name)
++                elif not steps or (root == 'Array' and steps[0][0] == 'prototype'):
++                    # Escaping the constructor/prototype through an alias or
++                    # reflection API can replace methods outside direct syntax.
++                    self.modified_intrinsics.add(root + ('.prototype' if steps else ''))
++
++    def intrinsic_modified(self, name):
++        for modified in self.modified_intrinsics:
++            if '*' in modified:
++                if name.startswith(modified.split('*', 1)[0]):
++                    return True
++            elif name == modified or name.startswith(modified + '.'):
++                return True
++        return False
+ 
+     def regions(self, scope):
+         """Static lexical identities; dataflow state still supplies values."""

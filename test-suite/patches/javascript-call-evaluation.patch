@@ -1,0 +1,299 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 5b63ffe..bada5e2 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -674,6 +674,8 @@ class _Scope:
+     code: str = ''
+     statements: list = field(default_factory=list)
+     parameter_sources: dict = field(default_factory=dict)
++    asynchronous: bool = False
++    generator: bool = False
+ 
+ 
+ @dataclass
+@@ -919,6 +921,8 @@ def _function_scopes(text, code):
+         scope = _Scope(start, end, body, body_end, name,
+                        _parameters(text, code, params_start, params_end), declaration, concise)
+         scope.parameter_sources = _parameter_sources(text, code, params_start, params_end)
++        scope.asynchronous = bool(re.search(r'\basync[^\S\r\n]*\Z', code[:start]))
++        scope.generator = bool(re.match(r'function\s*\*', code[start:]))
+         scopes.append(scope)
+ 
+     for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?', code):
+@@ -1190,10 +1194,11 @@ class _Flow:
+             return self.engine.lookup(self.scope, name)
+         return None
+ 
+-    def bind(self, callee, arguments, ranges, state):
++    def arguments(self, ranges, state):
++        """Evaluate and expand each argument once, in source order."""
+         actual, uncertain = [], None
+ 
+-        def expand(fact, left, right):
++        def expand(left, right):
+             nonlocal uncertain
+             raw = self.scope.code[left:right].strip()
+             if raw.startswith('...'):
+@@ -1207,17 +1212,22 @@ class _Flow:
+                             if begin == finish == closing:
+                                 continue  # a trailing comma creates no argument
+                             if self.scope.code[begin:finish].strip():
+-                                expand(self.value(begin, finish, state), begin, finish)
++                                expand(begin, finish)
+                             else:
+                                 actual.append((frozenset(), True))  # an array hole is undefined
+                     return
+                 if uncertain is None:
+                     uncertain = len(actual)
+                 fact = self.value(opening, right, state)
++            else:
++                fact = self.value(left, right, state)
+             actual.append((fact, raw in {'undefined', 'void 0'}))
+ 
+-        for fact, (left, right) in zip(arguments, ranges):
+-            expand(fact, left, right)
++        for left, right in ranges:
++            expand(left, right)
++        return actual, uncertain
++
++    def bind(self, callee, actual, uncertain, state):
+         bound = {}
+         default_flow = None
+         default_state = None
+@@ -1236,7 +1246,12 @@ class _Flow:
+                 for name in bound:
+                     default_state.owners[name] = self.engine.binding(callee, name)
+                 default_flow.pairs.update(_pairs(callee.code, *default))
++                bypass = default_state.copy() if uncertain is not None and index >= uncertain else None
+                 incoming = _join(incoming, default_flow.value(*default, default_state))
++                if bypass is not None:
++                    # An unknown-length spread may supply this argument.
++                    # A throwing default must not erase that normal path.
++                    default_state.replace(_join_states(bypass, default_state))
+             for name in names:
+                 bound[name] = incoming
+         if default_flow is not None:
+@@ -1295,6 +1310,12 @@ class _Flow:
+             target = assignment.group(1)
+             rhs = start + assignment.end()
+             previous = self.reference(target, state)
++            if assignment.group(2) in {'||=', '&&=', '??='}:
++                branch = state.copy()
++                fact = self.value(rhs, end, branch)
++                self.assign(target, fact, branch, start, self.callable(rhs, end, branch))
++                state.replace(_join_states(state, branch))
++                return _join(previous, fact)
+             fact = self.value(rhs, end, state)
+             if assignment.group(2) != '=':
+                 fact = _join(previous, fact)
+@@ -1309,6 +1330,16 @@ class _Flow:
+             if code[cursor] in '([{' and cursor in self.pairs:
+                 cursor = self.pairs[cursor] + 1
+                 continue
++            write = next((entry for entry in self.engine.write_sinks if entry[0] == cursor), None)
++            if write is not None:
++                location, rhs, rule, label = write
++                # The receiver executes first; evaluate the assigned value
++                # just once, not again when emitting the DOM sink effect.
++                self.value(start, location, state)
++                fact = self.value(rhs, end, state)
++                if state.reachable and rule == self.rule:
++                    self.effect(location, label, fact)
++                return fact
+             operator = code[cursor:cursor + 2]
+             if operator in {'&&', '||', '??'}:
+                 operators.append((1 if operator in {'||', '??'} else 2, cursor))
+@@ -1387,15 +1418,46 @@ class _Flow:
+             callee = None
+             if '.' not in callee_name:
+                 callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
+-            argument_facts = [self.value(left, right, state) for left, right in arguments]
++            actual, uncertain = self.arguments(arguments, state)
++            argument_facts = [fact for fact, _ in actual]
+             if not state.reachable:
+                 return frozenset()
+             if isinstance(callee, _Scope):
+                 self.engine.dependents[(callee, self.rule)].add(self.scope)
+                 summary = self.engine.summaries.get((callee, self.rule), _Summary())
+-                bound = self.bind(callee, argument_facts, arguments, state)
++                awaited = bool(re.search(r'\bawait\s*(?:\(\s*)*$', code[start:match.start()]))
++                deferred = callee.asynchronous and not callee.generator and not awaited
++                before_defaults, throw_start = state.copy(), len(self.throws)
++                bound = self.bind(callee, actual, uncertain, state)
++                if deferred:
++                    # An async rejection is not a synchronous throw. Without
++                    # await, post-suspension writes are only possible effects;
++                    # in particular they cannot strongly clear caller taint.
++                    default_normal = state.reachable
++                    completions = [before_defaults, *self.throws[throw_start:]]
++                    del self.throws[throw_start:]
++                    if default_normal:
++                        incoming = state.copy()
++                        completions.append(incoming)
++                        for writes, reachable in ((summary.writes, summary.normal),
++                                                  (summary.raised, summary.exceptional)):
++                            if reachable:
++                                completion = incoming.copy()
++                                self.apply_writes(writes, callee, bound, completion, incoming)
++                                completions.append(completion)
++                        for (location, label), fact in summary.effects.items():
++                            self.effect(location, label, self.substitute(fact, callee, bound, incoming))
++                        facts.append(self.substitute(summary.returned, callee, bound, incoming))
++                    state.replace(_join_states(*completions))
++                    cursor = closing + 1
++                    continue
+                 if not state.reachable:
+                     return frozenset()
++                if callee.generator:
++                    # Creating an iterator binds defaults but does not run
++                    # the generator body; .next()/yield dispatch is separate.
++                    cursor = closing + 1
++                    continue
+                 incoming = state.copy()
+                 call_fact = self.substitute(summary.returned, callee, bound, incoming)
+                 for (location, label), fact in summary.effects.items():
+@@ -1423,6 +1485,8 @@ class _Flow:
+                 sink = self.engine.call_sinks.get(match.start())
+                 if sink and sink[0] == self.rule and call_binding == 'imported':
+                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
++                    if self.rule == 'js.taint.sql' and uncertain == 0:
++                        selected = argument_facts  # the spread may have zero elements
+                     self.effect(match.start(), sink[1], _join(*selected))
+                 regex = SANITIZERS_BY_RULE.get(self.rule)
+                 following = code[closing + 1:end].lstrip()
+@@ -1434,9 +1498,6 @@ class _Flow:
+             cursor = closing + 1
+         facts.append(references(cursor, end))
+         result = _join(*facts)
+-        for location, expr_start, rule, label in self.engine.write_sinks:
+-            if rule == self.rule and start <= location < end:
+-                self.effect(location, label, self.value(expr_start, end, state))
+         return result
+ 
+     def expression(self, start, end, state):
+@@ -1455,6 +1516,9 @@ class _Flow:
+             return state
+         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
+         if compound:
++            if compound.group(2) in {'||=', '&&=', '??='}:
++                self.value(offset, end, state)
++                return state
+             name = compound.group(1)
+             previous = self.reference(name, state)
+             fact = self.value(offset + compound.start(3), end, state)
+diff --git a/test-suite/js/test_taint_call_completions.py b/test-suite/js/test_taint_call_completions.py
+index 55bdf7a..1730232 100644
+--- a/test-suite/js/test_taint_call_completions.py
++++ b/test-suite/js/test_taint_call_completions.py
+@@ -151,6 +151,99 @@ class CallCompletionTests(unittest.TestCase):
+         self.check('function rebind() { DOMPurify = external; return req.query.html; } '
+                    'res.send(DOMPurify.sanitize(rebind())); res.send(DOMPurify.sanitize(req.query.html));', 'xss')
+ 
++    def test_unawaited_rejection_does_not_stop_the_caller(self):
++        self.check('async function fail() { throw Error(); } fail(); res.send(req.query.html);', 'xss')
++        self.check('const fail = async () => { throw Error(); }; fail(); res.send(req.query.html);', 'xss')
++        self.check('const fail = async () => { throw Error(); }; fail(); res.send("safe");')
++        self.check('async\nfunction fail() { throw Error(); } fail(); res.send(req.query.html);')
++
++    def test_awaited_rejection_reaches_handler_not_normal_continuation(self):
++        self.check('async function fail() { throw Error(); } await fail(); res.send(req.query.html);')
++        self.check('let out = "safe"; async function fail() { out = req.query.html; throw Error(); } '
++                   'try { await (fail()); } catch (error) { res.send(out); }', 'xss')
++
++    def test_async_cleanup_without_await_cannot_strongly_clear_taint(self):
++        prefix = 'let out = req.query.html; async function clear() { await external(); out = "safe"; } '
++        self.check(prefix + 'clear(); res.send(out);', 'xss')
++        self.check(prefix + 'await clear(); res.send(out);')
++
++    def test_async_default_rejection_does_not_run_body_or_stop_caller(self):
++        prefix = ('let out = "safe"; function fail() { out = req.query.html; throw Error(); } '
++                  'async function accept(v = fail()) { out = "body"; } ')
++        self.check(prefix + 'accept(); res.send(out);', 'xss')
++        self.check(prefix + 'await accept(); res.send(out);')
++        self.check(prefix + 'accept("explicit"); res.send(out);')
++
++    def test_rejected_promise_argument_does_not_prevent_sink_call(self):
++        self.check('async function fail() { throw Error(); } res.send(req.query.html, fail());', 'xss')
++        self.check('async function fail() { throw Error(); } res.send(req.query.html, await fail());')
++
++    def test_generator_creation_does_not_run_body_cleanup(self):
++        for kind in ('function*', 'async function*'):
++            with self.subTest(kind=kind):
++                self.check(f'let out = req.query.html; {kind} clear() {{ out = "safe"; yield 1; }} '
++                           'clear(); res.send(out);', 'xss')
++
++    def test_spread_literal_elements_execute_once(self):
++        prefix = ('let a = req.query.html, b = "safe"; function swap() { const tmp = a; a = b; b = tmp; return a; } '
++                  'function first(value) { return value; } ')
++        self.check(prefix + 'res.send(first(...[swap()]));')
++        self.check(prefix + 'res.send(first(...[swap()])); res.send(b);', 'xss')
++        self.check(prefix + 'res.send(first(...[swap(), swap()]));')
++
++    def test_nested_spreads_keep_evaluation_order(self):
++        prefix = ('let out = req.query.html; function clear() { out = "safe"; return ""; } '
++                  'function first(a, b) { return a; } function second(a, b) { return b; } ')
++        self.check(prefix + 'res.send(first(...[...[out, clear()]]));', 'xss')
++        self.check(prefix + 'res.send(second(...[...[clear(), out]]));')
++
++    def test_unknown_spread_expression_is_not_reexecuted(self):
++        prefix = ('let a = req.query.html, b = "safe"; function swap() { const tmp = a; a = b; b = tmp; return a; } '
++                  'function accept(...values) { return "safe"; } ')
++        self.check(prefix + 'accept(...swap()); res.send(a);')
++        self.check(prefix + 'accept(...swap()); res.send(b);', 'xss')
++
++    def test_spread_sql_parameters_are_not_query_text(self):
++        self.check('db.query(...["SELECT * FROM users WHERE id = ?", req.query.id]);')
++        self.check('db.query(...[req.query.sql, []]);', 'sql')
++        self.check('eval(...[req.query.code]);', 'eval')
++        self.check('db.query(...values, req.query.sql);', 'sql')
++        self.check('db.query("SELECT 1", ...values, req.query.id);')
++
++    def test_unknown_spread_keeps_normal_path_around_throwing_default(self):
++        prefix = 'function fail() { throw Error(); } function get(value = fail()) { return req.query.html; } '
++        self.check(prefix + 'res.send(get(...values));', 'xss')
++        self.check(prefix + 'res.send(get());')
++        self.check(prefix + 'res.send(get(...[]));')
++
++    def test_spread_holes_and_trailing_commas_bind_defaults(self):
++        prefix = 'function second(a, b = req.query.html) { return b; } '
++        self.check(prefix + 'res.send(second(...["safe", ,]));', 'xss')
++        self.check(prefix + 'res.send(second(...["safe", "safe",]));')
++
++    def test_dom_assignment_value_is_evaluated_once(self):
++        prefix = 'let out = req.query.html; function clear() { out = "safe"; return ""; } '
++        for member in ('innerHTML', 'outerHTML'):
++            with self.subTest(member=member):
++                self.check(prefix + f'document.getElementById("target").{member} = out + clear();', 'xss')
++                self.check(prefix + f'document.getElementById("target").{member} = clear() + out;')
++
++    def test_dom_receiver_executes_before_assigned_value(self):
++        self.check('let out = req.query.html; function target() { out = "safe"; return node; } target().innerHTML = out;')
++        self.check('let out = "safe"; function target() { out = req.query.html; return node; } target().innerHTML = out;', 'xss')
++
++    def test_dom_assignment_does_not_apply_rhs_write_twice(self):
++        prefix = 'let a = req.query.html, b = "safe"; function swap() { const tmp = a; a = b; b = tmp; return a; } '
++        self.check(prefix + 'document.getElementById("target").innerHTML = swap(); res.send(a);')
++        self.check(prefix + 'document.getElementById("target").innerHTML = swap(); res.send(b);', 'xss')
++
++    def test_logical_assignment_preserves_bypass_effects(self):
++        prefix = 'let out = req.query.html; function clear() { out = "safe"; return ""; } let value = flag; '
++        for operator in ('||=', '&&=', '??='):
++            with self.subTest(operator=operator):
++                self.check(prefix + f'value {operator} clear(); res.send(out);', 'xss')
++                self.check(prefix + f'res.send(value {operator} clear()); res.send(out);', 'xss')
++
+ 
+ @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner checks')
+ class CallCompletionScannerTests(unittest.TestCase):
+@@ -161,6 +254,11 @@ class CallCompletionScannerTests(unittest.TestCase):
+             ('final-return', 'function read(){try{return req.query.html;}finally{return "safe";}} res.send(read());', set()),
+             ('thrown-write', 'let out="safe";function put(v){out=v;throw Error();}try{put(req.query.html);}catch(e){res.send(out);}', {'xss'}),
+             ('no-continuation', 'let out="safe";function put(v){out=v;throw Error();}put(req.query.html);res.send(out);', set()),
++            ('async-continuation', 'async function fail(){throw Error();}fail();res.send(req.query.html);', {'xss'}),
++            ('spread-read', 'let out=req.query.html;function clear(){out="safe";return "";}function first(a,b){return a;}res.send(first(...[out,clear()]));', {'xss'}),
++            ('spread-sql', 'db.query(...["SELECT * FROM users WHERE id = ?",req.query.id]);', set()),
++            ('dom-before-clear', 'let out=req.query.html;function clear(){out="safe";return "";}document.getElementById("target").innerHTML=out+clear();', {'xss'}),
++            ('dom-after-clear', 'let out=req.query.html;function clear(){out="safe";return "";}document.getElementById("target").innerHTML=clear()+out;', set()),
+         ]
+         for name, source, expected in cases:
+             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='ubs-js-completion-cli-') as tmp:

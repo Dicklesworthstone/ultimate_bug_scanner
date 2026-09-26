@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/javascript-call-completions.patch
+      - test-suite/patches/javascript-call-evaluation.patch
       - test-suite/js/test_taint_call_completions.py
       - .github/workflows/javascript-call-completions.yml
   workflow_dispatch:
@@ -39,7 +40,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
-      - name: Apply incremental completion semantics to reviewed scalar writes
+      - name: Apply incremental completion and evaluation semantics
         run: |
           source=modules/helpers/ubs_core/analyzers/taint_js.py
           if test "$(git hash-object "$source")" = 38a50392b5540131d25ade30664b883ec28b4005; then
@@ -56,6 +57,10 @@ jobs:
           git apply --check test-suite/patches/javascript-call-completions.patch
           git apply test-suite/patches/javascript-call-completions.patch
           test "$(git hash-object "$source")" = 5b63ffeb31da94c9aa7088078e51be1b78cfd31e
+          git apply --check test-suite/patches/javascript-call-evaluation.patch
+          git apply test-suite/patches/javascript-call-evaluation.patch
+          test "$(git hash-object "$source")" = bada5e2788a5f2145a2b2ee1ee5054f49b28b4f2
+          test "$(git hash-object test-suite/js/test_taint_call_completions.py)" = 1730232cc887ff6432cf2c5ee637870973ac19e1
           python3 -m unittest discover -s test-suite/js -p 'test_taint*.py' -v
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
@@ -84,7 +89,7 @@ jobs:
           from pathlib import Path
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
+                     'modules/helpers/ubs_core/analyzers/taint_js.py', 'test-suite/js/test_taint_call_completions.py'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed) <= allowed, changed
           before = {path: Path(path).read_bytes() for path in changed}

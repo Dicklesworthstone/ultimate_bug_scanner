@@ -33,6 +33,13 @@ when any of these hold:
    surviving path knows ``start > 0``.
 4. **IndexError is handled.** The access sits under a ``try`` whose handlers
    name ``IndexError``, ``LookupError`` or a bare ``except``.
+5. **A private nonempty sequence supplies a bisect predecessor.** An exact
+   ``i = bisect_right(seq, value)`` followed by ``seq[i - 1]`` is in bounds
+   when ``seq`` is a locally constructed nonempty list/tuple that is neither
+   mutated nor exposed to other code. The insertion point is in ``[0, n]``;
+   its predecessor is in the valid Python index range ``[-1, n - 1]``.
+   Empty sequences, shadowed bisect functions, optional bounds and aliases
+   are deliberately outside this proof.
 
 A negative index is not an IndexError in Python (``x[-1]`` wraps), but it is
 still a logic bug, so an unguarded ``x[i - 1]`` under a plain
@@ -306,6 +313,187 @@ def _loop_guards(
             or _enumerate_guards(iterated, want_upper, offset))
 
 
+def _sequence_shape(node: ast.AST) -> tuple[type, int] | None:
+    """Builtin sequence type and a lower bound on its constructed length."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return type(node), sum(not isinstance(item, ast.Starred) for item in node.elts)
+    if isinstance(node, ast.ListComp):
+        return ast.List, 0
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _sequence_shape(node.left), _sequence_shape(node.right)
+        if left is not None and right is not None and left[0] is right[0]:
+            return left[0], left[1] + right[1]
+    return None
+
+
+def _string_binding(node: ast.AST, name: str) -> bool:
+    """Bindings whose identifier is stored directly rather than as ast.Name."""
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return any(alias.name == '*' or (alias.asname or alias.name.split('.')[0]) == name
+                   for alias in node.names)
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                         ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+        return node.name == name
+    if isinstance(node, ast.MatchMapping):
+        return node.rest == name
+    return False
+
+
+def _known_bisect_right(call: ast.AST, root: ast.AST, parents) -> bool:
+    """Require an imported standard function with no static rebinding.
+
+    The proof is intentionally conservative about scope: any binder using
+    the import's local name rejects it, even in an unrelated child scope.
+    """
+    if not isinstance(call, ast.Call) or len(call.args) != 2 or call.keywords:
+        return False
+    if isinstance(call.func, ast.Name):
+        name, module = call.func.id, False
+    elif (isinstance(call.func, ast.Attribute) and call.func.attr == 'bisect_right'
+          and isinstance(call.func.value, ast.Name)):
+        name, module = call.func.value.id, True
+    else:
+        return False
+    imports = 0
+    module_names = {alias.asname or alias.name
+                    for imported in ast.walk(root) if isinstance(imported, ast.Import)
+                    for alias in imported.names if alias.name == 'bisect'}
+    ancestor_scopes = {root}
+    ancestor = parents.get(call)
+    while ancestor is not None:
+        if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            ancestor_scopes.add(ancestor)
+        ancestor = parents.get(ancestor)
+    for candidate in ast.walk(root):
+        if isinstance(candidate, ast.Name) and candidate.id in module_names:
+            use = parents.get(candidate)
+            invocation = parents.get(use)
+            if not (isinstance(candidate.ctx, ast.Load)
+                    and isinstance(use, ast.Attribute) and use.attr == 'bisect_right'
+                    and isinstance(use.ctx, ast.Load)
+                    and isinstance(invocation, ast.Call) and invocation.func is use):
+                return False  # Every alias refers to the same mutable module object.
+        if isinstance(candidate, (ast.Import, ast.ImportFrom)):
+            for alias in candidate.names:
+                if alias.name == '*':
+                    return False
+                local = alias.asname or alias.name.split('.')[0]
+                if local != name:
+                    continue
+                valid = (isinstance(candidate, ast.Import) and module and alias.name == 'bisect'
+                         or isinstance(candidate, ast.ImportFrom) and not module
+                         and candidate.level == 0 and candidate.module == 'bisect' and alias.name == 'bisect_right')
+                if not valid:
+                    return False
+                enclosing = parents.get(candidate)
+                while enclosing is not None and not isinstance(enclosing, (
+                        ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    enclosing = parents.get(enclosing)
+                if enclosing not in ancestor_scopes:
+                    return False
+                imports += 1
+        elif isinstance(candidate, ast.Name) and candidate.id == name and isinstance(candidate.ctx, (ast.Store, ast.Del)):
+            return False
+        elif _string_binding(candidate, name):
+            return False
+        elif isinstance(candidate, (ast.Global, ast.Nonlocal)) and name in candidate.names:
+            return False
+        elif isinstance(candidate, ast.Call) and isinstance(candidate.func, ast.Name) \
+                and candidate.func.id in {'exec', 'eval', 'globals', 'locals', 'vars', 'setattr', 'delattr'}:
+            return False
+    return imports == 1
+
+
+def _enclosing_function(node: ast.AST, parents):
+    parent = parents.get(node)
+    while parent is not None:
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return parent
+        parent = parents.get(parent)
+    return None
+
+
+def _private_nonempty_sequence(name: str, scope, root, parents) -> bool:
+    """Prove a fresh local sequence cannot shrink or escape before lookup."""
+    initializers = []
+    for candidate in ast.walk(scope):
+        if _string_binding(candidate, name):
+            return False
+        if isinstance(candidate, (ast.Global, ast.Nonlocal)) and name in candidate.names:
+            return False
+        if not isinstance(candidate, ast.Name) or candidate.id != name:
+            continue
+        if _enclosing_function(candidate, parents) is not scope:
+            return False  # A captured sequence can be changed by a callback.
+        parent = parents.get(candidate)
+        if isinstance(candidate.ctx, ast.Store):
+            if isinstance(parent, ast.Assign) and len(parent.targets) == 1 and parent.targets[0] is candidate:
+                initializers.append(parent.value)
+            elif isinstance(parent, ast.AnnAssign) and parent.target is candidate and parent.value is not None:
+                initializers.append(parent.value)
+            else:
+                return False
+        elif isinstance(candidate.ctx, ast.Load):
+            if (isinstance(parent, ast.Subscript) and parent.value is candidate
+                    and isinstance(parent.ctx, ast.Load)):
+                continue
+            if (isinstance(parent, ast.Call) and parent.args and parent.args[0] is candidate
+                    and _known_bisect_right(parent, root, parents)):
+                continue
+            return False  # Includes mutation methods, aliases and unknown calls.
+        else:
+            return False
+    if len(initializers) != 1:
+        return False
+    shape = _sequence_shape(initializers[0])
+    return shape is not None and shape[1] > 0
+
+
+def _bisect_predecessor_guarded(node: ast.Subscript, name: str, delta: int, parents) -> bool:
+    if delta != -1 or not isinstance(node.value, ast.Name):
+        return False
+    scope = _enclosing_function(node, parents)
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    statement = node
+    while not isinstance(statement, ast.stmt):
+        statement = parents.get(statement)
+        if statement is None:
+            return False
+    parent = parents.get(statement)
+    previous = None
+    if parent is not None:
+        for _field, value in ast.iter_fields(parent):
+            if isinstance(value, list) and statement in value:
+                index = value.index(statement)
+                previous = value[index - 1] if index else None
+                break
+    if not (isinstance(previous, ast.Assign) and len(previous.targets) == 1
+            and isinstance(previous.targets[0], ast.Name) and previous.targets[0].id == name):
+        return False
+    for part in ast.walk(scope):
+        if _string_binding(part, name):
+            return False
+        if isinstance(part, (ast.Global, ast.Nonlocal)) and name in part.names:
+            return False
+        if isinstance(part, ast.Name) and part.id == name:
+            if _enclosing_function(part, parents) is not scope:
+                return False
+            if isinstance(part.ctx, (ast.Store, ast.Del)) and part is not previous.targets[0]:
+                return False  # A callback/closure must not change the insertion point.
+    call = previous.value
+    root = scope
+    while root in parents:
+        root = parents[root]
+    if not _known_bisect_right(call, root, parents):
+        return False
+    if not (isinstance(call.args[0], ast.Name) and call.args[0].id == node.value.id):
+        return False
+    return _private_nonempty_sequence(node.value.id, scope, root, parents)
+
+
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
     hits: list[tuple[Path, int, int, str]] = []
     for path in files:
@@ -332,6 +520,8 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
             if delta == 0:
                 continue
             if _guarded(node, name, delta, parents):
+                continue
+            if _bisect_predecessor_guarded(node, name, delta, parents):
                 continue
             line_no = node.slice.lineno
             if line_no in seen:

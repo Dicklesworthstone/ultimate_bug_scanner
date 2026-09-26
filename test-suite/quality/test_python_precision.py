@@ -322,6 +322,171 @@ class IndexArithmeticGuardTests(unittest.TestCase):
         hits = run_detector(index_arithmetic, {"unguarded.py": self.UNGUARDED})
         self.assertEqual(len(hits), 5, hits)
 
+    def test_private_nonempty_bisect_predecessors_are_in_bounds(self) -> None:
+        # bisect_right returns 0..len(seq). For a nonempty builtin sequence,
+        # both the -1 endpoint and the len(seq)-1 endpoint are valid indices.
+        for initializer in ("[0, 4]", "(0, 4)", "[0] + [p for p in points]", "[0, *points]"):
+            with self.subTest(initializer=initializer):
+                hits = run_detector(index_arithmetic, {"predecessor.py": f"""
+                    from bisect import bisect_right
+                    def locate(points, position):
+                        offsets = {initializer}
+                        cursor = bisect_right(offsets, position)
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(hits, [])
+
+    def test_bisect_import_aliases_preserve_the_bound(self) -> None:
+        for imported, function in (
+            ("from bisect import bisect_right as search", "search"),
+            ("import bisect as search", "search.bisect_right"),
+        ):
+            with self.subTest(imported=imported):
+                hits = run_detector(index_arithmetic, {"alias.py": f"""
+                    {imported}
+                    def locate(position):
+                        offsets: list[int] = [0]
+                        cursor = {function}(offsets, position)
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(hits, [])
+
+    def test_empty_or_unknown_sequences_keep_bisect_findings(self) -> None:
+        for initializer in ("[]", "()", "[p for p in points]", "[*points]", "points"):
+            with self.subTest(initializer=initializer):
+                hits = run_detector(index_arithmetic, {"empty.py": f"""
+                    from bisect import bisect_right
+                    def locate(points, position):
+                        offsets = {initializer}
+                        cursor = bisect_right(offsets, position)
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_bisect_shadowing_does_not_prove_a_bound(self) -> None:
+        for imported, parameters, statement in (
+            ("from other import bisect_right", "position", "pass"),
+            ("from bisect import bisect_right", "position, bisect_right", "pass"),
+            ("from bisect import bisect_right", "position", "bisect_right = lambda *_: 99"),
+            ("from bisect import bisect_right", "position", "def bisect_right(*args): return 99"),
+            ("from bisect import bisect_right", "position", "from other import bisect_right"),
+            ("from bisect import bisect_right", "position", "match position:\n                            case {'search': bisect_right}: pass"),
+        ):
+            with self.subTest(imported=imported, parameters=parameters, statement=statement):
+                hits = run_detector(index_arithmetic, {"shadow.py": f"""
+                    {imported}
+                    def locate({parameters}):
+                        {statement}
+                        offsets = [0]
+                        cursor = bisect_right(offsets, position)
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_bisect_module_mutation_and_escape_keep_findings(self) -> None:
+        for mutation in (
+            "search.bisect_right = lambda *_: 99",
+            "setattr(search, 'bisect_right', lambda *_: 99)",
+            "alias = search; alias.bisect_right = lambda *_: 99",
+            "replace_function(search)",
+        ):
+            with self.subTest(mutation=mutation):
+                hits = run_detector(index_arithmetic, {"module.py": f"""
+                    import bisect as search
+                    {mutation}
+                    def locate(position):
+                        offsets = [0]
+                        cursor = search.bisect_right(offsets, position)
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_bisect_import_from_another_scope_is_not_a_binding(self) -> None:
+        hits = run_detector(index_arithmetic, {"scope.py": """
+            def unrelated():
+                from bisect import bisect_right
+            def locate(position):
+                offsets = [0]
+                cursor = bisect_right(offsets, position)
+                return offsets[cursor - 1]
+        """})
+        self.assertEqual(len(hits), 1, hits)
+
+    def test_mutating_another_bisect_alias_invalidates_the_import(self) -> None:
+        for imported, function in (
+            ("import bisect as search", "search.bisect_right"),
+            ("from bisect import bisect_right", "bisect_right"),
+        ):
+            with self.subTest(imported=imported):
+                hits = run_detector(index_arithmetic, {"other_alias.py": f"""
+                    import bisect as other
+                    other.bisect_right = lambda *_: 99
+                    {imported}
+                    def locate(position):
+                        offsets = [0]
+                        cursor = {function}(offsets, position)
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_sequence_mutation_or_escape_invalidates_bisect_proof(self) -> None:
+        for before, after in (
+            ("pass", "offsets.clear()"),
+            ("alias = offsets", "alias.clear()"),
+            ("pass", "del offsets[:]"),
+            ("pass", "offsets = []"),
+            ("expose(offsets)", ""),
+            ("def clear(): offsets.clear()", ""),
+        ):
+            with self.subTest(before=before, after=after):
+                hits = run_detector(index_arithmetic, {"mutation.py": f"""
+                    from bisect import bisect_right
+                    def locate(position):
+                        offsets = [0]
+                        {before}
+                        cursor = bisect_right(offsets, position)
+                        {after}
+                        return offsets[cursor - 1]
+                """})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_bisect_optional_bounds_and_different_sequences_keep_findings(self) -> None:
+        for arguments, lookup in (
+            ("offsets, position, 0, 99", "offsets"),
+            ("offsets, position, hi=99", "offsets"),
+            ("offsets, position", "other"),
+        ):
+            with self.subTest(arguments=arguments, lookup=lookup):
+                hits = run_detector(index_arithmetic, {"bounds.py": f"""
+                    from bisect import bisect_right
+                    def locate(position, other):
+                        offsets = [0]
+                        cursor = bisect_right({arguments})
+                        return {lookup}[cursor - 1]
+                """})
+                self.assertEqual(len(hits), 1, hits)
+
+    def test_callback_cannot_change_bisect_index_before_lookup(self) -> None:
+        hits = run_detector(index_arithmetic, {"callback.py": """
+            from bisect import bisect_right
+            def locate(position):
+                offsets = [0]
+                def change():
+                    nonlocal cursor
+                    cursor = 99
+                cursor = bisect_right(offsets, position)
+                return change(), offsets[cursor - 1]
+        """})
+        self.assertEqual(len(hits), 1, hits)
+
+    def test_list_membership_does_not_prove_an_index_bound(self) -> None:
+        hits = run_detector(index_arithmetic, {"membership.py": """
+            def wrong(values, cursor):
+                if cursor - 1 in values:
+                    return values[cursor - 1]
+        """})
+        self.assertEqual(len(hits), 1, hits)
+
     def test_ladder_promotes_to_warning_above_threshold(self) -> None:
         body = "def f(x, i):\n    return (\n" + "".join(
             f"        x[i + {n}],\n" for n in range(1, index_arithmetic.WARNING_ABOVE + 3)

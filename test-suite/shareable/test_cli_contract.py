@@ -960,6 +960,25 @@ def check_robot_docs_flags_parse() -> None:
     # Examples such as --output=report.json write relative paths: run from a
     # scratch directory so nothing lands in the repository root.
     scratch = Path(tempfile.mkdtemp(prefix="ubs-flags-"))
+    # Selection flags need a real HEAD and changed source; the documented
+    # --rules example needs a readable directory containing a valid policy.
+    source = scratch / "flag_parse.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    run_git(["init", "--quiet", "-b", "main"], cwd=scratch)
+    run_git(["add", source.name], cwd=scratch)
+    run_git([
+        "-c", "user.name=UBS Test", "-c", "user.email=ubs-test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "flag parser fixture",
+    ], cwd=scratch)
+    source.write_text("value = 2\n", encoding="utf-8")
+    run_git(["add", source.name], cwd=scratch)
+    rules = scratch / "rules"
+    rules.mkdir()
+    (rules / "flag_parse.yml").write_text(
+        "id: custom.flag-parse\nlanguage: python\nseverity: warning\n"
+        "message: flag parser fixture\nrule:\n  pattern: print($VALUE)\n",
+        encoding="utf-8",
+    )
     for flag in doc["commands"]["flags"]:
         example = flag["example"]
         if flag["name"] in ("--update", "--update-modules"):

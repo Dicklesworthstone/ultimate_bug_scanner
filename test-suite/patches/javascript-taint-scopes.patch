@@ -1,0 +1,567 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+index 31fd7f8..b30df19 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -1,8 +1,9 @@
+ """JavaScript/TypeScript taint analysis with sink-specific sanitizer effects.
+ 
+ Executable-expression masks retain template interpolation and source offsets.
+-Propagation is still flow-insensitive within a file; this is not a complete
+-interprocedural or control-flow analysis (the remaining D6 work).
++Lexical function bindings and local-call return/sink summaries prevent
++cross-function contamination. Statement flow remains conservative within a
++function; cross-file calls and path-sensitive control flow remain D6 work.
+ 
+ Emit dialects:
+ - main(argv) preserves the legacy output dialect: one
+@@ -18,6 +19,7 @@ import sys
+ from bisect import bisect_right
+ from collections import defaultdict, deque
+ from copy import deepcopy
++from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Iterable
+ 
+@@ -358,11 +360,11 @@ def child_process_bindings(lines):
+     return module_aliases, function_aliases
+ 
+ 
+-def parse_assignments(lines):
+-    text, code = lexical_views('\n'.join(lines))
++def assignment_records(text):
++    """Yield source offsets as well as names; line numbers are not scope keys."""
++    text, code = lexical_views(text)
+     assignments = []
+     seen = set()
+-    line_starts = [0] + [m.end() for m in re.finditer('\n', text)]
+     for boundary in re.finditer(r'(?:^|[;\n{}])\s*', code):
+         start = boundary.end()
+         statement = text[start:]
+@@ -386,10 +388,17 @@ def parse_assignments(lines):
+         end = expression_end(code, expr_start)
+         expr = text[expr_start:end].strip()
+         for target in targets:
+-            assignments.append((bisect_right(line_starts, start), target, expr))
++            assignments.append((start, target, expr_start, end, expr, pattern is not ASSIGN_SIMPLE))
+     return assignments
+ 
+ 
++def parse_assignments(lines):
++    text = '\n'.join(lines)
++    line_starts = [0] + [m.end() for m in re.finditer('\n', text)]
++    return [(bisect_right(line_starts, start), target, expr)
++            for start, target, _begin, _end, expr, _decl in assignment_records(text)]
++
++
+ def find_sources(expr: str):
+     matches = []
+     code = lexical_views(expr)[1]
+@@ -413,7 +422,7 @@ def assignment_sources(expr: str):
+     return []
+ 
+ 
+-def unsanitized_expression(expr: str, sink_rule: str | None) -> str:
++def unsanitized_expression(expr: str, sink_rule: str | None, *, shadowed=()) -> str:
+     """Mask only complete sanitizer call results, not their unsafe siblings.
+ 
+     Replacing complete calls with spaces preserves offsets and cannot join
+@@ -435,6 +444,8 @@ def unsanitized_expression(expr: str, sink_rule: str | None) -> str:
+     for match in regex.finditer(code):
+         if match.start() < covered_until:
+             continue
++        if code[match.start():match.end() - 1].strip() in shadowed:
++            continue
+         previous = match.start() - 1
+         while previous >= 0 and code[previous].isspace():
+             previous -= 1
+@@ -594,6 +605,454 @@ _MESSAGE = {
+ }
+ 
+ 
++_IDENTIFIER = re.compile(r'[A-Za-z_$][\w$]*')
++
++
++def argument_spans(code: str, start: int, end: int):
++    """Split at top-level commas, retaining absolute source offsets."""
++    depth = 0
++    begin = start
++    for pos in range(start, end):
++        char = code[pos]
++        if char in '([{':
++            depth += 1
++        elif char in ')]}':
++            depth -= 1
++        elif char == ',' and depth == 0:
++            yield begin, pos
++            begin = pos + 1
++    if code[begin:end].strip():
++        yield begin, end
++
++
++@dataclass
++class Parameter:
++    names: tuple[str, ...]
++    default: tuple[int, int] | None = None
++    rest: bool = False
++
++
++def top_level_separator(code, start, end, wanted):
++    depth = 0
++    for pos in range(start, end):
++        char = code[pos]
++        if char in '([{':
++            depth += 1
++        elif char in ')]}':
++            depth -= 1
++        elif not depth and char == wanted:
++            return pos
++    return end
++
++
++def binding_names(code: str):
++    """Names bound by simple or destructured parameter patterns, not keys."""
++    code = code.strip().removeprefix('...').strip()
++    equals = top_level_separator(code, 0, len(code), '=')
++    code = code[:equals].strip()
++    if code.startswith(('{', '[')):
++        closing = '}' if code[0] == '{' else ']'
++        # The final delimiter can precede a TypeScript annotation.
++        depth, end = 0, None
++        for pos, char in enumerate(code):
++            if char == code[0]:
++                depth += 1
++            elif char == closing:
++                depth -= 1
++                if not depth:
++                    end = pos
++                    break
++        if end is None:
++            return ()
++        names = []
++        for a, b in argument_spans(code, 1, end):
++            part = code[a:b]
++            if code[0] == '{':
++                colon = top_level_separator(part, 0, len(part), ':')
++                if colon < len(part):
++                    part = part[colon + 1:]
++            names.extend(binding_names(part))
++        return tuple(names)
++    match = re.match(r'([A-Za-z_$][\w$]*)\s*(?:[?:]|$)', code)
++    return (match.group(1),) if match else ()
++
++
++@dataclass
++class FunctionScope:
++    start: int
++    end: int
++    header: int
++    parameters: tuple[Parameter, ...] = ()
++    name: str = ''
++    parent: int = 0
++    implicit_return: bool = False
++
++
++class FunctionIndex:
++    """Balanced lexical scopes for functions, methods and arrow callbacks.
++
++    This does not pretend to parse all JavaScript/TypeScript. Only complete
++    recognized function boundaries isolate bindings; unresolved calls retain
++    conservative argument flow. Statements inside each function are still
++    analyzed as a may-flow graph rather than path-sensitive execution.
++    """
++
++    def __init__(self, text: str):
++        self.text, self.code = lexical_views(text)
++        self.pairs = {}
++        stack = []
++        for pos, char in enumerate(self.code):
++            if char in '([{':
++                stack.append(pos)
++            elif char in ')]}' and stack:
++                if self.code[stack[-1]] == {')': '(', ']': '[', '}': '{'}[char]:
++                    begin = stack.pop()
++                    self.pairs[begin] = pos
++                    self.pairs[pos] = begin
++        found = {}
++
++        def add(header, args_start, args_end, body, name='', implicit=False):
++            if implicit:
++                end = expression_end(self.code, body)
++                end = next((b for _a, b in argument_spans(self.code, body, end)), end)
++                start = body
++            else:
++                if body not in self.pairs or self.code[body] != '{':
++                    return
++                start, end = body + 1, self.pairs[body]
++            params = []
++            for a, b in argument_spans(self.code, args_start, args_end):
++                parameter = self.code[a:b].strip()
++                equals = top_level_separator(self.code, a, b, '=')
++                params.append(Parameter(binding_names(self.code[a:equals]),
++                                        (equals + 1, b) if equals < b else None,
++                                        parameter.startswith('...')))
++            prefix = self.code[:header].rstrip()
++            binding = re.search(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?::[^;={}\n]+)?=\s*(?:async\s*)?$', prefix)
++            if binding:
++                name = binding.group(1)
++            found[start] = FunctionScope(start, end, header, tuple(params), name,
++                                         implicit_return=implicit)
++
++        for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?\s*\(', self.code):
++            opening = match.end() - 1
++            closing = self.pairs.get(opening)
++            if closing is None:
++                continue
++            body = re.match(r'\s*(?::[^;={}]+)?\s*\{', self.code[closing + 1:])
++            if body:
++                add(match.start(), opening + 1, closing, closing + body.end(), match.group(1) or '')
++        for match in re.finditer(r'=>', self.code):
++            left = match.start() - 1
++            while left >= 0 and self.code[left].isspace():
++                left -= 1
++            # A parenthesized TypeScript arrow may carry a return annotation.
++            annotation = re.search(r'\)\s*:\s*[\w$\[\]<>|&., ?]+$', self.code[:left + 1])
++            if annotation:
++                left = annotation.start()
++            if left >= 0 and self.code[left] == ')' and left in self.pairs:
++                opening = self.pairs[left]
++                header, a, b = opening, opening + 1, left
++            else:
++                parameter = re.search(r'[A-Za-z_$][\w$]*$', self.code[:left + 1])
++                if parameter is None:
++                    continue
++                header, a, b = parameter.start(), parameter.start(), parameter.end()
++            body = match.end()
++            while body < len(self.code) and self.code[body].isspace():
++                body += 1
++            if body < len(self.code):
++                add(header, a, b, body, implicit=self.code[body] != '{')
++        # Method bodies also need isolated locals even when their receiver
++        # cannot yet be resolved to an interprocedural call target.
++        for match in re.finditer(r'\b([A-Za-z_$][\w$]*)\s*\(', self.code):
++            if match.group(1) in {'if', 'for', 'while', 'switch', 'catch', 'with'}:
++                continue
++            opening = match.end() - 1
++            closing = self.pairs.get(opening)
++            if closing is None:
++                continue
++            body = re.match(r'\s*(?::[^;={}]+)?\s*\{', self.code[closing + 1:])
++            if body:
++                brace = closing + body.end()
++                if brace + 1 not in found:
++                    add(match.start(), opening + 1, closing, brace)
++        self.scopes = [FunctionScope(0, len(text) + 1, 0)] + sorted(found.values(), key=lambda s: s.start)
++        self.starts = [scope.start for scope in self.scopes]
++        ancestors = [0]
++        for i, scope in enumerate(self.scopes[1:], 1):
++            while ancestors[-1] and scope.header >= self.scopes[ancestors[-1]].end:
++                ancestors.pop()
++            scope.parent = ancestors[-1]
++            ancestors.append(i)
++        self.blocks = sorted((a, b) for a, b in self.pairs.items() if a < b and self.code[a] == '{')
++        self.bindings = defaultdict(set)
++        for i, scope in enumerate(self.scopes[1:], 1):
++            for param in scope.parameters:
++                for name in param.names:
++                    # Earlier parameters are in scope in later defaults;
++                    # declarations in the function body are not.
++                    self.bindings[i, name].add((scope.header, scope.end, i))
++        self.records = assignment_records(text)
++        for start, target, _a, _b, _expr, declaration in self.records:
++            if declaration:
++                self.declare(self.at(start), target, start, bool(re.match(r'var\b', self.code[start:])))
++        # Uninitialized declarations still shadow captured/global bindings.
++        for match in re.finditer(r'\b(let|const|var)\s+([A-Za-z_$][\w$]*)', self.code):
++            self.declare(self.at(match.start()), match.group(2), match.start(), match.group(1) == 'var')
++        self.functions = {}
++        for i, scope in enumerate(self.scopes[1:], 1):
++            if scope.name:
++                self.declare(scope.parent, scope.name, scope.header)
++                key = self.binding(scope.parent, scope.name, scope.header)
++                supported = all(param.names for param in scope.parameters)
++                self.functions[key] = i if key not in self.functions and supported else None
++        # A summary is only applicable while the binding still names that
++        # function. Reassignment/ambiguous definitions fall back to unknown-call
++        # argument flow, never the stale "clean return" summary.
++        for start, target, _a, end, _expr, _decl in self.records:
++            key = self.binding(self.at(start), target, start)
++            callee = self.functions.get(key)
++            if callee is not None and not start <= self.scopes[callee].header < end:
++                self.functions[key] = None
++
++    def at(self, pos: int) -> int:
++        index = max(0, bisect_right(self.starts, pos) - 1)
++        while index and pos >= self.scopes[index].end:
++            index = self.scopes[index].parent
++        return index
++
++    def declare(self, scope, name, position, function_wide=False):
++        begin, end, identity = self.scopes[scope].start, self.scopes[scope].end, scope
++        if not function_wide:
++            for a, b in reversed(self.blocks):
++                if begin <= a + 1 <= position < b <= end:
++                    if a + 1 != begin:
++                        begin, end, identity = a + 1, b, len(self.scopes) + a + 1
++                    break
++        self.bindings[scope, name].add((begin, end, identity))
++
++    def binding(self, scope: int, name: str, position: int):
++        while True:
++            for begin, end, identity in sorted(self.bindings[scope, name], reverse=True):
++                if begin <= position < end:
++                    return identity, name
++            if not scope:
++                return 0, name
++            # A closure inherits the lexical environment where it is defined,
++            # not an unrelated later block in its parent's function body.
++            position, scope = self.scopes[scope].header, self.scopes[scope].parent
++
++    def references(self, expr: str, scope: int, offset: int):
++        code = lexical_views(expr)[1]
++        for match in _IDENTIFIER.finditer(code):
++            before, after = match.start() - 1, match.end()
++            while before >= 0 and code[before].isspace():
++                before -= 1
++            while after < len(code) and code[after].isspace():
++                after += 1
++            if (before >= 0 and code[before] == '.') or code[after:after + 1] == ':':
++                continue
++            yield self.binding(scope, match.group(), offset + match.start())
++
++    def without_functions(self, begin: int, end: int) -> str:
++        value = list(self.text[begin:end])
++        for scope in self.scopes[1:]:
++            if begin <= scope.header < end:
++                stop = min(end, scope.end + (not scope.implicit_return))
++                for pos in range(scope.header, stop):
++                    value[pos - begin] = '\n' if self.text[pos] == '\n' else ' '
++        return ''.join(value)
++
++
++class ScopedTaint:
++    """Finite source/parameter facts with call-site substitution and effects.
++
++    A parameter remains symbolic in its defining function. Calls substitute
++    actual argument facts into return and sink summaries, rather than pouring
++    all callers into one parameter variable. Cycles terminate because joins
++    only add origins; bounded provenance is evidence, not part of the lattice.
++    """
++
++    def __init__(self, index: FunctionIndex, rule: str, sinks):
++        self.index, self.rule = index, rule
++        self.facts = defaultdict(dict)
++        self.readers = defaultdict(set)
++        self.work = []
++        self.active = -1
++        self.pending = deque()
++        self.queued = set()
++        for i, scope in enumerate(index.scopes[1:], 1):
++            for param in scope.parameters:
++                for name in param.names:
++                    self.facts[('var', i, name)][('param', i, name)] = (name,)
++        for start, target, begin, end, _expr, _decl in index.records:
++            scope = index.at(start)
++            key = ('var', *index.binding(scope, target, start))
++            self.add(key, lambda a=begin, b=end, s=scope: self.evaluate(a, b, s), target)
++        for i, scope in enumerate(index.scopes[1:], 1):
++            if scope.implicit_return:
++                self.add(('return', i), lambda s=scope, i=i: self.evaluate(s.start, s.end, i))
++        for match in re.finditer(r'\breturn\b', index.code):
++            before = index.code[:match.start()].rstrip()
++            after = index.code[match.end():].lstrip()
++            if before.endswith('.') or after.startswith(':'):
++                continue
++            scope = index.at(match.start())
++            if not scope:
++                continue
++            begin = match.end()
++            # Automatic semicolon insertion makes a newline after return an
++            # empty return, not a return of the following statement.
++            following = re.match(r'[^\S\n]*', index.code[begin:]).end() + begin
++            if following < len(index.code) and index.code[following] == '\n':
++                continue
++            end = expression_end(index.code, begin)
++            self.add(('return', scope), lambda a=begin, b=end, s=scope: self.evaluate(a, b, s))
++        self.sinks = sinks
++        reachable = defaultdict(set)
++        for number, (start, begin, _rule, _label, call) in enumerate(sinks):
++            owner = index.at(start)
++            end = expression_end(index.code, begin, call=call)
++            if rule == 'js.taint.sql':
++                end = begin + len(query_argument(index.text[begin:end]))
++            reachable[owner].add(number)
++            self.add(('effect', owner, number), lambda a=begin, b=end, s=owner: self.evaluate(a, b, s))
++        calls = list(self.local_calls(0, len(index.text)))
++        callers = defaultdict(set)
++        for _start, _end, callee, _args, owner in calls:
++            callers[callee].add(owner)
++        queue = deque(reachable)
++        while queue:
++            callee = queue.popleft()
++            for owner in sorted(callers[callee]):
++                new = reachable[callee] - reachable[owner]
++                if new:
++                    reachable[owner].update(new)
++                    queue.append(owner)
++        for _start, _end, callee, args, owner in calls:
++            for number in sorted(reachable[callee]):
++                self.add(('effect', owner, number),
++                         lambda c=callee, a=args, s=owner, n=number:
++                         self.substitute(self.read(('effect', c, n)), c, a, s))
++
++    def add(self, node, operation, label=''):
++        self.work.append((node, operation, label))
++        self.enqueue(len(self.work) - 1)
++
++    def enqueue(self, number):
++        if number not in self.queued:
++            self.queued.add(number)
++            self.pending.append(number)
++
++    def read(self, node):
++        if self.active >= 0:
++            self.readers[node].add(self.active)
++        return self.facts[node]
++
++    @staticmethod
++    def extend(path, label):
++        if not label or (path and path[-1] == label):
++            return path
++        return (*path[-(PATH_LIMIT - 1):], label)
++
++    def local_calls(self, begin, end):
++        index = self.index
++        for match in re.finditer(r'(?<![\w$.])([A-Za-z_$][\w$]*)\s*\(', index.code[begin:end]):
++            start, opening = begin + match.start(), begin + match.end() - 1
++            closing = index.pairs.get(opening)
++            if closing is None or closing >= end:
++                continue
++            if any(scope.header <= start < scope.start for scope in index.scopes[1:]):
++                continue
++            owner = index.at(start)
++            callee = index.functions.get(index.binding(owner, match.group(1), start))
++            if callee is not None:
++                yield start, closing + 1, callee, tuple(argument_spans(index.code, opening + 1, closing)), owner
++
++    def substitute(self, facts, callee, args, owner, depth=0):
++        result = {}
++        scope = self.index.scopes[callee]
++        for origin, path in list(facts.items()):
++            if origin[0] == 'param' and origin[1] == callee:
++                position, parameter = next((i, p) for i, p in enumerate(scope.parameters)
++                                           if origin[2] in p.names)
++                incoming = {}
++                spread = next((i for i, (a, b) in enumerate(args)
++                               if self.index.code[a:b].lstrip().startswith('...')), None)
++                if spread is not None and position >= spread:
++                    # The expansion length is unknown: every later formal can
++                    # receive expanded data. Never interpret it as one argument.
++                    actuals = args[spread:]
++                else:
++                    actuals = args[position:] if parameter.rest else args[position:position + 1]
++                for a, b in actuals:
++                    incoming.update(self.evaluate(a, b, owner, depth + 1))
++                missing = (not actuals or (spread is not None and position >= spread)
++                           or self.index.code[actuals[0][0]:actuals[0][1]].strip() in {'undefined', 'void 0'})
++                if missing and parameter.default is not None:
++                    default = self.evaluate(*parameter.default, callee, depth + 1)
++                    # Defaults may reference earlier parameters. Those symbols
++                    # are instantiated at this same call rather than shared.
++                    if depth < 64:
++                        incoming.update(self.substitute(default, callee, args, owner, depth + 1))
++                    else:
++                        incoming.update(default)
++                for source, incoming_path in incoming.items():
++                    result.setdefault(source, self.extend(incoming_path, (scope.name or 'callback') + '()'))
++            else:
++                result.setdefault(origin, self.extend(path, (scope.name or 'callback') + '()'))
++        return result
++
++    def evaluate(self, begin, end, owner, depth=0):
++        index = self.index
++        expr = index.without_functions(begin, end)
++        shadowed = {name for (scope, name), callee in index.functions.items()
++                    if index.binding(owner, name, begin) == (scope, name)}
++        expr = unsanitized_expression(expr, self.rule, shadowed=shadowed)
++        result = {}
++        masked = list(expr)
++        covered = begin
++        if depth < 64:
++            for start, stop, callee, args, _scope in self.local_calls(begin, end):
++                if start < covered or not expr[start - begin:stop - begin].strip():
++                    continue
++                result.update(self.substitute(self.read(('return', callee)), callee, args, owner, depth))
++                for pos in range(start, stop):
++                    masked[pos - begin] = '\n' if index.text[pos] == '\n' else ' '
++                covered = stop
++        # At the nesting bound unresolved subexpressions retain source and
++        # argument flow rather than being silently replaced with clean values.
++        expr = ''.join(masked)
++        for snippet, _label in assignment_sources(expr):
++            result.setdefault(('source', begin, snippet), (snippet.strip(),))
++        for scope, name in index.references(expr, owner, begin):
++            for origin, path in self.read(('var', scope, name)).items():
++                result.setdefault(origin, path)
++        return result
++
++    def solve(self):
++        while self.pending:
++            self.active = self.pending.popleft()
++            self.queued.remove(self.active)
++            node, operation, label = self.work[self.active]
++            incoming = operation()
++            new = {origin: self.extend(path, label) for origin, path in incoming.items()
++                   if origin not in self.facts[node]}
++            if new:
++                self.facts[node].update(new)
++                for reader in sorted(self.readers[node]):
++                    self.enqueue(reader)
++        self.active = -1
++        findings = {}
++        for node, facts in self.facts.items():
++            if node[0] == 'effect':
++                for origin, path in facts.items():
++                    if origin[0] == 'source':
++                        findings.setdefault(node[2], path)
++        return findings
++
++
+ def scan_file_findings(path: Path):
+     """Yield (rule_id, line, col, path_desc) per detection, without the
+     heredoc's 3-sample cap — used by the structured run(ctx) path."""
+@@ -604,26 +1063,19 @@ def scan_file_findings(path: Path):
+     text, code = lexical_views(text)
+     lines = text.splitlines()
+     line_starts = [0] + [match.end() for match in re.finditer('\n', text)]
+-    assignments = parse_assignments(lines)
+-    tainted_by_rule = {rule: record_taint(assignments, rule) for rule in KIND_BY_RULE}
++    index = FunctionIndex(text)
+     child_process_modules, child_process_functions = child_process_bindings(lines)
+     sinks = list(child_process_sinks(text, code, child_process_modules, child_process_functions))
+     for regex, rule, label, call in SINKS:
+         sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
+-    for start, expr_start, rule, sink_label, call in sorted(sinks):
+-        expr = text[expr_start:expression_end(code, expr_start, call=call)]
+-        if rule == 'js.taint.sql':
+-            expr = query_argument(expr)
+-        expr = unsanitized_expression(expr, rule)
+-        literal = find_sources(expr)
+-        if literal:
+-            snippet, _ = literal[0]
+-            path_desc = f"{snippet.strip()} -> {sink_label}"
+-        else:
+-            ref, meta = expr_has_tainted(expr, tainted_by_rule[rule])
+-            if not ref:
+-                continue
+-            path_desc = format_path(meta.get('path', [ref]), sink_label)
++    detected = []
++    for rule in KIND_BY_RULE:
++        selected = sorted(sink for sink in sinks if sink[2] == rule)
++        if selected:
++            for number, path in ScopedTaint(index, rule, selected).solve().items():
++                start, _begin, _rule, label, _call = selected[number]
++                detected.append((start, rule, format_path(path, label)))
++    for start, rule, path_desc in sorted(detected):
+         line = bisect_right(line_starts, start)
+         yield rule, line, start - line_starts[line - 1] + 1, path_desc
+ 

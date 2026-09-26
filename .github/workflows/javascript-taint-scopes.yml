@@ -1,0 +1,136 @@
+name: JavaScript Scoped Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/js/test_taint_scopes.py
+      - test-suite/patches/javascript-taint-scopes.patch
+      - .github/workflows/javascript-taint-scopes.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-scopes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Temporary publication of validated blobs, never commits or refs.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Reproduce the old engine defects
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 31fd7f879de3bf4badc4ab394a31b5215b621678
+          echo "JS_SCOPES_BASE $(git rev-parse HEAD)"
+          if python3 test-suite/js/test_taint_scopes.py \
+            JavaScriptScopeTests.test_sibling_function_locals_are_isolated \
+            JavaScriptScopeTests.test_source_returning_helper \
+            JavaScriptScopeTests.test_parameter_to_sink_effect > "$RUNNER_TEMP/scopes-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/scopes-before.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/scopes-before.log"
+          grep -q 'FAILED (failures=3)' "$RUNNER_TEMP/scopes-before.log"
+      - name: Apply the exact reviewed implementation and rebuild integrity chain
+        run: |
+          git apply --check test-suite/patches/javascript-taint-scopes.patch
+          git apply test-suite/patches/javascript-taint-scopes.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = b30df19c2a018fa0db40faf3e7fb35ed80ea0779
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Run scoped and existing domain regressions
+        run: |
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Run existing JavaScript quality tests
+        run: python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Verify real scanner interprocedural detections and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          cases = [
+              ('helper-source', 'function read() { return req.query.code; }\neval(read());', {'js.taint.eval'}, set()),
+              ('helper-sink', 'function run(value) { shell.exec(value); }\nrun(req.query.command);', {'js.taint.command'}, set()),
+              ('recursive-effect', 'function a(x) { if (flag) return b(x); eval(x); }\nfunction b(y) { a(y); }\nb(req.query.code);', {'js.taint.eval'}, set()),
+              ('default-source', 'function read(value = req.query.html) { return value; }\nres.send(read());', {'js.taint.xss'}, set()),
+              ('scope-clean', 'function a(req) { const html = req.query.html; }\nfunction b() { const html = "hello"; res.send(html); }', set(), {'js.taint.xss'}),
+              ('constant-clean', 'function clean(value) { return "hello"; }\nres.send(clean(req.query.html));', set(), {'js.taint.xss'}),
+              ('wrapped-sanitizer', 'function escape(x) { return DOMPurify.sanitize(x); }\nres.send(escape(req.query.html));', set(), {'js.taint.xss'}),
+              ('call-isolation', 'function id(x) { return x; }\nconst raw = id(req.query.html);\nconst clean = id("hello");\nres.send(clean);', set(), {'js.taint.xss'}),
+          ]
+          for name, source, expected, forbidden in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-js-scopes-') as tmp:
+                  target = Path(tmp) / 'app.js'
+                  target.write_text(source + '\n', encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(target), '--only=js', '--format=json', '--ci'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=120)
+                  print(name, 'exit', result.returncode, result.stderr, flush=True)
+                  assert result.returncode in (0, 1), result.stdout
+                  data = json.loads(result.stdout)
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              if isinstance(value.get(key), str):
+                                  rules.add(value[key].replace('javascript.', 'js.'))
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(data)
+                  assert expected <= rules, (name, expected, rules, data)
+                  assert not forbidden & rules, (name, forbidden, rules, data)
+                  print('JS_SCOPES_E2E_PASS', name, sorted(rules), flush=True)
+          PY
+      - name: Verify deterministic regeneration and publish tested blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_js.py'}
+          allowed.update(str(p) for p in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, changed
+          before = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert all(Path(name).read_bytes() == data for name, data in before.items())
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for name in changed:
+              data = Path(name).read_bytes()
+              response = subprocess.run([
+                  'gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-',
+              ], input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                 text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              print('JS_SCOPES_BLOB', name, sha, mode, flush=True)
+          PY

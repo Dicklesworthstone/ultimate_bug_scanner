@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/javascript-heap-source.patch.gz
+      - test-suite/patches/javascript-heap-calls.patch.gz
       - .github/workflows/javascript-heap.yml
   workflow_dispatch:
 
@@ -44,21 +45,31 @@ jobs:
           brew install bash jq ripgrep shellcheck
           echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
           npm install --global @ast-grep/cli
-      - name: Apply the exact source-and-test implementation
+      - name: Apply the exact local and interprocedural heap implementations
         run: |
           bash -c 'test "$BASH_VERSINFO" -ge 5'
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 477c8ac86895e19afdf6dacc96834c93cb90b736
           test "$(git hash-object test-suite/patches/javascript-heap-source.patch.gz)" = 0dc09146652bec4fc2e991222314081e679a4479
-          gzip -dc test-suite/patches/javascript-heap-source.patch.gz > "$RUNNER_TEMP/js-heap-source.patch"
-          git apply --check "$RUNNER_TEMP/js-heap-source.patch"
-          git apply "$RUNNER_TEMP/js-heap-source.patch"
+          base="$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)"
+          if [ "$base" = 477c8ac86895e19afdf6dacc96834c93cb90b736 ]; then
+            gzip -dc test-suite/patches/javascript-heap-source.patch.gz > "$RUNNER_TEMP/js-heap-source.patch"
+            git apply --check "$RUNNER_TEMP/js-heap-source.patch"
+            git apply "$RUNNER_TEMP/js-heap-source.patch"
+          else
+            test "$base" = 9d982e5f001212eb6eaec9166c01604f2fe97989
+          fi
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 9d982e5f001212eb6eaec9166c01604f2fe97989
           test "$(git hash-object test-suite/quality/test_taint_js_heap.py)" = 150d578fb48cc1b8c213211753ca68412909f394
+          test "$(git hash-object test-suite/patches/javascript-heap-calls.patch.gz)" = fa67fce149d2afbae9d1cd0e6c0133db60a145df
+          gzip -dc test-suite/patches/javascript-heap-calls.patch.gz > "$RUNNER_TEMP/js-heap-calls.patch"
+          git apply --check "$RUNNER_TEMP/js-heap-calls.patch"
+          git apply "$RUNNER_TEMP/js-heap-calls.patch"
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = c924bd3b74664208b056eb27be867c5ef70a7ad4
+          test "$(git hash-object test-suite/quality/test_taint_js_heap.py)" = 0bb5d1266bc01fa17a7b94dbb7e3872e4817efd2
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --check
-      - name: Run heap regressions including all eight real scanner scenarios
+      - name: Run 119 heap tests including 16 real scanner and 21 Node scenarios
         run: |
           command -v ast-grep
           command -v node
@@ -70,6 +81,7 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
           result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+          assert result.testsRun == 119, result.testsRun
           assert result.wasSuccessful() and not result.skipped, (result.failures, result.errors, result.skipped)
           print('JS_HEAP_TESTS_PASS', result.testsRun, flush=True)
           PY

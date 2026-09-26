@@ -1,0 +1,242 @@
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -653,6 +653,10 @@
+             cursor = pairs[cursor] + 1
+             continue
+         if code[cursor] == separator:
++            if separator == '=' and (code[cursor:cursor + 2] in {'=>', '=='}
++                                     or code[cursor - 1:cursor] in {'=', '!', '<', '>'}):
++                cursor += 1
++                continue
+             yield part, cursor
+             part = cursor + 1
+         cursor += 1
+@@ -704,10 +708,66 @@
+     return entries
+ 
+ 
++def _signature_body(code, pairs, closing):
++    """Find the implementation body, not a brace inside a TS return type."""
++    cursor = closing + 1
++    while cursor < len(code) and code[cursor].isspace():
++        cursor += 1
++    if code[cursor:cursor + 1] == '{':
++        return cursor
++    if code[cursor:cursor + 1] != ':':
++        return None
++    start, angle = cursor + 1, 0
++    cursor = start
++    while cursor < len(code):
++        char = code[cursor]
++        if char == ';' and not angle:
++            return None
++        if char in '([' and cursor in pairs:
++            cursor = pairs[cursor] + 1
++            continue
++        if char == '<':
++            angle += 1
++        elif char == '>' and code[cursor - 1:cursor] != '=':
++            angle = max(0, angle - 1)
++        elif char == '{':
++            before = code[start:cursor].rstrip()
++            if angle or not before or before[-1:] in {'|', '&', '?', ':'} or before.endswith('=>'):
++                if cursor not in pairs:
++                    return None
++                cursor = pairs[cursor] + 1
++                continue
++            return cursor
++        cursor += 1
++    return None
++
++
+ def _function_scopes(text, code):
+     """Recognize bounded lexical function forms; never import scanned code."""
+     pairs = _pairs(code)
+     scopes, body_starts = [], set()
++    type_ranges = []
++
++    def parameter_types(start, end):
++        for left, right in _chunks(code, start, end):
++            _, equals = next(_chunks(code, left, right, '='))
++            _, colon = next(_chunks(code, left, equals, ':'))
++            if colon < equals:
++                type_ranges.append((colon + 1, equals))
++
++    for match in re.finditer(r'\b(?:const|let|var)\s+[A-Za-z_$][\w$]*', code):
++        end = expression_end(code, match.start())
++        _, equals = next(_chunks(code, match.end(), end, '='))
++        if code[match.end():equals].lstrip().startswith(':'):
++            type_ranges.append((match.end(), equals))
++    # Callback parameter types must be known before visiting any arrow in
++    # their enclosing signature; they are not executable nested functions.
++    for opening, closing in pairs.items():
++        if opening < closing and code[opening] == '(':
++            body = _signature_body(code, pairs, closing)
++            arrow = re.match(r'\s*(?::[^;={}]+)?=>', code[closing + 1:])
++            if body is not None or arrow is not None:
++                parameter_types(opening + 1, closing)
+ 
+     def add(start, params_start, params_end, body, name='', declaration=False, concise=False):
+         if body in body_starts:
+@@ -732,13 +792,10 @@
+         closing = pairs.get(opening)
+         if closing is None:
+             continue
+-        body = closing + 1
+-        while body < len(code) and code[body].isspace():
+-            body += 1
+-        if code[body:body + 1] == ':':
+-            body = code.find('{', body)
+-        if body < 0:
+-            continue
++        body = _signature_body(code, pairs, closing)
++        if body is None:
++            continue
++        type_ranges.append((closing + 1, body))
+         prefix = code[:match.start()].rstrip()
+         declaration = not prefix or prefix[-1] in ';{}' or bool(re.search(r'\b(?:export|default|async)\s*$', prefix))
+         if '\n' in code[max(prefix.rfind(';'), prefix.rfind('}')) + 1:match.start()] and not re.search(r'=\s*$', prefix):
+@@ -746,6 +803,8 @@
+         add(match.start(), opening + 1, closing, body, match.group(1) or '', declaration)
+ 
+     for match in re.finditer(r'=>', code):
++        if any(left <= match.start() < right for left, right in type_ranges):
++            continue
+         before = code[:match.start()].rstrip()
+         end = len(before)
+         if before.endswith(')') and end - 1 in pairs:
+@@ -762,6 +821,11 @@
+                     continue
+                 start = params_start = parameter.start()
+                 params_end = parameter.end()
++        # A generic arrow's type-parameter prefix belongs to the function
++        # value, not to its enclosing declaration or a comma-separated RHS.
++        generic = re.search(r'<[^;={}]*>\s*$', code[:start])
++        if generic:
++            start = generic.start()
+         body = match.end()
+         while body < len(code) and code[body].isspace():
+             body += 1
+@@ -777,10 +841,8 @@
+         closing = pairs.get(match.end() - 1)
+         if closing is None:
+             continue
+-        body = closing + 1
+-        while body < len(code) and code[body].isspace():
+-            body += 1
+-        if code[body:body + 1] == '{' and body not in body_starts:
++        body = _signature_body(code, pairs, closing)
++        if body is not None and body not in body_starts:
+             add(match.start(), match.end(), closing, body)
+ 
+     root = _Scope(0, len(text), 0, len(text), '<module>')
+@@ -930,6 +992,19 @@
+         return frozenset()
+ 
+     def callable(self, start, end, state):
++        # Parentheses around an arrow do not turn it into an unknown callee.
++        # Trim original whitespace: the scope mask also blanks real functions.
++        text = self.engine.text
++        while start < end and text[start].isspace():
++            start += 1
++        while end > start and text[end - 1].isspace():
++            end -= 1
++        while self.scope.code[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
++            start, end = start + 1, end - 1
++            while start < end and text[start].isspace():
++                start += 1
++            while end > start and text[end - 1].isspace():
++                end -= 1
+         for child in self.scope.children:
+             if start <= child.start and child.end <= end and self.scope.code[start:child.start].strip() in {'', 'async'}:
+                 return child
+--- a/test-suite/js/test_taint_scopes.py
++++ b/test-suite/js/test_taint_scopes.py
+@@ -239,6 +239,87 @@
+     def test_return_property_is_not_a_return_statement(self):
+         self.scan('function f() { iterator.return(req.query.html); }\nres.send(f());')
+ 
++    def test_function_type_annotation_is_not_an_executable_arrow(self):
++        self.scan('const read: () => string = () => req.query.html;\nres.send(read());', 'xss')
++        self.scan('const clean: (x: string) => string = x => "hello";\nres.send(clean(req.query.html));')
++
++    def test_callback_type_does_not_change_lexical_parent(self):
++        self.scan('const html = req.query.html;\nfunction outer(cb: () => string) {\n'
++                  'function inner() { res.send(html); } }', 'xss')
++
++    def test_generic_arrow_binding_has_return_summary(self):
++        self.scan('const read = <T,>(value: T) => req.query.html;\nres.send(read("hello"));', 'xss')
++
++    def test_parenthesized_arrow_binding_has_return_summary(self):
++        self.scan('const read = ((() => req.query.html));\nres.send(read());', 'xss')
++        self.scan('const clean = ((x => "hello"));\nres.send(clean(req.query.html));')
++
++    def test_object_return_type_is_not_a_function_body(self):
++        self.scan('function identity(x): {html: string} { return x; }\n'
++                  'res.send(identity(req.query));', 'xss')
++
++    def test_nested_generic_object_return_type(self):
++        self.scan('function identity(x): Promise<{html: string}> { return x; }\n'
++                  'res.send(identity(req.query));', 'xss')
++
++    def test_typed_parameter_does_not_gain_a_phantom_default(self):
++        text = 'callback: () => string'
++        params = taint_js._parameters(text, taint_js.lexical_views(text)[1], 0, len(text))
++        self.assertEqual(params, ((('callback',), False, None),))
++
++    def test_typed_parameter_preserves_its_real_default(self):
++        text = 'callback: () => string = fallback'
++        params = taint_js._parameters(text, taint_js.lexical_views(text)[1], 0, len(text))
++        names, rest, default = params[0]
++        self.assertEqual(names, ('callback',))
++        self.assertFalse(rest)
++        self.assertEqual(text[slice(*default)].strip(), 'fallback')
++
++    def test_typed_declaration_preserves_its_real_initializer(self):
++        text = 'const read: () => string = () => req.query.html'
++        entries = taint_js._declaration_entries(text, taint_js.lexical_views(text)[1], 0, len(text))
++        self.assertEqual(len(entries), 1)
++        _, names, begin, end = entries[0]
++        self.assertEqual(names, ['read'])
++        self.assertEqual(text[begin:end].strip(), '() => req.query.html')
++
++    def test_type_arrows_do_not_create_phantom_scopes(self):
++        text = 'const read: () => string = () => req.query.html;'
++        root, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
++        self.assertEqual(len(scopes), 1)
++        self.assertIs(scopes[0].parent, root)
++        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end], 'req.query.html')
++
++    def test_function_return_type_does_not_create_phantom_scopes(self):
++        text = 'function identity(x): () => string { return x; }'
++        _, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
++        self.assertEqual(len(scopes), 1)
++        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end].strip(), 'return x;')
++
++    def test_typed_tuple_and_union_return_bodies(self):
++        for annotation in ('[string, string]', '{html: string} | null',
++                           'Promise<{html: string} | null>', '{html: string} & {id: number}'):
++            with self.subTest(annotation=annotation):
++                self.scan(f'function identity(x): {annotation} {{ return x; }}\n'
++                          'res.send(identity(req.query));', 'xss')
++
++    def test_typed_constant_return_remains_clean(self):
++        self.scan('function clean(x): {html: string} { return {html: "hello"}; }\n'
++                  'res.send(clean(req.query).html);')
++
++    def test_typed_wrapper_keeps_sanitizer_domain(self):
++        self.scan('function escape(x: string): string { return DOMPurify.sanitize(x); }\n'
++                  'res.send(escape(req.query.html)); eval(escape(req.query.html));', 'eval')
++
++    def test_typed_method_has_the_real_body(self):
++        text = 'class Example { read(): {html: string} { return req.query; } }'
++        _, scopes = taint_js._function_scopes(text, taint_js.lexical_views(text)[1])
++        self.assertEqual(len(scopes), 1)
++        self.assertEqual(text[scopes[0].body_start:scopes[0].body_end].strip(), 'return req.query;')
++
++    def test_parenthesized_named_function_keeps_return_summary(self):
++        self.scan('const read = (function named() { return req.query.html; });\nres.send(read());', 'xss')
++
+ 
+ if __name__ == '__main__':
+     unittest.main(verbosity=2)

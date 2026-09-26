@@ -1,0 +1,134 @@
+name: TypeScript Taint Signatures
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/javascript-typescript-signatures.patch
+      - .github/workflows/javascript-typescript-signatures.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-signatures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Publish immutable validated content, never commits, branches or tags.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check exact current-engine inputs and reproduce missed flows
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = fd87359beccf83a6142adfa0cd64cb7ba4c06d94
+          test "$(git hash-object test-suite/js/test_taint_scopes.py)" = 96146c11d1a960a6980f2ec2a436f88dce5bd8c7
+          echo "TS_SIGNATURES_BASE $(git rev-parse HEAD)"
+          git apply --check test-suite/patches/javascript-typescript-signatures.patch
+          git apply --include=test-suite/js/test_taint_scopes.py test-suite/patches/javascript-typescript-signatures.patch
+          if python3 test-suite/js/test_taint_scopes.py \
+            JavaScriptScopeTests.test_function_type_annotation_is_not_an_executable_arrow \
+            JavaScriptScopeTests.test_object_return_type_is_not_a_function_body \
+            JavaScriptScopeTests.test_generic_arrow_binding_has_return_summary > "$RUNNER_TEMP/typescript-before.log" 2>&1; then
+            cat "$RUNNER_TEMP/typescript-before.log"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/typescript-before.log"
+          grep -q 'FAILED (failures=3)' "$RUNNER_TEMP/typescript-before.log"
+      - name: Apply the incremental fix without replacing the ordered engine
+        run: |
+          git apply --include=modules/helpers/ubs_core/analyzers/taint_js.py test-suite/patches/javascript-typescript-signatures.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 1e28e26d2f86e59177624958de21309d92ec44a1
+          test "$(git hash-object test-suite/js/test_taint_scopes.py)" = 85b79438bbc7b016a78ad4164d6e31faa2ab2e9b
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Validate source regressions and existing taint controls
+        run: |
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_domains.py
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Run existing JavaScript quality tests
+        run: python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+      - name: Validate the real scanner on typed helper sources and clean controls
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          cases = [
+              ('typed-arrow', 'const read: () => string = () => req.query.html; res.send(read());', True),
+              ('object-return', 'function id(x): {html: string} { return x; } res.send(id(req.query));', True),
+              ('generic-arrow', 'const read = <T,>(x: T) => req.query.html; res.send(read("hello"));', True),
+              ('wrapped-arrow', 'const read = ((() => req.query.html)); res.send(read());', True),
+              ('typed-clean', 'function clean(x): {html: string} { return {html: "hello"}; } res.send(clean(req.query).html);', False),
+              ('wrapped-clean', 'const clean = ((x => "hello")); res.send(clean(req.query.html));', False),
+          ]
+          for name, source, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-ts-signatures-') as tmp:
+                  target = Path(tmp) / 'app.ts'
+                  target.write_text(source + '\n', encoding='utf-8')
+                  result = subprocess.run([str(root / 'ubs'), str(target), '--only=js', '--format=json', '--ci'],
+                                          cwd=tmp, capture_output=True, text=True, timeout=120)
+                  print(name, 'exit', result.returncode, result.stderr, flush=True)
+                  assert result.returncode in (0, 1), result.stdout
+                  rules = set()
+                  def visit(value):
+                      if isinstance(value, dict):
+                          for key in ('rule', 'rule_id', 'ruleId'):
+                              if isinstance(value.get(key), str):
+                                  rules.add(value[key].replace('javascript.', 'js.'))
+                          for child in value.values():
+                              visit(child)
+                      elif isinstance(value, list):
+                          for child in value:
+                              visit(child)
+                  visit(json.loads(result.stdout))
+                  assert ('js.taint.xss' in rules) == expected, (name, rules, result.stdout)
+                  print('TS_SIGNATURES_E2E_PASS', name, flush=True)
+          PY
+      - name: Verify deterministic integrity regeneration and publish tested blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     'modules/helpers/ubs_core/analyzers/taint_js.py', 'test-suite/js/test_taint_scopes.py'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) <= allowed, changed
+          before = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert all(Path(name).read_bytes() == data for name, data in before.items())
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for name in changed:
+              data = Path(name).read_bytes()
+              response = subprocess.run([
+                  'gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-',
+              ], input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                 text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              print('TS_SIGNATURES_BLOB', name, sha, mode, flush=True)
+          PY

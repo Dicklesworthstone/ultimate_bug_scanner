@@ -11,8 +11,7 @@ on:
       - .github/workflows/python-taint-dataflow.yml
   workflow_dispatch:
 
-# The original preparation candidate was superseded by the implementation in
-# 266a647. Validate the checked-in source, never reinstall that older candidate.
+# Validate the checked-in source, never reinstall an older preparation candidate.
 permissions:
   contents: read
 
@@ -23,9 +22,14 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Record exact source for reproducing failures
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/taint-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/taint-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/taint-source-snapshot.tar.gz"
       - name: Check the actual committed analyzer
         run: |
           python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v
@@ -35,3 +39,10 @@ jobs:
               test()
               print('LEGACY_SELFTEST_PASS', name)
           PY
+      - name: Preserve exact reproduction source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-taint-source-${{ github.sha }}
+          path: ${{ runner.temp }}/taint-source-*
+          retention-days: 3

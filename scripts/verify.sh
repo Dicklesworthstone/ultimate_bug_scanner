@@ -1,202 +1,212 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ultimate Bug Scanner – verification helper
-# Fetches release checksums + signature, validates them with minisign (when
-# UBS_MINISIGN_PUBKEY is set) or with cosign keyless verification of the
-# Sigstore bundle the release pipeline attaches (SHA256SUMS.sigstore.json),
-# then verifies install.sh before executing it. Fails closed unless --insecure.
+# Authenticate one release manifest, then stage every executable the installer
+# consumes. The downloaded installer must not re-fetch an unsigned manifest or
+# install a different runner after its own signature has been checked.
 
-COLOR=1
-if [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-dumb}" = "dumb" ]; then COLOR=0; fi
-if [ "$COLOR" -eq 1 ]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; BOLD=''; RESET=''
-fi
-
-info() { printf "%b %s\n" "${BLUE}→${RESET}" "$*"; }
-ok()   { printf "%b %s\n" "${GREEN}✓${RESET}" "$*"; }
-warn() { printf "%b %s\n" "${YELLOW}⚠${RESET}" "$*"; }
-err()  { printf "%b %s\n" "${RED}✗${RESET}" "$*" >&2; }
-die()  { err "$*"; exit 1; }
-
-normalize_version() {
-  local raw="${1:-}"
-  raw="${raw#v}"
-  printf '%s' "$raw"
-}
-
-compute_sha256() {
-  local file="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$file" | awk '{print $1}'
-    return 0
-  fi
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$file" | awk '{print $1}'
-    return 0
-  fi
-  if command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$file" | awk '{print $NF}'
-    return 0
-  fi
-  return 1
-}
-
-VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/VERSION"
-VERSION_DEFAULT="5.0.7"
-VERSION="$(normalize_version "${UBS_VERSION:-$(cat "$VERSION_FILE" 2>/dev/null || echo "$VERSION_DEFAULT")}")" \
-  || VERSION="$VERSION_DEFAULT"
-
-ARTIFACT_BASE_DEFAULT="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
-ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-$ARTIFACT_BASE_DEFAULT}"
-MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"  # minisign path when set
-# cosign keyless path: the certificate must come from this repository's release
-# workflow on a v* tag, issued by GitHub's OIDC provider.
-COSIGN_IDENTITY_RE="${UBS_COSIGN_IDENTITY_RE:-^https://github.com/Dicklesworthstone/ultimate_bug_scanner/\.github/workflows/release\.yml@refs/tags/v}"
-COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com"
-VERIFY_WITH="${UBS_VERIFY_WITH:-}"          # minisign | cosign (default: minisign when a key is set, else cosign)
-INSECURE=0
+info() { printf '→ %s\n' "$*"; }
+ok() { printf '✓ %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+usage_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
 usage() {
-  printf "%bUsage%b: verify.sh [--version X.Y.Z|vX.Y.Z] [--insecure] [--install-args \"--easy-mode\"]\n" "$BOLD" "$RESET"
   cat <<'USAGE'
+Usage: verify.sh [--version X.Y.Z|vX.Y.Z] [--insecure] [-- INSTALLER_ARGS...]
 
-Actions:
-  - Downloads SHA256SUMS and its signature (SHA256SUMS.minisig or SHA256SUMS.sigstore.json) for the chosen version.
-  - Verifies the SHA256SUMS signature: with minisign when UBS_MINISIGN_PUBKEY is set,
-    otherwise with cosign keyless verification of SHA256SUMS.sigstore.json
-    (UBS_VERIFY_WITH=minisign|cosign forces one path).
-  - Verifies the checksum for install.sh.
-  - Executes install.sh locally with any extra args you pass via --install-args.
+Authenticate SHA256SUMS, verify install.sh, ubs and git_safety_guard.py against
+that same manifest, and install the verified local payload. The caller's
+working directory is preserved for project hook setup. Missing signatures,
+missing or ambiguous checksums, and different release versions fail closed.
+
+Options:
+  --version VERSION       Select an exact release, including prerelease tags.
+  --install-args "ARGS"   Legacy whitespace-separated arguments (no shell eval).
+  -- ARGS...              Pass installer arguments without splitting or eval.
+  --insecure              Explicitly skip ALL signature and checksum checks.
+  -h, --help              Show help without downloading or installing anything.
 
 Environment:
-  UBS_VERSION            Override version (defaults to ./VERSION or 5.0.7).
-  UBS_ARTIFACT_BASE      Override release base URL.
-  UBS_MINISIGN_PUBKEY    minisign public key (base64 line from `minisign -G`); optional when cosign is installed.
-  UBS_VERIFY_WITH        minisign | cosign — force the verification path.
+  UBS_VERSION             Version; otherwise use the checkout's VERSION file.
+                          A standalone verifier requires an explicit version.
+  UBS_ARTIFACT_BASE       HTTPS mirror containing the selected release assets.
+  UBS_MINISIGN_PUBKEY     Trusted minisign key; selects minisign when provided.
+  UBS_VERIFY_WITH         minisign | cosign; default is cosign without a key.
+
+Cosign requires this repository's release.yml certificate on the EXACT selected
+vVERSION tag, issued by GitHub Actions. Minisign additionally binds the requested
+version to the authenticated runner's literal UBS_VERSION declaration.
 USAGE
 }
 
+normalize_version() { printf '%s' "${1#v}"; }
+VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/VERSION"
+VERSION="${UBS_VERSION:-$(cat "$VERSION_FILE" 2>/dev/null || true)}"
+MINISIGN_PUBKEY="${UBS_MINISIGN_PUBKEY:-}"
+VERIFY_WITH="${UBS_VERIFY_WITH:-}"
+INSECURE=0
 INSTALL_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version)
-      VERSION="$(normalize_version "$2")"
-      ARTIFACT_BASE="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}"
-      shift 2
-      ;;
+      [[ $# -ge 2 && -n "$2" ]] || usage_error '--version requires a value'
+      VERSION="$2"; shift 2 ;;
+    --version=*) VERSION="${1#*=}"; shift ;;
     --install-args)
-      IFS=' ' read -r -a INSTALL_ARGS <<<"$2"; shift 2 ;;
-    --insecure)
-      INSECURE=1; shift ;;
-    -h|--help)
-      usage; exit 0 ;;
-    *)
-      err "Unknown flag: $1"; usage; exit 1 ;;
+      [[ $# -ge 2 ]] || usage_error '--install-args requires a value'
+      legacy_args=()
+      IFS=' ' read -r -a legacy_args <<<"$2" || true
+      INSTALL_ARGS+=("${legacy_args[@]}"); shift 2 ;;
+    --insecure) INSECURE=1; shift ;;
+    --) shift; INSTALL_ARGS+=("$@"); break ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage_error "Unknown flag: $1" ;;
   esac
 done
 
-if [ "$INSECURE" -eq 1 ]; then
-  info "Insecure mode requested: skipping signature and checksum verification."
-fi
+VERSION="$(normalize_version "$VERSION")"
+version_pattern='^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z][0-9A-Za-z.+-]*)?$'
+[[ "$VERSION" =~ $version_pattern ]] \
+  || usage_error 'Select a release with --version X.Y.Z (or set UBS_VERSION)'
+ARTIFACT_BASE="${UBS_ARTIFACT_BASE:-https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v${VERSION}}"
+ARTIFACT_BASE="${ARTIFACT_BASE%/}"
+[[ "$ARTIFACT_BASE" == https://* && "$ARTIFACT_BASE" != *$'\n'* && "$ARTIFACT_BASE" != *$'\r'* ]] \
+  || usage_error 'UBS_ARTIFACT_BASE must be an HTTPS release URL'
+COSIGN_IDENTITY="https://github.com/Dicklesworthstone/ultimate_bug_scanner/.github/workflows/release.yml@refs/tags/v${VERSION}"
+COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
-if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-  die "Need curl or wget to download release artifacts."
-fi
-
-if [ "$INSECURE" -eq 0 ]; then
-  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1 \
-    || die "No SHA256 tool found (need sha256sum, shasum, or openssl)."
-  if [ -z "$VERIFY_WITH" ]; then
-    if [ -n "$MINISIGN_PUBKEY" ]; then VERIFY_WITH="minisign"; else VERIFY_WITH="cosign"; fi
+if [[ "$INSECURE" -eq 0 ]]; then
+  [[ -z "${UBS_COSIGN_IDENTITY_RE:-}" ]] \
+    || usage_error 'UBS_COSIGN_IDENTITY_RE is not supported: verification requires the exact release identity'
+  for argument in "${INSTALL_ARGS[@]}"; do
+    case "$argument" in
+      --local|--insecure|--skip-verification)
+        usage_error "$argument would bypass the authenticated release; use the verifier's explicit --insecure opt-out instead" ;;
+    esac
+  done
+  if [[ -z "$VERIFY_WITH" ]]; then
+    if [[ -n "$MINISIGN_PUBKEY" ]]; then VERIFY_WITH=minisign; else VERIFY_WITH=cosign; fi
   fi
   case "$VERIFY_WITH" in
     minisign)
-      command -v minisign >/dev/null 2>&1 || die "minisign is required for UBS_VERIFY_WITH=minisign (install it, or install cosign for keyless verification)."
-      [ -n "$MINISIGN_PUBKEY" ] || die "UBS_MINISIGN_PUBKEY is not set. Export the minisign public key, install cosign for keyless verification, or rerun with --insecure."
-      ;;
+      command -v minisign >/dev/null 2>&1 || die 'minisign is required for this verification path'
+      [[ -n "$MINISIGN_PUBKEY" ]] || die 'UBS_MINISIGN_PUBKEY must contain a trusted minisign public key' ;;
     cosign)
-      command -v cosign >/dev/null 2>&1 || die "Neither UBS_MINISIGN_PUBKEY (minisign) nor cosign is available. Install cosign (https://docs.sigstore.dev/cosign/system_config/installation/), export the minisign key, or rerun with --insecure."
-      ;;
-    *) die "UBS_VERIFY_WITH must be minisign or cosign (got '$VERIFY_WITH')." ;;
+      command -v cosign >/dev/null 2>&1 || die 'Install cosign for keyless verification, or configure minisign and UBS_MINISIGN_PUBKEY' ;;
+    *) die "UBS_VERIFY_WITH must be minisign or cosign (got '$VERIFY_WITH')" ;;
   esac
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || command -v openssl >/dev/null 2>&1 \
+    || die 'Need sha256sum, shasum, or openssl to verify payload digests'
 fi
+# curl is already a UBS runtime dependency. Restrict both the initial URL and
+# redirects: a nominal HTTPS URL must not redirect an executable to HTTP/FTP.
+command -v curl >/dev/null 2>&1 || die 'curl is required to download release artifacts'
 
 mktemp_dir() {
   local base="${TMPDIR:-/tmp}"
-  mktemp -d 2>/dev/null \
-    || mktemp -d -t ubs-verify.XXXXXX 2>/dev/null \
-    || mktemp -d "${base%/}/ubs-verify.XXXXXX" 2>/dev/null
+  (umask 077; mktemp -d "${base%/}/ubs-verify.XXXXXXXX")
 }
-
-TMPDIR="$(mktemp_dir)" || die "Failed to create temporary directory (mktemp -d)"
+VERIFY_DIR="$(mktemp_dir)" || die 'Could not create private release staging directory'
 cleanup() {
-  local dir="${TMPDIR:-}"
-  [[ -n "$dir" && "$dir" != "/" ]] || return 0
-  rm -rf "$dir" 2>/dev/null || true
+  # Only this invocation's randomly created directory is ever removed.
+  [[ -n "${VERIFY_DIR:-}" && "$VERIFY_DIR" != / ]] || return 0
+  rm -rf -- "$VERIFY_DIR"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-download() {
-  local url="$1" out="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --retry-delay 1 --compressed -o "$out" "$url"
+fetch_asset() {
+  local name="$1"
+  curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 20 --max-time 180 --retry 3 --retry-delay 1 --compressed \
+    -o "$VERIFY_DIR/$name" "$ARTIFACT_BASE/$name" \
+    || die "Failed to download release asset: $name"
+}
+
+compute_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
   else
-    wget --https-only --secure-protocol=TLSv1_2 --tries=3 --waitretry=1 --timeout=20 -O "$out" "$url"
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
   fi
 }
 
-S_FILE="$TMPDIR/SHA256SUMS"
-SIG_FILE="$TMPDIR/SHA256SUMS.minisig"
-BUNDLE_FILE="$TMPDIR/SHA256SUMS.sigstore.json"
-COSIGN_ERR="$TMPDIR/cosign.err"
-INSTALL_FILE="$TMPDIR/install.sh"
+expected_digest() {
+  # Fixed, flat asset names only. Accept GNU text/binary markers and CRLF, but
+  # never pick the first of duplicate entries or tolerate a malformed digest.
+  LC_ALL=C awk -v name="$1" '
+    { sub(/\r$/, "") }
+    $2 == name || $2 == "*" name || $2 == "./" name || $2 == "*./" name {
+      count++
+      if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) bad = 1
+      digest = tolower($1)
+    }
+    END { if (count != 1 || bad) exit 1; print digest }
+  ' "$VERIFY_DIR/SHA256SUMS"
+}
+
+verify_asset() {
+  local expected actual
+  expected="$(expected_digest "$1")" || die "Missing, malformed or duplicate checksum entry: $1"
+  actual="$(compute_sha256 "$VERIFY_DIR/$1")" || die "Could not hash release asset: $1"
+  [[ "$expected" == "$actual" ]] || die "Checksum verification failed for $1"
+  ok "Checksum verified: $1"
+}
 
 info "Version: $VERSION"
 info "Release base: $ARTIFACT_BASE"
-
-download "$ARTIFACT_BASE/SHA256SUMS" "$S_FILE"
-download "$ARTIFACT_BASE/install.sh" "$INSTALL_FILE"
-
-if [ "$INSECURE" -eq 0 ]; then
+if [[ "$INSECURE" -eq 0 ]]; then
+  fetch_asset SHA256SUMS
   case "$VERIFY_WITH" in
     minisign)
-      download "$ARTIFACT_BASE/SHA256SUMS.minisig" "$SIG_FILE"
-      minisign -Vm "$S_FILE" -P "$MINISIGN_PUBKEY" -x "$SIG_FILE" >/dev/null \
-        || die "Signature verification failed for SHA256SUMS (minisign)"
-      info "SHA256SUMS signature verified with minisign"
-      ;;
+      fetch_asset SHA256SUMS.minisig
+      minisign -Vm "$VERIFY_DIR/SHA256SUMS" -P "$MINISIGN_PUBKEY" \
+        -x "$VERIFY_DIR/SHA256SUMS.minisig" >/dev/null \
+        || die 'Signature verification failed for SHA256SUMS (minisign)' ;;
     cosign)
-      download "$ARTIFACT_BASE/SHA256SUMS.sigstore.json" "$BUNDLE_FILE" \
-        || die "SHA256SUMS.sigstore.json is not published for $VERSION (releases before the cosign bundles); set UBS_MINISIGN_PUBKEY to verify with minisign"
-      if ! cosign verify-blob --bundle "$BUNDLE_FILE" \
-          --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
-          --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
-          "$S_FILE" >/dev/null 2>"$COSIGN_ERR"; then
-        cat "$COSIGN_ERR" >&2
-        die "Signature verification failed for SHA256SUMS (cosign keyless bundle)"
-      fi
-      info "SHA256SUMS signature verified with cosign (keyless: ${COSIGN_IDENTITY_RE})"
-      ;;
+      fetch_asset SHA256SUMS.sigstore.json
+      cosign verify-blob --bundle "$VERIFY_DIR/SHA256SUMS.sigstore.json" \
+        --certificate-identity "$COSIGN_IDENTITY" \
+        --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+        "$VERIFY_DIR/SHA256SUMS" >/dev/null \
+        || die 'Signature verification failed for SHA256SUMS (cosign)' ;;
   esac
-  expected_sum="$(awk '$2=="install.sh"{print $1}' "$S_FILE" | head -n 1)"
-  [ -n "${expected_sum:-}" ] || die "install.sh entry missing in checksum file"
-  actual_sum="$(compute_sha256 "$INSTALL_FILE")" || die "No SHA256 tool found (need sha256sum, shasum, or openssl)."
-  if [[ "$expected_sum" != "$actual_sum" ]]; then
-    err "Checksum verification failed for install.sh"
-    err "Expected: ${expected_sum}"
-    err "Got:      ${actual_sum}"
-    exit 1
-  fi
-  ok "Signature + checksum verified"
+  ok "Release manifest authenticated with $VERIFY_WITH"
+  # Validate all required entries before fetching any executable payload.
+  for asset in install.sh ubs git_safety_guard.py; do
+    expected_digest "$asset" >/dev/null || die "Missing, malformed or duplicate checksum entry: $asset"
+  done
+  for asset in install.sh ubs git_safety_guard.py; do
+    fetch_asset "$asset"
+    verify_asset "$asset"
+  done
+  runner_version="$(awk '/^UBS_VERSION=/ { sub(/\r$/, ""); count++; value=$0 }
+    END { if (count != 1) exit 1; print value }' "$VERIFY_DIR/ubs")" \
+    || die 'Authenticated runner has no unique literal UBS_VERSION declaration'
+  case "$runner_version" in
+    "UBS_VERSION=\"${VERSION}\""|"UBS_VERSION='${VERSION}'"|"UBS_VERSION=${VERSION}") ;;
+    *) die "Authenticated runner does not match requested version $VERSION" ;;
+  esac
+  # The installer recognizes ubs + VERSION next to itself as an explicit local
+  # release source. The hook is likewise taken from the authenticated copy.
+  # Keep the caller's cwd so project hooks are not installed into this staging
+  # directory, and never pass --local (which would prefer a planted cwd/ubs).
+  printf '%s\n' "$VERSION" > "$VERIFY_DIR/VERSION"
+  mkdir -p "$VERIFY_DIR/.claude/hooks"
+  cp "$VERIFY_DIR/git_safety_guard.py" "$VERIFY_DIR/.claude/hooks/git_safety_guard.py"
 else
-  warn "Skipping signature and checksum verification (insecure mode)."
+  warn 'Explicit insecure mode: signature and checksum verification are disabled'
+  fetch_asset install.sh
 fi
 
-ok "Executing installer"
-# The downloaded installer has no VERSION file beside it; retain this release.
-export UBS_ARTIFACT_BASE="$ARTIFACT_BASE"
-exec bash "$INSTALL_FILE" "${INSTALL_ARGS[@]}"
+ok 'Executing installer'
+status=0
+UBS_ARTIFACT_BASE="$ARTIFACT_BASE" UBS_NO_AUTO_UPDATE=1 \
+  bash "$VERIFY_DIR/install.sh" "${INSTALL_ARGS[@]}" || status=$?
+# Do not exec: the parent owns staging cleanup on both success and failure.
+exit "$status"

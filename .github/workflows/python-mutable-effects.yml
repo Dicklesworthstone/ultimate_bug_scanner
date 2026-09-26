@@ -7,6 +7,7 @@ on:
       - test-suite/patches/python-mutable-effects.patch
       - test-suite/patches/python-callable-effects.patch
       - test-suite/patches/python-interpreter-processes.patch
+      - test-suite/patches/python-process-vectors-stdin.patch
       - .github/workflows/python-mutable-effects.yml
   workflow_dispatch:
 
@@ -36,17 +37,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
           npm install --global @ast-grep/cli
-      - name: Apply reviewed mutation, callable, and process implementations
+      - name: Apply reviewed mutation, callable, process, and argv/stdin implementations
         run: |
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = bd8aa2c2b515df2da74a1e665e63d9a9802dad00
           test "$(git hash-object test-suite/patches/python-mutable-effects.patch)" = cea449f50962c96301557faeb825660ecc164078
           test "$(git hash-object test-suite/patches/python-callable-effects.patch)" = 8019041f1f888b00df60ca42aa92b31ac2ad44f2
           test "$(git hash-object test-suite/patches/python-interpreter-processes.patch)" = 1ff2642a881314b32f67203d8706bed00e66c879
-          for patch in python-mutable-effects python-callable-effects python-interpreter-processes; do
+          test "$(git hash-object test-suite/patches/python-process-vectors-stdin.patch)" = 062e8b0e8ed50194847278e281e2f33a8c12e171
+          for patch in python-mutable-effects python-callable-effects python-interpreter-processes python-process-vectors-stdin; do
             git apply --check "test-suite/patches/$patch.patch"
             git apply "test-suite/patches/$patch.patch"
           done
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = 7d03b852894a605a7b073c7400f3a89ef7da1d7c
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ea327a121f4a00ff07d29f68f4d6163689b9b66d
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
           ./scripts/verify_checksums.sh
@@ -118,7 +120,7 @@ jobs:
           base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
           tree = store('trees', {'base_tree': base_tree,
                                 'tree': [{key: value for key, value in record.items() if key != 'before'} for record in records]})
-          manifest = {'base': base, 'tree': tree, 'source': '7d03b852894a605a7b073c7400f3a89ef7da1d7c', 'files': records}
+          manifest = {'base': base, 'tree': tree, 'source': 'ea327a121f4a00ff07d29f68f4d6163689b9b66d', 'files': records}
           (scratch / 'mutable-publication.json').write_text(json.dumps(manifest, indent=2) + '\n')
           print('MUTABLE_TESTED_TREE', json.dumps(manifest), flush=True)
           PY

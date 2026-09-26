@@ -1,0 +1,765 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index 7d03b852894a605a7b073c7400f3a89ef7da1d7c..ea327a121f4a00ff07d29f68f4d6163689b9b66d 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -188,6 +188,23 @@
+     """A value is not an import/callable identity just because it is text."""
+     value: str
+ 
++
++@dataclass(frozen=True)
++class _SymbolicValue:
++    parameter: str
++
++
++@dataclass(frozen=True)
++class _ArgumentVector:
++    # Only fixed syntactic constructions have a shape. Unknown writes/escapes
++    # invalidate it instead of guessing which position a heap fact describes.
++    operands: tuple
++
++
++@dataclass(frozen=True)
++class _ProcessInput:
++    kind: str
++
+ # Preserve the existing conventional unimported names, but never restore one
+ # after a local assignment/parameter has explicitly shadowed it.
+ _IMPLICIT_IDENTITIES = frozenset({
+@@ -211,6 +228,11 @@
+     if len(choices) == 1:
+         return next(iter(choices))
+     return choices  # Empty means no known return yet; None means unknown.
++
++
++def _without_object_contract(binding):
++    return _join_bindings(*(None if isinstance(value, (_ArgumentVector, _ProcessInput)) else value
++                            for value in _binding_choices(binding)))
+ 
+ 
+ def _extend_qualifier(base: str, attribute: str) -> str:
+@@ -333,6 +355,42 @@
+     return CLEAN, CLEAN
+ 
+ 
++def _interpreter_reads_stdin(kind, arguments):
++    """Whether stdin may be executable source, rather than application data."""
++    index = 0
++    shell_stdin = False
++    while index < len(arguments):
++        option = _literal_text(arguments[index][0])
++        if option is None:
++            return True
++        if option == '--':
++            return shell_stdin or index + 1 == len(arguments) or _literal_text(arguments[index + 1][0]) == '-'
++        if option == '-':
++            return True
++        if not option.startswith(('-', '+')):
++            return shell_stdin
++        consumes = ({'-o', '+o', '-O', '+O', '--rcfile', '--init-file'} if kind == 'shell'
++                    else {'-W', '-X', '--check-hash-based-pycs'})
++        if option in consumes:
++            index += 2
++            continue
++        if option.startswith('-') and not option.startswith('--'):
++            if kind == 'shell':
++                if 'c' in option[1:]:
++                    return False
++                shell_stdin = shell_stdin or 's' in option[1:]
++            else:
++                for position, flag in enumerate(option[1:], 2):
++                    if flag in {'c', 'm'}:
++                        return False
++                    if flag in {'W', 'X'}:
++                        if not option[position:]:
++                            index += 1
++                        break
++        index += 1
++    return True
++
++
+ class _State(dict):
+     """Value facts, callable identities, and a field-insensitive object heap.
+ 
+@@ -345,6 +403,7 @@
+         self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
+         self.references = dict(getattr(values, 'references', {}))
+         self.heap = dict(getattr(values, 'heap', {}))
++        self.mutated = set(getattr(values, 'mutated', ()))
+ 
+     def value(self, name):
+         return join_facts(self.get(name, CLEAN), *(self.heap.get(ref, CLEAN)
+@@ -359,11 +418,12 @@
+         self.bindings = dict(other.bindings)
+         self.references = dict(other.references)
+         self.heap = dict(other.heap)
++        self.mutated = set(other.mutated)
+ 
+     def __eq__(self, other):
+         return (isinstance(other, _State) and dict.__eq__(self, other)
+                 and self.bindings == other.bindings and self.references == other.references
+-                and self.heap == other.heap)
++                and self.heap == other.heap and self.mutated == other.mutated)
+ 
+ 
+ def _join_states(*states):
+@@ -379,6 +439,7 @@
+         joined.references[name] = frozenset().union(*(state.references.get(name, NO_REFERENCES) for state in reachable))
+     for ref in set().union(*(state.heap for state in reachable)):
+         joined.heap[ref] = join_facts(*(state.heap.get(ref, CLEAN) for state in reachable))
++    joined.mutated = set().union(*(state.mutated for state in reachable))
+     return joined
+ 
+ 
+@@ -480,10 +541,10 @@
+     def mutate(self, references, fact, state):
+         # Weak updates preserve other fields and possible aliases. A write of
+         # clean data to one field is not proof that the whole object is safe.
+-        if not fact:
+-            return
++        state.mutated.update(references)
+         for ref in references:
+-            state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
++            if fact:
++                state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
+             self.mutations[ref] = join_facts(self.mutations.get(ref, CLEAN), fact)
+ 
+     def effect(self, kind, node, label, fact):
+@@ -626,6 +687,27 @@
+                 bound[f'@global:{name}'] = state.references.get(name, NO_REFERENCES)
+         return bound
+ 
++    def bind_values(self, function, node, keyword_nodes, state):
++        positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
++        bound = {name: self.expression_bindings.get(arg) for name, arg in zip(positional, node.args)}
++        if any(isinstance(arg, ast.Starred) for arg in node.args):
++            # Unknown expansion must not certify a particular program/option.
++            bound.update((name, None) for name in positional)
++        bound.update((name, self.expression_bindings.get(value)) for name, value in keyword_nodes.items()
++                     if name is not None)
++        for name, value in self.engine.default_bindings.get(function, {}).items():
++            bound.setdefault(name, value)
++        for name in self.engine.closures.get(function, ()):
++            bound[f'@free:{name}'] = state.bindings.get(name)
++        for name in self.engine.global_names:
++            if (not isinstance(self.scope, ast.Module)
++                    and (name in self.engine.locals.get(self.scope, set())
++                         or name in self.engine.closures.get(self.scope, set()))):
++                bound[f'@global:{name}'] = _SymbolicValue(f'@global:{name}')
++            else:
++                bound[f'@global:{name}'] = state.bindings.get(name)
++        return bound
++
+     @staticmethod
+     def substitute(fact, bound, call_name):
+         result = CLEAN
+@@ -641,10 +723,21 @@
+             result = join_facts(result, incoming)
+         return result
+ 
+-    def substitute_binding(self, binding, bound, references, node, call_name):
++    def substitute_binding(self, binding, bound, references, node, call_name, values):
+         choices = []
+         for target in _binding_choices(binding):
+-            if isinstance(target, _BoundCallable):
++            if isinstance(target, _SymbolicValue):
++                choices.append(values.get(target.parameter))
++            elif isinstance(target, _ArgumentVector):
++                operands = []
++                for operand, fact in target.operands:
++                    if isinstance(operand, _SymbolicValue):
++                        replacement = values.get(operand.parameter)
++                        if isinstance(replacement, (_LiteralString, _SymbolicValue)):
++                            operand = replacement
++                    operands.append((operand, self.substitute(fact, bound, call_name)))
++                choices.append(_ArgumentVector(tuple(operands)))
++            elif isinstance(target, _BoundCallable):
+                 actual = frozenset().union(*(references.get(ref, NO_REFERENCES) if isinstance(ref, str)
+                                              else frozenset({node}) for ref in target.references))
+                 choices.append(_BoundCallable(target.name, actual, self.substitute(target.receiver, bound, call_name)))
+@@ -654,10 +747,15 @@
+ 
+     def command_operand(self, node, fact):
+         literal = self.expression_bindings.get(node)
+-        return (literal if isinstance(literal, _LiteralString) else node), fact
++        if literal == 'sys.executable':
++            literal = _LiteralString('python')
++        return (literal if isinstance(literal, (_LiteralString, _SymbolicValue)) else node), fact
+ 
+     def command_operands(self, node):
+         """Expand literal argv without evaluating any argument a second time."""
++        binding = self.expression_bindings.get(node)
++        if isinstance(binding, _ArgumentVector):
++            return list(binding.operands)
+         if not isinstance(node, (ast.List, ast.Tuple)):
+             return None
+         result = []
+@@ -669,13 +767,46 @@
+                 result.append(self.command_operand(item, self.expression_facts.get(item, CLEAN)))
+         return result
+ 
+-    def interpreter_effects(self, program_node, operands):
+-        program = _literal_text(self.expression_bindings.get(program_node)) or _literal_text(program_node)
+-        # sys.executable denotes this Python interpreter, not a script path.
+-        if self.expression_bindings.get(program_node) == 'sys.executable':
+-            program = 'python'
++    def command_vectors(self, node):
++        binding = self.expression_bindings.get(node)
++        if isinstance(binding, (frozenset, _ArgumentVector)):
++            return [list(value.operands) if isinstance(value, _ArgumentVector) else None
++                    for value in _binding_choices(binding)]
++        return [self.command_operands(node)]
++
++    def interpreter_name(self, node):
++        binding = self.expression_bindings.get(node)
++        if binding == 'sys.executable':
++            return 'python'
++        return _literal_text(binding) or _literal_text(node)
++
++    def process_input(self, node, program, operands, keyword_nodes, *, shell=False):
++        """Remember only processes whose explicit stdin pipe accepts source.
++
++        A communicate() spelling alone is not a process sink. The identity
++        follows the process or its bound method, including local returns.
++        """
++        kind = _interpreter_kind(self.interpreter_name(program))
++        pipe = keyword_nodes.get('stdin')
++        piped = self.expression_bindings.get(pipe) == 'subprocess.PIPE' or (
++            isinstance(pipe, ast.UnaryOp) and isinstance(pipe.op, ast.USub)
++            and isinstance(pipe.operand, ast.Constant) and pipe.operand.value == 1)
++        if not shell and piped and kind is not None and _interpreter_reads_stdin(kind, operands):
++            return _ProcessInput(kind)
++        return None
++
++    def interpreter_effects(self, program_node, operands, stdin=CLEAN):
++        program = self.interpreter_name(program_node)
+         kind = _interpreter_kind(program)
+-        return _interpreter_inputs(kind, operands) if kind is not None else (CLEAN, CLEAN)
++        if kind is None:
++            return CLEAN, CLEAN
++        shell, raw = _interpreter_inputs(kind, operands)
++        if stdin and _interpreter_reads_stdin(kind, operands):
++            if kind == 'shell':
++                shell = join_facts(shell, stdin)
++            else:
++                raw = join_facts(raw, stdin)
++        return shell, raw
+ 
+     def command_effect(self, node, executable, shell_code=CLEAN, interpreter_code=CLEAN):
+         # One diagnostic at a process call even when more than one operand is
+@@ -718,6 +849,10 @@
+                               for ref in self.expression_references.get(expression, NO_REFERENCES)))
+         arguments = [live_argument(expression, fact) for expression, fact in zip(node.args, arguments)]
+         keywords = {key: live_argument(keyword_nodes.get(key), fact) for key, fact in keywords.items()}
++        for expression in (*node.args, *keyword_nodes.values()):
++            if self.expression_references.get(expression, NO_REFERENCES) & state.mutated:
++                value = self.expression_bindings.get(expression)
++                self.expression_bindings[expression] = _without_object_contract(value)
+         branches, results, references, bindings = [], [], [], []
+         # A join must retain possible dangerous callees. Each target sees the
+         # same pre-call state; evaluating another target cannot sanitize it.
+@@ -750,6 +885,7 @@
+             call_name = _call_name(function)
+             bound = self.bind(function, node, arguments, keywords, state)
+             references = self.bind_references(function, node, keyword_nodes, state)
++            values = self.bind_values(function, node, keyword_nodes, state)
+             summary = self.engine.summaries.get(function, FunctionSummary())
+             for kind, line, column, label, fact in summary.effects:
+                 propagated = self.substitute(fact, bound, call_name)
+@@ -764,14 +900,14 @@
+                                                for parameter in summary.returned_references))
+             self.expression_references[node] = returned_refs or frozenset({node})
+             self.expression_bindings[node] = self.substitute_binding(
+-                summary.returned_binding, bound, references, node, call_name)
++                summary.returned_binding, bound, references, node, call_name, values)
+             returned = self.substitute(summary.returned, bound, call_name)
+             if function in self.engine.generators:
+                 self.generator_returns[node] = returned
+                 self.generator_return_references[node] = returned_refs
+                 self.generator_return_bindings[node] = self.expression_bindings[node]
+                 self.expression_bindings[node] = self.substitute_binding(
+-                    summary.yielded_binding, bound, references, node, call_name)
++                    summary.yielded_binding, bound, references, node, call_name, values)
+                 self.expression_references[node] = frozenset().union(*(
+                     references.get(parameter, NO_REFERENCES) for parameter in summary.yielded_references))
+                 return self.substitute(summary.yielded, bound, call_name)
+@@ -785,14 +921,18 @@
+             return join_facts(keywords.get(None, CLEAN), *(keywords.get(key, CLEAN) for key in names))
+ 
+         leaf = name.rsplit('.', 1)[-1]
+-        if receiver_refs:
++        mutators = {'append', 'add', 'insert', 'extend', 'update', 'setdefault', 'clear', 'pop',
++                    'popitem', 'remove', 'reverse', 'sort', '__setitem__', '__delitem__', '__iadd__', '__imul__'}
++        if receiver_refs and leaf in mutators:
+             written = CLEAN
+             if leaf in {'append', 'add'}:
+                 written = first
+             elif leaf == 'insert':
+                 written = arguments[1] if len(arguments) > 1 else CLEAN
+-            elif leaf in {'extend', 'update', 'setdefault'}:
++            elif leaf in {'extend', 'update', 'setdefault', '__iadd__'}:
+                 written = join_facts(*arguments, *keywords.values())
++            elif leaf == '__setitem__':
++                written = arguments[1] if len(arguments) > 1 else CLEAN
+             self.mutate(receiver_refs, written, state)
+         if leaf in {'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
+             label = 'render_template' if leaf.startswith('render_template') else ('Flask Response' if leaf == 'Response' else leaf)
+@@ -803,36 +943,47 @@
+             query = source_argument('sql', 'query', 'statement', 'operation')
+             self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
+         elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
+-            command = source_argument('args')
++            command_fact = source_argument('args')
+             command_node = node.args[0] if node.args else keyword_nodes.get('args')
+             shell = keyword_nodes.get('shell')
+             shell_true = isinstance(shell, ast.Constant) and bool(shell.value)
+             shell_unknown = (shell is not None and not isinstance(shell, ast.Constant)) or None in keywords
+-            operands = self.command_operands(command_node)
+-            if operands is not None:
+-                # A list's first item selects the program or shell command;
+-                # later argument side effects must not re-evaluate that item.
+-                command = operands[0][1] if operands else CLEAN
+-            executable = join_facts(keywords.get('executable', CLEAN), keywords.get(None, CLEAN))
++            explicit_executable = join_facts(keywords.get('executable', CLEAN), keywords.get(None, CLEAN))
+             executable_node = keyword_nodes.get('executable')
+             executable_literal = self.expression_bindings.get(executable_node)
+             fixed_executable = (isinstance(executable_literal, _LiteralString)
+                                 or isinstance(executable_node, ast.Constant) and executable_node.value is not None)
+             has_override = executable_node is not None and not (
+                 isinstance(executable_node, ast.Constant) and executable_node.value is None)
+-            if (not shell_true or shell_unknown) and not fixed_executable:
+-                executable = join_facts(executable, command)
+-            shell_code = command if shell_true or shell_unknown else CLEAN
+-            interpreter_code = CLEAN
+-            if operands and (not shell_true or shell_unknown):
+-                program_node = executable_node if fixed_executable else operands[0][0]
+-                nested_shell, interpreter_code = self.interpreter_effects(program_node, operands[1:])
+-                shell_code = join_facts(shell_code, nested_shell)
+-            if (shell_true or shell_unknown) and has_override:
+-                # shell=True still passes -c to an explicitly selected shell;
+-                # selecting Python does not make shell quoting Python-safe.
+-                if _interpreter_kind(_literal_text(executable_literal) or _literal_text(executable_node)) != 'shell':
+-                    interpreter_code = join_facts(interpreter_code, command)
++            executable, shell_code, interpreter_code = explicit_executable, CLEAN, CLEAN
++            process_inputs = []
++            stdin = keywords.get('input', CLEAN) if leaf in {'run', 'check_output'} else CLEAN
++            # Keep each program/argv alternative paired. Combining the first
++            # item of one branch with tainted data from another invents flows.
++            for operands in self.command_vectors(command_node):
++                command = (operands[0][1] if operands else CLEAN) if operands is not None else command_fact
++                if (not shell_true or shell_unknown) and not fixed_executable:
++                    executable = join_facts(executable, command)
++                if shell_true or shell_unknown:
++                    shell_code = join_facts(shell_code, command)
++                    if has_override and _interpreter_kind(self.interpreter_name(executable_node)) != 'shell':
++                        interpreter_code = join_facts(interpreter_code, command)
++                process = None
++                if not shell_true or shell_unknown:
++                    program_node = executable_node if fixed_executable else operands[0][0] if operands else command_node
++                    if operands is not None or self.interpreter_name(command_node) is not None:
++                        tail = operands[1:] if operands else []
++                        nested_shell, nested_raw = self.interpreter_effects(program_node, tail, stdin)
++                        shell_code = join_facts(shell_code, nested_shell)
++                        interpreter_code = join_facts(interpreter_code, nested_raw)
++                        process = self.process_input(node, program_node, tail, keyword_nodes)
++                    elif _interpreter_kind(self.interpreter_name(program_node)) is not None:
++                        # A mutated/escaped vector no longer proves positional
++                        # safety, even when executable= fixes argv[0].
++                        interpreter_code = join_facts(interpreter_code, command_fact, stdin)
++                process_inputs.append(process)
++            if leaf == 'Popen':
++                self.expression_bindings[node] = _join_bindings(*process_inputs)
+             self.command_effect(node, executable, shell_code, interpreter_code)
+         elif name == 'asyncio.create_subprocess_exec':
+             executable = source_argument('program')
+@@ -844,6 +995,7 @@
+                 program_node = override
+             operands = [self.command_operand(argument, value) for argument, value in zip(node.args[1:], arguments[1:])]
+             shell_code, interpreter_code = self.interpreter_effects(program_node, operands)
++            self.expression_bindings[node] = self.process_input(node, program_node, operands, keyword_nodes)
+             self.command_effect(node, executable, shell_code, interpreter_code)
+         elif name in {'os.execv', 'os.execve', 'os.execvp', 'os.execvpe', 'os.execl', 'os.execle',
+                       'os.execlp', 'os.execlpe', 'os.posix_spawn', 'os.posix_spawnp'}:
+@@ -852,11 +1004,17 @@
+             if leaf.startswith('execl'):
+                 tail = -1 if leaf.endswith('e') else len(node.args)
+                 operands = [self.command_operand(argument, value) for argument, value in zip(node.args[2:tail], arguments[2:tail])]
++                shell_code, interpreter_code = self.interpreter_effects(program_node, operands)
+             else:
+                 argv = node.args[1] if len(node.args) > 1 else keyword_nodes.get('argv', keyword_nodes.get('args'))
+-                vector = self.command_operands(argv)
+-                operands = vector[1:] if vector else []
+-            shell_code, interpreter_code = self.interpreter_effects(program_node, operands)
++                shell_code, interpreter_code = CLEAN, CLEAN
++                for vector in self.command_vectors(argv):
++                    if vector is None and _interpreter_kind(self.interpreter_name(program_node)) is not None:
++                        interpreter_code = join_facts(interpreter_code, self.expression_facts.get(argv, CLEAN))
++                    else:
++                        nested_shell, nested_raw = self.interpreter_effects(program_node, vector[1:] if vector else [])
++                        shell_code = join_facts(shell_code, nested_shell)
++                        interpreter_code = join_facts(interpreter_code, nested_raw)
+             self.command_effect(node, executable, shell_code, interpreter_code)
+         elif name in {'os.system', 'os.popen', 'subprocess.getoutput', 'subprocess.getstatusoutput',
+                       'asyncio.create_subprocess_shell'}:
+@@ -868,6 +1026,21 @@
+             self.command_effect(node, keywords.get('executable', CLEAN), command, raw)
+         elif name in {'eval', 'exec', 'builtins.eval', 'builtins.exec'}:
+             self.effect('eval', node, leaf, source_argument('source', 'object'))
++        elif name in {'@stdin.shell', '@stdin.python'}:
++            code = source_argument('input')
++            self.command_effect(node, CLEAN, code if name == '@stdin.shell' else CLEAN,
++                                code if name == '@stdin.python' else CLEAN)
++        else:
++            # Passing a known vector to an unmodeled routine may mutate it.
++            # Retain aggregate provenance but stop certifying its old shape.
++            # This effect is summarized even for a symbolic helper parameter.
++            for expression in (*node.args, *keyword_nodes.values()):
++                value = self.expression_bindings.get(expression)
++                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue))
++                       for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
++                           'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
++                           'builtins.print', 'builtins.str', 'builtins.len', 'builtins.repr'}:
++                    self.mutate(self.expression_references.get(expression, NO_REFERENCES), CLEAN, state)
+         configurable_html = name == 'bleach.clean' and (
+             len(node.args) > 1 or any(keyword.arg not in {'text', 'strip', 'strip_comments'} for keyword in node.keywords)
+         )
+@@ -894,6 +1067,9 @@
+                 receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
+                 receiver_fact = self.expression_facts.get(node.value, CLEAN)
+                 for base in _binding_choices(self.expression_bindings.get(node.value)):
++                    if isinstance(base, _ProcessInput) and node.attr == 'communicate':
++                        candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact))
++                        continue
+                     name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
+                             else _extend_qualifier(base.name, node.attr) if isinstance(base, _BoundCallable)
+                             else _qualified(node, state.bindings))
+@@ -910,7 +1086,7 @@
+                         fact = join_facts(fact, self.source(node, state, name))
+             elif isinstance(node, ast.Lambda):
+                 binding = node
+-            elif isinstance(node, ast.NamedExpr):
++            elif isinstance(node, (ast.NamedExpr, ast.Await)):
+                 binding = self.expression_bindings.get(node.value)
+             elif isinstance(node, ast.IfExp):
+                 binding = _join_bindings(self.expression_bindings.get(node.body), self.expression_bindings.get(node.orelse))
+@@ -934,6 +1110,8 @@
+                 markers = tuple(self.expression_bindings.get(item) for item in node.elts)
+                 if any(isinstance(marker, _FrameworkInput) for marker in markers):
+                     binding = markers
++                else:
++                    binding = _ArgumentVector(tuple(self.command_operands(node)))
+             self.expression_bindings[node] = binding
+             if isinstance(node, ast.Name):
+                 self.expression_references[node] = state.references.get(node.id, NO_REFERENCES)
+@@ -943,6 +1121,8 @@
+                 self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
+             elif isinstance(node, (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Call)):
+                 self.expression_references.setdefault(node, frozenset({node}))
++            if self.expression_references.get(node, NO_REFERENCES) & state.mutated:
++                self.expression_bindings[node] = _without_object_contract(binding)
+             self.expression_facts[node] = fact
+         return fact
+ 
+@@ -969,6 +1149,11 @@
+             self.engine.defaults[node] = defaults
+             self.engine.default_references[node] = {
+                 arg.arg: self.expression_references.get(value, NO_REFERENCES)
++                for arg, value in (*zip(positional[len(positional) - len(signature.defaults):], signature.defaults),
++                                   *zip(signature.kwonlyargs, signature.kw_defaults)) if value is not None
++            }
++            self.engine.default_bindings[node] = {
++                arg.arg: self.expression_bindings.get(value)
+                 for arg, value in (*zip(positional[len(positional) - len(signature.defaults):], signature.defaults),
+                                    *zip(signature.kwonlyargs, signature.kw_defaults)) if value is not None
+             }
+@@ -1070,6 +1255,7 @@
+             self.engine.defaults[node] = default_facts
+             self.engine.default_references[node] = {name: self.expression_references.get(default, NO_REFERENCES)
+                                                     for name, default in defaults.items()}
++            self.engine.default_bindings[node] = {name: self.expression_bindings.get(default) for name, default in defaults.items()}
+             self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
+             state[node.name] = CLEAN
+             state.bindings[node.name] = node
+@@ -1102,6 +1288,11 @@
+             references = self.expression_references.get(node.target, NO_REFERENCES)
+             fact = join_facts(previous, self.expr(node.value, state))
+             self.assign(node.target, fact, state, target_references=references)
++            # A known list += mutates the object observed by earlier aliases;
++            # tuple/string += instead rebinds. Do not conflate these cases.
++            if isinstance(node.target, ast.Name) and references and all(isinstance(ref, ast.List) for ref in references):
++                self.mutate(references, fact, state)
++                state.references[node.target.id] = references
+         elif isinstance(node, ast.Assert):
+             self.expr(node.test, state)
+             # The message runs only on a raising path. Its sinks matter, but
+@@ -1165,6 +1356,8 @@
+                     state[target.id] = CLEAN
+                     state.bindings[target.id] = None
+                     state.references[target.id] = NO_REFERENCES
++                elif isinstance(target, (ast.Subscript, ast.Attribute)):
++                    self.assign(target, CLEAN, state)
+         elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
+             subject = self.expr(node.subject, state)
+             branches = []
+@@ -1220,13 +1413,22 @@
+         returned = join_facts(self.returned, *(self.mutations.get(ref, CLEAN) for ref in self.returned_references))
+         yielded = join_facts(self.yielded, *(self.mutations.get(ref, CLEAN) for ref in self.yielded_references))
+         mutations = tuple(sorted((ref, fact) for ref, fact in self.mutations.items() if isinstance(ref, str)))
++        returned_binding = _join_bindings(*self.returned_bindings)
++        yielded_binding = _join_bindings(*self.yielded_bindings)
++        # finally may change an object after its return expression was read.
++        # Such an object still returns, but its old argv/process contract does
++        # not. Evidence-only clean writes therefore matter to this summary.
++        if self.returned_references & self.mutations.keys():
++            returned_binding = _without_object_contract(returned_binding)
++        if self.yielded_references & self.mutations.keys():
++            yielded_binding = _without_object_contract(yielded_binding)
+         return FunctionSummary(
+             returned=returned, effects=tuple((*key, fact) for key, fact in sorted(self.effects.items())),
+             yielded=yielded, mutations=mutations,
+             returned_references=frozenset(ref for ref in self.returned_references if isinstance(ref, str)),
+             yielded_references=frozenset(ref for ref in self.yielded_references if isinstance(ref, str)),
+-            returned_binding=_join_bindings(*self.returned_bindings),
+-            yielded_binding=_join_bindings(*self.yielded_bindings),
++            returned_binding=returned_binding,
++            yielded_binding=yielded_binding,
+         )
+ 
+ 
+@@ -1238,6 +1440,7 @@
+         self.framework_inputs = {}
+         self.framework_dependencies = {}
+         self.default_references = {}
++        self.default_bindings = {}
+         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+         self.generators = {function for function in self.functions
+@@ -1335,10 +1538,12 @@
+                     description = self.framework_inputs.get(function, {}).get(arg.arg)
+                     if description is not None and description.kind == 'request':
+                         state.bindings[arg.arg] = '@request:' + description.name
++                    else:
++                        state.bindings[arg.arg] = _SymbolicValue(arg.arg)
+                     state.references[arg.arg] = frozenset({arg.arg})
+                 for name in self.closures[function]:
+                     state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
+-                    state.bindings[name] = None
++                    state.bindings[name] = _SymbolicValue(f'@free:{name}')
+                     state.references[name] = frozenset({f'@free:{name}'})
+                 if isinstance(function, ast.Lambda):
+                     # Analyze lambda bodies once per fixed-point pass, not by
+ diff --git a/test-suite/quality/test_taint_python_processes.py b/test-suite/quality/test_taint_python_processes.py
+index da8ba29652b5f176fba1de274f8f8f35ed217e72..2e4806c84ef622ca1115cbb8eab119b108c0b3f1 100644
+--- a/test-suite/quality/test_taint_python_processes.py
++++ b/test-suite/quality/test_taint_python_processes.py
+@@ -168,6 +168,191 @@
+         ''', 'command')
+ 
+ 
++class SavedArgumentVectorTests(SourceTest):
++    def test_saved_vectors_preserve_code_and_data_positions(self):
++        for literal in ('["echo", input()]', '("echo", input())',
++                        '["python3", "-c", "print(1)", input()]',
++                        '["sh", "-c", \'printf "%s" "$1"\', "argv0", input()]'):
++            with self.subTest(literal=literal):
++                self.assert_rules(f'args = {literal}\nalias = args\nsubprocess.run(alias)')
++        self.assert_rules('args = ["python3", "-c", input()]\nalias = args\nsubprocess.run(alias)', 'command')
++
++    def test_branches_do_not_cross_pair_program_and_payload(self):
++        self.assert_rules('args = ["echo", input()] if flag else ["python3", "-c", "print(1)"]\nsubprocess.run(args)')
++        self.assert_rules('args = ["echo", input()] if flag else ["python3", "-c", input()]\nsubprocess.run(args)', 'command')
++        self.assert_rules('if flag:\n args=["echo", input()]\nelse:\n args=["sh", "-c", "echo safe"]\nsubprocess.run(args)')
++
++    def test_helper_built_vectors_substitute_each_parameter(self):
++        for program, expected in (('python3', ('command',)), ('echo', ())):
++            with self.subTest(program=program):
++                self.assert_rules(f'''\
++                    def build(program, code):
++                        return [program, '-c', code]
++                    def forward(value):
++                        return build({program!r}, value)
++                    subprocess.run(forward(input()))
++                ''', *expected)
++
++    def test_helper_vector_defaults_and_keywords(self):
++        self.assert_rules('''
++            def build(code, program='python3'):
++                return [program, '-c', code]
++            subprocess.run(build(code=input()))
++        ''', 'command')
++        self.assert_rules('''
++            def build(code, program='python3'):
++                return [program, '-c', code]
++            subprocess.run(build(program='echo', code=input()))
++        ''')
++
++    def test_returned_vectors_keep_sanitizer_domains(self):
++        self.assert_rules('def build(value):\n return ["python3", "-c", shlex.quote(value)]\nsubprocess.run(build(input()))', 'command')
++        self.assert_rules('def build(value):\n return ["sh", "-c", "echo " + shlex.quote(value)]\nsubprocess.run(build(input()))')
++
++    def test_source_snapshots_are_not_re_read_after_rebinding(self):
++        self.assert_rules('code = input()\nargs = ["python3", "-c", code]\ncode = "safe"\nsubprocess.run(args)', 'command')
++        self.assert_rules('code = "print(1)"\nargs = ["python3", "-c", code]\ncode = input()\nsubprocess.run(args)')
++
++    def test_strong_rebinding_detaches_vector_aliases(self):
++        self.assert_rules('args = ["python3", "-c", input()]\nargs = ["echo", input()]\nsubprocess.run(args)')
++        self.assert_rules('args = ["echo", input()]\nalias = args\nalias = ["python3", "-c", input()]\nsubprocess.run(args)')
++
++    def test_clean_writes_invalidate_argument_position_certainty(self):
++        self.assert_rules('args = ["echo", "-c", input()]\nalias = args\nalias[0] = "python3"\nsubprocess.run(args)', 'command')
++        self.assert_rules('args = ["echo", "-c", input()]\nargs.reverse()\nsubprocess.run(args)', 'command')
++        self.assert_rules('args = ["echo", "-c", input()]\nargs.pop(0)\nsubprocess.run(args)', 'command')
++        self.assert_rules('args = ["echo", "python3", "-c", input()]\ndel args[0]\nsubprocess.run(args)', 'command')
++
++    def test_augmented_lists_keep_mutations_visible_to_aliases(self):
++        self.assert_rules('args=["python3"]\nalias=args\nargs += ["-c", input()]\nsubprocess.run(alias)', 'command')
++        self.assert_rules('args=("python3", "-c", "print(1)")\nalias=args\nargs += (input(),)\nsubprocess.run(alias)')
++        self.assert_rules('args=["python3"]\nargs.__iadd__(["-c", input()])\nsubprocess.run(args)', 'command')
++
++    def test_returned_vector_changed_in_finally_is_not_certified_safe(self):
++        self.assert_rules('''
++            def build(code):
++                args = ['echo', '-c', code]
++                try:
++                    return args
++                finally:
++                    args[0] = 'python3'
++            subprocess.run(build(input()))
++        ''', 'command')
++
++    def test_helper_clean_mutations_are_summary_effects(self):
++        self.assert_rules('''
++            def change(args):
++                args[0] = 'python3'
++            args = ['echo', '-c', input()]
++            change(args)
++            subprocess.run(args)
++        ''', 'command')
++
++    def test_unknown_calls_invalidate_escaped_vector_shapes(self):
++        self.assert_rules('args = ["echo", "-c", input()]\nunknown(args)\nsubprocess.run(args)', 'command')
++        self.assert_rules('''
++            def forward(args):
++                unknown(args)
++            args = ['echo', '-c', input()]
++            forward(args)
++            subprocess.run(args)
++        ''', 'command')
++
++    def test_shape_is_invalidated_when_a_later_argument_mutates_it(self):
++        self.assert_rules('args=["echo", "-c", input()]\nsubprocess.run(args, env=args.reverse())', 'command')
++
++    def test_fixed_override_does_not_trust_a_mutated_vector(self):
++        self.assert_rules('args=["ignored", "safe.py", input()]\nargs[1]="-c"\nsubprocess.run(args, executable="python3")', 'command')
++
++    def test_os_exec_uses_saved_vectors_without_conflating_argv0(self):
++        self.assert_rules('args=[input(), "-c", "print(1)"]\nos.execv("python3", args)')
++        self.assert_rules('args=["ignored", "-c", input()]\nos.execv("python3", args)', 'command')
++        self.assert_rules('args=["ignored", "-c", input()]\nos.execv("echo", args)')
++
++    def test_framework_parameter_flows_through_vector_factory(self):
++        self.assert_rules('''
++            from fastapi import Query
++            def build(code):
++                return ['python3', '-c', code]
++            def route(code=Query()):
++                args = build(code)
++                subprocess.run(args)
++        ''', 'command')
++
++    def test_recursion_does_not_grow_argument_vectors(self):
++        # The analyzer uses a finite set of fixed vector shapes, not repeated
++        # execution of a recursive builder. Timeout is a required safety gate.
++        probe = ('import sys;sys.path.insert(0,sys.argv[1]);'
++                 'from test_taint_python_dataflow import SourceTest;'
++                 'SourceTest().assert_rules(sys.stdin.read(), "command")')
++        import sys
++        result = subprocess.run([sys.executable, '-B', '-c', probe, str(Path(__file__).parent)],
++                                input='def build(code):\n return build(code) if flag else ["python3", "-c", code]\nsubprocess.run(build(input()))',
++                                text=True, capture_output=True, timeout=10)
++        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++
++class InterpreterStdinTests(SourceTest):
++    def test_input_keyword_is_source_only_when_interpreter_reads_code(self):
++        for args in ('["python3"]', '["python3", "-"]', '["python3", "-I", "-"]',
++                     '["sh"]', '["bash", "-s"]', '["bash", "-s", "argv0"]'):
++            with self.subTest(args=args):
++                self.assert_rules(f'subprocess.run({args}, input=input())', 'command')
++        for args in ('["echo"]', '["python3", "-c", "print(1)"]', '["python3", "-m", "module"]',
++                     '["python3", "script.py"]', '["bash", "-c", "cat"]', '["bash", "script.sh"]'):
++            with self.subTest(args=args):
++                self.assert_rules(f'subprocess.run({args}, input=input())')
++
++    def test_stdin_source_domains_and_helper_substitution(self):
++        self.assert_rules('subprocess.run(["python3", "-"], input=shlex.quote(input()))', 'command')
++        self.assert_rules('subprocess.run(["bash", "-s"], input="echo " + shlex.quote(input()))')
++        self.assert_rules('def execute(code):\n subprocess.run(["python3", "-"], input=code)\nexecute(shlex.quote(input()))', 'command')
++
++    def test_shell_true_stdin_is_application_data(self):
++        self.assert_rules('subprocess.run("cat", shell=True, input=input())')
++        self.assert_rules('subprocess.run(["python3", "-c", "print(1)"], shell=True, input=input())')
++
++    def test_saved_vector_stdin_respects_code_option_boundaries(self):
++        self.assert_rules('args=["python3", "-"]\nsubprocess.run(args, input=input())', 'command')
++        self.assert_rules('args=["python3", "-c", "print(1)"]\nsubprocess.run(args, input=input())')
++
++    def test_popen_identity_gates_communicate_source(self):
++        self.assert_rules('p=subprocess.Popen(["python3"], stdin=subprocess.PIPE)\np.communicate(input())', 'command')
++        self.assert_rules('p=subprocess.Popen(["python3", "-c", "print(1)"], stdin=subprocess.PIPE)\np.communicate(input())')
++        self.assert_rules('p=subprocess.Popen(["echo"], stdin=subprocess.PIPE)\np.communicate(input())')
++        self.assert_rules('p=subprocess.Popen(["python3"])\np.communicate(input())')
++        self.assert_rules('p=Other()\np.communicate(input())')
++
++    def test_communicate_alias_captures_process_not_rebound_name(self):
++        self.assert_rules('p=subprocess.Popen(["python3"], stdin=subprocess.PIPE)\nsend=p.communicate\np=Other()\nsend(input())', 'command')
++        self.assert_rules('p=Other()\nsend=p.communicate\np=subprocess.Popen(["python3"], stdin=subprocess.PIPE)\nsend(input())')
++        self.assert_rules('p=subprocess.Popen(["python3"],stdin=subprocess.PIPE)\np.communicate=print\np.communicate(input())')
++        self.assert_rules('p=subprocess.Popen(["python3"],stdin=subprocess.PIPE)\nsend=p.communicate\np.communicate=print\nsend(input())', 'command')
++
++    def test_returned_process_keeps_stdin_contract(self):
++        self.assert_rules('def start():\n return subprocess.Popen(["python3"], stdin=subprocess.PIPE)\np=start()\np.communicate(input())', 'command')
++
++    def test_literal_pipe_alias_is_resolved_at_construction(self):
++        self.assert_rules('from subprocess import Popen, PIPE\np=Popen(["python3"],stdin=PIPE)\np.communicate(input=input())', 'command')
++        self.assert_rules('p=subprocess.Popen(["python3"],stdin=-1)\np.communicate(input())', 'command')
++        self.assert_rules('PIPE=None\np=subprocess.Popen(["python3"],stdin=PIPE)\np.communicate(input())')
++
++    def test_async_process_input_contract_survives_await(self):
++        self.assert_rules('async def run():\n p=await asyncio.create_subprocess_exec("python3", stdin=subprocess.PIPE)\n await p.communicate(input())', 'command')
++        self.assert_rules('async def run():\n p=await asyncio.create_subprocess_exec("echo", stdin=subprocess.PIPE)\n await p.communicate(input())')
++
++    def test_alternative_processes_preserve_possible_interpreter(self):
++        self.assert_rules('if flag:\n p=subprocess.Popen(["python3"],stdin=subprocess.PIPE)\nelse:\n p=subprocess.Popen(["echo"],stdin=subprocess.PIPE)\np.communicate(input())', 'command')
++
++    def test_request_body_can_be_an_interpreter_stdin_program(self):
++        self.assert_rules('''
++            from fastapi import Request
++            async def route(req: Request):
++                p = subprocess.Popen(['python3', '-'], stdin=subprocess.PIPE)
++                p.communicate(await req.body())
++        ''', 'command')
++
++
+ @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'Set UBS_TAINT_E2E=1 for real CLI scans')
+ class InterpreterCliTests(unittest.TestCase):
+     def test_python_code(self):
+@@ -181,6 +366,18 @@
+ 
+     def test_async_code(self):
+         self.check_process('async-code', 'asyncio.create_subprocess_exec("sh", "-c", input())', True)
++
++    def test_saved_argument_data(self):
++        self.check_process('saved-data', 'args=["echo", input()]\nsubprocess.run(args)', False)
++
++    def test_factory_code(self):
++        self.check_process('factory-code', 'def build(code):\n return ["python3", "-c", code]\nsubprocess.run(build(input()))', True)
++
++    def test_stdin_program(self):
++        self.check_process('stdin-code', 'p=subprocess.Popen(["python3"],stdin=subprocess.PIPE)\np.communicate(input())', True)
++
++    def test_stdin_data(self):
++        self.check_process('stdin-data', 'subprocess.run(["python3", "-c", "print(1)"],input=input())', False)
+ 
+     def check_process(self, name, source, unsafe):
+         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-processes'

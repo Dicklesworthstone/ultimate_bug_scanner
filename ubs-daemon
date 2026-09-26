@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import shutil
 import socket
@@ -22,7 +23,7 @@ import stat
 import struct
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 
 try:
@@ -260,41 +261,66 @@ def snapshot(root: Path, scanner: Path) -> str | None:
         return None
 
 
-def run_scanner(root: Path, scanner: Path, paths: list[Path], options: list[str], timeout: float) -> dict:
-    """Bound output and wall time, preserving actual scanner streams and status."""
+def run_scanner(root: Path, scanner: Path, paths: list[Path], options: list[str], timeout: float,
+                *, cancel: threading.Event | None = None) -> dict:
+    """Supervise one process group with bounded pipes, time and cancellation.
+
+    Drain both streams through EOF, including helpers outliving the runner.
+    Unlike polling temporary-file sizes, pipes apply backpressure before a
+    noisy scanner can exhaust the filesystem between limit checks.
+    """
+    if cancel is not None and cancel.is_set():
+        return {'exit_code': 2, 'stdout': '', 'stderr': 'Scanner cancelled\n'}
     env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', NO_COLOR='1')
     command = [str(scanner), *options, '--', *map(str, paths)]
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen(command, cwd=root, env=env, stdout=stdout, stderr=stderr, start_new_session=True)
-        started = time.monotonic()
-        error = None
+    process = subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    deadline = time.monotonic() + timeout
+    output = {'stdout': bytearray(), 'stderr': bytearray()}
+    error = None
+    with selectors.DefaultSelector() as streams:
         try:
-            while process.poll() is None:
-                if time.monotonic() - started > timeout:
+            for name in output:
+                pipe = getattr(process, name)
+                os.set_blocking(pipe.fileno(), False)
+                streams.register(pipe, selectors.EVENT_READ, name)
+            while streams.get_map() or process.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    error = 'Scanner cancelled'
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     error = 'Scanner timed out'
                     break
-                if max(os.fstat(stdout.fileno()).st_size, os.fstat(stderr.fileno()).st_size) > MAX_OUTPUT:
-                    error = 'Scanner output exceeded service limit'
+                for key, _ in streams.select(min(0.05, remaining)):
+                    buffer = output[key.data]
+                    try:
+                        chunk = os.read(key.fd, min(65536, MAX_OUTPUT - len(buffer) + 1))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        streams.unregister(key.fileobj)
+                    elif len(buffer) + len(chunk) > MAX_OUTPUT:
+                        error = 'Scanner output exceeded service limit'
+                        break
+                    else:
+                        buffer.extend(chunk)
+                if error:
                     break
-                time.sleep(0.02)
-            if max(os.fstat(stdout.fileno()).st_size, os.fstat(stderr.fileno()).st_size) > MAX_OUTPUT:
-                error = 'Scanner output exceeded service limit'
         finally:
-            # Kill descendants as well as the runner on failures/interruption.
-            # The process owns a new session; never signal the caller's group.
-            if error or process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            # Even successful runners can leave helpers with closed stdio.
+            # This group belongs solely to this request, not to the caller.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait()
-        if error:
-            return {'exit_code': 2, 'stdout': '', 'stderr': error + '\n'}
-        stdout.seek(0)
-        stderr.seek(0)
-        return {'exit_code': process.returncode if process.returncode >= 0 else 128 - process.returncode,
-                'stdout': stdout.read(MAX_OUTPUT).decode('utf-8', 'replace'),
-                'stderr': stderr.read(MAX_OUTPUT).decode('utf-8', 'replace')}
+            process.stdout.close()
+            process.stderr.close()
+    if error:
+        return {'exit_code': 2, 'stdout': '', 'stderr': error + '\n'}
+    return {'exit_code': process.returncode if process.returncode >= 0 else 128 - process.returncode,
+            **{name: data.decode('utf-8', 'replace') for name, data in output.items()}}
 
 
 class ScanService:

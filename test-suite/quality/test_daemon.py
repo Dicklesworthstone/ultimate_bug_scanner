@@ -7,12 +7,14 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -314,6 +316,106 @@ class ServiceTests(unittest.TestCase):
         result = self.cli('client', '--', 'has space.py', 'has\nnewline.py', '--update.py')
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(len(json.loads(result.stdout)['files']), 3)
+
+
+@unittest.skipUnless(os.name == 'posix', 'Scanner process groups require POSIX')
+class ScannerProcessTests(unittest.TestCase):
+    setUp = ServiceTests.setUp
+
+    def scan(self, timeout=3, **kwargs):
+        return daemon.run_scanner(self.root, self.scanner, [self.source], [], timeout, **kwargs)
+
+    def fork_scanner(self, child_body):
+        pidfile = self.work / 'child.pid'
+        self.scanner.write_text(
+            '#!/usr/bin/env python3\nimport os, pathlib, time\n'
+            'child = os.fork()\nif child == 0:\n' +
+            ''.join('    ' + line + '\n' for line in child_body.splitlines()) +
+            '    os._exit(0)\n' +
+            f'pathlib.Path({str(pidfile)!r}).write_text(str(child))\n'
+            'print("parent", flush=True)\nos._exit(0)\n')
+        def cleanup():
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        self.addCleanup(cleanup)
+
+    def test_collects_helper_output_after_runner_exits(self):
+        self.fork_scanner('time.sleep(0.15)\nprint("helper", flush=True)')
+        result = self.scan()
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertEqual(result['stdout'], 'parent\nhelper\n')
+
+    def test_inherited_pipes_remain_subject_to_scan_deadline(self):
+        self.fork_scanner('time.sleep(30)')
+        result = self.scan(timeout=3)
+        self.assertTrue((self.work / 'child.pid').exists(), 'helper must start before the deadline')
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertIn('timed out', result['stderr'])
+        self.assertEqual(result['stdout'], '')
+
+    def test_success_does_not_leave_background_helpers_running(self):
+        marker = self.work / 'helper-heartbeat'
+        self.fork_scanner('os.close(1)\nos.close(2)\nwhile True:\n'
+                          f'    pathlib.Path({str(marker)!r}).write_text(str(time.monotonic_ns()))\n'
+                          '    time.sleep(0.02)')
+        result = self.scan()
+        self.assertEqual(result['exit_code'], 0, result)
+        before = marker.read_bytes() if marker.exists() else None
+        time.sleep(0.2)
+        after = marker.read_bytes() if marker.exists() else None
+        self.assertEqual(before, after, 'scanner helper survived a completed request')
+
+    def test_cancellation_interrupts_a_running_scan(self):
+        cancelled = threading.Event()
+        running = threading.Event()
+        def interrupt():
+            until = time.monotonic() + 5
+            while time.monotonic() < until:
+                if Path(self.env['SCAN_COUNT']).exists():
+                    running.set()
+                    break
+                time.sleep(0.01)
+            cancelled.set()
+        worker = threading.Thread(target=interrupt)
+        worker.start()
+        self.addCleanup(worker.join)
+        with patch.dict(os.environ, {'SCAN_SLEEP': '30'}):
+            result = self.scan(timeout=30, cancel=cancelled)
+        self.assertTrue(running.is_set(), 'cancellation must exercise a running scanner')
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertEqual(result['stdout'], '')
+        self.assertIn('cancelled', result['stderr'])
+
+    def test_pre_cancelled_scan_does_not_launch_scanner(self):
+        cancelled = threading.Event()
+        cancelled.set()
+        result = self.scan(cancel=cancelled)
+        self.assertEqual(result['exit_code'], 2, result)
+        self.assertFalse(Path(self.env['SCAN_COUNT']).exists())
+
+    def test_both_large_streams_and_nonstandard_status_are_preserved(self):
+        self.scanner.write_text(
+            '#!/usr/bin/env python3\nimport os, sys\n'
+            'os.write(1, ("λ\\0" * 100000).encode())\n'
+            'os.write(2, b"diagnostic\\n" * 100000)\nsys.exit(7)\n')
+        result = self.scan()
+        self.assertEqual(result['exit_code'], 7, result['stderr'][:100])
+        self.assertEqual(result['stdout'], 'λ\0' * 100000)
+        self.assertEqual(result['stderr'], 'diagnostic\n' * 100000)
+
+    def test_output_limit_is_enforced_on_each_pipe(self):
+        for descriptor in (1, 2):
+            with self.subTest(descriptor=descriptor):
+                self.scanner.write_text('#!/usr/bin/env python3\nimport os\n'
+                                        f'while True: os.write({descriptor}, b"x" * 65536)\n')
+                with patch.object(daemon, 'MAX_OUTPUT', 100):
+                    result = self.scan()
+                self.assertEqual(result['exit_code'], 2, result)
+                self.assertIn('output exceeded', result['stderr'])
+                self.assertEqual(result['stdout'], '')
 
 
 @unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for actual scanner integration')

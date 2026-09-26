@@ -1,0 +1,185 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index db19032..8fe74d8 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -33,7 +33,7 @@ EXTS = {'.py', '.pyi'}
+ PATH_LIMIT = 5
+ 
+ SOURCE_PATTERNS = [
+-    re.compile(r"request\.(?:args|get_json|json|form|values|data|body|GET|POST)", re.IGNORECASE),
++    re.compile(r"request\.(?:args|get_json|json|form|values|data|body|GET|POST|query_params|path_params|headers|cookies|META)\b", re.IGNORECASE),
+     re.compile(r"flask\.request", re.IGNORECASE),
+     re.compile(r"django\.http\.request", re.IGNORECASE),
+     re.compile(r"input\s*\(", re.IGNORECASE),
+@@ -54,6 +54,79 @@ SANITIZERS = {
+ KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval')}
+ 
+ 
++_PARAMETER_MARKERS = {
++    f'{module}.{name}'
++    for module in ('fastapi', 'fastapi.params', 'fastapi.param_functions')
++    for name in ('Query', 'Path', 'Body', 'Form', 'Header', 'Cookie', 'File')
++}
++_DEPENDENCY_MARKERS = {
++    f'{module}.{name}'
++    for module in ('fastapi', 'fastapi.params', 'fastapi.param_functions')
++    for name in ('Depends', 'Security')
++}
++_REQUEST_TYPES = {'fastapi.Request', 'starlette.requests.Request', 'fastapi.requests.Request',
++                  'django.http.HttpRequest', 'flask.Request', 'werkzeug.wrappers.Request'}
++_SERVICE_TYPES = {'fastapi.Response', 'starlette.responses.Response', 'fastapi.BackgroundTasks',
++                  'starlette.background.BackgroundTasks', 'fastapi.security.SecurityScopes'}
++_ROUTER_TYPES = {'fastapi.FastAPI', 'fastapi.APIRouter', 'fastapi.applications.FastAPI',
++                 'fastapi.routing.APIRouter'}
++_ROUTE_METHODS = {'get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace', 'api_route'}
++_REQUEST_MEMBERS = {'args', 'get_json', 'json', 'form', 'values', 'data', 'body', 'GET', 'POST',
++                    'query_params', 'path_params', 'headers', 'cookies', 'COOKIES', 'META'}
++
++
++@dataclass(frozen=True)
++class _FrameworkInput:
++    kind: str
++    name: str
++
++
++def _imported_name(node, bindings):
++    """Resolve actual bindings, never a merely suggestive spelling."""
++    if isinstance(node, ast.Name):
++        target = bindings.get(node.id)
++        return target if isinstance(target, str) else ''
++    if isinstance(node, ast.Attribute):
++        base = _imported_name(node.value, bindings)
++        return f'{base}.{node.attr}' if base else ''
++    return ''
++
++
++def _framework_input(node, bindings):
++    """Interpret parameter metadata without evaluating annotations or imports."""
++    if isinstance(node, ast.Constant) and isinstance(node.value, str):
++        try:
++            parsed = ast.parse(node.value, mode='eval').body
++        except (SyntaxError, ValueError, RecursionError):
++            return None
++        # Do not recursively interpret strings containing more quoted strings.
++        if isinstance(parsed, ast.Constant):
++            return None
++        return _framework_input(parsed, bindings)
++    if isinstance(node, ast.Name) and isinstance(bindings.get(node.id), _FrameworkInput):
++        return bindings[node.id]
++    name = _imported_name(node, bindings)
++    if name in _REQUEST_TYPES:
++        return _FrameworkInput('request', name)
++    if name in _SERVICE_TYPES:
++        return _FrameworkInput('service', name)
++    if isinstance(node, ast.Call):
++        name = _imported_name(node.func, bindings)
++        if name in _PARAMETER_MARKERS:
++            return _FrameworkInput('source', name)
++        if name in _DEPENDENCY_MARKERS:
++            # A dependency may supply a trusted service, not request data.
++            return _FrameworkInput('dependency', name)
++    if isinstance(node, ast.Subscript) and _imported_name(node.value, bindings) in {
++            'typing.Annotated', 'typing_extensions.Annotated'}:
++        parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
++        for part in reversed(parts):
++            found = _framework_input(part, bindings)
++            if found is not None:
++                return found
++    return None
++
++
+ @dataclass(frozen=True)
+ class TaintTrace:
+     source: str
+@@ -243,6 +316,12 @@ class _Flow:
+                 candidate = 'params[...]'
+             elif base == 'event' and isinstance(node.slice, ast.Constant) and node.slice.value == 'body':
+                 candidate = "event['body']"
++        if candidate.startswith('@request:'):
++            qualified = candidate.removeprefix('@request:').removesuffix('(')
++            request_type, _, member = qualified.rpartition('.')
++            if request_type in _REQUEST_TYPES and member in _REQUEST_MEMBERS:
++                return frozenset({TaintTrace(qualified, path=(qualified,))})
++            return CLEAN
+         for pattern in SOURCE_PATTERNS:
+             match = pattern.search(candidate)
+             if match:
+@@ -406,6 +485,14 @@ class _Flow:
+                 candidate = _qualified(node, state.bindings)
+                 if candidate in SANITIZERS:
+                     binding = candidate
++                imported = _imported_name(node, state.bindings)
++                if imported in (_PARAMETER_MARKERS | _DEPENDENCY_MARKERS | _ROUTER_TYPES
++                                | _REQUEST_TYPES | _SERVICE_TYPES):
++                    binding = imported
++            if isinstance(node, ast.Call) and _imported_name(node.func, state.bindings) in _ROUTER_TYPES:
++                binding = '@fastapi.router'
++            if isinstance(node, ast.Subscript):
++                binding = _framework_input(node, state.bindings)
+             self.expression_bindings[node] = binding
+         return fact
+ 
+@@ -490,6 +577,7 @@ class _Flow:
+             defaults.update((arg.arg, default) for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
+                             if default is not None)
+             self.engine.defaults[node] = {name: self.expr(default, state) for name, default in defaults.items()}
++            self.engine.describe_framework(node, defaults, state.bindings)
+             for decorator in node.decorator_list:
+                 self.expr(decorator, state)
+             state[node.name] = CLEAN
+@@ -631,6 +719,7 @@ class _Analysis:
+         self.tree = tree
+         self.summaries = {}
+         self.defaults = {}
++        self.framework_inputs = {}
+         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+         self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
+@@ -650,6 +739,27 @@ class _Analysis:
+             node = self.parents.get(node)
+         return node
+ 
++    def describe_framework(self, function, defaults, bindings):
++        route = any(isinstance(decorator, ast.Call)
++                    and _imported_name(decorator.func, bindings) in {
++                        f'@fastapi.router.{method}' for method in _ROUTE_METHODS}
++                    for decorator in function.decorator_list)
++        inputs = {}
++        for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
++            description = (_framework_input(defaults.get(arg.arg), bindings)
++                           or _framework_input(arg.annotation, bindings))
++            if description is None and route:
++                description = _FrameworkInput('source', 'fastapi.request')
++            if description is not None:
++                inputs[arg.arg] = description
++        # Capture import identities at the definition, before later rebinding.
++        self.framework_inputs[function] = inputs
++
++    def framework_bound(self, function):
++        return {name: frozenset({TaintTrace(description.name, path=(description.name, name))})
++                for name, description in self.framework_inputs.get(function, {}).items()
++                if description.kind == 'source'}
++
+     def analyze(self):
+         # A summary contains only finite source/parameter/sanitizer facts.
+         # Equality excludes evidence paths, so recursive helpers terminate
+@@ -674,6 +784,9 @@ class _Analysis:
+                 params.extend(arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None)
+                 for arg in params:
+                     state[arg.arg] = frozenset({TaintTrace(arg.arg, parameter=arg.arg, path=(arg.arg,))})
++                    description = self.framework_inputs.get(function, {}).get(arg.arg)
++                    if description is not None and description.kind == 'request':
++                        state.bindings[arg.arg] = '@request:' + description.name
+                 for name in self.closures[function]:
+                     state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
+                     state.bindings[name] = None
+@@ -691,6 +804,9 @@ class _Analysis:
+                     for key, fact in flow.effects.items():
+                         if flow is not module:
+                             bound = {f'@global:{name}': value for name, value in globals_.items()}
++                            # Framework invocation is a separate entry point;
++                            # summaries remain symbolic for ordinary callers.
++                            bound.update(self.framework_bound(flow.scope))
+                             fact = flow.substitute(fact, bound, flow.scope.name + '()')
+                         concrete = frozenset(trace for trace in fact if trace.parameter is None)
+                         if concrete:

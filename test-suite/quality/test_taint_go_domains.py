@@ -34,9 +34,12 @@ class GoTaintDomainTests(unittest.TestCase):
 
     def scan(self, body: str):
         source = "package main\n\nfunc handler() {\n" + textwrap.dedent(body).strip() + "\n}\n"
+        return self.scan_source(source)
+
+    def scan_source(self, source: str):
         with tempfile.TemporaryDirectory(prefix="ubs-go-domain-") as tmp:
             path = Path(tmp) / "handler.go"
-            path.write_text(source, encoding="utf-8")
+            path.write_text(textwrap.dedent(source), encoding="utf-8")
             return list(taint_go.run(RunContext(lang="go", files=[path])))
 
     def rules(self, body: str):
@@ -279,6 +282,258 @@ class GoTaintDomainTests(unittest.TestCase):
     def test_repository_clean_taint_fixture_stays_clean(self):
         path = ROOT / "test-suite/golang/clean/taint_analysis.go"
         self.assertEqual(list(taint_go.run(RunContext(lang="go", files=[path]))), [])
+
+    def test_reassignment_and_statement_order(self):
+        self.assertEqual(self.rules('''
+            value := "safe"
+            fmt.Fprint(w, value)
+            value = r.FormValue("q")
+            fmt.Fprint(w, value)
+            value = "safe"
+            fmt.Fprint(w, value)
+        '''), ["go.taint.xss"])
+
+    def test_conditional_sanitization_does_not_hide_unsafe_branch(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            if escape { value = html.EscapeString(value) }
+            fmt.Fprint(w, value)
+        '''), ["go.taint.xss"])
+
+    def test_both_branches_clean_and_return_stops_flow(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            if escape { value = html.EscapeString(value) } else { value = "safe" }
+            fmt.Fprint(w, value)
+            return
+            fmt.Fprint(w, r.FormValue("unreachable"))
+        '''), [])
+
+    def test_block_shadowing_and_initializer_reference_outer_value(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            { value := html.EscapeString(value); fmt.Fprint(w, value) }
+            fmt.Fprint(w, value)
+            trusted := "safe"
+            { trusted := r.FormValue("q"); _ = trusted }
+            fmt.Fprint(w, trusted)
+        '''), ["go.taint.xss"])
+
+    def test_function_parameters_do_not_inherit_another_local(self):
+        self.assertEqual(self.scan_source('''
+            package main
+            func unsafe() { value := r.FormValue("q"); _ = value }
+            func safe(value string) { fmt.Fprint(w, value) }
+            func main() { safe("constant") }
+        '''), [])
+
+    def test_simultaneous_assignment_and_compound_assignment(self):
+        self.assertEqual(self.rules('''
+            unsafe := r.FormValue("q")
+            safe := "constant"
+            safe, unsafe = unsafe, safe
+            fmt.Fprint(w, unsafe)
+            fmt.Fprint(w, safe)
+            unsafe += safe
+            fmt.Fprint(w, unsafe)
+        '''), ["go.taint.xss"] * 2)
+
+    def test_loop_carried_dependency_converges_beyond_seven_rounds(self):
+        declarations = "\n".join(f'v{index} := "safe"' for index in range(1, 25))
+        propagation = "\n".join(f'v{index} = v{index - 1}' for index in range(24, 0, -1))
+        self.assertEqual(self.rules(f'''
+            v0 := r.FormValue("q")
+            {declarations}
+            for keep {{
+                fmt.Fprint(w, v24)
+                {propagation}
+            }}
+        '''), ["go.taint.xss"])
+
+    def test_loop_zero_iteration_continue_and_break_paths(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            for keep { value = "safe" }
+            fmt.Fprint(w, value)
+            value = "safe"
+            for keep {
+                fmt.Fprint(w, value)
+                value = r.FormValue("q")
+                continue
+                value = "safe"
+            }
+            for { value = "safe"; break }
+            fmt.Fprint(w, value)
+        '''), ["go.taint.xss"] * 2)
+
+    def test_source_after_break_cannot_reach_next_iteration(self):
+        self.assertEqual(self.rules('''
+            value := "safe"
+            for keep {
+                fmt.Fprint(w, value)
+                break
+                value = r.FormValue("q")
+            }
+        '''), [])
+
+    def test_local_helpers_propagate_only_returned_parameters(self):
+        findings = self.scan_source('''
+            package main
+            func selected(first, second string) string { return second }
+            func constant(input string) string { return "safe" }
+            func handler() {
+                value := r.FormValue("q")
+                fmt.Fprint(w, selected(value, "safe"))
+                fmt.Fprint(w, constant(value))
+                fmt.Fprint(w, selected("safe", value))
+            }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+        self.assertIn("selected()", findings[0]["message"])
+
+    def test_local_sanitizer_summary_retains_other_domains(self):
+        findings = self.scan_source('''
+            package main
+            func escaped(value string) string { return html.EscapeString(value) }
+            func handler() {
+                value := escaped(r.FormValue("q"))
+                fmt.Fprint(w, value)
+                db.Query(value)
+                exec.Command("sh", "-c", value)
+            }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.sql", "go.taint.command"])
+
+    def test_helper_sink_summary_reports_unsafe_caller(self):
+        findings = self.scan_source('''
+            package main
+            func render(value string) { fmt.Fprint(w, value) }
+            func forward(value string) { render(value) }
+            func handler() {
+                forward("safe")
+                forward(r.FormValue("q"))
+                forward(html.EscapeString(r.FormValue("q")))
+            }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+        self.assertEqual(findings[0]["line"], 7)
+        self.assertEqual(findings[0]["col"], 5)
+        self.assertIn("forward()", findings[0]["message"])
+        self.assertIn("render()", findings[0]["message"])
+
+    def test_recursive_helpers_and_named_return(self):
+        findings = self.scan_source('''
+            package main
+            func left(value string) string {
+                if done { return value }
+                return right(value)
+            }
+            func right(value string) string { return left(value) }
+            func named(value string) (result string) { result = right(value); return }
+            func handler() { fmt.Fprint(w, named(r.FormValue("q"))) }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+        self.assertIn(".FormValue(", findings[0]["message"])
+
+    def test_local_helpers_keep_tuple_result_positions(self):
+        findings = self.scan_source('''
+            package main
+            func pair(value string) (string, string) { return "safe", value }
+            func handler() {
+                safe, unsafe := pair(r.FormValue("q"))
+                fmt.Fprint(w, safe)
+                fmt.Fprint(w, unsafe)
+            }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+
+    def test_variadic_summary_includes_every_argument(self):
+        findings = self.scan_source('''
+            package main
+            func joined(prefix string, values ...string) string { return strings.Join(values, "") }
+            func handler() {
+                fmt.Fprint(w, joined(r.FormValue("ignored"), "safe"))
+                fmt.Fprint(w, joined("safe", "safe", r.FormValue("q")))
+            }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+
+    def test_helper_initialized_globals_reach_function_sinks(self):
+        findings = self.scan_source('''
+            package main
+            var unsafe = source()
+            var safe = html.EscapeString(source())
+            func source() string { return os.Getenv("Q") }
+            func handler() { fmt.Fprint(w, unsafe); fmt.Fprint(w, safe) }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+
+    def test_anonymous_http_handlers_and_goroutines_are_analyzed(self):
+        findings = self.scan_source('''
+            package main
+            var handler = func(w http.ResponseWriter, r *http.Request) {
+                fmt.Fprint(w, r.FormValue("q"))
+            }
+            func main() {
+                http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+                    fmt.Fprint(w, r.FormValue("q"))
+                })
+                value := r.FormValue("q")
+                go func() { fmt.Fprint(w, value) }()
+            }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"] * 3)
+
+    def test_closure_returns_do_not_taint_the_enclosing_function(self):
+        findings = self.scan_source('''
+            package main
+            func safe(value string) string {
+                callback := func() string { return value }
+                _ = callback
+                return "safe"
+            }
+            func handler() { fmt.Fprint(w, safe(r.FormValue("q"))) }
+        ''')
+        self.assertEqual(findings, [])
+
+    def test_struct_type_and_field_names_are_not_value_references(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            trusted := struct{value string}{value: "safe"}
+            unsafe := struct{value string}{value: value}
+            fmt.Fprint(w, trusted.value)
+            fmt.Fprint(w, unsafe.value)
+        '''), ["go.taint.xss"])
+
+    def test_repository_buggy_taint_fixture_preserves_every_sink(self):
+        path = ROOT / "test-suite/golang/buggy/taint_analysis.go"
+        findings = list(taint_go.run(RunContext(lang="go", files=[path])))
+        self.assertEqual([finding["rule"] for finding in findings],
+                         ["go.taint.sql", "go.taint.sql", "go.taint.xss", "go.taint.sql",
+                          "go.taint.sql", "go.taint.sql", "go.taint.sql", "go.taint.sql", "go.taint.command"])
+
+    def test_return_sanitizer_cannot_undo_helper_side_effects(self):
+        findings = self.scan_source('''
+            package main
+            func render(value string) string { fmt.Fprint(w, value); return value }
+            func handler() { _ = html.EscapeString(render(r.FormValue("q"))) }
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.xss"])
+
+    def test_multiple_init_functions_have_distinct_scopes(self):
+        findings = self.scan_source('''
+            package main
+            func init() { db.Query(os.Getenv("Q")) }
+            func init() {}
+        ''')
+        self.assertEqual([finding["rule"] for finding in findings], ["go.taint.sql"])
+
+    def test_shadowed_sanitizer_package_is_conservative(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            html := customEscaper
+            fmt.Fprint(w, html.EscapeString(value))
+        '''), ["go.taint.xss"])
 
 
 if __name__ == "__main__":

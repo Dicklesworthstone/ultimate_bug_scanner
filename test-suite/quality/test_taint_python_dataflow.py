@@ -192,6 +192,92 @@ class ReachingDefinitionTests(SourceTest):
             self.assertEqual(len(samples.split(',')), 3)
 
 
+class FrameworkBindingControls(SourceTest):
+    def test_runtime_strings_are_not_framework_markers_or_request_types(self):
+        for default, sink in (("'Query()'", "eval(value)"), ("'Request'", "eval(value.headers)")):
+            with self.subTest(default=default):
+                self.assert_rules(f'from fastapi import Query, Request\ndef ordinary(value={default}):\n    {sink}\n')
+        self.assert_rules('''
+            from fastapi import FastAPI, Depends
+            app = FastAPI()
+            @app.get('/')
+            def endpoint(value='Depends(service)'):
+                eval(value)
+        ''', 'eval')
+
+    def test_annotated_metadata_strings_are_inert(self):
+        self.assert_rules('''
+            from typing import Annotated
+            from fastapi import Query
+            def ordinary(value: Annotated[str, 'Query()']):
+                eval(value)
+        ''')
+        self.assert_rules('''
+            from typing import Annotated
+            from fastapi import FastAPI, Depends
+            app = FastAPI()
+            @app.get('/')
+            def endpoint(value: Annotated[str, 'Depends(service)']):
+                eval(value)
+        ''', 'eval')
+
+    def test_constructed_source_and_dependency_markers_keep_identity(self):
+        for parameter in ('value=marker', 'value: Annotated[str, marker]'):
+            with self.subTest(parameter=parameter):
+                self.assert_rules(f'from typing import Annotated\nfrom fastapi import Query\nmarker = Query()\n'
+                                  f'def endpoint({parameter}):\n    eval(value)\n', 'eval')
+                self.assert_rules(f'from typing import Annotated\nfrom fastapi import FastAPI, Depends\n'
+                                  f'marker = Depends(service)\napp = FastAPI()\n@app.get("/")\n'
+                                  f'def endpoint({parameter}):\n    eval(value)\n')
+
+    def test_each_default_captures_its_own_evaluated_identity(self):
+        self.assert_rules('''
+            from fastapi import Query
+            def endpoint(value=Query(), ignored=(Query := other)):
+                eval(value)
+        ''', 'eval')
+        self.assert_rules('''
+            from fastapi import Query as real
+            Query = other
+            def ordinary(value=Query(), ignored=(Query := real)):
+                eval(value)
+        ''')
+
+    def test_marker_and_router_callable_precede_argument_side_effects(self):
+        self.assert_rules('''
+            from fastapi import Query
+            def endpoint(value=Query(default=(Query := other))):
+                eval(value)
+        ''', 'eval')
+        self.assert_rules('''
+            from fastapi import FastAPI
+            app = FastAPI(title=(FastAPI := other))
+            @app.get('/')
+            def endpoint(value):
+                eval(value)
+        ''', 'eval')
+
+    def test_decorator_identity_precedes_default_evaluation(self):
+        self.assert_rules('''
+            from fastapi import FastAPI
+            app = FastAPI()
+            @app.get('/')
+            def endpoint(value, ignored=(app := other)):
+                eval(value)
+        ''', 'eval')
+        self.assert_rules('''
+            from fastapi import FastAPI
+            real = FastAPI()
+            app = other
+            @app.get('/')
+            def ordinary(value, ignored=(app := real)):
+                eval(value)
+        ''')
+
+    def test_request_member_names_require_a_word_boundary(self):
+        self.assert_rules('def ordinary(request):\n    eval(request.database)\n    eval(request.GETAWAY)\n')
+
+
 class SuppressionTests(SourceTest):
     def test_marker_inside_string_does_not_disable_security(self):
         self.assert_rules("label = 'ubs:ignore'\neval(input())\n", 'eval')

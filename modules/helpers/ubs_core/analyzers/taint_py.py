@@ -33,7 +33,7 @@ EXTS = {'.py', '.pyi'}
 PATH_LIMIT = 5
 
 SOURCE_PATTERNS = [
-    re.compile(r"request\.(?:args|get_json|json|form|values|data|body|GET|POST)", re.IGNORECASE),
+    re.compile(r"request\.(?:args|get_json|json|form|values|data|body|GET|POST|query_params|path_params|headers|cookies|META)\b", re.IGNORECASE),
     re.compile(r"flask\.request", re.IGNORECASE),
     re.compile(r"django\.http\.request", re.IGNORECASE),
     re.compile(r"input\s*\(", re.IGNORECASE),
@@ -52,6 +52,83 @@ SANITIZERS = {
 }
 
 KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval')}
+
+
+_PARAMETER_MARKERS = {
+    f'{module}.{name}'
+    for module in ('fastapi', 'fastapi.params', 'fastapi.param_functions')
+    for name in ('Query', 'Path', 'Body', 'Form', 'Header', 'Cookie', 'File')
+}
+_DEPENDENCY_MARKERS = {
+    f'{module}.{name}'
+    for module in ('fastapi', 'fastapi.params', 'fastapi.param_functions')
+    for name in ('Depends', 'Security')
+}
+_REQUEST_TYPES = {'fastapi.Request', 'starlette.requests.Request', 'fastapi.requests.Request',
+                  'django.http.HttpRequest', 'flask.Request', 'werkzeug.wrappers.Request'}
+_SERVICE_TYPES = {'fastapi.Response', 'starlette.responses.Response', 'fastapi.BackgroundTasks',
+                  'starlette.background.BackgroundTasks', 'fastapi.security.SecurityScopes'}
+_ROUTER_TYPES = {'fastapi.FastAPI', 'fastapi.APIRouter', 'fastapi.applications.FastAPI',
+                 'fastapi.routing.APIRouter'}
+_ROUTE_METHODS = {'get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace', 'api_route'}
+_REQUEST_MEMBERS = {'args', 'get_json', 'json', 'form', 'values', 'data', 'body', 'GET', 'POST',
+                    'query_params', 'path_params', 'headers', 'cookies', 'COOKIES', 'META'}
+
+
+@dataclass(frozen=True)
+class _FrameworkInput:
+    kind: str
+    name: str
+
+
+def _imported_name(node, bindings):
+    """Resolve actual bindings, never a merely suggestive spelling."""
+    if isinstance(node, ast.Name):
+        target = bindings.get(node.id)
+        return target if isinstance(target, str) else ''
+    if isinstance(node, ast.Attribute):
+        base = _imported_name(node.value, bindings)
+        return f'{base}.{node.attr}' if base else ''
+    return ''
+
+
+def _framework_input(node, bindings, *, annotation_strings=False):
+    """Interpret parameter metadata without evaluating annotations or imports."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if not annotation_strings:
+            return None
+        try:
+            parsed = ast.parse(node.value, mode='eval').body
+        except (SyntaxError, ValueError, RecursionError):
+            return None
+        # Do not recursively interpret strings containing more quoted strings.
+        if isinstance(parsed, ast.Constant):
+            return None
+        return _framework_input(parsed, bindings, annotation_strings=True)
+    if isinstance(node, ast.Name) and isinstance(bindings.get(node.id), _FrameworkInput):
+        return bindings[node.id]
+    name = _imported_name(node, bindings)
+    if name in _REQUEST_TYPES:
+        return _FrameworkInput('request', name)
+    if name in _SERVICE_TYPES:
+        return _FrameworkInput('service', name)
+    if isinstance(node, ast.Call):
+        name = _imported_name(node.func, bindings)
+        if name in _PARAMETER_MARKERS:
+            return _FrameworkInput('source', name)
+        if name in _DEPENDENCY_MARKERS:
+            # A dependency may supply a trusted service, not request data.
+            return _FrameworkInput('dependency', name)
+    if isinstance(node, ast.Subscript) and _imported_name(node.value, bindings) in {
+            'typing.Annotated', 'typing_extensions.Annotated'}:
+        parts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+        for index in reversed(range(len(parts))):
+            # Only the type position accepts a forward reference. Metadata
+            # strings such as "Depends(service)" remain inert Python values.
+            found = _framework_input(parts[index], bindings, annotation_strings=index == 0)
+            if found is not None:
+                return found
+    return None
 
 
 @dataclass(frozen=True)
@@ -243,6 +320,12 @@ class _Flow:
                 candidate = 'params[...]'
             elif base == 'event' and isinstance(node.slice, ast.Constant) and node.slice.value == 'body':
                 candidate = "event['body']"
+        if candidate.startswith('@request:'):
+            qualified = candidate.removeprefix('@request:').removesuffix('(')
+            request_type, _, member = qualified.rpartition('.')
+            if request_type in _REQUEST_TYPES and member in _REQUEST_MEMBERS:
+                return frozenset({TaintTrace(qualified, path=(qualified,))})
+            return CLEAN
         for pattern in SOURCE_PATTERNS:
             match = pattern.search(candidate)
             if match:
@@ -272,7 +355,7 @@ class _Flow:
         if function.args.kwarg:
             accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
             bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
-        for name in self.engine.closures[function]:
+        for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = state.get(name, CLEAN)
         for name in self.engine.global_names:
             if (not isinstance(self.scope, ast.Module)
@@ -311,8 +394,33 @@ class _Flow:
         # Python evaluates the receiver/callable before argument expressions,
         # which may themselves reassign the receiver or callable name.
         receiver = self.expr(node.func.value, state) if isinstance(node.func, ast.Attribute) else CLEAN
+        if isinstance(node.func, ast.Lambda):
+            # Defaults execute when the callable is created, before arguments.
+            # The body executes only once the lambda is actually called.
+            self.expr(node.func, state)
         arguments = [self.expr(arg, state) for arg in node.args]
-        keywords = {keyword.arg: self.expr(keyword.value, state) for keyword in node.keywords}
+        keywords = {}
+        keyword_nodes = {}
+        for keyword in node.keywords:
+            if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+                for key, value in zip(keyword.value.keys, keyword.value.values):
+                    self.expr(key, state)
+                    key_name = key.value if isinstance(key, ast.Constant) and isinstance(key.value, str) else None
+                    keywords[key_name] = join_facts(keywords.get(key_name, CLEAN), self.expr(value, state))
+                    keyword_nodes[key_name] = value
+            else:
+                keywords[keyword.arg] = join_facts(keywords.get(keyword.arg, CLEAN), self.expr(keyword.value, state))
+                keyword_nodes[keyword.arg] = keyword.value
+        if isinstance(node.func, ast.Lambda):
+            bound = self.bind(node.func, node, arguments, keywords, state)
+            local = state.copy()
+            signature = node.func.args
+            for arg in (*signature.posonlyargs, *signature.args, *signature.kwonlyargs,
+                        signature.vararg, signature.kwarg):
+                if arg is not None:
+                    local[arg.arg] = _advance(bound.get(arg.arg, CLEAN), arg.arg)
+                    local.bindings[arg.arg] = None
+            return self.expr(node.func.body, local)
         if function is not None:
             bound = self.bind(function, node, arguments, keywords, state)
             summary = self.engine.summaries.get(function, FunctionSummary())
@@ -325,27 +433,46 @@ class _Flow:
             return self.substitute(summary.returned, bound, f'{function.name}()')
         fact = join_facts(receiver, *arguments, *keywords.values(), self.source(node, state))
         first = arguments[0] if arguments else CLEAN
+
+        def source_argument(*names):
+            if arguments:
+                return first
+            return join_facts(keywords.get(None, CLEAN), *(keywords.get(key, CLEAN) for key in names))
+
         leaf = name.rsplit('.', 1)[-1]
         if leaf in {'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
             label = 'render_template' if leaf.startswith('render_template') else ('Flask Response' if leaf == 'Response' else leaf)
             content = (join_facts(*arguments, *keywords.values()) if leaf.startswith('render_template')
-                       else first if arguments else keywords.get('content', keywords.get('response', CLEAN)))
+                       else source_argument('content', 'response', 'body'))
             self.effect('xss', node, label, content)
         elif leaf in {'execute', 'executemany', 'text'} and name.split('.')[0] in {'cursor', 'session', 'conn', 'engine', 'db'}:
-            query = first if arguments else keywords.get('sql', keywords.get('query', keywords.get('statement', CLEAN)))
+            query = source_argument('sql', 'query', 'statement', 'operation')
             self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
         elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
-            command = first if arguments else keywords.get('args', CLEAN)
-            command_node = node.args[0] if node.args else next((kw.value for kw in node.keywords if kw.arg == 'args'), None)
-            shell = next((kw.value for kw in node.keywords if kw.arg == 'shell'), None)
-            shell_enabled = shell is not None and not (isinstance(shell, ast.Constant) and not shell.value)
-            if not shell_enabled and isinstance(command_node, (ast.List, ast.Tuple)):
+            command = source_argument('args')
+            command_node = node.args[0] if node.args else keyword_nodes.get('args')
+            shell = keyword_nodes.get('shell')
+            shell_true = isinstance(shell, ast.Constant) and bool(shell.value)
+            shell_unknown = (shell is not None and not isinstance(shell, ast.Constant)) or None in keywords
+            if isinstance(command_node, (ast.List, ast.Tuple)):
+                # A list's first item selects the program or shell command;
+                # later argument side effects must not re-evaluate that item.
                 command = self.expression_facts.get(command_node.elts[0], CLEAN) if command_node.elts else CLEAN
-            self.effect('command', node, 'subprocess execution' if shell_enabled else 'subprocess executable', command)
+            executable = join_facts(keywords.get('executable', CLEAN), keywords.get(None, CLEAN))
+            executable_node = keyword_nodes.get('executable')
+            fixed_executable = isinstance(executable_node, ast.Constant) and executable_node.value is not None
+            if (not shell_true or shell_unknown) and not fixed_executable:
+                executable = join_facts(executable, command)
+            shell_code = command if shell_true or shell_unknown else CLEAN
+            if executable:
+                unsafe_shell = frozenset(trace for trace in shell_code if not _safe_for(trace, 'command', 'subprocess execution'))
+                self.effect('command', node, 'subprocess executable', join_facts(executable, unsafe_shell))
+            else:
+                self.effect('command', node, 'subprocess execution', shell_code)
         elif name in {'os.system', 'os.popen', 'os.execv', 'os.execve', 'os.execvp', 'os.execvpe'}:
             self.effect('command', node, 'os executable' if leaf.startswith('exec') else 'os command execution', first)
         elif name in {'eval', 'exec', 'builtins.eval', 'builtins.exec'}:
-            self.effect('eval', node, leaf, first if arguments else keywords.get('source', CLEAN))
+            self.effect('eval', node, leaf, source_argument('source', 'object'))
         configurable_html = name == 'bleach.clean' and (
             len(node.args) > 1 or any(keyword.arg not in {'text', 'strip', 'strip_comments'} for keyword in node.keywords)
         )
@@ -354,6 +481,9 @@ class _Flow:
         return fact
 
     def expr(self, node, state):
+        # Callable identity belongs to the point before its arguments execute:
+        # Query(alias := other) still constructs the originally bound marker.
+        imported_call = _imported_name(node.func, state.bindings) if isinstance(node, ast.Call) else ''
         fact = self.expression(node, state)
         if node is not None:
             self.expression_facts[node] = fact
@@ -362,11 +492,44 @@ class _Flow:
                 candidate = _qualified(node, state.bindings)
                 if candidate in SANITIZERS:
                     binding = candidate
+                imported = _imported_name(node, state.bindings)
+                if imported in (_PARAMETER_MARKERS | _DEPENDENCY_MARKERS | _ROUTER_TYPES
+                                | _REQUEST_TYPES | _SERVICE_TYPES):
+                    binding = imported
+            if isinstance(node, ast.Call):
+                if imported_call in _ROUTER_TYPES:
+                    binding = '@fastapi.router'
+                elif imported_call in _PARAMETER_MARKERS:
+                    binding = _FrameworkInput('source', imported_call)
+                elif imported_call in _DEPENDENCY_MARKERS:
+                    binding = _FrameworkInput('dependency', imported_call)
+            if isinstance(node, ast.Subscript):
+                binding = _framework_input(node, state.bindings)
             self.expression_bindings[node] = binding
         return fact
 
     def expression(self, node, state):
-        if node is None or isinstance(node, (ast.Constant, ast.Lambda)):
+        if node is None or isinstance(node, ast.Constant):
+            return CLEAN
+        if isinstance(node, ast.Lambda):
+            signature = node.args
+            positional = [*signature.posonlyargs, *signature.args]
+            defaults = {arg.arg: self.expr(value, state) for arg, value in
+                        zip(positional[len(positional) - len(signature.defaults):], signature.defaults)}
+            defaults.update({arg.arg: self.expr(value, state) for arg, value in
+                             zip(signature.kwonlyargs, signature.kw_defaults) if value is not None})
+            self.engine.defaults[node] = defaults
+            return CLEAN
+        if isinstance(node, ast.Compare):
+            self.expr(node.left, state)
+            self.expr(node.comparators[0], state)
+            for comparator in node.comparators[1:]:
+                executed = state.copy()
+                self.expr(comparator, executed)
+                state.replace(_join_states(state, executed))
+            return CLEAN  # A comparison produces a bool, not executable text.
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            self.expr(node.operand, state)
             return CLEAN
         if isinstance(node, ast.Name):
             return state.get(node.id, CLEAN)
@@ -421,13 +584,27 @@ class _Flow:
 
     def statement(self, node, state):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # Decorator expressions run before defaults. Preserve the real
+            # router identity even if a later default rebinds its name.
+            route = False
+            for decorator in node.decorator_list:
+                if isinstance(decorator, ast.Call) and _imported_name(decorator.func, state.bindings) in {
+                        f'@fastapi.router.{method}' for method in _ROUTE_METHODS}:
+                    route = True
+                self.expr(decorator, state)
             positional = [*node.args.posonlyargs, *node.args.args]
             defaults = dict(zip((arg.arg for arg in positional[-len(node.args.defaults):]), node.args.defaults)) if node.args.defaults else {}
             defaults.update((arg.arg, default) for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
                             if default is not None)
-            self.engine.defaults[node] = {name: self.expr(default, state) for name, default in defaults.items()}
-            for decorator in node.decorator_list:
-                self.expr(decorator, state)
+            default_facts = {}
+            default_inputs = {}
+            for name, default in defaults.items():
+                default_facts[name] = self.expr(default, state)
+                description = self.expression_bindings.get(default)
+                if isinstance(description, _FrameworkInput):
+                    default_inputs[name] = description
+            self.engine.defaults[node] = default_facts
+            self.engine.describe_framework(node, default_inputs, state.bindings, route)
             state[node.name] = CLEAN
             state.bindings[node.name] = node
         elif isinstance(node, ast.ClassDef):
@@ -445,12 +622,19 @@ class _Flow:
                                          else alias.name if alias.asname else local)
                 state[local] = CLEAN
         elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if node.value is None:
+                return state  # An annotation alone does not assign a value.
             fact = self.expr(node.value, state)
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 self.assign(target, fact, state, node.value)
         elif isinstance(node, ast.AugAssign):
             self.assign(node.target, join_facts(self.expr(node.target, state), self.expr(node.value, state)), state)
+        elif isinstance(node, ast.Assert):
+            self.expr(node.test, state)
+            # The message runs only on a raising path. Its sinks matter, but
+            # its assignments cannot sanitize the normal continuation.
+            self.expr(node.msg, state.copy())
         elif isinstance(node, ast.Expr):
             self.expr(node.value, state)
         elif isinstance(node, ast.Return):
@@ -560,6 +744,7 @@ class _Analysis:
         self.tree = tree
         self.summaries = {}
         self.defaults = {}
+        self.framework_inputs = {}
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
         self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
@@ -578,6 +763,23 @@ class _Analysis:
         while node is not None and not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             node = self.parents.get(node)
         return node
+
+    def describe_framework(self, function, default_inputs, bindings, route):
+        inputs = {}
+        for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
+            description = (default_inputs.get(arg.arg)
+                           or _framework_input(arg.annotation, bindings, annotation_strings=True))
+            if description is None and route:
+                description = _FrameworkInput('source', 'fastapi.request')
+            if description is not None:
+                inputs[arg.arg] = description
+        # Capture import identities at the definition, before later rebinding.
+        self.framework_inputs[function] = inputs
+
+    def framework_bound(self, function):
+        return {name: frozenset({TaintTrace(description.name, path=(description.name, name))})
+                for name, description in self.framework_inputs.get(function, {}).items()
+                if description.kind == 'source'}
 
     def analyze(self):
         # A summary contains only finite source/parameter/sanitizer facts.
@@ -603,6 +805,9 @@ class _Analysis:
                 params.extend(arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None)
                 for arg in params:
                     state[arg.arg] = frozenset({TaintTrace(arg.arg, parameter=arg.arg, path=(arg.arg,))})
+                    description = self.framework_inputs.get(function, {}).get(arg.arg)
+                    if description is not None and description.kind == 'request':
+                        state.bindings[arg.arg] = '@request:' + description.name
                 for name in self.closures[function]:
                     state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
                     state.bindings[name] = None
@@ -620,6 +825,9 @@ class _Analysis:
                     for key, fact in flow.effects.items():
                         if flow is not module:
                             bound = {f'@global:{name}': value for name, value in globals_.items()}
+                            # Framework invocation is a separate entry point;
+                            # summaries remain symbolic for ordinary callers.
+                            bound.update(self.framework_bound(flow.scope))
                             fact = flow.substitute(fact, bound, flow.scope.name + '()')
                         concrete = frozenset(trace for trace in fact if trace.parameter is None)
                         if concrete:

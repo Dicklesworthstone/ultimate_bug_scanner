@@ -5,14 +5,20 @@ on:
     branches: [main]
     paths:
       - .github/workflows/python-framework-taint.yml
-      - test-suite/patches/python-taint-frameworks.patch
-      - test-suite/patches/python-taint-dependencies.patch
-      - test-suite/quality/test_taint_python_frameworks.py
+      - ubs
+      - modules/ubs-python.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/test_taint_python_*.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_ubs_core.py
+      - test-suite/manifest.json
+      - test-suite/run_manifest.py
   workflow_dispatch:
 
-# Publish tested, content-addressed objects only. No branch or tag mutation.
+# The framework analyzer is shipped; validate the revision that triggered CI.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -21,12 +27,9 @@ jobs:
     env:
       UBS_NO_AUTO_UPDATE: '1'
       PYTHONDONTWRITEBYTECODE: '1'
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: main
           persist-credentials: false
       - uses: actions/setup-python@v6
         with:
@@ -37,43 +40,8 @@ jobs:
           sudo apt-get install -y jq ripgrep rsync shellcheck
           python3 -m pip install pyyaml jsonschema
           npm install --global @ast-grep/cli
-      - name: Apply the reviewed implementation over a checked base
-        run: |
-          python3 - <<'PY'
-          import hashlib, os, subprocess
-          from pathlib import Path
-          source = 'modules/helpers/ubs_core/analyzers/taint_py.py'
-          tests = 'test-suite/quality/test_taint_python_frameworks.py'
-          scratch = Path(os.environ['RUNNER_TEMP'])
-          print('FRAMEWORK_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          lint = subprocess.run(['shellcheck', '-S', 'warning', *scripts], capture_output=True, text=True)
-          (scratch / 'framework-lint-before.txt').write_text(str(lint.returncode) + '\n' + lint.stdout + lint.stderr)
-          def blob(path):
-              return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-          assert blob(source) in {'4d9f3848eb1f999ea553b91987642d983718f1d5', 'db1903210787528f7017793e8a5d5c2cfa7f9e9f', '8fe74d82c10e157f88bc364c20b2fdafbbc8b660', '4aaa996f9252a776ed02a96de49166ac4cce690a'}, blob(source)
-          if blob(source) == '4d9f3848eb1f999ea553b91987642d983718f1d5':
-              subprocess.run(['git', 'apply', 'test-suite/patches/python-taint-expressions.patch'], check=True)
-          if blob(source) == 'db1903210787528f7017793e8a5d5c2cfa7f9e9f':
-              patch = Path('test-suite/patches/python-taint-frameworks.patch')
-              assert hashlib.sha256(patch.read_bytes()).hexdigest() == 'b200a158a879a79015c3751b73067e5635a004c23b62ca37937366632669b902'
-              subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
-              subprocess.run(['git', 'apply', str(patch)], check=True)
-          if blob(source) == '8fe74d82c10e157f88bc364c20b2fdafbbc8b660':
-              patch = Path('test-suite/patches/python-taint-dependencies.patch')
-              assert hashlib.sha256(patch.read_bytes()).hexdigest() == '857bbe82bc393d7d8c76ea833f81e107c361b1b4afef1c8489750755c5a3945a'
-              assert blob(tests) == '0214a081539e31c3c2bef83508e815babcfc73cd'
-              subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
-              subprocess.run(['git', 'apply', '--include=' + tests, str(patch)], check=True)
-              before = subprocess.run(['python3', '-m', 'unittest', 'test_taint_python_frameworks.DependencyInputTests', '-q'], env=dict(os.environ, PYTHONPATH='test-suite/quality'), capture_output=True, text=True)
-              print(before.stdout + before.stderr, flush=True)
-              assert before.returncode != 0 and 'FAIL:' in before.stderr, 'Dependency tests must reproduce the missing functionality'
-              subprocess.run(['git', 'apply', '--include=' + source, str(patch)], check=True)
-          assert blob(source) == '4aaa996f9252a776ed02a96de49166ac4cce690a'
-          assert blob(tests) == '4790e0c8b6c2d5201e0b7259a43c895b5aec07ce'
-          PY
-          python3 scripts/update_checksums.py
-          ./scripts/update_sha256sums.sh
+      - name: Record the production revision under test
+        run: echo "FRAMEWORK_REVISION $(git rev-parse HEAD)"
       - name: Run source regressions and actual scanner integration
         run: |
           UBS_TAINT_E2E=1 python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v
@@ -86,39 +54,26 @@ jobs:
           python3 -m unittest discover -s test-suite/quality -p test_suppression_intervals.py -v
           python3 -m unittest discover -s test-suite/quality -p test_ubs_core.py -v
           python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean
-      - name: Verify and publish exact runtime and integrity-chain blobs
+      - name: Verify the production integrity chain and deterministic regeneration
         run: |
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          for script in scripts:
-              subprocess.run(['bash', '-n', script], check=True)
-          lint = subprocess.run(['shellcheck', '-S', 'warning', *scripts], capture_output=True, text=True)
-          actual = str(lint.returncode) + '\n' + lint.stdout + lint.stderr
-          assert actual == (Path(os.environ['RUNNER_TEMP']) / 'framework-lint-before.txt').read_text(), 'ShellCheck diagnostics changed'
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          diff = subprocess.check_output(['git', 'diff'])
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
-          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
-          assert diff == subprocess.check_output(['git', 'diff']), 'Checksum generation is not idempotent'
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          assert changed <= set(scripts) | {'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_py.py', 'test-suite/quality/test_taint_python_frameworks.py'}, changed
-          for name in sorted(changed):
-              data = Path(name).read_bytes()
-              original = subprocess.check_output(['git', 'rev-parse', 'HEAD:' + name], text=True).strip()
-              result = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'], input=json.dumps({'content': data.decode(), 'encoding': 'utf-8'}), text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(result.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
-              print('FRAMEWORK_TESTED_BLOB', mode, name, original, sha, flush=True)
-          print('FRAMEWORK_VALIDATION_PASS', flush=True)
-          PY
+          bash -n ubs
+          bash -n modules/lib/ubs-common.sh
+          bash -n scripts/new-module.sh
+          for module in modules/ubs-*.sh; do bash -n "$module"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+          git diff --check
+          git diff > "$RUNNER_TEMP/python-framework-tested.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/python-framework-idempotent.diff"
+          cmp "$RUNNER_TEMP/python-framework-tested.diff" "$RUNNER_TEMP/python-framework-idempotent.diff"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: python-framework-scanner-results
-          path: test-suite/artifacts/python-framework-sources/
+          path: |
+            test-suite/artifacts/python-framework-sources/
+            ${{ runner.temp }}/python-framework-*.diff
           retention-days: 3

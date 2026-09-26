@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - .github/workflows/go-taint-domain-validation.yml
+      - test-suite/patches/go-taint-command-domains.patch
+      - test-suite/quality/test_taint_go_domains.py
   workflow_dispatch:
 
-# Only immutable Git blobs are written. Publishing a branch remains a separate
-# reviewed fast-forward operation after this workflow's tests have passed.
+# Store immutable tested blobs only. Publishing a branch remains a separate
+# reviewed fast-forward operation after the real scanner tests have passed.
 permissions:
   contents: write
 
@@ -51,10 +53,16 @@ jobs:
           assert data['encoding'] == 'base64'
           raw = base64.b64decode(data['content'])
           assert hashlib.sha256(raw).hexdigest() == 'd71179619a42917c519e280d5e59f28c816003ab4313a48a2f2fee02f0347eb6'
-          compile(raw, name, 'exec')
           Path(name).write_bytes(raw)
+          patch = 'test-suite/patches/go-taint-command-domains.patch'
+          subprocess.run(['git', 'apply', '--check', patch], check=True)
+          subprocess.run(['git', 'apply', patch], check=True)
+          raw = Path(name).read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == '1675f21ce9a81f09f6fc5af1bd7645edfb61275ad20f806dea06a7cce14e24f7'
+          assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == 'd98cdb28a8f700facca60a5c37b3463c5a8d2ba9'
+          compile(raw, name, 'exec')
           PY
-          ./scripts/update_checksums.sh
+          python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
       - name: Run source regressions and registry compatibility
         run: |
@@ -86,7 +94,7 @@ jobs:
           for module in modules/ubs-*.sh; do bash -n "$module"; done
           git diff --check
           git diff > "$RUNNER_TEMP/go-taint-tested.diff"
-          ./scripts/update_checksums.sh
+          python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
           git diff > "$RUNNER_TEMP/go-taint-idempotent.diff"
           cmp "$RUNNER_TEMP/go-taint-tested.diff" "$RUNNER_TEMP/go-taint-idempotent.diff"

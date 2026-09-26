@@ -1,0 +1,92 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ubs_core/analyzers/taint_go.py
+index 3033c64..d98cdb2 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_go.py
++++ b/modules/helpers/ubs_core/analyzers/taint_go.py
+@@ -10,6 +10,7 @@ rule); `run()` yields the same hits as structured findings.
+ from __future__ import annotations
+ 
+ import re
++import json
+ from collections import defaultdict
+ from pathlib import Path
+ from typing import Iterable
+@@ -254,6 +255,69 @@ def sql_arg_is_parameterized(sql_arg: str) -> bool:
+     return bool(re.search(r"(?:\?|\$\d+|@[A-Za-z_][\w]*|:[A-Za-z_][\w]*)", sql_arg))
+ 
+ 
++def _literal_string(expr: str) -> str | None:
++    """Decode an entire literal, never a literal prefix of an expression."""
++    expr = expr.strip()
++    if re.fullmatch(r'`[^`]*`', expr, re.DOTALL):
++        return expr[1:-1].replace('\r', '')
++    if not re.fullmatch(r'"(?:[^"\\]|\\.)*"', expr, re.DOTALL):
++        return None
++    try:
++        # JSON's escapes are a subset of Go's interpreted-string escapes.
++        # Unsupported Go escapes stay unknown instead of being guessed safe.
++        return json.loads(expr)
++    except (ValueError, TypeError):
++        return None
++
++
++def command_arg_from_call(expr: str, method: str) -> str:
++    """Select executable/code inputs, not argv data (os/exec has no shell).
++
++    An unknown executable or interpreter option is conservative. Once a
++    shell's -c program is identified, later positional arguments are data.
++    For ordinary fixed programs, option injection is a separate rule/domain.
++    """
++    args = split_go_args(expr)
++    if method == 'CommandContext':
++        args = args[1:]
++    if not args:
++        return ''
++    executable = _literal_string(args[0])
++    if executable is None:
++        return ', '.join(args)
++    name = executable.replace('\\', '/').rsplit('/', 1)[-1].lower()
++    if name.endswith('.exe'):
++        name = name[:-4]
++    shell = name in {'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'fish'}
++    if shell:
++        code_flags = {'-c'}
++    elif re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', name):
++        code_flags = {'-c'}
++    elif name in {'node', 'nodejs'}:
++        code_flags = {'-e', '--eval', '-p', '--print'}
++    elif name in {'ruby', 'perl'}:
++        code_flags = {'-e', '-E'}
++    elif name == 'php':
++        code_flags = {'-r'}
++    elif name in {'powershell', 'pwsh', 'cmd', 'command'}:
++        # These shells may consume multiple command tokens, unlike sh -c.
++        return ', '.join(args[1:])
++    else:
++        return ''
++
++    for index, arg in enumerate(args[1:], start=1):
++        literal = _literal_string(arg)
++        if literal is None:
++            # Could be -c/-e, the program, or an expanded argument slice.
++            return ', '.join(args[index:])
++        if literal in code_flags or (shell and re.fullmatch(r'-[A-Za-z]*c[A-Za-z]*', literal)):
++            return args[index + 1] if index + 1 < len(args) else ''
++        if literal == '--' or not literal.startswith('-'):
++            # A fixed script path terminates interpreter option processing.
++            return ''
++    return ''
++
++
+ def brace_delta(raw: str) -> int:
+     stripped = strip_comments(raw)
+     return stripped.count('{') - stripped.count('}')
+@@ -362,6 +426,9 @@ def iter_file_hits(path: Path, base_dir: Path):
+                 if rule == 'go.taint.sql':
+                     method = match.group().rstrip()[:-1].rstrip().rsplit('.', 1)[-1]
+                     expr = sql_arg_from_call(expr, method)
++                elif rule == 'go.taint.command':
++                    method = match.group().rstrip()[:-1].rstrip().rsplit('.', 1)[-1]
++                    expr = command_arg_from_call(expr, method)
+                 taint_expr = _expression_for_sink(expr, rule)
+                 direct = find_sources(taint_expr)
+                 ref = meta = None

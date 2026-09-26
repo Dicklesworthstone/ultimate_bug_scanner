@@ -228,6 +228,58 @@ class GoTaintDomainTests(unittest.TestCase):
             with self.subTest(name=name):
                 check()
 
+    def test_fixed_executable_arguments_are_data_not_shell_source(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            exec.Command("ls", value)
+            exec.CommandContext(parent, "printf", "%s", value)
+            exec.Command("ls", filepath.Clean(value))
+            exec.Command(`echo`, value)
+        '''), [])
+
+    def test_dynamic_executable_is_dangerous_even_after_path_clean(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            exec.Command(value, "fixed")
+            exec.CommandContext(parent, filepath.Clean(value))
+        '''), ["go.taint.command"] * 2)
+
+    def test_shell_code_and_positional_data_are_distinguished(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            exec.Command("/bin/bash", "-lc", value)
+            exec.CommandContext(parent, "sh", "-c", value)
+            exec.Command("sh", "-c", "printf '%s'", "sh", value)
+            exec.Command("sh", "/opt/fixed-script.sh", value)
+        '''), ["go.taint.command"] * 2)
+
+    def test_interpreter_code_arguments_remain_dangerous(self):
+        for executable, flag in (("python3", "-c"), ("node", "--eval"),
+                                 ("ruby", "-e"), ("perl", "-E"), ("php", "-r")):
+            with self.subTest(executable=executable):
+                self.assertEqual(self.rules(f'''
+                    value := r.FormValue("q")
+                    exec.Command("{executable}", "{flag}", value)
+                '''), ["go.taint.command"])
+
+    def test_dynamic_interpreter_options_and_argv_expansion_are_conservative(self):
+        self.assertEqual(self.rules('''
+            value := r.FormValue("q")
+            exec.Command("sh", value, "fixed")
+            args := []string{"-c", value}
+            exec.Command("sh", args...)
+        '''), ["go.taint.command"] * 2)
+
+    def test_command_context_does_not_treat_context_as_code(self):
+        self.assertEqual(self.rules('''
+            context := r.FormValue("q")
+            exec.CommandContext(context, "echo", "fixed")
+        '''), [])
+
+    def test_repository_clean_taint_fixture_stays_clean(self):
+        path = ROOT / "test-suite/golang/clean/taint_analysis.go"
+        self.assertEqual(list(taint_go.run(RunContext(lang="go", files=[path]))), [])
+
 
 if __name__ == "__main__":
     unittest.main()

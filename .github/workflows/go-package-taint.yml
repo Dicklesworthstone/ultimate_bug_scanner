@@ -7,6 +7,8 @@ on:
       - .github/workflows/go-package-taint.yml
       - test-suite/patches/go-package-taint.patch
       - test-suite/patches/go-package-tests.py
+      - test-suite/patches/go-initializers.patch
+      - test-suite/patches/go-initializers-tests.py
   workflow_dispatch:
 
 permissions:
@@ -14,14 +16,13 @@ permissions:
 
 jobs:
   package-dataflow:
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,34 +40,40 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply reviewed package analysis and cache invalidation
+      - name: Apply reviewed package summaries and initializer fixpoint
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import subprocess
           def blob(path):
               return subprocess.check_output(['git', 'hash-object', path], text=True).strip()
-          before = {
-              'modules/helpers/ubs_core/analyzers/taint_go.py': '842527e589c080ad4d93e85c8ad4491ee577096e',
-              'modules/helpers/ubs_core/go_scan.py': 'e253f1628f8bf8067a478abae4b6dc30202fd93c',
-          }
-          after = {
-              'modules/helpers/ubs_core/analyzers/taint_go.py': '30746d92467d897880be6bec6fac04cca07d7fe7',
-              'modules/helpers/ubs_core/go_scan.py': 'bcf9f29e9c926f424229b556ad4dfea5104f3fab',
-          }
-          actual = {path: blob(path) for path in before}
-          if actual != after:
-              assert actual == before, ('Reconcile changed Go sources before applying', actual)
-              subprocess.run(['git', 'apply', '--check', 'test-suite/patches/go-package-taint.patch'], check=True)
-              subprocess.run(['git', 'apply', 'test-suite/patches/go-package-taint.patch'], check=True)
-          assert {path: blob(path) for path in after} == after
-          target = Path('test-suite/quality/test_taint_go_packages.py')
-          reviewed = Path('test-suite/patches/go-package-tests.py')
-          assert blob(str(reviewed)) == '45aa4fa43e65be6e36b436aed27f7908e8889ce7'
-          if target.exists():
-              assert target.read_bytes() == reviewed.read_bytes(), 'Do not overwrite newer tests'
-          else:
-              target.write_bytes(reviewed.read_bytes())
+          def apply(path):
+              subprocess.run(['git', 'apply', '--check', path], check=True)
+              subprocess.run(['git', 'apply', path], check=True)
+          source = 'modules/helpers/ubs_core/analyzers/taint_go.py'
+          runner = 'modules/helpers/ubs_core/go_scan.py'
+          state = (blob(source), blob(runner))
+          original = ('842527e589c080ad4d93e85c8ad4491ee577096e', 'e253f1628f8bf8067a478abae4b6dc30202fd93c')
+          package = ('30746d92467d897880be6bec6fac04cca07d7fe7', 'bcf9f29e9c926f424229b556ad4dfea5104f3fab')
+          final = ('c0c49d10da545f147813899f997302cf4fefcfbf', 'bcf9f29e9c926f424229b556ad4dfea5104f3fab')
+          assert state in (original, package, final), ('Reconcile changed Go sources before applying', state)
+          if state == original:
+              apply('test-suite/patches/go-package-taint.patch')
+              assert (blob(source), blob(runner)) == package
+          if (blob(source), blob(runner)) == package:
+              apply('test-suite/patches/go-initializers.patch')
+          assert (blob(source), blob(runner)) == final
+          for pending, name, sha in (
+              ('go-package-tests.py', 'test_taint_go_packages.py', '45aa4fa43e65be6e36b436aed27f7908e8889ce7'),
+              ('go-initializers-tests.py', 'test_taint_go_initializers.py', '5992315ddf71eef5d98add44d7e7639754e4d6f8'),
+          ):
+              target = Path('test-suite/quality') / name
+              reviewed = Path('test-suite/patches') / pending
+              assert blob(str(reviewed)) == sha
+              if target.exists():
+                  assert target.read_bytes() == reviewed.read_bytes(), 'Do not overwrite newer tests'
+              else:
+                  target.write_bytes(reviewed.read_bytes())
           PY
       - name: Run actual analyzer and incremental-cache regressions
         run: |
@@ -80,8 +87,8 @@ jobs:
           git diff --check
       - name: Install real scanner dependencies
         run: |
-          brew install bash jq ripgrep rsync shellcheck
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
       - name: Regenerate the complete verified runtime chain
         run: |
@@ -106,6 +113,9 @@ jobs:
               ('html-not-sql', 'func escape(v string) string { return html.EscapeString(v) }', 'func h() { db.Query(escape(r.FormValue("q"))) }', {'sql'}),
               ('safe-constant', 'func send(v string) { exec.Command("sh", "-c", v) }', 'func h() { send("echo safe") }', set()),
               ('parameterized-sql', 'func lookup(v string) { db.Query("SELECT $1", v) }', 'func h() { lookup(r.FormValue("q")) }', set()),
+              ('forward-initializer', 'var raw = os.Getenv("QUERY")', 'var query = raw\nfunc h() { db.Query(query) }', {'sql'}),
+              ('grouped-initializer', 'var raw = os.Getenv("QUERY")', 'var (query string = raw)\nfunc h() { db.Query(query) }', {'sql'}),
+              ('clean-initializer', 'var raw = "SELECT 1"', 'var (query string = raw)\nfunc h() { db.Query(query) }', set()),
           ]
           for name, helper, caller, expected in cases:
               with tempfile.TemporaryDirectory(prefix='ubs-go-package-e2e-') as tmp:
@@ -121,6 +131,7 @@ jobs:
                   (folder / 'stderr.log').write_text(result.stderr)
                   assert result.returncode in (0, 1), (name, result.stdout, result.stderr)
                   report = json.loads(result.stdout)
+                  (folder / 'result.json').write_text(json.dumps(report, indent=2))
                   assert report['status'] == 'ok', report
                   rules = set()
                   def visit(value):
@@ -155,7 +166,7 @@ jobs:
           scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
                      *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
           sources = ['modules/helpers/ubs_core/analyzers/taint_go.py', 'modules/helpers/ubs_core/go_scan.py',
-                     'test-suite/quality/test_taint_go_packages.py']
+                     'test-suite/quality/test_taint_go_packages.py', 'test-suite/quality/test_taint_go_initializers.py']
           allowed = set(scripts + sources + ['SHA256SUMS'])
           changed = set(git('diff', '--name-only').splitlines())
           untracked = set(git('ls-files', '--others', '--exclude-standard').splitlines())

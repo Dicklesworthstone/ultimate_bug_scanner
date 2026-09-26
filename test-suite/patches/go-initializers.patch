@@ -1,0 +1,96 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ubs_core/analyzers/taint_go.py
+index 30746d9..c0c49d1 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_go.py
++++ b/modules/helpers/ubs_core/analyzers/taint_go.py
+@@ -314,6 +314,16 @@ class _Parser:
+         return tuple(statements)
+ 
+     def statement(self, start: int, end: int):
++        declaration = re.match(r'(var|const)\s*\(', self.code[start:end])
++        if declaration:
++            opening = start + declaration.end() - 1
++            close = self.pairs.get(opening)
++            if close is not None:
++                # A declaration group is not a lexical block. Its individual
++                # specs retain their original offsets and share the scope.
++                body = tuple(replace(node, kind=declaration.group(1))
++                             for node in self.block(opening + 1, close))
++                return _Statement(start, close + 1, 'declarations', body), close + 1
+         if self.code[start] == '{' and start in self.pairs:
+             close = self.pairs[start]
+             return _Statement(start, close + 1, 'block', self.block(start + 1, close)), close + 1
+@@ -625,8 +635,9 @@ class _Analysis:
+             facts.append(state.get(scope.bindings.get(name, name), _CLEAN))
+         return _join(*facts)
+ 
+-    def simple(self, start: int, end: int, state, scope) -> _Flow:
+-        code = self.code[start:end]
++    def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
++        prefix = declaration_kind + ' ' if declaration_kind else ''
++        code = prefix + self.code[start:end]
+         keyword = re.match(r'\s*(return|break|continue)\b', code)
+         if keyword:
+             if keyword.group(1) == 'break':
+@@ -648,7 +659,7 @@ class _Analysis:
+             if match is None:
+                 continue
+             targets = [name.strip() for name in match.group('targets').split(',')]
+-            expr_start = start + match.start('expr')
++            expr_start = start + match.start('expr') - len(prefix)
+             values = self.values(self.source[expr_start:end], expr_start, state, scope)
+             declaration = match.group('op') == ':=' or bool(re.match(r'\s*(?:var|const)\b', code))
+             updates = {}
+@@ -683,6 +694,10 @@ class _Analysis:
+         return _Flow(state, breaks, continues)
+ 
+     def statement(self, node, state, scope) -> _Flow:
++        if node.kind in {'var', 'const'}:
++            return self.simple(node.start, node.end, state, scope, node.kind)
++        if node.kind == 'declarations':
++            return self.block(node.body, state, scope)
+         if node.kind == 'simple':
+             return self.simple(node.start, node.end, state, scope)
+         if node.kind == 'block':
+@@ -751,6 +766,23 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
+             cursor = function.end
+         global_nodes.extend(parser.block(cursor, len(code)))
+     globals_scope = _Scope()
++    def declare_globals(nodes):
++        for node in nodes:
++            if node.kind == 'declarations':
++                declare_globals(node.body)
++                continue
++            prefix = node.kind + ' ' if node.kind in {'var', 'const'} else ''
++            declaration = re.match(r'\s*(?:var|const)\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
++                                   prefix + code[node.start:node.end])
++            if declaration:
++                for target in declaration.group(1).split(','):
++                    target = target.strip()
++                    if target != '_':
++                        globals_scope.declare(target, node.start)
++    # Package declarations are in scope even before their initializer appears.
++    # Pre-bind their stable cells so a forward reference cannot accidentally
++    # read a different, unbound name on the first pass.
++    declare_globals(global_nodes)
+     global_analysis = _Analysis(source, code, rule, summaries)
+     global_state = {}
+     by_name = defaultdict(list)
+@@ -770,12 +802,15 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
+         name = pending.popleft()
+         queued.discard(name)
+         if name == '@globals':
+-            globals_scope = _Scope()
+             global_analysis = _Analysis(source, code, rule, summaries)
+-            updated = global_analysis.block(global_nodes, {}, globals_scope).normal or {}
++            updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
++            updated = _join_states(global_state, updated)
+             if updated != global_state:
+                 global_state = updated
+-                for caller in summaries:
++                # Initializers can depend on later variables, including through
++                # local helper calls. Join finite facts and revisit both sides
++                # until stable, not for an arbitrary number of file passes.
++                for caller in ('@globals', *summaries):
+                     if caller not in queued:
+                         pending.append(caller)
+                         queued.add(caller)

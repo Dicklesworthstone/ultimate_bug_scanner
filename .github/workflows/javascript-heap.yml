@@ -4,8 +4,14 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/javascript-heap-source.patch.gz
-      - test-suite/patches/javascript-heap-calls.patch.gz
+      - ubs
+      - modules/ubs-js.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/**
+      - test-suite/quality/*js*.py
+      - test-suite/js/test_taint_domains.py
+      - test-suite/js/test_taint_scopes.py
+      - test-suite/js/test_taint_effects.py
       - .github/workflows/javascript-heap.yml
   workflow_dispatch:
     inputs:
@@ -22,9 +28,6 @@ jobs:
   heap-regressions:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 20
-    # Store tested immutable Git blobs only. No commit, branch or tag writes.
-    permissions:
-      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -56,27 +59,9 @@ jobs:
             sudo apt-get install -y bash jq ripgrep rsync shellcheck
           fi
           npm install --global @ast-grep/cli
-      - name: Apply the exact local and interprocedural heap implementations
+      - name: Verify the committed production integrity chain
         run: |
           bash -c 'test "$BASH_VERSINFO" -ge 5'
-          test "$(git hash-object test-suite/patches/javascript-heap-source.patch.gz)" = 0dc09146652bec4fc2e991222314081e679a4479
-          base="$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)"
-          if [ "$base" = 477c8ac86895e19afdf6dacc96834c93cb90b736 ]; then
-            gzip -dc test-suite/patches/javascript-heap-source.patch.gz > "$RUNNER_TEMP/js-heap-source.patch"
-            git apply --check "$RUNNER_TEMP/js-heap-source.patch"
-            git apply "$RUNNER_TEMP/js-heap-source.patch"
-          else
-            test "$base" = 9d982e5f001212eb6eaec9166c01604f2fe97989
-          fi
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 9d982e5f001212eb6eaec9166c01604f2fe97989
-          test "$(git hash-object test-suite/quality/test_taint_js_heap.py)" = 150d578fb48cc1b8c213211753ca68412909f394
-          test "$(git hash-object test-suite/patches/javascript-heap-calls.patch.gz)" = fa67fce149d2afbae9d1cd0e6c0133db60a145df
-          gzip -dc test-suite/patches/javascript-heap-calls.patch.gz > "$RUNNER_TEMP/js-heap-calls.patch"
-          git apply --check "$RUNNER_TEMP/js-heap-calls.patch"
-          git apply "$RUNNER_TEMP/js-heap-calls.patch"
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = c924bd3b74664208b056eb27be867c5ef70a7ad4
-          test "$(git hash-object test-suite/quality/test_taint_js_heap.py)" = 0bb5d1266bc01fa17a7b94dbb7e3872e4817efd2
-          python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --check
@@ -104,53 +89,15 @@ jobs:
           python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
           shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
           for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
-      - name: Verify deterministic checksum closure and publish tested blobs
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Verify byte-identical production checksum regeneration
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          from pathlib import Path
-          new_test = 'test-suite/quality/test_taint_js_heap.py'
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          changed = sorted(set(changed) | {new_test})
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_js.py', new_test}
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert set(changed) <= allowed, changed
-          before = {name: Path(name).read_bytes() for name in changed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
-          after = sorted(set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | {new_test})
-          assert changed == after, (changed, after)
-          assert all(Path(name).read_bytes() == data for name, data in before.items())
-          subprocess.run(['./scripts/verify_checksums.sh'], check=True)
-          subprocess.run(['./scripts/verify_sha256sums.sh'], check=True)
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          manifest = []
-          for name in changed:
-              data = Path(name).read_bytes()
-              result = subprocess.run(['gh', 'api', '--method', 'POST',
-                  f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
-                  text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(result.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              entry = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
-              mode = entry[0] if entry else '100644'
-              manifest.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha})
-              print('JS_HEAP_BLOB', name, sha, mode, flush=True)
-          Path(os.environ['RUNNER_TEMP'], 'js-heap-tested-blobs.json').write_text(json.dumps(manifest, indent=2))
-          print('JS_HEAP_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
-          PY
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 scripts/update_checksums.py
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: javascript-heap-validation
-          path: |
-            ${{ runner.temp }}/js-heap-tested-blobs.json
-            test-suite/artifacts/javascript-heap/
+          path: test-suite/artifacts/javascript-heap/
           retention-days: 3

@@ -2,6 +2,8 @@
 
 Executable-expression masks retain template interpolation and source offsets.
 Local functions use finite return/sink summaries and ordered assignment state.
+Known local allocations retain heap aliases, property state and ordinary array
+mutator effects. General heap mutation through helper calls is not summarized.
 The lexical front end handles ordinary functions, arrows and structured blocks;
 cross-file calls, dynamic dispatch and the full JavaScript grammar are not modeled.
 
@@ -560,6 +562,53 @@ class _Trace:
     path: tuple[str, ...] = field(default=(), compare=False)
 
 
+class _Fact(frozenset):
+    """Immutable taint origins plus references to finite allocation sites.
+
+    References are not taint: a clean object is still a value, and two names
+    can refer to it before a later property write introduces any source.
+    """
+
+    def __new__(cls, traces=(), refs=()):
+        value = super().__new__(cls, traces)
+        object.__setattr__(value, 'refs', frozenset(refs))
+        return value
+
+    def __setattr__(self, name, value):
+        raise AttributeError('taint facts are immutable')
+
+    def __bool__(self):
+        return bool(len(self) or self.refs)
+
+    def __eq__(self, other):
+        return (isinstance(other, frozenset) and frozenset.__eq__(self, other)
+                and self.refs == getattr(other, 'refs', frozenset()))
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        # Retain the frozenset hash for ordinary scalar facts.
+        return hash((frozenset(self), self.refs)) if self.refs else frozenset.__hash__(self)
+
+
+def _refs(fact):
+    return getattr(fact, 'refs', frozenset())
+
+
+def _materialize(fact, heap, seen=frozenset()):
+    """Snapshot reachable taint at a consumption point; cycles are finite."""
+    result = frozenset()
+    pending, visited = [fact], set(seen)
+    while pending:
+        current = pending.pop()
+        result = _join(result, frozenset(current))
+        for ref in _refs(current) - visited:
+            visited.add(ref)
+            pending.extend(heap.get(ref, {}).values())
+    return result
+
+
 def _join(*facts):
     traces = {}
     for fact in facts:
@@ -567,7 +616,7 @@ def _join(*facts):
             previous = traces.get(trace)
             if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
                 traces[trace] = trace
-    return frozenset(traces.values())
+    return _Fact(traces.values(), frozenset().union(*(_refs(fact) for fact in facts)))
 
 
 def _step(fact, name):
@@ -577,7 +626,7 @@ def _step(fact, name):
         if len(path) > PATH_LIMIT:
             path = (path[0], *path[-(PATH_LIMIT - 1):])
         traces.append(_Trace(trace.origin, path))
-    return frozenset(traces)
+    return _Fact(traces, _refs(fact))
 
 
 class _State(dict):
@@ -588,6 +637,10 @@ class _State(dict):
         # local must never redirect a callee's write into its lexical parent.
         self.owners = dict(getattr(values, 'owners', {}))
         self.cells = dict(getattr(values, 'cells', {}))
+        self.heap = {ref: dict(slots) for ref, slots in getattr(values, 'heap', {}).items()}
+        self.weak_refs = set(getattr(values, 'weak_refs', ()))
+        self.array_lengths = dict(getattr(values, 'array_lengths', {}))
+        self.written_cells = set(getattr(values, 'written_cells', ()))
 
     def copy(self):
         return _State(self)
@@ -595,7 +648,9 @@ class _State(dict):
     def __eq__(self, other):
         return (isinstance(other, _State) and dict.__eq__(self, other)
                 and self.bindings == other.bindings and self.owners == other.owners
-                and self.cells == other.cells)
+                and self.cells == other.cells and self.heap == other.heap
+                and self.weak_refs == other.weak_refs and self.array_lengths == other.array_lengths
+                and self.written_cells == other.written_cells)
 
 
 def _cell_input(key):
@@ -627,6 +682,17 @@ def _join_states(*states):
         # A branch without a write preserves the incoming cell, not bottom.
         # This also permits a definitely executed clean setter to kill taint.
         result.cells[key] = _join(*(_cell_value(key, state) for state in states))
+    for ref in set().union(*(state.heap.keys() for state in states)):
+        # Allocation sites can be absent on one branch; only paths on which
+        # the object exists contribute its property values.
+        objects = [state.heap[ref] for state in states if ref in state.heap]
+        keys = set().union(*(slots.keys() for slots in objects))
+        result.heap[ref] = {key: _join(*(slots.get(key, frozenset()) for slots in objects)) for key in keys}
+    result.weak_refs = set().union(*(state.weak_refs for state in states))
+    result.written_cells = set().union(*(state.written_cells for state in states))
+    for ref in set().union(*(state.array_lengths.keys() for state in states)):
+        lengths = [state.array_lengths[ref] for state in states if ref in state.array_lengths]
+        result.array_lengths[ref] = lengths[0] if all(length == lengths[0] for length in lengths) else None
     return result
 
 
@@ -655,6 +721,24 @@ class _Statement:
     body: list = field(default_factory=list)
     alternate: list = field(default_factory=list)
     extra: object = None
+
+
+@dataclass(eq=False)
+class _HeapCall:
+    """A reusable transfer summary for one abstract heap input, not an inline AST.
+
+    The worklist evaluates callees separately. Inputs retain alias equivalence
+    and exact property facts; different actual inputs never share mutable state.
+    """
+
+    scope: _Scope
+    rule: str
+    location: int
+    bound: dict
+    incoming: _State
+    ancestors: frozenset
+    result: object = None
+    readers: set = field(default_factory=set)
 
 
 def _pairs(code, start=0, end=None):
@@ -1101,7 +1185,9 @@ class _Flow:
         self.breaks, self.continues = [], []
         self.pairs = _pairs(scope.code, scope.body_start, scope.body_end)
 
-    def effect(self, start, label, fact):
+    def effect(self, start, label, fact, state=None):
+        if state is not None:
+            fact = _materialize(fact, state.heap)
         if fact:
             key = (start, label)
             self.effects[key] = _join(self.effects.get(key, frozenset()), fact)
@@ -1122,6 +1208,250 @@ class _Flow:
             key = state.owners.get(name, self.engine.binding(self.scope, name, position))
             state.owners[name] = key
             state.cells[key] = state[name]
+            state.written_cells.add(key)
+
+    @staticmethod
+    def property_key(raw):
+        raw = raw.strip()
+        if re.fullmatch(r'[A-Za-z_$][\w$]*|(?:0|[1-9][0-9]*)', raw):
+            return raw
+        if len(raw) >= 2 and raw[0] in '\'"' and raw[-1] == raw[0] and '\\' not in raw[1:-1]:
+            return raw[1:-1]
+        return None
+
+    @staticmethod
+    def array_index(key):
+        if key is not None and re.fullmatch(r'0|[1-9][0-9]*', key):
+            # Other numeric-looking names are ordinary properties, not indices.
+            return int(key) if len(key) <= 10 and int(key) < 4294967295 else None
+        return None
+
+    def access(self, start, end):
+        """A variable and balanced dot/bracket selectors, at real offsets."""
+        code, text = self.scope.code, self.engine.text
+        root = re.match(r'[A-Za-z_$][\w$]*', code[start:end])
+        if root is None:
+            return None
+        selectors, cursor = self.selectors(start + root.end(), end)
+        return root.group(), selectors, cursor
+
+    def selectors(self, cursor, end, stop_at_call=False):
+        code, text = self.scope.code, self.engine.text
+        selectors = []
+        while cursor < end:
+            before = cursor
+            while cursor < end and code[cursor].isspace():
+                cursor += 1
+            member = re.match(r'\?*\.\s*([A-Za-z_$][\w$]*)', code[cursor:end])
+            if member:
+                if stop_at_call and code[cursor + member.end():end].lstrip().startswith('('):
+                    cursor = before
+                    break
+                selectors.append((member.group(1), None))
+                cursor += member.end()
+            elif code[cursor:cursor + 1] == '[' and self.pairs.get(cursor, end) < end:
+                closing = self.pairs[cursor]
+                raw = text[cursor + 1:closing].strip()
+                key = self.property_key(raw) if raw.startswith(('"', "'")) or raw.isdecimal() else None
+                selectors.append((key, (cursor + 1, closing) if key is None else None))
+                cursor = closing + 1
+            else:
+                cursor = before
+                break
+        return selectors, cursor
+
+    def property(self, fact, key, state):
+        # Unknown objects retain the original conservative parameter/source
+        # fact. Known allocations allow unrelated clean fields to stay clean.
+        result = frozenset(fact)
+        for ref in _refs(fact):
+            slots = state.heap.get(ref, {})
+            if key == 'length' and ref in state.array_lengths:
+                continue  # array length is a count, not attacker-provided text
+            if key is None:
+                result = _join(result, *slots.values())
+            else:
+                result = _join(result, slots.get(key, frozenset()), slots.get(None, frozenset()))
+        return result
+
+    def read_access(self, parsed, state, evaluate_keys=True):
+        root, selectors, _end = parsed
+        fact = self.reference(root, state)
+        for key, expression in selectors:
+            selected = frozenset()
+            if expression is not None:
+                # Computed keys have effects. Unknown/external maps also keep
+                # conservative selector flow; their unseen stored values are
+                # not evidence of safety. Known allocations use their slots.
+                selected = (self.value(*expression, state) if evaluate_keys
+                            else self.operand_snapshot(*expression, state))
+            unknown = not _refs(fact) or bool(frozenset(fact))
+            fact = self.property(fact, key, state)
+            if unknown:
+                fact = _join(fact, selected)
+        return fact
+
+    def write_property(self, fact, key, value, state):
+        refs = _refs(fact)
+        strong = (len(refs) == 1 and key is not None and not frozenset(fact)
+                  and not refs & state.weak_refs)
+        for ref in refs:
+            slots = state.heap.setdefault(ref, {})
+            slots[key] = value if strong else _join(slots.get(key, frozenset()), value)
+            if ref in state.array_lengths:
+                length = state.array_lengths[ref]
+                if key is None or key == 'length':
+                    state.array_lengths[ref] = None
+                elif self.array_index(key) is not None and length is not None:
+                    state.array_lengths[ref] = max(length, int(key) + 1)
+
+    def allocate(self, start, end, state):
+        text, code = self.engine.text, self.scope.code
+        ref = (self.scope, start)
+        slots = {}
+        array = code[start] == '['
+        unknown_offset = False
+        length = 0
+        for index, (left, right) in enumerate(_chunks(code, start + 1, end - 1)):
+            raw = text[left:right].strip()
+            if not raw:
+                if array and right < end - 1:
+                    length += 1  # an interior hole contributes to array length
+                continue
+            length += 1
+            if raw.startswith('...'):
+                begin = left + text[left:right].index('...') + 3
+                spread = self.value(begin, right, state)
+                if array:
+                    unknown_offset = True
+                    slots[None] = _join(slots.get(None, frozenset()), _materialize(spread, state.heap))
+                else:
+                    refs = _refs(spread)
+                    if len(refs) == 1 and not frozenset(spread):
+                        slots.update(state.heap.get(next(iter(refs)), {}))
+                    else:
+                        slots[None] = _join(slots.get(None, frozenset()), _materialize(spread, state.heap))
+                continue
+            if array:
+                key, begin = (None if unknown_offset else str(index)), left
+            else:
+                _, colon = next(_chunks(code, left, right, ':'))
+                key = self.property_key(text[left:colon])
+                if text[left:colon].strip().startswith('['):
+                    opening = left + text[left:colon].index('[')
+                    closing = self.pairs.get(opening)
+                    if closing is not None:
+                        raw_key = text[opening + 1:closing].strip()
+                        key = self.property_key(raw_key) if raw_key.startswith(('"', "'")) or raw_key.isdecimal() else None
+                        if key is None:
+                            self.value(opening + 1, closing, state)
+                begin = colon + 1 if colon < right else left
+            value = self.value(begin, right, state)
+            slots[key] = _join(slots.get(key, frozenset()), value) if key is None else value
+        # Repeated visits to a loop allocation site summarize all its objects;
+        # do not discard earlier aliases when the site is evaluated again.
+        previous = state.heap.get(ref)
+        if previous is not None:
+            state.weak_refs.add(ref)
+            slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
+                     for key in previous.keys() | slots.keys()}
+        state.heap[ref] = slots
+        if array:
+            state.array_lengths[ref] = None if unknown_offset or previous is not None else length
+        return _Fact(refs=(ref,))
+
+    def mutation_call(self, name, arguments, facts, state):
+        """Model ordinary built-in mutators without treating counts as data.
+
+        Exact lengths widen to unknown at branch/loop disagreement. No length
+        counter can grow forever in the worklist, and uncertain aliases never
+        receive a destructive strong update.
+        """
+        if name == 'Object.assign' and state.bindings.get('Object', 'imported') == 'imported' and facts:
+            target = facts[0]
+            if not _refs(target):
+                return None
+            for source in facts[1:]:
+                refs = _refs(source)
+                keys = set().union(*(state.heap.get(ref, {}).keys() for ref in refs))
+                for key in keys:
+                    incoming = self.property(source, key, state)
+                    # Missing keys on an alternative source must retain the
+                    # target's old value; Object.assign does not delete them.
+                    if len(refs) != 1 or frozenset(source):
+                        incoming = _join(incoming, self.property(target, key, state))
+                    self.write_property(target, key, incoming, state)
+                if frozenset(source):
+                    self.write_property(target, None, frozenset(source), state)
+            return target
+        receiver_name, dot, method = name.rpartition('.')
+        if not dot or method not in {'push', 'unshift', 'pop', 'shift', 'reverse'}:
+            return None
+        parts = receiver_name.split('.')
+        receiver = self.reference(parts[0], state)
+        for key in parts[1:]:
+            receiver = self.property(receiver, key, state)
+        refs = _refs(receiver)
+        if not refs or any(ref not in state.array_lengths or method in state.heap[ref] for ref in refs):
+            return None
+        returned = frozenset()
+        spread = any(self.engine.text[left:right].lstrip().startswith('...') for left, right in arguments)
+        for ref in refs:
+            slots = state.heap[ref]
+            length = state.array_lengths[ref]
+            precise = len(refs) == 1 and ref not in state.weak_refs and length is not None
+            numeric = {key: value for key, value in slots.items() if self.array_index(key) is not None}
+            if method in {'push', 'unshift'}:
+                if not facts:
+                    continue
+                if not precise or spread:
+                    slots[None] = _join(slots.get(None, frozenset()), *facts,
+                                        *numeric.values() if method == 'unshift' else ())
+                    state.array_lengths[ref] = None
+                else:
+                    if method == 'unshift':
+                        for key in numeric:
+                            slots.pop(key)
+                        slots.update({str(int(key) + len(facts)): value for key, value in numeric.items()})
+                    for offset, value in enumerate(facts):
+                        slots[str((length if method == 'push' else 0) + offset)] = value
+                    state.array_lengths[ref] = length + len(facts)
+            elif method in {'pop', 'shift'}:
+                if not precise:
+                    returned = _join(returned, *slots.values())
+                elif length:
+                    index = str(length - 1) if method == 'pop' else '0'
+                    returned = _join(returned, slots.pop(index, frozenset()), slots.get(None, frozenset()))
+                    if method == 'shift':
+                        for key in numeric:
+                            slots.pop(key, None)
+                        slots.update({str(int(key) - 1): value for key, value in numeric.items() if int(key) > 0})
+                    state.array_lengths[ref] = length - 1
+            else:  # reverse returns the same array, not a copy
+                if precise:
+                    for key in numeric:
+                        slots.pop(key)
+                    slots.update({str(length - int(key) - 1): value for key, value in numeric.items() if int(key) < length})
+                else:
+                    slots[None] = _join(slots.get(None, frozenset()), *numeric.values())
+        return receiver if method == 'reverse' else returned
+
+    def operand_snapshot(self, start, end, state):
+        """Consume non-call operands before a later call mutates the heap."""
+        text, code = self.engine.text[start:end], self.scope.code[start:end]
+        facts = [frozenset({_Trace(('source', source), (source,))})
+                 for source, _ in assignment_sources(text)]
+        consumed = 0
+        for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*', code):
+            if match.start() < consumed or code[match.end():].lstrip().startswith(':'):
+                continue
+            if match.group() in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
+                continue
+            parsed = self.access(start + match.start(), end)
+            if parsed:
+                facts.append(self.read_access(parsed, state, evaluate_keys=False))
+                consumed = parsed[2] - start
+        return _materialize(_join(*facts), state.heap)
 
     def apply_writes(self, writes, callee, bound, state, incoming):
         # Substitute against one pre-call snapshot. Reading a preceding update
@@ -1129,6 +1459,7 @@ class _Flow:
         for key, fact in writes.items():
             value = self.substitute(fact, callee, bound, incoming)
             state.cells[key] = value
+            state.written_cells.add(key)
             name = key[2]
             if name not in state or state.owners.get(name) == key:
                 state[name], state.owners[name] = value, key
@@ -1200,18 +1531,32 @@ class _Flow:
                     default_flow = _Flow(self.engine, callee, self.rule)
                     default_flow.parameter_context = True
                     default_state = _State()
+                    default_state.cells = dict(state.cells)
+                    default_state.heap = {ref: dict(slots) for ref, slots in state.heap.items()}
+                    default_state.weak_refs = set(state.weak_refs)
+                    default_state.array_lengths = dict(state.array_lengths)
                 default_state.update(bound)
                 for name in bound:
                     default_state.owners[name] = self.engine.binding(callee, name)
                 default_flow.pairs.update(_pairs(callee.code, *default))
-                incoming = _join(incoming, default_flow.value(*default, default_state))
+                bypass = default_state.copy() if uncertain is not None and index >= uncertain else None
+                default_fact = default_flow.value(*default, default_state)
+                if bypass is not None:
+                    # An unknown spread may supply this formal. The default's
+                    # effects are possible, not proof that cleanup occurred.
+                    default_state = _join_states(bypass, default_state)
+                incoming = _join(incoming, default_fact)
             for name in names:
                 bound[name] = incoming
         if default_flow is not None:
             incoming = state.copy()
             for (location, label), fact in default_flow.effects.items():
-                self.effect(location, label, self.substitute(fact, callee, bound, incoming))
-            writes = {key: value for key, value in default_state.cells.items() if key[0] is not callee}
+                self.effect(location, label, self.substitute(fact, callee, bound, incoming), incoming)
+            state.heap = default_state.heap
+            state.weak_refs = default_state.weak_refs
+            state.array_lengths = default_state.array_lengths
+            writes = {key: value for key, value in default_state.cells.items()
+                      if key[0] is not callee and key in default_state.written_cells}
             self.apply_writes(writes, callee, bound, state, incoming)
             for dependency, callers in self.engine.dependents.items():
                 if dependency[1] == self.rule and callee in callers:
@@ -1250,18 +1595,39 @@ class _Flow:
             return frozenset()
         if code[start] == '(' and self.pairs.get(start) == end - 1:
             return self.value(start + 1, end - 1, state)
-        assignment = re.match(r'([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[start:end])
+        if code[start] in '[{' and self.pairs.get(start) == end - 1:
+            return self.allocate(start, end, state)
+        access = self.access(start, end)
+        assignment = (re.match(r'\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[access[2]:end])
+                      if access else None)
         if assignment:
-            target = assignment.group(1)
-            rhs = start + assignment.end()
+            target = re.sub(r'\s+', '', text[start:access[2]])
+            rhs = access[2] + assignment.end()
+            receiver = None
+            if access[1]:
+                receiver = self.read_access((access[0], access[1][:-1], access[2]), state)
+                key, computed = access[1][-1]
+                if computed is not None:
+                    self.value(*computed, state)
             fact = self.value(rhs, end, state)
-            if assignment.group(2) != '=':
-                fact = _join(self.reference(target, state), fact)
-            self.assign(target, fact, state, start, self.callable(rhs, end, state))
+            if assignment.group(1) != '=':
+                old = self.property(receiver, key, state) if receiver is not None else self.reference(target, state)
+                fact = _join(old, fact)
+            if receiver is not None and _refs(receiver):
+                self.write_property(receiver, key, _step(fact, target), state)
+            else:
+                self.assign(target, fact, state, start, self.callable(rhs, end, state))
             for location, expr_start, rule, label in self.engine.write_sinks:
                 if rule == self.rule and start <= location < rhs <= expr_start:
-                    self.effect(location, label, fact)
+                    self.effect(location, label, fact, state)
             return fact
+        if access and access[2] == end:
+            fact = self.read_access(access, state)
+            root_fact = self.reference(access[0], state)
+            sources = () if _refs(root_fact) and not frozenset(root_fact) else assignment_sources(text[start:end])
+            sources = frozenset(_Trace(('source', source), (source,))
+                                for source, _ in sources)
+            return _join(fact, sources)
         operators, question, colon, depth = [], None, None, 0
         cursor = start
         while cursor < end:
@@ -1292,6 +1658,10 @@ class _Flow:
             state.update(merged)
             state.bindings = dict(merged.bindings)
             state.owners, state.cells = dict(merged.owners), dict(merged.cells)
+            state.heap = merged.heap
+            state.weak_refs = merged.weak_refs
+            state.array_lengths = merged.array_lengths
+            state.written_cells = merged.written_cells
             return _join(*facts)
         if operators:
             _, operator = min(operators, key=lambda item: (item[0], -item[1]))
@@ -1303,6 +1673,10 @@ class _Flow:
             state.update(merged)
             state.bindings = dict(merged.bindings)
             state.owners, state.cells = dict(merged.owners), dict(merged.cells)
+            state.heap = merged.heap
+            state.weak_refs = merged.weak_refs
+            state.array_lengths = merged.array_lengths
+            state.written_cells = merged.written_cells
             return _join(left, right)
         remainder = list(code[start:end])
         source_remainder = list(text[start:end])
@@ -1311,6 +1685,7 @@ class _Flow:
             if left < right:
                 source_remainder[left - start:right - start] = [' '] * (right - left)
         facts = []
+        sole_local_call = False
         call_pattern = re.compile(r'(?<![\w$])(?:new\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(')
         cursor = start
         while cursor < end:
@@ -1322,6 +1697,10 @@ class _Flow:
             if closing is None or closing >= end:
                 cursor = match.end()
                 continue
+            if cursor < match.start():
+                facts.append(self.operand_snapshot(cursor, match.start(), state))
+                remainder[cursor - start:match.start() - start] = [' '] * (match.start() - cursor)
+                source_remainder[cursor - start:match.start() - start] = [' '] * (match.start() - cursor)
             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
                          if code[left:right].strip()]
             argument_facts = [self.value(left, right, state) for left, right in arguments]
@@ -1330,15 +1709,22 @@ class _Flow:
             if '.' not in callee_name:
                 callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
             if isinstance(callee, _Scope):
+                sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
-                returned, effects, writes = self.engine.summaries.get((callee, self.rule), (frozenset(), {}, {}))
                 bound = self.bind(callee, argument_facts, arguments, state)
                 incoming = state.copy()
-                call_fact = self.substitute(returned, callee, bound, incoming)
-                for (location, label), fact in effects.items():
-                    self.effect(location, label, self.substitute(fact, callee, bound, incoming))
-                self.apply_writes(writes, callee, bound, state, incoming)
+                if self.engine.heap_required(callee, bound, incoming):
+                    call_fact, effects = self.engine.heap_call(callee, self.rule, match.start(), bound, state)
+                    for (location, label), fact in effects.items():
+                        self.effect(location, label, fact)
+                else:
+                    returned, effects, writes = self.engine.summaries.get((callee, self.rule), (frozenset(), {}, {}))
+                    call_fact = self.substitute(returned, callee, bound, incoming)
+                    for (location, label), fact in effects.items():
+                        self.effect(location, label, self.substitute(fact, callee, bound, incoming), incoming)
+                    self.apply_writes(writes, callee, bound, state, incoming)
             else:
+                mutation = self.mutation_call(callee_name, arguments, argument_facts, state)
                 call_fact = _join(*argument_facts)
                 receiver = callee_name.split('.')[0]
                 if '.' in callee_name:
@@ -1355,21 +1741,38 @@ class _Flow:
                 binding = state.bindings.get(receiver, 'imported')
                 if sink and sink[0] == self.rule and state.bindings.get(callee_name, 'imported') == 'imported':
                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
-                    self.effect(match.start(), sink[1], _join(*selected))
+                    self.effect(match.start(), sink[1], _join(*selected), state)
                 regex = SANITIZERS_BY_RULE.get(self.rule)
                 following = code[closing + 1:end].lstrip()
                 if regex and regex.match(candidate) and not following.startswith(('.', '[')):
                     previous = code[:match.start()].rstrip()
                     if not previous.endswith('.') and binding == 'imported':
                         call_fact = frozenset()
+                # Unknown calls may transform or serialize their arguments;
+                # their return is not proof of object identity.
+                call_fact = _materialize(call_fact, state.heap)
+                if mutation is not None:
+                    call_fact = mutation
+                    sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
+            selectors, call_end = self.selectors(closing + 1, end, stop_at_call=True)
+            for key, computed in selectors:
+                selected = self.value(*computed, state) if computed is not None else frozenset()
+                unknown = not _refs(call_fact) or bool(frozenset(call_fact))
+                call_fact = self.property(call_fact, key, state)
+                if unknown:
+                    call_fact = _join(call_fact, selected)
+            sole_local_call = code[start:match.start()].strip() in {'', 'await'} and call_end == end
             facts.append(call_fact)
-            remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
-            source_remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
-            cursor = closing + 1
+            remainder[match.start() - start:call_end - start] = [' '] * (call_end - match.start())
+            source_remainder[match.start() - start:call_end - start] = [' '] * (call_end - match.start())
+            cursor = call_end
         remaining = ''.join(remainder)
         for source, _ in assignment_sources(''.join(source_remainder)):
             facts.append(frozenset({_Trace(('source', source), (source,))}))
+        consumed = 0
         for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*', remaining):
+            if match.start() < consumed:
+                continue
             name = match.group(0)
             name = re.sub(r'\s+', '', name)
             if name in {'true', 'false', 'null', 'undefined', 'new', 'await', 'typeof', 'void', 'this'}:
@@ -1377,14 +1780,17 @@ class _Flow:
             after = remaining[match.end():].lstrip()
             if after.startswith(':'):
                 continue  # object literal keys are not variable references
-            facts.append(self.reference(name.split('.')[0], state))
-            if '.' in name and name in state:
+            member = self.access(start + match.start(), end)
+            if member:
+                facts.append(self.read_access(member, state))
+                consumed = member[2] - start
+            if '.' in name and name in state and not _refs(self.reference(name.split('.')[0], state)):
                 facts.append(state[name])
         result = _join(*facts)
         for location, expr_start, rule, label in self.engine.write_sinks:
             if rule == self.rule and start <= location < end:
-                self.effect(location, label, self.value(expr_start, end, state))
-        return result
+                self.effect(location, label, self.value(expr_start, end, state), state)
+        return result if sole_local_call else _materialize(result, state.heap)
 
     def expression(self, start, end, state):
         text = self.engine.text
@@ -1597,6 +2003,9 @@ class _Engine:
         self.summaries, self.final_states = {}, {}
         self.captures = {}
         self.dependents = defaultdict(set)
+        self.heap_calls = {}
+        self.current_task = None
+        self.pending, self.queued = deque(), set()
         modules, functions = child_process_bindings(text.splitlines())
         sinks = list(child_process_sinks(text, code, modules, functions))
         for regex, rule, label, call in SINKS:
@@ -1606,6 +2015,177 @@ class _Engine:
         for scope in self.scopes:
             scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
         self.binding_regions = {scope: self.regions(scope) for scope in self.scopes}
+        self.capture_keys = {}
+        self.local_targets = {}
+        for scope in self.functions:
+            keys, targets = set(), set()
+            ranges = [(scope.body_start, scope.body_end)]
+            ranges.extend(default for _names, _rest, default in scope.params if default is not None)
+            for left, right in ranges:
+                for match in re.finditer(r'(?<![\w$.])[A-Za-z_$][\w$]*', scope.code[left:right]):
+                    start, end = left + match.start(), left + match.end()
+                    if scope.code[end:right].lstrip().startswith(':'):
+                        continue
+                    name = match.group()
+                    key = self.binding(scope, name, start)
+                    if key[0] is not scope:
+                        keys.add(key)
+                    if scope.code[end:right].lstrip().startswith('('):
+                        target = self.lookup(scope, name)
+                        if target is not None:
+                            targets.add(target)
+                        # A constant arrow binding is also a lexical target.
+                        targets.update(fn for fn in self.functions if fn.name == name)
+            self.capture_keys[scope], self.local_targets[scope] = keys, targets
+        while True:
+            changed = False
+            for scope, targets in self.local_targets.items():
+                extra = set().union(*(self.capture_keys[target] for target in targets)) - self.capture_keys[scope]
+                if extra:
+                    self.capture_keys[scope].update(extra)
+                    changed = True
+            if not changed:
+                break
+        self.heap_scopes = {scope for scope in self.functions
+                            if re.search(r'[\[{]', scope.code[scope.body_start:scope.body_end])}
+        # Factories hidden behind ordinary local wrappers still need an object
+        # result. This set only grows over the finite set of lexical functions.
+        while True:
+            added = {scope for scope in self.functions if scope not in self.heap_scopes
+                     and any(self.lookup(scope, match.group(1)) in self.heap_scopes
+                             for match in re.finditer(r'\b([A-Za-z_$][\w$]*)\s*\(',
+                                                      scope.code[scope.body_start:scope.body_end]))}
+            if not added:
+                break
+            self.heap_scopes.update(added)
+
+    def enqueue(self, task):
+        if task not in self.queued:
+            self.queued.add(task)
+            self.pending.append(task)
+
+    def heap_required(self, callee, bound, state):
+        return (callee in self.heap_scopes or isinstance(self.current_task, _HeapCall)
+                or any(_refs(fact) for fact in bound.values())
+                or any(_refs(fact) for fact in state.cells.values()))
+
+    def heap_input(self, callee, bound, incoming, recursive):
+        state = _State()
+        ancestors, parent = set(), callee.parent
+        while parent is not None:
+            ancestors.add(parent)
+            parent = parent.parent
+        state.cells = {key: value for key, value in incoming.cells.items()
+                       if key[0] in ancestors and key in self.capture_keys[callee]}
+        for name, key in incoming.owners.items():
+            if key in state.cells and self.binding(callee, name) == key:
+                state[name], state.owners[name] = state.cells[key], key
+                state.bindings[name] = incoming.bindings.get(name)
+        # Copy only reachable objects, preserving borrowed identities and cycles.
+        pending = list(frozenset().union(*(_refs(fact) for fact in (*bound.values(), *state.cells.values()))))
+        while pending:
+            ref = pending.pop()
+            if ref in state.heap:
+                continue
+            state.heap[ref] = dict(incoming.heap.get(ref, {}))
+            for fact in state.heap[ref].values():
+                pending.extend(_refs(fact) - state.heap.keys())
+            if ref in incoming.array_lengths:
+                state.array_lengths[ref] = None if recursive else incoming.array_lengths[ref]
+        state.weak_refs = incoming.weak_refs & state.heap.keys()
+        return state
+
+    def heap_call(self, callee, rule, location, bound, state):
+        """Apply a separately solved summary, preserving borrowed references.
+
+        Fresh allocations retain their finite set of traversed call sites.
+        Distinct inner allocations must not merge at an outer return, while
+        recursion must not create an unbounded call-history tuple. A collapsed
+        allocation is weak; recursive array lengths widen rather than growing.
+        """
+        task = self.current_task
+        ancestors = task.ancestors if isinstance(task, _HeapCall) else frozenset((task,))
+        incoming = self.heap_input(callee, bound, state, callee in ancestors)
+        signature = (callee, rule, location, frozenset(bound.items()),
+                     frozenset(incoming.cells.items()), frozenset(incoming.bindings.items()),
+                     frozenset((ref, frozenset(slots.items())) for ref, slots in incoming.heap.items()),
+                     frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()))
+        context = self.heap_calls.get(signature)
+        if context is None:
+            context = _HeapCall(callee, rule, location, dict(bound), incoming,
+                                ancestors | {callee})
+            self.heap_calls[signature] = context
+            self.enqueue(context)
+        context.readers.add(task)
+        if context.result is None:
+            return frozenset(), {}
+        returned, effects, writes, output = context.result
+        renamed = {ref: ref if ref in incoming.heap else
+                   (*ref[:2], (ref[2] if len(ref) > 2 else frozenset()) | {location})
+                   for ref in output.heap}
+
+        def translate(fact):
+            return _Fact(fact, (renamed.get(ref, ref) for ref in _refs(fact)))
+
+        # All translations use the same pre-call input. A swap must not read
+        # an already-updated slot; borrowed objects keep their caller identity.
+        groups = defaultdict(list)
+        for old, new in renamed.items():
+            groups[new].append(old)
+        for new, originals in groups.items():
+            keys = set().union(*(output.heap[old].keys() for old in originals))
+            slots = {key: _join(*(translate(output.heap[old].get(key, frozenset()))
+                                  for old in originals)) for key in keys}
+            collision = any(old not in incoming.heap for old in originals) and new in state.heap
+            if collision:
+                previous = state.heap[new]
+                slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
+                         for key in previous.keys() | slots.keys()}
+            collapsed = len(originals) > 1 or collision
+            if collapsed or any(old in output.weak_refs for old in originals):
+                state.weak_refs.add(new)
+            state.heap[new] = slots
+            lengths = [output.array_lengths[old] for old in originals if old in output.array_lengths]
+            if lengths:
+                state.array_lengths[new] = (lengths[0] if not collapsed
+                    and all(length == lengths[0] for length in lengths) else None)
+        for key, fact in writes.items():
+            value = translate(fact)
+            state.cells[key] = value
+            state.written_cells.add(key)
+            name = key[2]
+            if name not in state or state.owners.get(name) == key:
+                state[name], state.owners[name], state.bindings[name] = value, key, None
+        label = (callee.name or '<callback>') + '()'
+        return _step(translate(returned), label), {key: _step(fact, label) for key, fact in effects.items()}
+
+    def analyze_heap(self, context):
+        scope, rule = context.scope, context.rule
+        state = context.incoming.copy()
+        for name in self.declarations(scope.statements):
+            state[name], state.bindings[name] = frozenset(), None
+            state.owners[name] = self.binding(scope, name)
+        for names, _, _ in scope.params:
+            for name in names:
+                state[name] = context.bound.get(name, frozenset())
+                state.bindings[name], state.owners[name] = None, self.binding(scope, name)
+        for child in scope.children:
+            if child.name and child.declaration:
+                state.bindings[child.name] = child
+                state.owners[child.name] = self.binding(scope, child.name, child.start)
+        flow = _Flow(self, scope, rule)
+        if scope.concise:
+            flow.returned = flow.value(scope.body_start, scope.body_end, state)
+            final = state
+        else:
+            final = flow.block(scope.statements, state)
+        exits = [*flow.exit_states, *([final] if final is not None else [])]
+        output = _join_states(*exits)
+        if output is None:
+            output = context.incoming.copy()
+        writes = {key: value for key, value in output.cells.items()
+                  if key[0] is not scope and key in output.written_cells}
+        return flow.returned, flow.effects, writes, output
 
     def regions(self, scope):
         """Static lexical identities; dataflow state still supplies values."""
@@ -1701,7 +2281,9 @@ class _Engine:
         exits = [*flow.exit_states, *([final] if final is not None else [])]
         joined = _join_states(*exits)
         writes = {} if joined is None else {key: value for key, value in joined.cells.items() if key[0] is not scope}
-        return flow.returned, flow.effects, writes
+        heap = (joined if joined is not None else state).heap
+        return (_materialize(flow.returned, heap), flow.effects,
+                {key: _materialize(value, heap) for key, value in writes.items()})
 
     def concrete(self, fact, rule, visited=frozenset()):
         result = frozenset()
@@ -1713,7 +2295,8 @@ class _Engine:
                 owner = key[0]
                 state = self.final_states.get((owner, rule))
                 if state is not None:
-                    result = _join(result, self.concrete(_cell_value(key, state), rule, visited | {trace.origin}))
+                    captured = _materialize(_cell_value(key, state), state.heap)
+                    result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
             elif trace.origin[0] == 'parameter':
                 _, scope, name = trace.origin
                 source = scope.parameter_sources.get(name)
@@ -1731,7 +2314,8 @@ class _Engine:
                 while parent is not None:
                     state = self.captures.get((scope, rule), self.final_states.get((parent, rule), {}))
                     if name in state:
-                        result = _join(result, self.concrete(state[name], rule, visited | {trace.origin}))
+                        captured = _materialize(state[name], getattr(state, 'heap', {}))
+                        result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
                         break
                     parent = parent.parent
         return result
@@ -1739,18 +2323,25 @@ class _Engine:
     def findings(self):
         found = {}
         for rule in KIND_BY_RULE:
-            pending = deque(reversed(self.scopes))
-            queued = set(pending)
-            while pending:
-                scope = pending.popleft()
-                queued.discard(scope)
+            self.pending, self.queued = deque(reversed(self.scopes)), set(self.scopes)
+            while self.pending:
+                task = self.pending.popleft()
+                self.queued.discard(task)
+                self.current_task = task
+                if isinstance(task, _HeapCall):
+                    result = self.analyze_heap(task)
+                    if task.result != result:
+                        task.result = result
+                        for reader in task.readers:
+                            self.enqueue(reader)
+                    continue
+                scope = task
                 summary = self.analyze(scope, rule)
                 if self.summaries.get((scope, rule)) != summary:
                     self.summaries[(scope, rule)] = summary
                     for caller in self.dependents[(scope, rule)]:
-                        if caller not in queued:
-                            pending.append(caller)
-                            queued.add(caller)
+                        self.enqueue(caller)
+            self.current_task = None
             for scope in self.scopes:
                 for (location, label), fact in self.summaries[(scope, rule)][1].items():
                     if self.dependents[(scope, rule)]:

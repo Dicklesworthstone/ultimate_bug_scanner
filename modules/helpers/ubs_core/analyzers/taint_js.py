@@ -712,6 +712,8 @@ class _Scope:
     code: str = ''
     statements: list = field(default_factory=list)
     parameter_sources: dict = field(default_factory=dict)
+    asynchronous: bool = False
+    generator: bool = False
 
 
 @dataclass
@@ -722,6 +724,16 @@ class _Statement:
     body: list = field(default_factory=list)
     alternate: list = field(default_factory=list)
     extra: object = None
+    catch_names: tuple = ()
+    catch_range: tuple | None = None
+
+
+class _NoNormalCompletion(Exception):
+    """Internal analysis control: this expression has no returning path.
+
+    Exceptional facts are recorded separately by the flow. This is never an
+    exception raised by executing the scanned program (which is not run).
+    """
 
 
 @dataclass(eq=False)
@@ -972,9 +984,15 @@ def _function_scopes(text, code):
         else:
             return
         body_starts.add(body if concise else body - 1)
+        async_prefix = re.search(r'\basync[ \t]*$', code[:start])
+        generator = bool(re.match(r'function\s*\*', code[start:]))
+        if async_prefix is not None:
+            start = async_prefix.start()
         scope = _Scope(start, end, body, body_end, name,
                        _parameters(text, code, params_start, params_end), declaration, concise)
         scope.parameter_sources = _parameter_sources(text, code, params_start, params_end)
+        scope.asynchronous = async_prefix is not None
+        scope.generator = generator
         scopes.append(scope)
 
     for match in re.finditer(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)?', code):
@@ -1095,11 +1113,13 @@ class _Parser:
             body_start = self.skip(start + keyword.end(), end)
             if code[body_start:body_start + 1] == '{':
                 body, after = self.statement(body_start, end)
-                handlers, final = [], []
+                handlers, final, catch_names, catch_range = [], [], (), None
                 lookahead = self.skip(after, end)
                 if re.match(r'catch\b', code[lookahead:]):
                     handler_start = self.skip(lookahead + 5, end)
                     if code[handler_start:handler_start + 1] == '(' and handler_start in self.pairs:
+                        catch_range = (handler_start + 1, self.pairs[handler_start])
+                        catch_names = tuple(_binding_names(code[handler_start + 1:self.pairs[handler_start]]))
                         handler_start = self.skip(self.pairs[handler_start] + 1, end)
                     if code[handler_start:handler_start + 1] == '{':
                         handler, after = self.statement(handler_start, end)
@@ -1110,7 +1130,7 @@ class _Parser:
                     if code[final_start:final_start + 1] == '{':
                         tail, after = self.statement(final_start, end)
                         final = [tail]
-                return _Statement('try', start, after, [body], handlers, final), after
+                return _Statement('try', start, after, [body], handlers, final, catch_names, catch_range), after
         if keyword and keyword.group(1) == 'do':
             body_start = self.skip(start + keyword.end(), end)
             if body_start < end:
@@ -1179,12 +1199,30 @@ class _Parser:
 class _Flow:
     def __init__(self, engine, scope, rule):
         self.engine, self.scope, self.rule = engine, scope, rule
-        self.returned = frozenset()
         self.effects = {}
-        self.exit_states = []
+        # Completion value and store travel together. A finalizer can replace
+        # one without retroactively reevaluating the other.
+        self.returns, self.throws = [], []
         self.parameter_context = False
         self.breaks, self.continues = [], []
         self.pairs = _pairs(scope.code, scope.body_start, scope.body_end)
+
+    def branch_value(self, start, end, state):
+        try:
+            return self.value(start, end, state), state
+        except _NoNormalCompletion:
+            return frozenset(), None
+
+    @staticmethod
+    def replace_state(state, incoming):
+        state.clear()
+        state.update(incoming)
+        state.bindings = dict(incoming.bindings)
+        state.owners, state.cells = dict(incoming.owners), dict(incoming.cells)
+        state.heap = incoming.heap
+        state.weak_refs = incoming.weak_refs
+        state.array_lengths = incoming.array_lengths
+        state.written_cells = incoming.written_cells
 
     def effect(self, start, label, fact, state=None):
         if state is not None:
@@ -1345,6 +1383,89 @@ class _Flow:
                     state.array_lengths[ref] = None
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
+
+    def catch_pattern(self, start, end, fact, state, position, missing=False):
+        """Bind a thrown value, preserving field identity and initializer order.
+
+        Scalar facts do not distinguish undefined from another clean scalar,
+        so an uncertain default joins both stores; it cannot prove cleanup.
+        A definitely absent own slot executes its initializer, while a known
+        object value cannot be undefined. Getters and custom iterators remain
+        outside this lexical heap model.
+        """
+        text, code = self.engine.text, self.scope.code
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start == end:
+            return
+        _, equals = next(_chunks(code, start, end, '='))
+        if equals < end:
+            if missing:
+                fact = self.value(equals + 1, end, state)
+            elif not _refs(fact) or frozenset(fact):
+                fallback, branch = self.branch_value(equals + 1, end, state.copy())
+                self.replace_state(state, _join_states(state, branch))
+                fact = _join(fact, fallback)
+            end = equals
+            while end > start and text[end - 1].isspace():
+                end -= 1
+        if code[start:start + 1] in {'{', '['} and self.pairs.get(start) == end - 1:
+            array, excluded = code[start] == '[', set()
+            for index, (left, right) in enumerate(_chunks(code, start + 1, end - 1)):
+                while left < right and text[left].isspace():
+                    left += 1
+                if left == right:
+                    continue
+                if code[left:left + 3] == '...':
+                    ref, slots = (self.scope, left, 'catch-rest'), {}
+                    for parent in _refs(fact):
+                        for key, value in state.heap.get(parent, {}).items():
+                            if array:
+                                numeric = self.array_index(key)
+                                if key is not None and (numeric is None or numeric < index):
+                                    continue
+                                key = str(numeric - index) if numeric is not None else None
+                            elif key in excluded:
+                                continue
+                            slots[key] = _join(slots.get(key, frozenset()), value)
+                    state.heap[ref] = slots
+                    if array:
+                        lengths = [state.array_lengths.get(parent) for parent in _refs(fact)]
+                        state.array_lengths[ref] = (max(0, lengths[0] - index) if lengths and
+                            lengths[0] is not None and all(length == lengths[0] for length in lengths) else None)
+                    rest = _Fact(frozenset(fact), refs=(ref,))
+                    self.catch_pattern(left + 3, right, rest, state, position)
+                    continue
+                selected = frozenset()
+                if array:
+                    key, begin = str(index), left
+                else:
+                    _, colon = next(_chunks(code, left, right, ':'))
+                    _, default = next(_chunks(code, left, colon, '='))
+                    raw_key = text[left:default].strip()
+                    key = self.property_key(raw_key)
+                    if code[left:left + 1] == '[' and left in self.pairs:
+                        close = self.pairs[left]
+                        literal = text[left + 1:close].strip()
+                        key = self.property_key(literal) if literal.startswith(('"', "'")) or literal.isdecimal() else None
+                        if key is None:
+                            selected = self.value(left + 1, close, state)
+                    begin = colon + 1 if colon < right else left
+                    if key is not None:
+                        excluded.add(key)
+                value = self.property(fact, key, state)
+                if not _refs(fact) or frozenset(fact):
+                    value = _join(value, selected)
+                absent = (bool(_refs(fact)) and not frozenset(fact) and key is not None
+                          and all(key not in state.heap.get(parent, {}) and None not in state.heap.get(parent, {})
+                                  for parent in _refs(fact)))
+                self.catch_pattern(begin, right, value, state, position, absent)
+            return
+        for name in _binding_names(text[start:end]):
+            state.owners[name] = self.engine.binding(self.scope, name, position)
+            self.assign(name, fact, state, position)
 
     def allocate(self, start, end, state):
         text, code = self.engine.text, self.scope.code
@@ -1559,6 +1680,33 @@ class _Flow:
         bound = {}
         default_flow = None
         default_state = None
+
+        def complete_defaults(normal=True):
+            if default_flow is None:
+                return
+            incoming = state.copy()
+            for (location, label), fact in default_flow.effects.items():
+                self.effect(location, label, self.substitute(fact, callee, bound, incoming), incoming)
+            for fact, store in default_flow.throws:
+                exceptional = incoming.copy()
+                exceptional.heap = store.heap
+                exceptional.weak_refs = store.weak_refs
+                exceptional.array_lengths = store.array_lengths
+                writes = {key: value for key, value in store.cells.items()
+                          if key[0] is not callee and key in store.written_cells}
+                self.apply_writes(writes, callee, bound, exceptional, incoming)
+                self.throws.append((self.substitute(fact, callee, bound, incoming), exceptional))
+            if normal:
+                state.heap = default_state.heap
+                state.weak_refs = default_state.weak_refs
+                state.array_lengths = default_state.array_lengths
+                writes = {key: value for key, value in default_state.cells.items()
+                          if key[0] is not callee and key in default_state.written_cells}
+                self.apply_writes(writes, callee, bound, state, incoming)
+            for dependency, callers in self.engine.dependents.items():
+                if dependency[1] == self.rule and callee in callers:
+                    callers.add(self.scope)
+
         for index, (names, rest, default) in enumerate(callee.params):
             incoming = _join(*(fact for fact, _ in actual[index:])) if rest else (actual[index][0] if index < len(actual) else frozenset())
             missing = index >= len(actual) or actual[index][1]
@@ -1579,27 +1727,18 @@ class _Flow:
                     default_state.owners[name] = self.engine.binding(callee, name)
                 default_flow.pairs.update(_pairs(callee.code, *default))
                 bypass = default_state.copy() if uncertain is not None and index >= uncertain else None
-                default_fact = default_flow.value(*default, default_state)
+                default_fact, evaluated = default_flow.branch_value(*default, default_state)
+                if evaluated is None and bypass is None:
+                    complete_defaults(normal=False)
+                    raise _NoNormalCompletion
                 if bypass is not None:
                     # An unknown spread may supply this formal. The default's
                     # effects are possible, not proof that cleanup occurred.
-                    default_state = _join_states(bypass, default_state)
+                    default_state = _join_states(bypass, evaluated)
                 incoming = _join(incoming, default_fact)
             for name in names:
                 bound[name] = incoming
-        if default_flow is not None:
-            incoming = state.copy()
-            for (location, label), fact in default_flow.effects.items():
-                self.effect(location, label, self.substitute(fact, callee, bound, incoming), incoming)
-            state.heap = default_state.heap
-            state.weak_refs = default_state.weak_refs
-            state.array_lengths = default_state.array_lengths
-            writes = {key: value for key, value in default_state.cells.items()
-                      if key[0] is not callee and key in default_state.written_cells}
-            self.apply_writes(writes, callee, bound, state, incoming)
-            for dependency, callers in self.engine.dependents.items():
-                if dependency[1] == self.rule and callee in callers:
-                    callers.add(self.scope)
+        complete_defaults()
         return bound
 
     def substitute(self, fact, callee, bound, state):
@@ -1648,9 +1787,11 @@ class _Flow:
                 key, computed = access[1][-1]
                 if computed is not None:
                     self.value(*computed, state)
+            old = (self.property(receiver, key, state) if receiver is not None
+                   else self.reference(target, state)) if assignment.group(1) != '=' else frozenset()
+            old = _materialize(old, state.heap)
             fact = self.value(rhs, end, state)
             if assignment.group(1) != '=':
-                old = self.property(receiver, key, state) if receiver is not None else self.reference(target, state)
                 fact = _join(old, fact)
             if receiver is not None and _refs(receiver):
                 self.write_property(receiver, key, _step(fact, target), state)
@@ -1691,31 +1832,20 @@ class _Flow:
         if question is not None and colon is not None:
             self.value(start, question, state)
             left, right = state.copy(), state.copy()
-            facts = (self.value(question + 1, colon, left), self.value(colon + 1, end, right))
+            left_fact, left = self.branch_value(question + 1, colon, left)
+            right_fact, right = self.branch_value(colon + 1, end, right)
             merged = _join_states(left, right)
-            state.clear()
-            state.update(merged)
-            state.bindings = dict(merged.bindings)
-            state.owners, state.cells = dict(merged.owners), dict(merged.cells)
-            state.heap = merged.heap
-            state.weak_refs = merged.weak_refs
-            state.array_lengths = merged.array_lengths
-            state.written_cells = merged.written_cells
-            return _join(*facts)
+            if merged is None:
+                raise _NoNormalCompletion
+            self.replace_state(state, merged)
+            return _join(left_fact, right_fact)
         if operators:
             _, operator = min(operators, key=lambda item: (item[0], -item[1]))
             left = self.value(start, operator, state)
             branch = state.copy()
-            right = self.value(operator + 2, end, branch)
+            right, branch = self.branch_value(operator + 2, end, branch)
             merged = _join_states(state, branch)
-            state.clear()
-            state.update(merged)
-            state.bindings = dict(merged.bindings)
-            state.owners, state.cells = dict(merged.owners), dict(merged.cells)
-            state.heap = merged.heap
-            state.weak_refs = merged.weak_refs
-            state.array_lengths = merged.array_lengths
-            state.written_cells = merged.written_cells
+            self.replace_state(state, merged)
             return _join(left, right)
         remainder = list(code[start:end])
         source_remainder = list(text[start:end])
@@ -1742,29 +1872,82 @@ class _Flow:
                 source_remainder[cursor - start:match.start() - start] = [' '] * (match.start() - cursor)
             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
                          if code[left:right].strip()]
-            argument_facts = [self.value(left, right, state) for left, right in arguments]
+            # GetValue(callee) precedes ArgumentListEvaluation. An argument can
+            # rebind a function or sanitizer for *later* calls, not this one.
             callee_name = re.sub(r'\s+', '', match.group(1))
             callee = self.engine.call_target(self.scope, callee_name, state, self.rule)
+            receiver = callee_name.split('.')[0]
+            binding = state.bindings.get(receiver, 'imported')
+            sink_binding = state.bindings.get(callee_name, 'imported')
+            if self.engine.relative_import(self.scope, receiver):
+                binding = None
+            argument_facts = [self.value(left, right, state) for left, right in arguments]
+            if isinstance(callee, _Scope) and callee.generator:
+                # A generator call creates an iterator; it does not execute
+                # the body. Iterator advancement is outside this call model.
+                callee = None
             if isinstance(callee, _Scope):
                 self.engine.import_captures(callee, state, self.rule)
+                deferred = callee.asynchronous and not re.search(r'\bawait\s*$', code[start:match.start()])
                 sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
-                bound = self.bind(callee, argument_facts, arguments, state)
+                throw_count = len(self.throws)
+                try:
+                    bound = self.bind(callee, argument_facts, arguments, state)
+                except _NoNormalCompletion:
+                    if not deferred:
+                        raise
+                    # An async parameter initializer rejects the promise; it
+                    # does not synchronously throw at the call expression.
+                    rejected = self.throws[throw_count:]
+                    self.throws[throw_count:] = []
+                    merged = _join_states(*(store for _, store in rejected))
+                    if merged is not None:
+                        self.replace_state(state, merged)
+                    call_fact = _join(*(fact for fact, _ in rejected))
+                    facts.append(call_fact)
+                    remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+                    source_remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+                    cursor = closing + 1
+                    continue
+                if deferred:
+                    self.throws[throw_count:] = []
                 incoming = state.copy()
                 if self.engine.heap_required(callee, bound, incoming):
-                    call_fact, effects = self.engine.heap_call(callee, self.rule, match.start(), bound, state)
+                    call_fact, effects, normal, thrown, exceptional = self.engine.heap_call(
+                        callee, self.rule, match.start(), bound, state)
                     for (location, label), fact in effects.items():
                         self.effect(location, label, fact)
+                    if exceptional is not None:
+                        if deferred:
+                            self.replace_state(state, _join_states(state if normal else None, exceptional))
+                            call_fact = _join(call_fact, thrown)
+                        else:
+                            self.throws.append((thrown, exceptional))
+                    if not normal and not deferred:
+                        raise _NoNormalCompletion
                 else:
-                    returned, effects, writes = self.engine.summaries.get((callee, self.rule), (frozenset(), {}, {}))
+                    returned, effects, writes, normal, thrown, throw_writes = self.engine.summaries.get(
+                        (callee, self.rule), (frozenset(), {}, {}, False, None, {}))
                     call_fact = self.substitute(returned, callee, bound, incoming)
                     for (location, label), fact in effects.items():
                         self.effect(location, label, self.substitute(fact, callee, bound, incoming), incoming)
-                    self.apply_writes(writes, callee, bound, state, incoming)
+                    if thrown is not None:
+                        exceptional = incoming.copy()
+                        self.apply_writes(throw_writes, callee, bound, exceptional, incoming)
+                        if deferred:
+                            self.apply_writes(writes, callee, bound, state, incoming)
+                            self.replace_state(state, _join_states(state if normal else None, exceptional))
+                            call_fact = _join(call_fact, self.substitute(thrown, callee, bound, incoming))
+                        else:
+                            self.throws.append((self.substitute(thrown, callee, bound, incoming), exceptional))
+                    if not normal and not deferred:
+                        raise _NoNormalCompletion
+                    if not (deferred and thrown is not None):
+                        self.apply_writes(writes, callee, bound, state, incoming)
             else:
                 mutation = self.mutation_call(callee_name, arguments, argument_facts, state)
                 call_fact = _join(*argument_facts)
-                receiver = callee_name.split('.')[0]
                 if '.' in callee_name:
                     call_fact = _join(call_fact, self.reference(receiver, state))
                 # Argument facts already retain precise local-call returns.
@@ -1776,10 +1959,7 @@ class _Flow:
                         source = source_match.group(0)
                         call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
                 sink = self.engine.call_sinks.get(match.start())
-                binding = state.bindings.get(receiver, 'imported')
-                if self.engine.relative_import(self.scope, receiver):
-                    binding = None  # a local module is not a built-in sanitizer
-                if sink and sink[0] == self.rule and state.bindings.get(callee_name, 'imported') == 'imported':
+                if sink and sink[0] == self.rule and sink_binding == 'imported':
                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
                     self.effect(match.start(), sink[1], _join(*selected), state)
                 regex = SANITIZERS_BY_RULE.get(self.rule)
@@ -1794,6 +1974,9 @@ class _Flow:
                 if mutation is not None:
                     call_fact = mutation
                     sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
+                # Unknown code may throw. Record the invocation-time store,
+                # not every unrelated statement prefix in a try block.
+                self.throws.append((_materialize(_join(*argument_facts), state.heap), state.copy()))
             selectors, call_end = self.selectors(closing + 1, end, stop_at_call=True)
             for key, computed in selectors:
                 selected = self.value(*computed, state) if computed is not None else frozenset()
@@ -1851,8 +2034,9 @@ class _Flow:
         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
         if compound:
             name = compound.group(1)
+            old = _materialize(self.reference(name, state), state.heap)
             fact = self.value(offset + compound.start(3), end, state)
-            self.assign(name, _join(self.reference(name, state), fact), state, start)
+            self.assign(name, _join(old, fact), state, start)
             return state
         declaration = None
         for pattern in (DESTRUCT_OBJECT, DESTRUCT_ARRAY, ASSIGN_DECL, ASSIGN_SIMPLE):
@@ -1904,6 +2088,12 @@ class _Flow:
         return state
 
     def statement(self, node, state):
+        try:
+            return self.transfer(node, state)
+        except _NoNormalCompletion:
+            return None
+
+    def transfer(self, node, state):
         if node.kind == 'commonjs_import':
             for name in node.extra:
                 key = self.engine.import_path(self.scope, [name])
@@ -1954,6 +2144,7 @@ class _Flow:
             local = self.engine.declarations(node.body, block=True)
             outer = state.copy()
             break_count, continue_count = len(self.breaks), len(self.continues)
+            return_count, throw_count = len(self.returns), len(self.throws)
             for name in local:
                 state[name], state.bindings[name] = frozenset(), None
                 state.owners[name] = self.engine.binding(self.scope, name, node.start + 1)
@@ -1965,6 +2156,8 @@ class _Flow:
                     self.engine.captures[key] = _join_states(self.engine.captures.get(key), captured)
             for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
                 self.restore(exit_state, outer, local)
+            for _, exit_state in (*self.returns[return_count:], *self.throws[throw_count:]):
+                self.restore(exit_state, outer, local)
             return self.restore(result, outer, local)
         if node.kind == 'if':
             self.value(node.start, node.end, state)
@@ -1973,30 +2166,48 @@ class _Flow:
             right = self.block(node.alternate, state.copy()) if condition != 'true' else None
             return _join_states(left, right)
         if node.kind == 'try':
-            # An exception may interrupt any statement before the handler.
-            # Join prefix states so a later overwrite cannot erase that path.
-            entry = state.copy()
-            exit_count, break_count, continue_count = len(self.exit_states), len(self.breaks), len(self.continues)
-            body = node.body[0].body if node.body and node.body[0].kind == 'block' else node.body
-            prefix, current = entry.copy(), entry.copy()
-            for statement in body:
-                if current is None:
-                    break
-                current = self.statement(statement, current)
-                prefix = _join_states(prefix, current)
-            handler = self.block(node.alternate, prefix) if node.alternate else None
+            return_count, throw_count = len(self.returns), len(self.throws)
+            break_count, continue_count = len(self.breaks), len(self.continues)
+            current = self.block(node.body, state.copy())
+            handler = None
+            if node.alternate and self.throws[throw_count:]:
+                thrown = self.throws[throw_count:]
+                self.throws[throw_count:] = []
+                caught = _join_states(*(exit_state for _, exit_state in thrown))
+                outer = caught.copy()
+                value = _join(*(fact for fact, _ in thrown))
+                handler_return, handler_throw = len(self.returns), len(self.throws)
+                handler_break, handler_continue = len(self.breaks), len(self.continues)
+                try:
+                    if node.catch_range is not None:
+                        self.catch_pattern(*node.catch_range, value, caught, node.alternate[0].start + 1)
+                    handler = self.block(node.alternate, caught)
+                except _NoNormalCompletion:
+                    # Binding initializers are part of handler completion;
+                    # their throws still run this try statement's finalizer.
+                    handler = None
+                self.restore(handler, outer, node.catch_names)
+                for _, exit_state in (*self.returns[handler_return:], *self.throws[handler_throw:]):
+                    self.restore(exit_state, outer, node.catch_names)
+                for exit_state in (*self.breaks[handler_break:], *self.continues[handler_continue:]):
+                    self.restore(exit_state, outer, node.catch_names)
             merged = _join_states(current, handler)
             if node.extra:
-                # Finally transforms every completion, including pending
-                # return/throw/break/continue. Do not keep pre-finally cells in
-                # the write summary: a definite cleanup can replace them.
-                exits, breaks, continues = (self.exit_states[exit_count:], self.breaks[break_count:],
-                                             self.continues[continue_count:])
-                self.exit_states[exit_count:] = []
+                # A normal finalizer preserves the pending completion/value;
+                # an abrupt finalizer replaces it. Never union a cancelled
+                # return into the function result or a throw into normal writes.
+                returns, throws = self.returns[return_count:], self.throws[throw_count:]
+                breaks, continues = self.breaks[break_count:], self.continues[continue_count:]
+                self.returns[return_count:] = []
+                self.throws[throw_count:] = []
                 self.breaks[break_count:] = []
                 self.continues[continue_count:] = []
-                for destination, pending in ((self.exit_states, exits), (self.breaks, breaks),
-                                             (self.continues, continues)):
+                for destination, pending in ((self.returns, returns), (self.throws, throws)):
+                    for value, exit_state in pending:
+                        tail = self.block(node.extra, exit_state.copy())
+                        if tail is not None:
+                            destination.append((value, tail))
+                for destination, pending in ((self.breaks, breaks), (self.continues, continues)):
                     for exit_state in pending:
                         tail = self.block(node.extra, exit_state.copy())
                         if tail is not None:
@@ -2051,7 +2262,11 @@ class _Flow:
                 return self.restore(_join_states(current, *exits), outer, loop_names)
             while True:
                 self.breaks, self.continues = [], []
-                self.value(*condition, current)
+                try:
+                    self.value(*condition, current)
+                except _NoNormalCompletion:
+                    self.breaks, self.continues = outer_breaks, outer_continues
+                    return self.restore(_join_states(*exits), outer, loop_names)
                 body_state = current.copy()
                 if iteration:
                     names, left, right = iteration
@@ -2063,7 +2278,10 @@ class _Flow:
                 after = self.block(node.body, body_state)
                 after = _join_states(after, *self.continues)
                 if after is not None and update is not None:
-                    after = self.expression(*update, after)
+                    try:
+                        after = self.expression(*update, after)
+                    except _NoNormalCompletion:
+                        after = None
                 exits.extend(self.breaks)
                 merged = _join_states(entry, after)
                 if merged == current:
@@ -2072,12 +2290,12 @@ class _Flow:
             self.breaks, self.continues = outer_breaks, outer_continues
             return self.restore(_join_states(current, *exits), outer, loop_names)
         if node.kind == 'return':
-            self.returned = _join(self.returned, self.value(node.start, node.end, state))
-            self.exit_states.append(state.copy())
+            value = self.value(node.start, node.end, state)
+            self.returns.append((value, state.copy()))
             return None
         if node.kind == 'throw':
-            self.value(node.start, node.end, state)
-            self.exit_states.append(state.copy())
+            value = self.value(node.start, node.end, state)
+            self.throws.append((value, state.copy()))
             return None
         if node.kind in {'break', 'continue'}:
             (self.breaks if node.kind == 'break' else self.continues).append(state.copy())
@@ -2427,8 +2645,20 @@ class _Engine:
             self.enqueue(context)
         context.readers.add(task)
         if context.result is None:
-            return frozenset(), {}
-        returned, effects, writes, output = context.result
+            return frozenset(), {}, False, frozenset(), None
+        returned, effects, writes, output, thrown, throw_writes, exceptional = context.result
+        label = self.call_label(callee)
+        thrown_value, thrown_state = frozenset(), None
+        if exceptional is not None:
+            thrown_state = state.copy()
+            thrown_value = self.apply_heap_output(incoming, thrown_state, exceptional, throw_writes, thrown, location)
+        result = frozenset()
+        if output is not None:
+            result = self.apply_heap_output(incoming, state, output, writes, returned, location)
+        return (_step(result, label), {key: _step(fact, label) for key, fact in effects.items()},
+                output is not None, _step(thrown_value, label), thrown_state)
+
+    def apply_heap_output(self, incoming, state, output, writes, returned, location):
         renamed = {ref: ref if ref in incoming.heap else
                    (*ref[:2], (ref[2] if len(ref) > 2 else frozenset()) | {location})
                    for ref in output.heap}
@@ -2465,8 +2695,7 @@ class _Engine:
             name = key[2]
             if name not in state or state.owners.get(name) == key:
                 state[name], state.owners[name], state.bindings[name] = value, key, None
-        label = self.call_label(callee)
-        return _step(translate(returned), label), {key: _step(fact, label) for key, fact in effects.items()}
+        return translate(returned)
 
     def analyze_heap(self, context):
         scope, rule = context.scope, context.rule
@@ -2484,17 +2713,20 @@ class _Engine:
                 state.owners[child.name] = self.binding(scope, child.name, child.start)
         flow = _Flow(self, scope, rule)
         if scope.concise:
-            flow.returned = flow.value(scope.body_start, scope.body_end, state)
-            final = state
+            value, final = flow.branch_value(scope.body_start, scope.body_end, state)
+            if final is not None:
+                flow.returns.append((value, final.copy()))
+            final = None
         else:
             final = flow.block(scope.statements, state)
-        exits = [*flow.exit_states, *([final] if final is not None else [])]
+        exits = [*(exit_state for _, exit_state in flow.returns), *([final] if final is not None else [])]
         output = _join_states(*exits)
-        if output is None:
-            output = context.incoming.copy()
-        writes = {key: value for key, value in output.cells.items()
-                  if key[0] is not scope and key in output.written_cells}
-        return flow.returned, flow.effects, writes, output
+        exceptional = _join_states(*(exit_state for _, exit_state in flow.throws))
+        def writes(store):
+            return {} if store is None else {key: value for key, value in store.cells.items()
+                                            if key[0] is not scope and key in store.written_cells}
+        return (_join(*(value for value, _ in flow.returns)), flow.effects, writes(output), output,
+                _join(*(value for value, _ in flow.throws)), writes(exceptional), exceptional)
 
     def regions(self, scope):
         """Static lexical identities; dataflow state still supplies values."""
@@ -2525,8 +2757,12 @@ class _Engine:
                             regions.extend((begin, stop, name) for name in _binding_names(iterator.group(2)))
                     pending.append((node.body, left, right))
                 pending.append((node.alternate, left, right))
-                if node.kind == 'try' and node.extra:
-                    pending.append((node.extra, left, right))
+                if node.kind == 'try':
+                    if node.alternate:
+                        handler = node.alternate[0]
+                        regions.extend((handler.start + 1, handler.end - 1, name) for name in node.catch_names)
+                    if node.extra:
+                        pending.append((node.extra, left, right))
         for child in scope.children:
             if child.name and child.declaration:
                 left, right = min((span for span in blocks if span[0] <= child.start <= span[1]),
@@ -2604,17 +2840,26 @@ class _Engine:
                 state.owners[child.name] = self.binding(scope, child.name, child.start)
         flow = _Flow(self, scope, rule)
         if scope.concise:
-            flow.returned = flow.value(scope.body_start, scope.body_end, state)
-            final = state
+            value, final = flow.branch_value(scope.body_start, scope.body_end, state)
+            if final is not None:
+                flow.returns.append((value, final.copy()))
+            final = None
         else:
             final = flow.block(scope.statements, state)
         self.final_states[(scope, rule)] = final or state
-        exits = [*flow.exit_states, *([final] if final is not None else [])]
+        exits = [*(exit_state for _, exit_state in flow.returns), *([final] if final is not None else [])]
         joined = _join_states(*exits)
         writes = {} if joined is None else {key: value for key, value in joined.cells.items() if key[0] is not scope}
         heap = (joined if joined is not None else state).heap
-        return (_materialize(flow.returned, heap), flow.effects,
-                {key: _materialize(value, heap) for key, value in writes.items()})
+        thrown = _join_states(*(exit_state for _, exit_state in flow.throws))
+        throw_value = (None if thrown is None else
+                       _join(*(_materialize(value, store.heap) for value, store in flow.throws)))
+        throw_writes = ({} if thrown is None else
+                        {key: _materialize(value, thrown.heap) for key, value in thrown.cells.items()
+                         if key[0] is not scope})
+        return (_join(*(_materialize(value, store.heap) for value, store in flow.returns)), flow.effects,
+                {key: _materialize(value, heap) for key, value in writes.items()},
+                joined is not None, throw_value, throw_writes)
 
     def concrete(self, fact, rule, visited=frozenset()):
         result = frozenset()

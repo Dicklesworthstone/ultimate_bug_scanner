@@ -1425,6 +1425,49 @@ class IncrementalCacheTests(unittest.TestCase):
 
         self._run_with_logging(case_id, _test)
 
+    def _rust_meta_scan(self, *extra: str) -> tuple[list[tuple[str, str, int]], dict]:
+        proc = subprocess.run(
+            [str(REPO_ROOT / "ubs"), "--ci", "--no-auto-update", "--only=rust",
+             "--format=json", *extra, str(self.project_dir)],
+            capture_output=True, text=True, cwd=self.test_root, timeout=300,
+            env={**os.environ, "UBS_NO_AUTO_UPDATE": "1"},
+        )
+        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        doc = json.loads(proc.stdout)
+        findings = sorted((f["rule_id"], Path(f["file"]).name, f["line"]) for f in doc["findings"])
+        return findings, doc["totals"]
+
+    @unittest.skipUnless(shutil.which("ast-grep"), "the duplicated guard pass needs real ast-grep")
+    def test_rust_partial_cache_matches_uncached_scan(self) -> None:
+        """GH #150: a scan with some cache hits must equal a cold scan."""
+        case_id = "cache-rust-partial-selection"
+
+        def _test() -> None:
+            (self.project_dir / "a.rs").write_text(
+                "fn go(v: Option<u32>) -> u32 {\n    if let Some(x) = v {\n        return x;\n    }\n"
+                "    v.unwrap()\n}\n", encoding="utf-8")
+            (self.project_dir / "b.rs").write_text("fn other() {}\n", encoding="utf-8")
+            for i in range(1, 21):
+                (self.project_dir / f"m{i}.rs").write_text(f"// TODO: item {i}\nfn f{i}() {{}}\n",
+                                                           encoding="utf-8")
+            self._rust_meta_scan()  # prime the cache
+            # One changed file and one new marker: 21 markers cross the > 20
+            # tech-debt threshold only when cached files are counted too.
+            (self.project_dir / "b.rs").write_text("fn other() { let n = 2; }\n", encoding="utf-8")
+            (self.project_dir / "m21.rs").write_text("// TODO: one more\nfn g() {}\n", encoding="utf-8")
+            partial = self._rust_meta_scan()
+            warm = self._rust_meta_scan()
+            cold = self._rust_meta_scan("--no-cache")
+            guarded = [f for f in cold[0] if f[0] == "rust.ownership.guarded-later-unwrap"]
+            self.assertEqual(guarded, [("rust.ownership.guarded-later-unwrap", "a.rs", 5)], cold)
+            debt = [f for f in cold[0] if f[0] == "rust.code-quality.tech-debt"]
+            self.assertEqual(len(debt), 1, cold)
+            self.assertGreaterEqual(cold[1]["warning"], 2, cold)
+            self.assertEqual(partial, cold)
+            self.assertEqual(warm, cold)
+
+        self._run_with_logging(case_id, _test)
+
 
 if __name__ == "__main__":
     unittest.main()

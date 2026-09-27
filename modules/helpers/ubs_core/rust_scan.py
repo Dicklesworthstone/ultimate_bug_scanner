@@ -1243,10 +1243,19 @@ def run_narrowing(scan: Scan, skip_type_narrowing: bool) -> list[Hit]:
         if guard_json is not None:
             guard_json.unlink(missing_ok=True)
     hits: list[Hit] = []
-    allowed = scan.allowed
+    # The guard pass walks the whole project, but only the files being
+    # analyzed now may report: a cache hit's findings come back through
+    # replay_findings, and emitting them here too duplicated them (GH #150).
+    current: set[str] = set()
+    for path in scan.files:
+        current.add(str(path))
+        try:
+            current.add(str(path.resolve()))
+        except OSError:
+            pass
     for path, line, col, message in issues:
         path_str = str(path)
-        if path_str not in allowed:
+        if path_str not in current:
             # legacy guard entries came from the raw project walk; the
             # authoritative-file-set filter applied to their matches too
             continue
@@ -1834,6 +1843,11 @@ def cat_8(scan: Scan, r: Renderer) -> None:
         r.finding("good", 0, "No hardcoded secrets detected")
 
 
+# Findings that describe the whole selection rather than one file: never
+# cached per file, never replayed (GH #150).
+_SELECTION_WIDE_RULES = frozenset({"rust.code-quality.tech-debt"})
+
+
 def cat_9(scan: Scan, r: Renderer) -> None:
     r.header(9); r.category(9)
     todo = scan.rg_lines("TODO", ignore_case=True, rule_id="rust.code-quality.tech-debt")
@@ -2237,6 +2251,12 @@ def main(argv: list[str] | None = None) -> int:
     # because the marker is part of the contract and must survive -q — the
     # runner passes -q straight through to the modules.
     r.lines.append(f"UBS module: rust (contract v2) — {args.project or project_dir}")
+    # Category 9 compares a marker total across the whole selection with a
+    # threshold. It is never cached per file; when any file is replayed from
+    # the cache it runs once, after replay, over every selected file (GH #150).
+    full_lines_map = {f: scan.lines_map[f] for f in original_files if f in scan.lines_map}
+    full_texts = {f: scan.texts[f] for f in original_files if f in scan.texts}
+    defer_selection_wide = len(files_to_scan) < len(original_files) and 9 not in skip
     if files_to_scan:
         scan.files = list(files_to_scan)
         scan.lines_map = {f: scan.lines_map[f] for f in files_to_scan if f in scan.lines_map}
@@ -2285,7 +2305,7 @@ def main(argv: list[str] | None = None) -> int:
         from ubs_core.rust_rules import AST_CHECKS
 
         for category in sorted(_CAT_FUNCTIONS):
-            if category in skip:
+            if category in skip or (category == 9 and defer_selection_wide):
                 continue
             if category == 1:
                 cat_1(scan, r, narrowing_hits, narrowing_skip_note)
@@ -2301,6 +2321,8 @@ def main(argv: list[str] | None = None) -> int:
 
         by_file: dict[str, list[dict]] = {}
         for record in scan.records:
+            if record.get("rule") in _SELECTION_WIDE_RULES:
+                continue
             by_file.setdefault(record.get("path", ""), []).append(record)
         # An incomplete analysis must never become the cached answer: the next
         # run would hit the cache and report the findings this one could not
@@ -2317,11 +2339,15 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # Replay cached findings (for both partial and full cache hits)
-    cached_records = [rec for recs in cached_findings.values() for rec in recs]
+    cached_records = [rec for recs in cached_findings.values() for rec in recs
+                      if rec.get("rule") not in _SELECTION_WIDE_RULES]
     if cached_records:
         replay_findings(scan, r, cached_records)
 
     scan.files = original_files
+    scan.lines_map, scan.texts = full_lines_map, full_texts
+    if defer_selection_wide:
+        cat_9(scan, r)
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:

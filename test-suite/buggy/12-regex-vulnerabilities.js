@@ -90,7 +90,7 @@ function isSecureUrl(url) {
 }
 
 // BUG 14: Case-insensitive flag abuse
-const searchRegex = /user.*input/gi;
+const searchRegex = new RegExp("user.*input", "gi");
 function searchLogs(logs, userInput) {
   const pattern = new RegExp(userInput, "gi"); // User can inject regex
   return logs.filter((log) => pattern.test(log));
@@ -118,7 +118,7 @@ function checkMultiple(str1, str2) {
 
 // BUG 18: Unsafe regex in validation allows injection
 function validateUsername(username) {
-  const pattern = /^[a-zA-Z0-9]+$/;
+  const pattern = new RegExp("^[a-zA-Z0-9]+$");
   if (!pattern.test(username)) {
     throw new Error("Invalid username");
   }

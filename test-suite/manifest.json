@@ -4147,6 +4147,71 @@
       }
     },
     {
+      "id": "js-buggy-fixture-pin-fetch-abort",
+      "description": "Pins every unsignalled fetch in fetch-timeout-buggy.ts, including the Prettier-wrapped `window` / `.fetch(` chain (GH #148). A fixture edit or formatter pass that removes one fails here instead of hiding behind a min-1 total.",
+      "path": "test-suite/js/security/fetch-timeout-buggy.ts",
+      "language": "js",
+      "tags": ["js", "typescript", "security", "buggy", "fixture-pin", "regression"],
+      "args": ["--only=js", "--format=json"],
+      "expect": {
+        "rule_ids": {
+          "min": {"js.security.fetch-abort": 3}
+        }
+      }
+    },
+    {
+      "id": "js-buggy-fixture-pin-jsx-target-blank",
+      "description": "Pins the intentional bug in target-blank-buggy.tsx (GH #147: a style pass once added rel=\"noopener\" and removed it).",
+      "path": "test-suite/js/security/target-blank-buggy.tsx",
+      "language": "js",
+      "tags": ["js", "typescript", "tsx", "security", "buggy", "fixture-pin", "regression"],
+      "args": ["--only=js", "--format=json"],
+      "expect": {
+        "rule_ids": {
+          "min": {"js.security.jsx-target-blank": 1}
+        }
+      }
+    },
+    {
+      "id": "js-buggy-fixture-pin-dynamic-regexp",
+      "description": "Pins the five new RegExp(...) constructions in 12-regex-vulnerabilities.js. The rule only reports above three, so turning two constant patterns into literals (GH #147) silently dropped it; the directory-level js-core-buggy case could not notice.",
+      "path": "test-suite/buggy/12-regex-vulnerabilities.js",
+      "language": "js",
+      "tags": ["js", "buggy", "regex", "fixture-pin", "regression"],
+      "args": ["--only=js", "--format=json"],
+      "expect": {
+        "rule_ids": {
+          "min": {"js.regex.dynamic-regexp": 5}
+        }
+      }
+    },
+    {
+      "id": "js-buggy-fixture-pin-ternary-nullish-ts",
+      "description": "Pins the unparenthesized nullish ternary in the TypeScript rule-pack coverage fixture (GH #147).",
+      "path": "test-suite/js/buggy/ast-grep-rule-pack-coverage.ts",
+      "language": "js",
+      "tags": ["js", "typescript", "buggy", "ast-grep", "fixture-pin", "regression"],
+      "args": ["--only=js", "--format=json"],
+      "expect": {
+        "rule_ids": {
+          "min": {"js.operator-precedence-ternary-nullish": 1}
+        }
+      }
+    },
+    {
+      "id": "js-buggy-fixture-pin-ternary-nullish-tsx",
+      "description": "Pins the unparenthesized nullish ternary in the TSX rule-pack coverage fixture (GH #147).",
+      "path": "test-suite/js/buggy/ast-grep-rule-pack-coverage.tsx",
+      "language": "js",
+      "tags": ["js", "typescript", "tsx", "buggy", "ast-grep", "fixture-pin", "regression"],
+      "args": ["--only=js", "--format=json"],
+      "expect": {
+        "rule_ids": {
+          "min": {"js.operator-precedence-ternary-nullish": 1}
+        }
+      }
+    },
+    {
       "id": "js-typescript-fetch-cancellation-clean",
       "description": "TypeScript fetch calls with direct or shared AbortSignal wiring should stay clean.",
       "path": "test-suite/js/security/fetch-timeout-clean.ts",

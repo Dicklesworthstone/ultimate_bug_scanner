@@ -670,7 +670,9 @@ def check_expectations(
                     continue
                 if f.get("suppressed") is True:
                     continue
-                rid = f.get("rule_id") or f.get("ruleId") or f.get("id")
+                # Meta-runner JSON names the field "rule"; module artifacts
+                # and SARIF-derived records use the other spellings.
+                rid = f.get("rule") or f.get("rule_id") or f.get("ruleId") or f.get("id")
                 if rid and isinstance(rid, str):
                     rule_counts[rid] = rule_counts.get(rid, 0) + 1
 

@@ -124,7 +124,7 @@ class EditTests(unittest.TestCase):
             lsp.apply_changes('stale', [edit((0, 0), (0, 1), 'x')], synchronized=False)
 
     def test_malformed_range_and_length_fail_closed(self):
-        cases = [edit((0, 2), (0, 1), ''), edit((2, 0), (2, 0), ''), edit((-1, 0), (0, 0), ''),
+        cases = [edit((0, 2), (0, 1), ''), edit((0, 100), (0, 99), ''), edit((2, 0), (2, 0), ''), edit((-1, 0), (0, 0), ''),
                  edit((True, 0), (0, 0), ''), edit((0, False), (0, 0), ''),
                  edit((0, 0), (0, 1), '', rangeLength=True), edit((0, 0), (0, 1), '', rangeLength=2),
                  {'range': None, 'text': ''}, {'text': '', 'rangeLength': 0}, {'text': '\ud800'}, None]

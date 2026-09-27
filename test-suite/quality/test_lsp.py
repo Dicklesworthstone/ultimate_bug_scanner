@@ -402,7 +402,7 @@ class StdioTests(Fixture):
         send('initialize', {'rootUri': self.root.as_uri()}, id='init')
         capabilities = receive(lambda m: m.get('id') == 'init')['result']['capabilities']
         self.assertEqual(capabilities['positionEncoding'], 'utf-16')
-        self.assertEqual(capabilities['textDocumentSync']['change'], 1)
+        self.assertEqual(capabilities['textDocumentSync']['change'], 2)
         send('initialized')
         send('textDocument/didOpen', {'textDocument': {'uri': self.uri, 'text': 'clean\n', 'version': 1}})
         receive(lambda m: m.get('method') == 'textDocument/publishDiagnostics' and m['params']['diagnostics'] == [])

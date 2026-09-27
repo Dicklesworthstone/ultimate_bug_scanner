@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Saved-document UBS diagnostics over LSP stdio; no project code is imported.
+"""UBS editor diagnostics over LSP; saved source or opt-in buffer snapshots.
 
-Run from a trusted checkout with an explicit --repo. Unsaved buffers are never
-written to disk or passed off as scanned. Detection remains in the ordinary UBS
-runner; this optional adapter is not an in-process analysis engine.
+Run from a trusted checkout with an explicit --repo. Buffer snapshots never
+write into the original workspace. Detection remains in the ordinary trusted
+UBS runner; this adapter is neither a second detector nor an execution sandbox.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from urllib.parse import unquote_to_bytes, urlsplit
 
@@ -187,7 +188,7 @@ def apply_changes(text, changes, *, synchronized=True):
             raise ProtocolError('Invalid document edit range')
         start = position_offset(text, range_.get('start'))
         end = position_offset(text, range_.get('end'))
-        if end < start:
+        if end < start or (range_['start']['line'], range_['start']['character']) > (range_['end']['line'], range_['end']['character']):
             raise ProtocolError('Reversed document edit range')
         length = change.get('rangeLength')
         if 'rangeLength' in change and (type(length) is not int or length < 0
@@ -388,17 +389,225 @@ def scan(scanner, root, documents, root_id, timeout, cancel, policy=()):
     report = decode_json(output['stdout'])
     if not isinstance(report, dict) or not isinstance(report.get('totals'), dict) or report['totals'].get('files') != len(paths):
         raise ProtocolError('Scanner coverage does not match selected documents; ignored or unsupported files are not verified')
-    return {uri: (report_diagnostics(report, doc['path'], root, doc['text'], process.returncode,
+    return {uri: (report_diagnostics(report, doc['path'], root,
+                                    doc.get('wire_text', doc['text']).replace('\r\n', '\n').replace('\r', '\n'), process.returncode,
                                     selected_paths=paths), snapshots[uri][1]) for uri, doc in documents.items()}
 
 
+MAX_WORKSPACE_BYTES = 128 * 1024 * 1024
+MAX_WORKSPACE_ENTRIES = 20000
+
+
+def file_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+class BufferWorkspace:
+    """Private complete workspace copy with exact editor buffers substituted.
+
+    This is an input snapshot, NOT an execution sandbox. The explicit trusted
+    scanner still owns detector, ignore and tool policy. No hard links, symlinks,
+    Git redirections or unbounded context copies are permitted. Retained metadata
+    lets publication verify the disk context after this temporary tree is gone.
+    """
+    def __init__(self, root, root_id, documents, cancel, deadline):
+        self.original, self.root_id = root, root_id
+        self.documents, self.cancel, self.deadline = documents, cancel, deadline
+        self.entries = {}
+        self.missing = set()
+        self.temporary = None
+        self.root = None
+
+    def check(self):
+        if self.cancel.is_set():
+            raise ProtocolError('Buffer scan cancelled')
+        if time.monotonic() >= self.deadline:
+            raise ProtocolError('Buffer snapshot/scan timed out')
+
+    def open_original(self, relative):
+        self.check()
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = os.open(self.original, flags)
+        try:
+            info = os.fstat(descriptor)
+            if (info.st_dev, info.st_ino) != self.root_id:
+                raise ProtocolError('Repository root was replaced')
+            parts = relative.parts
+            for index, part in enumerate(parts):
+                self.check()
+                if part in ('', '.', '..'):
+                    raise ProtocolError('Unsafe buffer workspace path')
+                mode = flags if index < len(parts) - 1 else os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                child = os.open(part, mode, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            result, descriptor = descriptor, None
+            return result
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def verify(self):
+        """Validate every original entry, including dirs and absent new buffers."""
+        for relative, expected in self.entries.items():
+            fd = self.open_original(relative)
+            try:
+                if file_stamp(os.fstat(fd)) != expected:
+                    raise ProtocolError('Workspace context changed during buffer analysis: ' + str(relative))
+            finally:
+                os.close(fd)
+        for relative in self.missing:
+            try:
+                fd = self.open_original(relative)
+            except FileNotFoundError:
+                continue
+            else:
+                os.close(fd)
+                raise ProtocolError('A new buffer acquired disk contents during analysis: ' + str(relative))
+
+    def __enter__(self):
+        self.check()
+        if any(key.startswith('GIT_') for key in os.environ):
+            raise ProtocolError('Buffer snapshots do not support redirected Git environments')
+        if any((parent / '.git').exists() for parent in self.original.parents):
+            raise ProtocolError('Buffer mode requires the complete repository root, not an inherited Git subdirectory')
+        # Refuse an in-repository temp location BEFORE creating anything there.
+        temp_parent = Path(tempfile.gettempdir()).resolve()
+        if temp_parent.is_relative_to(self.original):
+            raise ProtocolError('Buffer snapshot temporary directory must be outside --repo')
+        self.temporary = tempfile.TemporaryDirectory(prefix='ubs-lsp-buffer-', dir=temp_parent)
+        try:
+            self.root = Path(self.temporary.name) / 'workspace'
+            self.root.mkdir(mode=0o700)
+            pending = [Path('.')]
+            total = 0
+            while pending:
+                self.check()
+                relative = pending.pop()
+                if len(self.entries) >= MAX_WORKSPACE_ENTRIES:
+                    raise ProtocolError('Buffer workspace entry limit exceeded')
+                fd = self.open_original(relative)
+                try:
+                    info = os.fstat(fd)
+                    stamp = file_stamp(info)
+                    self.entries[relative] = stamp
+                    target = self.root / relative
+                    if stat.S_ISDIR(info.st_mode):
+                        target.mkdir(mode=0o700, exist_ok=True)
+                        children = []
+                        with os.scandir(fd) as items:
+                            for item in items:
+                                self.check()
+                                if len(self.entries) + len(pending) + len(children) >= MAX_WORKSPACE_ENTRIES:
+                                    raise ProtocolError('Buffer workspace entry limit exceeded')
+                                children.append(item.name)
+                        pending.extend(relative / name for name in sorted(children, reverse=True))
+                    elif stat.S_ISREG(info.st_mode):
+                        if relative.name == '.git' or ('.git' in relative.parts and relative.name in {'commondir', 'gitdir', 'alternates'}):
+                            raise ProtocolError('External/linked Git metadata is not supported in buffer snapshots')
+                        if info.st_size > MAX_WORKSPACE_BYTES - total:
+                            raise ProtocolError('Buffer workspace byte limit exceeded')
+                        git_config = '.git' in relative.parts and relative.name in {'config', 'config.worktree'}
+                        tail = b''
+                        with target.open('xb') as output:
+                            while chunk := os.read(fd, min(65536, MAX_WORKSPACE_BYTES - total + 1)):
+                                self.check()
+                                total += len(chunk)
+                                if total > MAX_WORKSPACE_BYTES:
+                                    raise ProtocolError('Buffer workspace byte limit exceeded')
+                                if git_config:
+                                    tokens = (tail + chunk).lower()
+                                    if any(token in tokens for token in (b'include', b'worktree', b'excludesfile')):
+                                        raise ProtocolError('Path-dependent Git configuration is not supported in buffer snapshots')
+                                    tail = tokens[-32:]
+                                output.write(chunk)
+                        target.chmod(0o700 if info.st_mode & 0o111 else 0o600)
+                    else:
+                        raise ProtocolError('Buffer context must contain only regular files and directories: ' + str(relative))
+                    if file_stamp(os.fstat(fd)) != stamp:
+                        raise ProtocolError('Workspace input changed while snapshotting: ' + str(relative))
+                finally:
+                    os.close(fd)
+            paths = set()
+            virtual_paths = set(self.entries)
+            for doc in self.documents.values():
+                self.check()
+                path = doc['path']
+                relative = path.relative_to(self.original)
+                if not relative.parts or '..' in relative.parts or '.git' in relative.parts or relative in paths:
+                    raise ProtocolError('Unsafe, duplicate or Git-metadata buffer path')
+                if len(relative.parts) > 128:
+                    raise ProtocolError('Buffer path nesting limit exceeded')
+                paths.add(relative)
+                additions = {relative, *relative.parents} - virtual_paths
+                if len(virtual_paths) + len(additions) > MAX_WORKSPACE_ENTRIES:
+                    raise ProtocolError('Buffer workspace entry limit exceeded')
+                virtual_paths.update(additions)
+                if relative in self.entries:
+                    if not stat.S_ISREG(self.entries[relative][2]):
+                        raise ProtocolError('An editor buffer cannot replace a directory')
+                    old_size = self.entries[relative][3]
+                else:
+                    # A missing leaf/parent is valid for a new unsaved file.
+                    # Non-directory or symlink parents still fail closed.
+                    try:
+                        fd = self.open_original(relative)
+                    except FileNotFoundError:
+                        self.missing.add(relative)
+                    else:
+                        os.close(fd)
+                        raise ProtocolError('New buffer appeared while creating snapshot')
+                    old_size = 0
+                raw = editor_text(doc.get('wire_text', doc['text'])).encode('utf-8')
+                total += len(raw) - old_size
+                if total > MAX_WORKSPACE_BYTES:
+                    raise ProtocolError('Buffer workspace byte limit exceeded')
+                target = self.root / relative
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                # Copied files never share inodes with the checkout.
+                with target.open('wb') as output:
+                    output.write(raw)
+                target.chmod(0o600)
+            self.verify()
+            return self
+        except BaseException:
+            self.temporary.cleanup()
+            raise
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.temporary.cleanup()
+
+
+def scan_buffers(scanner, root, documents, root_id, timeout, cancel, policy=()):
+    if any(not doc['synchronized'] for doc in documents.values()):
+        return {uri: ([note('ubs.unverified', 'Synchronize every selected buffer before analysis.', 3)], None)
+                for uri in documents}
+    with BufferWorkspace(root, root_id, documents, cancel, time.monotonic() + timeout) as workspace:
+        selected = {uri: dict(doc, path=workspace.root / doc['path'].relative_to(root))
+                    for uri, doc in documents.items()}
+        info = workspace.root.stat()
+        workspace.check()
+        results = scan(scanner, workspace.root, selected, (info.st_dev, info.st_ino),
+                       workspace.deadline - time.monotonic(), cancel, policy)
+        workspace.verify()
+        # Diagnostics route against the shadow paths, but no private temporary
+        # path should escape into messages. Publication uses the original URIs.
+        for diagnostics, _ in results.values():
+            for diagnostic in diagnostics:
+                diagnostic['message'] = diagnostic['message'].replace(str(workspace.root), str(root))
+                diagnostic['data'] = {'ubsSourceMode': 'buffer'}
+        return {uri: (value[0], workspace) for uri, value in results.items()}
+
+
 class Server:
-    def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=()):
+    def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=(), buffer_mode=False):
         self.root, self.scanner, self.send = root, scanner, send
         info = root.stat()
         self.root_id = (info.st_dev, info.st_ino)
         self.jobs, self.timeout = jobs, timeout
         self.policy = policy
+        self.buffer_mode = buffer_mode
         self.pool = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix='ubs-lsp')
         self.documents = {}
         self.pending = OrderedDict()
@@ -422,7 +631,9 @@ class Server:
             self.batch[2].set()
         for uri in selected if announce else ():
             if uri in self.documents:
-                self.publish(uri, [note('ubs.unverified', 'Selected-document scan invalidated; rescan after saving all documents.', 3)])
+                message = ('Buffer snapshot invalidated; updated buffer analysis is pending.' if self.buffer_mode else
+                           'Selected-document scan invalidated; rescan after saving all documents.')
+                self.publish(uri, [note('ubs.unverified', message, 3)])
 
     def publish(self, uri, diagnostics):
         params = {'uri': uri, 'diagnostics': diagnostics}
@@ -445,6 +656,9 @@ class Server:
             self.documents[uri]['generation'] = self.generation
 
     def queue(self, uri):
+        if self.buffer_mode:
+            self.queue_documents()
+            return
         self.invalidate(uri)
         self.pending[uri] = self.documents[uri]['generation']
         self.publish(uri, [note('ubs.pending', 'UBS verification pending for this saved document.', 3)])
@@ -467,8 +681,14 @@ class Server:
             result = future.result()
             # Verify the complete group before publishing ANY member, not a
             # sequence of individually eligible clean results from mixed bytes.
+            verified = set()
             for uri, doc in documents.items():
                 identity = result[uri][1]
+                if isinstance(identity, BufferWorkspace):
+                    if identity not in verified:
+                        identity.verify()
+                        verified.add(identity)
+                    continue
                 if identity is not None and read_source(self.root, doc['path'], self.root_id) != (doc['text'], identity):
                     raise ProtocolError('Selected source changed before diagnostics could be published')
         except Exception as exc:
@@ -494,7 +714,7 @@ class Server:
         if self.batch_pending is not None and not self.active and self.batch is None and time.monotonic() >= self.batch_due:
             documents, self.batch_pending = self.batch_pending, None
             cancel = threading.Event()
-            self.batch = (self.pool.submit(scan, self.scanner, self.root, documents, self.root_id,
+            self.batch = (self.pool.submit(scan_buffers if self.buffer_mode else scan, self.scanner, self.root, documents, self.root_id,
                                            self.timeout, cancel, self.policy), documents, cancel)
         busy = {uri for uri, _, _ in self.active.values()}
         for uri, generation in list(self.pending.items()):
@@ -550,6 +770,7 @@ class Server:
                 self.initialized = True
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {
                     'capabilities': {'positionEncoding': 'utf-16',
+                                     'experimental': {'ubs': {'sourceMode': 'buffer' if self.buffer_mode else 'saved'}},
                                      'executeCommandProvider': {'commands': ['ubs.scanOpenDocuments']}, 'textDocumentSync': {
                         'openClose': True, 'change': 2, 'save': {'includeText': True}}},
                     'serverInfo': {'name': 'ubs-lsp', 'version': '1'}}})
@@ -607,6 +828,8 @@ class Server:
                 self.invalidate(uri)
                 self.documents.pop(uri, None)
                 self.publish(uri, [])
+                if self.buffer_mode:
+                    self.queue_documents()
                 return
             if method == 'textDocument/didOpen':
                 if uri in self.documents or len(self.documents) >= MAX_DOCUMENTS:
@@ -642,7 +865,7 @@ class Server:
             self.documents[uri] = {'path': path, 'text': text, 'wire_text': wire_text,
                                    'version': version, 'sync_version': version, 'generation': self.generation,
                                    'synchronized': True}
-            if method == 'textDocument/didOpen':
+            if method == 'textDocument/didOpen' or self.buffer_mode:
                 self.queue(uri)
             else:
                 self.publish(uri, [note('ubs.unsaved', 'Save this document to run UBS; unsaved buffers are not scanned.', 3)])
@@ -684,6 +907,8 @@ def main(argv=None):
     parser.add_argument('--scan-timeout', type=float, default=120)
     parser.add_argument('--profile', choices=('strict', 'loose'))
     parser.add_argument('--fail-on-warning', action='store_true')
+    parser.add_argument('--buffer-mode', choices=('saved', 'snapshot'), default='saved',
+                        help='saved (default), or opt-in unsaved analysis in a private complete workspace snapshot')
     args = parser.parse_args(argv)
     if os.name != 'posix' or not 1 <= args.jobs <= 4 or not 0 < args.scan_timeout <= 3600:
         parser.error('POSIX, 1–4 jobs and a finite timeout of 0–3600 seconds are required')
@@ -701,7 +926,8 @@ def main(argv=None):
         outgoing.append(memoryview(data))
         output_bytes += len(data)
     policy = (('--profile=' + args.profile,) if args.profile else ()) + (('--fail-on-warning',) if args.fail_on_warning else ())
-    server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout, policy=policy)
+    server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout, policy=policy,
+                    buffer_mode=args.buffer_mode == 'snapshot')
     framer = Framer()
     incoming, output = sys.stdin.fileno(), sys.stdout.fileno()
     old_in, old_out = os.get_blocking(incoming), os.get_blocking(output)

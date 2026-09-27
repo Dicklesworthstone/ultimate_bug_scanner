@@ -158,7 +158,7 @@ def note(code, message, severity=2):
             'severity': severity, 'code': code, 'source': 'ubs', 'message': message[:8192]}
 
 
-def report_diagnostics(report, path, root, text, exit_code):
+def report_diagnostics(report, path, root, text, exit_code, *, selected_paths=()):
     if not isinstance(report, dict) or report.get('status') != 'ok' or report.get('failed_modules'):
         raise ProtocolError('Scanner returned an incomplete or failed report')
     totals = report.get('totals')
@@ -168,6 +168,23 @@ def report_diagnostics(report, path, root, text, exit_code):
     ast_records = report.get('ast_findings', [])
     if not isinstance(records, list) or not isinstance(ast_records, list):
         raise ProtocolError('Scanner report has no valid findings ledger')
+    # A summary cannot be called clean merely because its producer omitted
+    # diagnostic records. Report-only AST evidence does not supply this credit.
+    accounted = {'critical': 0, 'warning': 0, 'info': 0}
+    for finding in records:
+        if not isinstance(finding, dict):
+            raise ProtocolError('Invalid finding record')
+        if finding.get('suppressed') is True:
+            continue
+        weight = finding.get('count') if finding.get('scope') in ('project', 'project_aggregate') else 1
+        if type(weight) is not int or weight < 0:
+            raise ProtocolError('Invalid finding occurrence count')
+        if finding.get('severity') in accounted:
+            accounted[finding['severity']] += weight
+    for severity, available in accounted.items():
+        declared = totals.get(severity, 0)
+        if type(declared) is not int or not 0 <= declared <= available:
+            raise ProtocolError('Scanner summary is not covered by its findings ledger')
     bases = [root]
     project = report.get('project')
     if isinstance(project, str) and Path(project).is_absolute():
@@ -176,7 +193,9 @@ def report_diagnostics(report, path, root, text, exit_code):
             bases.append(candidate.parent if candidate == path else candidate)
     lines = text.split('\n')
     diagnostics = []
+    diagnostic_bytes = 0
     omitted = 0
+    other_documents = 0
     for finding in records + ast_records:
         if not isinstance(finding, dict) or type(finding.get('suppressed', False)) is not bool:
             raise ProtocolError('Invalid finding record')
@@ -195,6 +214,9 @@ def report_diagnostics(report, path, root, text, exit_code):
             if not isinstance(source, str) or not source or type(line) is not int or line < 1:
                 raise ProtocolError('Finding has invalid source coordinates')
             if not any(Path(os.path.normpath(base / source)) == path for base in bases):
+                if any(Path(os.path.normpath(base / source)) in selected_paths for base in bases):
+                    other_documents += 1
+                    continue
                 omitted += 1
                 continue
             if line > len(lines):
@@ -207,24 +229,39 @@ def report_diagnostics(report, path, root, text, exit_code):
             diagnostic = {'range': {'start': {'line': line - 1, 'character': 0},
                                     'end': {'line': line - 1, 'character': end}},
                           'severity': level, 'code': rule, 'source': 'ubs', 'message': (message or rule)[:8192]}
-        if len(diagnostics) < MAX_DIAGNOSTICS - 1:
+        size = len(json.dumps(diagnostic, ensure_ascii=True).encode('ascii'))
+        if len(diagnostics) < MAX_DIAGNOSTICS - 1 and diagnostic_bytes + size < MAX_MESSAGE // 2:
             diagnostics.append(diagnostic)
+            diagnostic_bytes += size
         else:
             omitted += 1
     if omitted:
         diagnostics.append(note('ubs.incomplete-display', f'{omitted} additional findings are outside this document or the display limit. Run UBS to see the complete report.'))
-    if exit_code == 1 and not diagnostics:
+    if exit_code == 1 and not diagnostics and not other_documents:
         diagnostics.append(note('ubs.unlocated-findings', 'UBS reported a failing scan without visible source diagnostics. Run UBS for the complete report.'))
     return diagnostics
 
 
-def scan(scanner, root, path, text, root_id, timeout, cancel):
-    saved, identity = read_source(root, path, root_id)
-    if saved != text:
-        return [note('ubs.unsaved', 'Save this document before running UBS; disk contents differ from the editor.', 3)], None
+def scan(scanner, root, documents, root_id, timeout, cancel, policy=()):
+    snapshots = {}
+    unsaved = []
+    for uri, doc in documents.items():
+        if cancel.is_set():
+            raise ProtocolError('Scan cancelled')
+        saved, identity = read_source(root, doc['path'], root_id)
+        snapshots[uri] = (saved, identity)
+        if saved != doc['text'] or not doc['synchronized']:
+            unsaved.append(uri)
+    if unsaved:
+        return {uri: ([note('ubs.unsaved' if uri in unsaved else 'ubs.unverified',
+                           'Save and synchronize every selected document before running this scan.', 3)], None)
+                for uri in documents}
+    paths = tuple(dict.fromkeys(doc['path'] for doc in documents.values()))
+    if len(paths) != len(documents):
+        raise ProtocolError('Multiple editor URIs name the same source; close duplicate documents')
     if cancel.is_set():
         raise ProtocolError('Scan cancelled')
-    command = [str(scanner), '--ci', '--no-auto-update', '--no-color', '--format=json', '--', str(path)]
+    command = [str(scanner), '--ci', '--no-auto-update', '--no-color', '--format=json', *policy, '--', *map(str, paths)]
     process = subprocess.Popen(command, cwd=root, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', NO_COLOR='1'),
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                start_new_session=True, bufsize=0)
@@ -263,23 +300,29 @@ def scan(scanner, root, path, text, root_id, timeout, cancel):
         process.stderr.close()
     if cancel.is_set():
         raise ProtocolError('Scan cancelled')
-    if read_source(root, path, root_id) != (saved, identity):
-        raise ProtocolError('Source changed during the scan; save again to recheck')
+    for uri, doc in documents.items():
+        if read_source(root, doc['path'], root_id) != snapshots[uri]:
+            raise ProtocolError('Selected source changed during the scan; save again to recheck')
     if process.returncode == 3:
-        return [note('ubs.not-scanned', 'UBS found no scan targets. This is not a verified clean document.')], identity
+        return {uri: ([note('ubs.not-scanned', 'UBS found no scan targets. This is not a verified clean document.')], value[1])
+                for uri, value in snapshots.items()}
     if process.returncode not in (0, 1):
         detail = output['stderr'].decode('utf-8', 'replace')[-2048:]
         raise ProtocolError(f'Scanner failed (exit {process.returncode}): {detail}')
     report = decode_json(output['stdout'])
-    return report_diagnostics(report, path, root, text, process.returncode), identity
+    if not isinstance(report, dict) or not isinstance(report.get('totals'), dict) or report['totals'].get('files') != len(paths):
+        raise ProtocolError('Scanner coverage does not match selected documents; ignored or unsupported files are not verified')
+    return {uri: (report_diagnostics(report, doc['path'], root, doc['text'], process.returncode,
+                                    selected_paths=paths), snapshots[uri][1]) for uri, doc in documents.items()}
 
 
 class Server:
-    def __init__(self, root, scanner, send, *, jobs=2, timeout=120):
+    def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=()):
         self.root, self.scanner, self.send = root, scanner, send
         info = root.stat()
         self.root_id = (info.st_dev, info.st_ino)
         self.jobs, self.timeout = jobs, timeout
+        self.policy = policy
         self.pool = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix='ubs-lsp')
         self.documents = {}
         self.pending = OrderedDict()
@@ -288,6 +331,22 @@ class Server:
         self.initialized = False
         self.shutdown = False
         self.exit_code = None
+        self.batch_pending = None
+        self.batch_due = 0
+        self.batch = None
+        self.published_group = set()
+        self.register_watches = False
+        self.registration_pending = False
+
+    def cancel_batch(self, *, announce=True):
+        selected = set(self.batch_pending or (self.batch[1] if self.batch and not self.batch[2].is_set() else {})) | self.published_group
+        self.published_group = set()
+        self.batch_pending = None
+        if self.batch:
+            self.batch[2].set()
+        for uri in selected if announce else ():
+            if uri in self.documents:
+                self.publish(uri, [note('ubs.unverified', 'Selected-document scan invalidated; rescan after saving all documents.', 3)])
 
     def publish(self, uri, diagnostics):
         params = {'uri': uri, 'diagnostics': diagnostics}
@@ -296,6 +355,10 @@ class Server:
         self.send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': params})
 
     def invalidate(self, uri):
+        # Any document/scope change makes a grouped result obsolete, including
+        # changes to a different file on which a clean result may depend.
+        if self.batch_pending is not None or self.batch is not None or self.published_group:
+            self.cancel_batch()
         self.generation += 1
         self.pending.pop(uri, None)
         for _, (target, _, cancel) in self.active.items():
@@ -309,6 +372,34 @@ class Server:
         self.pending[uri] = self.documents[uri]['generation']
         self.publish(uri, [note('ubs.pending', 'UBS verification pending for this saved document.', 3)])
 
+    def queue_documents(self):
+        self.cancel_batch()
+        for uri in self.documents:
+            self.invalidate(uri)
+        self.pending.clear()
+        self.batch_pending = {uri: dict(doc) for uri, doc in self.documents.items()} or None
+        self.batch_due = time.monotonic() + 0.15
+        for uri in self.documents:
+            self.publish(uri, [note('ubs.pending', 'UBS selected-document verification pending.', 3)])
+
+    def complete(self, future, documents, cancel):
+        if self.shutdown or cancel.is_set() or any(uri not in self.documents or self.documents[uri]['generation'] != doc['generation']
+                                                  for uri, doc in documents.items()):
+            return
+        try:
+            result = future.result()
+            # Verify the complete group before publishing ANY member, not a
+            # sequence of individually eligible clean results from mixed bytes.
+            for uri, doc in documents.items():
+                identity = result[uri][1]
+                if identity is not None and read_source(self.root, doc['path'], self.root_id) != (doc['text'], identity):
+                    raise ProtocolError('Selected source changed before diagnostics could be published')
+        except Exception as exc:
+            result = {uri: ([note('ubs.unverified', 'UBS could not verify this document: ' + str(exc))], None) for uri in documents}
+        for uri in documents:
+            self.publish(uri, result[uri][0])
+        return True
+
     def tick(self):
         for future, (uri, generation, cancel) in list(self.active.items()):
             if not future.done():
@@ -317,26 +408,37 @@ class Server:
             doc = self.documents.get(uri)
             if self.shutdown or doc is None or doc['generation'] != generation or cancel.is_set():
                 continue
-            try:
-                diagnostics, identity = future.result()
-                if identity is not None and read_source(self.root, doc['path'], self.root_id) != (doc['text'], identity):
-                    raise ProtocolError('Source changed before diagnostics could be published')
-            except Exception as exc:
-                diagnostics = [note('ubs.unverified', 'UBS could not verify this document: ' + str(exc))]
-            self.publish(uri, diagnostics)
+            self.complete(future, {uri: doc}, cancel)
+        if self.batch and self.batch[0].done():
+            future, documents, cancel = self.batch
+            self.batch = None
+            if self.complete(future, documents, cancel):
+                self.published_group = set(documents)
+        if self.batch_pending is not None and not self.active and self.batch is None and time.monotonic() >= self.batch_due:
+            documents, self.batch_pending = self.batch_pending, None
+            cancel = threading.Event()
+            self.batch = (self.pool.submit(scan, self.scanner, self.root, documents, self.root_id,
+                                           self.timeout, cancel, self.policy), documents, cancel)
         busy = {uri for uri, _, _ in self.active.values()}
         for uri, generation in list(self.pending.items()):
-            if self.shutdown or len(self.active) >= self.jobs:
+            if self.shutdown or self.batch or self.batch_pending is not None or len(self.active) >= self.jobs:
                 break
             if uri in busy:
                 continue
             del self.pending[uri]
             doc = self.documents[uri]
             cancel = threading.Event()
-            future = self.pool.submit(scan, self.scanner, self.root, doc['path'], doc['text'], self.root_id, self.timeout, cancel)
+            future = self.pool.submit(scan, self.scanner, self.root, {uri: dict(doc)}, self.root_id, self.timeout, cancel, self.policy)
             self.active[future] = (uri, generation, cancel)
 
     def handle(self, message):
+        if (isinstance(message, dict) and message.get('jsonrpc') == '2.0' and 'method' not in message
+                and message.get('id') == 'ubs-watch-registration' and self.registration_pending):
+            self.registration_pending = False
+            if 'error' in message:
+                self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {
+                    'type': 2, 'message': 'Editor file-watch registration failed; use ubs.scanOpenDocuments to refresh dependency changes.'}})
+            return
         request_id = message.get('id') if isinstance(message, dict) else None
         is_request = isinstance(message, dict) and 'id' in message
         if (not isinstance(message, dict) or message.get('jsonrpc') != '2.0'
@@ -364,9 +466,14 @@ class Server:
                 if uri is not None:
                     if not isinstance(uri, str) or document_path(uri.rstrip('/') + '/.ubs-lsp-root', self.root).parent != self.root:
                         raise ProtocolError('Editor root must match --repo')
+                capabilities = params.get('capabilities') or {}
+                workspace = capabilities.get('workspace') or {} if isinstance(capabilities, dict) else {}
+                watches = workspace.get('didChangeWatchedFiles') or {} if isinstance(workspace, dict) else {}
+                self.register_watches = isinstance(watches, dict) and watches.get('dynamicRegistration') is True and watches.get('relativePatternSupport') is True
                 self.initialized = True
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {
-                    'capabilities': {'positionEncoding': 'utf-16', 'textDocumentSync': {
+                    'capabilities': {'positionEncoding': 'utf-16',
+                                     'executeCommandProvider': {'commands': ['ubs.scanOpenDocuments']}, 'textDocumentSync': {
                         'openClose': True, 'change': 1, 'save': {'includeText': True}}},
                     'serverInfo': {'name': 'ubs-lsp', 'version': '1'}}})
                 return
@@ -377,13 +484,38 @@ class Server:
                 return
             if method == 'shutdown' and is_request:
                 self.shutdown = True
+                self.cancel_batch(announce=False)
                 self.pending.clear()
                 for _, _, cancel in self.active.values():
                     cancel.set()
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': None})
                 return
+            if method == 'workspace/executeCommand' and is_request:
+                if params.get('command') != 'ubs.scanOpenDocuments' or params.get('arguments', []) != []:
+                    raise ProtocolError('Only ubs.scanOpenDocuments without arguments is supported')
+                self.queue_documents()
+                self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {'queued': len(self.documents)}})
+                return
             if is_request:
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32601, 'message': 'Method not found'}})
+                return
+            if method == 'initialized' and self.register_watches:
+                self.register_watches = False
+                self.registration_pending = True
+                self.send({'jsonrpc': '2.0', 'id': 'ubs-watch-registration', 'method': 'client/registerCapability',
+                           'params': {'registrations': [{'id': 'ubs-project-inputs', 'method': 'workspace/didChangeWatchedFiles',
+                                      'registerOptions': {'watchers': [{'globPattern': {'baseUri': self.root.as_uri(), 'pattern': '**/*'}, 'kind': 7}]}}]}})
+                return
+            if method == 'workspace/didChangeWatchedFiles':
+                changes = params.get('changes')
+                if not isinstance(changes, list) or len(changes) > 4096:
+                    raise ProtocolError('Invalid or oversized watched-file notification')
+                for change in changes:
+                    if not isinstance(change, dict) or type(change.get('type')) is not int or change['type'] not in (1, 2, 3):
+                        raise ProtocolError('Invalid watched-file event')
+                    document_path(change.get('uri'), self.root)
+                if changes:
+                    self.queue_documents()
                 return
             if method in ('initialized', '$/cancelRequest', '$/setTrace'):
                 return
@@ -451,6 +583,7 @@ class Server:
                 self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {'type': 1, 'message': str(exc)}})
 
     def close(self):
+        self.cancel_batch(announce=False)
         self.pending.clear()
         for _, _, cancel in self.active.values():
             cancel.set()
@@ -463,6 +596,8 @@ def main(argv=None):
     parser.add_argument('--scanner', default=str(Path(__file__).resolve().with_name('ubs')))
     parser.add_argument('--jobs', type=int, default=2)
     parser.add_argument('--scan-timeout', type=float, default=120)
+    parser.add_argument('--profile', choices=('strict', 'loose'))
+    parser.add_argument('--fail-on-warning', action='store_true')
     args = parser.parse_args(argv)
     if os.name != 'posix' or not 1 <= args.jobs <= 4 or not 0 < args.scan_timeout <= 3600:
         parser.error('POSIX, 1–4 jobs and a finite timeout of 0–3600 seconds are required')
@@ -479,7 +614,8 @@ def main(argv=None):
             raise ProtocolError('Editor is not consuming diagnostics; output limit exceeded')
         outgoing.append(memoryview(data))
         output_bytes += len(data)
-    server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout)
+    policy = (('--profile=' + args.profile,) if args.profile else ()) + (('--fail-on-warning',) if args.fail_on_warning else ())
+    server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout, policy=policy)
     framer = Framer()
     incoming, output = sys.stdin.fileno(), sys.stdout.fileno()
     old_in, old_out = os.get_blocking(incoming), os.get_blocking(output)

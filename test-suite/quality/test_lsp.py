@@ -93,7 +93,8 @@ class Fixture(unittest.TestCase):
         until = time.monotonic() + timeout
         while time.monotonic() < until:
             self.server.tick()
-            if not self.server.pending and not self.server.active:
+            if (not self.server.pending and not self.server.active
+                    and not getattr(self.server, 'batch_pending', None) and not getattr(self.server, 'batch', None)):
                 return
             time.sleep(0.015)
         self.fail('scan did not finish: ' + repr(self.messages))

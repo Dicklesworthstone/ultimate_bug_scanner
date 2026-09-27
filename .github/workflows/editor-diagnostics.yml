@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - ubs-lsp
-      - test-suite/quality/test_lsp.py
+      - test-suite/quality/test_lsp*.py
       - .github/workflows/editor-diagnostics.yml
   workflow_dispatch:
 
@@ -34,7 +34,7 @@ jobs:
           npm install --global @ast-grep/cli
       - name: Validate editor protocol and real saved-source detection
         run: |
-          python3 -m unittest discover -s test-suite/quality -p test_lsp.py -v
+          python3 -m unittest discover -s test-suite/quality -p 'test_lsp*.py' -v
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --exit-code

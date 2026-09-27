@@ -1,0 +1,123 @@
+name: Canonical Daemon CLI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/daemon-cli.patch
+      - test-suite/patches/daemon-cli-tests.py
+      - .github/workflows/daemon-cli.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_DAEMON_E2E: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Apply the reviewed canonical CLI implementation
+        run: |
+          test "$(git hash-object test-suite/patches/daemon-cli.patch)" = c359a29e3c113df1ed8c2d418405a7cab93af477
+          test "$(git hash-object test-suite/patches/daemon-cli-tests.py)" = f2284e50b1d2581ea940800484c4234110c248e5
+          git apply --check test-suite/patches/daemon-cli.patch
+          git apply test-suite/patches/daemon-cli.patch
+          cp test-suite/patches/daemon-cli-tests.py test-suite/quality/test_daemon_entrypoint.py
+          git add -N test-suite/quality/test_daemon_entrypoint.py
+          # Preserve the concurrently landed directory/staged/diff support.
+          git apply - <<'PATCH'
+          diff --git a/docs/daemon.md b/docs/daemon.md
+          --- a/docs/daemon.md
+          +++ b/docs/daemon.md
+          @@ -19,7 +19,7 @@
+           Put the service selector first. Options after it follow the daemon interface:
+           `--repo` selects the root, relative files are resolved against that root, and
+           `--` protects dash-prefixed filenames. `ubs --client` defaults to JSON and keeps
+          -the existing one-shot fallback when no matching service is running. Staged,
+          -directory and custom-rule scans still use ordinary `ubs`; unsupported service
+          -selection flags are errors, not requests to scan different bytes. Both `ubs`
+          +the existing one-shot fallback when no matching service is running. Custom-rule
+          +and baseline scans still use ordinary `ubs`; unsupported service policy flags
+          +are errors, not requests to scan under different rules. Both `ubs`
+           and its matching regular `ubs-daemon` file must be installed together.
+          diff --git a/test-suite/quality/test_daemon_entrypoint.py b/test-suite/quality/test_daemon_entrypoint.py
+          --- a/test-suite/quality/test_daemon_entrypoint.py
+          +++ b/test-suite/quality/test_daemon_entrypoint.py
+          @@ -125,8 +125,8 @@
+                   for option in ('--format=sarif', '--profile=strict', '--fail-on-warning'):
+                       self.assertIn(option, report['args'])
+           
+          -    def test_unsupported_selection_is_not_silently_changed_to_worktree(self):
+          -        result = self.cli('--client', '--staged', '--scanner', str(self.scanner), 'a.py')
+          +    def test_unsupported_policy_is_not_silently_discarded(self):
+          +        result = self.cli('--client', '--rules=/missing-policy', '--scanner', str(self.scanner), 'a.py')
+                   self.assertEqual(result.returncode, 2, result.stderr)
+                   self.assertFalse(Path(self.env['SCAN_COUNT']).exists())
+           
+          PATCH
+          python3 scripts/update_checksums.py
+      - name: Validate actual service, canonical CLI and existing scaffold behavior
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_daemon*.py' -v 2>&1 | tee "$RUNNER_TEMP/daemon-cli-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p test_new_module.py -v 2>&1 | tee "$RUNNER_TEMP/daemon-cli-scaffold.log"
+          shellcheck -S warning ubs scripts/verify_checksums.sh .claude/hooks/on-file-write.sh
+          bash -n ubs
+          bash -n scripts/verify_checksums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Publish only tested immutable objects, never branches or tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          diff = subprocess.check_output(['git', 'diff'])
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          assert diff == subprocess.check_output(['git', 'diff']), 'Checksums are not idempotent'
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'scripts/update_checksums.py', 'scripts/verify_checksums.sh', 'docs/daemon.md', 'test-suite/quality/test_new_module.py', 'test-suite/quality/test_daemon_entrypoint.py'}
+          assert set(changed) == allowed, changed
+          records = []
+          for name in changed:
+              data = Path(name).read_bytes()
+              result = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'], input=json.dumps({'content': data.decode(), 'encoding': 'utf-8'}), text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(result.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              before = subprocess.run(['git', 'rev-parse', '--verify', 'HEAD:' + name], text=True, capture_output=True)
+              mode = '100755' if os.access(name, os.X_OK) else '100644'
+              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before.stdout.strip() if before.returncode == 0 else None})
+          manifest = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': records}
+          Path(os.environ['RUNNER_TEMP'], 'daemon-cli-publication.json').write_text(json.dumps(manifest, indent=2))
+          print('DAEMON_CLI_TESTED', json.dumps(manifest), flush=True)
+          PY
+      - name: Retain exact candidate and diagnostics
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/daemon-cli-final.diff"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/daemon-cli-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: daemon-cli-validation
+          path: ${{ runner.temp }}/daemon-cli-*
+          retention-days: 3

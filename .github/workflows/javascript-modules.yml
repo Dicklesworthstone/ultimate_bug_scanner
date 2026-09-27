@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/javascript-modules-source.patch.xz
+      - test-suite/patches/javascript-module-report-contract.patch
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -59,6 +60,8 @@ jobs:
           for name, sha in expected.items():
               assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
           PY
+          git apply --check test-suite/patches/javascript-module-report-contract.patch
+          git apply test-suite/patches/javascript-module-report-contract.patch
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh

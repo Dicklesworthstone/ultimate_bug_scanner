@@ -1,0 +1,74 @@
+diff --git a/test-suite/quality/test_taint_js_modules.py b/test-suite/quality/test_taint_js_modules.py
+index 41452b9..2c26777 100644
+--- a/test-suite/quality/test_taint_js_modules.py
++++ b/test-suite/quality/test_taint_js_modules.py
+@@ -55,6 +55,49 @@ class ModuleTaintTests(unittest.TestCase):
+                 self.assertIn(' -> ', finding['message'])
+             return findings
+ 
++    def assert_report_findings(self, report, root, expected):
++        """Validate both public report dialects independently, including counts."""
++        self.assertEqual(report['status'], 'ok', report)
++        channels = [(report['findings'], 'rule_id', 'file')]
++        channels.extend((scanner['findings'], 'rule', 'path')
++                        for scanner in report['scanners'] if scanner['language'] == 'js')
++        self.assertGreaterEqual(len(channels), 2, report)
++        for records, rule_key, path_key in channels:
++            found = []
++            for record in records:
++                rule = record[rule_key]
++                if not rule.startswith(('js.taint.', 'javascript.taint.')):
++                    continue
++                path = Path(record[path_key]).resolve().relative_to(root.resolve()).as_posix()
++                found.append((path, rule.rsplit('.', 1)[-1]))
++                self.assertGreater(record['line'], 0, record)
++                self.assertGreater(record['col'], 0, record)
++                self.assertEqual(record['severity'], 'critical', record)
++                self.assertFalse(record['suppressed'], record)
++            self.assertEqual(Counter(found), Counter([expected] if expected else []), report)
++
++    def test_report_dialects_retain_exact_paths_counts_and_locations(self):
++        with tempfile.TemporaryDirectory(prefix='ubs-module-report-') as tmp:
++            root = Path(tmp).resolve()
++            location = str(root / 'src/app.mjs')
++            common = {'line': 2, 'col': 3, 'severity': 'critical', 'suppressed': False}
++            merged = {**common, 'rule_id': 'javascript.taint.xss', 'file': location}
++            scanner = {**common, 'rule': 'javascript.taint.xss', 'path': location}
++            report = {'status': 'ok', 'findings': [merged],
++                      'scanners': [{'language': 'js', 'findings': [scanner]}]}
++            expected = ('src/app.mjs', 'xss')
++            self.assert_report_findings(report, root, expected)
++            report['findings'] = [merged, merged]
++            with self.assertRaises(AssertionError):
++                self.assert_report_findings(report, root, expected)
++            report['findings'] = [{**merged, 'file': str(root / 'wrong.mjs')}]
++            with self.assertRaises(AssertionError):
++                self.assert_report_findings(report, root, expected)
++            report['findings'] = [merged]
++            report['scanners'][0]['findings'] = [{**scanner, 'line': 0}]
++            with self.assertRaises(AssertionError):
++                self.assert_report_findings(report, root, expected)
++
+     def test_exported_source_return(self):
+         self.scan({'lib.js': 'export function read() { return req.query.html; }',
+                    'app.js': 'import {read} from "./lib.js"; res.send(read());'}, ('app.js', 'xss'))
+@@ -473,18 +516,7 @@ class ModuleTaintTests(unittest.TestCase):
+                 self.assertIn(result.returncode,(0,1),(result.stdout,result.stderr))
+                 report=json.loads(result.stdout)
+                 (artifact/'result.json').write_text(json.dumps(report,indent=2))
+-                self.assertEqual(report['status'],'ok',report)
+-                found=[]
+-                def visit(value):
+-                    if isinstance(value,dict):
+-                        rule=value.get('rule') or value.get('rule_id') or value.get('ruleId') or ''
+-                        if rule.startswith(('js.taint.','javascript.taint.')):
+-                            found.append((Path(value.get('path','')).name,rule.rsplit('.',1)[-1]))
+-                        for child in value.values(): visit(child)
+-                    elif isinstance(value,list):
+-                        for child in value: visit(child)
+-                visit(report)
+-                self.assertEqual(set(found),{expected} if expected else set(),report)
++                self.assert_report_findings(report, root, expected)
+ 
+ 
+ if __name__ == '__main__':

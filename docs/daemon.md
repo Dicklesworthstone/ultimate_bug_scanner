@@ -54,7 +54,7 @@ it is not included in exported portable runtimes or installed by `install.sh`.
 
 Misses still run the standard CLI, preserving its verified modules and existing
 Merkle cache. This does not claim sub-100 ms edited-file scans: keeping parsers
-and analysis state warm and adding filesystem watchers remain K4 work. Scanner
+and analysis state warm and native recursive filesystem watching remain K4 work. Scanner
 wall time is bounded (`--scan-timeout`, default 120 seconds); outputs are capped
 at 8 MiB per stream and timeout/overflow yields an environment error, not a
 truncated clean report. Requests and retained report memory are also bounded.
@@ -160,6 +160,56 @@ wrong repositories are errors. Cancellation never falls back to one-shot
 execution. `--require-daemon` in the example ensures the named scan is actually
 managed by the service; ordinary clients still retain their existing fallback.
 Unnamed requests remain supported and can be stopped with `stop`.
+
+## Continuous feedback for explicit files
+
+Start the daemon explicitly, then keep a foreground watcher running for the
+source files being edited:
+
+```bash
+./ubs-daemon serve --repo /path/to/project
+# In another terminal with the same environment:
+./ubs-daemon watch --repo /path/to/project --debounce=0.3 src/main.py src/util.py
+```
+
+The watcher observes the bytes and file identity of each **explicitly named
+file**. The default polling interval is 0.25 seconds (`--watch-interval`, minimum
+0.1); a 0.3-second quiet period combines rapid saves into one scan (`--debounce`).
+Atomic replacement and same-size edits with restored mtimes trigger another
+generation. Missing, unreadable, oversized, non-regular or escaping files
+produce an `invalid` event with exit code 2, not a clean result. Restoring the
+file resumes scanning. Watched input is bounded to 256 files and 128 MiB.
+
+On every observed edit the previous report is invalidated immediately. A
+superseded scan is cancelled using its own unique request id; the watcher never
+stops the daemon or cancels somebody else's work. It rechecks the watched files
+at completion and discards outdated results. Ctrl-C/SIGTERM cancels outstanding
+watch work and exits 130. Transport timeouts also attempt cancellation. Client
+I/O uses an absolute request deadline, so a trickling response cannot extend a
+request indefinitely; pending transfers are locally interruptible.
+
+Stdout is always a sequence of **JSONL event envelopes**, schema `ubs.watch/1`:
+`changed`, `scanning`, `superseded`, `result`, `invalid`, or `error`. Each carries
+a generation, source fingerprint and the watched paths. A `changed` event means
+the preceding report is no longer current. `result` includes the scanner's
+original `stdout`, `stderr`, `exit_code` and cache marker. The requested
+`--format=text|json|jsonl|sarif` controls that inner scanner payload, not the
+outer event stream. Profiles and fail-on-warning policy are preserved.
+
+Watch mode requires a compatible running daemon with the same scanner and
+environment. It never starts a service, falls back to a second scanner, or
+silently masks service failures. Directory/Git selection and caller-assigned
+request ids are rejected for watch mode; use `client` for those selections.
+The existing save hook is unchanged.
+
+This is explicit-file polling, not recursive project watching or a warmed
+analysis engine. Unnamed dependencies, configuration, ignore files and tools
+do **not** trigger a new generation; restart the watcher after changing those
+inputs, or include source dependencies in the explicit file set. The underlying
+scanner still owns dependency analysis and cache validation on every request.
+The source fingerprint is an observation marker, not a certificate that the
+entire repository or external tool environment is unchanged. No edited-file
+latency improvement is claimed.
 
 Validation:
 

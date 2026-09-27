@@ -7,6 +7,7 @@ on:
       - test-suite/patches/javascript-heap-shapes.patch.xz
       - test-suite/patches/javascript-native-identity.patch.xz
       - test-suite/patches/javascript-native-exports.patch.xz
+      - test-suite/patches/javascript-heap-templates.patch.xz
       - .github/workflows/javascript-heap-shapes.yml
   workflow_dispatch:
 
@@ -32,7 +33,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply exact reviewed shape and native identity increments
+      - name: Apply exact reviewed shape, identity and summary-template increments
         run: |
           python3 - <<'PY'
           import hashlib
@@ -43,7 +44,6 @@ jobs:
               return subprocess.check_output(['git','hash-object',path],text=True).strip()
           source = 'modules/helpers/ubs_core/analyzers/taint_js.py'
           tests = 'test-suite/js/test_taint_heap.py'
-          assert blob(source) == '5dc2d9daece893dd5515a6d2178941ff9ec88f33'
           stages = [
               ('javascript-heap-shapes.patch.xz', 'd0e155c96c5ca90ad940430bcf2d428105368124785ed249c333bef6fc2b6328',
                '12c81cf151445b4c9c5549f1330add88dcced924', '9a9d33f718f58312f31a51d52d31f55354b64fcd'),
@@ -52,12 +52,22 @@ jobs:
               ('javascript-native-exports.patch.xz', '3eb47660f1a7e36cf19ab3a489573c11202d42d238c329512a8fccdc4c0420d4',
                'ba33ac4e17f45ebc5907dd2f66042d3a01373bf4', 'e655e6787428e83b78594faac894b3d1f1f25237'),
           ]
-          for filename, digest, source_sha, test_sha in stages:
+          def apply(filename, digest):
               patch = lzma.decompress(Path('test-suite/patches',filename).read_bytes())
               assert hashlib.sha256(patch).hexdigest() == digest, filename
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
-              assert blob(source) == source_sha and blob(tests) == test_sha, filename
+          if blob(source) == '5dc2d9daece893dd5515a6d2178941ff9ec88f33':
+              for filename, digest, source_sha, test_sha in stages:
+                  apply(filename, digest)
+                  assert blob(source) == source_sha and blob(tests) == test_sha, filename
+          # The preceding exact candidate may have been activated meanwhile.
+          # Never replace a newer or unrecognized implementation.
+          assert blob(source) == 'ba33ac4e17f45ebc5907dd2f66042d3a01373bf4'
+          assert blob(tests) == 'e655e6787428e83b78594faac894b3d1f1f25237'
+          apply('javascript-heap-templates.patch.xz', 'd4333f4bc0d2ac09cce51fbd816bb4d19e6911ee05370cbfe52d8fb230537e6e')
+          assert blob(source) == '265268ff924bcf8aefe06c9f926afa4ca17e872d'
+          assert blob('test-suite/quality/test_taint_js_heap.py') == '0de8ec7d2e63f06c3a844726cf63258bcd3e8ed4'
           print('JS_SHAPES_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),flush=True)
           PY
           python3 scripts/update_checksums.py
@@ -111,8 +121,8 @@ jobs:
           import tarfile
           import urllib.request
           changed = subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
-          required = {'modules/helpers/ubs_core/analyzers/taint_js.py','test-suite/js/test_taint_heap.py'}
-          allowed = required | {'ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
+          required = {'modules/helpers/ubs_core/analyzers/taint_js.py','test-suite/quality/test_taint_js_heap.py'}
+          allowed = required | {'test-suite/js/test_taint_heap.py','ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert required <= set(changed) <= allowed, changed
           before = {name:Path(name).read_bytes() for name in changed}

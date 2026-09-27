@@ -844,7 +844,8 @@ def validate_scan_response(response: dict) -> None:
         raise ServiceError('Invalid scanner output streams')
 
 
-def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] = (),
+                 directories: tuple[str, ...] = ()) -> tuple[str, list[str]]:
     """Observe source files plus optional dependency trees without changing scan scope.
 
     Source paths must stay regular files. Dependency paths may be absent or
@@ -873,14 +874,17 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
         errors.append(message)
         digest.update(b'error\0' + message.encode('utf-8', 'replace'))
 
-    for values, recursive in ((names, False), (dependencies, True)):
+    for values, recursive, optional, require_dir in ((names, False, False, False),
+                                                    (directories, True, False, True),
+                                                    (dependencies, True, True, False)):
         if len(values) > 256:
             raise ServiceError('At most 256 source paths and 256 watch inputs are permitted')
         for name in values:
             if not isinstance(name, str) or not name or '\x00' in name:
                 raise ServiceError('Invalid watch input path')
-            digest.update(('dependency\0' if recursive else 'source\0').encode() + os.fsencode(name) + b'\0')
-            pending.append((root / name, recursive, recursive))
+            kind = 'directory\0' if require_dir else 'dependency\0' if optional else 'source\0'
+            digest.update(kind.encode() + os.fsencode(name) + b'\0')
+            pending.append((root / name, recursive, optional, require_dir))
     pending.reverse()
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     try:
@@ -913,7 +917,7 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
     try:
         root_identity = os.fstat(root_fd)
         while pending:
-            path, recursive, optional = pending.pop()
+            path, recursive, optional, require_dir = pending.pop()
             entries += 1
             if entries > MAX_SNAPSHOT_ENTRIES:
                 invalid(path, 'watched inputs exceed the entry limit')
@@ -939,6 +943,8 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
                     current_stamp = stamp(info)
                     digest.update(repr(current_stamp).encode() + b'\0')
                     checked.append((path, resolved, link_stamp, current_stamp))
+                    if require_dir and not stat.S_ISDIR(info.st_mode):
+                        raise ServiceError('watched scan directory is no longer a directory')
                     if not stat.S_ISREG(info.st_mode) and not (recursive and stat.S_ISDIR(info.st_mode)):
                         raise ServiceError('watched source is not a regular file or permitted directory')
                     if resolved in seen:
@@ -953,7 +959,7 @@ def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] 
                                 if entries + len(pending) + len(children) >= MAX_SNAPSHOT_ENTRIES:
                                     raise ServiceError('watched inputs exceed the entry limit')
                                 children.append(item.name)
-                        pending.extend((path / child, True, False) for child in sorted(children, reverse=True))
+                        pending.extend((path / child, True, False, False) for child in sorted(children, reverse=True))
                     else:
                         if info.st_size > MAX_SNAPSHOT - total:
                             raise ServiceError('watched sources exceed the byte limit')
@@ -1008,10 +1014,11 @@ def cancel_watch_request(root: Path, request_id: str) -> bool:
 
 def watch(root: Path, request: dict, timeout: float, interval: float, debounce: float,
           *, dependencies: tuple[str, ...] = ()) -> int:
-    """Foreground, explicit-file edit feedback; never starts a daemon or falls back."""
+    """Foreground file/directory feedback; never starts a daemon or falls back."""
     validate_scan(root, request)
-    if request.get('selection', 'files') != 'files':
-        raise ServiceError('watch requires explicit source files, not directory or Git selection')
+    selection = request.get('selection', 'files')
+    if selection not in {'files', 'directory'}:
+        raise ServiceError('watch requires source files or one directory, not Git selection')
     if len(dependencies) > 256:
         raise ServiceError('At most 256 watch inputs are permitted')
     for name in dependencies:
@@ -1037,13 +1044,21 @@ def watch(root: Path, request: dict, timeout: float, interval: float, debounce: 
     pending = False
     settled_at = 0.0
     names = request['paths']
+    project_watch = selection == 'directory'
 
     def observe():
+        if project_watch:
+            # Watch the repository, not only the scan directory. Sibling
+            # dependencies and root ignore/config files can affect a scan.
+            # Both the root and selected target must remain directories.
+            return watch_inputs(root, [], directories=tuple(dict.fromkeys(('.', *names))),
+                                dependencies=dependencies)
         return watch_inputs(root, names, dependencies=dependencies) if dependencies else watch_inputs(root, names)
 
     def emit(event, **fields):
         print(json.dumps(dict(schema='ubs.watch/1', event=event, generation=generation,
-                              source_fingerprint=observed, paths=names, watch_inputs=dependencies, **fields),
+                              source_fingerprint=observed, paths=names, selection=selection,
+                              watch_inputs=('.', *dependencies) if project_watch else dependencies, **fields),
                          ensure_ascii=True, separators=(',', ':')), flush=True)
 
     try:

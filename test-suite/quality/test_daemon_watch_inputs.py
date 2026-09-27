@@ -6,7 +6,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from test_daemon_selection import SelectionFixture, daemon
+from test_daemon_selection import ROOT, SelectionFixture, daemon
 from test_daemon_watch import WatchFixture
 
 # Protocol double. The dependency affects the result but is NOT a scan target.
@@ -24,6 +24,29 @@ if 'SLOW' in text:
 print(json.dumps({'files': records, 'args': args, 'policy': text}))
 print('dependency scanner diagnostic', file=sys.stderr)
 sys.exit(1 if 'BUG' in text else 0)
+'''
+
+# Directory selection / simple ignore-policy protocol double, not UBS rules.
+DIRECTORY_SCANNER = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+args = sys.argv[1:]
+targets = args[args.index('--') + 1:]
+root = pathlib.Path.cwd()
+ignore = root / '.ubsignore'
+excluded = set(ignore.read_text().splitlines()) if ignore.is_file() else set()
+records = []
+for target in targets:
+    for path in sorted(pathlib.Path(target).rglob('*.py')):
+        relative = path.relative_to(root).as_posix()
+        if relative not in excluded:
+            records.append((relative, path.read_text()))
+with open(os.environ['SCAN_COUNT'], 'a') as out:
+    out.write(json.dumps({'pid': os.getpid(), 'records': records}) + '\n')
+if any('SLOW' in text for _, text in records):
+    time.sleep(30)
+print(json.dumps({'files': records, 'args': args}))
+print('directory scanner diagnostic', file=sys.stderr)
+sys.exit(3 if not records else 1 if any('BUG' in text for _, text in records) else 0)
 '''
 
 
@@ -220,6 +243,27 @@ class InputObservationTests(SelectionFixture, unittest.TestCase):
                 self.observe(*dependencies)
         self.assertTrue(self.observe('../outside')[1])
 
+    def test_required_directory_cannot_disappear_or_become_a_file(self):
+        tree = self.root / 'src'
+        tree.mkdir()
+        def observe():
+            return daemon.watch_inputs(self.root, [], directories=('.', 'src'))
+        self.assertEqual(observe()[1], [])
+        tree.rename(self.work / 'old-src')
+        self.assertTrue(observe()[1])
+        tree.write_text('now a file')
+        self.assertTrue(any('no longer a directory' in error for error in observe()[1]))
+
+    def test_project_observation_includes_git_metadata(self):
+        self.init_git()
+        first, errors = daemon.watch_inputs(self.root, [], directories=('.',))
+        self.assertEqual(errors, [])
+        # Only Git metadata changes: no source edit is needed for invalidation.
+        self.git('config', 'core.excludesFile', 'different-policy')
+        after, errors = daemon.watch_inputs(self.root, [], directories=('.',))
+        self.assertEqual(errors, [])
+        self.assertNotEqual(first, after)
+
 
 @unittest.skipUnless(os.name == 'posix', 'watch uses Unix service')
 class DependencyWatchTests(WatchFixture, unittest.TestCase):
@@ -310,6 +354,129 @@ class DependencyWatchTests(WatchFixture, unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertNotIn('Traceback', result.stderr)
         self.assertEqual(self.calls(), [])
+
+
+@unittest.skipUnless(os.name == 'posix', 'watch uses Unix service')
+class DirectoryWatchTests(WatchFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.scanner.write_text(DIRECTORY_SCANNER)
+        self.tree = self.root / 'src'
+        self.tree.mkdir()
+
+    def test_added_renamed_and_removed_sources_are_rediscovered(self):
+        self.start()
+        self.start_watch(files=['.'])
+        initial = self.event('result')
+        self.assertEqual(initial['exit_code'], 0)
+        source = self.tree / 'new.py'
+        source.write_text('BUG')
+        added = self.event('result')
+        self.assertEqual(added['exit_code'], 1)
+        self.assertEqual(added['selection'], 'directory')
+        self.assertEqual(added['watch_inputs'], ['.'])
+        source.rename(self.tree / 'renamed.py')
+        renamed = self.event('result')
+        self.assertIn(['src/renamed.py', 'BUG'], json.loads(renamed['stdout'])['files'])
+        self.tree.rename(self.work / 'removed-src')
+        removed = self.event('result')
+        self.assertEqual(removed['exit_code'], 0)
+        self.assertEqual(json.loads(removed['stdout'])['files'], [['a.py', 'clean\n']])
+        self.assertEqual(len(self.calls()), 4)
+        self.assertFalse(any(item.get('cached') for item in (initial, added, renamed, removed)))
+
+    def test_sibling_and_root_policy_edits_trigger_without_expanding_scope(self):
+        (self.tree / 'target.py').write_text('BUG')
+        self.source.write_text('BUG outside scan directory')
+        self.start()
+        self.start_watch(files=['src'])
+        self.assertEqual(self.event('result')['exit_code'], 1)
+        (self.root / '.ubsignore').write_text('src/target.py\n')
+        ignored = self.event('result')
+        self.assertEqual(ignored['exit_code'], 3)
+        report = json.loads(ignored['stdout'])
+        self.assertEqual(report['args'][-2:], ['--', str(self.tree)])
+        self.assertEqual(report['files'], [])
+        self.source.write_text('changed sibling dependency')
+        sibling = self.event('result')
+        self.assertEqual(sibling['exit_code'], 3)
+        self.assertEqual(sibling['paths'], ['src'])
+        self.assertEqual(json.loads(sibling['stdout'])['files'], [])
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_empty_directory_stays_watched_until_source_is_added(self):
+        self.start()
+        self.start_watch(files=['src'])
+        empty = self.event('result')
+        self.assertEqual(empty['exit_code'], 3)
+        (self.tree / 'new.py').write_text('BUG')
+        added = self.event('result')
+        self.assertEqual(added['exit_code'], 1)
+        self.assertGreater(added['generation'], empty['generation'])
+
+    def test_missing_directory_invalidates_then_recreation_resumes(self):
+        (self.tree / 'target.py').write_text('clean')
+        self.start()
+        self.start_watch(files=['src'])
+        self.assertEqual(self.event('result')['exit_code'], 0)
+        self.tree.rename(self.work / 'old-src')
+        invalid = self.event('invalid')
+        self.assertEqual(invalid['exit_code'], 2)
+        self.assertEqual(len(self.calls()), 1)
+        self.tree.mkdir()
+        (self.tree / 'new.py').write_text('BUG')
+        self.assertEqual(self.event('result')['exit_code'], 1)
+
+    def test_obsolete_directory_scan_is_cancelled_for_new_inventory(self):
+        source = self.tree / 'slow.py'
+        source.write_text('SLOW')
+        self.start()
+        self.start_watch(files=['src'])
+        self.event('scanning')
+        old = self.await_calls(1)[0]
+        source.rename(self.work / 'removed-slow.py')
+        (self.tree / 'new.py').write_text('BUG')
+        latest = self.event('result', timeout=8)
+        self.assertEqual(latest['exit_code'], 1)
+        self.assertEqual(json.loads(latest['stdout'])['files'], [['src/new.py', 'BUG']])
+        self.assertEqual(len([item for item in self.events if item['event'] == 'result']), 1)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(old['pid'], 0)
+
+    def test_escaping_directory_replacement_does_not_scan_external_source(self):
+        (self.tree / 'target.py').write_text('clean')
+        self.start()
+        self.start_watch(files=['src'])
+        self.event('result')
+        outside = self.work / 'private'
+        outside.mkdir()
+        (outside / 'secret.py').write_text('PRIVATE')
+        self.tree.rename(self.work / 'old-src')
+        self.tree.symlink_to(outside, target_is_directory=True)
+        invalid = self.event('invalid')
+        self.assertIn('outside', invalid['stderr'])
+        self.assertNotIn('PRIVATE', invalid['stderr'])
+        self.assertEqual(len(self.calls()), 1)
+
+
+@unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for the actual scanner')
+class RealDirectoryWatchTests(WatchFixture, unittest.TestCase):
+    def test_real_added_file_and_ignore_policy_are_observed(self):
+        self.source.write_text('value = 1\n')
+        self.start(scanner=ROOT / 'ubs')
+        self.start_watch(scanner=ROOT / 'ubs', files=['.'])
+        self.assertEqual(self.event('result', timeout=150)['exit_code'], 0)
+        target = self.root / 'added.py'
+        target.write_text('eval(input())\n')
+        added = self.event('result', timeout=150)
+        self.assertEqual(added['exit_code'], 1, added)
+        report = json.loads(added['stdout'])
+        self.assertTrue(any(item['rule_id'] == 'python.taint.eval' for item in report['findings']), report)
+        (self.root / '.ubsignore').write_text('added.py\n')
+        ignored = self.event('result', timeout=150)
+        self.assertEqual(ignored['exit_code'], 0, ignored)
+        self.assertFalse(any(item['rule_id'] == 'python.taint.eval'
+                             for item in json.loads(ignored['stdout']).get('findings', [])))
 
 
 if __name__ == '__main__':

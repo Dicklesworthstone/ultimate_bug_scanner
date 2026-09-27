@@ -161,7 +161,7 @@ execution. `--require-daemon` in the example ensures the named scan is actually
 managed by the service; ordinary clients still retain their existing fallback.
 Unnamed requests remain supported and can be stopped with `stop`.
 
-## Continuous feedback for explicit files
+## Continuous feedback for files and directories
 
 Start the daemon explicitly, then keep a foreground watcher running for the
 source files being edited:
@@ -170,6 +170,8 @@ source files being edited:
 ./ubs-daemon serve --repo /path/to/project
 # In another terminal with the same environment:
 ./ubs-daemon watch --repo /path/to/project --debounce=0.3 src/main.py src/util.py
+# Or rescan a directory as files are created, renamed, edited or removed:
+./ubs-daemon watch --repo /path/to/project src/
 ```
 
 The watcher observes the bytes and file identity of each **explicitly named
@@ -199,9 +201,33 @@ outer event stream. Profiles and fail-on-warning policy are preserved.
 
 Watch mode requires a compatible running daemon with the same scanner and
 environment. It never starts a service, falls back to a second scanner, or
-silently masks service failures. Directory/Git selection and caller-assigned
-request ids are rejected for watch mode; use `client` for those selections.
+silently masks service failures. Git selection and caller-assigned request ids
+are rejected for watch mode; use `client` for staged/diff scans.
 The existing save hook is unchanged.
+
+### Recursive project observation with directory scans
+
+With one directory target, `watch` observes the **entire served repository tree**
+while passing only that selected directory to the ordinary scanner. This catches
+new source files, directory renames and removals, sibling dependency edits, and
+root-level ignore/configuration changes without expanding scan scope. The normal
+scanner still owns file selection and ignore policy. All entries, including Git
+storage, hidden files and ignored dependencies, count toward the observation's
+20,000-entry/128-MiB bounds; there is no silently truncated "clean" project view.
+
+An empty directory can return exit 3 and remains watched; adding source resumes
+scanning. If the selected directory disappears, becomes a file or escapes the
+root through a symlink, the observation is invalid until repaired. Missing or
+unsafe nested inputs also prevent result publication. Directory requests never
+reuse whole reports, preserving the existing project-tool execution policy.
+Events expose `selection: "directory"`, the original scan `paths`, and `.` in
+`watch_inputs`. Explicit-file events use `selection: "files"`.
+
+This is bounded byte/metadata polling, not OS-native filesystem notification.
+External Git metadata (for example linked-worktree administration), global
+configuration and tool installations outside the served root are not observed;
+restart the watcher after changing those inputs. Large repositories with vendor
+or build trees should use explicit files and narrower `--watch-input` paths.
 
 ### Dependency and policy invalidation
 

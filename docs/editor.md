@@ -133,7 +133,7 @@ this does not discover every project source or prove whole-project correctness.
 Select `--buffer-mode=incremental` to retain one private workspace between
 successful buffer scans. It has the same selected-buffer, policy and isolation
 boundaries as `snapshot`, but unchanged support files keep their private inodes
-and paths. Only changed editor buffers are rewritten. The ordinary scanner is
+and paths. Only changed buffers and changed regular support files are rewritten. The ordinary scanner is
 still invoked on every accepted scan; this is not a cache of clean reports or
 a warmed in-process analysis engine.
 
@@ -145,15 +145,26 @@ python3 -I /trusted/ultimate_bug_scanner/ubs-lsp \
 The first copy is byte-checked before retention. Every lease validates the
 complete original and private metadata inventories, including inode and change
 time, then checks them again after scanning and before diagnostic publication.
-Each generation retains its own validation records. Original-context or selected
-path changes cause a fresh complete snapshot; unknown or unsafe input is not
-silently omitted. Restoring only modification times does not preserve eligibility.
+Each generation retains its own validation records. Saved edits and atomic
+replacements of existing regular files are refreshed incrementally after a
+complete bounded inventory check. Unsaved editor text remains authoritative for
+selected buffers even when an autosave updates their disk versions. Changed
+support files are streamed into authenticated private counterparts; other files
+are not recopied. Original and overlaid workspace sizes are both bounded.
+
+Added, removed or retyped paths, or changes to the selected document set, cause
+a fresh complete snapshot. Unknown or unsafe input is not silently omitted.
+Restoring only modification times does not preserve eligibility. Changes during
+enumeration or copying reject the entire partial refresh before a scanner can
+use it. Updated Git configuration is subject to the original redirection checks.
 
 Private-tree mutation by a scanner, cancellation, timeout or scanner failure
 discards the retained workspace. A later request must rebuild it from original
 context. Only one scanner may lease the workspace, and shutdown joins scanner
 work before removing it. Unlike one-shot `snapshot`, this opt-in mode retains
-private source copies between scans, until disposal or server exit. All existing
+private source copies between scans, until disposal, last-document close or
+shutdown. Cleanup waits for an active scanner to be reaped before removing its
+workspace, and reopening documents after an idle cleanup is supported. All existing
 128-MiB/20,000-entry bounds and the no-hard-link/no-symlink checks still apply.
 Tools that write into the copied project may therefore need one-shot mode.
 

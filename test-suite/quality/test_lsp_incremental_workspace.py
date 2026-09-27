@@ -131,17 +131,18 @@ class ReuseTests(Fixture):
         with self.assertRaisesRegex(lsp.ProtocolError, 'Private buffer'):
             first.verify()
 
-    def test_same_size_disk_edit_with_restored_mtime_rebuilds_from_new_bytes(self):
+    def test_same_size_disk_edit_with_restored_mtime_refreshes_from_new_bytes(self):
         with self.workspace() as first:
             old_root = first.root
         stamp = self.support.stat()
         self.support.write_text('DENY!')
         os.utime(self.support, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
         with self.workspace() as second:
-            self.assertFalse(second.reused)
-            self.assertNotEqual(second.root, old_root)
+            self.assertTrue(second.reused)
+            self.assertEqual(second.root, old_root)
             self.assertEqual((second.root / 'support.dat').read_text(), 'DENY!')
-        self.assertFalse(old_root.exists())
+            self.assertEqual(second.copied_bytes, 5)
+        self.assertTrue(old_root.exists())
 
     def test_added_removed_and_new_buffer_membership_rebuild_context(self):
         with self.workspace() as first:
@@ -289,6 +290,163 @@ class ReuseTests(Fixture):
                 pass
         self.assertIsNone(self.cache.retained)
 
+    def test_only_changed_support_file_is_copied(self):
+        big = self.root / 'unchanged.bin'
+        big.write_bytes(b'z' * 1024 * 1024)
+        with self.workspace('buffer') as first:
+            before = lsp.file_stamp((first.root / big.name).stat())
+        self.support.write_text('DENY new policy')
+        with self.workspace('buffer') as second:
+            self.assertTrue(second.reused)
+            self.assertEqual(second.copied_bytes, len('DENY new policy'))
+            self.assertEqual(second.buffer_bytes_written, 0)
+            self.assertEqual(lsp.file_stamp((second.root / big.name).stat()), before)
+            self.assertEqual((second.root / self.support.name).read_text(), 'DENY new policy')
+
+    def test_atomic_autosave_refreshes_disk_guard_without_overwriting_buffer(self):
+        with self.workspace('unsaved latest') as first:
+            original_guard = dict(first.entries)
+            private_stamp = lsp.file_stamp((first.root / 'a.py').stat())
+        saved = self.work / 'atomic-save'
+        saved.write_text('older autosaved contents')
+        os.replace(saved, self.source)
+        with self.workspace('unsaved latest') as second:
+            self.assertTrue(second.reused)
+            self.assertEqual(second.root, first.root)
+            self.assertEqual(second.copied_bytes, 0)
+            self.assertEqual(second.buffer_bytes_written, 0)
+            self.assertEqual(lsp.file_stamp((second.root / 'a.py').stat()), private_stamp)
+            self.assertEqual((second.root / 'a.py').read_text(), 'unsaved latest')
+        self.assertEqual(self.source.read_text(), 'older autosaved contents')
+        self.assertEqual(first.entries, original_guard)
+        with self.assertRaisesRegex(lsp.ProtocolError, 'context changed'):
+            first.verify()
+
+    def test_atomic_support_save_preserves_other_private_inodes(self):
+        with self.workspace('buffer') as first:
+            source_stamp = lsp.file_stamp((first.root / 'a.py').stat())
+        saved = self.work / 'saved-support'
+        saved.write_text('DENY atomic')
+        os.replace(saved, self.support)
+        with self.workspace('buffer') as second:
+            self.assertTrue(second.reused)
+            self.assertEqual(second.root, first.root)
+            self.assertEqual((second.root / 'support.dat').read_text(), 'DENY atomic')
+            self.assertEqual(lsp.file_stamp((second.root / 'a.py').stat()), source_stamp)
+
+    def test_support_mode_changes_and_old_guards_are_not_lost(self):
+        with self.workspace() as first:
+            original_guard = dict(first.entries)
+        self.support.chmod(0o755)
+        with self.workspace() as second:
+            self.assertTrue(second.reused)
+            self.assertEqual((second.root / 'support.dat').stat().st_mode & 0o777, 0o700)
+        self.assertEqual(first.entries, original_guard)
+        with self.assertRaisesRegex(lsp.ProtocolError, 'context changed'):
+            first.verify()
+        self.support.chmod(0o644)
+        with self.workspace() as third:
+            self.assertTrue(third.reused)
+            self.assertEqual((third.root / 'support.dat').stat().st_mode & 0o777, 0o600)
+
+    def test_redirected_git_config_cannot_be_introduced_by_incremental_copy(self):
+        git = self.root / '.git'
+        git.mkdir()
+        config = git / 'config'
+        config.write_text('[core]\nrepositoryformatversion=0\n')
+        with self.workspace() as first:
+            root = first.root
+        config.write_text('[include]\npath=/external\n')
+        with self.assertRaisesRegex(lsp.ProtocolError, 'Path-dependent'), self.workspace():
+            pass
+        self.assertIsNone(self.cache.retained)
+        self.assertFalse(root.exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_changed_source_byte_bound_is_checked_before_private_mutation(self):
+        with self.workspace() as first:
+            root = first.root
+        self.support.write_bytes(b'x' * 200)
+        with patch.object(lsp, 'MAX_WORKSPACE_BYTES', 100), self.assertRaisesRegex(lsp.ProtocolError, 'byte limit'):
+            with self.workspace():
+                pass
+        self.assertFalse(root.exists())
+        self.assertIsNone(self.cache.retained)
+
+    def test_context_edit_during_incremental_copy_discards_mixed_generation(self):
+        later = self.root / 'z.dat'
+        later.write_text('before')
+        with self.workspace() as first:
+            root = first.root
+        self.support.write_text('changed one')
+        later.write_text('trigger edit')
+        original_read = os.read
+        def edit_earlier(fd, size):
+            result = original_read(fd, size)
+            if result == b'trigger edit':
+                self.support.write_text('changed twice')
+            return result
+        with patch.object(lsp.os, 'read', side_effect=edit_earlier), self.assertRaisesRegex(lsp.ProtocolError, 'context changed'):
+            with self.workspace():
+                pass
+        self.assertIsNone(self.cache.retained)
+        self.assertFalse(root.exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_support_update_cancellation_discards_partial_writes(self):
+        with self.workspace() as first:
+            root = first.root
+        self.support.write_text('DENY replacement')
+        cancel = threading.Event()
+        write = os.write
+        def interrupt(fd, data):
+            count = write(fd, data[:1])
+            cancel.set()
+            return count
+        with patch.object(lsp.os, 'write', side_effect=interrupt), self.assertRaisesRegex(lsp.ProtocolError, 'cancelled'):
+            with self.workspace(cancel=cancel):
+                pass
+        self.assertIsNone(self.cache.retained)
+        self.assertFalse(root.exists())
+        self.assertEqual(self.support.read_text(), 'DENY replacement')
+        with self.workspace() as recovered:
+            self.assertFalse(recovered.reused)
+            self.assertEqual((recovered.root / 'support.dat').read_text(), 'DENY replacement')
+
+    def test_late_private_symlink_substitution_cannot_redirect_support_write(self):
+        with self.workspace() as first:
+            root = first.root
+        self.support.write_text('DENY replacement')
+        refresh = lsp.BufferWorkspace.refresh_support_file
+        def redirect(workspace, relative):
+            target = workspace.root / relative
+            target.rename(self.work / 'old-private-support')
+            target.symlink_to(self.support)
+            return refresh(workspace, relative)
+        with patch.object(lsp.BufferWorkspace, 'refresh_support_file', redirect), self.assertRaises(OSError):
+            with self.workspace():
+                pass
+        self.assertEqual(self.support.read_text(), 'DENY replacement')
+        self.assertFalse(root.exists())
+        self.assertIsNone(self.cache.retained)
+
+    def test_original_growth_during_support_copy_is_bounded(self):
+        with self.workspace() as first:
+            root = first.root
+        self.support.write_text('new!')
+        read = os.read
+        def grow(fd, size):
+            chunk = read(fd, size)
+            if chunk == b'new!':
+                with self.support.open('a') as stream:
+                    stream.write('growth')
+            return chunk
+        with patch.object(lsp.os, 'read', side_effect=grow), self.assertRaisesRegex(lsp.ProtocolError, 'grew'):
+            with self.workspace():
+                pass
+        self.assertIsNone(self.cache.retained)
+        self.assertFalse(root.exists())
+
 
 class ServerFixture(Fixture):
     def setUp(self):
@@ -361,7 +519,7 @@ class ServerTests(ServerFixture):
         self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'test.buffer')
         self.assertEqual(self.support.read_text(), 'allow')
 
-    def test_dependency_edit_rebuilds_before_next_result(self):
+    def test_dependency_edit_refreshes_before_next_result(self):
         self.open('clean buffer')
         self.drain()
         self.support.write_text('DENY')
@@ -369,7 +527,7 @@ class ServerTests(ServerFixture):
         self.drain()
         self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'test.buffer')
         self.assertEqual(self.calls()[-1]['context'], 'DENY')
-        self.assertNotEqual(self.calls()[0]['cwd'], self.calls()[1]['cwd'])
+        self.assertEqual(self.calls()[0]['cwd'], self.calls()[1]['cwd'])
 
     def test_grouped_buffers_preserve_policy_and_new_file_scope(self):
         self.server.policy = ('--profile=strict', '--fail-on-warning')
@@ -414,6 +572,115 @@ class ServerTests(ServerFixture):
         self.support.write_text('DENY')
         self.server.tick()
         self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'ubs.unverified')
+
+    def test_autosave_keeps_private_scope_and_newer_unsaved_buffer(self):
+        self.open('BUG latest buffer')
+        self.drain()
+        path = self.calls()[0]['cwd']
+        saved = self.work / 'saved.py'
+        saved.write_text('older saved text')
+        os.replace(saved, self.source)
+        self.send('workspace/didChangeWatchedFiles', {'changes': [{'uri': self.uri, 'type': 2}]})
+        self.drain()
+        self.assertEqual(self.calls()[-1]['cwd'], path)
+        self.assertEqual(next(iter(self.calls()[-1]['texts'].values())), 'BUG latest buffer')
+        self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'test.buffer')
+        self.assertEqual(self.source.read_text(), 'older saved text')
+
+    def test_last_document_close_drops_plaintext_and_reopen_uses_new_workspace(self):
+        self.open('BUG private')
+        self.drain()
+        root = Path(self.calls()[0]['cwd'])
+        self.send('textDocument/didClose', {'textDocument': {'uri': self.uri}})
+        self.drain()
+        self.assertFalse(root.exists())
+        self.assertIsNone(self.server.workspace_cache.retained)
+        self.open('new buffer')
+        self.drain()
+        self.assertNotEqual(self.calls()[-1]['cwd'], str(root))
+        self.assertEqual(self.reports()[-1]['diagnostics'], [])
+
+    def test_shutdown_cancels_active_lease_and_removes_private_tree_before_exit(self):
+        self.open('SLOW')
+        until = time.monotonic() + 5
+        while not self.calls() and time.monotonic() < until:
+            self.server.tick()
+            time.sleep(0.01)
+        self.assertEqual(len(self.calls()), 1)
+        old = self.calls()[0]
+        self.send('shutdown', id=9)
+        self.assertEqual(self.messages[-1], {'jsonrpc': '2.0', 'id': 9, 'result': None})
+        marker = len(self.messages)
+        self.drain()
+        self.assertEqual(len(self.messages), marker)
+        self.assertFalse(Path(old['cwd']).exists())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(old['pid'], 0)
+
+    def test_real_stdio_incremental_context_refresh_and_cleanup(self):
+        process = subprocess.Popen([sys.executable, '-I', str(ROOT / 'ubs-lsp'), '--repo', str(self.root),
+                                    '--scanner', str(self.scanner), '--buffer-mode=incremental'],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        messages = queue.Queue()
+        def read():
+            framer = lsp.Framer()
+            while data := process.stdout.read1(65536):
+                for message in framer.feed(data):
+                    messages.put(message)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        def finish():
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+            reader.join(timeout=1)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+        self.addCleanup(finish)
+        def send(method, params=None, **extra):
+            process.stdin.write(lsp.frame(dict(jsonrpc='2.0', method=method, params=params or {}, **extra)))
+            process.stdin.flush()
+        observed = []
+        def receive(predicate):
+            until = time.monotonic() + 6
+            while time.monotonic() < until:
+                try:
+                    message = messages.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                observed.append(message)
+                if predicate(message):
+                    return message
+            self.fail('No expected stdio result: ' + repr(observed))
+        def diagnostics(message):
+            return message.get('method') == 'textDocument/publishDiagnostics'
+        send('initialize', {'rootUri': self.root.as_uri()}, id=1)
+        capabilities = receive(lambda m: m.get('id') == 1)['result']['capabilities']
+        self.assertEqual(capabilities['experimental']['ubs']['workspaceStrategy'], 'incremental')
+        send('textDocument/didOpen', {'textDocument': {'uri': self.uri, 'version': 1, 'text': 'clean'}})
+        receive(lambda m: diagnostics(m) and m['params']['diagnostics'] == [])
+        initial = self.calls()[0]
+        self.support.write_text('DENY')
+        send('workspace/didChangeWatchedFiles', {'changes': [{'uri': self.support.as_uri(), 'type': 2}]})
+        receive(lambda m: diagnostics(m) and any(d['code'] == 'test.buffer' for d in m['params']['diagnostics']))
+        self.assertEqual(self.calls()[-1]['cwd'], initial['cwd'])
+        self.assertEqual(self.calls()[-1]['context'], 'DENY')
+        self.support.write_text('allow')
+        send('textDocument/didChange', {'textDocument': {'uri': self.uri, 'version': 2}, 'contentChanges': [{'text': 'repaired'}]})
+        receive(lambda m: diagnostics(m) and m['params'].get('version') == 2 and m['params']['diagnostics'] == [])
+        self.assertEqual(len(self.calls()), 3)
+        self.assertEqual(len({call['cwd'] for call in self.calls()}), 1)
+        self.assertEqual(self.source.read_text(), 'disk source\n')
+        send('shutdown', id=2)
+        receive(lambda m: m.get('id') == 2)
+        send('exit')
+        self.assertEqual(process.wait(timeout=5), 0)
+        self.assertEqual(process.stderr.read(), b'')
+        self.assertFalse(Path(initial['cwd']).exists())
 
     def test_snapshot_mode_remains_one_shot_and_saved_mode_refuses_unsaved_text(self):
         for buffer_mode in (True, False):

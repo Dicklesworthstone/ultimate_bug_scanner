@@ -700,11 +700,121 @@ class BufferWorkspace:
         finally:
             os.close(fd)
 
+    def refresh_original(self):
+        """Refresh changed regular support files without recopying stable inputs.
+
+        Enumerate the complete original graph before updating anything. A
+        structural change needs a fresh snapshot; metadata changes to existing
+        files (including atomic saves) can keep the private graph. Selected
+        buffer text always wins over newer saved bytes. All guards are local
+        to this generation, and any mid-refresh race discards the whole lease.
+        """
+        current = {}
+        pending = [Path('.')]
+        original_bytes = 0
+        while pending:
+            relative = pending.pop()
+            self.check()
+            if len(current) >= MAX_WORKSPACE_ENTRIES:
+                raise ProtocolError('Buffer workspace entry limit exceeded')
+            fd = self.open_original(relative)
+            try:
+                info = os.fstat(fd)
+                stamp = file_stamp(info)
+                current[relative] = stamp
+                if stat.S_ISDIR(info.st_mode):
+                    children = []
+                    with os.scandir(fd) as items:
+                        for item in items:
+                            self.check()
+                            if len(current) + len(pending) + len(children) >= MAX_WORKSPACE_ENTRIES:
+                                raise ProtocolError('Buffer workspace entry limit exceeded')
+                            children.append(item.name)
+                    pending.extend(relative / name for name in sorted(children, reverse=True))
+                elif stat.S_ISREG(info.st_mode):
+                    original_bytes += info.st_size
+                    if original_bytes > MAX_WORKSPACE_BYTES:
+                        raise ProtocolError('Buffer workspace byte limit exceeded')
+                else:
+                    raise ProtocolError('Unsafe original workspace entry: ' + str(relative))
+                if file_stamp(os.fstat(fd)) != stamp:
+                    raise ProtocolError('Workspace changed during incremental enumeration')
+            finally:
+                os.close(fd)
+        if (current.keys() != self.entries.keys()
+                or any(stat.S_IFMT(stamp[2]) != stat.S_IFMT(self.entries[path][2])
+                       for path, stamp in current.items())):
+            return False
+        if len(self.expected_paths) > MAX_WORKSPACE_ENTRIES:
+            raise ProtocolError('Buffer workspace entry limit exceeded')
+        updates = [path for path, stamp in current.items()
+                   if stat.S_ISREG(stamp[2]) and path not in self.buffer_hashes
+                   and stamp != self.entries[path]]
+        total = sum(stamp[3] for stamp in self.shadow_stamps.values() if stat.S_ISREG(stamp[2]))
+        total += sum(current[path][3] - self.shadow_stamps[path][3] for path in updates)
+        if total > MAX_WORKSPACE_BYTES:
+            raise ProtocolError('Buffer workspace byte limit exceeded')
+        self.entries = current
+        self.verify()
+        for relative in updates:
+            self.refresh_support_file(relative)
+        self.verify()
+        return True
+
+    def refresh_support_file(self, relative):
+        """Stream a changed source into its authenticated private counterpart."""
+        expected = self.entries[relative]
+        source = self.open_original(relative)
+        try:
+            if file_stamp(os.fstat(source)) != expected:
+                raise ProtocolError('Workspace context changed before incremental copy')
+            guard = self.shadow_guard()
+            target = guard.open_original(relative, final_flags=os.O_WRONLY)
+            try:
+                info = os.fstat(target)
+                if (file_stamp(info) != self.shadow_stamps[relative]
+                        or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                    raise ProtocolError('Private support target changed before update')
+                os.ftruncate(target, 0)
+                remaining = expected[3]
+                digest = hashlib.sha256()
+                tail = b''
+                git_config = '.git' in relative.parts and relative.name in {'config', 'config.worktree'}
+                while chunk := os.read(source, min(65536, remaining + 1)):
+                    self.check()
+                    remaining -= len(chunk)
+                    if remaining < 0:
+                        raise ProtocolError('Workspace context grew during incremental copy')
+                    if git_config:
+                        tokens = (tail + chunk).lower()
+                        if any(token in tokens for token in (b'include', b'worktree', b'excludesfile')):
+                            raise ProtocolError('Path-dependent Git configuration is not supported in buffer snapshots')
+                        tail = tokens[-32:]
+                    digest.update(chunk)
+                    output = memoryview(chunk)
+                    while output:
+                        self.check()
+                        count = os.write(target, output[:65536])
+                        if count <= 0:
+                            raise ProtocolError('Incomplete private support write')
+                        output = output[count:]
+                        self.copied_bytes += count
+                if remaining or file_stamp(os.fstat(source)) != expected:
+                    raise ProtocolError('Workspace context changed during incremental copy')
+                os.fchmod(target, 0o700 if expected[2] & 0o111 else 0o600)
+                self.shadow_stamps[relative] = file_stamp(os.fstat(target))
+                self.content_hashes[relative] = digest.digest()
+            finally:
+                os.close(target)
+        finally:
+            os.close(source)
+
 
 class BufferWorkspaceCache:
     """One private workspace, exclusively leased to one scanner at a time.
 
-    Only unchanged disk context and the same selected paths may be reused.
+    Only an unchanged graph and the same selected paths may be reused. Changed
+    regular-file contents are refreshed under the complete inventory guards.
     Every generation has its own immutable source guard; a stale result never
     borrows the metadata, cancellation token or deadline of a newer lease.
     """
@@ -741,10 +851,12 @@ class BufferWorkspaceCache:
                 workspace.shadow_stamps = dict(previous.shadow_stamps)
                 workspace.shadow_id = previous.shadow_id
                 try:
-                    workspace.verify()
+                    workspace.verify_shadow()
                 except (OSError, ProtocolError):
                     workspace.check()  # Cancellation/timeouts do not authorize a retry.
                     same_scope = False
+                if same_scope:
+                    same_scope = workspace.refresh_original()
             if same_scope:
                 total = sum(stamp[3] for stamp in workspace.shadow_stamps.values() if stat.S_ISREG(stamp[2]))
                 original_total = sum(stamp[3] for stamp in workspace.entries.values() if stat.S_ISREG(stamp[2]))
@@ -809,6 +921,15 @@ class BufferWorkspaceCache:
             raise ProtocolError('Cannot close an active private buffer workspace')
         try:
             self.closed = True
+            self.discard()
+        finally:
+            self.lock.release()
+
+    def clear(self):
+        """Drop idle plaintext copies while allowing a later document reopen."""
+        if not self.lock.acquire(blocking=False):
+            raise ProtocolError('Cannot clear an active private buffer workspace')
+        try:
             self.discard()
         finally:
             self.lock.release()
@@ -950,6 +1071,8 @@ class Server:
             self.batch = None
             if self.complete(future, documents, cancel):
                 self.published_group = set(documents)
+        if self.workspace_cache is not None and not self.active and self.batch is None and (self.shutdown or not self.documents):
+            self.workspace_cache.clear()
         if self.batch_pending is not None and not self.active and self.batch is None and time.monotonic() >= self.batch_due:
             documents, self.batch_pending = self.batch_pending, None
             cancel = threading.Event()

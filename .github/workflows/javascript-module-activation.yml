@@ -36,13 +36,20 @@ jobs:
           assert repo == 'Dicklesworthstone/ultimate_bug_scanner'
           base = 'https://api.github.com/repos/' + repo
           token = os.environ['GH_TOKEN']
+          class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, url):
+                  request = super().redirect_request(req, fp, code, msg, headers, url)
+                  if request is not None:
+                      request.remove_header('Authorization')
+                  return request
+          opener = urllib.request.build_opener(NoCredentialRedirect())
           def api(path, payload=None):
               headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json'}
               data = None if payload is None else json.dumps(payload).encode()
               if data is not None:
                   headers['Content-Type'] = 'application/json'
               request = urllib.request.Request(base + path, data=data, headers=headers)
-              with urllib.request.urlopen(request, timeout=90) as response:
+              with opener.open(request, timeout=90) as response:
                   return response.read()
           run = json.loads(api('/actions/runs/36295950465'))
           assert run['conclusion'] == 'success'

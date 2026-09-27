@@ -129,36 +129,162 @@ def _ast_report_sources(doc: dict) -> list[tuple[str, list[dict]]]:
     return reports
 
 
-def _baseline_records(baseline_path: str | Path) -> list[tuple[str, dict]]:
-    """Read baseline identities without discarding their accounting metadata."""
+class _BaselineJSON:
+    """Read report containers incrementally; only a single finding is decoded.
+
+    Unknown metadata is walked, not materialized. Reject oversized individual
+    values and excessive nesting rather than buffering a malformed baseline
+    until memory exhaustion. Neither limit restricts the report's total size
+    or number of findings.
+    """
+
+    CHUNK_SIZE = 64 * 1024
+    MAX_VALUE = 16 * 1024 * 1024  # Decoded characters, not total report bytes.
+    MAX_DEPTH = 128
+    _SPACE = re.compile(r"[ \t\r\n]*")
+
+    def __init__(self, source):
+        self.source = source
+        self.buffer = ""
+        self.position = 0
+        self.eof = False
+        self.decoder = json.JSONDecoder()
+
+    def fill(self):
+        self.buffer = self.buffer[self.position:]
+        self.position = 0
+        chunk = self.source.read(self.CHUNK_SIZE)
+        self.eof = not chunk
+        self.buffer += chunk
+
+    def peek(self):
+        while True:
+            self.position = self._SPACE.match(self.buffer, self.position).end()
+            if self.position < len(self.buffer):
+                return self.buffer[self.position]
+            if self.eof:
+                return ""
+            self.fill()
+
+    def expect(self, character):
+        if self.peek() != character:
+            raise ValueError(f"expected {character!r} in baseline JSON")
+        self.position += 1
+
+    def value(self):
+        first = self.peek()
+        if not first:
+            raise ValueError("unexpected end of baseline JSON")
+        while True:
+            try:
+                value, end = self.decoder.raw_decode(self.buffer, self.position)
+            except ValueError:
+                if self.eof:
+                    raise
+            else:
+                # raw_decode accepts a numeric prefix such as `1` when a
+                # chunk ends with `1e`. Read ahead before accepting scalars.
+                if (self.eof or first not in "-0123456789IN"
+                        or (end < len(self.buffer) and self.buffer[end] in " \t\r\n,]}:")):
+                    if end - self.position > self.MAX_VALUE:
+                        raise ValueError("baseline JSON value exceeds 16777216 characters")
+                    self.position = end
+                    return value
+            if len(self.buffer) - self.position >= self.MAX_VALUE:
+                raise ValueError("baseline JSON value exceeds 16777216 characters or is malformed")
+            self.fill()
+
+    def elements(self):
+        self.expect("[")
+        if self.peek() != "]":
+            while True:
+                yield
+                if self.peek() == "]":
+                    break
+                self.expect(",")
+        self.expect("]")
+
+    def members(self):
+        self.expect("{")
+        if self.peek() != "}":
+            while True:
+                key = self.value()
+                if not isinstance(key, str):
+                    raise ValueError("baseline JSON object key must be a string")
+                self.expect(":")
+                yield key
+                if self.peek() == "}":
+                    break
+                self.expect(",")
+        self.expect("}")
+
+    def skip(self, depth=0):
+        if depth > self.MAX_DEPTH:
+            raise ValueError("baseline JSON nesting exceeds 128 levels")
+        kind = self.peek()
+        if kind == "{":
+            for _ in self.members():
+                self.skip(depth + 1)
+        elif kind == "[":
+            for _ in self.elements():
+                self.skip(depth + 1)
+        else:
+            self.value()
+
+    def records(self, channel):
+        for _ in self.elements():
+            item = self.value()
+            fp = item.get("fingerprint") if isinstance(item, dict) else item
+            if not isinstance(fp, str) or not fp:
+                raise ValueError("every baseline finding requires a nonempty fingerprint")
+            if channel == "report" and not isinstance(item, dict):
+                raise ValueError("extras.ast_findings must contain finding objects")
+            selected = "counted" if channel == "*" and isinstance(item, dict) else channel
+            yield selected, item if isinstance(item, dict) else {"fingerprint": fp}
+
+    def report(self, *, scanner=False, extras=False):
+        seen = set()
+        for key in self.members():
+            relevant = (key == "ast_findings" if extras else
+                        key == "extras" or (not scanner and key in {"findings", "scanners"}))
+            if relevant:
+                if key in seen:
+                    raise ValueError(f"duplicate baseline report field: {key}")
+                seen.add(key)
+            if extras and key == "ast_findings":
+                yield from self.records("report")
+            elif not extras and not scanner and key == "findings":
+                yield from self.records("counted")
+            elif not extras and key == "extras" and self.peek() == "{":
+                yield from self.report(extras=True)
+            elif not extras and not scanner and key == "scanners" and self.peek() == "[":
+                for _ in self.elements():
+                    if self.peek() == "{":
+                        yield from self.report(scanner=True)
+                    else:
+                        self.skip()
+            else:
+                self.skip()
+
+
+def _baseline_records(baseline_path: str | Path) -> Iterator[tuple[str, dict]]:
+    """Stream baseline identities and accounting metadata without a report copy."""
     if not baseline_path:
-        return []
+        return
     p = Path(baseline_path)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        with p.open(encoding="utf-8") as source:
+            reader = _BaselineJSON(source)
+            if reader.peek() == "{":
+                yield from reader.report()
+            elif reader.peek() == "[":
+                yield from reader.records("*")
+            else:
+                raise ValueError("expected a report object or fingerprint array")
+            if reader.peek():
+                raise ValueError("trailing content after baseline JSON")
+    except (OSError, ValueError, RecursionError) as exc:
         raise ValueError(f"cannot read baseline {p}: {exc}") from exc
-    if isinstance(data, dict):
-        records = data.get("findings", [])
-        if not isinstance(records, list):
-            raise ValueError(f"baseline {p}: findings must be an array")
-        items = [("counted", record) for record in records]
-        for _, records in _ast_report_sources(data):
-            items.extend(("report", record) for record in records)
-    elif isinstance(data, list):
-        # An explicit fingerprint list has no producer/channel metadata. Its
-        # identities remain usable for single source occurrences, not for
-        # arbitrary positive project weights.
-        items = [("*" if isinstance(record, str) else "counted", record) for record in data]
-    else:
-        raise ValueError(f"baseline {p}: expected a report object or fingerprint array")
-    records = []
-    for channel, item in items:
-        fp = item.get("fingerprint") if isinstance(item, dict) else item
-        if not isinstance(fp, str) or not fp:
-            raise ValueError(f"baseline {p}: every finding requires a nonempty fingerprint")
-        records.append((channel, item if isinstance(item, dict) else {"fingerprint": fp}))
-    return records
 
 
 def load_baseline_fingerprints(baseline_path: str | Path) -> set[str]:
@@ -183,41 +309,97 @@ class _BaselineFilter:
     """
 
     _LEVELS = {"info": 0, "warning": 1, "critical": 2}
+    MEMORY_LIMIT = 4096
 
     def __init__(self, baseline_path: str | Path = "") -> None:
         self._allowances: dict[tuple[str, str, str], _BaselineAllowance] = {}
         self._remaining: dict[tuple[str, str, str], int] = {}
-        for channel, record in _baseline_records(baseline_path):
-            suppressed = record.get("suppressed", False)
-            if not isinstance(suppressed, bool):
-                raise ValueError("baseline finding suppressed must be a boolean")
-            if suppressed:
-                continue
-            severity = record.get("severity")
-            if "severity" in record and severity not in ("info", "warning", "critical"):
-                raise ValueError("baseline finding severity must be critical, warning or info")
-            scope = record.get("scope", "source")
-            if scope not in ("source", "project", "project_aggregate"):
-                raise ValueError("baseline finding has an invalid scope")
-            if scope in ("project", "project_aggregate"):
-                count = record.get("count")
-                if (not isinstance(count, int) or isinstance(count, bool)
-                        or (count != 0 if scope == "project" else count <= 0)):
-                    raise ValueError("baseline project finding has an invalid occurrence count")
-            else:
-                count = 1
-                if set(record) == {"fingerprint"}:
-                    scope = None
-            key = (channel, str(record.get("lang") or ""), record["fingerprint"])
-            allowance = _BaselineAllowance(scope, self._LEVELS.get(severity), count)
-            if key in self._allowances and self._allowances[key] != allowance:
+        self._db: sqlite3.Connection | None = None
+        self._size = 0
+        self._closed = False
+        try:
+            for channel, record in _baseline_records(baseline_path):
+                suppressed = record.get("suppressed", False)
+                if not isinstance(suppressed, bool):
+                    raise ValueError("baseline finding suppressed must be a boolean")
+                if suppressed:
+                    continue
+                severity = record.get("severity")
+                if "severity" in record and severity not in ("info", "warning", "critical"):
+                    raise ValueError("baseline finding severity must be critical, warning or info")
+                scope = record.get("scope", "source")
+                if scope not in ("source", "project", "project_aggregate"):
+                    raise ValueError("baseline finding has an invalid scope")
+                if scope in ("project", "project_aggregate"):
+                    count = record.get("count")
+                    if (not isinstance(count, int) or isinstance(count, bool)
+                            or (count != 0 if scope == "project" else count <= 0)):
+                        raise ValueError("baseline project finding has an invalid occurrence count")
+                else:
+                    count = 1
+                    if set(record) == {"fingerprint"}:
+                        scope = None
+                key = (channel, str(record.get("lang") or ""), record["fingerprint"])
+                self._remember(key, _BaselineAllowance(scope, self._LEVELS.get(severity), count))
+        except BaseException:
+            self.close()
+            raise
+
+    def _lookup(self, key):
+        if self._db is None:
+            allowance = self._allowances.get(key)
+            return (allowance, self._remaining[key]) if allowance is not None else None
+        row = self._db.execute(
+            "SELECT scope, severity, n, remaining FROM allowances "
+            "WHERE channel = ? AND lang = ? AND fingerprint = ?", self._db_key(key)).fetchone()
+        return (_BaselineAllowance(row[0], row[1], int(row[2])), int(row[3])) if row else None
+
+    @staticmethod
+    def _db_key(key):
+        # JSON permits escaped surrogate code points. BLOB keys retain the
+        # same string identity as the small-scan dictionary, without relying
+        # on SQLite's UTF-8 text encoder or collation.
+        return tuple(part.encode("utf-8", "surrogatepass") for part in key)
+
+    def _remember(self, key, allowance):
+        previous = self._lookup(key)
+        if previous is not None:
+            if previous[0] != allowance:
                 raise ValueError(f"baseline has conflicting records for fingerprint {key[-1]}")
-            # Duplicate records are not additional occurrence credit.
+            return  # Duplicate records are not additional occurrence credit.
+        if self._db is None and self._size >= self.MEMORY_LIMIT:
+            # Private, automatically removed on close; never an in-memory DB.
+            # Counts are decimal TEXT because JSON integers can exceed int64.
+            self._db = sqlite3.connect("")
+            self._db.execute("PRAGMA cache_size = -2048")
+            self._db.execute(
+                "CREATE TABLE allowances (channel BLOB, lang BLOB, fingerprint BLOB, "
+                "scope TEXT, severity INTEGER, n TEXT, remaining TEXT, "
+                "PRIMARY KEY (channel, lang, fingerprint)) WITHOUT ROWID")
+            self._db.executemany("INSERT INTO allowances VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                 ((*self._db_key(k), a.scope, a.severity, str(a.count), str(self._remaining[k]))
+                                  for k, a in self._allowances.items()))
+            self._allowances.clear()
+            self._remaining.clear()
+        if self._db is None:
             self._allowances[key] = allowance
-            self._remaining[key] = count
+            self._remaining[key] = allowance.count
+        else:
+            self._db.execute("INSERT INTO allowances VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             (*self._db_key(key), allowance.scope, allowance.severity,
+                              str(allowance.count), str(allowance.count)))
+        self._size += 1
+
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
+            self._db = None
+        self._closed = True
 
     def retain(self, finding: dict, channel: str = "counted") -> dict | None:
-        if not self._allowances:
+        if self._closed:
+            raise ValueError("baseline filter has been closed")
+        if not self._size:
             # Nothing can be removed. Preserve unfiltered, already-normalized
             # AST reports that historically allow an omitted fingerprint.
             return finding
@@ -225,12 +407,13 @@ class _BaselineFilter:
         if not isinstance(fp, str) or not fp:
             raise ValueError("finding requires a nonempty fingerprint before baseline filtering")
         lang = str(finding.get("lang") or "")
-        key = next((key for key in ((channel, lang, fp), (channel, "", fp),
-                                   ("*", lang, fp), ("*", "", fp))
-                    if key in self._allowances), None)
-        if key is None:
+        for key in ((channel, lang, fp), (channel, "", fp), ("*", lang, fp), ("*", "", fp)):
+            entry = self._lookup(key)
+            if entry is not None:
+                break
+        else:
             return finding
-        allowance = self._allowances[key]
+        allowance, remaining = entry
         scope = finding.get("scope", "source")
         if allowance.scope is not None and allowance.scope != scope:
             return finding
@@ -244,8 +427,13 @@ class _BaselineFilter:
         if scope == "project_aggregate" and allowance.scope != scope:
             return finding  # A bare fingerprint cannot prove any project weight.
         count = _occurrence_count(finding)
-        matched = min(count, self._remaining[key])
-        self._remaining[key] -= matched
+        matched = min(count, remaining)
+        if self._db is None:
+            self._remaining[key] -= matched
+        else:
+            self._db.execute("UPDATE allowances SET remaining = ? "
+                             "WHERE channel = ? AND lang = ? AND fingerprint = ?",
+                             (str(remaining - matched), *self._db_key(key)))
         if matched == count:
             return None
         if matched and scope == "project_aggregate":
@@ -487,8 +675,9 @@ def merge(
     count = 0
     counts_by_lang: dict[str, dict[str, int]] = {}
     observed_by_lang: dict[str, dict[str, int]] = {}
-    baseline = _BaselineFilter(baseline_path if new_only else "")
+    baseline = None
     try:
+        baseline = _BaselineFilter(baseline_path if new_only else "")
         # The normalized ledger can be much larger than its source tree. Keep
         # it on disk throughout: neither raw records, normalized records nor
         # the final serialized document need a whole-report in-memory copy.
@@ -581,6 +770,8 @@ def merge(
         raise ValueError(f"cannot assemble findings: {exc}") from exc
     finally:
         ordinals.close()
+        if baseline is not None:
+            baseline.close()
     return count
 
 

@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import io
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from contextlib import chdir
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "modules" / "helpers"))
 from ubs_core.findings_merge import load_baseline_fingerprints, load_sink, merge, to_sarif
+from ubs_core import findings_merge
 
 ARTIFACTS = REPO_ROOT / "test-suite" / "artifacts"
 
@@ -524,6 +528,256 @@ class FindingsIntegrityTests(unittest.TestCase):
                 merged = json.loads(self.combined.read_text(encoding="utf-8"))
                 self.assertEqual(merged["scanners"][0]["extras"]["ast_findings"], [record])
                 self.assertEqual(merged["totals"]["warning"], 0)
+
+
+class StreamingBaselineTests(unittest.TestCase):
+    def setUp(self):
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        self.tmp = tempfile.TemporaryDirectory(prefix="baseline-stream-", dir=ARTIFACTS)
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.baseline = self.root / "baseline.json"
+
+    def store(self, value):
+        self.baseline.write_text(json.dumps(value), encoding="utf-8")
+        return self.baseline
+
+    def filter(self, value, limit):
+        with mock.patch.object(findings_merge._BaselineFilter, "MEMORY_LIMIT", limit):
+            result = findings_merge._BaselineFilter(self.store(value))
+        self.addCleanup(result.close)
+        return result
+
+    def test_chunk_boundaries_preserve_json_scalars_and_escaped_names(self):
+        doc = {"metadata": [1.2e-50, -1e+20, -0.02, None, True, False,
+                            "line\nquote\"slash\\\u0000", {"ignored": [1, 2, 3]}],
+               "findings": [{"fingerprint": "nul\0name\n雪😀", "severity": "warning"}],
+               "scanners": [{"extras": {"ast_findings": [{"fingerprint": "scanner"}]}}],
+               "extras": {"ast_findings": [{"fingerprint": "root"}]}}
+        expected = [("counted", doc["findings"][0]), ("report", {"fingerprint": "scanner"}),
+                    ("report", {"fingerprint": "root"})]
+        for size in (1, 2, 3, 7, 64, 65536):
+            for ascii_only in (True, False):
+                with self.subTest(size=size, ascii_only=ascii_only):
+                    self.baseline.write_text(json.dumps(doc, ensure_ascii=ascii_only), encoding="utf-8")
+                    with mock.patch.object(findings_merge._BaselineJSON, "CHUNK_SIZE", size):
+                        self.assertEqual(list(findings_merge._baseline_records(self.baseline)), expected)
+
+    def test_only_documented_report_containers_supply_baseline_credit(self):
+        self.store({"findings": [{"fingerprint": "counted"}],
+                    "nested": {"findings": [{"fingerprint": "not-a-finding"}]},
+                    "scanners": [None, 3, {"findings": [{"fingerprint": "not-counted"}],
+                                          "extras": {"ast_findings": [{"fingerprint": "advice"}]}}]})
+        self.assertEqual(list(findings_merge._baseline_records(self.baseline)),
+                         [("counted", {"fingerprint": "counted"}), ("report", {"fingerprint": "advice"})])
+
+    def test_fingerprint_lists_keep_wildcard_and_counted_channels_separate(self):
+        self.store(["legacy", {"fingerprint": "counted"}])
+        self.assertEqual(list(findings_merge._baseline_records(self.baseline)),
+                         [("*", {"fingerprint": "legacy"}), ("counted", {"fingerprint": "counted"})])
+
+    def test_invalid_json_after_valid_records_never_publishes_a_filtered_report(self):
+        for suffix in (",]", "] trailing", ",", ",true]", ',{"fingerprint":}', ',{"fingerprint":""}]'):
+            for chunk_size in (1, 65536):
+                with self.subTest(suffix=suffix, chunk_size=chunk_size):
+                    self.baseline.write_text('["known"' + suffix, encoding="utf-8")
+                    combined = self.root / "combined.json"
+                    original = '{"scanners":[],"totals":{}}'
+                    combined.write_text(original, encoding="utf-8")
+                    with mock.patch.object(findings_merge._BaselineJSON, "CHUNK_SIZE", chunk_size):
+                        with self.assertRaises(ValueError):
+                            merge(self.root, combined, baseline_path=self.baseline, new_only=True)
+                    self.assertEqual(combined.read_text(encoding="utf-8"), original)
+
+    def test_duplicate_relevant_containers_are_rejected(self):
+        for source in ('{"findings":[],"findings":[]}',
+                       '{"extras":{"ast_findings":[],"ast_findings":[]}}',
+                       '{"scanners":[],"scanners":[]}',
+                       '{"scanners":[{"extras":{},"extras":{}}]}'):
+            with self.subTest(source=source):
+                self.baseline.write_text(source, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "duplicate baseline report field"):
+                    load_baseline_fingerprints(self.baseline)
+
+    def test_malformed_numbers_are_not_accepted_at_a_chunk_boundary(self):
+        for number in ("01", "1e", "1e+", "--2", "1.", "-", "1x"):
+            with self.subTest(number=number):
+                self.baseline.write_text('{"metadata":' + number + ',"findings":[]}', encoding="utf-8")
+                with mock.patch.object(findings_merge._BaselineJSON, "CHUNK_SIZE", 1):
+                    with self.assertRaises(ValueError):
+                        load_baseline_fingerprints(self.baseline)
+
+    def test_individual_values_and_metadata_nesting_are_bounded(self):
+        for source in ('["' + 'a' * 300 + '"]', '{"metadata":"' + 'a' * 300 + '"}',
+                       '{"metadata":' + '[' * 10 + '0' + ']' * 10 + '}'):
+            with self.subTest(source=source):
+                self.baseline.write_text(source, encoding="utf-8")
+                with mock.patch.multiple(findings_merge._BaselineJSON, MAX_VALUE=128,
+                                         MAX_DEPTH=5, CHUNK_SIZE=7):
+                    with self.assertRaises(ValueError):
+                        load_baseline_fingerprints(self.baseline)
+        # A large read buffer cannot bypass the individual-value limit.
+        with mock.patch.multiple(findings_merge._BaselineJSON, MAX_VALUE=128, CHUNK_SIZE=4096):
+            self.store(["a" * 300])
+            with self.assertRaises(ValueError):
+                load_baseline_fingerprints(self.baseline)
+
+    def test_unknown_large_arrays_are_walked_in_bounded_reads(self):
+        class BoundedReader(io.StringIO):
+            def read(self, size=-1):
+                if not 0 <= size <= 19:
+                    raise AssertionError("unbounded baseline read")
+                return super().read(size)
+        source = BoundedReader('{"metadata":[' + ','.join(['{"text":"metadata"}'] * 5000)
+                               + '],"findings":[{"fingerprint":"known"}]}')
+        with mock.patch.object(findings_merge._BaselineJSON, "CHUNK_SIZE", 19):
+            parser = findings_merge._BaselineJSON(source)
+            self.assertEqual(list(parser.report()), [("counted", {"fingerprint": "known"})])
+            self.assertEqual(parser.peek(), "")
+
+    def test_spilled_matching_preserves_scope_severity_language_and_occurrence_budget(self):
+        huge_count = 2 ** 80
+        entries = [
+            {"fingerprint": "ordinary", "lang": "python", "severity": "warning"},
+            {"fingerprint": "aggregate", "scope": "project_aggregate", "count": huge_count,
+             "severity": "warning"},
+            {"fingerprint": "note", "scope": "project", "count": 0, "severity": "info"},
+            {"fingerprint": "suppressed", "suppressed": True},
+            {"fingerprint": "unicode\0\ud800雪", "lang": "py\udfff"},
+        ]
+        for limit in (100, 1):
+            with self.subTest(limit=limit):
+                baseline = self.filter({"findings": entries + [entries[1]],
+                                        "extras": {"ast_findings": [{"fingerprint": "advisory"}]}}, limit)
+                ordinary = {"fingerprint": "ordinary", "lang": "python", "severity": "warning"}
+                for changed in ({**ordinary, "severity": "critical"}, {**ordinary, "lang": "go"},
+                                {"fingerprint": "advisory"}, {"fingerprint": "suppressed"}):
+                    self.assertEqual(baseline.retain(changed), changed)
+                self.assertIsNone(baseline.retain(ordinary))
+                self.assertEqual(baseline.retain(ordinary), ordinary)
+                aggregate = {"fingerprint": "aggregate", "scope": "project_aggregate",
+                             "count": huge_count - 3, "severity": "warning"}
+                self.assertIsNone(baseline.retain(aggregate))
+                self.assertEqual(baseline.retain({**aggregate, "count": 8}), {**aggregate, "count": 5})
+                self.assertEqual(baseline.retain({**aggregate, "count": 1}), {**aggregate, "count": 1})
+                self.assertIsNone(baseline.retain({"fingerprint": "note", "scope": "project", "severity": "info"}))
+                self.assertIsNone(baseline.retain({"fingerprint": "note", "scope": "project", "severity": "info"}))
+                self.assertIsNone(baseline.retain({"fingerprint": "unicode\0\ud800雪", "lang": "py\udfff"}))
+                self.assertIsNone(baseline.retain({"fingerprint": "advisory"}, "report"))
+
+    def test_specific_language_allowance_still_takes_precedence_after_spill(self):
+        entries = [{"fingerprint": "same", "lang": "python", "severity": "info"},
+                   {"fingerprint": "same", "severity": "critical"}]
+        for limit in (100, 0):
+            with self.subTest(limit=limit):
+                baseline = self.filter(entries, limit)
+                finding = {"fingerprint": "same", "lang": "python", "severity": "warning"}
+                self.assertEqual(baseline.retain(finding), finding)
+                self.assertIsNone(baseline.retain({**finding, "lang": "go"}))
+
+    def test_conflicting_records_after_spill_are_still_rejected(self):
+        for limit in (100, 1):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, "conflicting records"):
+                self.filter([{"fingerprint": "same", "severity": "info"}, {"fingerprint": "other"},
+                             {"fingerprint": "same", "severity": "critical"}], limit)
+
+    def test_closed_filter_never_becomes_an_empty_successful_baseline(self):
+        for limit in (100, 0):
+            with self.subTest(limit=limit):
+                baseline = self.filter(["known"], limit)
+                baseline.close()
+                baseline.close()
+                with self.assertRaisesRegex(ValueError, "closed"):
+                    baseline.retain({"fingerprint": "known"})
+
+    def test_successful_merge_closes_the_spilled_baseline(self):
+        real_connect = findings_merge.sqlite3.connect
+        connections = []
+        def connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connections.append(connection)
+            return connection
+        combined = self.root / "combined.json"
+        combined.write_text('{"scanners":[],"totals":{}}', encoding="utf-8")
+        self.store(["known"])
+        with mock.patch.object(findings_merge._BaselineFilter, "MEMORY_LIMIT", 0), \
+                mock.patch.object(findings_merge.sqlite3, "connect", side_effect=connect):
+            self.assertEqual(merge(self.root, combined, baseline_path=self.baseline, new_only=True), 0)
+        self.assertEqual(len(connections), 1)
+        with self.assertRaises(findings_merge.sqlite3.ProgrammingError):
+            connections[0].execute("SELECT 1")
+
+    def test_disk_error_and_late_parse_error_close_database_without_publishing(self):
+        real_connect = findings_merge.sqlite3.connect
+        connections = []
+        def connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connections.append(connection)
+            return connection
+        combined = self.root / "combined.json"
+        original = '{"scanners":[],"totals":{}}'
+        combined.write_text(original, encoding="utf-8")
+        self.baseline.write_text('["one", "two", ', encoding="utf-8")
+        with mock.patch.object(findings_merge._BaselineFilter, "MEMORY_LIMIT", 0), \
+                mock.patch.object(findings_merge.sqlite3, "connect", side_effect=connect):
+            with self.assertRaises(ValueError):
+                merge(self.root, combined, baseline_path=self.baseline, new_only=True)
+        self.assertEqual(len(connections), 1)
+        with self.assertRaises(findings_merge.sqlite3.ProgrammingError):
+            connections[0].execute("SELECT 1")
+        self.assertEqual(combined.read_text(encoding="utf-8"), original)
+        with mock.patch.object(findings_merge._BaselineFilter, "MEMORY_LIMIT", 0), \
+                mock.patch.object(findings_merge.sqlite3, "connect",
+                                  side_effect=findings_merge.sqlite3.OperationalError("disk full")):
+            with self.assertRaisesRegex(ValueError, "disk full"):
+                merge(self.root, combined, baseline_path=self.baseline, new_only=True)
+        self.assertEqual(combined.read_text(encoding="utf-8"), original)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux VmHWM peak RSS")
+    def test_large_baseline_and_new_findings_merge_stays_below_64_mib(self):
+        started = time.monotonic()
+        print("[baseline-stream-memory] RUN 120000 distinct baseline findings", flush=True)
+        known = {"rule": "py.memory", "path": "missing.py", "line": 0,
+                 "severity": "warning", "message": "diagnostic 1"}
+        sink = self.root / "python.findings.json"
+        combined = self.root / "combined.json"
+        sink.write_text(json.dumps(known) + "\n", encoding="utf-8")
+        combined.write_text('{"scanners":[],"totals":{}}', encoding="utf-8")
+        merge(self.root, combined)
+        captured = json.loads(combined.read_text())["findings"][0]
+        with self.baseline.open("w", encoding="utf-8") as output:
+            output.write('{"findings":[' + json.dumps(captured))
+            for index in range(119999):
+                output.write(',' + json.dumps({"fingerprint": f"filler-{index}", "lang": "python",
+                                              "severity": "warning", "message": "detail " * 40}))
+            output.write('],"metadata":[')
+            for index in range(20000):
+                output.write((',' if index else '') + json.dumps({"annotation": "text " * 30}))
+            output.write(']}')
+        sink.write_text(json.dumps(known) + "\n" + json.dumps({**known, "message": "diagnostic 2"}) + "\n",
+                        encoding="utf-8")
+        combined.write_text('{"scanners":[{"language":"python","warning":2}],"totals":{"warning":2}}',
+                            encoding="utf-8")
+        program = (
+            "import json, pathlib, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from ubs_core.findings_merge import merge\n"
+            "root = pathlib.Path(sys.argv[2])\n"
+            "count = merge(root, root/'combined.json', baseline_path=root/'baseline.json', new_only=True)\n"
+            "rss = next(int(s.split()[1]) for s in pathlib.Path('/proc/self/status').read_text().splitlines() if s.startswith('VmHWM:'))\n"
+            "print(json.dumps({'count':count,'rss':rss}))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", program, str(REPO_ROOT / "modules/helpers"), str(self.root)],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        measured = json.loads(proc.stdout)
+        self.assertEqual(measured["count"], 1)
+        self.assertLess(measured["rss"], 64 * 1024, measured)
+        result = json.loads(combined.read_text(encoding="utf-8"))
+        self.assertEqual(result["totals"]["warning"], 1)
+        self.assertEqual(result["findings"][0]["message"], "diagnostic 2")
+        self.assertNotEqual(result["findings"][0]["fingerprint"], captured["fingerprint"])
+        print(f"[baseline-stream-memory] PASS {measured['rss']} KiB ({time.monotonic() - started:.2f}s)", flush=True)
 
 
 if __name__ == "__main__":

@@ -411,13 +411,21 @@ class BufferWorkspace:
     Git redirections or unbounded context copies are permitted. Retained metadata
     lets publication verify the disk context after this temporary tree is gone.
     """
-    def __init__(self, root, root_id, documents, cancel, deadline):
+    def __init__(self, root, root_id, documents, cancel, deadline, *, cache=None):
         self.original, self.root_id = root, root_id
         self.documents, self.cancel, self.deadline = documents, cancel, deadline
         self.entries = {}
         self.missing = set()
         self.temporary = None
         self.root = None
+        self.cache = cache
+        self.content_hashes = {}
+        self.shadow_stamps = {}
+        self.buffer_hashes = {}
+        self.expected_paths = set()
+        self.reused = False
+        self.copied_bytes = 0
+        self.buffer_bytes_written = 0
 
     def check(self):
         if self.cancel.is_set():
@@ -425,7 +433,7 @@ class BufferWorkspace:
         if time.monotonic() >= self.deadline:
             raise ProtocolError('Buffer snapshot/scan timed out')
 
-    def open_original(self, relative):
+    def open_original(self, relative, *, final_flags=os.O_RDONLY):
         self.check()
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         descriptor = os.open(self.original, flags)
@@ -438,7 +446,7 @@ class BufferWorkspace:
                 self.check()
                 if part in ('', '.', '..'):
                     raise ProtocolError('Unsafe buffer workspace path')
-                mode = flags if index < len(parts) - 1 else os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                mode = flags if index < len(parts) - 1 else final_flags | os.O_NONBLOCK | os.O_NOFOLLOW
                 child = os.open(part, mode, dir_fd=descriptor)
                 os.close(descriptor)
                 descriptor = child
@@ -465,8 +473,10 @@ class BufferWorkspace:
             else:
                 os.close(fd)
                 raise ProtocolError('A new buffer acquired disk contents during analysis: ' + str(relative))
+        if self.shadow_stamps:
+            self.verify_shadow()
 
-    def __enter__(self):
+    def validate_configuration(self):
         self.check()
         if any(key.startswith('GIT_') for key in os.environ):
             raise ProtocolError('Buffer snapshots do not support redirected Git environments')
@@ -476,6 +486,15 @@ class BufferWorkspace:
         temp_parent = Path(tempfile.gettempdir()).resolve()
         if temp_parent.is_relative_to(self.original):
             raise ProtocolError('Buffer snapshot temporary directory must be outside --repo')
+        return temp_parent
+
+    def __enter__(self):
+        if self.cache is not None:
+            return self.cache.enter(self)
+        return self.build()
+
+    def build(self):
+        temp_parent = self.validate_configuration()
         self.temporary = tempfile.TemporaryDirectory(prefix='ubs-lsp-buffer-', dir=temp_parent)
         try:
             self.root = Path(self.temporary.name) / 'workspace'
@@ -510,6 +529,7 @@ class BufferWorkspace:
                             raise ProtocolError('Buffer workspace byte limit exceeded')
                         git_config = '.git' in relative.parts and relative.name in {'config', 'config.worktree'}
                         tail = b''
+                        digest = hashlib.sha256()
                         with target.open('xb') as output:
                             while chunk := os.read(fd, min(65536, MAX_WORKSPACE_BYTES - total + 1)):
                                 self.check()
@@ -522,7 +542,11 @@ class BufferWorkspace:
                                         raise ProtocolError('Path-dependent Git configuration is not supported in buffer snapshots')
                                     tail = tokens[-32:]
                                 output.write(chunk)
+                                digest.update(chunk)
+                                self.copied_bytes += len(chunk)
                         target.chmod(0o700 if info.st_mode & 0o111 else 0o600)
+                        if self.cache is not None:
+                            self.content_hashes[relative] = digest.digest()
                     else:
                         raise ProtocolError('Buffer context must contain only regular files and directories: ' + str(relative))
                     if file_stamp(os.fstat(fd)) != stamp:
@@ -569,6 +593,11 @@ class BufferWorkspace:
                 with target.open('wb') as output:
                     output.write(raw)
                 target.chmod(0o600)
+                self.buffer_bytes_written += len(raw)
+                if self.cache is not None:
+                    self.content_hashes[relative] = hashlib.sha256(raw).digest()
+                    self.buffer_hashes[relative] = self.content_hashes[relative]
+            self.expected_paths = virtual_paths
             self.verify()
             return self
         except BaseException:
@@ -576,14 +605,220 @@ class BufferWorkspace:
             raise
 
     def __exit__(self, exc_type, exc, traceback):
-        self.temporary.cleanup()
+        if self.cache is None:
+            self.temporary.cleanup()
+        else:
+            self.cache.leave(self, exc_type)
+
+    def shadow_guard(self):
+        # The root identity is captured before scanner execution, never learned
+        # from a potentially replaced root when the next request arrives.
+        return BufferWorkspace(self.root, self.shadow_id, {}, self.cancel, self.deadline)
+
+    def seal_shadow(self):
+        """Prove the initial private tree contains exactly the copied input.
+
+        This one-time byte check prevents adopting a changed private file as
+        the baseline. Later leases check inode/ctime plus the full inventory.
+        No finding/result cache is involved.
+        """
+        info = self.root.lstat()
+        self.shadow_id = (info.st_dev, info.st_ino)
+        guard = self.shadow_guard()
+        pending = [Path('.')]
+        stamps = {}
+        while pending:
+            relative = pending.pop()
+            self.check()
+            if relative not in self.expected_paths or relative in stamps:
+                raise ProtocolError('Unexpected entry in private buffer workspace')
+            fd = guard.open_original(relative)
+            try:
+                before = os.fstat(fd)
+                stamps[relative] = file_stamp(before)
+                if stat.S_ISDIR(before.st_mode):
+                    with os.scandir(fd) as items:
+                        for item in items:
+                            if len(stamps) + len(pending) >= MAX_WORKSPACE_ENTRIES:
+                                raise ProtocolError('Private buffer workspace entry limit exceeded')
+                            pending.append(relative / item.name)
+                elif stat.S_ISREG(before.st_mode) and before.st_nlink == 1:
+                    digest = hashlib.sha256()
+                    remaining = before.st_size
+                    while chunk := os.read(fd, min(65536, remaining + 1)):
+                        self.check()
+                        remaining -= len(chunk)
+                        if remaining < 0:
+                            raise ProtocolError('Private buffer input grew during validation')
+                        digest.update(chunk)
+                    if remaining or digest.digest() != self.content_hashes.get(relative):
+                        raise ProtocolError('Private buffer input differs from copied contents')
+                else:
+                    raise ProtocolError('Unsafe private buffer workspace entry')
+                if file_stamp(os.fstat(fd)) != stamps[relative]:
+                    raise ProtocolError('Private buffer input changed during validation')
+            finally:
+                os.close(fd)
+        if set(stamps) != self.expected_paths:
+            raise ProtocolError('Private buffer workspace inventory is incomplete')
+        self.shadow_stamps = stamps
+        self.verify_shadow()
+
+    def verify_shadow(self):
+        guard = self.shadow_guard()
+        for relative, expected in self.shadow_stamps.items():
+            fd = guard.open_original(relative)
+            try:
+                info = os.fstat(fd)
+                if file_stamp(info) != expected or stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+                    raise ProtocolError('Private buffer workspace changed: ' + str(relative))
+            finally:
+                os.close(fd)
+
+    def rewrite_buffer(self, relative, raw):
+        """Write only an authenticated, still-private regular inode."""
+        guard = self.shadow_guard()
+        fd = guard.open_original(relative, final_flags=os.O_WRONLY)
+        try:
+            before = os.fstat(fd)
+            if (file_stamp(before) != self.shadow_stamps[relative]
+                    or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1):
+                raise ProtocolError('Private buffer target changed before update')
+            os.ftruncate(fd, 0)
+            remaining = memoryview(raw)
+            while remaining:
+                self.check()
+                count = os.write(fd, remaining[:65536])
+                if count <= 0:
+                    raise ProtocolError('Incomplete private buffer write')
+                remaining = remaining[count:]
+                self.buffer_bytes_written += count
+            os.fchmod(fd, 0o600)
+            self.shadow_stamps[relative] = file_stamp(os.fstat(fd))
+            self.content_hashes[relative] = hashlib.sha256(raw).digest()
+            self.buffer_hashes[relative] = self.content_hashes[relative]
+        finally:
+            os.close(fd)
 
 
-def scan_buffers(scanner, root, documents, root_id, timeout, cancel, policy=()):
+class BufferWorkspaceCache:
+    """One private workspace, exclusively leased to one scanner at a time.
+
+    Only unchanged disk context and the same selected paths may be reused.
+    Every generation has its own immutable source guard; a stale result never
+    borrows the metadata, cancellation token or deadline of a newer lease.
+    """
+    def __init__(self):
+        self.retained = None
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def discard(self):
+        previous, self.retained = self.retained, None
+        if previous is not None:
+            previous.temporary.cleanup()
+
+    def enter(self, workspace):
+        if not self.lock.acquire(blocking=False):
+            raise ProtocolError('Private buffer workspace is already in use')
+        try:
+            if self.closed:
+                raise ProtocolError('Private buffer workspace cache is closed')
+            workspace.validate_configuration()
+            previous = self.retained
+            selected = {doc['path'] for doc in workspace.documents.values()}
+            same_scope = (previous is not None and workspace.original == previous.original
+                          and workspace.root_id == previous.root_id
+                          and selected == {doc['path'] for doc in previous.documents.values()}
+                          and len(selected) == len(workspace.documents))
+            if same_scope:
+                workspace.root, workspace.temporary = previous.root, previous.temporary
+                workspace.entries = dict(previous.entries)
+                workspace.missing = set(previous.missing)
+                workspace.expected_paths = set(previous.expected_paths)
+                workspace.content_hashes = dict(previous.content_hashes)
+                workspace.buffer_hashes = dict(previous.buffer_hashes)
+                workspace.shadow_stamps = dict(previous.shadow_stamps)
+                workspace.shadow_id = previous.shadow_id
+                try:
+                    workspace.verify()
+                except (OSError, ProtocolError):
+                    workspace.check()  # Cancellation/timeouts do not authorize a retry.
+                    same_scope = False
+            if same_scope:
+                total = sum(stamp[3] for stamp in workspace.shadow_stamps.values() if stat.S_ISREG(stamp[2]))
+                original_total = sum(stamp[3] for stamp in workspace.entries.values() if stat.S_ISREG(stamp[2]))
+                if (len(workspace.expected_paths) > MAX_WORKSPACE_ENTRIES
+                        or max(total, original_total) > MAX_WORKSPACE_BYTES):
+                    raise ProtocolError('Retained buffer workspace exceeds current bounds')
+                updates = []
+                for doc in workspace.documents.values():
+                    workspace.check()
+                    relative = doc['path'].relative_to(workspace.original)
+                    raw = editor_text(doc.get('wire_text', doc['text'])).encode('utf-8')
+                    total += len(raw) - workspace.shadow_stamps[relative][3]
+                    updates.append((relative, raw))
+                if total > MAX_WORKSPACE_BYTES:
+                    raise ProtocolError('Buffer workspace byte limit exceeded')
+                for relative, raw in updates:
+                    if hashlib.sha256(raw).digest() != workspace.buffer_hashes[relative]:
+                        workspace.rewrite_buffer(relative, raw)
+                workspace.reused = True
+                workspace.verify()
+                self.retained = None  # Ownership passes to this exclusive lease.
+                return workspace
+            self.discard()
+            # Do not retain any old inventory if an authoritative rebuild is needed.
+            workspace.root = workspace.temporary = None
+            workspace.entries.clear()
+            workspace.missing.clear()
+            workspace.shadow_stamps.clear()
+            workspace.content_hashes.clear()
+            workspace.buffer_hashes.clear()
+            workspace.build()
+            workspace.seal_shadow()
+            return workspace
+        except BaseException:
+            try:
+                self.discard()
+            finally:
+                try:
+                    if workspace.temporary is not None:
+                        workspace.temporary.cleanup()
+                finally:
+                    self.lock.release()
+            raise
+
+    def leave(self, workspace, exc_type):
+        try:
+            if exc_type is None:
+                workspace.verify()
+                self.retained = workspace
+            else:
+                workspace.temporary.cleanup()
+        except BaseException:
+            workspace.temporary.cleanup()
+            raise
+        finally:
+            self.lock.release()
+
+    def close(self):
+        # Server.close joins scanner workers first. Reject misuse rather than
+        # deleting input still in use by a live scanner.
+        if not self.lock.acquire(blocking=False):
+            raise ProtocolError('Cannot close an active private buffer workspace')
+        try:
+            self.closed = True
+            self.discard()
+        finally:
+            self.lock.release()
+
+
+def scan_buffers(scanner, root, documents, root_id, timeout, cancel, policy=(), *, cache=None):
     if any(not doc['synchronized'] for doc in documents.values()):
         return {uri: ([note('ubs.unverified', 'Synchronize every selected buffer before analysis.', 3)], None)
                 for uri in documents}
-    with BufferWorkspace(root, root_id, documents, cancel, time.monotonic() + timeout) as workspace:
+    with BufferWorkspace(root, root_id, documents, cancel, time.monotonic() + timeout, cache=cache) as workspace:
         selected = {uri: dict(doc, path=workspace.root / doc['path'].relative_to(root))
                     for uri, doc in documents.items()}
         info = workspace.root.stat()
@@ -601,13 +836,17 @@ def scan_buffers(scanner, root, documents, root_id, timeout, cancel, policy=()):
 
 
 class Server:
-    def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=(), buffer_mode=False):
+    def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=(), buffer_mode=False,
+                 incremental_workspace=False):
         self.root, self.scanner, self.send = root, scanner, send
         info = root.stat()
         self.root_id = (info.st_dev, info.st_ino)
         self.jobs, self.timeout = jobs, timeout
         self.policy = policy
         self.buffer_mode = buffer_mode
+        if incremental_workspace and not buffer_mode:
+            raise ProtocolError('Incremental workspaces require buffer mode')
+        self.workspace_cache = BufferWorkspaceCache() if incremental_workspace else None
         self.pool = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix='ubs-lsp')
         self.documents = {}
         self.pending = OrderedDict()
@@ -714,8 +953,9 @@ class Server:
         if self.batch_pending is not None and not self.active and self.batch is None and time.monotonic() >= self.batch_due:
             documents, self.batch_pending = self.batch_pending, None
             cancel = threading.Event()
+            options = {'cache': self.workspace_cache} if self.workspace_cache is not None else {}
             self.batch = (self.pool.submit(scan_buffers if self.buffer_mode else scan, self.scanner, self.root, documents, self.root_id,
-                                           self.timeout, cancel, self.policy), documents, cancel)
+                                           self.timeout, cancel, self.policy, **options), documents, cancel)
         busy = {uri for uri, _, _ in self.active.values()}
         for uri, generation in list(self.pending.items()):
             if self.shutdown or self.batch or self.batch_pending is not None or len(self.active) >= self.jobs:
@@ -770,7 +1010,10 @@ class Server:
                 self.initialized = True
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {
                     'capabilities': {'positionEncoding': 'utf-16',
-                                     'experimental': {'ubs': {'sourceMode': 'buffer' if self.buffer_mode else 'saved'}},
+                                     'experimental': {'ubs': {
+                                         'sourceMode': 'buffer' if self.buffer_mode else 'saved',
+                                         'workspaceStrategy': 'incremental' if self.workspace_cache is not None else
+                                                              'snapshot' if self.buffer_mode else 'original'}},
                                      'executeCommandProvider': {'commands': ['ubs.scanOpenDocuments']}, 'textDocumentSync': {
                         'openClose': True, 'change': 2, 'save': {'includeText': True}}},
                     'serverInfo': {'name': 'ubs-lsp', 'version': '1'}}})
@@ -897,6 +1140,8 @@ class Server:
         for _, _, cancel in self.active.values():
             cancel.set()
         self.pool.shutdown(wait=True, cancel_futures=True)
+        if self.workspace_cache is not None:
+            self.workspace_cache.close()
 
 
 def main(argv=None):
@@ -907,8 +1152,8 @@ def main(argv=None):
     parser.add_argument('--scan-timeout', type=float, default=120)
     parser.add_argument('--profile', choices=('strict', 'loose'))
     parser.add_argument('--fail-on-warning', action='store_true')
-    parser.add_argument('--buffer-mode', choices=('saved', 'snapshot'), default='saved',
-                        help='saved (default), or opt-in unsaved analysis in a private complete workspace snapshot')
+    parser.add_argument('--buffer-mode', choices=('saved', 'snapshot', 'incremental'), default='saved',
+                        help='saved (default), one-shot snapshot, or reusable incremental private buffer workspace')
     args = parser.parse_args(argv)
     if os.name != 'posix' or not 1 <= args.jobs <= 4 or not 0 < args.scan_timeout <= 3600:
         parser.error('POSIX, 1–4 jobs and a finite timeout of 0–3600 seconds are required')
@@ -927,7 +1172,7 @@ def main(argv=None):
         output_bytes += len(data)
     policy = (('--profile=' + args.profile,) if args.profile else ()) + (('--fail-on-warning',) if args.fail_on_warning else ())
     server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout, policy=policy,
-                    buffer_mode=args.buffer_mode == 'snapshot')
+                    buffer_mode=args.buffer_mode != 'saved', incremental_workspace=args.buffer_mode == 'incremental')
     framer = Framer()
     incoming, output = sys.stdin.fileno(), sys.stdout.fileno()
     old_in, old_out = os.get_blocking(incoming), os.get_blocking(output)

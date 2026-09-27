@@ -43,7 +43,7 @@ clients can send one full replacement when a large batch exceeds those limits.
 
 ## Default: saved-source analysis
 
-Without `--buffer-mode=snapshot`, a saved document is scanned on open and save.
+With the default `--buffer-mode=saved`, a saved document is scanned on open and save.
 Changes cancel obsolete work and immediately replace previous findings with an
 informational **save to verify** diagnostic. Unsaved text is not written into
 the checkout or presented as a scan of disk contents. UTF-8 BOM and newline
@@ -127,6 +127,41 @@ mode more suitable for large or symlink-heavy projects.
 Snapshot mode is not warmed in-process analysis and makes no latency claim.
 It copies context again for each accepted scan. Only open documents are targets;
 this does not discover every project source or prove whole-project correctness.
+
+### Reuse unchanged context between buffer edits
+
+Select `--buffer-mode=incremental` to retain one private workspace between
+successful buffer scans. It has the same selected-buffer, policy and isolation
+boundaries as `snapshot`, but unchanged support files keep their private inodes
+and paths. Only changed editor buffers are rewritten. The ordinary scanner is
+still invoked on every accepted scan; this is not a cache of clean reports or
+a warmed in-process analysis engine.
+
+```bash
+python3 -I /trusted/ultimate_bug_scanner/ubs-lsp \
+  --repo /absolute/project --buffer-mode=incremental --profile=strict
+```
+
+The first copy is byte-checked before retention. Every lease validates the
+complete original and private metadata inventories, including inode and change
+time, then checks them again after scanning and before diagnostic publication.
+Each generation retains its own validation records. Original-context or selected
+path changes cause a fresh complete snapshot; unknown or unsafe input is not
+silently omitted. Restoring only modification times does not preserve eligibility.
+
+Private-tree mutation by a scanner, cancellation, timeout or scanner failure
+discards the retained workspace. A later request must rebuild it from original
+context. Only one scanner may lease the workspace, and shutdown joins scanner
+work before removing it. Unlike one-shot `snapshot`, this opt-in mode retains
+private source copies between scans, until disposal or server exit. All existing
+128-MiB/20,000-entry bounds and the no-hard-link/no-symlink checks still apply.
+Tools that write into the copied project may therefore need one-shot mode.
+
+The initialization response exposes `experimental.ubs.workspaceStrategy` as
+`original`, `snapshot` or `incremental`. Stable private paths allow the normal
+scanner to apply its existing cache policy, but no end-to-end latency or cache-hit
+guarantee is implied. External configurations and tools remain trusted session
+inputs, not part of a certified project snapshot.
 
 ## Grouped saved scans and dependency changes
 

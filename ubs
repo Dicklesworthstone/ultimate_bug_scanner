@@ -49,23 +49,23 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='d87e4aa37fbc69a6570081a3cc4c24d4eb044f9c980a9a18683021d6e775917d'
-  [cpp]='1119bffee07b581f309f4d44af5d8556ab11a4c41354ac6cb06864ea886b57f5'
-  [csharp]='a11e5d29dff27000f0620496131ddc75e71129f85e111490f958016144a8b9ee'
-  [elixir]='4c5281204b29020c3798ed708724c98aee90cd33f3afa853b0c95d4b5e4cc9f9'
-  [golang]='3e29003496095c3a2e51f978eac58ab3aca940e53c7b957f76fdc8253191fa68'
-  [java]='e454300c6fc19f21ff4a5f14a274e57e8cb380ee06ee156f22bc42fb75bd6b31'
-  [js]='52a90d2c81a017a13d65d69d6353c6c178657ddb58a6ecc52af171cdc781d71c'
-  [kotlin]='f1f443866804d364d7441695d53cf600658a484b96548f02dc2a48cbd445e1ca'
-  [python]='3d8c7e4cfd029a5543fa653395450086fafb145f8f4aa5d14a21d704f420d732'
-  [ruby]='e29678405429ead584ae99d1d5cbe47888a88f4199dc4026ec56f20ac364c7b6'
-  [rust]='7e9252c5b48a8a5c2b0bf550dae2ab4bc433fb95456222bf6626ae9988168fd0'
-  [swift]='99c5334f476d5aad41b0a9509eb1b0ee1bbb44fd7149ee00ce777124a8f16d8d'
+  [bash]='828a034d25b8499bbda9f1ffc99f1843a3cc0c5b4596de131f0ef68dad1dc370'
+  [cpp]='7a6af9f71d3968f6daa56332f64c0fee7d5f4f1e57e38452ad02c5ac4abffccd'
+  [csharp]='ffca16d60b209da9b3a70e8856ac68dae56dfeb6c57dcd0925b38a18544a8c83'
+  [elixir]='16377412793b24c60282ea4c633918330ccab262676bf3327a271c21cdba224c'
+  [golang]='3c16faa6608d06d2bea8f2b84a3ce6192fd0b7e9b0f2fed40b7fc121e40c4896'
+  [java]='5737b4af81066fe06f2c38ad1d0e85ba8212035dfdc9ad9ffd0540ee314b5aa7'
+  [js]='fe2ebd8b8a7314c478a9b1fa5da349384406a1db856ea9d35baaeee27ad2e664'
+  [kotlin]='f754b8133fade0e6e10933d4fdfa038b283e3c30933e8c3240b0a82b5b74d5e2'
+  [python]='f282c396a7ee91a2134936e9909b2ba54e6c6d5c613ef42b61077dc726b48430'
+  [ruby]='c9bc9c19847a59a641a512a57b7106f88e31a1ffa37555f5758526248a35566d'
+  [rust]='4cea44f62b0b9b327fd6c29f729ba2291cf6d79086fc4fb58fd7289d92136ef7'
+  [swift]='a2a20c4015844331fa95adac8e7e11941216caccb3dc124e9a5b44d3b84b721e'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
 declare -A HELPER_CHECKSUMS=(
-  ['contract.json']='93cd47cd7142c954c4d6a34a62e6786d1512762b9352098000c8415c86912203'
+  ['contract.json']='406ecd66239cf0c23b2611c98bf1732114934e416c60d0edac6e20ca716129f8'
   ['helpers/async_task_handles_csharp.py']='d5b029f8fe9452fafba22a9bd6a26db9952b8072fdee224d976f140c824af93d'
   ['helpers/cfg_test_only_modules_rust.py']='27dbd7f843d546c07743bf642f4dfa9912f0c205007c583c5e18d6b52fa39e68'
   ['helpers/resource_lifecycle_cpp.py']='886611236e8230551ad302bc2b91894935adb29f427dff92c5e0e18370e9f582'
@@ -79,7 +79,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/type_narrowing_kotlin.py']='a50e5060d1784b53e27cfc4dba745011fb2e3b7bd15176f91f0477eced54d321'
   ['helpers/type_narrowing_rust.py']='155095a92a5a90ef88d668a88236f7d8611ec6f94aad42615eacdbe92b21e163'
   ['helpers/type_narrowing_swift.py']='d83d064db4418d4c245e6bcf7a386280e27c0ebdc57a7c4f6c32443887d6eeea'
-  ['helpers/type_narrowing_ts.js']='67bb540f1b85993336f06d712a5c1e6f28ee2201d4404a8e00279d01b9859637'
+  ['helpers/type_narrowing_ts.js']='988cc579899f1104832c1d5693a92a038b7ad3d036289a854667c5c1b0441793'
   ['helpers/ubs_core/__init__.py']='b75e6b0fd574ac97252fe667280d5807ce1fc6726b1a92980796e46e8de3592f'
   ['helpers/ubs_core/__main__.py']='4aed5b835f04ba3a51b13a650b15dc05e2e43436e9e8be19000551999172639e'
   ['helpers/ubs_core/analyzers/__init__.py']='090badfe6b8be4c60de495a74b362acff5a4d9f8461dbb56d5b6718783e39b86'
@@ -160,7 +160,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_go.py']='bfe9f108de90ed91a5a1f40e8384fa1d4872f0501b23570bec0cf54da29e600b'
   ['helpers/ubs_core/analyzers/taint_java_redirect.py']='39fb0763494056f30a450f8c9296b02effc9a18a06d6560b8beeefa67310dc90'
   ['helpers/ubs_core/analyzers/taint_java_traversal.py']='c73cbe618a30944ca491dac09aa667f3e2599b1c54f95a8a9747bdad9135dcfd'
-  ['helpers/ubs_core/analyzers/taint_js.py']='05ad866447373f6fef4b89546f3e2277846a30472e1e98769baed8a4927f8715'
+  ['helpers/ubs_core/analyzers/taint_js.py']='cc47c37dbebf13d83ea369bf59dede486bad34a83cfe6124bdc1d32bd6b97352'
   ['helpers/ubs_core/analyzers/taint_py.py']='8290bda8d6f4d9752a70dc14b985fb8b27cc4caa1d04d1cad7087d66dc85509d'
   ['helpers/ubs_core/analyzers/taint_ruby_traversal.py']='ecff0b7c2607695048741f48551209464e80db385415490d1ebd92227a9813e0'
   ['helpers/ubs_core/analyzers/taint_ruby_url.py']='4453f0434f95879880777748ab7d6041fa81588bf281c9ec9a2183c2cc706c63'
@@ -170,7 +170,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/bash_rules.py']='17eda47be732993bb1f636cf0375823042c1701646cd656cf9735ae8dc298882'
   ['helpers/ubs_core/bash_scan.py']='a2c65de4e90a4c1aad47068b83a030ff2abd42214f1e1c6dc30f3a01f4cc04d4'
   ['helpers/ubs_core/cache.py']='121008fdd270030ea2ab8108bd16bbb82598750baa1b6e5d40ab48442afe2458'
-  ['helpers/ubs_core/cli.py']='2d1c49737d8318d2dc8ba583e360168ca0e77fe7850437029031bf101cfa3be9'
+  ['helpers/ubs_core/cli.py']='46c110524dbcd18e46f83014c3cbf81b08e5442df9a97bb0c21fb574d67540db'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='adb8693a5ac0370aa0bc9f7aabbb05eb63da64fac792e1451f15b352f870a114'
   ['helpers/ubs_core/cpp_detectors/async_errors.py']='e3c03636656ec7477e940520806c8080326ec7700b0e0cb6d702c8ef0a0ed713'
@@ -282,6 +282,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/java_rules.py']='25646798a89ca69b7a101901456ab0970ad28abdffef5fab33458ff8b900a9cf'
   ['helpers/ubs_core/java_scan.py']='e1d39a3790f943feca57062ff77be558ae766a87fffbffd374f98fe50fbb4997'
   ['helpers/ubs_core/js_ast.py']='cc0ee3b63512bb043ac5167dfbb8b67b7c2cbdbe5ae8e9d11d6828c62451da5f'
+  ['helpers/ubs_core/js_modules.py']='c9d688b7e65842cc5ed907d6a439fe958f3831de639a2a7a429ebf66bc2a2c6f'
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
   ['helpers/ubs_core/js_patterns/debug_quality.py']='de6e0c36dfb9e06691b65ec5e8fd7739ec22840ebf5c487801f998218bb78172'
   ['helpers/ubs_core/js_patterns/eq_regex_dom.py']='d2513ecc6d6311612e0ccd02293d25a5373ef60cf4d689f96ec30c4c12cf4d8a'
@@ -290,7 +291,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_patterns/proto_vars.py']='b4fdf0f9ccfa5b4133f12f53dc2813fcd618530756c9a299ed16e1d0c0388b31'
   ['helpers/ubs_core/js_patterns/security_node.py']='7ceb9d14a629fb7bb89fce5c702a7ccc769260be10feab937a843b473efcf81e'
   ['helpers/ubs_core/js_rules.py']='e038f6d8a7ad177e7cce78aa236580c3d2f8cb6dae65bfad172f3961465ebc4a'
-  ['helpers/ubs_core/js_scan.py']='1ab936853f9af37b6d160cb0fc20f2ce4ffa40d45d78d1d87a525bbf29d5743a'
+  ['helpers/ubs_core/js_scan.py']='50dda39243dca29a988022e1abd442b152cab15551cb4e8dcdf51be251a1ce7a'
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
   ['helpers/ubs_core/kotlin_scan.py']='2ea25fa756000235c64be1b02dad721d5e5d57284522648de73dcec36be14fde'
   ['helpers/ubs_core/lexer.py']='5b0ea23b77e1d414ca0d9cafdc8bd6ed8a6f2b12c20aa83e6af82b275db15686'
@@ -415,7 +416,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='96931ef2d2a578403e5a3828ab0668e717f22e1d47a83387a2736192332c5fc7'
+  ['lib/ubs-common.sh']='2bdf49168604435812d197137a9bd3eb930c26d0e46bedcaf9fd9db0c7210c04'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -897,6 +898,7 @@ HELPER_ASSETS=(
   "helpers/ubs_core/java_rules.py"
   "helpers/ubs_core/java_scan.py"
   "helpers/ubs_core/js_ast.py"
+  "helpers/ubs_core/js_modules.py"
   "helpers/ubs_core/js_patterns/__init__.py"
   "helpers/ubs_core/js_patterns/debug_quality.py"
   "helpers/ubs_core/js_patterns/eq_regex_dom.py"
@@ -1261,7 +1263,7 @@ IGNORE_FILE=""
 DEFAULT_IGNORES="node_modules,venv,.venv,.env,site-packages,dist,build,vendor,target,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels,.next,.turbo,.nuxt,.svelte-kit,.output,storybook-static,.cache,.parcel-cache,.pnpm,.bun"
 # Content-scoped directory names and the source extensions that keep a bin/ alive.
 SCOPED_IGNORE_DIRS="bin,obj,env"
-SOURCE_EXTENSIONS="js,jsx,mjs,cjs,ts,tsx,py,pyi,pyw,pyx,pxd,pxi,ipynb,go,tmpl,gotmpl,tpl,rs,c,cc,cpp,cxx,cppm,mpp,ixx,h,hh,hpp,hxx,ipp,tpp,java,kt,kts,rb,rake,ru,gemspec,erb,haml,slim,rbi,rbs,jbuilder,swift,mm,m,metal,cs,csx,ex,exs,heex,eex,leex,sface"  # union of the modules' INCLUDE_EXT defaults
+SOURCE_EXTENSIONS="js,jsx,mjs,cjs,ts,tsx,mts,cts,py,pyi,pyw,pyx,pxd,pxi,ipynb,go,tmpl,gotmpl,tpl,rs,c,cc,cpp,cxx,cppm,mpp,ixx,h,hh,hpp,hxx,ipp,tpp,java,kt,kts,rb,rake,ru,gemspec,erb,haml,slim,rbi,rbs,jbuilder,swift,mm,m,metal,cs,csx,ex,exs,heex,eex,leex,sface"  # union of the modules' INCLUDE_EXT defaults
 # Safety guards: maximum directory size (MB) and whether to refuse home/root dirs
 MAX_DIR_SIZE_MB="${UBS_MAX_DIR_SIZE_MB:-1000}"  # 1GB default; set 0 to disable
 SKIP_SIZE_CHECK="${UBS_SKIP_SIZE_CHECK:-0}"
@@ -1347,7 +1349,7 @@ fi
 # (union scan of a directory and a file that does not exist yet).
 looks_like_source_path(){
   case "${1##*/}" in
-    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyi|*.pyw|*.pyx|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.rake|*.swift|*.metal|*.cs|*.csx|*.csproj|*.sln|*.ex|*.exs|*.vue|*.svelte|*.sh|*.bash)
+    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.mts|*.cts|*.py|*.pyi|*.pyw|*.pyx|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.rake|*.swift|*.metal|*.cs|*.csx|*.csproj|*.sln|*.ex|*.exs|*.vue|*.svelte|*.sh|*.bash)
       return 0;;
     *) return 1;;
   esac
@@ -1358,7 +1360,7 @@ looks_like_source_path(){
 # which case the caller keeps the shadow-workspace path and rg-based detection.
 lang_for_source_file(){
   case "${1##*/}" in
-    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx) echo js;;
+    *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.mts|*.cts) echo js;;
     *.py|*.pyi|*.pyw) echo python;;
     *.go) echo golang;;
     *.rs) echo rust;;
@@ -2800,7 +2802,7 @@ cap = max_mb * 1024 * 1024 if max_mb > 0 else 0
 
 LANG_EXT_HINTS = {
     "py": "python", "pyi": "python", "pyw": "python", "pyx": "python", "ipynb": "python",
-    "js": "js", "jsx": "js", "mjs": "js", "cjs": "js", "ts": "js", "tsx": "js", "vue": "js", "svelte": "js",
+    "js": "js", "jsx": "js", "mjs": "js", "cjs": "js", "ts": "js", "tsx": "js", "mts": "js", "cts": "js", "vue": "js", "svelte": "js",
     "c": "cpp", "cc": "cpp", "cpp": "cpp", "cxx": "cpp", "h": "cpp", "hh": "cpp", "hpp": "cpp", "hxx": "cpp",
     "rs": "rust",
     "go": "golang",
@@ -4819,10 +4821,10 @@ detect_lang(){
     js)
       if need_cmd rg; then
         rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!*.min.*' -g '!venv/**' -g '!.venv/**' \
-           -g '*.{js,jsx,ts,tsx,mjs,cjs}' -g 'package.json' . "$PROJECT_DIR" 2>/dev/null && found=0
+           -g '*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}' -g 'package.json' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
         find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name venv -o -name .venv -o -name .git \) -prune -o \
-          -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.mjs' -o -name '*.cjs' -o -name 'package.json' \) -print -quit 2>/dev/null | grep -q . && found=0
+          -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.mts' -o -name '*.cts' -o -name 'package.json' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
     python)

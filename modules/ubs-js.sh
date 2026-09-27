@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="96931ef2d2a578403e5a3828ab0668e717f22e1d47a83387a2736192332c5fc7"
+UBS_LIB_CHECKSUM="2bdf49168604435812d197137a9bd3eb930c26d0e46bedcaf9fd9db0c7210c04"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -119,7 +119,7 @@ OUTPUT_FILE=""
 FORMAT="text"          # text|json|sarif
 CI_MODE=0
 FAIL_ON_WARNING=0
-INCLUDE_EXT="js,jsx,ts,tsx,mjs,cjs"
+INCLUDE_EXT="js,jsx,ts,tsx,mjs,cjs,mts,cts"
 QUIET=0
 NO_COLOR_FLAG=0
 EXTRA_EXCLUDES=""
@@ -144,7 +144,7 @@ Options:
   --format=FMT             Output format: text|json|sarif (default: text)
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
-  --include-ext=CSV        File extensions (default: js,jsx,ts,tsx,mjs,cjs)
+  --include-ext=CSV        File extensions (default: js,jsx,ts,tsx,mjs,cjs,mts,cts)
   --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
   --jobs=N                 Parallel jobs for ripgrep (default: auto)
   --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
@@ -304,13 +304,13 @@ run_v2_legacy_parity_bridges(){
   if [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -ne 1 ]]; then
     for e in "${_EXT_ARR[@]}"; do
       case "$(echo "$e" | xargs)" in
-      ts|tsx) allow_ts=1 ;;
+      ts|tsx|mts|cts) allow_ts=1 ;;
       esac
     done
     # has_ts probe over the v2 file list itself (same scope the scan used).
     local has_ts=0
     if [[ "$allow_ts" -eq 1 && -f "$list_file" ]]; then
-      has_ts="$(tr '\0' '\n' <"$list_file" 2>/dev/null | grep -cE '\.tsx?$' || true)"
+      has_ts="$(tr '\0' '\n' <"$list_file" 2>/dev/null | grep -cE '\.(tsx?|mts|cts)$' || true)"
       [[ "${has_ts:-0}" -gt 0 ]] && has_ts=1 || has_ts=0
     fi
     if [[ "$has_ts" -eq 1 ]]; then
@@ -505,7 +505,7 @@ run_contract_v2_js(){
     fi
     local has_sensitive=0
     if [[ -f "$list_file" ]]; then
-      if tr '\0' '\n' <"$list_file" 2>/dev/null | grep -qE '\.(tsx?|jsx)$'; then
+      if tr '\0' '\n' <"$list_file" 2>/dev/null | grep -qE '\.(tsx?|mts|cts|jsx)$'; then
         has_sensitive=1
       fi
     fi

@@ -213,7 +213,7 @@
     "js": {
       "file": "ubs-js.sh",
       "display": "JavaScript / TypeScript",
-      "extensions": ["js", "jsx", "ts", "tsx", "mjs", "cjs"],
+      "extensions": ["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts"],
       "manifest_files": [
         "package.json",
         "tsconfig.json",

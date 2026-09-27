@@ -349,7 +349,7 @@ def run_analyzers(
     from ubs_core.registry import analyzers_for_lang
 
     for analyzer in analyzers_for_lang("javascript"):
-        if prefilter is not None:
+        if prefilter is not None and analyzer.name != 'taint_js':
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:
             target_files = list(files)
@@ -369,6 +369,29 @@ def run_analyzers(
                 "message": finding.get("message", ""),
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")
+
+
+def _expand_module_misses(graph, files, cached_findings, files_to_scan, cache):
+    """Reanalyze a selected import component when either endpoint changes.
+
+    A source can live in a caller while the reported sink lives in its helper.
+    Invalidation is therefore bidirectional, not just importer -> dependency.
+    Unrelated components retain normal per-file and directory-cache hits.
+    """
+    changed = {path.resolve() for path in files_to_scan}
+    invalid = set()
+    for component in graph.components():
+        members = {module.path for module in component}
+        if members & changed:
+            invalid.update(members)
+    for path in files:
+        if path.resolve() in invalid:
+            cached_findings.pop(path, None)
+    pending = [path for path in files if path not in cached_findings]
+    hits, total = len(cached_findings), len(files)
+    cache.stats.update(hits=hits, misses=len(pending), total=total,
+                       hit_rate=round(hits / total, 4) if total else 0.0)
+    return pending
 
 
 def _render_text(args, files: Sequence[Path], counters: dict[str, int],
@@ -471,6 +494,8 @@ def main(argv: list[str] | None = None) -> int:
     patterns = load_patterns()
 
     from ubs_core.cache import CapturingSink, ScanCache
+    from ubs_core.js_modules import ModuleGraph
+    module_graph = ModuleGraph(files)
 
     cache = ScanCache(
         lang="js",
@@ -480,9 +505,10 @@ def main(argv: list[str] | None = None) -> int:
         # Async AST findings are calibrated to info in non-strict mode.
         # Replaying those records in a strict scan would suppress its warning
         # exit; the reverse transition would retain inflated severities.
-        extra=f"fail_on_warning={args.fail_on_warning}",
+        extra=f"fail_on_warning={args.fail_on_warning};modules={module_graph.cache_context()}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
+    files_to_scan = _expand_module_misses(module_graph, files, cached_findings, files_to_scan, cache)
 
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).

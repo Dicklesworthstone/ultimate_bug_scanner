@@ -4,13 +4,17 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/javascript-modules-source.patch.xz
-      - test-suite/patches/javascript-module-report-contract.patch
-      - test-suite/patches/javascript-typescript-resolution.patch.xz
-      - test-suite/patches/javascript-reexport-worklist.patch.xz
-      - test-suite/patches/javascript-module-suffix-selection.patch
-      - test-suite/patches/javascript-commonjs-source.patch.xz
-      - test-suite/patches/javascript-commonjs-shared-state.patch.xz
+      - modules/helpers/ubs_core/analyzers/taint_js.py
+      - modules/helpers/ubs_core/js_modules.py
+      - modules/helpers/ubs_core/js_scan.py
+      - modules/helpers/ubs_core/cli.py
+      - modules/helpers/type_narrowing_ts.js
+      - modules/contract.json
+      - modules/ubs-js.sh
+      - ubs
+      - test-suite/quality/test_taint_js_modules.py
+      - test-suite/quality/test_taint_js_commonjs.py
+      - test-suite/quality/test_taint_js_heap.py
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -20,7 +24,7 @@ permissions:
 jobs:
   module-regressions:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -31,106 +35,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Retain exact source for independent reproduction
+      - name: Verify the committed runtime and complete integrity chain
         run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/js-modules-source-head.txt"
-          git ls-files --stage > "$RUNNER_TEMP/js-modules-source-index.txt"
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/js-modules-source.tar.gz"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: js-modules-source
-          path: ${{ runner.temp }}/js-modules-source*
-          retention-days: 3
-      - name: Apply reviewed module implementation and rebuild integrity
-        run: |
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = c924bd3b74664208b056eb27be867c5ef70a7ad4
-          test "$(git hash-object modules/helpers/ubs_core/cli.py)" = e1dd6be9659247d0be81a1bd547c329bf95acb06
-          test "$(git hash-object modules/helpers/ubs_core/js_scan.py)" = 81ef939bbe1e4c9f5622e43cf1f2afae9ac751a7
-          python3 - <<'PY'
-          import hashlib
-          import lzma
-          import subprocess
-          from pathlib import Path
-          patch = lzma.decompress(Path('test-suite/patches/javascript-modules-source.patch.xz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == '0ab47f8bdbe82a7fe2a8aca704a9cde91de41f9c2f6b0a3429493f3c3261baf7'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          expected = {
-              'modules/helpers/ubs_core/analyzers/taint_js.py': 'e8f3bacc3983fd26af4d4808a900ca8a69858343',
-              'modules/helpers/ubs_core/cli.py': 'e43c1a8e3bf4b1103872f069a09aa52222d0598d',
-              'modules/helpers/ubs_core/js_scan.py': 'eac6a372d4203abe5f3869c49efcc6c7cfdead1f',
-              'modules/helpers/ubs_core/js_modules.py': 'a384aaef801d3a820b154da8ba19e4cc3d751fbe',
-              'test-suite/quality/test_taint_js_modules.py': '41452b9be06b3a0a7d59645661a66f1e1955ec5d',
-          }
-          for name, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
-          PY
-          git apply --check test-suite/patches/javascript-module-report-contract.patch
-          git apply test-suite/patches/javascript-module-report-contract.patch
-          python3 - <<'PY'
-          import hashlib
-          import lzma
-          import subprocess
-          from pathlib import Path
-          stages = [
-              ('javascript-typescript-resolution.patch.xz',
-               'e4e013571fe1396a857d21112c16358f0ff634e9ee1ccc78ff06a242e32ab616',
-               'f96f9afe3986dab5b22bf9748b6a896447ed2a58', 'db2ae8ed9b52239a9f6df138b99777a8d695bbfc'),
-              ('javascript-reexport-worklist.patch.xz',
-               '834a565b1185d24c0a7cda85c07193a8f1c53e56e7e2fe94c1a41ff1737116b9',
-               'a1689dacca187532f75d74f4a69704edf9b764aa', '5e1763229de069ef7836f27db169cd1b62c20ae0'),
-          ]
-          for filename, digest, graph_sha, test_sha in stages:
-              patch = lzma.decompress(Path('test-suite/patches', filename).read_bytes())
-              assert hashlib.sha256(patch).hexdigest() == digest, filename
-              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-              expected = {'modules/helpers/ubs_core/js_modules.py': graph_sha,
-                          'test-suite/quality/test_taint_js_modules.py': test_sha}
-              for name, sha in expected.items():
-                  assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
-          PY
-          python3 - <<'PY'
-          import hashlib
-          from pathlib import Path
-          patch = Path('test-suite/patches/javascript-module-suffix-selection.patch').read_bytes()
-          assert hashlib.sha256(patch).hexdigest() == 'adf0bac73f031f34c1ef6c76aa529d9ce31fc6c5f163681fa7aa24474a04612e'
-          PY
-          git apply --check test-suite/patches/javascript-module-suffix-selection.patch
-          git apply test-suite/patches/javascript-module-suffix-selection.patch
-          python3 - <<'PY'
-          import hashlib
-          import lzma
-          import subprocess
-          from pathlib import Path
-          patch = lzma.decompress(Path('test-suite/patches/javascript-commonjs-source.patch.xz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == '9a558d4af43b500234f02355f75a34351edd3907a371120cce0638b862e49bd9'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          expected = {
-              'modules/helpers/ubs_core/analyzers/taint_js.py': '885560a5d2ae48269851932128b585b059f7cced',
-              'modules/helpers/ubs_core/js_modules.py': '4eebcd7e61ca3bb36cf4080d591ad6eb73c7db4f',
-              'test-suite/quality/test_taint_js_commonjs.py': '7c3798d755ef87f7198fb5987cfe05cbd63c009b',
-              'test-suite/quality/test_taint_js_modules.py': '4ab280d9f0cbbda694c93cf8e3fac45b0e857d45',
-          }
-          for name, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
-          patch = lzma.decompress(Path('test-suite/patches/javascript-commonjs-shared-state.patch.xz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == '0390c13c86c0d59584d5b7a5c6b770cf888aaead8d373d04f80017836f78d62c'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          expected = {
-              'modules/helpers/ubs_core/analyzers/taint_js.py': '5525652afa50a614924da9e2e9a967ec4309d91c',
-              'modules/helpers/ubs_core/js_modules.py': '9d5d0365db90fcd55dc25bc7031f33eec3b98b74',
-              'test-suite/quality/test_taint_js_commonjs.py': '324deb34ea720cecb3f3735157de0a35bb9f9d60',
-          }
-          for name, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
-          PY
-          python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-          git diff --check
+          python3 scripts/update_checksums.py
+          git diff --exit-code
       - name: Install scanner dependencies and independent TypeScript test oracle
         run: |
           sudo apt-get update
@@ -160,49 +70,17 @@ jobs:
           python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
           shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
           for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
-      - name: Retain verified runtime and deterministic integrity evidence
+      - name: Verify deterministic integrity after scanner execution
         run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          import tarfile
-          from pathlib import Path
-          new = {'modules/helpers/ubs_core/js_modules.py', 'test-suite/quality/test_taint_js_modules.py',
-                 'test-suite/quality/test_taint_js_commonjs.py'}
-          def changed_names():
-              return sorted(set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | new)
-          changed = changed_names()
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_js.py', 'modules/helpers/ubs_core/cli.py',
-                     'modules/helpers/ubs_core/js_scan.py', 'modules/contract.json',
-                     'modules/helpers/type_narrowing_ts.js'} | new
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert set(changed) <= allowed, changed
-          before = {name: Path(name).read_bytes() for name in changed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
-          assert changed == changed_names()
-          assert all(Path(name).read_bytes() == data for name, data in before.items())
-          for command in (['./scripts/verify_checksums.sh'], ['./scripts/verify_sha256sums.sh'], ['git', 'diff', '--check']):
-              subprocess.run(command, check=True)
-          manifest = []
-          with tarfile.open(Path(os.environ['RUNNER_TEMP'], 'js-modules-verified.tar.gz'), 'w:gz') as archive:
-              for name in changed:
-                  data = before[name]
-                  sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-                  entry = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
-                  manifest.append({'path': name, 'mode': entry[0] if entry else '100644', 'sha': sha})
-                  archive.add(name, arcname=name)
-          Path(os.environ['RUNNER_TEMP'], 'js-modules-verified.json').write_text(json.dumps(manifest, indent=2))
-          print('JS_MODULES_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip())
-          PY
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: javascript-modules-validation
           path: |
-            ${{ runner.temp }}/js-modules-verified*
             test-suite/artifacts/javascript-modules/
             test-suite/artifacts/javascript-commonjs/
             test-suite/artifacts/javascript-heap/

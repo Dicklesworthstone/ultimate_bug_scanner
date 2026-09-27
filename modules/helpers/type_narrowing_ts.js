@@ -93,7 +93,7 @@ for (const spec of cliExcludes) {
     }
   }
 }
-const EXTENSIONS = new Set([".ts", ".tsx"]);
+const EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
 
 function isExcluded(fullPath, name) {
   if (SKIP_DIRS.has(name)) return true;

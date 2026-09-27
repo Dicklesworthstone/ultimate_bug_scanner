@@ -2,10 +2,10 @@
 
 Executable-expression masks retain template interpolation and source offsets.
 Local functions use finite return/sink summaries and ordered assignment state.
-Known local allocations retain heap aliases, property state and ordinary array
-mutator effects. General heap mutation through helper calls is not summarized.
-The lexical front end handles ordinary functions, arrows and structured blocks;
-cross-file calls, dynamic dispatch and the full JavaScript grammar are not modeled.
+Selected relative ES modules and static CommonJS interfaces share call summaries
+without sharing lexical locals. Heap identities and mutations propagate through
+local/imported helpers; require snapshots retain shared export object identity.
+Package resolution, dynamic loaders/dispatch and the full grammar are not modeled.
 
 Emit dialects:
 - main(argv) preserves the legacy output dialect: one
@@ -23,6 +23,7 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from os.path import commonpath
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
@@ -30,7 +31,7 @@ from ubs_core.registry import Analyzer, RunContext, register
 ROOT: Path = Path()
 BASE_DIR: Path = Path()
 SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '.cache', 'dist', 'build', 'coverage', 'tmp', '.turbo'}
-EXTS = {'.js', '.jsx', '.ts', '.tsx'}
+EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts'}
 PATH_LIMIT = 5
 ROUTE_PARAM_FIELDS = r"(?:id|slug|user|username|email|name|status|tenant|account|role|filter|search|sort|limit|offset|where|order|table|column)"
 ROUTE_PARAM_OBJECT = re.compile(r"^\s*\(?\s*(?:await\s+)?((?:context\.)?params)\s*\)?\s*$", re.IGNORECASE)
@@ -1195,6 +1196,13 @@ class _Flow:
     def reference(self, name, state):
         if name in state:
             return state[name]
+        key = self.engine.binding(self.scope, name)
+        captured_require = ((key[0], name) in self.engine.commonjs_locals
+                            and self.scope is not key[0])
+        imported = self.engine.import_value(key, state, self.rule,
+                                           captured_require=captured_require)
+        if imported is not None:
+            return imported
         if self.scope.parent is not None:
             scope = self.scope.parent if self.parameter_context else self.scope
             position = self.scope.start if self.parameter_context else None
@@ -1276,7 +1284,27 @@ class _Flow:
 
     def read_access(self, parsed, state, evaluate_keys=True):
         root, selectors, _end = parsed
-        fact = self.reference(root, state)
+        exported, consumed = None, 0
+        local = self.engine.lexical_binding(self.scope, root)
+        if root not in state.bindings and (local[0], root) not in self.engine.commonjs_locals:
+            names = [root]
+            for key, _expression in selectors:
+                if key is None:
+                    break
+                names.append(key)
+                candidate = self.engine.import_path(self.scope, names)
+                if candidate is None:
+                    break
+                consumed += 1
+                if candidate[2] != '@namespace':
+                    exported = candidate
+                    break
+        if exported is not None:
+            fact = self.engine.import_value(exported, state, self.rule)
+            fact = frozenset() if fact is None else fact
+            selectors = selectors[consumed:]
+        else:
+            fact = self.reference(root, state)
         for key, expression in selectors:
             selected = frozenset()
             if expression is not None:
@@ -1291,13 +1319,26 @@ class _Flow:
                 fact = _join(fact, selected)
         return fact
 
-    def write_property(self, fact, key, value, state):
+    def write_property(self, fact, key, value, state, *, initialize_export=False):
         refs = _refs(fact)
         strong = (len(refs) == 1 and key is not None and not frozenset(fact)
                   and not refs & state.weak_refs)
         for ref in refs:
             slots = state.heap.setdefault(ref, {})
             slots[key] = value if strong else _join(slots.get(key, frozenset()), value)
+            owner = self.engine.commonjs_namespace_refs.get(ref)
+            if owner is not None and not initialize_export:
+                # A namespace export is a property of a shared ordinary
+                # object, not an immutable ESM binding. Every spelling and
+                # borrowed helper must observe writes through that identity.
+                module = self.engine.module_roots[owner]
+                names = [name for name in module.exports if key is None or name == key]
+                for name in names:
+                    exported = self.engine.export_key(module, name)
+                    if exported is not None:
+                        state.cells[exported] = self.property(_Fact(refs=(ref,)), name, state)
+                        state.written_cells.add(exported)
+                        state.bindings[exported[2]] = None
             if ref in state.array_lengths:
                 length = state.array_lengths[ref]
                 if key is None or key == 'length':
@@ -1483,10 +1524,8 @@ class _Flow:
             if start <= child.start and child.end <= end and self.scope.code[start:child.start].strip() in {'', 'async'}:
                 return child
         name = self.engine.text[start:end].strip()
-        if re.fullmatch(r'[A-Za-z_$][\w$]*', name):
-            if name in state.bindings:
-                return state.bindings[name]
-            return self.engine.lookup(self.scope, name)
+        if re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', name):
+            return self.engine.call_target(self.scope, name, state, self.rule)
         return None
 
     def bind(self, callee, arguments, ranges, state):
@@ -1568,7 +1607,7 @@ class _Flow:
         for trace in fact:
             if trace.origin[0] == 'capture':
                 incoming = _cell_value(trace.origin[1], state)
-                result = _join(result, _step(incoming, (callee.name or '<callback>') + '()'))
+                result = _join(result, _step(incoming, self.engine.call_label(callee)))
                 continue
             kind, owner, name = trace.origin if trace.origin[0] != 'source' else ('source', None, None)
             if kind == 'parameter' and owner is callee:
@@ -1578,7 +1617,7 @@ class _Flow:
             else:
                 incoming = frozenset({trace})
             if incoming:
-                incoming = _step(incoming, (callee.name or '<callback>') + '()')
+                incoming = _step(incoming, self.engine.call_label(callee))
                 if kind in {'parameter', 'free'}:
                     for name in trace.path[1:]:
                         incoming = _step(incoming, name)
@@ -1705,10 +1744,9 @@ class _Flow:
                          if code[left:right].strip()]
             argument_facts = [self.value(left, right, state) for left, right in arguments]
             callee_name = re.sub(r'\s+', '', match.group(1))
-            callee = None
-            if '.' not in callee_name:
-                callee = state.bindings.get(callee_name) if callee_name in state.bindings else self.engine.lookup(self.scope, callee_name)
+            callee = self.engine.call_target(self.scope, callee_name, state, self.rule)
             if isinstance(callee, _Scope):
+                self.engine.import_captures(callee, state, self.rule)
                 sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
                 bound = self.bind(callee, argument_facts, arguments, state)
@@ -1739,6 +1777,8 @@ class _Flow:
                         call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
                 sink = self.engine.call_sinks.get(match.start())
                 binding = state.bindings.get(receiver, 'imported')
+                if self.engine.relative_import(self.scope, receiver):
+                    binding = None  # a local module is not a built-in sanitizer
                 if sink and sink[0] == self.rule and state.bindings.get(callee_name, 'imported') == 'imported':
                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
                     self.effect(match.start(), sink[1], _join(*selected), state)
@@ -1801,8 +1841,10 @@ class _Flow:
             for _, names, rhs, finish in entries:
                 fact = self.value(rhs, finish, state) if rhs is not None else frozenset()
                 binding = self.callable(rhs, finish, state) if rhs is not None else None
-                if rhs is not None and binding is None and re.match(r"\s*require\s*\(\s*['\"][^'\"]+['\"]\s*\)", text[rhs:finish]):
-                    binding = 'imported'
+                if rhs is not None and binding is None:
+                    required = re.match(r"\s*require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", text[rhs:finish])
+                    if required and not required.group(1).startswith(('./', '../', '/')):
+                        binding = 'imported'
                 for name in names:
                     self.assign(name, fact, state, start, binding)
             return state
@@ -1824,8 +1866,10 @@ class _Flow:
             fact = self.value(rhs, end, state)
             target = match.group(1).split(':', 1)[0] if pattern is ASSIGN_DECL else match.group(1)
             binding = self.callable(rhs, end, state)
-            if binding is None and re.match(r"\s*require\s*\(\s*['\"][^'\"]+['\"]\s*\)", text[rhs:end]):
-                binding = 'imported'
+            if binding is None:
+                required = re.match(r"\s*require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)", text[rhs:end])
+                if required and not required.group(1).startswith(('./', '../', '/')):
+                    binding = 'imported'
             for name in parse_targets(target):
                 self.assign(name, fact, state, start, binding)
         else:
@@ -1860,6 +1904,52 @@ class _Flow:
         return state
 
     def statement(self, node, state):
+        if node.kind == 'commonjs_import':
+            for name in node.extra:
+                key = self.engine.import_path(self.scope, [name])
+                fact, binding = frozenset(), None
+                if key is not None:
+                    fact = self.engine.import_value(key, state, self.rule) or frozenset()
+                    source = self.engine.final_states.get((key[0], self.rule))
+                    if source is not None and key not in state.written_cells:
+                        binding = source.bindings.get(key[2])
+                # require/destructuring takes a value snapshot at this point.
+                # Its local cell is not the exporting module's mutable slot.
+                state.owners[name] = self.engine.lexical_binding(self.scope, name, node.start)
+                self.assign(name, fact, state, node.start, binding)
+            return state
+        if node.kind == 'commonjs_export':
+            kind, members = node.extra
+            value = self.value(node.start, node.end, state)
+            if kind == 'object':
+                namespace = value
+            elif kind == 'namespace':
+                namespace = state.get('@namespace')
+                if namespace is None:
+                    ref = (self.scope, self.scope.body_start, 'commonjs')
+                    state.heap[ref] = {}
+                    namespace = _Fact(refs=(ref,))
+            else:
+                namespace = None
+            for name, key, begin, end in members:
+                fact = self.property(value, name, state) if kind == 'object' else value
+                # Field extraction must not retain the container reference:
+                # its unrelated fields must not taint a clean named export.
+                if kind == 'object':
+                    fact = _join(*(state.heap[ref].get(name, frozenset()) for ref in _refs(value)))
+                self.assign(key, fact, state, begin, self.callable(begin, end, state))
+                if kind == 'namespace':
+                    self.write_property(namespace, name, fact, state, initialize_export=True)
+            if namespace is not None:
+                for ref in _refs(namespace):
+                    self.engine.commonjs_namespace_refs[ref] = self.scope
+                self.assign('@namespace', namespace, state, node.start)
+            return state
+        if node.kind == 'module_default':
+            value = self.value(node.start, node.end, state)
+            self.assign('@default', value, state, node.start,
+                        self.callable(node.start, node.end, state))
+            return state
         if node.kind == 'block':
             local = self.engine.declarations(node.body, block=True)
             outer = state.copy()
@@ -1996,25 +2086,99 @@ class _Flow:
 
 
 class _Engine:
-    def __init__(self, text, code):
+    def __init__(self, text, code, graph=None, modules=()):
+        self.graph = graph
+        self.module_roots = {}
+        self.default_targets = {}
+        self.commonjs_targets = {}
+        self.commonjs_namespace_refs = {}
+        self.commonjs_locals = set()
+        self.source_root = Path(commonpath([str(module.path.parent) for module in modules])) if modules else None
+        if modules:
+            chunks, masks, offset = [], [], 0
+            for module in modules:
+                module.start, module.end = offset, offset + len(module.text)
+                chunks.extend((module.text, '\n;\n'))
+                masks.extend((module.code, '\n;\n'))
+                offset = module.end + 3
+            text, code = ''.join(chunks), ''.join(masks)
         self.text, self.code = text, code
-        self.root, self.functions = _function_scopes(text, code)
-        self.scopes = [self.root, *self.functions]
+        if modules:
+            self.functions, roots = [], []
+            for module in modules:
+                root, functions = _function_scopes(module.text, module.code)
+                for scope in [root, *functions]:
+                    scope.start += module.start
+                    scope.end += module.start
+                    scope.body_start += module.start
+                    scope.body_end += module.start
+                    scope.params = tuple((names, rest, None if default is None else
+                                          (default[0] + module.start, default[1] + module.start))
+                                         for names, rest, default in scope.params)
+                    scope.code = code if scope.code == module.code else (
+                        code[:module.start] + scope.code + code[module.end:])
+                module.root = root
+                self.module_roots[root] = module
+                roots.append(root)
+                self.functions.extend(functions)
+                if module.anonymous_default is not None:
+                    begin = module.start + module.anonymous_default
+                    candidates = [fn for fn in root.children if begin <= fn.start
+                                  and re.fullmatch(r'\s*(?:async\s*)?\(*\s*', code[begin:fn.start])]
+                    if candidates:
+                        self.default_targets[root] = min(candidates, key=lambda fn: fn.start)
+            self.root = roots[0]
+            self.scopes = [*roots, *self.functions]
+        else:
+            self.root, self.functions = _function_scopes(text, code)
+            self.scopes = [self.root, *self.functions]
         self.summaries, self.final_states = {}, {}
         self.captures = {}
         self.dependents = defaultdict(set)
         self.heap_calls = {}
         self.current_task = None
         self.pending, self.queued = deque(), set()
-        modules, functions = child_process_bindings(text.splitlines())
-        sinks = list(child_process_sinks(text, code, modules, functions))
+        sinks = []
+        for left, right in ([(m.start, m.end) for m in modules] if modules else [(0, len(text))]):
+            aliases, functions = child_process_bindings(text[left:right].splitlines())
+            sinks.extend((a + left, b + left, rule, label, call)
+                         for a, b, rule, label, call in
+                         child_process_sinks(text[left:right], code[left:right], aliases, functions))
         for regex, rule, label, call in SINKS:
             sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
         self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
         self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
         for scope in self.scopes:
             scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
+        for root, module in self.module_roots.items():
+            for begin, end, names in module.commonjs_imports:
+                root.statements.append(_Statement('commonjs_import', module.start + begin,
+                                                 module.start + end, extra=names))
+                self.commonjs_locals.update((root, name) for name in names)
+            root.statements.sort(key=lambda node: node.start)
+            if module.anonymous_default is not None:
+                begin, end = module.start + module.anonymous_default, module.start + module.default_end
+                root.statements = [node for node in root.statements if not begin <= node.start < end]
+                root.statements.append(_Statement('module_default', begin, end))
+                root.statements.sort(key=lambda node: node.start)
+            for start, begin, end, members in module.commonjs_exports:
+                start, begin, end = (position + module.start for position in (start, begin, end))
+                root.statements = [node for node in root.statements if not start <= node.start < end]
+                members = [(name, key, left + module.start, right + module.start)
+                           for name, key, left, right in members]
+                root.statements.append(_Statement('commonjs_export', begin, end,
+                                                 extra=(module.commonjs, members)))
+                root.statements.sort(key=lambda node: node.start)
+                for _name, key, left, right in members:
+                    literal = self.text[left:right].strip()
+                    candidates = [fn for fn in root.children
+                                  if (left <= fn.start and fn.end <= right)
+                                  or (fn.name == literal and fn.declaration)]
+                    if len(candidates) == 1:
+                        self.commonjs_targets[root, key] = candidates[0]
         self.binding_regions = {scope: self.regions(scope) for scope in self.scopes}
+        for root, module in self.module_roots.items():
+            self.binding_regions[root].extend((root.body_start, root.body_end, name) for name in module.imports)
         self.capture_keys = {}
         self.local_targets = {}
         for scope in self.functions:
@@ -2058,6 +2222,151 @@ class _Engine:
             if not added:
                 break
             self.heap_scopes.update(added)
+
+    def selected_import(self, scope, name):
+        key = self.lexical_binding(scope, name)
+        module = self.module_roots.get(key[0])
+        imported = module.imports.get(name) if module is not None else None
+        return bool(imported and name not in module.uncertain_requires
+                    and self.graph.resolve(module, imported[0]) is not None)
+
+    def relative_import(self, scope, name):
+        # A helper excluded from the selected scan is unknown, not a proof of
+        # sanitization. This also covers missing and ambiguous dependencies.
+        key = self.lexical_binding(scope, name)
+        module = self.module_roots.get(key[0])
+        entry = module.imports.get(name) if module is not None else None
+        return bool(entry and entry[0].startswith(('./', '../')))
+
+    def export_key(self, module, name):
+        found = self.graph.exported(module, name)
+        if found is None:
+            return None
+        target, local = found
+        if target.root not in self.module_roots:
+            return None
+        return target.root, target.root.body_start, local
+
+    def import_path(self, scope, names):
+        owner = self.lexical_binding(scope, names[0])[0]
+        module = self.module_roots.get(owner)
+        entry = module.imports.get(names[0]) if module is not None else None
+        if entry is None or names[0] in module.uncertain_requires:
+            return None
+        target = self.graph.resolve(module, entry[0])
+        if target is None:
+            return None
+        found = ((target, '@namespace') if entry[1] == '*'
+                 else self.graph.exported(target, entry[1]))
+        for name in names[1:]:
+            if found is None or found[1] != '@namespace':
+                return None
+            found = self.graph.exported(found[0], name)
+        if found is None or found[0].root not in self.module_roots:
+            return None
+        return found[0].root, found[0].root.body_start, found[1]
+
+    def call_label(self, callee):
+        label = (callee.name or '<callback>') + '()'
+        if len(self.module_roots) > 1:
+            root = callee
+            while root.parent is not None:
+                root = root.parent
+            module = self.module_roots[root]
+            label = f'{module.path.relative_to(self.source_root).as_posix()}:{label}'
+        return label
+
+    def import_value(self, key, state, rule, *, captured_require=False):
+        owner = key[0]
+        task = self.current_task
+        current_scope = task.scope if isinstance(task, _HeapCall) else task
+        root = current_scope
+        while root is not None and root.parent is not None:
+            root = root.parent
+        if owner not in self.module_roots or (owner is root and not captured_require):
+            return None
+        if task is not None:
+            self.dependents[(owner, rule)].add(task)
+        if key in state.cells:
+            return state.cells[key]
+        source = self.final_states.get((owner, rule))
+        if source is None:
+            return frozenset()
+        fact = source.cells.get(key, source.get(key[2], frozenset()))
+        state.cells[key] = fact
+        pending = list(_refs(fact))
+        while pending:
+            ref = pending.pop()
+            if ref in state.heap:
+                continue
+            state.heap[ref] = dict(source.heap.get(ref, {}))
+            namespace_owner = self.commonjs_namespace_refs.get(ref)
+            if namespace_owner is not None:
+                module = self.module_roots[namespace_owner]
+                for name in module.exports:
+                    exported = self.export_key(module, name)
+                    if exported in source.written_cells:
+                        state.written_cells.add(exported)
+                        if exported in source.cells:
+                            state.cells[exported] = source.cells[exported]
+            for value in state.heap[ref].values():
+                pending.extend(_refs(value) - state.heap.keys())
+            if ref in source.array_lengths:
+                state.array_lengths[ref] = source.array_lengths[ref]
+        state.weak_refs.update(source.weak_refs & state.heap.keys())
+        return fact
+
+    def import_captures(self, callee, state, rule):
+        for key in self.capture_keys[callee]:
+            self.import_value(key, state, rule)
+
+    def call_target(self, scope, name, state, rule):
+        parts = name.split('.')
+        local = self.lexical_binding(scope, parts[0])
+        if (local[0], parts[0]) in self.commonjs_locals and parts[0] not in state.bindings:
+            # An independently analyzed closure may read its defining module's
+            # require snapshot. Concrete calls already provide current cells.
+            self.import_value(local, state, rule, captured_require=scope is not local[0])
+            if len(parts) == 1:
+                if local in state.written_cells:
+                    return None
+                source = self.final_states.get((local[0], rule))
+                return source.bindings.get(parts[0]) if source is not None else None
+        if len(parts) == 2:
+            receiver = state.get(parts[0], state.cells.get(local, frozenset()))
+            refs = _refs(receiver)
+            if refs and not frozenset(receiver):
+                targets = []
+                for ref in refs:
+                    owner = self.commonjs_namespace_refs.get(ref)
+                    if owner is None:
+                        return None
+                    key = self.export_key(self.module_roots[owner], parts[1])
+                    if key is None or key in state.written_cells:
+                        return None
+                    source = self.final_states.get((owner, rule))
+                    if self.current_task is not None:
+                        self.dependents[(owner, rule)].add(self.current_task)
+                    targets.append(source.bindings.get(key[2]) if source is not None else None)
+                return targets[0] if all(target is targets[0] for target in targets) else None
+        if parts[0] in state.bindings:
+            return state.bindings[name] if len(parts) == 1 else None
+        key = self.import_path(scope, parts)
+        if key is not None:
+            # A setter may have replaced the exported binding through another
+            # import name or namespace. The exporter's initialization summary
+            # is stale at this call site even if this spelling was never read.
+            if key in state.written_cells:
+                return None
+            owner, _, local = key
+            task = self.current_task
+            if task is not None:
+                self.dependents[(owner, rule)].add(task)
+            source = self.final_states.get((owner, rule))
+            return source.bindings.get(local) if source is not None else None
+        if len(parts) == 1:
+            return state.bindings.get(name) if name in state.bindings else self.lookup(scope, name)
+        return None
 
     def enqueue(self, task):
         if task not in self.queued:
@@ -2156,7 +2465,7 @@ class _Engine:
             name = key[2]
             if name not in state or state.owners.get(name) == key:
                 state[name], state.owners[name], state.bindings[name] = value, key, None
-        label = (callee.name or '<callback>') + '()'
+        label = self.call_label(callee)
         return _step(translate(returned), label), {key: _step(fact, label) for key, fact in effects.items()}
 
     def analyze_heap(self, context):
@@ -2225,18 +2534,40 @@ class _Engine:
                 regions.append((left, right, child.name))
         return regions
 
-    def binding(self, scope, name, position=None):
+    def lexical_binding(self, scope, name, position=None):
         position = scope.body_start if position is None else position
+        root = scope
         while scope is not None:
+            root = scope
             matches = [(left, right) for left, right, candidate in self.binding_regions[scope]
                        if candidate == name and left <= position <= right]
             if matches:
                 left, _ = min(matches, key=lambda span: span[1] - span[0])
                 return scope, left, name
             position, scope = scope.start, scope.parent
-        return self.root, self.root.body_start, name
+        return root, root.body_start, name
+
+    def binding(self, scope, name, position=None):
+        key = self.lexical_binding(scope, name, position)
+        if (key[0], name) in self.commonjs_locals:
+            return key
+        module = self.module_roots.get(key[0])
+        entry = module.imports.get(name) if module is not None else None
+        if entry and entry[1] != '*' and name not in module.uncertain_requires:
+            target = self.graph.resolve(module, entry[0])
+            resolved = self.export_key(target, entry[1]) if target is not None else None
+            if resolved is not None:
+                return resolved
+        return key
 
     def lookup(self, scope, name):
+        key = self.binding(scope, name)
+        if self.selected_import(scope, name) and key[0] in self.module_roots:
+            if (key[0], key[2]) in self.commonjs_targets:
+                return self.commonjs_targets[key[0], key[2]]
+            if key[2] == '@default':
+                return self.default_targets.get(key[0])
+            return next((fn for fn in key[0].children if fn.name == key[2]), None)
         while scope is not None:
             for child in reversed(scope.children):
                 if child.name == name and child.declaration:
@@ -2336,8 +2667,10 @@ class _Engine:
                             self.enqueue(reader)
                     continue
                 scope = task
+                before = self.final_states.get((scope, rule))
                 summary = self.analyze(scope, rule)
-                if self.summaries.get((scope, rule)) != summary:
+                if (self.summaries.get((scope, rule)) != summary or
+                        (scope in self.module_roots and before != self.final_states.get((scope, rule)))):
                     self.summaries[(scope, rule)] = summary
                     for caller in self.dependents[(scope, rule)]:
                         self.enqueue(caller)
@@ -2379,8 +2712,11 @@ def main(argv=None) -> int:
     ROOT = Path(argv[1]).resolve()
     BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
     issues = defaultdict(lambda: {'count': 0, 'samples': []})
-    for file_path in iter_js_files(ROOT):
-        analyze_file(file_path, issues)
+    for file_path, rule, line, _col, path_desc in scan_project_findings(iter_js_files(ROOT)):
+        bucket = issues[rule]
+        bucket['count'] += 1
+        if len(bucket['samples']) < 3:
+            bucket['samples'].append(f'{file_path.relative_to(BASE_DIR)}:{line} {path_desc}')
     for rule_id, data in issues.items():
         samples = ','.join(data['samples'])
         print(f"{rule_id}\t{data['count']}\t{samples}")
@@ -2403,21 +2739,33 @@ _MESSAGE = {
 
 
 def scan_file_findings(path: Path):
-    """Yield (rule_id, line, col, path_desc) per detection, without the
-    heredoc's 3-sample cap — used by the structured run(ctx) path."""
-    try:
-        text = path.read_text(encoding='utf-8')
-    except (UnicodeDecodeError, OSError):
-        return
-    text, code = lexical_views(text)
-    line_starts = [0] + [match.end() for match in re.finditer('\n', text)]
-    for start, rule, path_desc in _Engine(text, code).findings():
-        line = bisect_right(line_starts, start)
-        yield rule, line, start - line_starts[line - 1] + 1, path_desc
+    """Single selected file, using the same module semantics as both CLIs."""
+    for _path, rule, line, col, path_desc in scan_project_findings([path]):
+        yield rule, line, col, path_desc
+
+
+def scan_project_findings(files):
+    """Resolve only selected modules; findings retain original file offsets."""
+    from ubs_core.js_modules import ModuleGraph
+    graph = ModuleGraph(files)
+    for modules in graph.components():
+        engine = _Engine('', '', graph, modules)
+        starts = [module.start for module in modules]
+        line_starts = {module.path: [0] + [match.end() for match in re.finditer('\n', module.text)]
+                       for module in modules}
+        for start, rule, path_desc in engine.findings():
+            module = modules[bisect_right(starts, start) - 1]
+            if start >= module.end:
+                continue
+            offset = start - module.start
+            lines = line_starts[module.path]
+            line = bisect_right(lines, offset)
+            yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
     cwd = Path.cwd()
+    selected = []
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
@@ -2429,19 +2777,19 @@ def run(ctx: RunContext) -> Iterable[dict]:
             rel_parts = ()
         if any(part in SKIP_DIRS for part in rel_parts):
             continue
-        rel = path.resolve()
-        for rule, line, col, path_desc in scan_file_findings(path):
-            kind = KIND_BY_RULE[rule]
-            yield {
-                "rule": f"javascript.taint.{kind}",
-                "path": str(rel),
-                "line": line,
-                "col": col,
-                "layer": "taint",
-                "lang": "javascript",
-                "severity": _SEVERITY.get(kind, "warning"),
-                "message": f"{_MESSAGE.get(kind, kind)} ({path_desc})",
-            }
+        selected.append(path)
+    for path, rule, line, col, path_desc in scan_project_findings(selected):
+        kind = KIND_BY_RULE[rule]
+        yield {
+            "rule": f"javascript.taint.{kind}",
+            "path": str(path),
+            "line": line,
+            "col": col,
+            "layer": "taint",
+            "lang": "javascript",
+            "severity": _SEVERITY.get(kind, "warning"),
+            "message": f"{_MESSAGE.get(kind, kind)} ({path_desc})",
+        }
 
 
 def _selftest_direct_source_sink(tmp_prefix: str = "ubs_core_taint_js_") -> None:

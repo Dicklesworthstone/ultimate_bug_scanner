@@ -176,7 +176,19 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
             )
             return list(run_scan(ctx) if layer == "scan" else run_layer(layer, ctx))
 
-        findings = run_work_stealing(files, _process_shard, num_workers=jobs)
+        if args.lang == 'javascript' and layer in {'taint', 'scan'}:
+            # Module summaries require both endpoints in the same analysis.
+            # Parallelize independent components, never split an import edge.
+            from concurrent.futures import ThreadPoolExecutor
+            from ubs_core.js_modules import ModuleGraph
+            graph = ModuleGraph(files)
+            groups = [[module.path for module in component] for component in graph.components()]
+            grouped = {path for group in groups for path in group}
+            groups.extend([path] for path in files if path.resolve() not in grouped)
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                findings = [finding for group in executor.map(_process_shard, groups) for finding in group]
+        else:
+            findings = run_work_stealing(files, _process_shard, num_workers=jobs)
     else:
         ctx = RunContext(
             lang=args.lang,

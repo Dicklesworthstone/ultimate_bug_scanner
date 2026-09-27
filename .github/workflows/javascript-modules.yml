@@ -8,6 +8,7 @@ on:
       - test-suite/patches/javascript-module-report-contract.patch
       - test-suite/patches/javascript-typescript-resolution.patch.xz
       - test-suite/patches/javascript-reexport-worklist.patch.xz
+      - test-suite/patches/javascript-module-suffix-selection.patch
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -87,6 +88,14 @@ jobs:
               for name, sha in expected.items():
                   assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
           PY
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          patch = Path('test-suite/patches/javascript-module-suffix-selection.patch').read_bytes()
+          assert hashlib.sha256(patch).hexdigest() == 'adf0bac73f031f34c1ef6c76aa529d9ce31fc6c5f163681fa7aa24474a04612e'
+          PY
+          git apply --check test-suite/patches/javascript-module-suffix-selection.patch
+          git apply test-suite/patches/javascript-module-suffix-selection.patch
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
@@ -135,7 +144,8 @@ jobs:
           changed = changed_names()
           allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
                      'modules/helpers/ubs_core/analyzers/taint_js.py', 'modules/helpers/ubs_core/cli.py',
-                     'modules/helpers/ubs_core/js_scan.py'} | new
+                     'modules/helpers/ubs_core/js_scan.py', 'modules/contract.json',
+                     'modules/helpers/type_narrowing_ts.js'} | new
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed) <= allowed, changed
           before = {name: Path(name).read_bytes() for name in changed}

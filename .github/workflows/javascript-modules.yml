@@ -7,6 +7,7 @@ on:
       - test-suite/patches/javascript-modules-source.patch.xz
       - test-suite/patches/javascript-module-report-contract.patch
       - test-suite/patches/javascript-typescript-resolution.patch.xz
+      - test-suite/patches/javascript-reexport-worklist.patch.xz
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -68,16 +69,23 @@ jobs:
           import lzma
           import subprocess
           from pathlib import Path
-          patch = lzma.decompress(Path('test-suite/patches/javascript-typescript-resolution.patch.xz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == 'e4e013571fe1396a857d21112c16358f0ff634e9ee1ccc78ff06a242e32ab616'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          expected = {
-              'modules/helpers/ubs_core/js_modules.py': 'f96f9afe3986dab5b22bf9748b6a896447ed2a58',
-              'test-suite/quality/test_taint_js_modules.py': 'db2ae8ed9b52239a9f6df138b99777a8d695bbfc',
-          }
-          for name, sha in expected.items():
-              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
+          stages = [
+              ('javascript-typescript-resolution.patch.xz',
+               'e4e013571fe1396a857d21112c16358f0ff634e9ee1ccc78ff06a242e32ab616',
+               'f96f9afe3986dab5b22bf9748b6a896447ed2a58', 'db2ae8ed9b52239a9f6df138b99777a8d695bbfc'),
+              ('javascript-reexport-worklist.patch.xz',
+               '834a565b1185d24c0a7cda85c07193a8f1c53e56e7e2fe94c1a41ff1737116b9',
+               'a1689dacca187532f75d74f4a69704edf9b764aa', '5e1763229de069ef7836f27db169cd1b62c20ae0'),
+          ]
+          for filename, digest, graph_sha, test_sha in stages:
+              patch = lzma.decompress(Path('test-suite/patches', filename).read_bytes())
+              assert hashlib.sha256(patch).hexdigest() == digest, filename
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+              expected = {'modules/helpers/ubs_core/js_modules.py': graph_sha,
+                          'test-suite/quality/test_taint_js_modules.py': test_sha}
+              for name, sha in expected.items():
+                  assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
           PY
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh

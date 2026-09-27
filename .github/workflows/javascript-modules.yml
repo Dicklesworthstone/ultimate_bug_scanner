@@ -9,6 +9,7 @@ on:
       - test-suite/patches/javascript-typescript-resolution.patch.xz
       - test-suite/patches/javascript-reexport-worklist.patch.xz
       - test-suite/patches/javascript-module-suffix-selection.patch
+      - test-suite/patches/javascript-commonjs-source.patch.xz
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -96,6 +97,24 @@ jobs:
           PY
           git apply --check test-suite/patches/javascript-module-suffix-selection.patch
           git apply test-suite/patches/javascript-module-suffix-selection.patch
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          import subprocess
+          from pathlib import Path
+          patch = lzma.decompress(Path('test-suite/patches/javascript-commonjs-source.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == '9a558d4af43b500234f02355f75a34351edd3907a371120cce0638b862e49bd9'
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          expected = {
+              'modules/helpers/ubs_core/analyzers/taint_js.py': '885560a5d2ae48269851932128b585b059f7cced',
+              'modules/helpers/ubs_core/js_modules.py': '4eebcd7e61ca3bb36cf4080d591ad6eb73c7db4f',
+              'test-suite/quality/test_taint_js_commonjs.py': '7c3798d755ef87f7198fb5987cfe05cbd63c009b',
+              'test-suite/quality/test_taint_js_modules.py': '4ab280d9f0cbbda694c93cf8e3fac45b0e857d45',
+          }
+          for name, sha in expected.items():
+              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
+          PY
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
@@ -113,7 +132,7 @@ jobs:
           python3 - <<'PY'
           import importlib.util
           import unittest
-          for path in ('test-suite/quality/test_taint_js_modules.py', 'test-suite/quality/test_taint_js_heap.py'):
+          for path in ('test-suite/quality/test_taint_js_modules.py', 'test-suite/quality/test_taint_js_commonjs.py', 'test-suite/quality/test_taint_js_heap.py'):
               spec = importlib.util.spec_from_file_location('regressions', path)
               module = importlib.util.module_from_spec(spec)
               spec.loader.exec_module(module)
@@ -138,7 +157,8 @@ jobs:
           import subprocess
           import tarfile
           from pathlib import Path
-          new = {'modules/helpers/ubs_core/js_modules.py', 'test-suite/quality/test_taint_js_modules.py'}
+          new = {'modules/helpers/ubs_core/js_modules.py', 'test-suite/quality/test_taint_js_modules.py',
+                 'test-suite/quality/test_taint_js_commonjs.py'}
           def changed_names():
               return sorted(set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | new)
           changed = changed_names()
@@ -172,5 +192,6 @@ jobs:
           path: |
             ${{ runner.temp }}/js-modules-verified*
             test-suite/artifacts/javascript-modules/
+            test-suite/artifacts/javascript-commonjs/
             test-suite/artifacts/javascript-heap/
           retention-days: 3

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repository-local UBS scan service. Never imports or executes project code.
+"""Repository-local UBS scan service backed by the ordinary scanner.
 
 The existing scanner is the source of truth. Cache hits require matching
 repository/runtime bytes and invocation environment; misses run the normal CLI.
@@ -161,22 +161,36 @@ def validate_request_id(value) -> str:
 
 
 def validate_scan(root: Path, request: dict) -> tuple[list[Path], list[str]]:
-    allowed = {'protocol', 'op', 'root', 'environment', 'scanner', 'paths', 'format', 'profile', 'fail_on_warning', 'request_id'}
+    allowed = {'protocol', 'op', 'root', 'environment', 'scanner', 'paths', 'format', 'profile',
+               'fail_on_warning', 'request_id', 'selection'}
     if set(request) - allowed:
         raise ServiceError('Unknown scan request fields')
     if 'request_id' in request:
         validate_request_id(request['request_id'])
+    selection = request.get('selection', 'files')
+    if not isinstance(selection, str) or selection not in {'files', 'directory', 'staged', 'diff'}:
+        raise ServiceError('Unknown source selection')
     paths = request.get('paths')
-    if not isinstance(paths, list) or not 1 <= len(paths) <= 256:
+    if not isinstance(paths, list):
+        raise ServiceError('Source paths must be a list')
+    if selection == 'files' and not 1 <= len(paths) <= 256:
         raise ServiceError('A scan requires 1 to 256 explicit source files')
+    if selection == 'directory' and len(paths) != 1:
+        raise ServiceError('A directory scan requires exactly one directory')
+    if selection in {'staged', 'diff'} and paths:
+        raise ServiceError('Git selection cannot be combined with explicit paths')
     selected = []
     for name in paths:
         if not isinstance(name, str) or not name or '\x00' in name:
             raise ServiceError('Invalid source path')
         path = (root / name).resolve(strict=True)
-        if not path.is_relative_to(root) or not path.is_file():
-            raise ServiceError(f'Source file is outside the served repository or is not regular: {name}')
-        if not stat.S_ISREG(path.stat().st_mode):
+        if not path.is_relative_to(root):
+            raise ServiceError(f'Source is outside the served repository: {name}')
+        mode = path.stat().st_mode
+        if selection == 'directory':
+            if not stat.S_ISDIR(mode):
+                raise ServiceError(f'Source is not a directory: {name}')
+        elif not stat.S_ISREG(mode):
             raise ServiceError(f'Source is not a regular file: {name}')
         if path not in selected:
             selected.append(path)
@@ -192,6 +206,23 @@ def validate_scan(root: Path, request: dict) -> tuple[list[Path], list[str]]:
         options.append('--profile=' + profile)
     if warnings:
         options.append('--fail-on-warning')
+    if selection in {'staged', 'diff'}:
+        # The runner owns Git file selection, including index contents and
+        # ignore policy. Never replace --staged with worktree filenames. It
+        # may promote a subdirectory to the Git root, so refuse such a scope
+        # rather than silently scanning outside the served repository.
+        try:
+            git = subprocess.run(['git', '-C', str(root), 'rev-parse', '--show-toplevel'],
+                                 capture_output=True, timeout=IO_TIMEOUT, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise ServiceError('Git repository discovery timed out') from exc
+        if git.returncode or not git.stdout.endswith(b'\n'):
+            raise ServiceError('Git selection requires a Git worktree root')
+        git_root = Path(os.fsdecode(git.stdout[:-1])).resolve(strict=True)
+        if git_root != root:
+            raise ServiceError('Git selection requires --repo to be the Git worktree root')
+        selected = [root]
+        options.append('--' + selection)
     return selected, options
 
 
@@ -427,8 +458,14 @@ class ScanService:
         # Its external environment/advisory database is not a source snapshot;
         # reuse only when callers explicitly disable those optional tools.
         live_audit = request.get('format', 'json') == 'text' and os.environ.get('ENABLE_UV_TOOLS') != '0' \
-            and any(path.suffix.lower() in {'.py', '.pyi', '.pyw', '.ipynb'} for path in paths)
-        before = snapshot(self.root, self.scanner, cancel=cancellation) if self.cache_bytes and not live_audit else None
+            and any(path.is_dir() or path.suffix.lower() in {'.py', '.pyi', '.pyw', '.ipynb'} for path in paths)
+        # Project scans can run optional tools/build phases; Git selection
+        # also depends on objects/metadata outside snapshot(). Those results
+        # are not source-only. Keep the scanner's own incremental cache, but
+        # do not reuse whole reports or silently disable the caller's tools.
+        source_only = request.get('selection', 'files') == 'files'
+        reuse = self.cache_bytes and not live_audit and source_only
+        before = snapshot(self.root, self.scanner, cancel=cancellation) if reuse else None
         check_cancelled(cancellation)
         key = (tuple(map(str, paths)), tuple(options), before)
         with self._cache_lock:
@@ -753,7 +790,7 @@ def request_service(root: Path, request: dict, timeout: float) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=('serve', 'client', 'status', 'stop', 'cancel'))
-    parser.add_argument('files', nargs='*', help='source files relative to --repo')
+    parser.add_argument('files', nargs='*', help='source files or one directory relative to --repo')
     parser.add_argument('--repo', default='.', help='repository root (default: current directory)')
     parser.add_argument('--scanner', default=str(Path(__file__).resolve().with_name('ubs')))
     parser.add_argument('--format', default='json', choices=sorted(FORMATS))
@@ -765,6 +802,9 @@ def main(argv=None) -> int:
     parser.add_argument('--cache-mib', type=int, default=32, help='bounded report cache; 0 disables reuse')
     parser.add_argument('--jobs', type=int, default=1, help='concurrent scanner processes for serve (1 to 8)')
     parser.add_argument('--request-id', help='name a client request or identify one to cancel')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--staged', action='store_true', help='scan Git index contents, not worktree copies')
+    selection.add_argument('--diff', action='store_true', help='scan worktree changes using the normal runner')
     args = parser.parse_intermixed_args(argv)
     try:
         if os.name != 'posix' or fcntl is None:
@@ -780,7 +820,7 @@ def main(argv=None) -> int:
         if args.command == 'cancel' and args.request_id is None:
             raise ServiceError('cancel requires --request-id')
         if args.command != 'client' and (args.profile is not None or args.fail_on_warning
-                                         or args.require_daemon or args.format != 'json'):
+                                         or args.require_daemon or args.format != 'json' or args.staged or args.diff):
             raise ServiceError('Scan policy and report options apply to client requests, not service lifecycle commands')
         root = Path(args.repo).resolve(strict=True)
         scanner = Path(args.scanner).resolve(strict=True)
@@ -800,6 +840,10 @@ def main(argv=None) -> int:
         if args.command == 'client':
             request.update(paths=args.files, format=args.format, profile=args.profile, fail_on_warning=args.fail_on_warning,
                            environment=environment_key(), scanner=str(scanner))
+            if args.staged or args.diff:
+                request['selection'] = 'staged' if args.staged else 'diff'
+            elif len(args.files) == 1 and (root / args.files[0]).is_dir():
+                request['selection'] = 'directory'
             paths, options = validate_scan(root, request)
         elif args.files:
             raise ServiceError('Lifecycle commands do not accept source files')

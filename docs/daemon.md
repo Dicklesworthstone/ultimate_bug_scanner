@@ -16,9 +16,9 @@ analysis are not implemented yet.
 `client` prints the scanner's original stdout/stderr and returns its exit status.
 Its default format is JSON. Text, JSONL and SARIF are also supported, together
 with `--profile=strict|loose` and `--fail-on-warning`. Relative source names are
-resolved against `--repo`; use `--` before names starting with a dash. Only
-explicit regular files inside the repository are accepted. Directory, staged,
-diff, custom-rule and baseline requests still use the normal `ubs` command.
+resolved against `--repo`; use `--` before names starting with a dash. Select
+explicit regular files, one directory, or a Git-scoped scan as described below.
+Custom-rule and baseline requests still use the normal `ubs` command.
 
 A missing daemon or a different invocation environment/scanner falls back to an
 ordinary scan. `--require-daemon` disables that fallback. Authentication, protocol
@@ -32,7 +32,7 @@ getpeereid); there is no TCP listener. A per-repository lock prevents stealing a
 live socket, and replacing the served root invalidates service. The server
 exits after 900 idle seconds by default (`--idle-timeout`).
 
-Reports are retained in a bounded in-memory LRU (32 MiB by default,
+Eligible explicit-file reports are retained in a bounded in-memory LRU (32 MiB by default,
 `--cache-mib=0` disables it). Reuse requires matching source selection, policy,
 format, environment, and a fresh byte snapshot of the repository and adjacent
 runtime modules. Global Git configuration and ordinary tool executable updates
@@ -58,6 +58,43 @@ and analysis state warm and adding filesystem watchers remain K4 work. Scanner
 wall time is bounded (`--scan-timeout`, default 120 seconds); outputs are capped
 at 8 MiB per stream and timeout/overflow yields an environment error, not a
 truncated clean report. Requests and retained report memory are also bounded.
+
+## Project, directory and Git-scoped scans
+
+```bash
+./ubs-daemon client --repo /path/to/project .
+./ubs-daemon client --repo /path/to/project src/
+./ubs-daemon client --repo /path/to/project --staged --fail-on-warning
+./ubs-daemon client --repo /path/to/project --diff
+```
+
+The service forwards a directory or `--staged` / `--diff` to the ordinary
+scanner; it does not construct a competing file list, copy worktree files over
+index contents, or implement its own ignore/language policy. Staged scans use
+the scanner's index semantics, and diff scans use its working-tree semantics.
+All existing format/profile/failure-policy options, cancellation, admission
+limits and missing-daemon fallback apply. A no-target result keeps exit 3.
+
+A directory request accepts exactly one existing directory within `--repo`.
+Mixed files/directories and escaping symlinks are rejected. Git requests take
+no positional paths and require `--repo` to equal the Git worktree root; a
+served subdirectory cannot silently expand to its parent repository. Linked
+worktrees are supported. Without paths or a Git-selection flag, the client
+still errors rather than accidentally scanning an entire project.
+
+Directory and Git-scoped requests always invoke the scanner. They do not reuse
+whole reports: project-level optional tools/build phases and Git object state
+can depend on inputs outside the explicit-file report cache's snapshot. The
+scanner's own incremental cache remains available. The frontend does not
+silently disable optional analysis or builds; directory scans inherit the
+ordinary scanner's tool execution, including Rust build phases when enabled.
+Use the scanner's documented environment controls identically for server and
+client when intentionally selecting static-only analysis.
+
+Protocol clients opt in with `selection: "directory"` and one directory in
+`paths`, or `selection: "staged"|"diff"` and `paths: []`. Omitting `selection`
+retains the explicit-files-only protocol. Older servers reject these new fields
+as errors; that rejection is not permission to run a fallback scanner.
 
 ## Parallel requests, backpressure and shutdown
 

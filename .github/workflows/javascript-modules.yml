@@ -10,6 +10,7 @@ on:
       - test-suite/patches/javascript-reexport-worklist.patch.xz
       - test-suite/patches/javascript-module-suffix-selection.patch
       - test-suite/patches/javascript-commonjs-source.patch.xz
+      - test-suite/patches/javascript-commonjs-shared-state.patch.xz
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -111,6 +112,17 @@ jobs:
               'modules/helpers/ubs_core/js_modules.py': '4eebcd7e61ca3bb36cf4080d591ad6eb73c7db4f',
               'test-suite/quality/test_taint_js_commonjs.py': '7c3798d755ef87f7198fb5987cfe05cbd63c009b',
               'test-suite/quality/test_taint_js_modules.py': '4ab280d9f0cbbda694c93cf8e3fac45b0e857d45',
+          }
+          for name, sha in expected.items():
+              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
+          patch = lzma.decompress(Path('test-suite/patches/javascript-commonjs-shared-state.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == '0390c13c86c0d59584d5b7a5c6b770cf888aaead8d373d04f80017836f78d62c'
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          expected = {
+              'modules/helpers/ubs_core/analyzers/taint_js.py': '5525652afa50a614924da9e2e9a967ec4309d91c',
+              'modules/helpers/ubs_core/js_modules.py': '9d5d0365db90fcd55dc25bc7031f33eec3b98b74',
+              'test-suite/quality/test_taint_js_commonjs.py': '324deb34ea720cecb3f3735157de0a35bb9f9d60',
           }
           for name, sha in expected.items():
               assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name

@@ -4,120 +4,180 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/javascript-call-completions.patch
-      - test-suite/patches/javascript-call-evaluation.patch
+      - modules/helpers/ubs_core/analyzers/taint_js.py
       - test-suite/js/test_taint_call_completions.py
+      - test-suite/patches/javascript-call-completions.patch.xz
       - .github/workflows/javascript-call-completions.yml
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   completion-regressions:
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Retain exact source identities
-        run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/js-completion-source-head.txt"
-          git ls-files -s > "$RUNNER_TEMP/js-completion-source-index.txt"
-          git archive --format=tar.gz --output="$RUNNER_TEMP/js-completion-source.tar.gz" HEAD
-      - uses: actions/upload-artifact@v4
-        with:
-          name: js-completion-source
-          path: ${{ runner.temp }}/js-completion-source*
-          retention-days: 3
+          fetch-depth: 50
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
-      - name: Apply incremental completion and evaluation semantics
-        run: |
-          source=modules/helpers/ubs_core/analyzers/taint_js.py
-          if test "$(git hash-object "$source")" = 38a50392b5540131d25ade30664b883ec28b4005; then
-            git apply --check test-suite/patches/javascript-captured-writes.patch
-            git apply test-suite/patches/javascript-captured-writes.patch
-          fi
-          test "$(git hash-object "$source")" = 477c8ac86895e19afdf6dacc96834c93cb90b736
-          if python3 test-suite/js/test_taint_call_completions.py > "$RUNNER_TEMP/js-completion-before.log" 2>&1; then
-            cat "$RUNNER_TEMP/js-completion-before.log"
-            exit 1
-          fi
-          cat "$RUNNER_TEMP/js-completion-before.log"
-          grep -q 'FAILED (failures=14, errors=1, skipped=1)' "$RUNNER_TEMP/js-completion-before.log"
-          git apply --check test-suite/patches/javascript-call-completions.patch
-          git apply test-suite/patches/javascript-call-completions.patch
-          test "$(git hash-object "$source")" = 5b63ffeb31da94c9aa7088078e51be1b78cfd31e
-          git apply --check test-suite/patches/javascript-call-evaluation.patch
-          git apply test-suite/patches/javascript-call-evaluation.patch
-          test "$(git hash-object "$source")" = bada5e2788a5f2145a2b2ee1ee5054f49b28b4f2
-          test "$(git hash-object test-suite/js/test_taint_call_completions.py)" = 1730232cc887ff6432cf2c5ee637870973ac19e1
-          python3 -m unittest discover -s test-suite/js -p 'test_taint*.py' -v
-          python3 scripts/update_checksums.py
-          ./scripts/update_sha256sums.sh
-          git diff --check
-      - name: Install real scanner dependencies
-        run: |
-          brew install bash jq ripgrep shellcheck
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
-          npm install --global @ast-grep/cli
-      - name: Validate actual scanner and existing JavaScript quality gates
-        run: |
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
-          UBS_TAINT_E2E=1 python3 test-suite/js/test_taint_call_completions.py
-      - name: Publish verified immutable blobs without changing any ref
+          python-version: '3.13'
+      - name: Restore only the verified module baseline when not yet active
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           python3 - <<'PY'
           import hashlib
+          import io
           import json
           import os
-          import subprocess
           from pathlib import Path
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_js.py', 'test-suite/js/test_taint_call_completions.py'}
+          import subprocess
+          import tarfile
+          import urllib.request
+          import zipfile
+          current = subprocess.check_output(['git', 'hash-object', 'modules/helpers/ubs_core/analyzers/taint_js.py'], text=True).strip()
+          if current == '5525652afa50a614924da9e2e9a967ec4309d91c':
+              raise SystemExit(0)
+          assert current == 'c924bd3b74664208b056eb27be867c5ef70a7ad4', current
+          # Do not replace any newer runtime work with a historical artifact.
+          baseline = 'db052f997074c1ea7d693a33aa8e9d9e68a9645b'
+          class NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, url):
+                  request = super().redirect_request(req, fp, code, msg, headers, url)
+                  if request is not None:
+                      request.remove_header('Authorization')
+                  return request
+          opener = urllib.request.build_opener(NoCredentialRedirect())
+          def get(path):
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + path,
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+              with opener.open(request, timeout=90) as response:
+                  return response.read()
+          run = json.loads(get('/actions/runs/36295950465'))
+          assert run['conclusion'] == 'success' and run['head_sha'] == baseline
+          data = get('/actions/artifacts/10924862205/zip')
+          assert hashlib.sha256(data).hexdigest() == '1f740a5c4b9e7c1e619593bf025bf22c5510aef38f1ebfe8d2757c3b4c87f851'
+          bundle = zipfile.ZipFile(io.BytesIO(data))
+          manifest = json.loads(bundle.read('_temp/js-modules-verified.json'))
+          names = [entry['path'] for entry in manifest]
+          assert len(names) == len(set(names)) == 24
+          subprocess.run(['git', 'diff', '--exit-code', baseline, '--', *names], check=True)
+          archive = tarfile.open(fileobj=io.BytesIO(bundle.read('_temp/js-modules-verified.tar.gz')))
+          assert {member.name for member in archive.getmembers()} == set(names)
+          for entry in manifest:
+              member = archive.getmember(entry['path'])
+              assert member.isfile() and member.size < 2_000_000
+              name = Path(member.name)
+              assert not name.is_absolute() and '..' not in name.parts
+              data = archive.extractfile(member).read()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == entry['sha']
+              name.parent.mkdir(parents=True, exist_ok=True)
+              name.write_bytes(data)
+              name.chmod(0o755 if entry['mode'] == '100755' else 0o644)
+          print('JS_COMPLETION_BASE', baseline, flush=True)
+          PY
+      - name: Apply exact reviewed call-completion implementation
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          from pathlib import Path
+          import subprocess
+          assert subprocess.check_output(['git','hash-object','modules/helpers/ubs_core/analyzers/taint_js.py'],text=True).strip() == '5525652afa50a614924da9e2e9a967ec4309d91c'
+          patch = lzma.decompress(Path('test-suite/patches/javascript-call-completions.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == 'e419cd68a9e7dccf3a8aaf591ab1cb6d98aadfb7d7ce9e969bcecc339afc712f'
+          subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+          subprocess.run(['git','apply','-'],input=patch,check=True)
+          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py':'b898a38c2a212a94ce1312ed637dba49655605ed',
+                      'test-suite/js/test_taint_call_completions.py':'70192b8bd8513e4da9ef3f14b7324ebb75d7e6b4'}
+          for name, sha in expected.items():
+              assert subprocess.check_output(['git','hash-object',name],text=True).strip() == sha, name
+          PY
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Install native scanner and independent language controls
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Test call completions, cross-file flows, and heap mutation without skips
+        run: |
+          command -v ast-grep
+          command -v node
+          command -v tsc
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          for path in ('test-suite/js/test_taint_call_completions.py',
+                       'test-suite/quality/test_taint_js_modules.py',
+                       'test-suite/quality/test_taint_js_commonjs.py',
+                       'test-suite/quality/test_taint_js_heap.py'):
+              spec = importlib.util.spec_from_file_location('regressions',path)
+              module = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+              assert result.wasSuccessful() and not result.skipped, (path,result.failures,result.errors,result.skipped)
+              print('JS_COMPLETION_TEST_PASS',path,result.testsRun,flush=True)
+          PY
+          python3 test-suite/js/test_taint_domains.py
+          python3 test-suite/js/test_taint_scopes.py
+          python3 test-suite/js/test_taint_effects.py
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Retain exact verified runtime and integrity closure
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          new = {'modules/helpers/ubs_core/js_modules.py', 'test-suite/quality/test_taint_js_modules.py', 'test-suite/quality/test_taint_js_commonjs.py'}
+          allowed = {'ubs','SHA256SUMS','modules/contract.json','modules/lib/ubs-common.sh','scripts/new-module.sh',
+                     'modules/helpers/type_narrowing_ts.js','modules/helpers/ubs_core/analyzers/taint_js.py',
+                     'modules/helpers/ubs_core/cli.py','modules/helpers/ubs_core/js_scan.py','test-suite/js/test_taint_call_completions.py'} | new
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          def changed_names():
+              return sorted(set(subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()) | new)
+          changed = changed_names()
           assert set(changed) <= allowed, changed
-          before = {path: Path(path).read_bytes() for path in changed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
-          subprocess.run(['./scripts/update_sha256sums.sh'], check=True)
-          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          assert all(Path(path).read_bytes() == content for path, content in before.items())
-          subprocess.run(['git', 'diff', '--check'], check=True)
-          files = []
-          for path in changed:
-              content = Path(path).read_bytes()
-              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                                        input=json.dumps({'content': content.decode('utf-8'), 'encoding': 'utf-8'}),
-                                        text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(response.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
-              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', path], text=True).split()[0]
-              files.append({'path': path, 'sha': sha, 'mode': mode, 'type': 'blob'})
-              print('JS_COMPLETION_BLOB', path, sha, mode, flush=True)
-          result = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': files}
-          Path(os.environ['RUNNER_TEMP'], 'js-completion-validated.json').write_text(json.dumps(result, indent=2))
+          before = {name:Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3','scripts/update_checksums.py'],check=True)
+          assert changed == changed_names()
+          assert all(Path(name).read_bytes() == data for name,data in before.items())
+          for command in (['./scripts/verify_checksums.sh'],['./scripts/verify_sha256sums.sh'],['git','diff','--check']):
+              subprocess.run(command,check=True)
+          manifest = []
+          with tarfile.open(Path(os.environ['RUNNER_TEMP'],'js-completion-verified.tar.gz'),'w:gz') as archive:
+              for name,data in before.items():
+                  sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+                  mode = '100755' if Path(name).stat().st_mode & 0o111 else '100644'
+                  manifest.append({'path':name,'sha':sha,'mode':mode})
+                  archive.add(name,arcname=name)
+          Path(os.environ['RUNNER_TEMP'],'js-completion-verified.json').write_text(json.dumps(manifest,indent=2))
+          print('JS_COMPLETION_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip())
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: javascript-call-completions
+          name: javascript-call-completion-validation
           path: |
-            ${{ runner.temp }}/js-completion-*.log
-            ${{ runner.temp }}/js-completion-validated.json
-            test-suite/artifacts/javascript-call-completions/
+            ${{ runner.temp }}/js-completion-verified*
+            test-suite/artifacts/javascript-completions/
+            test-suite/artifacts/javascript-modules/
+            test-suite/artifacts/javascript-heap/
           retention-days: 3

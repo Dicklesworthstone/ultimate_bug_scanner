@@ -1,0 +1,86 @@
+name: JavaScript Module Activation Objects
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/javascript-module-activation.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verified-objects:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Transfer previously validated immutable objects without changing refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import io
+          import json
+          import os
+          import tarfile
+          import urllib.request
+          import zipfile
+          repo = os.environ['GH_REPO']
+          assert repo == 'Dicklesworthstone/ultimate_bug_scanner'
+          base = 'https://api.github.com/repos/' + repo
+          token = os.environ['GH_TOKEN']
+          def api(path, payload=None):
+              headers = {'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json'}
+              data = None if payload is None else json.dumps(payload).encode()
+              if data is not None:
+                  headers['Content-Type'] = 'application/json'
+              request = urllib.request.Request(base + path, data=data, headers=headers)
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  return response.read()
+          run = json.loads(api('/actions/runs/36295950465'))
+          assert run['conclusion'] == 'success'
+          assert run['head_sha'] == 'db052f997074c1ea7d693a33aa8e9d9e68a9645b'
+          artifact = json.loads(api('/actions/artifacts/10924862205'))
+          assert artifact['workflow_run']['id'] == run['id']
+          assert not artifact['expired']
+          archive = api('/actions/artifacts/10924862205/zip')
+          assert hashlib.sha256(archive).hexdigest() == '1f740a5c4b9e7c1e619593bf025bf22c5510aef38f1ebfe8d2757c3b4c87f851'
+          bundle = zipfile.ZipFile(io.BytesIO(archive))
+          manifest = json.loads(bundle.read('_temp/js-modules-verified.json'))
+          expected = {
+              'SHA256SUMS', 'modules/contract.json', 'modules/helpers/type_narrowing_ts.js',
+              'modules/helpers/ubs_core/analyzers/taint_js.py', 'modules/helpers/ubs_core/cli.py',
+              'modules/helpers/ubs_core/js_modules.py', 'modules/helpers/ubs_core/js_scan.py',
+              'modules/lib/ubs-common.sh', 'scripts/new-module.sh', 'ubs',
+              'test-suite/quality/test_taint_js_commonjs.py', 'test-suite/quality/test_taint_js_modules.py',
+          }
+          expected.update('modules/ubs-' + lang + '.sh' for lang in
+                          ('bash', 'cpp', 'csharp', 'elixir', 'golang', 'java', 'js', 'kotlin', 'python', 'ruby', 'rust', 'swift'))
+          assert len(manifest) == 24 and {e['path'] for e in manifest} == expected
+          tar = tarfile.open(fileobj=io.BytesIO(bundle.read('_temp/js-modules-verified.tar.gz')))
+          members = tar.getmembers()
+          assert len(members) == len(expected) and {m.name for m in members} == expected
+          contents = {}
+          for entry in manifest:
+              member = tar.getmember(entry['path'])
+              assert member.isfile() and 0 <= member.size < 2_000_000
+              assert entry['mode'] in ('100644', '100755')
+              assert bool(member.mode & 0o111) == (entry['mode'] == '100755')
+              data = tar.extractfile(member).read()
+              sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              assert sha == entry['sha'], entry['path']
+              contents[entry['path']] = data
+          for entry in manifest:
+              data = contents[entry['path']]
+              result = json.loads(api('/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')}))
+              assert result['sha'] == entry['sha'], entry['path']
+              print('JS_ACTIVATION_OBJECT', entry['path'], entry['sha'], entry['mode'], flush=True)
+          print('JS_ACTIVATION_VERIFIED', run['head_sha'], len(manifest), flush=True)
+          PY

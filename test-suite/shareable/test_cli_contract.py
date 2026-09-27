@@ -152,6 +152,47 @@ def check_rules_dir_custom_rule_in_sarif() -> None:
         report("rules_dir_custom_rule_in_sarif", "custom.no-console" in rule_ids, f"exit={proc.returncode} rule_ids={sorted(rule_ids)[:6]}", proc)
 
 
+def check_rules_dir_nested_and_yaml_rules_are_loaded() -> None:
+    # GH #144: the runner validated rules recursively, but modules that load
+    # only the top level (and some only *.yml) dropped nested rules silently.
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        rules = root / "rules"
+        (rules / "python").mkdir(parents=True)
+        (rules / "python" / "no-raw-get.yml").write_text(
+            "id: custom.no-raw-get\nlanguage: python\nseverity: error\n"
+            "message: use the retrying client\nrule:\n  pattern: requests.get($$$)\n",
+            encoding="utf-8",
+        )
+        (rules / "python" / "http").mkdir()
+        (rules / "python" / "http" / "no-raw-post.yaml").write_text(
+            "id: custom.no-raw-post\nlanguage: python\nseverity: error\n"
+            "message: use the retrying client\nrule:\n  pattern: requests.post($$$)\n",
+            encoding="utf-8",
+        )
+        # A hidden directory in a rules checkout is not a rule source.
+        (rules / ".github").mkdir()
+        (rules / ".github" / "ci.yml").write_text("on: push\n", encoding="utf-8")
+        project = root / "proj"
+        project.mkdir()
+        (project / "app.py").write_text(
+            'import requests\nrequests.get("https://example.invalid")\nrequests.post("https://example.invalid")\n',
+            encoding="utf-8")
+        wanted = {"custom.no-raw-get", "custom.no-raw-post"}
+        proc = run(["--only=python", "--ci", "--no-cache", "--format=json", f"--rules={rules}", str(project)],
+                   env={"UBS_NO_CACHE": "1"})
+        try:
+            doc = json.loads(proc.stdout)
+            found = {f.get("rule_id", "") for f in doc.get("findings", [])} & wanted
+            status = doc.get("status")
+        except json.JSONDecodeError as exc:
+            found, status = set(), None
+            proc.stderr += f"\n[test] {exc}"
+        ok = found == wanted and status == "ok"
+        report("rules_dir_nested_and_yaml_rules_are_loaded", ok,
+               f"exit={proc.returncode} status={status} found={sorted(found)}", proc)
+
+
 def check_include_ext_forwarded() -> None:
     with tempfile.TemporaryDirectory(prefix="ubs-ext-") as tmp:
         proj = Path(tmp) / "proj"
@@ -2207,6 +2248,7 @@ def main() -> int:
         check_output_file_positional,
         check_output_flag_json,
         check_rules_dir_custom_rule_in_sarif,
+        check_rules_dir_nested_and_yaml_rules_are_loaded,
         check_include_ext_forwarded,
         check_list_categories,
         check_env_skip_type_narrowing,

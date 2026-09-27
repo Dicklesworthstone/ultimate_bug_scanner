@@ -1212,9 +1212,15 @@ id: custom.no-direct-state-mutation
 language: typescript
 rule:
   pattern: this.state.$FIELD = $VALUE
-severity: critical
+severity: error
 message: "Never mutate state directly - use setState()"
 ```
+
+`severity` takes ast-grep's levels (`error`, `warning`, `info`, `hint`); UBS reports
+`error` as critical. `critical` is not an ast-grep level, so ast-grep refuses to parse
+the rule and the scan ends as partial (exit 2). Rules may sit in subdirectories of the
+`--rules` directory, as `.yml` or `.yaml`; hidden directories such as `.github/` are
+skipped.
 
 ### **Excluding False Positives**
 

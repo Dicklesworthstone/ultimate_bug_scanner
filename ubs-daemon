@@ -844,54 +844,152 @@ def validate_scan_response(response: dict) -> None:
         raise ServiceError('Invalid scanner output streams')
 
 
-def watch_inputs(root: Path, names: list[str]) -> tuple[str, list[str]]:
-    """Byte-hash explicitly watched files; missing/unsafe states are never clean.
+def watch_inputs(root: Path, names: list[str], *, dependencies: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+    """Observe source files plus optional dependency trees without changing scan scope.
 
-    This is an edit trigger, not permission to reuse scanner results. Include
-    inode/ctime as well as bytes to catch atomic saves and an edit restored
-    between observations. Inputs outside this list are not watched.
+    Source paths must stay regular files. Dependency paths may be absent or
+    directories: additions, removals and policy-file creation are edit triggers.
+    Walk every entry, including ignored/hidden files; only the scanner decides
+    what to analyze. Bounds or unsafe entries invalidate the entire observation.
+    File opens are anchored to the repository descriptor, not a path checked
+    before opening. A final metadata pass detects edits during the traversal.
+    This observation is never permission to reuse a scanner result.
     """
     digest = hashlib.sha256()
     errors = []
     total = 0
-    for name in names:
-        path = root / name
-        digest.update(os.fsencode(name) + b'\0')
+    pending = []
+    checked = []
+    missing = []
+    seen = set()
+    entries = 0
+
+    def stamp(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def invalid(path, exc):
+        message = f'{path}: {exc}'
+        errors.append(message)
+        digest.update(b'error\0' + message.encode('utf-8', 'replace'))
+
+    for values, recursive in ((names, False), (dependencies, True)):
+        if len(values) > 256:
+            raise ServiceError('At most 256 source paths and 256 watch inputs are permitted')
+        for name in values:
+            if not isinstance(name, str) or not name or '\x00' in name:
+                raise ServiceError('Invalid watch input path')
+            digest.update(('dependency\0' if recursive else 'source\0').encode() + os.fsencode(name) + b'\0')
+            pending.append((root / name, recursive, recursive))
+    pending.reverse()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(root, directory_flags)
+    except OSError as exc:
+        invalid(root, exc)
+        return 'sha256:' + digest.hexdigest(), errors
+
+    def open_inside(resolved):
+        # Resolve symlinks first, then walk the canonical components using
+        # O_NOFOLLOW at EVERY level. A swapped parent cannot redirect reads.
+        parts = resolved.relative_to(root).parts
+        descriptor = os.dup(root_fd)
         try:
-            resolved = path.resolve(strict=True)
-            if not resolved.is_relative_to(root):
-                raise ServiceError('watched path is outside the served repository')
-            digest.update(os.fsencode(str(resolved)) + b'\0')
-            # Nonblocking prevents a file changed to a FIFO from hanging the
-            # watch loop. Verify the opened descriptor, not an earlier stat.
-            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, 'O_NOFOLLOW', 0)
-            descriptor = os.open(resolved, flags)
-            with os.fdopen(descriptor, 'rb') as stream:
-                before = os.fstat(stream.fileno())
-                stamp = (before.st_dev, before.st_ino, before.st_mode, before.st_size,
-                         before.st_mtime_ns, before.st_ctime_ns)
-                digest.update(repr(stamp).encode() + b'\0')
-                if not stat.S_ISREG(before.st_mode):
-                    raise ServiceError('watched source is not a regular file')
-                if before.st_size > MAX_SNAPSHOT - total:
-                    raise ServiceError('watched sources exceed the byte limit')
-                while chunk := stream.read(65536):
-                    total += len(chunk)
-                    if total > MAX_SNAPSHOT:
-                        raise ServiceError('watched sources exceed the byte limit')
-                    digest.update(chunk)
-                after = os.fstat(stream.fileno())
-                current = path.stat()
-                if path.resolve(strict=True) != resolved or any(
-                    (item.st_dev, item.st_ino, item.st_mode, item.st_size, item.st_mtime_ns, item.st_ctime_ns) != stamp
-                    for item in (after, current)
-                ):
-                    raise ServiceError('watched source changed while being read')
-        except (OSError, ServiceError, ValueError, RuntimeError) as exc:
-            message = f'{name}: {exc}'
-            errors.append(message)
-            digest.update(b'error\0' + message.encode('utf-8', 'replace'))
-        digest.update(b'\0')
+            for part in parts[:-1]:
+                child = os.open(part, directory_flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            if parts:
+                child = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                                dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            result, descriptor = descriptor, None
+            return result
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    try:
+        root_identity = os.fstat(root_fd)
+        while pending:
+            path, recursive, optional = pending.pop()
+            entries += 1
+            if entries > MAX_SNAPSHOT_ENTRIES:
+                invalid(path, 'watched inputs exceed the entry limit')
+                break
+            digest.update(os.fsencode(str(path)) + b'\0')
+            try:
+                resolved = path.resolve(strict=False)
+                if not resolved.is_relative_to(root):
+                    raise ServiceError('watched path is outside the served repository')
+                digest.update(os.fsencode(str(resolved)) + b'\0')
+                try:
+                    link_stamp = stamp(path.lstat())
+                except FileNotFoundError:
+                    if not optional:
+                        raise
+                    digest.update(b'missing\0')
+                    missing.append((path, resolved))
+                    continue
+                digest.update(repr(link_stamp).encode() + b'\0')
+                descriptor = open_inside(resolved)
+                try:
+                    info = os.fstat(descriptor)
+                    current_stamp = stamp(info)
+                    digest.update(repr(current_stamp).encode() + b'\0')
+                    checked.append((path, resolved, link_stamp, current_stamp))
+                    if not stat.S_ISREG(info.st_mode) and not (recursive and stat.S_ISDIR(info.st_mode)):
+                        raise ServiceError('watched source is not a regular file or permitted directory')
+                    if resolved in seen:
+                        continue
+                    seen.add(resolved)
+                    if stat.S_ISDIR(info.st_mode):
+                        children = []
+                        # scandir yields incrementally. Never allocate an
+                        # unbounded list before applying the inventory budget.
+                        with os.scandir(descriptor) as items:
+                            for item in items:
+                                if entries + len(pending) + len(children) >= MAX_SNAPSHOT_ENTRIES:
+                                    raise ServiceError('watched inputs exceed the entry limit')
+                                children.append(item.name)
+                        pending.extend((path / child, True, False) for child in sorted(children, reverse=True))
+                    else:
+                        if info.st_size > MAX_SNAPSHOT - total:
+                            raise ServiceError('watched sources exceed the byte limit')
+                        while chunk := os.read(descriptor, min(65536, MAX_SNAPSHOT - total + 1)):
+                            total += len(chunk)
+                            if total > MAX_SNAPSHOT:
+                                raise ServiceError('watched sources exceed the byte limit')
+                            digest.update(chunk)
+                    if stamp(os.fstat(descriptor)) != current_stamp:
+                        raise ServiceError('watched input changed while being read')
+                finally:
+                    os.close(descriptor)
+            except (OSError, ServiceError, ValueError, RuntimeError) as exc:
+                invalid(path, exc)
+            digest.update(b'\0')
+        for path, resolved, link_stamp, current_stamp in checked:
+            try:
+                if path.resolve(strict=True) != resolved or stamp(path.lstat()) != link_stamp:
+                    raise ServiceError('watched input changed during observation')
+                descriptor = open_inside(resolved)
+                try:
+                    if stamp(os.fstat(descriptor)) != current_stamp:
+                        raise ServiceError('watched input changed during observation')
+                finally:
+                    os.close(descriptor)
+            except (OSError, ServiceError, ValueError, RuntimeError) as exc:
+                invalid(path, exc)
+        for path, resolved in missing:
+            if path.exists() or path.is_symlink() or path.resolve(strict=False) != resolved:
+                invalid(path, 'watched input appeared during observation')
+        if identity(root) != (root_identity.st_dev, root_identity.st_ino):
+            invalid(root, 'watched repository root changed during observation')
+    except (OSError, ValueError, RuntimeError) as exc:
+        invalid(root, exc)
+    finally:
+        os.close(root_fd)
     return 'sha256:' + digest.hexdigest(), errors
 
 
@@ -908,11 +1006,22 @@ def cancel_watch_request(root: Path, request_id: str) -> bool:
     return True
 
 
-def watch(root: Path, request: dict, timeout: float, interval: float, debounce: float) -> int:
+def watch(root: Path, request: dict, timeout: float, interval: float, debounce: float,
+          *, dependencies: tuple[str, ...] = ()) -> int:
     """Foreground, explicit-file edit feedback; never starts a daemon or falls back."""
     validate_scan(root, request)
     if request.get('selection', 'files') != 'files':
         raise ServiceError('watch requires explicit source files, not directory or Git selection')
+    if len(dependencies) > 256:
+        raise ServiceError('At most 256 watch inputs are permitted')
+    for name in dependencies:
+        if not isinstance(name, str) or not name or '\x00' in name:
+            raise ServiceError('Watch input must be a path inside the served repository')
+        try:
+            if not (root / name).resolve().is_relative_to(root):
+                raise ServiceError('Watch input must be a path inside the served repository')
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ServiceError(f'Cannot resolve watch input: {name}') from exc
     root_identity = identity(root)
     status = request_service(root, {'protocol': PROTOCOL, 'op': 'status', 'root': str(root)}, IO_TIMEOUT)
     if status.get('root') != str(root) or status.get('status') != 'ready':
@@ -929,16 +1038,19 @@ def watch(root: Path, request: dict, timeout: float, interval: float, debounce: 
     settled_at = 0.0
     names = request['paths']
 
+    def observe():
+        return watch_inputs(root, names, dependencies=dependencies) if dependencies else watch_inputs(root, names)
+
     def emit(event, **fields):
         print(json.dumps(dict(schema='ubs.watch/1', event=event, generation=generation,
-                              source_fingerprint=observed, paths=names, **fields),
+                              source_fingerprint=observed, paths=names, watch_inputs=dependencies, **fields),
                          ensure_ascii=True, separators=(',', ':')), flush=True)
 
     try:
         while True:
             if identity(root) != root_identity:
                 raise ServiceError('Watched repository root has been replaced')
-            stamp, errors = watch_inputs(root, names)
+            stamp, errors = observe()
             now = time.monotonic()
             if stamp != observed:
                 observed = stamp
@@ -957,7 +1069,7 @@ def watch(root: Path, request: dict, timeout: float, interval: float, debounce: 
                     # Completion and observation can race. Re-read immediately
                     # before publishing; never attach a prior generation's
                     # report to bytes saved while the exchange was finishing.
-                    final_stamp, errors = watch_inputs(root, names)
+                    final_stamp, errors = observe()
                     if final_stamp != observed:
                         observed = final_stamp
                         generation += 1
@@ -1023,6 +1135,8 @@ def main(argv=None) -> int:
     parser.add_argument('--request-id', help='name a client request or identify one to cancel')
     parser.add_argument('--watch-interval', type=float, default=None, help='watch poll interval in seconds (0.1 to 60)')
     parser.add_argument('--debounce', type=float, default=None, help='watch quiet period in seconds (0 to 60)')
+    parser.add_argument('--watch-input', action='append', default=[], metavar='PATH',
+                        help='also observe a dependency/policy file or tree without adding scan targets (repeatable)')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('--staged', action='store_true', help='scan Git index contents, not worktree copies')
     selection.add_argument('--diff', action='store_true', help='scan worktree changes using the normal runner')
@@ -1040,8 +1154,8 @@ def main(argv=None) -> int:
                 raise ServiceError('--request-id applies only to client and cancel')
         if args.command == 'cancel' and args.request_id is None:
             raise ServiceError('cancel requires --request-id')
-        if args.command != 'watch' and (args.watch_interval is not None or args.debounce is not None):
-            raise ServiceError('--watch-interval and --debounce apply only to watch')
+        if args.command != 'watch' and (args.watch_interval is not None or args.debounce is not None or args.watch_input):
+            raise ServiceError('--watch-interval, --debounce and --watch-input apply only to watch')
         interval = args.watch_interval if args.watch_interval is not None else 0.25
         debounce = args.debounce if args.debounce is not None else 0.3
         if not 0.1 <= interval <= 60 or not 0 <= debounce <= 60:
@@ -1076,7 +1190,7 @@ def main(argv=None) -> int:
                 def stop_watch(_signal, _frame):
                     raise KeyboardInterrupt
                 signal.signal(signal.SIGTERM, stop_watch)
-                return watch(root, request, args.scan_timeout, interval, debounce)
+                return watch(root, request, args.scan_timeout, interval, debounce, dependencies=tuple(args.watch_input))
         elif args.files:
             raise ServiceError('Lifecycle commands do not accept source files')
         try:

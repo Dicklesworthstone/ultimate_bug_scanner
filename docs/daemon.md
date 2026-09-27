@@ -178,7 +178,8 @@ file**. The default polling interval is 0.25 seconds (`--watch-interval`, minimu
 Atomic replacement and same-size edits with restored mtimes trigger another
 generation. Missing, unreadable, oversized, non-regular or escaping files
 produce an `invalid` event with exit code 2, not a clean result. Restoring the
-file resumes scanning. Watched input is bounded to 256 files and 128 MiB.
+file resumes scanning. Watched input is bounded to 256 source files, 256
+additional dependency paths, 20,000 graph entries and 128 MiB of unique contents.
 
 On every observed edit the previous report is invalidated immediately. A
 superseded scan is cancelled using its own unique request id; the watcher never
@@ -202,10 +203,41 @@ silently masks service failures. Directory/Git selection and caller-assigned
 request ids are rejected for watch mode; use `client` for those selections.
 The existing save hook is unchanged.
 
-This is explicit-file polling, not recursive project watching or a warmed
-analysis engine. Unnamed dependencies, configuration, ignore files and tools
-do **not** trigger a new generation; restart the watcher after changing those
-inputs, or include source dependencies in the explicit file set. The underlying
+### Dependency and policy invalidation
+
+Use repeatable `--watch-input=PATH` options to watch dependency files, entire
+dependency trees or policy files **without adding them to the scan targets**:
+
+```bash
+./ubs-daemon watch --repo /path/to/project \
+  --watch-input=lib/ --watch-input=.ubsignore --watch-input=pyproject.toml \
+  src/main.py
+```
+
+A watched dependency path may initially be absent. Its creation, removal or
+recreation triggers a new generation; an absent optional policy is not a source
+error. The explicitly scanned source files still must exist and remain regular
+files. Dependency directories are traversed recursively, including hidden and
+ignored files: the observer does not replace the scanner's selection policy.
+Renames, added directories and same-size edits with restored mtimes are detected.
+Use `--watch-input=.` to observe the whole repository while scanning a fixed file
+set, subject to the same aggregate limits. Large vendor trees may exceed them;
+narrow the watched inputs instead of silently dropping part of the graph.
+
+Internal symlinks are observed as a finite graph; their contents are read once
+per canonical path. Escaping/broken links, special files, read errors or exceeded
+limits invalidate the observation and suspend scans until repaired. Opens are
+anchored to a repository file descriptor with no-follow checks at each component,
+and a final metadata pass detects edits to earlier files during enumeration.
+Every event includes `watch_inputs` separately from the unchanged scan `paths`.
+Dependency-only edits also cancel obsolete requests. A restored exact snapshot
+may reuse a valid report, but it is emitted under the new observation generation.
+
+This remains polling, not a warmed analysis engine. Unnamed dependencies,
+configuration, ignore files and tools do **not** trigger a new generation;
+restart the watcher after changing those inputs or name them explicitly.
+Keep generated reports, cache directories and service sockets outside watched
+trees to avoid self-triggered rescans or special-file errors. The underlying
 scanner still owns dependency analysis and cache validation on every request.
 The source fingerprint is an observation marker, not a certificate that the
 entire repository or external tool environment is unchanged. No edited-file

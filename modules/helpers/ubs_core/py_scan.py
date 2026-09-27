@@ -430,6 +430,8 @@ def run_analyzers(
     skip: set[int] | None = None,
     enable_new: bool = False,
     prefilter: Any = None,
+    taint: bool | None = None,
+    project_dir: str | None = None,
 ) -> None:
     """Run registered python analyzers (taint, lifecycle, guards, ctcompare).
 
@@ -440,15 +442,18 @@ def run_analyzers(
     from ubs_core.registry import analyzers_for_lang
 
     for analyzer in analyzers_for_lang("python"):
+        if taint is not None and (analyzer.name == "taint_py") != taint:
+            continue
         if analyzer.layer == "narrowing" and not enable_new:
             continue
-        if prefilter is not None:
+        if prefilter is not None and analyzer.name != "taint_py":
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:
             target_files = list(files)
         if not target_files:
             continue
-        ctx = RunContext(lang="python", files=target_files)
+        ctx = RunContext(lang="python", files=target_files,
+                         profile={"project_dir": project_dir} if project_dir else {})
         for finding in analyzer.run(ctx):
             if skip and _record_category(finding) in skip:
                 continue
@@ -742,7 +747,8 @@ def main(argv: list[str] | None = None) -> int:
         scan_patterns(patterns, files_to_scan, capturing_sink, skip,
                       prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True)
         run_detectors(files_to_scan, capturing_sink, skip)
-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, taint=False)
         if args.ast_rule_dir:
             from ubs_core.py_ast import scan_all
             from ubs_core.py_rules import CATEGORY_MAP, SEVERITY_MAP
@@ -793,6 +799,15 @@ def main(argv: list[str] | None = None) -> int:
             all_recs.extend(recs)
 
     all_recs = reconcile_pattern_records(patterns, all_recs)
+
+    # Imported helpers can change findings in otherwise unchanged files. Keep
+    # this selected-project pass out of per-file caches and literal prefilters;
+    # all other analyzer layers retain their existing incremental behavior.
+    taint_sink = CapturingSink()
+    run_analyzers(files, taint_sink, skip, taint=True,
+                  project_dir=args.project_dir or args.project or ".")
+    for f in files:
+        all_recs.extend(taint_sink.get_for_file(f))
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for r in all_recs:

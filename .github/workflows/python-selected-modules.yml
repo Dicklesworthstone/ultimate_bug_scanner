@@ -4,13 +4,17 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/python-selected-modules.patch.xz
+      - ubs
+      - modules/ubs-python.sh
+      - modules/lib/ubs-common.sh
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/py_scan.py
+      - test-suite/quality/test_taint_python_*.py
       - .github/workflows/python-selected-modules.yml
   workflow_dispatch:
 
-# Store tested immutable objects only; never write commits, branches or tags.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -33,46 +37,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck python3-yaml python3-jsonschema
           npm install --global @ast-grep/cli
-      - name: Apply the reviewed selected-module implementation
+      - name: Verify committed runtime integrity
         run: |
-          python3 - <<'PY'
-          import gzip
-          import hashlib
-          import lzma
-          from pathlib import Path
-          import subprocess
-          def identity(name):
-              return subprocess.check_output(['git', 'hash-object', name], text=True).strip()
-          before = {
-              'modules/helpers/ubs_core/analyzers/taint_py.py': 'bb2199a28ccc526160ec11d185288a154bfa3530',
-              'modules/helpers/ubs_core/py_scan.py': '04ccb7b815507b5eabba46890d4d76b26e59346f',
-          }
-          for name, expected in before.items():
-              assert identity(name) == expected, (name, identity(name), expected)
-          patch = lzma.decompress(Path('test-suite/patches/python-selected-modules.patch.xz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == '888cf6c9aa86d4aeae5de02ea057efb287aadccef98ee51741429807a07d36fe'
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          # These 62 existing completion controls were used in the preceding
-          # runtime validation but omitted from its published test inventory.
-          # Restore only that test file, never superseded analyzer source.
-          name = 'test-suite/patches/python-integrated-completions.patch.gz'
-          assert identity(name) == '93ead362ae3691c9259eae6342377241dc554683'
-          retained = gzip.decompress(Path(name).read_bytes())
-          include = '--include=test-suite/quality/test_taint_python_call_completions.py'
-          subprocess.run(['git', 'apply', '--check', include, '-'], input=retained, check=True)
-          subprocess.run(['git', 'apply', include, '-'], input=retained, check=True)
-          after = {
-              'modules/helpers/ubs_core/analyzers/taint_py.py': '23ef74c30c9fd325438d1e43e7ef72f071e81bcc',
-              'modules/helpers/ubs_core/py_scan.py': 'c4279b97fe84a79de0de4279a3050042e0edb081',
-              'test-suite/quality/test_taint_python_modules.py': '9fb044e600602751cb7ad88b1329f87a44859eab',
-              'test-suite/quality/test_taint_python_call_completions.py': 'a4cac63efe3dde361b3a5ada969f7d3955a50f4c',
-          }
-          for name, expected in after.items():
-              assert identity(name) == expected, (name, identity(name), expected)
-          PY
-          python3 scripts/update_checksums.py
-          ./scripts/update_sha256sums.sh
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
       - name: Validate all Python dataflow and actual JSON SARIF staged cache scans
@@ -104,57 +70,11 @@ jobs:
           cmp "$RUNNER_TEMP/pymod-tested.diff" "$RUNNER_TEMP/pymod-regenerated.diff"
           for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
           shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
-      - name: Store only tested immutable objects
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          scratch = Path(os.environ['RUNNER_TEMP'])
-          tests = {'test-suite/quality/test_taint_python_modules.py',
-                   'test-suite/quality/test_taint_python_call_completions.py'}
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | tests
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     'modules/helpers/ubs_core/analyzers/taint_py.py', 'modules/helpers/ubs_core/py_scan.py'} | tests
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert changed <= allowed, sorted(changed - allowed)
-          def store(endpoint, payload):
-              response = subprocess.run(
-                  ['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/{endpoint}", '--input', '-'],
-                  input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=90)
-              return json.loads(response.stdout)['sha']
-          records = []
-          for name in sorted(changed):
-              raw = Path(name).read_bytes()
-              expected = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
-              index = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
-              mode, before = (index[0], index[1]) if index else ('100644', None)
-              sha = store('blobs', {'content': raw.decode('utf-8'), 'encoding': 'utf-8'})
-              assert sha == expected, (name, sha, expected)
-              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before})
-          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-          tree = store('trees', {'base_tree': base_tree,
-                                'tree': [{k: v for k, v in item.items() if k != 'before'} for item in records]})
-          manifest = {'base': base, 'tree': tree, 'files': records}
-          (scratch / 'pymod-publication.json').write_text(json.dumps(manifest, indent=2) + '\n')
-          print('PYTHON_MODULE_TESTED_TREE', json.dumps(manifest), flush=True)
-          PY
       - name: Preserve source and diagnostics
         if: always()
         run: |
           git diff > "$RUNNER_TEMP/pymod-final.diff"
           git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/pymod-source.tar.gz"
-          for name in modules call_completions; do
-            if [[ -f "test-suite/quality/test_taint_python_$name.py" ]]; then
-              cp "test-suite/quality/test_taint_python_$name.py" "$RUNNER_TEMP/pymod-$name-tests.py"
-            fi
-          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:

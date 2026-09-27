@@ -4,8 +4,9 @@ The AST transfer functions use strong assignment updates, join control-flow
 branches, and iterate loops and recursive function summaries to a fixpoint.
 Facts retain source provenance and sink-specific sanitizers. Local helpers
 summarize both returned values and parameters reaching a sink; analyzed code
-is never imported or executed. Cross-file and arbitrary dynamic dispatch are
-not modeled; known callable aliases and their finite branch alternatives are.
+is never imported or executed. Selected acyclic Python modules share function
+summaries; unresolved/cyclic imports and arbitrary dynamic dispatch retain
+conservative opaque-call behavior. Known callable aliases are modeled.
 Mutable objects use a finite, field-insensitive heap: aliases share writes,
 and local call summaries propagate output-parameter and captured-object writes.
 Pending returns, raises, breaks and continues pass through cleanup before
@@ -22,8 +23,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import os
 import re
 import sys
+from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -218,6 +221,16 @@ class _DeferredCall:
     arguments: tuple
     references: tuple
     values: tuple = ()
+
+
+@dataclass(frozen=True)
+class _ModuleBinding:
+    project: object
+    key: Path
+
+    @property
+    def reference(self):
+        return '@module:' + str(self.key)
 
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
@@ -854,6 +867,26 @@ class _Flow:
                 return frozenset({TaintTrace(source, path=(source,))})
         return CLEAN
 
+    def global_arguments(self, function, state):
+        """A helper reads its defining module, never a caller's same-name local."""
+        owner = self.engine.owner(function)
+        namespace = state if owner is self.engine else owner.globals
+        module_ref = (owner.project.module_reference(owner) if owner.project is not None else None)
+        for name in owner.global_names:
+            key = f'@global:{name}'
+            if (owner is self.engine and not isinstance(self.scope, ast.Module)
+                    and (name in self.engine.locals.get(self.scope, set())
+                         or name in self.engine.closures.get(self.scope, set()))):
+                yield key, frozenset({TaintTrace(name, parameter=key, path=(name,))}), frozenset({key}), _SymbolicValue(key)
+            else:
+                refs = namespace.references.get(name, NO_REFERENCES)
+                fact = join_facts(namespace.value(name), state.heap.get(module_ref, CLEAN),
+                                  *(state.heap.get(ref, CLEAN) for ref in refs))
+                value = namespace.bindings.get(name)
+                if refs & state.mutated or module_ref in state.mutated:
+                    value = _without_object_contract(value)
+                yield key, fact, refs, value
+
     def bind(self, function, node, arguments, keywords, state):
         positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
         bound = {name: fact for name, fact in zip(positional, arguments)}
@@ -880,18 +913,8 @@ class _Flow:
             bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = state.value(name)
-        for name in self.engine.global_names:
-            if (not isinstance(self.scope, ast.Module)
-                    and (name in self.engine.locals.get(self.scope, set())
-                         or name in self.engine.closures.get(self.scope, set()))):
-                # The callee resolves globals in its defining module, not in
-                # the caller's local/closure namespace. Carry that dependency
-                # outward until a module call site supplies the actual value.
-                bound[f'@global:{name}'] = frozenset({
-                    TaintTrace(name, parameter=f'@global:{name}', path=(name,))
-                })
-            else:
-                bound[f'@global:{name}'] = state.value(name)
+        for key, fact, _refs, _value in self.global_arguments(function, state):
+            bound[key] = fact
         return bound
 
     def bind_references(self, function, node, keyword_nodes, state):
@@ -917,13 +940,11 @@ class _Flow:
                 bound[name] = bound.get(name, NO_REFERENCES) | expanded
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = state.references.get(name, NO_REFERENCES)
-        for name in self.engine.global_names:
-            if (not isinstance(self.scope, ast.Module)
-                    and (name in self.engine.locals.get(self.scope, set())
-                         or name in self.engine.closures.get(self.scope, set()))):
-                bound[f'@global:{name}'] = frozenset({f'@global:{name}'})
-            else:
-                bound[f'@global:{name}'] = state.references.get(name, NO_REFERENCES)
+        for key, _fact, refs, _value in self.global_arguments(function, state):
+            bound[key] = refs
+        if self.engine.project is not None:
+            for key in self.engine.project.module_references:
+                bound[key] = frozenset({key})
         return bound
 
     def bind_values(self, function, node, keyword_nodes, state):
@@ -938,13 +959,8 @@ class _Flow:
             bound.setdefault(name, value)
         for name in self.engine.closures.get(function, ()):
             bound[f'@free:{name}'] = state.bindings.get(name)
-        for name in self.engine.global_names:
-            if (not isinstance(self.scope, ast.Module)
-                    and (name in self.engine.locals.get(self.scope, set())
-                         or name in self.engine.closures.get(self.scope, set()))):
-                bound[f'@global:{name}'] = _SymbolicValue(f'@global:{name}')
-            else:
-                bound[f'@global:{name}'] = state.bindings.get(name)
+        for key, _fact, _refs, value in self.global_arguments(function, state):
+            bound[key] = value
         return bound
 
     def resume_environment(self, function, bound, references, values, state):
@@ -954,19 +970,8 @@ class _Flow:
         this lexical scope. A caller-local spelling is not a callee global,
         and an unrelated caller cannot replace a captured closure binding.
         """
-        for name in self.engine.global_names:
-            key = f'@global:{name}'
-            shadowed = (not isinstance(self.scope, ast.Module)
-                        and (name in self.engine.locals.get(self.scope, set())
-                             or name in self.engine.closures.get(self.scope, set())))
-            if shadowed:
-                bound[key] = frozenset({TaintTrace(name, parameter=key, path=(name,))})
-                references[key] = frozenset({key})
-                values[key] = _SymbolicValue(key)
-            else:
-                bound[key] = state.value(name)
-                references[key] = state.references.get(name, NO_REFERENCES)
-                values[key] = state.bindings.get(name)
+        for key, fact, refs, value in self.global_arguments(function, state):
+            bound[key], references[key], values[key] = fact, refs, value
         for name in self.engine.closures.get(function, ()):
             owner = self.engine.enclosing(function)
             while owner is not None and not isinstance(owner, ast.Module):
@@ -1450,6 +1455,12 @@ class _Flow:
                 receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
                 receiver_fact = self.expression_facts.get(node.value, CLEAN)
                 for base in _binding_choices(self.expression_bindings.get(node.value)):
+                    if isinstance(base, _ModuleBinding):
+                        incoming, member, refs = base.project.member(base.key, node.attr, state)
+                        fact = join_facts(fact, incoming)
+                        self.expression_references[node] = self.expression_references.get(node, NO_REFERENCES) | refs
+                        candidates.append(member)
+                        continue
                     if isinstance(base, _ProcessInput) and node.attr == 'communicate':
                         candidates.append(_BoundCallable('@stdin.' + base.kind, receiver_refs, receiver_fact))
                         continue
@@ -1501,7 +1512,7 @@ class _Flow:
             if isinstance(node, ast.Name):
                 self.expression_references[node] = state.references.get(node.id, NO_REFERENCES)
             elif isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
-                self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
+                self.expression_references.setdefault(node, self.expression_references.get(node.value, NO_REFERENCES))
             elif isinstance(node, ast.NamedExpr):
                 self.expression_references[node] = self.expression_references.get(node.value, NO_REFERENCES)
             elif isinstance(node, (ast.List, ast.Tuple, ast.Dict, ast.Set, ast.Call)):
@@ -1702,6 +1713,11 @@ class _Flow:
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 local = alias.asname or alias.name.split('.')[0]
+                imported = (self.engine.project.imported(self.engine, node, alias, state)
+                            if self.engine.project is not None else None)
+                if imported is not None:
+                    state[local], state.bindings[local], state.references[local] = imported
+                    continue
                 state.bindings[local] = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
                                          else alias.name if alias.asname else local)
                 state[local] = CLEAN
@@ -1897,11 +1913,14 @@ class _Flow:
 
 
 class _Analysis:
-    def __init__(self, tree):
+    def __init__(self, tree, project=None):
         self.tree = tree
+        self.project = project
+        self.globals = _State()
         self.summaries = {}
         self.defaults = {}
         self.framework_inputs = {}
+        self.framework_values = {}
         self.framework_dependencies = {}
         self.default_references = {}
         self.default_bindings = {}
@@ -1919,6 +1938,9 @@ class _Analysis:
                 available.update(self.locals.get(parent, set()))
                 parent = self.enclosing(parent)
             self.closures[function] = available - self.locals[function]
+
+    def owner(self, function):
+        return self.project.owners.get(function, self) if self.project is not None else self
 
     def enclosing(self, node):
         node = self.parents.get(node)
@@ -1965,7 +1987,11 @@ class _Analysis:
                         continue
                     summary = self.summaries.get(provider, FunctionSummary())
                     delivered = summary.yielded if provider in self.generators else summary.returned
-                    incoming = _Flow.substitute(delivered, {**global_bound, **bound.get(provider, {})}, provider.name + '()')
+                    owner = self.owner(provider)
+                    provider_globals = (global_bound if owner is self else
+                                        {f'@global:{key}': owner.globals.value(key) for key in owner.globals})
+                    provider_inputs = bound.get(provider, {}) if owner is self else owner.framework_values.get(provider, {})
+                    incoming = _Flow.substitute(delivered, {**provider_globals, **provider_inputs}, provider.name + '()')
                     previous = bound[function].get(name, CLEAN)
                     updated = join_facts(previous, incoming)
                     if updated != previous:
@@ -2033,8 +2059,10 @@ class _Analysis:
                     changed = True
                 flows.append(flow)
             if not changed:
+                self.globals = globals_
                 effects = {}
                 framework_bound = self.framework_bound(globals_)
+                self.framework_values = framework_bound
                 for flow in flows:
                     for key, fact in flow.effects.items():
                         if flow is not module:
@@ -2048,6 +2076,164 @@ class _Analysis:
                         if concrete:
                             effects[key] = join_facts(effects.get(key, CLEAN), concrete)
                 return effects
+
+
+class _Project:
+    """Resolve only selected Python source files; never search sys.path/import code.
+
+    Module initialization is dependency ordered. Cycles (and their dependent
+    modules) keep opaque calls rather than using a guessed partial namespace.
+    A virtual line map keeps imported sink locations and suppressions attached
+    to their defining file without concatenating/parsing source buffers.
+    """
+
+    def __init__(self, files, root=None):
+        self.sources = []
+        self.modules = {}
+        self.namespaces = set()
+        self.keys = {}
+        self.ready = set()
+        seen, offset = set(), 0
+        for path in files:
+            path = Path(path).resolve()
+            if path in seen or path.suffix.lower() not in EXTS or should_skip(path):
+                continue
+            seen.add(path)
+            try:
+                text = path.read_text(encoding='utf-8')
+                tree = ast.parse(text, filename=str(path))
+            except (OSError, UnicodeError, SyntaxError, ValueError):
+                continue
+            ast.increment_lineno(tree, offset)
+            engine = _Analysis(tree, self)
+            self.sources.append((path, text, engine, offset))
+            if path.suffix == '.py':
+                key = path.parent if path.name == '__init__.py' else path.with_suffix('')
+                self.keys[engine] = key
+                # foo.py and foo/__init__.py cannot both prove a module identity.
+                self.modules[key] = None if key in self.modules else engine
+            offset += max(1, len(text.splitlines()) + 1)
+        parents = [str(path.parent) for path, _, _, _ in self.sources]
+        self.root = Path(root).resolve() if root else Path(os.path.commonpath(parents)) if parents else Path.cwd()
+        if self.root.is_file():
+            self.root = self.root.parent
+        for key in self.modules:
+            self.namespaces.add(key)
+            self.namespaces.update(parent for parent in key.parents if parent.is_relative_to(self.root))
+        self.owners = {function: engine for _, _, engine, _ in self.sources for function in engine.functions}
+        self.module_references = {'@module:' + str(key) for key in self.namespaces}
+        # AST-keyed metadata is safe to share. Module variable namespaces and
+        # framework entrypoint bindings remain separate per defining module.
+        for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures'):
+            shared = {}
+            for _, _, engine, _ in self.sources:
+                shared.update(getattr(engine, name))
+            for _, _, engine, _ in self.sources:
+                setattr(engine, name, shared)
+        generators = set().union(*(engine.generators for _, _, engine, _ in self.sources))
+        for _, _, engine, _ in self.sources:
+            engine.generators = generators
+
+    def module_reference(self, engine):
+        key = self.keys.get(engine)
+        return '@module:' + str(key) if key is not None else None
+
+    def import_key(self, engine, node, name):
+        if isinstance(node, ast.ImportFrom) and node.level:
+            key = self.keys.get(engine)
+            if key is None:
+                return None
+            path = next(path for path, _, candidate, _ in self.sources if candidate is engine)
+            base = path.parent
+            for _ in range(node.level - 1):
+                base = base.parent
+            if not base.is_relative_to(self.root):
+                return None
+        else:
+            base = self.root
+        return base.joinpath(*name.split('.')) if name else base
+
+    def dependencies(self, engine):
+        dependencies = set()
+        for node in ast.walk(engine.tree):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            names = ([node.module or '', *('.'.join(filter(None, (node.module, alias.name)))
+                      for alias in node.names if alias.name != '*')]
+                     if isinstance(node, ast.ImportFrom) else [alias.name for alias in node.names])
+            for name in names:
+                key = self.import_key(engine, node, name)
+                if key is None:
+                    continue
+                for prefix in (key, *key.parents):
+                    dependency = self.modules.get(prefix)
+                    if dependency is not None and dependency is not engine:
+                        dependencies.add(dependency)
+        return dependencies
+
+    def member(self, key, name, state):
+        module_ref = '@module:' + str(key)
+        if module_ref in state.mutated:
+            # An attribute assignment/opaque mutation can replace an exported
+            # callable or scalar. Do not keep certifying its old clean value.
+            return state.heap.get(module_ref, CLEAN), None, frozenset({module_ref})
+        engine = self.modules.get(key)
+        if engine is not None and engine in self.ready and name in engine.globals:
+            namespace = engine.globals
+            refs = namespace.references.get(name, NO_REFERENCES)
+            for ref in refs:
+                state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), namespace.heap.get(ref, CLEAN))
+            fact = join_facts(namespace.value(name), *(state.heap.get(ref, CLEAN) for ref in refs))
+            value = namespace.bindings.get(name)
+            if refs & state.mutated:
+                value = _without_object_contract(value)
+            return fact, value, refs
+        child = key / name
+        if child in self.namespaces:
+            binding = _ModuleBinding(self, child)
+            return CLEAN, binding, frozenset({binding.reference})
+        return CLEAN, None, NO_REFERENCES
+
+    def imported(self, engine, node, alias, state):
+        if alias.name == '*':
+            return None  # Dynamic __all__ and wildcard bindings are not guessed.
+        name = node.module or '' if isinstance(node, ast.ImportFrom) else alias.name
+        key = self.import_key(engine, node, name)
+        if key not in self.namespaces:
+            return None  # External import: preserve the known library vocabulary.
+        if isinstance(node, ast.ImportFrom):
+            return self.member(key, alias.name, state)
+        if not alias.asname:
+            key = self.import_key(engine, node, alias.name.split('.')[0])
+        binding = _ModuleBinding(self, key)
+        return CLEAN, binding, frozenset({binding.reference})
+
+    def findings(self):
+        pending = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
+        effects = {}
+        while pending:
+            ready = [engine for engine, deps in pending.items() if deps <= self.ready]
+            if not ready:
+                # Do not pretend to execute a cyclic import's partially
+                # initialized modules. Still run ordinary intrafile analysis.
+                ready = list(pending)
+                for engine in ready:
+                    engine.project = None
+            for engine in ready:
+                for key, fact in engine.analyze().items():
+                    effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                self.ready.add(engine)
+                del pending[engine]
+        starts = [offset for _, _, _, offset in self.sources]
+        indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
+        for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
+            path, _, _, offset = self.sources[bisect_right(starts, line - 1) - 1]
+            line -= offset
+            rule = f'py.taint.{kind}'
+            if indexes[path].is_suppressed(line, rule) or indexes[path].is_suppressed(line, f'python.taint.{kind}'):
+                continue
+            trace = min(fact, key=lambda item: (len(item.path), item.path, item.source))
+            yield path, rule, line, column, ' -> '.join((*trace.path, label))
 
 
 def should_skip(path: Path) -> bool:
@@ -2085,8 +2271,11 @@ def main(argv=None) -> int:
     ROOT = Path(argv[1]).resolve()
     BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
     issues = defaultdict(lambda: {'count': 0, 'samples': []})
-    for file_path in iter_files(ROOT):
-        analyze_file(file_path, issues)
+    for path, rule, line, _col, description in _Project(iter_files(ROOT), BASE_DIR).findings():
+        bucket = issues[rule]
+        bucket['count'] += 1
+        if len(bucket['samples']) < 3:
+            bucket['samples'].append(f'{path.relative_to(BASE_DIR)}:{line} {description}')
     for rule_id, data in issues.items():
         samples = ','.join(data['samples'])
         print(f"{rule_id}\t{data['count']}\t{samples}")
@@ -2127,26 +2316,20 @@ def scan_file_findings(path: Path):
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    for path in ctx.files:
-        if path.suffix.lower() not in EXTS:
+    for path, rule, line, col, path_desc in _Project(ctx.files, ctx.profile.get('project_dir')).findings():
+        kind = KIND_BY_RULE[rule]
+        if not ctx.rule_enabled(f'python.taint.{kind}') or not ctx.rule_enabled(rule):
             continue
-        if should_skip(path):
-            continue
-        rel = path.resolve()
-        for rule, line, col, path_desc in scan_file_findings(path):
-            kind = KIND_BY_RULE[rule]
-            if not ctx.rule_enabled(f'python.taint.{kind}') or not ctx.rule_enabled(rule):
-                continue
-            yield {
-                "rule": f"python.taint.{kind}",
-                "path": str(rel),
-                "line": line,
-                "col": col,
-                "layer": "taint",
-                "lang": "python",
-                "severity": _SEVERITY.get(kind, "warning"),
-                "message": f"{_MESSAGE.get(kind, kind)} ({path_desc})",
-            }
+        yield {
+            "rule": f"python.taint.{kind}",
+            "path": str(path),
+            "line": line,
+            "col": col,
+            "layer": "taint",
+            "lang": "python",
+            "severity": _SEVERITY.get(kind, "warning"),
+            "message": f"{_MESSAGE.get(kind, kind)} ({path_desc})",
+        }
 
 
 def _selftest_direct_source_sink(tmp_prefix: str = "ubs_core_taint_py_") -> None:

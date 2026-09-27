@@ -6,6 +6,7 @@ on:
     paths:
       - test-suite/patches/javascript-modules-source.patch.xz
       - test-suite/patches/javascript-module-report-contract.patch
+      - test-suite/patches/javascript-typescript-resolution.patch.xz
       - .github/workflows/javascript-modules.yml
   workflow_dispatch:
 
@@ -62,19 +63,36 @@ jobs:
           PY
           git apply --check test-suite/patches/javascript-module-report-contract.patch
           git apply test-suite/patches/javascript-module-report-contract.patch
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          import subprocess
+          from pathlib import Path
+          patch = lzma.decompress(Path('test-suite/patches/javascript-typescript-resolution.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == 'e4e013571fe1396a857d21112c16358f0ff634e9ee1ccc78ff06a242e32ab616'
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          expected = {
+              'modules/helpers/ubs_core/js_modules.py': 'f96f9afe3986dab5b22bf9748b6a896447ed2a58',
+              'test-suite/quality/test_taint_js_modules.py': 'db2ae8ed9b52239a9f6df138b99777a8d695bbfc',
+          }
+          for name, sha in expected.items():
+              assert subprocess.check_output(['git', 'hash-object', name], text=True).strip() == sha, name
+          PY
           python3 scripts/update_checksums.py
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --check
-      - name: Install scanner dependencies
+      - name: Install scanner dependencies and independent TypeScript test oracle
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
-          npm install --global @ast-grep/cli
-      - name: Test cross-file findings, Node semantics, cache and parallel scans
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Test cross-file findings, compiler semantics, cache and parallel scans
         run: |
           command -v ast-grep
           command -v node
+          command -v tsc
           python3 - <<'PY'
           import importlib.util
           import unittest

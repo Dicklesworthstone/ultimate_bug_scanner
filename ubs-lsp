@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""Saved-document UBS diagnostics over LSP stdio; no project code is imported.
+
+Run from a trusted checkout with an explicit --repo. Unsaved buffers are never
+written to disk or passed off as scanned. Detection remains in the ordinary UBS
+runner; this optional adapter is not an in-process analysis engine.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import unquote_to_bytes, urlsplit
+
+MAX_MESSAGE = 8 * 1024 * 1024
+MAX_TEXT = 2 * 1024 * 1024
+MAX_TEXT_TOTAL = 16 * 1024 * 1024
+MAX_DOCUMENTS = 64
+MAX_OUTPUT = 8 * 1024 * 1024
+MAX_DIAGNOSTICS = 2000
+
+
+class ProtocolError(ValueError):
+    pass
+
+
+def decode_json(data):
+    def constant(value):
+        raise ProtocolError('Non-finite JSON number: ' + value)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ProtocolError('Duplicate JSON field: ' + key)
+            result[key] = value
+        return result
+    try:
+        return json.loads(data, parse_constant=constant, object_pairs_hook=pairs)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ProtocolError('Invalid JSON: ' + str(exc)) from exc
+
+
+def frame(message):
+    body = json.dumps(message, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+    if len(body) > MAX_MESSAGE:
+        raise ProtocolError('Outbound LSP message exceeds limit')
+    return b'Content-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
+
+
+class Framer:
+    def __init__(self):
+        self.buffer = bytearray()
+        self.expected = None
+
+    def feed(self, data):
+        # The stdio loop supplies at most 64 KiB at a time.
+        if len(data) > MAX_MESSAGE + 8192:
+            raise ProtocolError('Inbound LSP chunk exceeds limit')
+        self.buffer.extend(data)
+        while True:
+            if self.expected is None:
+                end = self.buffer.find(b'\r\n\r\n')
+                if end < 0:
+                    if len(self.buffer) > 8192:
+                        raise ProtocolError('LSP headers exceed limit')
+                    return
+                if end > 8192:
+                    raise ProtocolError('LSP headers exceed limit')
+                headers = {}
+                for line in bytes(self.buffer[:end]).split(b'\r\n'):
+                    key, separator, value = line.partition(b':')
+                    key, value = key.strip().lower(), value.strip()
+                    if not separator or not key or key in headers:
+                        raise ProtocolError('Invalid or duplicate LSP header')
+                    headers[key] = value
+                length = headers.get(b'content-length', b'')
+                if not length.isdigit() or len(length) > 9 or not 0 < int(length) <= MAX_MESSAGE:
+                    raise ProtocolError('Invalid LSP Content-Length')
+                content_type = headers.get(b'content-type', b'').lower()
+                if b'charset=' in content_type and content_type.split(b'charset=', 1)[1].strip() not in (b'utf-8', b'utf8'):
+                    raise ProtocolError('LSP requires UTF-8')
+                self.expected = int(length)
+                del self.buffer[:end + 4]
+            if len(self.buffer) < self.expected:
+                return
+            raw = bytes(self.buffer[:self.expected])
+            del self.buffer[:self.expected]
+            self.expected = None
+            yield decode_json(raw)
+
+
+def document_path(uri, root):
+    if not isinstance(uri, str) or re.search(r'%(?![0-9a-fA-F]{2})', uri):
+        raise ProtocolError('Invalid document URI')
+    parsed = urlsplit(uri)
+    if parsed.scheme != 'file' or parsed.netloc not in ('', 'localhost') or parsed.query or parsed.fragment:
+        raise ProtocolError('Only local file URIs are supported')
+    name = unquote_to_bytes(parsed.path).decode('utf-8')
+    if '\0' in name or not name.startswith('/'):
+        raise ProtocolError('Invalid file URI path')
+    path = Path(os.path.normpath(name))
+    if not path.is_relative_to(root) or path == root:
+        raise ProtocolError('Document is outside the configured repository')
+    return path
+
+
+def normalized_text(value):
+    if not isinstance(value, str) or len(value.encode('utf-8')) > MAX_TEXT:
+        raise ProtocolError('Document text exceeds limit or is not UTF-8 text')
+    return value.removeprefix('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+
+
+def read_source(root, path, root_id):
+    """Read a bounded regular file through no-follow directory descriptors."""
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory)
+        if (info.st_dev, info.st_ino) != root_id:
+            raise ProtocolError('Repository root was replaced')
+        parts = path.relative_to(root).parts
+        if not parts:
+            raise ProtocolError('Source must be a file')
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+        with os.fdopen(descriptor, 'rb') as stream:
+            def stamp(value):
+                return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                        value.st_mtime_ns, value.st_ctime_ns)
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_TEXT:
+                raise ProtocolError('Source is not a bounded regular file')
+            raw = stream.read(MAX_TEXT + 1)
+            current = os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)
+            if len(raw) > MAX_TEXT or stamp(before) != stamp(os.fstat(stream.fileno())) or stamp(before) != stamp(current):
+                raise ProtocolError('Source changed while being read')
+            return normalized_text(raw.decode('utf-8')), (stamp(before), hashlib.sha256(raw).digest())
+    finally:
+        os.close(directory)
+
+
+def note(code, message, severity=2):
+    return {'range': {'start': {'line': 0, 'character': 0}, 'end': {'line': 0, 'character': 0}},
+            'severity': severity, 'code': code, 'source': 'ubs', 'message': message[:8192]}
+
+
+def report_diagnostics(report, path, root, text, exit_code):
+    if not isinstance(report, dict) or report.get('status') != 'ok' or report.get('failed_modules'):
+        raise ProtocolError('Scanner returned an incomplete or failed report')
+    totals = report.get('totals')
+    if not isinstance(totals, dict) or type(totals.get('files')) is not int or totals['files'] < 1:
+        raise ProtocolError('Scanner did not verify any source files')
+    records = report.get('findings')
+    ast_records = report.get('ast_findings', [])
+    if not isinstance(records, list) or not isinstance(ast_records, list):
+        raise ProtocolError('Scanner report has no valid findings ledger')
+    bases = [root]
+    project = report.get('project')
+    if isinstance(project, str) and Path(project).is_absolute():
+        candidate = Path(os.path.normpath(project))
+        if candidate.is_relative_to(root):
+            bases.append(candidate.parent if candidate == path else candidate)
+    lines = text.split('\n')
+    diagnostics = []
+    omitted = 0
+    for finding in records + ast_records:
+        if not isinstance(finding, dict) or type(finding.get('suppressed', False)) is not bool:
+            raise ProtocolError('Invalid finding record')
+        if finding.get('suppressed', False):
+            continue
+        rule, message = finding.get('rule_id'), finding.get('message')
+        severity = finding.get('severity')
+        if not isinstance(rule, str) or not rule or not isinstance(message, str) or severity not in ('critical', 'warning', 'info'):
+            raise ProtocolError('Finding lacks rule, message or severity')
+        level = {'critical': 1, 'warning': 2, 'info': 3}[severity]
+        source = finding.get('file')
+        line = finding.get('line')
+        if finding.get('scope') in ('project', 'project_aggregate'):
+            diagnostic = note(rule, '[Project-level finding] ' + message, level)
+        else:
+            if not isinstance(source, str) or not source or type(line) is not int or line < 1:
+                raise ProtocolError('Finding has invalid source coordinates')
+            if not any(Path(os.path.normpath(base / source)) == path for base in bases):
+                omitted += 1
+                continue
+            if line > len(lines):
+                raise ProtocolError('Finding is outside the saved document')
+            content = lines[line - 1]
+            # Producers do not share a proven column unit across languages.
+            # Highlight the complete line rather than inventing byte/codepoint
+            # precision. LSP ranges use UTF-16 code units, including astral text.
+            end = len(content.encode('utf-16-le')) // 2
+            diagnostic = {'range': {'start': {'line': line - 1, 'character': 0},
+                                    'end': {'line': line - 1, 'character': end}},
+                          'severity': level, 'code': rule, 'source': 'ubs', 'message': (message or rule)[:8192]}
+        if len(diagnostics) < MAX_DIAGNOSTICS - 1:
+            diagnostics.append(diagnostic)
+        else:
+            omitted += 1
+    if omitted:
+        diagnostics.append(note('ubs.incomplete-display', f'{omitted} additional findings are outside this document or the display limit. Run UBS to see the complete report.'))
+    if exit_code == 1 and not diagnostics:
+        diagnostics.append(note('ubs.unlocated-findings', 'UBS reported a failing scan without visible source diagnostics. Run UBS for the complete report.'))
+    return diagnostics
+
+
+def scan(scanner, root, path, text, root_id, timeout, cancel):
+    saved, identity = read_source(root, path, root_id)
+    if saved != text:
+        return [note('ubs.unsaved', 'Save this document before running UBS; disk contents differ from the editor.', 3)], None
+    if cancel.is_set():
+        raise ProtocolError('Scan cancelled')
+    command = [str(scanner), '--ci', '--no-auto-update', '--no-color', '--format=json', '--', str(path)]
+    process = subprocess.Popen(command, cwd=root, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', NO_COLOR='1'),
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True, bufsize=0)
+    output = {'stdout': bytearray(), 'stderr': bytearray()}
+    deadline = time.monotonic() + timeout
+    try:
+        with selectors.DefaultSelector() as pipes:
+            for name in output:
+                pipe = getattr(process, name)
+                os.set_blocking(pipe.fileno(), False)
+                pipes.register(pipe, selectors.EVENT_READ, name)
+            while pipes.get_map() or process.poll() is None:
+                if cancel.is_set():
+                    raise ProtocolError('Scan cancelled')
+                if time.monotonic() >= deadline:
+                    raise ProtocolError('Scanner timed out')
+                for key, _ in pipes.select(0.03):
+                    buffer = output[key.data]
+                    try:
+                        chunk = os.read(key.fd, min(65536, MAX_OUTPUT - len(buffer) + 1))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        pipes.unregister(key.fileobj)
+                    elif len(buffer) + len(chunk) > MAX_OUTPUT:
+                        raise ProtocolError('Scanner output exceeded limit')
+                    else:
+                        buffer.extend(chunk)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        process.stdout.close()
+        process.stderr.close()
+    if cancel.is_set():
+        raise ProtocolError('Scan cancelled')
+    if read_source(root, path, root_id) != (saved, identity):
+        raise ProtocolError('Source changed during the scan; save again to recheck')
+    if process.returncode == 3:
+        return [note('ubs.not-scanned', 'UBS found no scan targets. This is not a verified clean document.')], identity
+    if process.returncode not in (0, 1):
+        detail = output['stderr'].decode('utf-8', 'replace')[-2048:]
+        raise ProtocolError(f'Scanner failed (exit {process.returncode}): {detail}')
+    report = decode_json(output['stdout'])
+    return report_diagnostics(report, path, root, text, process.returncode), identity
+
+
+class Server:
+    def __init__(self, root, scanner, send, *, jobs=2, timeout=120):
+        self.root, self.scanner, self.send = root, scanner, send
+        info = root.stat()
+        self.root_id = (info.st_dev, info.st_ino)
+        self.jobs, self.timeout = jobs, timeout
+        self.pool = ThreadPoolExecutor(max_workers=jobs, thread_name_prefix='ubs-lsp')
+        self.documents = {}
+        self.pending = OrderedDict()
+        self.active = {}
+        self.generation = 0
+        self.initialized = False
+        self.shutdown = False
+        self.exit_code = None
+
+    def publish(self, uri, diagnostics):
+        params = {'uri': uri, 'diagnostics': diagnostics}
+        if uri in self.documents:
+            params['version'] = self.documents[uri]['version']
+        self.send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': params})
+
+    def invalidate(self, uri):
+        self.generation += 1
+        self.pending.pop(uri, None)
+        for _, (target, _, cancel) in self.active.items():
+            if target == uri:
+                cancel.set()
+        if uri in self.documents:
+            self.documents[uri]['generation'] = self.generation
+
+    def queue(self, uri):
+        self.invalidate(uri)
+        self.pending[uri] = self.documents[uri]['generation']
+        self.publish(uri, [note('ubs.pending', 'UBS verification pending for this saved document.', 3)])
+
+    def tick(self):
+        for future, (uri, generation, cancel) in list(self.active.items()):
+            if not future.done():
+                continue
+            del self.active[future]
+            doc = self.documents.get(uri)
+            if self.shutdown or doc is None or doc['generation'] != generation or cancel.is_set():
+                continue
+            try:
+                diagnostics, identity = future.result()
+                if identity is not None and read_source(self.root, doc['path'], self.root_id) != (doc['text'], identity):
+                    raise ProtocolError('Source changed before diagnostics could be published')
+            except Exception as exc:
+                diagnostics = [note('ubs.unverified', 'UBS could not verify this document: ' + str(exc))]
+            self.publish(uri, diagnostics)
+        busy = {uri for uri, _, _ in self.active.values()}
+        for uri, generation in list(self.pending.items()):
+            if self.shutdown or len(self.active) >= self.jobs:
+                break
+            if uri in busy:
+                continue
+            del self.pending[uri]
+            doc = self.documents[uri]
+            cancel = threading.Event()
+            future = self.pool.submit(scan, self.scanner, self.root, doc['path'], doc['text'], self.root_id, self.timeout, cancel)
+            self.active[future] = (uri, generation, cancel)
+
+    def handle(self, message):
+        request_id = message.get('id') if isinstance(message, dict) else None
+        is_request = isinstance(message, dict) and 'id' in message
+        if (not isinstance(message, dict) or message.get('jsonrpc') != '2.0'
+                or not isinstance(message.get('method'), str)
+                or is_request and type(request_id) not in (str, int)):
+            self.send({'jsonrpc': '2.0', 'id': request_id if type(request_id) in (str, int) else None,
+                       'error': {'code': -32600, 'message': 'Invalid JSON-RPC request'}})
+            return
+        try:
+            if not isinstance(message, dict) or message.get('jsonrpc') != '2.0' or not isinstance(message.get('method'), str):
+                raise ProtocolError('Invalid JSON-RPC request')
+            if is_request and type(request_id) not in (str, int):
+                raise ProtocolError('Invalid JSON-RPC id')
+            params = message.get('params', {})
+            if params is None:
+                params = {}
+            if not isinstance(params, dict):
+                raise ProtocolError('Parameters must be an object')
+            method = message['method']
+            if method == 'exit':
+                self.exit_code = 0 if self.shutdown else 1
+                return
+            if method == 'initialize' and is_request and not self.initialized:
+                uri = params.get('rootUri')
+                if uri is not None:
+                    if not isinstance(uri, str) or document_path(uri.rstrip('/') + '/.ubs-lsp-root', self.root).parent != self.root:
+                        raise ProtocolError('Editor root must match --repo')
+                self.initialized = True
+                self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {
+                    'capabilities': {'positionEncoding': 'utf-16', 'textDocumentSync': {
+                        'openClose': True, 'change': 1, 'save': {'includeText': True}}},
+                    'serverInfo': {'name': 'ubs-lsp', 'version': '1'}}})
+                return
+            if not self.initialized or self.shutdown:
+                if is_request:
+                    self.send({'jsonrpc': '2.0', 'id': request_id, 'error': {
+                        'code': -32002 if not self.initialized else -32600, 'message': 'Server is not running'}})
+                return
+            if method == 'shutdown' and is_request:
+                self.shutdown = True
+                self.pending.clear()
+                for _, _, cancel in self.active.values():
+                    cancel.set()
+                self.send({'jsonrpc': '2.0', 'id': request_id, 'result': None})
+                return
+            if is_request:
+                self.send({'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32601, 'message': 'Method not found'}})
+                return
+            if method in ('initialized', '$/cancelRequest', '$/setTrace'):
+                return
+            if method not in ('textDocument/didOpen', 'textDocument/didChange', 'textDocument/didSave', 'textDocument/didClose'):
+                return
+            item = params.get('textDocument')
+            if not isinstance(item, dict):
+                raise ProtocolError('Missing textDocument')
+            uri = item.get('uri')
+            path = document_path(uri, self.root)
+            if method == 'textDocument/didClose':
+                self.invalidate(uri)
+                self.documents.pop(uri, None)
+                self.publish(uri, [])
+                return
+            if method == 'textDocument/didOpen':
+                if uri in self.documents or len(self.documents) >= MAX_DOCUMENTS:
+                    raise ProtocolError('Duplicate document or too many open documents')
+                text, version = normalized_text(item.get('text')), item.get('version')
+            elif method == 'textDocument/didChange':
+                if uri not in self.documents:
+                    raise ProtocolError('Document is not open')
+                version = item.get('version')
+                if type(version) is not int or version <= self.documents[uri]['version']:
+                    raise ProtocolError('Document version must increase')
+                changes = params.get('contentChanges')
+                if not isinstance(changes, list) or len(changes) != 1 or not isinstance(changes[0], dict) or 'range' in changes[0]:
+                    raise ProtocolError('Full document synchronization is required')
+                text = normalized_text(changes[0].get('text'))
+            else:
+                if uri not in self.documents:
+                    raise ProtocolError('Document is not open')
+                if not self.documents[uri]['synchronized']:
+                    raise ProtocolError('A full document change is required after a synchronization error')
+                if 'text' in params and normalized_text(params['text']) != self.documents[uri]['text']:
+                    raise ProtocolError('Save text disagrees with the synchronized editor document')
+                self.queue(uri)
+                return
+            if type(version) is not int:
+                raise ProtocolError('Document version must be an integer')
+            total = sum(len(doc['text'].encode('utf-8')) for key, doc in self.documents.items() if key != uri)
+            if total + len(text.encode('utf-8')) > MAX_TEXT_TOTAL:
+                raise ProtocolError('Open document memory limit reached')
+            self.invalidate(uri)
+            self.documents[uri] = {'path': path, 'text': text, 'version': version, 'generation': self.generation,
+                                   'synchronized': True}
+            if method == 'textDocument/didOpen':
+                self.queue(uri)
+            else:
+                self.publish(uri, [note('ubs.unsaved', 'Save this document to run UBS; unsaved buffers are not scanned.', 3)])
+        except (ValueError, OSError, TypeError, RecursionError) as exc:
+            if is_request:
+                self.send({'jsonrpc': '2.0', 'id': request_id if type(request_id) in (str, int) else None,
+                           'error': {'code': -32602, 'message': str(exc)}})
+            else:
+                # Bad document notifications must invalidate outstanding work,
+                # not let an older generation appear current after a parse error.
+                params = message.get('params', {}) if isinstance(message, dict) else {}
+                item = params.get('textDocument', {}) if isinstance(params, dict) else {}
+                uri = item.get('uri') if isinstance(item, dict) else None
+                if isinstance(uri, str) and uri in self.documents:
+                    self.invalidate(uri)
+                    self.documents[uri]['synchronized'] = False
+                    self.publish(uri, [note('ubs.unverified', str(exc))])
+                self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {'type': 1, 'message': str(exc)}})
+
+    def close(self):
+        self.pending.clear()
+        for _, _, cancel in self.active.values():
+            cancel.set()
+        self.pool.shutdown(wait=True, cancel_futures=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', required=True, help='trusted workspace root; editor cannot broaden it')
+    parser.add_argument('--scanner', default=str(Path(__file__).resolve().with_name('ubs')))
+    parser.add_argument('--jobs', type=int, default=2)
+    parser.add_argument('--scan-timeout', type=float, default=120)
+    args = parser.parse_args(argv)
+    if os.name != 'posix' or not 1 <= args.jobs <= 4 or not 0 < args.scan_timeout <= 3600:
+        parser.error('POSIX, 1–4 jobs and a finite timeout of 0–3600 seconds are required')
+    root = Path(args.repo).resolve(strict=True)
+    scanner = Path(args.scanner).resolve(strict=True)
+    if not root.is_dir() or not scanner.is_file() or not os.access(scanner, os.X_OK):
+        parser.error('Repository must be a directory and scanner must be executable')
+    outgoing = deque()
+    output_bytes = 0
+    def send(message):
+        nonlocal output_bytes
+        data = frame(message)
+        if output_bytes + len(data) > 2 * MAX_MESSAGE:
+            raise ProtocolError('Editor is not consuming diagnostics; output limit exceeded')
+        outgoing.append(memoryview(data))
+        output_bytes += len(data)
+    server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout)
+    framer = Framer()
+    incoming, output = sys.stdin.fileno(), sys.stdout.fileno()
+    old_in, old_out = os.get_blocking(incoming), os.get_blocking(output)
+    os.set_blocking(incoming, False)
+    os.set_blocking(output, False)
+    def stop(_signal, _frame):
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, stop)
+    try:
+        with selectors.SelectSelector() as selector:
+            selector.register(incoming, selectors.EVENT_READ)
+            writing = False
+            while server.exit_code is None:
+                server.tick()
+                if outgoing and not writing:
+                    selector.register(output, selectors.EVENT_WRITE)
+                    writing = True
+                elif not outgoing and writing:
+                    selector.unregister(output)
+                    writing = False
+                for key, _ in selector.select(0.03):
+                    if key.fd == incoming:
+                        data = os.read(incoming, 65536)
+                        if not data:
+                            if framer.buffer or framer.expected is not None:
+                                raise ProtocolError('Incomplete LSP frame at EOF')
+                            return 0 if server.shutdown else 1
+                        for message in framer.feed(data):
+                            server.handle(message)
+                            if server.exit_code is not None:
+                                break
+                    elif outgoing:
+                        try:
+                            sent = os.write(output, outgoing[0][:65536])
+                        except BlockingIOError:
+                            continue
+                        output_bytes -= sent
+                        outgoing[0] = outgoing[0][sent:]
+                        if not outgoing[0]:
+                            outgoing.popleft()
+            return server.exit_code
+    finally:
+        server.close()
+        signal.signal(signal.SIGTERM, previous)
+        os.set_blocking(incoming, old_in)
+        os.set_blocking(output, old_out)
+
+
+if __name__ == '__main__':
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except (OSError, ValueError) as exc:
+        print(f'ubs-lsp: {exc}', file=sys.stderr)
+        raise SystemExit(2)

@@ -1,0 +1,40 @@
+name: Editor Diagnostics
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ubs-lsp
+      - test-suite/quality/test_lsp.py
+      - .github/workflows/editor-diagnostics.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  saved-source-diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_LSP_E2E: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep shellcheck
+          npm install --global @ast-grep/cli
+      - name: Validate editor protocol and real saved-source detection
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p test_lsp.py -v
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code

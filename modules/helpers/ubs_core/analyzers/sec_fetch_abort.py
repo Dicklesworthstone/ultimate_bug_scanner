@@ -18,14 +18,19 @@ from typing import Iterable, Iterator
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
-SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
 
 RULE = "js.security.fetch-abort"
 CATEGORY_ID = "js.security"
 SEVERITY = "warning"
 MESSAGE = "fetch() without AbortSignal cancellation"
 
-fetch_start_re = re.compile(r'(?<![\w$.])(?:window\s*\.\s*|globalThis\s*\.\s*)?fetch\s*\(')
+fetch_start_re = re.compile(r'(?<![\w$.])(?:(?:window|globalThis)\s*(?:\?\s*)?\.\s*)?fetch\s*\(')
+# A formatter may break `window.fetch(` after the receiver (GH #148):
+#     return window
+#       .fetch(url)
+# The continuation line alone looks like a method call on an unknown object.
+continued_fetch_re = re.compile(r'^(\s*)((?:\?\s*)?\.\s*fetch\s*\()')
+global_receiver_tail_re = re.compile(r'(?<![\w$.])(window|globalThis)\s*$')
 definition_re = re.compile(r'^\s*(?:export\s+)?(?:async\s+)?function\s+fetch\s*\(|^\s*declare\s+function\s+fetch\s*\(')
 assignment_re = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\b[^=]*=\s*(.*)')
 identifier_re = re.compile(r'^([A-Za-z_$][A-Za-z0-9_$]*)\b')
@@ -39,6 +44,24 @@ def code_line(source_line):
         return ""
     without_block_comments = re.sub(r'/\*.*?\*/', '', source_line)
     return re.sub(r'//.*', '', without_block_comments)
+
+
+def join_global_receivers(lines):
+    """Re-attach a `window`/`globalThis` receiver that ends the previous code
+    line to a line starting with `.fetch(`, so the call is seen whole. Line
+    count and numbering are preserved; only the continuation line changes."""
+    joined = list(lines)
+    previous_code = ""
+    for idx, line in enumerate(lines):
+        current = code_line(line)
+        if not current.strip():
+            continue
+        continuation = continued_fetch_re.match(current)
+        receiver = global_receiver_tail_re.search(previous_code) if continuation else None
+        if receiver:
+            joined[idx] = continuation.group(1) + receiver.group(1) + current[continuation.start(2):]
+        previous_code = current
+    return joined
 
 
 def statement_from(lines, idx, max_lines=14):
@@ -145,6 +168,7 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
         lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
     except Exception:
         return
+    lines = join_global_receivers(lines)
 
     safe_init_vars = set()
     safe_request_vars = set()
@@ -183,16 +207,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, str]]:
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    cwd = Path.cwd()
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
-            continue
-        # mirror the heredoc's skip_dirs relative to the scan root (cwd)
-        try:
-            rel_parts = path.resolve().relative_to(cwd).parts
-        except ValueError:
-            rel_parts = ()
-        if any(part in SKIP_DIRS for part in rel_parts):
             continue
         rel = path.resolve()
         for line, _sample in scan_file_findings(path):
@@ -249,6 +265,50 @@ def _selftest_signal_wiring_clean(tmp_prefix: str = "ubs_core_sec_fetch_abort_si
         assert findings == [], findings
 
 
+def _selftest_wrapped_global_receiver(tmp_prefix: str = "ubs_core_sec_fetch_abort_wrap_") -> None:
+    import tempfile
+
+    # GH #148: a formatter breaks the chain after the global receiver.
+    src = "\n".join([
+        "export function a(id: string) {",          # 1
+        "  return window",                          # 2
+        "    .fetch(`/api/${id}`)",                 # 3  flagged
+        "    .then((r) => r.text());",              # 4
+        "}",                                        # 5
+        "export function b() {",                    # 6
+        "  return globalThis // comment",           # 7
+        "",                                         # 8
+        "    ?.fetch('/api/b');",                   # 9  flagged
+        "}",                                        # 10
+        "export function c(signal: AbortSignal) {", # 11
+        "  return window",                          # 12
+        "    .fetch('/api/c', { signal })",         # 13 has signal
+        "    .then((r) => r.text());",              # 14
+        "}",                                        # 15
+        "export function d(controller: AbortController) {",  # 16
+        "  return window",                          # 17
+        "    .fetch('/api/d', {",                   # 18
+        "      method: 'POST',",                    # 19
+        "      signal: controller.signal,",         # 20 multi-line options
+        "    });",                                  # 21
+        "}",                                        # 22
+        "export function e(api: Client) {",         # 23
+        "  return api",                             # 24
+        "    .fetch('/api/e');",                    # 25 method on a client
+        "}",                                        # 26
+        "export function f(x: Wrapper) {",          # 27
+        "  return x.window",                        # 28
+        "    .fetch('/api/f');",                    # 29 not the global
+        "}",                                        # 30
+        "",
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "client.ts"
+        target.write_text(src, encoding="utf-8")
+        lines = [line for line, _sample in scan_file_findings(target)]
+        assert lines == [3, 9], lines
+
+
 def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_fetch_abort_run_") -> None:
     import tempfile
 
@@ -270,6 +330,7 @@ def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_sec_fetch_abort_run_"
 SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("bare-fetch-flagged", _selftest_bare_fetch_flagged),
     ("signal-wiring-clean", _selftest_signal_wiring_clean),
+    ("wrapped-global-receiver", _selftest_wrapped_global_receiver),
     ("run-record-shape", _selftest_run_record_shape),
 )
 

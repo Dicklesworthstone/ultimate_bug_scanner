@@ -711,6 +711,34 @@ class MetaRunnerRegressionTests(unittest.TestCase):
                  if f["rule"] == "js.type-coercion.loose-equality"]
         self.assertEqual([(Path(f["path"]).name, f["line"]) for f in loose], [("loose.ts", 2)])
 
+    def test_gh149_lockfile_integrity_padding_is_not_js_code(self) -> None:
+        (self.project / "package-lock.json").write_text(
+            '{"lockfileVersion":3,"integrity":"sha512-abc=="}\n')
+        (self.project / "pnpm-lock.yaml").write_text(
+            "lockfileVersion: 9.0\npackages:\n  left-pad@1.3.0:\n"
+            "    resolution: {integrity: sha512-abc==}\n")
+        (self.project / "yarn.lock").write_text(
+            'left-pad@^1.3.0:\n  version "1.3.0"\n  integrity sha512-abc==\n')
+        (self.project / "ok.ts").write_text("export const ok = (a: number) => a + 1;\n")
+        report, rules = self.scan()
+        self.assertEqual(rules, [], report)
+        self.assertEqual(report["totals"]["critical"], 0, report)
+        # Routed manifests stay selected; they are just not regex-scanned as code.
+        self.assertGreaterEqual(report["totals"]["files"], 2, report)
+        (self.project / "loose.ts").write_text(
+            "export function isX(value: string): boolean {\n  return value == \"x\";\n}\n")
+        report, rules = self.scan()
+        self.assertEqual(rules, ["js.type-coercion.loose-equality"], report)
+        # An explicitly named lockfile is not source either.
+        result = subprocess.run(
+            [str(REPO_ROOT / "ubs"), "--format=json", "--no-color", "--ci",
+             str(self.project / "package-lock.json")], cwd=self.tmp.name,
+            env={**os.environ, "UBS_NO_AUTO_UPDATE": "1", "UBS_NO_CACHE": "1"},
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["totals"]["critical"], 0, result.stdout)
+
 
 
 if __name__ == "__main__":

@@ -36,6 +36,18 @@ from ubs_core.io import read_ndjson
 
 MARKER = "ubs:ignore"
 _PATTERN_CACHE_KIND = "_ubs_js_pattern"
+# The file list also carries routed manifests (package-lock.json, yarn.lock,
+# pnpm-lock.yaml, .env, ...). The regex code patterns describe JS/TS syntax;
+# run over a lockfile they read base64 padding ("sha512-...==") as loose
+# equality (GH #149), and manifest text must not gate or suppress rules for
+# real source either. Only source files feed the pattern pool.
+DEFAULT_SOURCE_EXTS = ("js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts")
+
+
+def source_suffixes(extra_csv: str = "") -> frozenset[str]:
+    """Suffixes treated as JS/TS source: the module defaults plus --include-ext."""
+    names = list(DEFAULT_SOURCE_EXTS) + extra_csv.split(",")
+    return frozenset("." + name.strip().lstrip(".").lower() for name in names if name.strip().lstrip("."))
 
 _CATEGORY_SLUGS = {
     1: "null-undefined", 2: "equality", 3: "proto-object", 4: "type-coercion",
@@ -481,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
+    parser.add_argument("--source-ext", default="",
+                        help="extra comma-separated source extensions (the module's --include-ext)")
     args = parser.parse_args(argv)
 
     if args.files_from in ("-", ""):
@@ -543,7 +557,9 @@ def main(argv: list[str] | None = None) -> int:
         prefilter_res = run_prefilter(files_to_scan, prefilter_index)
 
         capturing_sink = CapturingSink()
-        counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip,
+        suffixes = source_suffixes(args.source_ext)
+        source_files = [path for path in files_to_scan if path.suffix.lower() in suffixes]
+        counters = scan_patterns(patterns, source_files, capturing_sink, skip,
                                  prefilter=prefilter_res, defer_global_checks=True)
         run_analyzers(files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         if args.ast_rule_dir:

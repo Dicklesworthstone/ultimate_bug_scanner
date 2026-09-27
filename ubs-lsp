@@ -122,6 +122,82 @@ def normalized_text(value):
     return value.removeprefix('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
 
 
+
+def editor_text(value):
+    """Keep wire text exact: normalization before range edits shifts positions."""
+    normalized_text(value)  # Shared UTF-8/type/size validation, not its result.
+    return value
+
+
+def position_offset(text, position):
+    """Translate a negotiated UTF-16 LSP position into an exact Python offset."""
+    if not isinstance(position, dict) or any(type(position.get(key)) is not int
+                                           or not 0 <= position[key] <= 2**31 - 1
+                                           for key in ('line', 'character')):
+        raise ProtocolError('Invalid UTF-16 edit position')
+    line, character = position['line'], position['character']
+    start = 0
+    # LSP lines end only at CR/LF, not every Unicode separator splitlines uses.
+    if line:
+        for number, match in enumerate(re.finditer(r'\r\n|\r|\n', text), 1):
+            if number == line:
+                start = match.end()
+                break
+        else:
+            raise ProtocolError('Edit line is outside the synchronized document')
+    end = start
+    units = 0
+    while end < len(text) and text[end] not in '\r\n':
+        if units == character:
+            return end
+        width = 2 if ord(text[end]) > 0xFFFF else 1
+        if units + width > character:
+            raise ProtocolError('Edit position splits a UTF-16 surrogate pair')
+        units += width
+        end += 1
+    # The protocol clamps a character beyond line end, without entering CRLF.
+    return end
+
+
+def apply_changes(text, changes, *, synchronized=True):
+    """Apply sequential changes transactionally, retaining BOM and newline bytes.
+
+    A full replacement is required before any delta after synchronization loss.
+    Bound the number of edits and intermediate documents, not just the final one.
+    """
+    if not isinstance(changes, list) or not 1 <= len(changes) <= 1024:
+        raise ProtocolError('A change requires 1 to 1024 text updates')
+    work = 0
+    for change in changes:
+        if not isinstance(change, dict):
+            raise ProtocolError('Invalid document change')
+        replacement = editor_text(change.get('text'))
+        work += len(text) + len(replacement)
+        if work > 2 * MAX_TEXT_TOTAL:
+            raise ProtocolError('Document change work limit exceeded; send a full replacement')
+        if 'range' not in change:
+            if 'rangeLength' in change:
+                raise ProtocolError('rangeLength requires an edit range')
+            text, synchronized = replacement, True
+            continue
+        if not synchronized:
+            raise ProtocolError('A full document change is required after a synchronization error')
+        range_ = change['range']
+        if not isinstance(range_, dict):
+            raise ProtocolError('Invalid document edit range')
+        start = position_offset(text, range_.get('start'))
+        end = position_offset(text, range_.get('end'))
+        if end < start:
+            raise ProtocolError('Reversed document edit range')
+        length = change.get('rangeLength')
+        if 'rangeLength' in change and (type(length) is not int or length < 0
+                                        or length != len(text[start:end].encode('utf-16-le')) // 2):
+            raise ProtocolError('Edit rangeLength disagrees with synchronized text')
+        text = editor_text(text[:start] + replacement + text[end:])
+    return text
+
+
+
 def read_source(root, path, root_id):
     """Read a bounded regular file through no-follow directory descriptors."""
     directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -351,7 +427,8 @@ class Server:
     def publish(self, uri, diagnostics):
         params = {'uri': uri, 'diagnostics': diagnostics}
         if uri in self.documents:
-            params['version'] = self.documents[uri]['version']
+            doc = self.documents[uri]
+            params['version'] = doc['version'] if doc['synchronized'] else doc.get('sync_version', doc['version'])
         self.send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': params})
 
     def invalidate(self, uri):
@@ -474,7 +551,7 @@ class Server:
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {
                     'capabilities': {'positionEncoding': 'utf-16',
                                      'executeCommandProvider': {'commands': ['ubs.scanOpenDocuments']}, 'textDocumentSync': {
-                        'openClose': True, 'change': 1, 'save': {'includeText': True}}},
+                        'openClose': True, 'change': 2, 'save': {'includeText': True}}},
                     'serverInfo': {'name': 'ubs-lsp', 'version': '1'}}})
                 return
             if not self.initialized or self.shutdown:
@@ -534,17 +611,17 @@ class Server:
             if method == 'textDocument/didOpen':
                 if uri in self.documents or len(self.documents) >= MAX_DOCUMENTS:
                     raise ProtocolError('Duplicate document or too many open documents')
-                text, version = normalized_text(item.get('text')), item.get('version')
+                wire_text, version = editor_text(item.get('text')), item.get('version')
             elif method == 'textDocument/didChange':
                 if uri not in self.documents:
                     raise ProtocolError('Document is not open')
                 version = item.get('version')
-                if type(version) is not int or version <= self.documents[uri]['version']:
+                if type(version) is not int or version <= self.documents[uri].get('sync_version', self.documents[uri]['version']):
                     raise ProtocolError('Document version must increase')
                 changes = params.get('contentChanges')
-                if not isinstance(changes, list) or len(changes) != 1 or not isinstance(changes[0], dict) or 'range' in changes[0]:
-                    raise ProtocolError('Full document synchronization is required')
-                text = normalized_text(changes[0].get('text'))
+                doc = self.documents[uri]
+                wire_text = apply_changes(doc.get('wire_text', doc['text']), changes,
+                                          synchronized=doc['synchronized'])
             else:
                 if uri not in self.documents:
                     raise ProtocolError('Document is not open')
@@ -556,11 +633,14 @@ class Server:
                 return
             if type(version) is not int:
                 raise ProtocolError('Document version must be an integer')
-            total = sum(len(doc['text'].encode('utf-8')) for key, doc in self.documents.items() if key != uri)
-            if total + len(text.encode('utf-8')) > MAX_TEXT_TOTAL:
+            text = normalized_text(wire_text)
+            total = sum(len(doc.get('wire_text', doc['text']).encode('utf-8'))
+                        for key, doc in self.documents.items() if key != uri)
+            if total + len(wire_text.encode('utf-8')) > MAX_TEXT_TOTAL:
                 raise ProtocolError('Open document memory limit reached')
             self.invalidate(uri)
-            self.documents[uri] = {'path': path, 'text': text, 'version': version, 'generation': self.generation,
+            self.documents[uri] = {'path': path, 'text': text, 'wire_text': wire_text,
+                                   'version': version, 'sync_version': version, 'generation': self.generation,
                                    'synchronized': True}
             if method == 'textDocument/didOpen':
                 self.queue(uri)
@@ -579,6 +659,12 @@ class Server:
                 if isinstance(uri, str) and uri in self.documents:
                     self.invalidate(uri)
                     self.documents[uri]['synchronized'] = False
+                    # A rejected higher-version delta still advances the wire
+                    # high-water mark; older full replacements cannot revive it.
+                    version = item.get('version')
+                    if type(version) is int:
+                        doc = self.documents[uri]
+                        doc['sync_version'] = max(version, doc.get('sync_version', doc['version']))
                     self.publish(uri, [note('ubs.unverified', str(exc))])
                 self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {'type': 1, 'message': str(exc)}})
 

@@ -6,6 +6,7 @@ on:
     paths:
       - test-suite/patches/javascript-heap-shapes.patch.xz
       - test-suite/patches/javascript-native-identity.patch.xz
+      - test-suite/patches/javascript-native-exports.patch.xz
       - .github/workflows/javascript-heap-shapes.yml
   workflow_dispatch:
 
@@ -48,6 +49,8 @@ jobs:
                '12c81cf151445b4c9c5549f1330add88dcced924', '9a9d33f718f58312f31a51d52d31f55354b64fcd'),
               ('javascript-native-identity.patch.xz', '85bad85ebb7e10d52fb313bc5747d0248b481d3ea9132d9bc331180abadc5522',
                '2041fe7138e24143b335ad69b257dc8154c08caa', 'a23f335861108e946d825373efec2a3802d84516'),
+              ('javascript-native-exports.patch.xz', '3eb47660f1a7e36cf19ab3a489573c11202d42d238c329512a8fccdc4c0420d4',
+               'ba33ac4e17f45ebc5907dd2f66042d3a01373bf4', 'e655e6787428e83b78594faac894b3d1f1f25237'),
           ]
           for filename, digest, source_sha, test_sha in stages:
               patch = lzma.decompress(Path('test-suite/patches',filename).read_bytes())

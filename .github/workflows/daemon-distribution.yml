@@ -6,21 +6,22 @@ on:
     paths:
       - test-suite/patches/daemon-distribution.patch.gz
       - test-suite/patches/daemon-distribution-tests.py.gz
+      - test-suite/patches/daemon-install-scope.patch
       - .github/workflows/daemon-distribution.yml
   workflow_dispatch:
     inputs:
       runner:
         description: Validation runner
         type: choice
-        options: [macos-14, ubuntu-latest, ubuntu-24.04-arm]
-        default: macos-14
+        options: [ubuntu-24.04-arm, macos-14, ubuntu-latest]
+        default: ubuntu-24.04-arm
 
 permissions:
   contents: write
 
 jobs:
   validate:
-    runs-on: ${{ inputs.runner || 'macos-14' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04-arm' }}
     timeout-minutes: 25
     env:
       UBS_NO_AUTO_UPDATE: '1'
@@ -101,6 +102,9 @@ jobs:
           git apply --check "$RUNNER_TEMP/distribution.patch"
           git apply "$RUNNER_TEMP/distribution.patch"
           gzip -dc test-suite/patches/daemon-distribution-tests.py.gz > test-suite/quality/test_daemon_install.py
+          test "$(git hash-object test-suite/patches/daemon-install-scope.patch)" = 2a7e54e04f07c3c6033a6e072fc4d84e47d162d7
+          git apply --check test-suite/patches/daemon-install-scope.patch
+          git apply test-suite/patches/daemon-install-scope.patch
           git add -N test-suite/quality/test_daemon_entrypoint.py test-suite/quality/test_daemon_install.py
           python3 scripts/update_checksums.py
       - name: Exercise service, installer, updater, bundles and agent hooks
@@ -110,6 +114,7 @@ jobs:
           python3 -m unittest discover -s test-suite/quality -p test_verified_release.py -v 2>&1 | tee "$RUNNER_TEMP/distribution-release-tests.log"
           python3 -m unittest discover -s test-suite/quality -p test_verified_runtime_bundle.py -v 2>&1 | tee "$RUNNER_TEMP/distribution-bundle-tests.log"
           python3 -m unittest discover -s test-suite/quality -p test_new_module.py -v 2>&1 | tee "$RUNNER_TEMP/distribution-scaffold-tests.log"
+          python3 test-suite/install/test_claude_hook_scope.py 2>&1 | tee "$RUNNER_TEMP/distribution-hook-scope-tests.log"
       - name: Enforce unchanged gates and no new installer lint diagnostics
         run: |
           shellcheck -S warning ubs scripts/verify_checksums.sh .claude/hooks/on-file-write.sh
@@ -150,7 +155,7 @@ jobs:
                      'scripts/verify.sh', 'docs/daemon.md', '.claude/hooks/on-file-write.sh', '.github/workflows/release.yml',
                      'test-suite/quality/test_new_module.py', 'test-suite/quality/test_daemon_entrypoint.py',
                      'test-suite/quality/test_daemon_install.py', 'test-suite/quality/test_verified_release.py',
-                     'test-suite/quality/test_verified_runtime_bundle.py'}
+                     'test-suite/quality/test_verified_runtime_bundle.py', 'test-suite/install/test_claude_hook_scope.py'}
           assert set(changed) == allowed, changed
           records = []
           for name in changed:

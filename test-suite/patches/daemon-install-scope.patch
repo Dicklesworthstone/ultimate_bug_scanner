@@ -1,0 +1,27 @@
+diff --git a/test-suite/install/test_claude_hook_scope.py b/test-suite/install/test_claude_hook_scope.py
+index 25b0341..69a0f0d 100644
+--- a/test-suite/install/test_claude_hook_scope.py
++++ b/test-suite/install/test_claude_hook_scope.py
+@@ -133,7 +133,13 @@ setup_claude_code_hook
+         bin_dir = self.root / "bin"
+         bin_dir.mkdir()
+         stub = bin_dir / "ubs"
+-        stub.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$1" > "$SCAN_LOG"\nexit 0\n')
++        # Accept the scanner's options-before-path and legacy path-first
++        # forms, but retain the exact single-path boundary assertion below.
++        stub.write_text('#!/usr/bin/env bash\n'
++                        'while [[ $# -gt 0 ]]; do\n'
++                        '  case "$1" in --) shift; break;; -*) shift;; *) break;; esac\n'
++                        'done\n[[ $# -gt 0 ]] || exit 2\n'
++                        'printf "%s\\n" "$1" > "$SCAN_LOG"\nexit 0\n')
+         stub.chmod(0o755)
+         target = nested / "sample with spaces.py"
+         target.write_text("pass\n")
+@@ -309,6 +315,7 @@ class InstallerCLI(unittest.TestCase):
+             # The action path must never need the network. A full --local easy-mode
+             # install exercises maybe_setup_hook under the same HOME reproduction.
+             shutil.copy2(ROOT / "ubs", home / "ubs")
++            shutil.copy2(ROOT / "ubs-daemon", home / "ubs-daemon")
+             for index, args in enumerate((
+                 ["--setup-claude-hook", "--non-interactive"],
+                 ["--easy-mode", "--local", "--skip-ast-grep", "--skip-ripgrep", "--skip-jq", "--skip-bun",

@@ -1857,9 +1857,12 @@ def cat_9(scan: Scan, r: Renderer) -> None:
     total = len(todo) + len(fixme) + len(hack)
     breakdown = (f"TODO:{len(todo)}, FIXME:{len(fixme)}, HACK:{len(hack)}, NOTE:{len(note)}")
     markers = todo + fixme + hack
-    p = markers[0].path if markers else (str(scan.files[0]) if scan.files else "")
-    l = markers[0].line if markers else 1
-    c = markers[0].col if markers else 1
+    # One record stands for the whole selection; anchor it at the first
+    # marker by path so the location does not follow file-list order.
+    first = min(markers, key=lambda h: (h.path, h.line, h.col)) if markers else None
+    p = first.path if first else (str(scan.files[0]) if scan.files else "")
+    l = first.line if first else 1
+    c = first.col if first else 1
     if total > 20:
         r.finding("warning", total, "Significant technical debt", breakdown)
         scan.emit("rust.code-quality.tech-debt", 9, "warning", total, "Significant technical debt",

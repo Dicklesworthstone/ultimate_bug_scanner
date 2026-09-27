@@ -263,13 +263,6 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if not path.is_file() or path.suffix.lower() not in EXTS:
             continue
-        try:
-            path.relative_to(BASE_DIR)
-        except ValueError:
-            pass  # outside the scan root: the heredoc's glob never applied SKIP_DIRS there
-        else:
-            if should_skip(path):
-                continue
         issues: list[tuple[str, int, str]] = []
         analyze(path, issues)
         for rel, line_no, code in issues:

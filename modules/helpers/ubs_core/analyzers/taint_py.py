@@ -2096,7 +2096,10 @@ class _Project:
         seen, offset = set(), 0
         for path in files:
             path = Path(path).resolve()
-            if path in seen or path.suffix.lower() not in EXTS or should_skip(path):
+            # The caller selected these files (iter_files or runner discovery);
+            # re-applying SKIP_DIRS to the absolute path dropped every file
+            # under an ancestor named build/, dist/, ... (GH #151).
+            if path in seen or path.suffix.lower() not in EXTS:
                 continue
             seen.add(path)
             try:
@@ -2247,7 +2250,9 @@ def iter_files(root: Path):
         return
     for path in root.rglob('*'):
         if not path.is_file(): continue
-        if should_skip(path): continue
+        # Prune below the walk root only: the checkout may itself live under
+        # a directory named build/ or dist/ (GH #151).
+        if should_skip(path.relative_to(root)): continue
         if path.suffix.lower() in EXTS: yield path
 
 

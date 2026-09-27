@@ -224,8 +224,6 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if path.suffix != ".rb":
             continue
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
         try:
             issues = analyze_file(path)
         except OSError:

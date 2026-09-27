@@ -206,8 +206,6 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if path.suffix.lower() not in {".kt", ".kts"}:
             continue
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:

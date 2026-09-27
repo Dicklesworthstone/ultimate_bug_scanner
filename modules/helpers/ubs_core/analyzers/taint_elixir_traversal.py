@@ -17,9 +17,8 @@ Adaptations vs the heredoc (detection logic untouched):
   derived from sys.argv at import time.
 - analyze() delegates the per-file loop to scan_file_findings() so main() and
   run() share one copy of the detection logic.
-- run(ctx) skips a file only when its cwd-relative parts hit SKIP_DIRS; the
-  heredoc computes the same check against its own ROOT, while ctx.files are
-  handed in by the caller (self-test tempdirs live outside the project).
+- run(ctx) scans every ctx.files entry: the caller's discovery already
+  applied exclusions, and SKIP_DIRS only prunes main()'s own directory walk.
 """
 from __future__ import annotations
 
@@ -251,17 +250,10 @@ _MESSAGE = "Request-derived path reaches file read/write/serve sink"
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    cwd = Path.cwd().resolve()
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
         resolved = path.resolve()
-        try:
-            parts = resolved.relative_to(cwd).parts
-        except ValueError:
-            parts = ()
-        if any(part in SKIP_DIRS for part in parts):
-            continue
         for line_no, col, code in scan_file_findings(path):
             yield {
                 "rule": "elixir.taint.request_path_traversal",

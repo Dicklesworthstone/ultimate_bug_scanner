@@ -268,8 +268,6 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
-        if should_skip(path):
-            continue
         rel = path.resolve()
         issues = []
         analyze(path, issues)

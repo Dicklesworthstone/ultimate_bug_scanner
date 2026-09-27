@@ -33,7 +33,6 @@ from typing import Iterable, Iterator
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
-SKIP_DIRS = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
 
 RULE = "js.type-coercion.invalid-typeof"
 CATEGORY_ID = "js.type-coercion"
@@ -207,16 +206,8 @@ def scan_file_findings(path: Path) -> Iterator[tuple[int, int, str]]:
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    cwd = Path.cwd()
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
-            continue
-        # mirror the heredoc's skip_dirs relative to the scan root (cwd)
-        try:
-            rel_parts = path.resolve().relative_to(cwd).parts
-        except ValueError:
-            rel_parts = ()
-        if any(part in SKIP_DIRS for part in rel_parts):
             continue
         rel = path.resolve()
         for line, col, _literal in scan_file_findings(path):

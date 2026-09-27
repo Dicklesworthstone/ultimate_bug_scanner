@@ -118,9 +118,6 @@ def run(ctx: RunContext) -> Iterable[dict]:
             resolved = path.resolve()
         except OSError:
             continue
-        rel_parts = resolved.relative_to(cwd).parts if resolved.is_relative_to(cwd) else ()
-        if any(part in SKIP_DIRS for part in rel_parts):
-            continue
         rel = str(resolved.relative_to(cwd)) if resolved.is_relative_to(cwd) else str(path)
         for line, col in scan_file(path):
             yield {

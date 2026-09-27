@@ -245,24 +245,76 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
     digest = hashlib.sha256()
     total = 0
     seen = set()
+    checked = []
+    absent = []
+    tools = []
+
+    def stamp(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns)
+
+    def open_nofollow(path):
+        # Anchor every component, not just the final filename. A parent
+        # swapped for a symlink cannot redirect the byte read outside the
+        # graph. O_NONBLOCK prevents a stat-to-open FIFO swap from hanging.
+        path = path.absolute()
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = os.open(path.anchor, directory_flags)
+        try:
+            for part in path.parts[1:-1]:
+                child = os.open(part, directory_flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            if len(path.parts) > 1:
+                child = os.open(path.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = child
+            result, descriptor = descriptor, None
+            return result
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
     roots = [root, scanner, scanner.parent / 'modules']
     config = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config')))
     # Global Git excludes can change file selection without a project edit.
     for extra in (Path.home() / '.gitconfig', Path.home() / '.gitignore', config / 'git'):
+        if extra.is_symlink():
+            return None
         digest.update(os.fsencode(str(extra)) + (b'1' if extra.exists() else b'0'))
         if extra.exists():
             roots.append(extra)
+        else:
+            absent.append(extra)
+            # An optional file may be created and removed during hashing.
+            # Guard its nearest existing parent as well as final absence.
+            parent = extra.parent
+            try:
+                while not parent.exists():
+                    if parent == parent.parent:
+                        return None
+                    parent = parent.parent
+                parent_info = parent.lstat()
+                if not stat.S_ISDIR(parent_info.st_mode):
+                    return None
+                checked.append((parent, stamp(parent_info)))
+            except OSError:
+                return None
     # Track tool replacement and ordinary in-place upgrades (ctime cannot be
     # restored with utime). Source/runtime inputs themselves are byte-hashed.
-    for name in ('bash', 'python3', 'jq', 'rg', 'ast-grep', 'node', 'go', 'ruff', 'semgrep', 'shellcheck', 'typos'):
+    for name in ('bash', 'python3', 'git', 'jq', 'rg', 'ast-grep', 'node', 'go', 'ruff', 'semgrep', 'shellcheck', 'typos'):
         executable = shutil.which(name)
         digest.update(name.encode() + b'\0' + os.fsencode(executable or '') + b'\0')
         if executable:
             try:
                 info = Path(executable).stat()
-                digest.update(str((info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)).encode())
+                tool_stamp = stamp(info)
+                digest.update(repr(tool_stamp).encode())
             except OSError:
                 return None
+        else:
+            tool_stamp = None
+        tools.append((name, executable, tool_stamp))
     try:
         for base in roots:
             if not base.exists():
@@ -277,6 +329,8 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
                 if len(seen) > MAX_SNAPSHOT_ENTRIES:
                     return None
                 info = path.lstat()
+                before = stamp(info)
+                checked.append((path, before))
                 digest.update(os.fsencode(str(path)) + b'\0')
                 digest.update(str((info.st_dev, info.st_ino, info.st_mode, info.st_size)).encode() + b'\0')
                 if stat.S_ISLNK(info.st_mode):
@@ -287,22 +341,36 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
                         continue
                     children = []
                     remaining = MAX_SNAPSHOT_ENTRIES - len(seen) - len(pending)
-                    for child in path.iterdir():
-                        if len(children) >= remaining:
+                    descriptor = open_nofollow(path)
+                    try:
+                        if stamp(os.fstat(descriptor)) != before:
                             return None
-                        children.append(child)
+                        # scandir is incremental; listdir/Path.iterdir may
+                        # allocate the whole directory before this budget.
+                        with os.scandir(descriptor) as entries:
+                            for entry in entries:
+                                check_cancelled(cancel)
+                                if len(children) >= remaining:
+                                    return None
+                                children.append(path / entry.name)
+                        if stamp(os.fstat(descriptor)) != before:
+                            return None
+                    finally:
+                        os.close(descriptor)
                     pending.extend(sorted(children, reverse=True))
                 elif stat.S_ISREG(info.st_mode):
                     if path.name == '.git':
                         return None  # Linked worktree metadata is outside root.
                     if info.st_size > MAX_SNAPSHOT - total:
                         return None
-                    before = (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
                     git_config = (path.name == '.gitconfig' or path == config / 'git' / 'config'
                                   or path.parent.name == '.git' and path.name in {'config', 'config.worktree'})
                     config_tail = b''
-                    with path.open('rb') as stream:
-                        while chunk := stream.read(65536):
+                    descriptor = open_nofollow(path)
+                    try:
+                        if stamp(os.fstat(descriptor)) != before:
+                            return None
+                        while chunk := os.read(descriptor, min(65536, MAX_SNAPSHOT - total + 1)):
                             check_cancelled(cancel)
                             total += len(chunk)
                             if total > MAX_SNAPSHOT:
@@ -316,12 +384,33 @@ def snapshot(root: Path, scanner: Path, *, cancel: threading.Event | None = None
                                 if b'include' in contents or b'excludesfile' in contents:
                                     return None
                                 config_tail = contents[-16:]
-                    info = path.stat()
-                    if before != (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns):
-                        return None
+                        if stamp(os.fstat(descriptor)) != before:
+                            return None
+                    finally:
+                        os.close(descriptor)
                     digest.update(b'\0')
                 else:
                     return None
+        # Verifying each file immediately after reading it is insufficient:
+        # an earlier file can change while later sources/runtime are hashed.
+        # A cache hit must reject that mixed-generation snapshot too.
+        for path, before in checked:
+            check_cancelled(cancel)
+            if stamp(path.lstat()) != before:
+                return None
+            descriptor = open_nofollow(path)
+            try:
+                if stamp(os.fstat(descriptor)) != before:
+                    return None
+            finally:
+                os.close(descriptor)
+        for path in absent:
+            if path.exists() or path.is_symlink():
+                return None
+        for name, executable, before in tools:
+            check_cancelled(cancel)
+            if shutil.which(name) != executable or (executable and stamp(Path(executable).stat()) != before):
+                return None
         return digest.hexdigest()
     except OSError:
         return None

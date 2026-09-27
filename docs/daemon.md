@@ -46,6 +46,14 @@ also disable reuse. Python text reports can include live dependency audits;
 they are not reused unless the caller explicitly selects native-only analysis
 with `ENABLE_UV_TOOLS=0`. The frontend never silently disables those tools.
 
+Cache snapshots verify the entire input inventory again after hashing, not only
+each file immediately after its read. Concurrent changes to earlier sources,
+directory inventories, optional global policy files or tool executables
+(including Git) invalidate reuse. Reads use nonblocking, component-wise
+no-follow descriptors, so file/parent symlink substitutions and FIFO swaps do
+not redirect or block snapshot reads. A failed snapshot causes an ordinary scan;
+it is never a clean result. These are input observations, not filesystem freezes.
+
 The toolchain and other external configuration that its programs load remain
 trusted session inputs; restart the daemon after changing tool libraries or
 external tool configuration. For installed scanners without an adjacent `modules`
@@ -54,7 +62,7 @@ it is not included in exported portable runtimes or installed by `install.sh`.
 
 Misses still run the standard CLI, preserving its verified modules and existing
 Merkle cache. This does not claim sub-100 ms edited-file scans: keeping parsers
-and analysis state warm and native recursive filesystem watching remain K4 work. Scanner
+and analysis state warm remains K4 work. Scanner
 wall time is bounded (`--scan-timeout`, default 120 seconds); outputs are capped
 at 8 MiB per stream and timeout/overflow yields an environment error, not a
 truncated clean report. Requests and retained report memory are also bounded.
@@ -223,7 +231,7 @@ reuse whole reports, preserving the existing project-tool execution policy.
 Events expose `selection: "directory"`, the original scan `paths`, and `.` in
 `watch_inputs`. Explicit-file events use `selection: "files"`.
 
-This is bounded byte/metadata polling, not OS-native filesystem notification.
+The default is bounded byte/metadata polling; Linux notifications are opt-in below.
 External Git metadata (for example linked-worktree administration), global
 configuration and tool installations outside the served root are not observed;
 restart the watcher after changing those inputs. Large repositories with vendor
@@ -259,8 +267,8 @@ Every event includes `watch_inputs` separately from the unchanged scan `paths`.
 Dependency-only edits also cancel obsolete requests. A restored exact snapshot
 may reuse a valid report, but it is emitted under the new observation generation.
 
-This remains polling, not a warmed analysis engine. Unnamed dependencies,
-configuration, ignore files and tools do **not** trigger a new generation;
+This is not a warmed analysis engine. In explicit-file polling mode, unnamed
+dependencies, configuration, ignore files and tools do **not** trigger a new generation;
 restart the watcher after changing those inputs or name them explicitly.
 Keep generated reports, cache directories and service sockets outside watched
 trees to avoid self-triggered rescans or special-file errors. The underlying
@@ -268,6 +276,40 @@ scanner still owns dependency analysis and cache validation on every request.
 The source fingerprint is an observation marker, not a certificate that the
 entire repository or external tool environment is unchanged. No edited-file
 latency improvement is claimed.
+
+### Linux filesystem notifications
+
+```bash
+./ubs-daemon watch --repo /path/to/project --watch-backend=inotify \
+  --watch-reconcile=5 src/
+```
+
+`--watch-backend=poll` remains the default. `inotify` selects Linux kernel
+notifications and fails explicitly if the API, procfs descriptor access or watch
+quota is unavailable. `auto` attempts the same backend and falls back to byte
+polling on backend failure; it does not launch a fallback scanner. The event
+envelope's `observer` object reports the active `backend`, fallback `reason`,
+`reconcile_seconds`, `byte_passes`, `event_batches` and `resyncs`.
+
+Notifications wake the observer without re-reading unchanged source on every
+idle tick. Directory marks discover additions and moves; file-inode marks also
+cover writes through hard links. Lexical-parent marks cover symlink replacement.
+Every byte observation rebuilds the subscription graph, including moved-in
+subdirectories. Overflow, lost watches or a saturated event drain force a fresh
+observation rather than being interpreted as an unchanged tree. Backend resources
+are bounded and released on rebuild or shutdown. Conservative parent notifications
+can cause extra unchanged-source rescans, but never broaden the scan target list.
+
+A quiet notification stream is **not** proof that bytes are unchanged. Inotify
+does not cover all remote-filesystem or memory-mapped writes, and mount changes
+can hide watched inodes (see `inotify(7)`, Limitations and caveats). The observer
+therefore retains periodic full byte reconciliation, default five seconds of
+idle time (`--watch-reconcile`, 0.1 to 60 seconds). Event-invisible edits may wait
+until that reconciliation; select polling for workloads requiring its shorter
+configured observation interval. Every scan dispatch and result publication
+still forces a full byte check, regardless of notification silence. Changes
+during subscription setup invalidate the observation. Existing source limits,
+confinement, debounce, cancellation and failure policy remain in force.
 
 Validation:
 

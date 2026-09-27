@@ -33,7 +33,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply exact reviewed shape, identity and summary-template increments
+      - name: Apply exact reviewed shape, identity and scheduled-summary increments
         run: |
           python3 - <<'PY'
           import hashlib
@@ -65,9 +65,9 @@ jobs:
           # Never replace a newer or unrecognized implementation.
           assert blob(source) == 'ba33ac4e17f45ebc5907dd2f66042d3a01373bf4'
           assert blob(tests) == 'e655e6787428e83b78594faac894b3d1f1f25237'
-          apply('javascript-heap-templates.patch.xz', 'd4333f4bc0d2ac09cce51fbd816bb4d19e6911ee05370cbfe52d8fb230537e6e')
-          assert blob(source) == '265268ff924bcf8aefe06c9f926afa4ca17e872d'
-          assert blob('test-suite/quality/test_taint_js_heap.py') == '0de8ec7d2e63f06c3a844726cf63258bcd3e8ed4'
+          apply('javascript-heap-templates.patch.xz', '63da65df02dd0f59a81ed3945b3cad5d6ea86d1df5c02ecf8a375d11e5858973')
+          assert blob(source) == 'be3183c0a46d9e6de0100c3d65eb41ad5f005e00'
+          assert blob('test-suite/quality/test_taint_js_heap.py') == 'd66a1ed2161ad4b0f9c202a8e2474eb665403d1b'
           print('JS_SHAPES_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),flush=True)
           PY
           python3 scripts/update_checksums.py

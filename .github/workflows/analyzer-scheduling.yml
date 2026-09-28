@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   validate-scope:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 20
     # Publish immutable blobs after validation, never commits or branch refs.
     permissions:
@@ -71,7 +71,8 @@ jobs:
           streamed=dict(integrated)
           streamed.update({
               'modules/helpers/ubs_core/registry.py':'ab169a35d198450a1ed25bd6ddcfe0fba4a319ed',
-              'test-suite/quality/test_analyzer_streaming.py':'bc694f42389bc44443a838284eb32d70f7a4b1ed',
+              'modules/helpers/ubs_core/cli.py':'79419b740c573b40d58dfa41c2d5a85631a1edd1',
+              'test-suite/quality/test_analyzer_streaming.py':'5aa1b21163a0bc7d8c80844f88c309b88f88418c',
           })
           if not any(all(blob(path)==sha for path,sha in state.items()) for state in (final,integrated,streamed)):
               if not all(blob(path)==sha for path,sha in expected.items()):
@@ -91,7 +92,7 @@ jobs:
           if not all(blob(path)==sha for path,sha in streamed.items()):
               assert all(blob(path)==sha for path,sha in integrated.items()),'Integrated source changed'
               patch=lzma.decompress(Path('test-suite/patches/core-streaming.patch.xz').read_bytes())
-              assert hashlib.sha256(patch).hexdigest()=='fe1e7a95ad4cd8c63a9e85d04181fc9ce8550f2651ec80acbc52370d50c74cfc'
+              assert hashlib.sha256(patch).hexdigest()=='be2e006f70b351588f3c9a5b61d3392ba4e30384dc17ec594e9c672c7c4b74e9'
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
           assert all(blob(path)==sha for path,sha in streamed.items()),'Streaming source changed'

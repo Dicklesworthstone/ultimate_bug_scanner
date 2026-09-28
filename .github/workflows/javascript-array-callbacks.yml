@@ -15,7 +15,6 @@ permissions:
 
 jobs:
   callback-regressions:
-    # Independent runner pool; retain every source/native/integrity assertion.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     # Temporary immutable object publication only; no commits or ref writes.
@@ -115,6 +114,7 @@ jobs:
           python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
           python3 test-suite/quality/test_python_command_injection_dataflow.py
           python3 test-suite/shareable/test_contract_checksums.py
+          python3 -m unittest discover -s test-suite/quality -p 'test_helper_python_floor.py' -v
           shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
           for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
       - name: Verify deterministic regeneration and publish tested immutable objects

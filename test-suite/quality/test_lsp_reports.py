@@ -109,6 +109,120 @@ class ReportTests(unittest.TestCase):
             self.render(report)
 
 
+class RoutingTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path('/project')
+        self.a = self.root / 'src/a.py'
+        self.b = self.root / 'src/b.py'
+
+    def finding(self, path, rule, **fields):
+        return dict({'rule_id': rule, 'file': str(path), 'line': 1,
+                     'severity': 'warning', 'message': rule}, **fields)
+
+    def report(self, records, **fields):
+        return dict({'status': 'ok', 'project': str(self.root),
+                     'totals': {'files': 2}, 'findings': records}, **fields)
+
+    def render(self, report, path, paths=None, **options):
+        return lsp.report_diagnostics(report, path, self.root, '\ufeffvalue😀\nnext\n', 1,
+                                      selected_paths=paths or (self.a, self.b), **options)
+
+    def test_relative_sibling_findings_use_the_selected_file_project_parent(self):
+        report = self.report([self.finding('b.py', 'test.sibling')], project=str(self.a))
+        diagnostics = self.render(report, self.b)
+        self.assertEqual([d['code'] for d in diagnostics], ['test.sibling'])
+        self.assertEqual(diagnostics[0]['range']['end'], {'line': 0, 'character': 8})
+        self.assertEqual(self.render(report, self.a), [])
+
+    def test_ambiguous_basename_is_not_invented_as_two_source_locations(self):
+        root_b = self.root / 'b.py'
+        report = self.report([self.finding('b.py', 'test.ambiguous')], project=str(self.root / 'src'))
+        for path in (root_b, self.b):
+            diagnostics = self.render(report, path, paths=(root_b, self.b))
+            self.assertEqual([d['code'] for d in diagnostics], ['ubs.incomplete-display'])
+            self.assertIn('1 additional findings', diagnostics[0]['message'])
+
+    def test_project_and_advisory_records_preserve_global_report_order(self):
+        records = [self.finding(self.b, 'b.first'),
+                   self.finding('', 'project', scope='project_aggregate', count=3),
+                   self.finding(self.a, 'a.first'),
+                   self.finding(self.a, 'suppressed', suppressed=True),
+                   self.finding(self.b, 'b.second')]
+        report = self.report(records, ast_findings=[self.finding(self.a, 'ast.a'),
+                                                   self.finding('', 'ast.project', scope='project')])
+        index = lsp.ReportIndex(report, self.root, (self.a, self.b), 1)
+        self.assertEqual([d['code'] for d in self.render(report, self.a, _index=index)],
+                         ['project', 'a.first', 'ast.a', 'ast.project'])
+        self.assertEqual([d['code'] for d in self.render(report, self.b, _index=index)],
+                         ['b.first', 'project', 'b.second', 'ast.project'])
+        self.assertEqual(sum(map(len, index.by_path.values())), 4)
+        self.assertEqual(len(index.shared), 2)
+        self.assertIs(index.by_path[self.b][0][1], records[0])
+
+    def test_absolute_paths_are_not_ambiguous_and_foreign_records_stay_visible(self):
+        report = self.report([self.finding(self.b, 'b.exact'), self.finding('/outside/a.py', 'foreign')],
+                             project=str(self.a))
+        for path, expected in ((self.a, ['ubs.incomplete-display']),
+                               (self.b, ['b.exact', 'ubs.incomplete-display'])):
+            self.assertEqual([d['code'] for d in self.render(report, path)], expected)
+
+    def test_display_limit_counts_omissions_per_document_without_losing_shared_records(self):
+        records = [self.finding(self.a, f'a.{i}') for i in range(5)]
+        records += [self.finding(self.b, 'b.only'), self.finding('', 'shared', scope='project', count=1)]
+        report = self.report(records)
+        index = lsp.ReportIndex(report, self.root, (self.a, self.b), 1)
+        with patch.object(lsp, 'MAX_DIAGNOSTICS', 4):
+            a = self.render(report, self.a, _index=index)
+            b = self.render(report, self.b, _index=index)
+        self.assertEqual([d['code'] for d in a], ['a.0', 'a.1', 'a.2', 'ubs.incomplete-display'])
+        self.assertIn('3 additional findings', a[-1]['message'])
+        self.assertEqual([d['code'] for d in b], ['b.only', 'shared'])
+
+    def test_late_malformed_record_invalidates_whole_report_not_only_its_owner(self):
+        for change in ({'line': True}, {'rule_id': ''}, {'message': None},
+                       {'severity': []}, {'suppressed': 'false'}):
+            report = self.report([self.finding(self.a, 'valid'), self.finding(self.b, 'invalid', **change)])
+            with self.subTest(change=change), self.assertRaises(lsp.ProtocolError):
+                self.render(report, self.a)
+
+    def test_bad_source_line_in_another_group_member_prevents_result_publication(self):
+        report = self.report([self.finding(self.b, 'outside-lines', line=99)])
+        index = lsp.ReportIndex(report, self.root, (self.a, self.b), 1)
+        with self.assertRaisesRegex(lsp.ProtocolError, 'outside the saved'):
+            {path: self.render(report, path, _index=index) for path in (self.a, self.b)}
+
+    def test_cancellation_interrupts_routing_and_empty_document_rendering(self):
+        class CancelAfter:
+            def __init__(self):
+                self.calls = 0
+
+            def is_set(self):
+                self.calls += 1
+                return self.calls >= 12
+
+        cancel = CancelAfter()
+        report = self.report([self.finding(self.a, 'test') for _ in range(100)])
+        with self.assertRaisesRegex(lsp.ProtocolError, 'cancelled'):
+            lsp.ReportIndex(report, self.root, (self.a, self.b), 1, cancel=cancel)
+        self.assertEqual(cancel.calls, 12)
+        token = threading.Event()
+        report = self.report([self.finding(self.a, 'test')])
+        index = lsp.ReportIndex(report, self.root, (self.a, self.b), 1, cancel=token)
+        token.set()
+        with self.assertRaisesRegex(lsp.ProtocolError, 'cancelled'):
+            self.render(report, self.b, _index=index)
+
+    def test_indexed_rendering_retains_unicode_byte_budget_and_omission_notice(self):
+        report = self.report([self.finding(self.a, 'large', message='🦀' * 8000) for _ in range(100)])
+        index = lsp.ReportIndex(report, self.root, (self.a, self.b), 1)
+        diagnostics = self.render(report, self.a, _index=index)
+        self.assertLess(len(diagnostics), 100)
+        self.assertEqual(diagnostics[-1]['code'], 'ubs.incomplete-display')
+        self.assertLess(len(lsp.frame({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics',
+                                      'params': {'uri': self.a.as_uri(), 'diagnostics': diagnostics}})), lsp.MAX_MESSAGE)
+        self.assertEqual(self.render(report, self.b, _index=index), [])
+
+
 class EditorTransitionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix='ubs-lsp-report-')
@@ -187,6 +301,37 @@ class EditorTransitionTests(unittest.TestCase):
         reports = [m['params'] for m in messages[before:] if m.get('method') == 'textDocument/publishDiagnostics']
         self.assertEqual(len(reports), 2)
         self.assertTrue(all(r['diagnostics'][0]['code'] == 'ubs.unverified' for r in reports))
+
+    def test_group_scan_validates_each_finding_once_not_once_per_document(self):
+        # Count record access at the existing scan boundary, not calls to a new
+        # implementation-specific API. The old implementation fails this bound.
+        accesses = [0]
+
+        class CountedFinding(dict):
+            def get(self, key, default=None):
+                accesses[0] += 1
+                return super().get(key, default)
+
+        decode = lsp.decode_json
+
+        def instrument(raw):
+            report = decode(raw)
+            report['findings'] = [CountedFinding(record) for record in report['findings']]
+            return report
+
+        documents = {}
+        for index in range(64):
+            path = self.root / f'{index}.py'
+            path.write_text('BUG\n')
+            documents[path.as_uri()] = {'path': path, 'text': 'BUG\n', 'wire_text': 'BUG\n',
+                                        'synchronized': True, 'generation': 1, 'version': 1}
+        info = self.root.stat()
+        with patch.object(lsp, 'decode_json', side_effect=instrument):
+            result = lsp.scan(self.scanner, self.root, documents, (info.st_dev, info.st_ino),
+                              5, threading.Event())
+        self.assertEqual(len(result), 64)
+        self.assertTrue(all([d['code'] for d in value[0]] == ['test.unsafe'] for value in result.values()))
+        self.assertLessEqual(accesses[0], 12 * 64, f'{accesses[0]} record accesses for 64 findings')
 
 
 if __name__ == '__main__':

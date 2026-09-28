@@ -111,10 +111,16 @@ class WorkspaceTests(Fixture):
     def test_disk_change_after_group_completion_invalidates_all_members(self):
         self.prepare()
         self.group()
-        self.group_running()
-        until = time.monotonic() + 3
-        while self.server.batch and not self.server.batch[0].done() and time.monotonic() < until:
-            time.sleep(0.02)
+        # Do not tick while waiting: a fast scanner must remain completed but
+        # unpublished until the external edit has happened.
+        self.server.batch_due = 0
+        self.server.tick()
+        self.assertIsNotNone(self.server.batch)
+        result = self.server.batch[0].result(timeout=5)
+        self.assertEqual(result[self.uri][0], [])
+        self.assertEqual(result[self.sink_uri][0][0]['code'], 'python.test.group')
+        for uri in (self.uri, self.sink_uri):
+            self.assertEqual(self.reports(uri)[-1]['diagnostics'][0]['code'], 'ubs.pending')
         self.source.write_text('changed after scan\n')
         self.wait()
         for uri in (self.uri, self.sink_uri):

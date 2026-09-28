@@ -281,10 +281,14 @@ class DiagnosticsTests(Fixture):
 
     def test_source_changed_between_completion_and_publication_is_not_clean(self):
         self.open()
-        self.running()
-        until = time.monotonic() + 3
-        while not all(future.done() for future in self.server.active) and time.monotonic() < until:
-            time.sleep(0.01)
+        # Dispatch exactly once. running() also ticks completion and can publish
+        # a fast scan before this test reaches the intended publication gap.
+        self.server.tick()
+        self.assertEqual(len(self.server.active), 1)
+        future = next(iter(self.server.active))
+        result = future.result(timeout=5)
+        self.assertEqual(result[self.uri][0], [])
+        self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'ubs.pending')
         self.source.write_text('BUG edited outside editor\n')
         self.wait()
         self.assertEqual(self.reports()[-1]['diagnostics'][0]['code'], 'ubs.unverified')

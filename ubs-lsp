@@ -11,6 +11,7 @@ import argparse
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import heapq
 import json
 import os
 from pathlib import Path
@@ -235,82 +236,115 @@ def note(code, message, severity=2):
             'severity': severity, 'code': code, 'source': 'ubs', 'message': message[:8192]}
 
 
-def report_diagnostics(report, path, root, text, exit_code, *, selected_paths=()):
-    if not isinstance(report, dict) or report.get('status') != 'ok' or report.get('failed_modules'):
-        raise ProtocolError('Scanner returned an incomplete or failed report')
-    totals = report.get('totals')
-    if not isinstance(totals, dict) or type(totals.get('files')) is not int or totals['files'] < 1:
-        raise ProtocolError('Scanner did not verify any source files')
-    records = report.get('findings')
-    # findings_merge leaves a successful zero-count summary unchanged when
-    # no producer emitted a finding sink. An absent array is valid only with
-    # explicit, integer zero counters and successful execution. Null/malformed
-    # arrays, omitted counters and unaccounted findings must still fail closed.
-    if 'findings' not in report and exit_code == 0 and all(
-            type(totals.get(severity)) is int and totals[severity] == 0
-            for severity in ('critical', 'warning', 'info')):
-        scanners = report.get('scanners', [])
-        if not isinstance(scanners, list) or any(
-                not isinstance(scanner, dict) or any(
-                    type(scanner.get(severity, 0)) is not int or scanner.get(severity, 0) != 0
-                    for severity in ('critical', 'warning', 'info'))
-                for scanner in scanners):
-            raise ProtocolError('Scanner counters disagree with the empty findings ledger')
-        records = []
-    ast_records = report.get('ast_findings', [])
-    if not isinstance(records, list) or not isinstance(ast_records, list):
-        raise ProtocolError('Scanner report has no valid findings ledger')
-    # A summary cannot be called clean merely because its producer omitted
-    # diagnostic records. Report-only AST evidence does not supply this credit.
-    accounted = {'critical': 0, 'warning': 0, 'info': 0}
-    for finding in records:
-        if not isinstance(finding, dict):
-            raise ProtocolError('Invalid finding record')
-        if finding.get('suppressed') is True:
-            continue
-        weight = finding.get('count') if finding.get('scope') in ('project', 'project_aggregate') else 1
-        if type(weight) is not int or weight < 0:
-            raise ProtocolError('Invalid finding occurrence count')
-        if finding.get('severity') in accounted:
-            accounted[finding['severity']] += weight
-    for severity, available in accounted.items():
-        declared = totals.get(severity, 0)
-        if type(declared) is not int or not 0 <= declared <= available:
-            raise ProtocolError('Scanner summary is not covered by its findings ledger')
-    bases = [root]
-    project = report.get('project')
-    if isinstance(project, str) and Path(project).is_absolute():
-        candidate = Path(os.path.normpath(project))
-        if candidate.is_relative_to(root):
-            bases.append(candidate.parent if candidate == path else candidate)
+class ReportIndex:
+    """Validate and route one scanner report once for its entire document group.
+
+    The index belongs to a single scan, never to a reusable result cache. Source
+    records are stored once in their owning bucket. Project records are shared
+    and merged by original ordinal when rendering, preserving report order
+    without copying the whole ledger for each document.
+    """
+    def __init__(self, report, root, paths, exit_code, *, cancel=None):
+        if not isinstance(report, dict) or report.get('status') != 'ok' or report.get('failed_modules'):
+            raise ProtocolError('Scanner returned an incomplete or failed report')
+        totals = report.get('totals')
+        if not isinstance(totals, dict) or type(totals.get('files')) is not int or totals['files'] < 1:
+            raise ProtocolError('Scanner did not verify any source files')
+        records = report.get('findings')
+        # A successful zero-count report may legitimately omit an empty sink.
+        # Missing counters and malformed/positive ledgers are not that case.
+        if 'findings' not in report and exit_code == 0 and all(
+                type(totals.get(severity)) is int and totals[severity] == 0
+                for severity in ('critical', 'warning', 'info')):
+            scanners = report.get('scanners', [])
+            if not isinstance(scanners, list) or any(
+                    not isinstance(scanner, dict) or any(
+                        type(scanner.get(severity, 0)) is not int or scanner.get(severity, 0) != 0
+                        for severity in ('critical', 'warning', 'info'))
+                    for scanner in scanners):
+                raise ProtocolError('Scanner counters disagree with the empty findings ledger')
+            records = []
+        ast_records = report.get('ast_findings', [])
+        if not isinstance(records, list) or not isinstance(ast_records, list):
+            raise ProtocolError('Scanner report has no valid findings ledger')
+        self.by_path = {path: [] for path in paths}
+        self.shared = []
+        self.omitted = 0
+        self.located = 0
+        self.cancel = cancel
+        bases = {root}
+        project = report.get('project')
+        if isinstance(project, str) and Path(project).is_absolute():
+            candidate = Path(os.path.normpath(project))
+            if candidate.is_relative_to(root):
+                # A producer may report its first selected file as project.
+                # Use that file's parent for ALL peers, not only for itself.
+                bases.add(candidate.parent if candidate in self.by_path else candidate)
+        accounted = {'critical': 0, 'warning': 0, 'info': 0}
+        ordinal = 0
+        for counted, channel in ((True, records), (False, ast_records)):
+            for finding in channel:
+                self.check()
+                ordinal += 1
+                if not isinstance(finding, dict) or type(finding.get('suppressed', False)) is not bool:
+                    raise ProtocolError('Invalid finding record')
+                if finding.get('suppressed', False):
+                    continue
+                rule, message = finding.get('rule_id'), finding.get('message')
+                severity = finding.get('severity')
+                if (not isinstance(rule, str) or not rule or not isinstance(message, str)
+                        or not isinstance(severity, str) or severity not in accounted):
+                    raise ProtocolError('Finding lacks rule, message or severity')
+                project_scoped = finding.get('scope') in ('project', 'project_aggregate')
+                if counted:
+                    weight = finding.get('count') if project_scoped else 1
+                    if type(weight) is not int or weight < 0:
+                        raise ProtocolError('Invalid finding occurrence count')
+                    accounted[severity] += weight
+                if project_scoped:
+                    self.shared.append((ordinal, finding))
+                    continue
+                source, line = finding.get('file'), finding.get('line')
+                if not isinstance(source, str) or not source or type(line) is not int or line < 1:
+                    raise ProtocolError('Finding has invalid source coordinates')
+                owners = {Path(os.path.normpath(base / source)) for base in bases} & self.by_path.keys()
+                if len(owners) != 1:
+                    # A basename matching two selected roots is ambiguous, not
+                    # permission to invent two source locations for one finding.
+                    self.omitted += 1
+                    continue
+                self.by_path[owners.pop()].append((ordinal, finding))
+                self.located += 1
+        for severity, available in accounted.items():
+            declared = totals.get(severity, 0)
+            if type(declared) is not int or not 0 <= declared <= available:
+                raise ProtocolError('Scanner summary is not covered by its findings ledger')
+        self.check()
+
+    def check(self):
+        if self.cancel is not None and self.cancel.is_set():
+            raise ProtocolError('Scan cancelled during diagnostic routing')
+
+    def findings(self, path):
+        yield from heapq.merge(self.shared, self.by_path[path], key=lambda item: item[0])
+
+
+def report_diagnostics(report, path, root, text, exit_code, *, selected_paths=(), _index=None):
+    index = _index if _index is not None else ReportIndex(report, root, (*selected_paths, path), exit_code)
+    index.check()
     lines = text.split('\n')
     diagnostics = []
     diagnostic_bytes = 0
-    omitted = 0
-    other_documents = 0
-    for finding in records + ast_records:
-        if not isinstance(finding, dict) or type(finding.get('suppressed', False)) is not bool:
-            raise ProtocolError('Invalid finding record')
-        if finding.get('suppressed', False):
-            continue
-        rule, message = finding.get('rule_id'), finding.get('message')
-        severity = finding.get('severity')
-        if not isinstance(rule, str) or not rule or not isinstance(message, str) or severity not in ('critical', 'warning', 'info'):
-            raise ProtocolError('Finding lacks rule, message or severity')
+    omitted = index.omitted
+    other_documents = index.located - len(index.by_path[path])
+    for _, finding in index.findings(path):
+        index.check()
+        rule, message, severity = finding['rule_id'], finding['message'], finding['severity']
         level = {'critical': 1, 'warning': 2, 'info': 3}[severity]
-        source = finding.get('file')
-        line = finding.get('line')
         if finding.get('scope') in ('project', 'project_aggregate'):
             diagnostic = note(rule, '[Project-level finding] ' + message, level)
         else:
-            if not isinstance(source, str) or not source or type(line) is not int or line < 1:
-                raise ProtocolError('Finding has invalid source coordinates')
-            if not any(Path(os.path.normpath(base / source)) == path for base in bases):
-                if any(Path(os.path.normpath(base / source)) in selected_paths for base in bases):
-                    other_documents += 1
-                    continue
-                omitted += 1
-                continue
+            line = finding['line']
             if line > len(lines):
                 raise ProtocolError('Finding is outside the saved document')
             content = lines[line - 1]
@@ -331,6 +365,7 @@ def report_diagnostics(report, path, root, text, exit_code, *, selected_paths=()
         diagnostics.append(note('ubs.incomplete-display', f'{omitted} additional findings are outside this document or the display limit. Run UBS to see the complete report.'))
     if exit_code == 1 and not diagnostics and not other_documents:
         diagnostics.append(note('ubs.unlocated-findings', 'UBS reported a failing scan without visible source diagnostics. Run UBS for the complete report.'))
+    index.check()
     return diagnostics
 
 
@@ -404,9 +439,10 @@ def scan(scanner, root, documents, root_id, timeout, cancel, policy=()):
     report = decode_json(output['stdout'])
     if not isinstance(report, dict) or not isinstance(report.get('totals'), dict) or report['totals'].get('files') != len(paths):
         raise ProtocolError('Scanner coverage does not match selected documents; ignored or unsupported files are not verified')
+    index = ReportIndex(report, root, paths, process.returncode, cancel=cancel)
     return {uri: (report_diagnostics(report, doc['path'], root,
                                     doc.get('wire_text', doc['text']).replace('\r\n', '\n').replace('\r', '\n'), process.returncode,
-                                    selected_paths=paths), snapshots[uri][1]) for uri, doc in documents.items()}
+                                    selected_paths=paths, _index=index), snapshots[uri][1]) for uri, doc in documents.items()}
 
 
 MAX_WORKSPACE_BYTES = 128 * 1024 * 1024

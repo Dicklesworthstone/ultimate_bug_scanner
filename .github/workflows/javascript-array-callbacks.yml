@@ -6,6 +6,7 @@ on:
     paths:
       - test-suite/patches/javascript-array-callbacks.patch.xz
       - test-suite/patches/javascript-callback-convergence.patch.xz
+      - test-suite/patches/javascript-callback-postfix.patch.xz
       - .github/workflows/javascript-array-callbacks.yml
   workflow_dispatch:
 
@@ -14,7 +15,8 @@ permissions:
 
 jobs:
   callback-regressions:
-    runs-on: ubuntu-latest
+    # Independent runner pool; retain every source/native/integrity assertion.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     # Temporary immutable object publication only; no commits or ref writes.
     permissions:
@@ -66,12 +68,18 @@ jobs:
                   apply(filename,digest)
                   assert blob(source)==sha,filename
           assert blob(source)=='be3183c0a46d9e6de0100c3d65eb41ad5f005e00'
-          apply('javascript-array-callbacks.patch.xz','75049d7a19d1492d0020d8307618a996e04af27917f0dee3006f28f68241eafc')
-          assert blob(source)=='49b2acef779f6c1aee79a0345d86d8c1f0e3b61c'
-          assert blob('test-suite/js/test_taint_callbacks.py')=='8eb4a7e2374764de07074d45d3c28d63e764fdec'
-          apply('javascript-callback-convergence.patch.xz','7c261fa850d9d41d877b0aa2d6ac521133f46fbf4a64d9517fca6f01b33575c4')
-          assert blob(source)=='348c7a3795ca86303c9445e027ab910f7c64073f'
-          assert blob('test-suite/js/test_taint_callbacks.py')=='f1664635e7ce0cfedb71ef47f1f0124892e39e6b'
+          stages=(
+              ('javascript-array-callbacks.patch.xz','75049d7a19d1492d0020d8307618a996e04af27917f0dee3006f28f68241eafc',
+               '49b2acef779f6c1aee79a0345d86d8c1f0e3b61c','8eb4a7e2374764de07074d45d3c28d63e764fdec'),
+              ('javascript-callback-convergence.patch.xz','7c261fa850d9d41d877b0aa2d6ac521133f46fbf4a64d9517fca6f01b33575c4',
+               '348c7a3795ca86303c9445e027ab910f7c64073f','f1664635e7ce0cfedb71ef47f1f0124892e39e6b'),
+              ('javascript-callback-postfix.patch.xz','57366d9c8afb6699c82311f4a6c65d710035aaf0882f42e08416e59f933c8603',
+               'eb6fc2986b46a9d09fe8876473dea5245c3f2889','05969345000772215d3f9890977a2d8dbda10d8b'),
+          )
+          for filename,digest,source_sha,test_sha in stages:
+              apply(filename,digest)
+              assert blob(source)==source_sha,filename
+              assert blob('test-suite/js/test_taint_callbacks.py')==test_sha,filename
           subprocess.run(['git','add','-N','test-suite/js/test_taint_callbacks.py'],check=True)
           PY
           python3 scripts/update_checksums.py

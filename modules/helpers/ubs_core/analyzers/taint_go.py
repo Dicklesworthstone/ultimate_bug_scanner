@@ -5,8 +5,11 @@ Statement transfers strongly update assignments, join branches and iterate
 loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
 Go type checker; imported-package calls and dynamically invoked closures are
-not resolved. Only explicitly selected files in the same directory AND package
-share summaries. Both output entrypoints consume the same finding stream.
+not resolved. JSON/XML decoders and Unmarshal propagate input through local
+destination pointers and package helper output parameters, using conservative
+aggregate writes rather than field-sensitive heap models. Only explicitly
+selected files in the same directory AND package share summaries. Both output
+entrypoints consume the same finding stream.
 """
 from __future__ import annotations
 
@@ -36,8 +39,7 @@ SOURCE_PATTERNS = [
     re.compile(r"\.(?:QueryParam|FormParam|Param)\(", re.IGNORECASE),
     re.compile(r"os\.Getenv", re.IGNORECASE),
     re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
-    re.compile(r"io\.ReadAll\([^)]*(?:r|req|request)\.Body", re.IGNORECASE),
-    re.compile(r"json\.NewDecoder\([^)]*(?:r|req|request)\.Body", re.IGNORECASE),
+    re.compile(r"\b(?:r|req|request)\.Body\b"),
 ]
 
 HTML_SANITIZERS = re.compile(
@@ -214,6 +216,28 @@ _Fact = frozenset[_Trace]
 _CLEAN: _Fact = frozenset()
 
 
+@dataclass(frozen=True)
+class _Target:
+    cell: str
+    parameter: int | None = None
+
+
+@dataclass(frozen=True)
+class _PointerKey:
+    cell: str
+
+
+@dataclass(frozen=True)
+class _DecoderKey:
+    cell: str
+
+
+@dataclass(frozen=True)
+class _DecoderInfo:
+    source: _Fact = _CLEAN
+    definite: bool = True
+
+
 def _join(*facts: _Fact) -> _Fact:
     result = {}
     for fact in facts:
@@ -240,8 +264,17 @@ def _join_states(*states):
     states = [state for state in states if state is not None]
     if not states:
         return None
-    return {name: _join(*(state.get(name, _CLEAN) for state in states))
-            for name in set().union(*(state.keys() for state in states))}
+    result = {}
+    for name in set().union(*(state.keys() for state in states)):
+        if isinstance(name, _PointerKey):
+            result[name] = frozenset().union(*(state.get(name, frozenset()) for state in states))
+        elif isinstance(name, _DecoderKey):
+            decoders = [state.get(name) for state in states]
+            result[name] = _DecoderInfo(_join(*(item.source for item in decoders if item is not None)),
+                                        all(item is not None and item.definite for item in decoders))
+        else:
+            result[name] = _join(*(state.get(name, _CLEAN) for state in states))
+    return result
 
 
 @dataclass
@@ -375,6 +408,7 @@ class _Function:
     results: tuple[str, ...]
     body: tuple[_Statement, ...]
     variadic: int | None = None
+    reference_parameters: frozenset[int] = frozenset()
 
 
 def _parameter_names(code: str) -> tuple[str, ...]:
@@ -392,6 +426,24 @@ def _parameter_names(code: str) -> tuple[str, ...]:
             names.append('')
             grouped = False
     return tuple(reversed(names))
+
+
+def _reference_parameters(code: str) -> frozenset[int]:
+    """Pointer/interface parameters may carry destinations; scalars are copies."""
+    references, reference = set(), False
+    parts = _parts(code)
+    for index in reversed(range(len(parts))):
+        start, end = parts[index]
+        part = code[start:end].strip()
+        match = re.match(r'[A-Za-z_]\w*\s+(.+)$', part, re.DOTALL)
+        if match:
+            typename = re.sub(r'\s+', '', match.group(1))
+            reference = typename.startswith('*') or typename in {'any', 'interface{}'}
+        elif not re.fullmatch(r'[A-Za-z_]\w*', part):
+            reference = False
+        if reference:
+            references.add(index)
+    return frozenset(references)
 
 
 def _functions(code: str, parser: _Parser) -> list[_Function]:
@@ -420,7 +472,8 @@ def _functions(code: str, parser: _Parser) -> list[_Function]:
         parameters = _parameter_names(code[match.end():param_end])
         functions.append(_Function(name, match.start(), end, parameters, results,
                                    parser.block(opening + 1, end - 1),
-                                   len(parameters) - 1 if '...' in code[match.end():param_end] else None))
+                                   len(parameters) - 1 if '...' in code[match.end():param_end] else None,
+                                   _reference_parameters(code[match.end():param_end])))
         covered = end
     return functions
 
@@ -430,6 +483,7 @@ class _Summary:
     returns: tuple[_Fact, ...] = ()
     effects: dict[tuple[int, str], _Fact] = field(default_factory=dict)
     variadic: int | None = None
+    writes: dict[int, _Fact] = field(default_factory=dict)
 
 
 def _join_summaries(summaries: list[_Summary]) -> _Summary:
@@ -453,10 +507,14 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
     returns = tuple(_join(*(widen(summary.returns[index]) for summary in summaries
                             if index < len(summary.returns))) for index in range(count))
     effects = {}
+    writes = {}
     for summary in summaries:
         for key, fact in summary.effects.items():
             effects[key] = _join(effects.get(key, _CLEAN), widen(fact))
-    return _Summary(returns, effects, variadic)
+        for index, fact in summary.writes.items():
+            index = min(index, variadic) if variadic is not None else index
+            writes[index] = _join(writes.get(index, _CLEAN), widen(fact))
+    return _Summary(returns, effects, variadic, writes)
 
 
 @dataclass
@@ -472,6 +530,118 @@ class _Analysis:
         self.effects = {}
         self.returns: tuple[_Fact, ...] = ()
         self.named_returns = ()
+        self.writes: dict[int, _Fact] = {}
+        self.decoder_results: dict[int, _DecoderInfo] = {}
+
+    @staticmethod
+    def unparenthesize(expr, offset=0):
+        offset += len(expr) - len(expr.lstrip())
+        expr = expr.strip()
+        while expr.startswith('(') and _pairs(_masked_source(expr)).get(0) == len(expr) - 1:
+            expr, offset = expr[1:-1], offset + 1
+            offset += len(expr) - len(expr.lstrip())
+            expr = expr.strip()
+        return expr, offset
+
+    def pointers(self, expr, state, scope):
+        expr, _ = self.unparenthesize(expr)
+        if re.fullmatch(r'[A-Za-z_]\w*', expr):
+            return state.get(_PointerKey(scope.bindings.get(expr, expr)), frozenset())
+        if expr.startswith('&'):
+            target, _ = self.unparenthesize(expr[1:])
+            match = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*',
+                                 _masked_source(target))
+            if match:
+                cell = scope.bindings.get(match.group(1), match.group(1))
+                return state.get(_PointerKey(cell), frozenset()) or frozenset({_Target(cell)})
+        return frozenset()
+
+    def decoder(self, expr, offset, state, scope):
+        expr, offset = self.unparenthesize(expr, offset)
+        if re.fullmatch(r'[A-Za-z_]\w*', expr):
+            return state.get(_DecoderKey(scope.bindings.get(expr, expr)))
+        call = re.match(r'(?:json|xml)\s*\.\s*NewDecoder\s*\(', _masked_source(expr))
+        if call and _pairs(_masked_source(expr)).get(call.end() - 1) == len(expr) - 1:
+            return self.decoder_results.get(offset)
+        return None
+
+    def write_targets(self, targets, fact, state, label):
+        # Decode can partially modify an object even when it returns an error.
+        # It can also leave omitted fields untouched. Weak aggregate writes
+        # preserve both possibilities; a clean document is not a sanitizer.
+        fact = _advance(fact, label)
+        for target in targets:
+            state[target.cell] = _join(state.get(target.cell, _CLEAN), fact)
+            if target.parameter is not None:
+                self.writes[target.parameter] = _join(self.writes.get(target.parameter, _CLEAN), fact)
+
+    def native_call(self, expr, code, match, pairs, offset, state, scope, *, whole=False):
+        """Known result shapes and output-parameter effects, never name-only Decode."""
+        root, member = match.group(1), match.group(2)
+        end = pairs.get(match.end() - 1)
+        if end is None:
+            return None
+        receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
+        standard = root not in scope.bindings
+        constructor = standard and root in {'json', 'xml'} and member == 'NewDecoder'
+        unmarshal = standard and root in {'json', 'xml'} and member == 'Unmarshal'
+        readall = standard and root in {'io', 'ioutil'} and member == 'ReadAll'
+        methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
+                   'UseNumber', 'DisallowUnknownFields', 'Buffered'}
+        method = member if receiver is not None and member in methods else None
+        chain = None
+        outer_end = end
+        if constructor:
+            chain = re.match(r'\s*\.\s*(Decode|DecodeElement|Token|RawToken|More|InputOffset|'
+                             r'UseNumber|DisallowUnknownFields|Buffered)\s*\(', code[end + 1:])
+            if chain:
+                opening = end + chain.end()
+                outer_end = pairs.get(opening)
+                if outer_end is None:
+                    return None
+        if not (constructor or unmarshal or readall or method):
+            return None
+        if whole and code[outer_end + 1:].strip():
+            return None
+
+        def arguments(start, stop):
+            values, targets = [], []
+            for left, right in _parts(code[start:stop]):
+                value = expr[start + left:start + right]
+                values.append(self.value(value, offset + start + left, state, scope))
+                targets.append(self.pointers(value, state, scope))
+            return values, targets
+
+        values, targets = arguments(match.end(), end)
+        if constructor:
+            if len(values) != 1:
+                return end, (_CLEAN,)
+            receiver = _DecoderInfo(values[0])
+            self.decoder_results[offset + match.start()] = receiver
+            if not chain:
+                return end, (_CLEAN,)
+            method = chain.group(1)
+            values, targets = arguments(end + chain.end() + 1, outer_end)
+        if unmarshal:
+            if len(values) == 2:
+                self.write_targets(targets[1], values[0], state, root + '.Unmarshal')
+            return end, (_CLEAN,)
+        if readall:
+            return end, (_join(*values), _CLEAN)
+        if method in {'Decode', 'DecodeElement'}:
+            if targets:
+                self.write_targets(targets[0], receiver.source, state, method)
+            result = (_CLEAN,)
+        elif method in {'Token', 'RawToken'}:
+            result = (receiver.source, _CLEAN)
+        elif method == 'Buffered':
+            result = (receiver.source,)
+        else:
+            result = (_CLEAN,)
+        if not receiver.definite:
+            # A join may also contain a different, unknown implementation.
+            result = (_join(*result, *values, state.get(scope.bindings.get(root, root), _CLEAN)),)
+        return outer_end, result
 
     def effect(self, offset: int, label: str, fact: _Fact):
         if fact:
@@ -491,16 +661,22 @@ class _Analysis:
         return _join(*result)
 
     def call(self, name: str, expr: str, offset: int, call_offset: int, state, scope) -> tuple[_Fact, ...]:
-        arguments = [self.value(expr[start:end], offset + start, state, scope)
-                     for start, end in _parts(_masked_source(expr))]
+        arguments, targets = [], []
+        for start, end in _parts(_masked_source(expr)):
+            arguments.append(self.value(expr[start:end], offset + start, state, scope))
+            targets.append(self.pointers(expr[start:end], state, scope))
         summary = self.summaries[name]
         if summary.variadic is not None:
             arguments = [*arguments[:summary.variadic], _join(*arguments[summary.variadic:])]
+            targets = [*targets[:summary.variadic], frozenset().union(*targets[summary.variadic:])]
         for (_sink_offset, label), fact in summary.effects.items():
             # Concrete sources are reported at the helper itself. Only an
             # input-dependent sink produces an additional call-site finding.
             dependent = frozenset(trace for trace in fact if trace.parameter is not None)
             self.effect(call_offset, label, self.instantiate(dependent, arguments, name))
+        for index, fact in summary.writes.items():
+            if index < len(targets):
+                self.write_targets(targets[index], self.instantiate(fact, arguments, name), state, name + '()')
         return tuple(self.instantiate(fact, arguments, name) for fact in summary.returns)
 
     def values(self, expr: str, offset: int, state, scope) -> tuple[_Fact, ...]:
@@ -508,6 +684,11 @@ class _Analysis:
         parts = _parts(code)
         if len(parts) > 1:
             return tuple(self.value(expr[start:end], offset + start, state, scope) for start, end in parts)
+        native = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
+        if native:
+            result = self.native_call(expr, code, native, _pairs(code), offset, state, scope, whole=True)
+            if result is not None:
+                return result[1]
         call = re.match(r'\s*([A-Za-z_]\w*)\s*\(', code)
         if call and call.group(1) in self.summaries and call.group(1) not in scope.bindings:
             end = _pairs(code).get(call.end() - 1)
@@ -594,6 +775,14 @@ class _Analysis:
             facts.extend(self.call(name, expr[match.end():end], offset + match.end(),
                                    offset + match.start(), state, scope))
             cover(match.start(), end + 1)
+        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
+            if masked[match.start()].isspace():
+                continue
+            result = self.native_call(expr, code, match, pairs, offset, state, scope)
+            if result is not None:
+                end, values = result
+                facts.extend(values)
+                cover(match.start(), end + 1)
         remaining = ''.join(masked)
         for regex, rule, label in SINKS:
             if rule != self.rule:
@@ -632,7 +821,9 @@ class _Analysis:
                 facts.append(frozenset({_Trace(source, path=(source,))}))
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)', remaining):
             name = match.group(1)
-            facts.append(state.get(scope.bindings.get(name, name), _CLEAN))
+            cell = scope.bindings.get(name, name)
+            facts.append(state.get(cell, _CLEAN))
+            facts.extend(state.get(target.cell, _CLEAN) for target in state.get(_PointerKey(cell), ()))
         return _join(*facts)
 
     def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
@@ -661,6 +852,12 @@ class _Analysis:
             targets = [name.strip() for name in match.group('targets').split(',')]
             expr_start = start + match.start('expr') - len(prefix)
             values = self.values(self.source[expr_start:end], expr_start, state, scope)
+            pieces = _parts(self.code[expr_start:end])
+            metadata = []
+            for left, right in pieces:
+                expression = self.source[expr_start + left:expr_start + right]
+                metadata.append((self.pointers(expression, state, scope),
+                                 self.decoder(expression, expr_start + left, state, scope), expression))
             declaration = match.group('op') == ':=' or bool(re.match(r'\s*(?:var|const)\b', code))
             updates = {}
             for index, target in enumerate(targets):
@@ -673,6 +870,16 @@ class _Analysis:
                 if match.group('op') == '+=':
                     fact = _join(state.get(key, _CLEAN), fact)
                 updates[key] = _advance(fact, target)
+                pointers, decoder, expression = metadata[index] if index < len(metadata) else (frozenset(), None, '')
+                if pointers and all(pointer.parameter is None for pointer in pointers):
+                    # A pointer alias observes its pointee at use time. Copying
+                    # old pointee facts here would survive a later clean reset.
+                    updates[key] = _CLEAN
+                if not pointers and (re.match(r'\s*new\s*\(', expression)
+                                     or re.match(r'\s*&\s*[A-Za-z_]\w*\s*\{', expression)):
+                    pointers = frozenset({_Target(key)})
+                updates[_PointerKey(key)] = pointers
+                updates[_DecoderKey(key)] = decoder
             state.update(updates)
             return _Flow(state)
         declaration = re.match(r'\s*var\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+[^=]+$', code)
@@ -823,12 +1030,14 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                 if parameter and parameter != '_':
                     key = scope.declare(parameter, function.start)
                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
+                    if index in function.reference_parameters:
+                        state[_PointerKey(key)] = frozenset({_Target(key, index)})
             for result in function.results:
                 if result:
                     state[scope.declare(result, function.start)] = _CLEAN
             analysis.named_returns = function.results
             analysis.block(function.body, state, scope)
-            variants.append(_Summary(analysis.returns, analysis.effects, function.variadic))
+            variants.append(_Summary(analysis.returns, analysis.effects, function.variadic, analysis.writes))
         summary = _join_summaries(variants)
         if summary != summaries[name]:
             summaries[name] = summary

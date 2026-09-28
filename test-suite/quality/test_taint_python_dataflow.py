@@ -306,7 +306,10 @@ class SuppressionTests(SourceTest):
 class RunnerIntegrationTests(unittest.TestCase):
     def test_runner_emits_taint_findings_and_safe_parameter_control(self):
         for code, expected in (("q=html.escape(input())\ncursor.execute(q)\n", True),
-                               ("q=input()\ncursor.execute('select %s', (q,))\n", False)):
+                               ("q=input()\ncursor.execute('select %s', (q,))\n", False),
+                               ("match request.get_json():\n    case {**rest}:\n        cursor.execute(rest['query'])\n", True),
+                               ("match cursor.execute:\n    case execute:\n        execute(input())\n", True),
+                               ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False)):
             with self.subTest(code=code), tempfile.TemporaryDirectory(prefix='ubs-taint-e2e-') as tmp:
                 path = Path(tmp) / 'view.py'
                 path.write_text(code)

@@ -510,6 +510,16 @@ def _scope_nodes(scope):
             todo.extend(reversed(list(ast.iter_child_nodes(node))))
 
 
+def _pattern_capture(node):
+    """Pattern targets are strings in the AST, not Name(Store) nodes."""
+    if hasattr(ast, 'MatchAs'):
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            return node.name
+        if isinstance(node, ast.MatchMapping):
+            return node.rest
+    return None
+
+
 def _local_names(scope) -> set[str]:
     names = set()
     for node in _scope_nodes(scope):
@@ -519,6 +529,8 @@ def _local_names(scope) -> set[str]:
             names.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             names.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+        elif (capture := _pattern_capture(node)) is not None:
+            names.add(capture)
     if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
         args = scope.args
         names.update(arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs))
@@ -840,6 +852,43 @@ class _Flow:
                     self.mutate(references, _advance(fact, base.id), state)
                 else:
                     state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
+
+    def bind_pattern(self, pattern, fact, state, binding=None, references=NO_REFERENCES):
+        """Bind one successful pattern without executing the subject again.
+
+        A whole-subject capture preserves callable identity and heap aliases.
+        Extracted fields use the existing field-insensitive heap abstraction,
+        but cannot inherit their container's callable/sanitizer identity. Star
+        and mapping-rest captures allocate new containers, unlike AS aliases.
+        """
+        if isinstance(pattern, ast.MatchOr):
+            alternatives = []
+            for alternative in pattern.patterns:
+                branch = state.copy()
+                self.bind_pattern(alternative, fact, branch, binding, references)
+                alternatives.append(branch)
+            state.replace(_join_states(*alternatives))
+            return
+        if isinstance(pattern, ast.MatchAs):
+            if pattern.pattern is not None:
+                self.bind_pattern(pattern.pattern, fact, state, binding, references)
+        elif isinstance(pattern, ast.MatchMapping):
+            for child in pattern.patterns:
+                self.bind_pattern(child, fact, state, references=references)
+            binding, references = None, frozenset({pattern})
+        elif isinstance(pattern, ast.MatchStar):
+            binding, references = None, frozenset({pattern})
+        elif isinstance(pattern, ast.MatchSequence):
+            for child in pattern.patterns:
+                self.bind_pattern(child, fact, state, references=references)
+        elif isinstance(pattern, ast.MatchClass):
+            for child in (*pattern.patterns, *pattern.kwd_patterns):
+                self.bind_pattern(child, fact, state, references=references)
+        name = _pattern_capture(pattern)
+        if name is not None:
+            state[name] = _advance(fact, name)
+            state.bindings[name] = binding
+            state.references[name] = references
 
     def source(self, node, state, candidate=None):
         # A supplied candidate was resolved before a call's argument effects.
@@ -1807,14 +1856,13 @@ class _Flow:
                     self.assign(target, CLEAN, state)
         elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
             subject = self.expr(node.subject, state)
+            binding = self.expression_bindings.get(node.subject)
+            references = self.expression_references.get(node.subject, NO_REFERENCES)
             branches = []
             exhaustive = False
             for case in node.cases:
                 branch = state.copy()
-                for pattern in ast.walk(case.pattern):
-                    name = getattr(pattern, 'name', None)
-                    if isinstance(name, str):
-                        branch[name] = _advance(subject, name)
+                self.bind_pattern(case.pattern, subject, branch, binding, references)
                 self.expr(case.guard, branch)
                 branches.append(self.block(case.body, branch))
                 if case.guard is None and _irrefutable_pattern(case.pattern):

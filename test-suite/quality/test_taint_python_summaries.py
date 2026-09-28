@@ -1,6 +1,8 @@
 """Module-local call/return and recursive summary regressions."""
+import ast
 import unittest
 from test_taint_python_dataflow import SourceTest
+from ubs_core.analyzers import taint_py
 
 
 class FunctionSummaryTests(SourceTest):
@@ -154,6 +156,163 @@ class FunctionSummaryTests(SourceTest):
     def test_definition_time_calls_are_analyzed(self):
         self.assert_rules('def run(value=eval(input())):\n    pass\n', 'eval')
         self.assert_rules('class Example(eval(input())):\n    pass\n', 'eval')
+
+
+class PatternCaptureTests(SourceTest):
+    def test_mapping_rest_reaches_sink_through_helper_return(self):
+        self.assert_rules('''
+            def remaining(payload):
+                match payload:
+                    case {'kind': _, **rest}:
+                        return rest
+                return {}
+            eval(remaining(request.get_json())['code'])
+        ''', 'eval')
+
+    def test_nested_mapping_rest_reaches_helper_sink(self):
+        self.assert_rules('''
+            def execute(payload):
+                match payload:
+                    case {'body': {'kind': _, **rest}}:
+                        cursor.execute(rest['query'])
+            execute(request.get_json())
+        ''', 'sql')
+
+    def test_capture_revokes_stale_sanitizer_and_function_bindings(self):
+        self.assert_rules('''
+            import html as clean
+            match other:
+                case clean:
+                    HttpResponse(clean.escape(input()))
+        ''', 'xss')
+        self.assert_rules('''
+            def clean(value):
+                return 'safe'
+            match other:
+                case clean:
+                    eval(clean(input()))
+        ''', 'eval')
+
+    def test_mapping_rest_revokes_previous_import_identity(self):
+        self.assert_rules('''
+            import html as rest
+            match payload:
+                case {**rest}:
+                    HttpResponse(rest.escape(input()))
+        ''', 'xss')
+
+    def test_whole_subject_capture_preserves_callable_identity(self):
+        self.assert_rules('''
+            match eval:
+                case execute:
+                    execute(input())
+        ''', 'eval')
+        self.assert_rules('''
+            def execute(value):
+                cursor.execute(value)
+            match execute:
+                case alias:
+                    alias(input())
+        ''', 'sql')
+
+    def test_captured_callable_is_returned_to_caller(self):
+        self.assert_rules('''
+            def executor():
+                match eval:
+                    case alias:
+                        return alias
+            executor()(input())
+        ''', 'eval')
+
+    def test_whole_subject_capture_preserves_sanitizer_identity(self):
+        self.assert_rules('''
+            import html
+            match html.escape:
+                case clean:
+                    HttpResponse(clean(input()))
+        ''')
+
+    def test_captured_string_does_not_become_callable_identity(self):
+        self.assert_rules('''
+            match 'eval':
+                case execute:
+                    execute(input())
+        ''')
+
+    def test_capture_preserves_output_object_alias(self):
+        self.assert_rules('''
+            def fill(data, code):
+                match data:
+                    case alias:
+                        alias['code'] = code
+            data = {}
+            fill(data, input())
+            eval(data['code'])
+        ''', 'eval')
+
+    def test_as_pattern_preserves_original_container_alias(self):
+        self.assert_rules('''
+            data = {}
+            match data:
+                case {} as alias:
+                    alias['code'] = input()
+            eval(data['code'])
+        ''', 'eval')
+
+    def test_mapping_rest_and_star_allocate_distinct_containers(self):
+        for subject, pattern, write in (("{'kind': 0}", "{'kind': _, **rest}", "rest['code'] = input()"),
+                                        ('[]', '[*rest]', 'rest.append(input())')):
+            with self.subTest(pattern=pattern):
+                self.assert_rules(f'data = {subject}\nmatch data:\n    case {pattern}:\n        {write}\neval(data)\n')
+                self.assert_rules(f'data = {subject}\nmatch data:\n    case {pattern}:\n        {write}\neval(rest)\n', 'eval')
+
+    def test_strong_capture_replaces_old_heap_alias(self):
+        self.assert_rules('''
+            old = {}
+            alias = old
+            match {}:
+                case alias:
+                    alias['code'] = input()
+            eval(old)
+        ''')
+
+    def test_or_pattern_joins_alias_and_fresh_container_possibilities(self):
+        self.assert_rules('''
+            data = {}
+            match data:
+                case [*alias] | alias:
+                    alias['code'] = input()
+            eval(data)
+        ''', 'eval')
+
+    def test_all_pattern_target_forms_are_lexically_local(self):
+        function = ast.parse('''
+def run(value):
+    match value:
+        case {'key': captured, **rest}:
+            pass
+        case [first, *tail] as whole:
+            pass
+        case Record(field=member):
+            pass
+''').body[0]
+        self.assertEqual(taint_py._local_names(function),
+                         {'value', 'captured', 'rest', 'first', 'tail', 'whole', 'member'})
+
+    def test_pattern_captures_respect_global_nonlocal_and_child_scopes(self):
+        function = ast.parse('''
+def run(value):
+    global external
+    nonlocal outer
+    match value:
+        case {'key': external, **outer}:
+            pass
+    def child():
+        match other:
+            case nested:
+                pass
+''').body[0]
+        self.assertEqual(taint_py._local_names(function), {'value', 'child'})
 
 
 if __name__ == "__main__":

@@ -21,9 +21,21 @@ def git_ignored_untracked(root: Path, subdir: Path) -> set[Path]:
 
     They are never in the repository, so pinning one puts a 404 into
     HELPER_ASSETS. Outside a git checkout (an exported tree) nothing is known
-    to be ignored.
+    to be ignored. Only this project's own repository counts: an exported tree
+    placed inside some other repository (a vendor/ or build directory that
+    repository ignores) would otherwise report every helper as ignored and the
+    tables would lose all of their helper pins.
     """
     try:
+        top = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True, check=False, timeout=60,
+        )
+        if top.returncode != 0:
+            return set()
+        toplevel = top.stdout.decode("utf-8", "surrogateescape").rstrip("\n")
+        if not toplevel or Path(toplevel).resolve() != root.resolve():
+            return set()
         result = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z", "--others", "--ignored",
              "--exclude-standard", "--", str(subdir.relative_to(root))],

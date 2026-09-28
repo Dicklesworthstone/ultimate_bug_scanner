@@ -103,9 +103,13 @@ done
 # Untracked files git ignores (editor backups such as foo.py.bak or foo.py~,
 # caches) are never in the repository, so they are neither walked nor allowed
 # as pins; scripts/update_checksums.py skips the same files. Outside a git
-# checkout (an exported tree) nothing is known to be ignored.
+# checkout (an exported tree) nothing is known to be ignored. Only this
+# project's own repository counts: an exported tree inside another repository
+# that ignores it (vendor/, a build dir) would otherwise have every helper
+# treated as ignored and skipped.
 declare -A GIT_IGNORED=()
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+git_toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ -n "$git_toplevel" ]] && [[ "$(cd -- "$git_toplevel" 2>/dev/null && pwd -P)" == "$(pwd -P)" ]]; then
   while IFS= read -r -d '' ignored; do
     GIT_IGNORED[$ignored]=1
   done < <(git ls-files -z --others --ignored --exclude-standard -- modules/helpers modules/lib 2>/dev/null || true)

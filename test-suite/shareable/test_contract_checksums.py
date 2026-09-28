@@ -162,6 +162,45 @@ class ContractChecksums(unittest.TestCase):
             result = verify()
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_tree_inside_an_ignoring_parent_repo_keeps_helper_pins(self) -> None:
+        # An exported tree unpacked under another repository's ignored
+        # directory (vendor/, build/) is not this project's checkout; its
+        # helpers must not all be treated as git-ignored and unpinned.
+        if shutil.which("git") is None:
+            self.skipTest("git not installed")
+        with tempfile.TemporaryDirectory(prefix="ubs-contract-parent-") as tmp:
+            parent = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(parent)], check=True, timeout=30)
+            (parent / ".gitignore").write_text("vendor/\n", encoding="utf-8")
+            root = parent / "vendor/ubs"
+            root.mkdir(parents=True)
+            self.make_tree(root)
+            verifier = root / "scripts/verify_checksums.sh"
+            shutil.copy2(REPO_ROOT / "scripts/verify_checksums.sh", verifier)
+            core = root / "modules/helpers/ubs_core"
+            core.mkdir(parents=True)
+            (core / "real.py").write_text("X = 1\n", encoding="utf-8")
+
+            result = self.generate(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for text in ((root / "ubs").read_text(encoding="utf-8"),
+                         (root / "modules/lib/ubs-common.sh").read_text(encoding="utf-8")):
+                self.assertIn("'helpers/ubs_core/real.py'", text)
+            def verify() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", str(verifier)], cwd=root, text=True,
+                    capture_output=True, check=False, timeout=60,
+                )
+
+            result = verify()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("GIT-IGNORED", result.stdout)
+            # The helper is still verified, not skipped as ignored.
+            (core / "real.py").write_text("X = 2\n", encoding="utf-8")
+            result = verify()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("CHECKSUM MISMATCH: modules/helpers/ubs_core/real.py", result.stdout)
+
     def test_checkout_pins_only_tracked_helpers(self) -> None:
         # Every HELPER_ASSETS entry is downloaded from the repository by an
         # installed ubs, so each one must be a tracked file.

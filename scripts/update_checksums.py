@@ -7,6 +7,7 @@ Updates:
 """
 import hashlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -14,6 +15,29 @@ def compute_sha256(path: Path) -> str:
     if not path.exists():
         return ""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def git_ignored_untracked(root: Path, subdir: Path) -> set[Path]:
+    """Untracked files git ignores under `subdir` (editor backups, caches).
+
+    They are never in the repository, so pinning one puts a 404 into
+    HELPER_ASSETS. Outside a git checkout (an exported tree) nothing is known
+    to be ignored.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--others", "--ignored",
+             "--exclude-standard", "--", str(subdir.relative_to(root))],
+            capture_output=True, check=False, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode != 0:
+        return set()
+    return {
+        (root / rel).resolve()
+        for rel in result.stdout.decode("utf-8", "surrogateescape").split("\0")
+        if rel
+    }
 
 def main():
     root = Path(__file__).resolve().parent.parent
@@ -92,6 +116,7 @@ def main():
 
     core_dir = modules_dir / "helpers" / "ubs_core"
     if core_dir.is_dir():
+        ignored = git_ignored_untracked(root, core_dir)
         for path in sorted(core_dir.rglob("*")):
             # Local tool caches (.ruff_cache/, .pytest_cache/, __pycache__/)
             # are not shipped: a pinned path is also a download target in
@@ -100,7 +125,7 @@ def main():
             parts = path.relative_to(core_dir).parts
             if any(part == "__pycache__" or part.startswith(".") for part in parts):
                 continue
-            if path.is_file():
+            if path.is_file() and path.resolve() not in ignored:
                 rel = "helpers/ubs_core/" + path.relative_to(core_dir).as_posix()
                 helper_map[rel] = rel
 

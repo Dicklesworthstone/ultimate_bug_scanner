@@ -100,9 +100,21 @@ for entrypoint in modules/ubs-*.sh scripts/new-module.sh; do
   fi
 done
 
+# Untracked files git ignores (editor backups such as foo.py.bak or foo.py~,
+# caches) are never in the repository, so they are neither walked nor allowed
+# as pins; scripts/update_checksums.py skips the same files. Outside a git
+# checkout (an exported tree) nothing is known to be ignored.
+declare -A GIT_IGNORED=()
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  while IFS= read -r -d '' ignored; do
+    GIT_IGNORED[$ignored]=1
+  done < <(git ls-files -z --others --ignored --exclude-standard -- modules/helpers modules/lib 2>/dev/null || true)
+fi
+
 echo ""
 echo "Verifying helper checksums..."
 while IFS= read -r -d '' helper; do
+  [[ -n "${GIT_IGNORED[$helper]:-}" ]] && continue
   if [[ ! -f "$helper" ]]; then
     echo -e "${RED}✗ CHECKSUM FILE MISSING: $helper${NC}"
     FAILED=1
@@ -161,6 +173,9 @@ done < <({
 for rel in "${!EXPECTED_HELPER_CHECKSUMS[@]}" "${!EXPECTED_COMMON_HELPER_CHECKSUMS[@]}"; do
   if [[ ! -f "modules/$rel" ]]; then
     echo -e "${RED}✗ PINNED HELPER NOT IN TREE: modules/$rel${NC}"
+    FAILED=1
+  elif [[ -n "${GIT_IGNORED[modules/$rel]:-}" ]]; then
+    echo -e "${RED}✗ PINNED HELPER IS GIT-IGNORED (never shipped): modules/$rel${NC}"
     FAILED=1
   fi
 done

@@ -117,6 +117,51 @@ class ContractChecksums(unittest.TestCase):
                 for cache in (".ruff_cache", "__pycache__", ".pytest_cache"):
                     self.assertNotIn(cache, text)
 
+    def test_git_ignored_helpers_are_not_pinned(self) -> None:
+        # Editor backups (foo.py.bak, foo.py~) are gitignored but not hidden,
+        # so the dot/__pycache__ filter alone still pinned them into
+        # HELPER_ASSETS, where an installed ubs 404s on every scan.
+        if shutil.which("git") is None:
+            self.skipTest("git not installed")
+        with tempfile.TemporaryDirectory(prefix="ubs-contract-ignored-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            verifier = root / "scripts/verify_checksums.sh"
+            shutil.copy2(REPO_ROOT / "scripts/verify_checksums.sh", verifier)
+            core = root / "modules/helpers/ubs_core"
+            core.mkdir(parents=True)
+            (core / "real.py").write_text("X = 1\n", encoding="utf-8")
+            (core / "real.py.bak").write_text("X = 0\n", encoding="utf-8")
+            (core / "real.py~").write_text("X = 0\n", encoding="utf-8")
+            subprocess.run(["git", "init", "-q", str(root)], check=True, timeout=30)
+
+            def verify() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", str(verifier)], cwd=root, text=True,
+                    capture_output=True, check=False, timeout=60,
+                )
+
+            # Tables generated before the ignore rule exists pin the backups;
+            # once git ignores them the verifier must reject those pins.
+            result = self.generate(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("'helpers/ubs_core/real.py.bak'", (root / "ubs").read_text(encoding="utf-8"))
+            (root / ".gitignore").write_text("*.bak\n*~\n", encoding="utf-8")
+            result = verify()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("PINNED HELPER IS GIT-IGNORED (never shipped): modules/helpers/ubs_core/real.py.bak", result.stdout)
+
+            result = self.generate(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            runner = (root / "ubs").read_text(encoding="utf-8")
+            common = (root / "modules/lib/ubs-common.sh").read_text(encoding="utf-8")
+            for text in (runner, common):
+                self.assertIn("'helpers/ubs_core/real.py'", text)
+                self.assertNotIn("real.py.bak", text)
+                self.assertNotIn("real.py~", text)
+            result = verify()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_checkout_pins_only_tracked_helpers(self) -> None:
         # Every HELPER_ASSETS entry is downloaded from the repository by an
         # installed ubs, so each one must be a tracked file.

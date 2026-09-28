@@ -522,8 +522,16 @@ def _pattern_capture(node):
 
 def _local_names(scope) -> set[str]:
     names = set()
+    # Iteration targets belong to the comprehension, not its containing
+    # function/module. Walrus targets still belong to the containing scope.
+    comprehension_targets = {
+        child for node in _scope_nodes(scope)
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+        for generator in node.generators for child in ast.walk(generator.target)
+    }
     for node in _scope_nodes(scope):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        if (isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+                and node not in comprehension_targets):
             names.add(node.id)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
@@ -661,6 +669,11 @@ class _Flow:
         self.generator_return_bindings = {}
         self.normal_state = None
         self.last_state = None
+        # Bound exact literal expansion across nested comprehensions. Once
+        # exhausted, the finite-lattice loop still analyzes every possible
+        # element/effect; this is a precision budget, not a scan cutoff.
+        self.comprehension_budget = 64
+        self.comprehension_environments = []
 
     def possible_exception(self, state):
         if state.reachable and self.exception_states:
@@ -983,9 +996,14 @@ class _Flow:
     def global_arguments(self, function, state):
         """A helper reads its defining module, never a caller's same-name local."""
         owner = self.engine.owner(function)
-        namespace = state if owner is self.engine else owner.globals
         module_ref = (owner.project.module_reference(owner) if owner.project is not None else None)
         for name in owner.global_names:
+            namespace = state if owner is self.engine else owner.globals
+            if owner is self.engine:
+                for comprehension, outer in self.comprehension_environments:
+                    if name in self.engine.locals[comprehension]:
+                        namespace = outer
+                        break
             key = f'@global:{name}'
             if (owner is self.engine and not isinstance(self.scope, ast.Module)
                     and (name in self.engine.locals.get(self.scope, set())
@@ -1738,7 +1756,9 @@ class _Flow:
                                                                    for value in node.values))
             state.replace(_join_states(*exits))
             return fact
-        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp)):
+            return self.comprehension(node, state)
+        if isinstance(node, ast.GeneratorExp):
             # The outer iterable executes in the enclosing scope, even when
             # constructing a lazy generator. Inner iterations may be skipped.
             first = node.generators[0]
@@ -1763,6 +1783,146 @@ class _Flow:
             return fact
         return join_facts(self.source(node, state), *(self.expr(child, state) for child in ast.iter_child_nodes(node)
                                               if isinstance(child, ast.expr)))
+
+    def comprehension(self, node, state):
+        """Execute eager comprehension clauses in their implicit local scope.
+
+        Heap writes and walrus assignments escape that scope on both normal
+        and exceptional edges. Iteration targets do not. Filters are ordered
+        branches, and mutable iterables participate in the loop fixed point.
+        """
+        first = node.generators[0]
+        iterable = self.expr(first.iter, state)
+        if not state.reachable:
+            return CLEAN
+        original = state.copy()
+        local_names = self.engine.locals[node]
+        nested = state.copy()
+        for name in local_names:
+            nested[name] = CLEAN
+            nested.bindings[name] = None
+            nested.references[name] = NO_REFERENCES
+        result = CLEAN
+
+        def project(current):
+            if current is None:
+                return None
+            projected = current.copy()
+            for target, source in ((projected, original),
+                                   (projected.bindings, original.bindings),
+                                   (projected.references, original.references)):
+                for name in local_names:
+                    if name in source:
+                        target[name] = source[name]
+                    else:
+                        target.pop(name, None)
+            return projected
+
+        def clause(index, entering):
+            nonlocal result
+            if entering is None or not entering.reachable:
+                return None
+            generator = node.generators[index]
+            value = iterable if index == 0 else self.expr(generator.iter, entering)
+            if not entering.reachable:
+                return None
+            refs = self.expression_references.get(generator.iter, NO_REFERENCES)
+            binding = self.expression_bindings.get(generator.iter)
+            literal = generator.iter
+            elements = None
+            if (isinstance(literal, (ast.List, ast.Tuple))
+                    and not any(isinstance(item, ast.Starred) for item in literal.elts)):
+                elements = literal.elts
+            elif isinstance(literal, ast.Dict) and all(key is not None for key in literal.keys):
+                # Iterating a dictionary yields its keys, not its values.
+                # Unknown/duplicate keys cannot establish an exact count.
+                elements = literal.keys
+            empty = (elements == [] or isinstance(literal, ast.Constant)
+                     and isinstance(literal.value, (str, bytes)) and not literal.value)
+            if empty:
+                return entering
+
+            def iteration(current, element=None):
+                nonlocal result
+                if current is None or not current.reachable:
+                    return None
+                if element is not None:
+                    element_refs = self.expression_references.get(element, NO_REFERENCES)
+                    fact = join_facts(self.expression_facts.get(element, CLEAN),
+                                      *(current.heap.get(ref, CLEAN) for ref in element_refs))
+                    self.assign(generator.target, fact, current, element)
+                else:
+                    fact = join_facts(value, *(current.heap.get(ref, CLEAN) for ref in refs))
+                    self.assign(generator.target, fact, current)
+                    if isinstance(generator.target, ast.Name):
+                        if elements is not None:
+                            current.bindings[generator.target.id] = _join_bindings(*(
+                                self.expression_bindings.get(item) for item in elements))
+                            current.references[generator.target.id] = frozenset().union(*(
+                                self.expression_references.get(item, NO_REFERENCES) for item in elements))
+                        elif generator.iter in self.generator_returns:
+                            current.bindings[generator.target.id] = binding
+                            current.references[generator.target.id] = refs
+                for name in local_names:
+                    if current.references.get(name, NO_REFERENCES) & current.mutated:
+                        current.bindings[name] = _without_object_contract(current.bindings.get(name))
+                skipped = []
+                for condition in generator.ifs:
+                    current, rejected = self.condition(condition, current)
+                    skipped.append(rejected)
+                if current is not None:
+                    if index + 1 < len(node.generators):
+                        current = clause(index + 1, current)
+                    else:
+                        values = ((node.key, node.value) if isinstance(node, ast.DictComp) else (node.elt,))
+                        fact = join_facts(*(self.expr(item, current) for item in values))
+                        if current.reachable:
+                            result = join_facts(result, fact)
+                return _join_states(current, *skipped)
+
+            # Fresh sequence literals cannot acquire additional elements from
+            # the body. Preserve evaluation order and element/callable aliases
+            # without inventing a second iteration of a singleton sequence.
+            if (elements is not None and isinstance(literal, (ast.List, ast.Tuple))
+                    and len(elements) <= self.comprehension_budget):
+                self.comprehension_budget -= len(elements)
+                current = entering
+                for element in elements:
+                    current = iteration(current, element)
+                return current
+            if elements is not None:
+                value = join_facts(*(self.expression_facts.get(item, CLEAN) for item in elements))
+            head = entering.copy()
+            exits = None if elements else entering.copy()
+            while True:
+                back = iteration(head.copy())
+                exits = _join_states(exits, back)
+                joined = _join_states(entering, back)
+                if joined == head:
+                    return exits
+                head = joined
+
+        pending = self.pending
+        self.pending = []
+        collecting = bool(self.exception_states)
+        if collecting:
+            self.exception_states.append(None)
+        self.comprehension_environments.append((node, original))
+        try:
+            normal = clause(0, nested)
+            outgoing = self.pending
+        finally:
+            self.comprehension_environments.pop()
+            self.pending = pending
+            exceptional = self.exception_states.pop() if collecting else None
+        self.pending.extend(_Completion(item.kind, project(item.state), item.value,
+                                        item.references, item.binding, item.exception_type)
+                            for item in _merge_completions(outgoing))
+        if exceptional is not None:
+            self.exception_states[-1] = _join_states(self.exception_states[-1], project(exceptional))
+        state.replace(project(normal))
+        self.expression_references[node] = frozenset({node})
+        return result
 
     def block(self, statements, state):
         for node in statements:
@@ -2059,6 +2219,11 @@ class _Analysis:
         self.generators = {function for function in self.functions
                            if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in _scope_nodes(function))}
         self.locals = {scope: _local_names(scope) for scope in [tree, *self.functions]}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                self.locals[node] = {child.id for generator in node.generators
+                                    for child in ast.walk(generator.target)
+                                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
         self.global_names = self.locals[tree]
         self.closures = {}
         for function in self.functions:
@@ -2073,10 +2238,19 @@ class _Analysis:
         return self.project.owners.get(function, self) if self.project is not None else self
 
     def enclosing(self, node):
-        node = self.parents.get(node)
-        while node is not None and not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
-            node = self.parents.get(node)
-        return node
+        child = node
+        parent = self.parents.get(child)
+        in_iterable = False
+        while parent is not None:
+            if isinstance(parent, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                return parent
+            if (isinstance(parent, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+                    and not (child is parent.generators[0] and in_iterable)):
+                return parent
+            if isinstance(parent, ast.comprehension):
+                in_iterable = child is parent.iter
+            child, parent = parent, self.parents.get(parent)
+        return None
 
     def describe_framework(self, function, default_inputs, bindings, route, route_dependencies):
         inputs = {}

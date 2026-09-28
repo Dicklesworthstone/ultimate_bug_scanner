@@ -1,4 +1,4 @@
-"""Mutable-object and framework integration regressions; fixtures are not executed."""
+"""Mutable-object regressions; the execution oracle replaces input and eval."""
 from __future__ import annotations
 
 import unittest
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import time
 
 from test_taint_python_dataflow import ROOT, SourceTest
@@ -362,6 +363,286 @@ class MutableIterableLoopTests(SourceTest):
         ''', 'eval')
 
 
+class ComprehensionEffectsTests(SourceTest):
+    def test_eager_collection_writes_reach_the_enclosing_scope(self):
+        for expression in ('[box.append(input()) for item in values]',
+                           '{box.append(input()) for item in values}',
+                           '{item: box.append(input()) for item in values}'):
+            with self.subTest(expression=expression):
+                self.assert_rules(f'box = []\n{expression}\neval(box[0])\n', 'eval')
+
+    def test_rejected_filter_keeps_its_writes_but_skips_the_element(self):
+        self.assert_rules('''
+            box = []
+            [eval(input()) for item in values if box.append(input()) and False]
+            eval(box[0])
+        ''', 'eval')
+
+    def test_false_filters_skip_later_filters_and_inner_iterables(self):
+        for tail in ('if False if box.append(input())',
+                     'if False for inner in box.append(input())',
+                     'if False and box.append(input())'):
+            with self.subTest(tail=tail):
+                self.assert_rules(f'box = []\n[eval(input()) for item in values {tail}]\neval(box[0])\n')
+
+    def test_unknown_filter_retains_both_reachable_paths(self):
+        self.assert_rules('''
+            box = []
+            [box.append(input()) for item in values if condition]
+            eval(box[0])
+        ''', 'eval')
+
+    def test_short_circuit_filter_preserves_walrus_alias(self):
+        self.assert_rules('''
+            box = []
+            alias = []
+            [0 for item in values if condition and (alias := box)]
+            alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_nested_clauses_propagate_helper_output_writes(self):
+        self.assert_rules('''
+            def fill(target, value):
+                target.append(value)
+            box = []
+            [fill(box, code) for row in rows if condition for code in request.args.values()]
+            eval(box[0])
+        ''', 'eval')
+
+    def test_comprehension_writes_participate_in_function_summaries(self):
+        self.assert_rules('''
+            def fill(target, value):
+                [target.append(value) for item in flags]
+            def forward(target, value):
+                fill(target, value)
+            box = []
+            forward(box, input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_output_writes_keep_sanitizer_domains(self):
+        self.assert_rules('''
+            def fill(target, value):
+                [target.append(html.escape(value)) for item in flags]
+            box = []
+            fill(box, input())
+            HttpResponse(box[0])
+            cursor.execute(box[0])
+        ''', 'sql')
+
+    def test_comprehension_result_has_mutable_object_identity(self):
+        self.assert_rules('''
+            box = [value for value in ['safe']]
+            alias = box
+            alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_walrus_alias_and_callable_escape_the_comprehension(self):
+        self.assert_rules('''
+            box = []
+            alias = []
+            [alias := box for item in values]
+            alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+        self.assert_rules('''
+            import os
+            run = lambda value: None
+            [run := os.system for item in values]
+            run(input())
+        ''', 'command')
+
+    def test_guaranteed_walrus_sanitizer_keeps_its_callable_binding(self):
+        self.assert_rules('''
+            escape = lambda value: value
+            [escape := html.escape for item in [0]]
+            HttpResponse(escape(input()))
+        ''')
+
+    def test_lambda_walrus_is_not_an_enclosing_assignment(self):
+        self.assert_rules('''
+            escape = html.escape
+            [lambda: (escape := unknown) for item in [0]]
+            HttpResponse(escape(input()))
+        ''')
+
+    def test_targets_do_not_shadow_enclosing_global_callables(self):
+        self.assert_rules('''
+            from os import system as run
+            def handle():
+                [run for run in []]
+                run(input())
+        ''', 'command')
+        self.assert_rules('''
+            from html import escape
+            def handle():
+                [escape for escape in values]
+                HttpResponse(escape(input()))
+        ''')
+
+    def test_lambda_captures_comprehension_targets_not_outer_names(self):
+        self.assert_rules('''
+            item = 'safe'
+            [(lambda: eval(item))() for item in [input()]]
+            eval(item)
+        ''', 'eval')
+        self.assert_rules('''
+            item = input()
+            [(lambda: eval(item))() for item in ['safe']]
+        ''')
+
+    def test_outer_iterable_lambda_uses_enclosing_scope(self):
+        self.assert_rules('''
+            item = input()
+            values = [item for item in (lambda: [item])()]
+            eval(values[0])
+        ''', 'eval')
+
+    def test_called_helper_reads_its_module_not_the_comprehension_target(self):
+        self.assert_rules('''
+            code = 'safe'
+            def run():
+                eval(code)
+            [run() for code in [input()]]
+        ''')
+        self.assert_rules('''
+            code = input()
+            def run():
+                eval(code)
+            [run() for code in ['safe']]
+        ''', 'eval')
+
+    def test_literals_preserve_element_aliases_and_callable_identities(self):
+        self.assert_rules('''
+            box = []
+            [target.append(input()) for target in [box]]
+            eval(box[0])
+        ''', 'eval')
+        self.assert_rules('''
+            import os
+            [run(input()) for run in [os.system]]
+        ''', 'command')
+
+    def test_destructured_literal_elements_keep_separate_facts(self):
+        self.assert_rules('''
+            [eval(clean) for clean, unused in [('safe', input())]]
+        ''')
+        self.assert_rules('''
+            [eval(code) for unused, code in [('safe', input())]]
+        ''', 'eval')
+
+    def test_empty_literals_and_false_filters_have_no_body_effects(self):
+        for iterable in ('[]', '()', '{}', "''", "b''"):
+            with self.subTest(iterable=iterable):
+                self.assert_rules(f'[eval(input()) for item in {iterable}]\n')
+        for expression in ('[eval(input()) for item in values if False]',
+                           '{eval(input()) for item in values if False}',
+                           '{eval(input()): 0 for item in values if False}'):
+            with self.subTest(expression=expression):
+                self.assert_rules(expression)
+
+    def test_dictionary_iteration_yields_keys_not_values(self):
+        self.assert_rules("[eval(key) for key in {'safe': input()}]\n")
+        self.assert_rules("[eval(key) for key in {input(): 'safe'}]\n", 'eval')
+
+    def test_singleton_has_no_invented_back_edge(self):
+        self.assert_rules('''
+            code = 'safe'
+            [eval(code) or (code := input()) for item in [0]]
+        ''')
+        self.assert_rules('''
+            code = 'safe'
+            [eval(code) or (code := input()) for item in [0, 1]]
+        ''', 'eval')
+
+    def test_mutable_iterable_reaches_a_fixed_point(self):
+        self.assert_rules('''
+            values = ['safe']
+            [eval(value) or values.append(input()) for value in values]
+        ''', 'eval')
+
+    def test_rebinding_does_not_retarget_an_existing_iterator(self):
+        self.assert_rules('''
+            values = ['safe']
+            [eval(value) or (values := [input()]) for value in values]
+        ''')
+
+    def test_exception_edges_keep_heap_and_restore_target_bindings(self):
+        self.assert_rules('''
+            def stop():
+                raise ValueError('stop')
+            from os import system as run
+            box = []
+            try:
+                [(box.append(input()), stop()) for run in [0]]
+            except ValueError:
+                eval(box[0])
+                run(input())
+        ''', 'eval', 'command')
+
+    def test_nonreturning_singleton_has_no_normal_continuation(self):
+        self.assert_rules('''
+            def stop():
+                raise ValueError('stop')
+            [stop() for item in [0]]
+            eval(input())
+        ''')
+        self.assert_rules('''
+            def stop():
+                raise ValueError('stop')
+            [stop() for item in unknown]
+            eval(input())
+        ''', 'eval')
+
+    def test_dictionary_key_precedes_value(self):
+        self.assert_rules('''
+            box = []
+            {box.append(input()): eval(box[0]) for item in [0]}
+        ''', 'eval')
+        self.assert_rules('''
+            def stop():
+                raise ValueError('stop')
+            {stop(): eval(input()) for item in [0]}
+        ''')
+
+    def test_precision_budget_falls_back_without_dropping_flows(self):
+        literals = ', '.join("'safe'" for _ in range(80)) + ', input()'
+        self.assert_rules(f'[eval(item) for item in [{literals}]]\n', 'eval')
+        self.assert_rules('''
+            box = []
+            [[box.append(input()) for inner in [0, 1]] for outer in [0, 1]]
+            eval(box[0])
+        ''', 'eval')
+
+    def test_cpython_execution_oracle_agrees_on_order_scope_and_filters(self):
+        # These small programs never execute input as code: eval is a recorder,
+        # and input returns an inert marker. CPython is the semantic oracle,
+        # independent from analyzer facts or expected-output regeneration.
+        cases = {
+            'heap': ("box=[]\n[box.append(input()) for item in [0]]\neval(box[0])", True),
+            'rejected-write': ("box=[]\n[eval(input()) for item in [0] if box.append(input()) and False]\neval(box[0])", True),
+            'false-filter': ("[eval(input()) for item in [0] if False]", False),
+            'empty': ("[eval(input()) for item in []]", False),
+            'singleton': ("code='safe'\n[eval(code) or (code:=input()) for item in [0]]", False),
+            'second-iteration': ("code='safe'\n[eval(code) or (code:=input()) for item in [0,1]]", True),
+            'dictionary-order': ("box=[]\n{box.append(input()):eval(box[0]) for item in [0]}", True),
+            'scope': ("item='safe'\n[(lambda:eval(item))() for item in [input()]]\neval(item)", True),
+            'bounded-append': ("values=['safe']\n[eval(value) or (values.append(input()) if len(values)==1 else None) for value in values]", True),
+        }
+        for name, (source, unsafe) in cases.items():
+            with self.subTest(case=name):
+                started = time.monotonic()
+                print(f'[python-comprehension-oracle-{name}] RUN', flush=True)
+                observed = []
+                namespace = {'input': lambda: 'TAINT_MARKER', 'eval': observed.append}
+                exec(compile(textwrap.dedent(source), '<comprehension-oracle>', 'exec'), namespace)
+                self.assertEqual('TAINT_MARKER' in observed, unsafe, observed)
+                self.assert_rules(source, *(('eval',) if unsafe else ()))
+                print(f'[python-comprehension-oracle-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+
 class FrameworkMutationEffectsTests(SourceTest):
     def test_request_parameter_reaches_a_mutated_output(self):
         self.assert_rules('''
@@ -450,6 +731,12 @@ class MutableObjectCliTests(unittest.TestCase):
             'loop-append': ("values = ['safe']\nfor value in values:\n    eval(value)\n    values.append(input())\n", True),
             'loop-break': ("values = ['safe']\nfor value in values:\n    eval(value)\n    values.append(input())\n    break\n", False),
             'loop-rebind': ("values = ['safe']\nfor value in values:\n    eval(value)\n    values = [input()]\n", False),
+            'comprehension-write': ("box = []\n[box.append(input()) for item in [0]]\neval(box[0])\n", True),
+            'comprehension-filter-write': ("box = []\n[0 for item in [0] if box.append(input()) and False]\neval(box[0])\n", True),
+            'comprehension-false': ("[eval(input()) for item in [0] if False]\n", False),
+            'comprehension-empty': ("[eval(input()) for item in []]\n", False),
+            'comprehension-alias': ("box=[]\nalias=[]\n[alias := box for item in [0]]\nalias.append(input())\neval(box[0])\n", True),
+            'comprehension-singleton': ("code='safe'\n[eval(code) or (code := input()) for item in [0]]\n", False),
         }
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-mutable-effects'
         artifacts.mkdir(parents=True, exist_ok=True)

@@ -1,6 +1,7 @@
 """Mutable-object regressions; the execution oracle replaces input and eval."""
 from __future__ import annotations
 
+import ast
 import unittest
 import json
 import os
@@ -643,6 +644,294 @@ class ComprehensionEffectsTests(SourceTest):
                 print(f'[python-comprehension-oracle-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
 
+class LiteralArgumentUnpackingTests(SourceTest):
+    def test_unpacked_output_parameters_retain_object_identity(self):
+        for arguments in ('*[box, input()]', '*(box, input())', '*[box], *(input(),)',
+                          '*[*[box], *[input()]]'):
+            with self.subTest(arguments=arguments):
+                self.assert_rules(f'''
+                    def fill(target, value):
+                        target.append(value)
+                    box = []
+                    fill({arguments})
+                    eval(box[0])
+                ''', 'eval')
+
+    def test_clean_output_argument_is_not_contaminated_by_unused_input(self):
+        self.assert_rules('''
+            def fill(target, value, unused):
+                target.append(value)
+            box = []
+            fill(*[box, 'safe', input()])
+            eval(box[0])
+        ''')
+
+    def test_unpacked_parameters_propagate_across_helper_summaries(self):
+        self.assert_rules('''
+            def fill(target, value):
+                target.append(value)
+            def forward(target, value):
+                fill(*[target], value=value)
+            box = []
+            forward(*(box, input()))
+            eval(box[0])
+        ''', 'eval')
+
+    def test_returned_parameter_alias_is_visible_to_the_caller(self):
+        self.assert_rules('''
+            def identity(target):
+                return target
+            box = []
+            alias = identity(*(box,))
+            alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_direct_returned_receiver_and_captured_method_keep_identity(self):
+        for invocation in ('identity(box).append(input())',
+                           'identity(*[box]).append(*[input()])',
+                           'append = identity(*[box]).append\nappend(input())'):
+            with self.subTest(invocation=invocation):
+                self.assert_rules('def identity(value): return value\nbox=[]\n' + invocation + '\neval(box[0])', 'eval')
+
+    def test_returned_receiver_does_not_mutate_other_allocations(self):
+        self.assert_rules('''
+            def identity(value):
+                return value
+            left = []
+            right = ['safe']
+            identity(*[left]).append(input())
+            eval(right[0])
+        ''')
+
+    def test_unknown_returned_method_cannot_gain_a_sanitizer_identity(self):
+        self.assert_rules('''
+            def identity(value):
+                return value
+            unknown = Object()
+            HttpResponse(identity(*[unknown]).escape(input()))
+        ''', 'xss')
+
+    def test_returned_callable_preserves_its_sink_identity(self):
+        self.assert_rules('''
+            def identity(value):
+                return value
+            execute = identity(*[eval])
+            execute(input())
+        ''', 'eval')
+
+    def test_empty_packs_do_not_hide_definition_time_defaults(self):
+        for arguments in ('*[]', '*()', '*[], *()'):
+            with self.subTest(arguments=arguments):
+                self.assert_rules(f'''
+                    def execute(value=input()):
+                        eval(value)
+                    execute({arguments})
+                ''', 'eval')
+
+    def test_empty_pack_preserves_mutable_default_alias(self):
+        self.assert_rules('''
+            box = []
+            def identity(value=box):
+                return value
+            identity(*[]).append(input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_sql_bind_parameters_are_not_query_source(self):
+        for call in ("cursor.execute(*['SELECT ?', (input(),)])",
+                     "query(*['SELECT ?', (input(),)])"):
+            with self.subTest(call=call):
+                self.assert_rules(f'''
+                    def query(sql, parameters):
+                        cursor.execute(sql, parameters)
+                    {call}
+                ''')
+        self.assert_rules("cursor.execute(*[input(), ('safe',)])", 'sql')
+
+    def test_eval_namespace_argument_is_not_executable_source(self):
+        self.assert_rules("eval(*['1', {'data': input()}])")
+        self.assert_rules("eval(*(input(), {}))", 'eval')
+
+    def test_process_argv_separates_data_and_interpreter_code(self):
+        for argv, unsafe in (("['echo', input()]", False),
+                             ("['sh', '-c', input()]", True),
+                             ("['python', '-c', input()]", True),
+                             ("[input(), 'safe']", True)):
+            with self.subTest(argv=argv):
+                self.assert_rules(f'subprocess.run(*[{argv}])', *(('command',) if unsafe else ()))
+
+    def test_sanitizer_domains_survive_unpacked_calls(self):
+        self.assert_rules("HttpResponse(*[html.escape(*[input()])])")
+        self.assert_rules("cursor.execute(*[html.escape(*[input()])])", 'sql')
+        self.assert_rules("os.system(*[shlex.quote(*[input()])])")
+        self.assert_rules("eval(*[shlex.quote(*[input()])])", 'eval')
+
+    def test_earlier_argument_keeps_alias_when_later_argument_rebinds_name(self):
+        self.assert_rules('''
+            def fill(target, value, unused):
+                target.append(value)
+            box = []
+            original = box
+            fill(*[box, input(), (box := [])])
+            eval(original[0])
+            eval(box[0])
+        ''', 'eval')
+
+    def test_later_argument_writes_reach_earlier_object_snapshot(self):
+        self.assert_rules('''
+            def execute(target, unused):
+                eval(target[0])
+            box = []
+            execute(*[box, box.append(input())])
+        ''', 'eval')
+
+    def test_scalar_snapshot_is_not_retroactively_tainted(self):
+        self.assert_rules('''
+            def execute(code, unused):
+                eval(code)
+            code = 'safe'
+            execute(*[code, (code := input())])
+        ''')
+
+    def test_callee_is_captured_before_argument_evaluation(self):
+        self.assert_rules('''
+            def execute(code, unused):
+                eval(code)
+            def harmless(code, unused):
+                return 'safe'
+            callback = execute
+            callback(*[input(), (callback := harmless)])
+        ''', 'eval')
+
+    def test_nonreturning_argument_prevents_later_effects_and_invocation(self):
+        self.assert_rules('''
+            def stop():
+                raise ValueError('stop')
+            def execute(code, unused):
+                eval(code)
+            execute(*[stop(), input()])
+            eval(input())
+        ''')
+
+    def test_keyword_effects_follow_all_positional_expansions(self):
+        self.assert_rules('''
+            def execute(code, unused):
+                eval(code)
+            code = 'safe'
+            execute(unused=(code := input()), *[code])
+        ''')
+
+    def test_opaque_unpacking_stays_conservative(self):
+        self.assert_rules('''
+            def execute(first, second):
+                eval(second)
+            execute(*[input(), *unknown])
+        ''')
+        self.assert_rules('''
+            def execute(first, second):
+                eval(second)
+            execute(*unknown, *[input()])
+        ''', 'eval')
+        self.assert_rules('''
+            def execute(first, second):
+                eval(second)
+            execute(*request.args.values())
+        ''', 'eval')
+
+    def test_coroutine_resume_retains_normalized_arguments_and_return_alias(self):
+        self.assert_rules('''
+            import asyncio
+            async def identity(value):
+                return value
+            box = []
+            alias = asyncio.run(*[identity(*[box])])
+            alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+        self.assert_rules('''
+            async def identity(value):
+                return value
+            async def route():
+                box = []
+                alias = await identity(*[box])
+                alias.append(input())
+                eval(box[0])
+        ''', 'eval')
+
+    def test_generator_yielded_alias_survives_normalized_call(self):
+        self.assert_rules('''
+            def values(box):
+                yield box
+            box = []
+            for alias in values(*[box]):
+                alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_framework_dependency_accepts_literal_positional_unpacking(self):
+        for annotation in ('Depends(*[provider])', 'Depends(*(provider,))'):
+            with self.subTest(annotation=annotation):
+                self.assert_rules(f'''
+                    from fastapi import Query, Depends
+                    def provider(value=Query()):
+                        return value
+                    def route(value={annotation}):
+                        eval(value)
+                ''', 'eval')
+                self.assert_rules(f'''
+                    from fastapi import Depends
+                    def provider():
+                        return 'safe'
+                    def route(value={annotation}):
+                        eval(value)
+                ''')
+
+    def test_loop_call_sites_keep_finite_allocation_identities(self):
+        self.assert_rules('''
+            def identity(value):
+                return value
+            box = []
+            while condition:
+                alias = identity(*[box])
+                alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+
+    def test_normalized_call_view_does_not_mutate_source_ast(self):
+        from ubs_core.analyzers.taint_py import _Analysis
+        source = ast.parse('fill(*[box, *(input(),)], *[])')
+        before = ast.dump(source, include_attributes=True)
+        analysis = _Analysis(source)
+        call = source.body[0].value
+        normalized = analysis.call_sites[call]
+        self.assertIsNot(call, normalized)
+        self.assertEqual(len(normalized.args), 2)
+        self.assertEqual(ast.dump(source, include_attributes=True), before)
+        self.assertEqual((normalized.lineno, normalized.col_offset), (call.lineno, call.col_offset))
+        self.assertIs(analysis.call_sites[call], normalized)
+
+    def test_cpython_unpacking_oracle_agrees_on_identity_order_and_defaults(self):
+        cases = {
+            'output-alias': ("def fill(out, value): out.append(value)\nbox=[]\nfill(*[box, input()])\neval(box[0])", True),
+            'returned-alias': ("def identity(out): return out\nbox=[]\nidentity(*(box,)).append(input())\neval(box[0])", True),
+            'default': ("def execute(code=input()): eval(code)\nexecute(*[])", True),
+            'unused': ("def execute(code, unused): eval(code)\nexecute(*['safe', input()])", False),
+            'scalar-snapshot': ("def execute(code, unused): eval(code)\ncode='safe'\nexecute(*[code, (code:=input())])", False),
+            'keyword-order': ("def execute(code, unused): eval(code)\ncode='safe'\nexecute(unused=(code:=input()), *[code])", False),
+            'nested': ("def execute(unused, code): eval(code)\nexecute(*[*['safe'], *(input(),)])", True),
+        }
+        for name, (source, unsafe) in cases.items():
+            with self.subTest(case=name):
+                print(f'[python-unpacking-oracle-{name}] RUN', flush=True)
+                observed = []
+                namespace = {'input': lambda: 'TAINT_MARKER', 'eval': observed.append}
+                exec(compile(source, '<unpacking-oracle>', 'exec'), namespace)
+                self.assertEqual('TAINT_MARKER' in observed, unsafe, observed)
+                self.assert_rules(source, *(('eval',) if unsafe else ()))
+                print(f'[python-unpacking-oracle-{name}] PASS', flush=True)
+
+
 class FrameworkMutationEffectsTests(SourceTest):
     def test_request_parameter_reaches_a_mutated_output(self):
         self.assert_rules('''
@@ -737,6 +1026,12 @@ class MutableObjectCliTests(unittest.TestCase):
             'comprehension-empty': ("[eval(input()) for item in []]\n", False),
             'comprehension-alias': ("box=[]\nalias=[]\n[alias := box for item in [0]]\nalias.append(input())\neval(box[0])\n", True),
             'comprehension-singleton': ("code='safe'\n[eval(code) or (code := input()) for item in [0]]\n", False),
+            'unpacking-output': ("def fill(box, value): box.append(value)\nbox=[]\nfill(*[box, input()])\neval(box[0])\n", True),
+            'unpacking-returned-alias': ("def identity(box): return box\nbox=[]\nidentity(*(box,)).append(input())\neval(box[0])\n", True),
+            'unpacking-default': ("def execute(value=input()): eval(value)\nexecute(*[])\n", True),
+            'unpacking-unused': ("def execute(value, unused): eval(value)\nexecute(*['safe', input()])\n", False),
+            'unpacking-namespace': ("eval(*['1', {'data': input()}])\n", False),
+            'unpacking-provider': ("from fastapi import Query, Depends\ndef provider(value=Query()): return value\ndef route(value=Depends(*[provider])): eval(value)\n", True),
         }
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-mutable-effects'
         artifacts.mkdir(parents=True, exist_ok=True)

@@ -115,7 +115,8 @@ def _keyword_argument(node, name):
 
 
 def _dependency_target(node, bindings, evaluated=None):
-    argument = node.args[0] if node.args else _keyword_argument(node, 'dependency')
+    arguments = _expanded_call(node).args
+    argument = arguments[0] if arguments else _keyword_argument(node, 'dependency')
     if evaluated is not None:
         target = evaluated.get(argument)
     else:
@@ -286,6 +287,28 @@ def _extend_qualifier(base: str, attribute: str) -> str:
 
 def _call_name(function):
     return '<lambda>()' if isinstance(function, ast.Lambda) else f'{function.name}()'
+
+
+def _expanded_call(node):
+    """Expose syntactic *list/*tuple arguments without evaluating them twice.
+
+    The containers are fresh and cannot escape: unpacking them is equivalent
+    to evaluating their elements in the same left-to-right argument order.
+    Leave opaque unpackings intact, including their conservative may-alias
+    behavior. Reuse this view for the lifetime of the analysis so call-site
+    object identities stay finite through loop and summary fixed points.
+    """
+    arguments = []
+    pending = list(reversed(node.args))
+    while pending:
+        argument = pending.pop()
+        if isinstance(argument, ast.Starred) and isinstance(argument.value, (ast.List, ast.Tuple)):
+            pending.extend(reversed(argument.value.elts))
+        else:
+            arguments.append(argument)
+    if arguments == node.args:
+        return node
+    return ast.copy_location(ast.Call(func=node.func, args=arguments, keywords=node.keywords), node)
 
 
 def join_facts(*facts: Fact) -> Fact:
@@ -1237,6 +1260,8 @@ class _Flow:
             self.effect('command', node, 'subprocess execution', shell_code)
 
     def call(self, node, state):
+        original = node
+        node = self.engine.call_sites.get(node, node)
         # Python evaluates the receiver/callable before argument expressions,
         # which may themselves reassign the receiver or callable name.
         self.expr(node.func, state)
@@ -1293,6 +1318,16 @@ class _Flow:
         state.replace(_join_states(*branches))
         self.expression_references[node] = frozenset().union(*references)
         self.expression_bindings[node] = _join_bindings(*bindings)
+        if original is not node:
+            # Parent expressions, await/yield-from and for loops refer to the
+            # source AST, not the normalized call-site view used for binding.
+            for values in (self.expression_references, self.expression_bindings,
+                           self.generator_returns, self.generator_return_references,
+                           self.generator_return_bindings):
+                if node in values:
+                    values[original] = values[node]
+                else:
+                    values.pop(original, None)
         return join_facts(*results)
 
     def invoke(self, node, state, target, fallback_name, receiver, receiver_refs,
@@ -1598,6 +1633,11 @@ class _Flow:
                     name = (_extend_qualifier(base, node.attr) if isinstance(base, str)
                             else _extend_qualifier(base.name, node.attr) if isinstance(base, _BoundCallable)
                             else _qualified(node, state.bindings))
+                    if not name and receiver_refs:
+                        # A returned object has identity even without a source
+                        # spelling (identity(box).append(...)). Keep the method
+                        # and receiver without inventing an import/sanitizer.
+                        name = _extend_qualifier('<object>', node.attr)
                     framework = name.startswith('@fastapi.router.') or name in (
                         _PARAMETER_MARKERS | _DEPENDENCY_MARKERS | _ROUTER_TYPES | _REQUEST_TYPES | _SERVICE_TYPES)
                     candidates.append(_BoundCallable(name, receiver_refs, receiver_fact) if name and receiver_refs and not framework
@@ -2215,6 +2255,7 @@ class _Analysis:
         self.default_references = {}
         self.default_bindings = {}
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        self.call_sites = {node: _expanded_call(node) for node in ast.walk(tree) if isinstance(node, ast.Call)}
         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = {function for function in self.functions
                            if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in _scope_nodes(function))}

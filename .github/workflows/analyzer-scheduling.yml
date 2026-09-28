@@ -6,6 +6,7 @@ on:
     paths:
       - test-suite/patches/analyzer-scheduling.patch.xz
       - test-suite/patches/analyzer-output.patch.xz
+      - test-suite/patches/core-worker-atomicity.patch.xz
       - .github/workflows/analyzer-scheduling.yml
   workflow_dispatch:
 
@@ -59,7 +60,14 @@ jobs:
           final=dict(expected)
           final['modules/helpers/ubs_core/cli.py']='5ab9f0a1231bcc552340669b3c91fd2d9c1d2099'
           final['test-suite/quality/test_analyzer_output.py']='290739ae41a72a1ac2e3d778ae42d65e87b9a77e'
-          if not all(blob(path)==sha for path,sha in final.items()):
+          integrated=dict(final)
+          integrated.update({
+              'modules/helpers/ubs_core/cli.py':'087da190a403b067ba55d0b1f10496a1d82d93bb',
+              'modules/helpers/ubs_core/shards.py':'ebe2490b249431d409254f1120b6bd82c5ee1214',
+              'test-suite/quality/test_core_parallel_scope.py':'02e5a67d4fd00315bb8c36e0fc4de0a543af2bb2',
+              'test-suite/quality/test_core_scan_atomicity.py':'8dc2f204c2b10781f9812a5f8fe476468a459705',
+          })
+          if not all(blob(path)==sha for path,sha in final.items()) and not all(blob(path)==sha for path,sha in integrated.items()):
               if not all(blob(path)==sha for path,sha in expected.items()):
                   subprocess.run(['git','apply','--check','-'],input=patch,check=True)
                   subprocess.run(['git','apply','-'],input=patch,check=True)
@@ -68,9 +76,17 @@ jobs:
               assert hashlib.sha256(patch).hexdigest()=='e72e77944bcf69787e6de48f64b76a9b2b85e95aae81909ce85d386cc0680b5e'
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
-          assert all(blob(path)==sha for path,sha in final.items()),'Candidate source changed'
+          if not all(blob(path)==sha for path,sha in integrated.items()):
+              assert all(blob(path)==sha for path,sha in final.items()),'Candidate source changed'
+              patch=lzma.decompress(Path('test-suite/patches/core-worker-atomicity.patch.xz').read_bytes())
+              assert hashlib.sha256(patch).hexdigest()=='510a297fe8ba748a6f667cc50998c7a0166cd3005af333838282eb441152198d'
+              subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+              subprocess.run(['git','apply','-'],input=patch,check=True)
+          assert all(blob(path)==sha for path,sha in integrated.items()),'Integrated source changed'
           subprocess.run(['git','add','-N','test-suite/quality/test_analyzer_scheduling.py',
-                          'test-suite/quality/test_analyzer_output.py'],check=True)
+                          'test-suite/quality/test_analyzer_output.py',
+                          'test-suite/quality/test_core_parallel_scope.py',
+                          'test-suite/quality/test_core_scan_atomicity.py'],check=True)
           PY
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
@@ -81,7 +97,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
-          npm install --global @ast-grep/cli typescript
+          # Use the same independent compiler oracle as the callback workflow.
+          npm install --global @ast-grep/cli typescript@5.8.3
           python3 - <<'PY'
           import shutil
           import subprocess
@@ -110,7 +127,8 @@ jobs:
                       count+=1
                       print('ANALYZER_SELFTEST_PASS',analyzer.name,name,flush=True)
           assert count>0
-          for pattern in ('test_analyzer*.py','test_taint_python*.py','test_taint_go*.py',
+          for pattern in ('test_analyzer*.py','test_core_parallel_scope.py','test_core_scan_atomicity.py',
+                          'test_taint_python*.py','test_taint_go*.py',
                           'test_taint_js_modules.py','test_taint_js_commonjs.py'):
               suite=unittest.defaultTestLoader.discover('test-suite/quality',pattern=pattern)
               result=unittest.TextTestRunner(verbosity=2).run(suite)
@@ -139,8 +157,10 @@ jobs:
           import urllib.request
           changed=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
           source={'modules/helpers/ubs_core/registry.py','modules/helpers/ubs_core/cli.py',
+                  'modules/helpers/ubs_core/shards.py',
                   'modules/helpers/ubs_core/analyzers/guards_py.py','modules/helpers/ubs_core/analyzers/narrowing_py.py',
-                  'test-suite/quality/test_analyzer_scheduling.py','test-suite/quality/test_analyzer_output.py'}
+                  'test-suite/quality/test_analyzer_scheduling.py','test-suite/quality/test_analyzer_output.py',
+                  'test-suite/quality/test_core_parallel_scope.py','test-suite/quality/test_core_scan_atomicity.py'}
           allowed=source|{'ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed)<=allowed,changed

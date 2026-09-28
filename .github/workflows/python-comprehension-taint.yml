@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   comprehension-dataflow:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-22.04
     timeout-minutes: 25
     permissions:
       contents: write
@@ -24,6 +24,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
       - name: Install real scanner validation dependencies
         run: |
           sudo apt-get update
@@ -94,6 +100,7 @@ jobs:
                 env=dict(os.environ, UBS_TAINT_E2E='1'))
           check('checksum-contract', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable',
                                      '-p', 'test_contract_checksums.py', '-v'])
+          check('python39-interpreter', ['python3.9', '--version'])
           check('python-floor', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable',
                                 '-p', 'test_helper_python_floor.py', '-v'])
           check('checksums', ['./scripts/verify_checksums.sh'])

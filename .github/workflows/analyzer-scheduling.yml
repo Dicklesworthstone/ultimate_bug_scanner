@@ -29,6 +29,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
+          python-version: '3.9'
+      - uses: actions/setup-python@v5
+        with:
           python-version: '3.13'
       - name: Retain exact input revision
         run: |
@@ -78,7 +81,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
-          npm install --global @ast-grep/cli
+          npm install --global @ast-grep/cli typescript
+          python3 - <<'PY'
+          import shutil
+          import subprocess
+          from pathlib import Path
+          compiler = Path(shutil.which('tsc')).resolve().parents[1]
+          subprocess.run(['node', '-e', 'console.log(require(process.argv[1]).version)', str(compiler)], check=True)
+          subprocess.run(['python3.9', '--version'], check=True)
+          PY
       - name: Exercise full-selection analysis and existing native taint regressions
         run: |
           set -o pipefail

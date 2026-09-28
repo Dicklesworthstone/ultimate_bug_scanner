@@ -30,7 +30,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Union
 
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.suppression import build_index
@@ -178,7 +178,9 @@ Fact = frozenset[TaintTrace]
 CLEAN: Fact = frozenset()
 # Allocation sites are AST nodes, while strings name symbolic argument,
 # closure, or module objects. Both sets are finite even inside recursion.
-References = frozenset[ast.AST | str]
+# A runtime alias, not an annotation: `ast.AST | str` would be evaluated and
+# raise TypeError on Python 3.9, which ubs still supports (python_is_3).
+References = frozenset[Union[ast.AST, str]]
 NO_REFERENCES: References = frozenset()
 
 

@@ -5,17 +5,24 @@ on:
     branches: [main]
     paths:
       - .github/workflows/taint-integration.yml
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/analyzers/taint_go.py
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_taint*.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/shareable/test_contract_checksums.py
+      - test-suite/shareable/test_helper_python_floor.py
+      - modules/lib/ubs-common.sh
+      - ubs
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  verified-candidates:
+  checked-in-dataflow:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    permissions:
-      contents: write
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -34,125 +41,45 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Validate each implementation and store immutable trees
+      - name: Verify checked-in runtime before execution
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Run Python, Go and command-injection dataflow regressions
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/python-taint-unit.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_go*.py' -v 2>&1 | tee "$RUNNER_TEMP/go-taint-unit.log"
+          python3 -m unittest discover -s test-suite/quality -p test_python_command_injection_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/command-taint-unit.log"
+      - name: Exercise real JSON and SARIF scanners
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          UBS_TAINT_E2E: '1'
         run: |
-          python3 - <<'PY'
-          import base64
-          import gzip
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-
-          output = Path(os.environ['RUNNER_TEMP']) / 'taint-integration'
-          output.mkdir()
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          def api(endpoint, payload=None):
-              args = ['gh', 'api', f"repos/{os.environ['GH_REPO']}/{endpoint}"]
-              if payload is not None:
-                  args += ['--method', 'POST', '--input', '-']
-              result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
-                                      text=True, capture_output=True, check=True, timeout=120)
-              return json.loads(result.stdout)
-          def check(name, command, *, env=None):
-              print('RUN', name, flush=True)
-              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                      text=True, env=env, timeout=600)
-              (output / (name + '.log')).write_text(result.stdout)
-              print(result.stdout, flush=True)
-              if result.returncode:
-                  raise RuntimeError(f'{name} exited {result.returncode}')
-              print('PASS', name, flush=True)
-
-          base = git('rev-parse', 'HEAD')
-          analyzer = 'modules/helpers/ubs_core/analyzers/taint_py.py'
-          assert git('hash-object', analyzer) == '406bcc674f2c1891c87fd7f26ea28eb9ef532f7f', 'Reconcile newer Python source first'
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          sources = {analyzer, 'modules/helpers/ubs_core/analyzers/taint_go.py',
-                     'test-suite/quality/test_taint_python_dataflow.py',
-                     'test-suite/quality/test_taint_python_summaries.py',
-                     'test-suite/quality/test_taint_python_effects.py',
-                     'test-suite/quality/test_taint_go_decoding.py'}
-          allowed = sources | set(scripts) | {'SHA256SUMS'}
-          stages = [
-              ('python-captures', '8d47e98f9549f502229341c980da42666b35e333',
-               '06f517f5f1bc4125523c59e218af4fc749476178dd6711f9e30a6c133059a46a',
-               'fix(taint): propagate Python match captures, identities and heap aliases'),
-              ('python-guards', 'e0c68c14aad398708c36c72a324bf4cafab627ed',
-               '90127f7dd8dea9e0e0fd1e097c565f889cb17437ebb7a08b4c3b29a396517e4a',
-               'fix(taint): model ordered Python match guards and completion paths'),
-              ('go-decoding', 'abccc04bf69bfe8b5755ed89b3c27721aafd36e3',
-               'aa36c3ac72822c4745c45ef559e61e1312c2c10b66a55e749210ef9feda705d3',
-               'feat(taint): integrate Go request decoding and output-parameter summaries'),
-              ('python-iterators', '426251daad20071276390a491821725afb398097',
-               'b2a418dfa1cd4e0bced9d788c1dd8276dec04c5986faa255a8b69c17cef566c8',
-               'fix(taint): propagate mutable iterable writes across Python loop back edges'),
-          ]
-          check('base-checksums', ['./scripts/verify_checksums.sh'])
-          check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
-          records = []
-          for name, blob, digest, message in stages:
-              stored = api('git/blobs/' + blob)
-              packed = base64.b64decode(stored['content'])
-              assert hashlib.sha1(b'blob ' + str(len(packed)).encode() + b'\0' + packed).hexdigest() == blob
-              patch = gzip.decompress(packed)
-              assert hashlib.sha256(patch).hexdigest() == digest
-              patch_file = output / (name + '.patch')
-              patch_file.write_bytes(patch)
-              check(name + '-apply-check', ['git', 'apply', '--check', str(patch_file)])
-              check(name + '-apply', ['git', 'apply', str(patch_file)])
-              check(name + '-generate', ['python3', 'scripts/update_checksums.py'])
-              pattern = 'test_taint_go*.py' if name == 'go-decoding' else 'test_taint_python_*.py'
-              check(name + '-unit', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', pattern, '-v'])
-              e2e = {'go-decoding': 'test_taint_go_decoding.py', 'python-iterators': 'test_taint_python_effects.py'}.get(name, 'test_taint_python_dataflow.py')
-              check(name + '-e2e', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', e2e, '-v'],
-                    env=dict(os.environ, UBS_TAINT_E2E='1'))
-              check(name + '-contract', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable', '-p', 'test_contract_checksums.py', '-v'])
-              check(name + '-python-floor', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable', '-p', 'test_helper_python_floor.py', '-v'])
-              check(name + '-checksums', ['./scripts/verify_checksums.sh'])
-              check(name + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
-              check(name + '-shellcheck', ['shellcheck', '-S', 'warning', *scripts])
-              check(name + '-diff', ['git', 'diff', '--check'])
-              changed = set(git('diff', '--name-only').splitlines()) | set(git('ls-files', '--others', '--exclude-standard').splitlines())
-              assert changed and changed <= allowed, sorted(changed - allowed)
-              before = {path: git('rev-parse', 'HEAD:' + path) if subprocess.run(['git', 'cat-file', '-e', 'HEAD:' + path],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else None for path in changed}
-              snapshot = {path: Path(path).read_bytes() for path in allowed if Path(path).exists()}
-              check(name + '-idempotence', ['python3', 'scripts/update_checksums.py'])
-              assert all(Path(path).read_bytes() == value for path, value in snapshot.items())
-              subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
-              entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0], 'type': 'blob',
-                          'content': Path(path).read_text()} for path in sorted(changed)]
-              tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
-              assert tree == git('write-tree'), 'Remote tree differs from tested source'
-              files = [{'path': entry['path'], 'mode': entry['mode'], 'type': 'blob',
-                        'sha': git('hash-object', entry['path']), 'before': before[entry['path']]} for entry in entries]
-              record = {'stage': name, 'base': base, 'tree': tree, 'message': message, 'files': files}
-              records.append(record)
-              (output / 'publication.json').write_text(json.dumps(records, indent=2))
-              print('TAINT_TREE_VALIDATED', json.dumps(record), flush=True)
-              subprocess.run(['git', '-c', 'user.name=UBS Validation', '-c', 'user.email=noreply@github.com',
-                              'commit', '-qm', message], check=True)
-          PY
-      - name: Preserve tested source and diagnostics
-        if: always()
+          set -o pipefail
+          for suite in test_taint_python_dataflow.py test_taint_python_effects.py test_taint_go_decoding.py; do
+            python3 -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/${suite%.py}-e2e.log"
+          done
+      - name: Verify supply-chain invariants and Python 3.9 compatibility
         run: |
-          mkdir -p "$RUNNER_TEMP/taint-integration"
-          git diff > "$RUNNER_TEMP/taint-integration/remaining.diff"
-          git ls-files -s > "$RUNNER_TEMP/taint-integration/source-index.txt"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/taint-integration/source.tar.gz"
+          set -o pipefail
+          python3.9 --version
+          python3 -m unittest discover -s test-suite/shareable -p test_contract_checksums.py -v 2>&1 | tee "$RUNNER_TEMP/contract-checksums.log"
+          python3 -m unittest discover -s test-suite/shareable -p test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/python-floor.log"
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: taint-integration-validation
           path: |
-            ${{ runner.temp }}/taint-integration
+            ${{ runner.temp }}/*taint-unit.log
+            ${{ runner.temp }}/test_taint*-e2e.log
+            ${{ runner.temp }}/contract-checksums.log
+            ${{ runner.temp }}/python-floor.log
             test-suite/artifacts/go-decoding
             test-suite/artifacts/python-mutable-effects
           retention-days: 3

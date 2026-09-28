@@ -1970,7 +1970,13 @@ class _Flow:
                 condition_exit = body.copy() if always is not True else None
             else:
                 condition_exit = head.copy()
-                self.assign(node.target, value, body)
+                # The iterator keeps the original object, not the current
+                # binding of its expression. Writes through any alias on a
+                # back edge can expose new elements on a later iteration.
+                # Read its heap at the fixed point, but keep each scalar
+                # element a snapshot (not an alias of the iterable itself).
+                current_value = join_facts(value, *(body.heap.get(ref, CLEAN) for ref in references))
+                self.assign(node.target, current_value, body)
                 # A local generator summary identifies its yielded callable;
                 # an ordinary iterable object is not itself that callable.
                 if isinstance(node.target, ast.Name) and node.iter in self.generator_returns:

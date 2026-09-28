@@ -209,6 +209,159 @@ class MutableObjectEffectsTests(SourceTest):
         self.assert_rules("Object(eval(input())).value = 'safe'\n", 'eval')
 
 
+class MutableIterableLoopTests(SourceTest):
+    def test_append_reaches_a_later_iteration(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                eval(value)
+                values.append(input())
+        ''', 'eval')
+
+    def test_alias_write_reaches_a_later_iteration(self):
+        self.assert_rules('''
+            values = ['safe']
+            alias = values
+            for value in values:
+                eval(value)
+                alias.append(input())
+        ''', 'eval')
+
+    def test_output_parameter_write_reaches_a_later_iteration(self):
+        self.assert_rules('''
+            def fill(target, value):
+                target.append(value)
+            values = ['safe']
+            for value in values:
+                eval(value)
+                fill(values, input())
+        ''', 'eval')
+
+    def test_symbolic_iterable_in_helper_observes_its_writes(self):
+        self.assert_rules('''
+            def consume(values, incoming):
+                for value in values:
+                    eval(value)
+                    values.append(incoming)
+            consume(['safe'], input())
+        ''', 'eval')
+
+    def test_continue_preserves_mutations_for_next_iteration(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                eval(value)
+                values.append(input())
+                continue
+        ''', 'eval')
+
+    def test_finally_write_on_continue_reaches_next_iteration(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                eval(value)
+                try:
+                    continue
+                finally:
+                    values.append(input())
+        ''', 'eval')
+
+    def test_break_does_not_invent_another_iteration(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                eval(value)
+                values.append(input())
+                break
+        ''')
+
+    def test_return_does_not_invent_another_iteration(self):
+        self.assert_rules('''
+            def consume():
+                values = ['safe']
+                for value in values:
+                    eval(value)
+                    values.append(input())
+                    return
+            consume()
+        ''')
+
+    def test_raise_does_not_invent_another_iteration(self):
+        self.assert_rules('''
+            values = ['safe']
+            try:
+                for value in values:
+                    eval(value)
+                    values.append(input())
+                    raise RuntimeError()
+            except RuntimeError:
+                pass
+        ''')
+
+    def test_iterable_rebinding_does_not_retarget_saved_iterator(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                eval(value)
+                values = [input()]
+        ''')
+
+    def test_saved_iterator_keeps_alias_after_original_name_is_rebound(self):
+        self.assert_rules('''
+            values = ['safe']
+            original = values
+            for value in values:
+                eval(value)
+                values = []
+                original.append(input())
+        ''', 'eval')
+
+    def test_unrelated_mutation_does_not_taint_iterator(self):
+        self.assert_rules('''
+            values = ['safe']
+            other = []
+            for value in values:
+                eval(value)
+                other.append(input())
+        ''')
+
+    def test_same_iteration_scalar_read_is_not_retroactively_tainted(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                values.append(input())
+                eval(value)
+                break
+        ''')
+
+    def test_clean_append_does_not_remove_original_taint(self):
+        self.assert_rules('''
+            values = [input()]
+            for value in values:
+                eval(value)
+                values.append('safe')
+        ''', 'eval')
+
+    def test_appended_sanitized_value_retains_its_sink_domain(self):
+        self.assert_rules('''
+            values = ['safe']
+            for value in values:
+                HttpResponse(value)
+                cursor.execute(value)
+                values.append(html.escape(input()))
+        ''', 'sql')
+
+    def test_iteration_over_returned_alias_observes_later_mutations(self):
+        self.assert_rules('''
+            def identity(values):
+                return values
+            values = ['safe']
+            for value in identity(values):
+                eval(value)
+                values.append(input())
+        ''', 'eval')
+
+
 class FrameworkMutationEffectsTests(SourceTest):
     def test_request_parameter_reaches_a_mutated_output(self):
         self.assert_rules('''
@@ -294,6 +447,9 @@ class MutableObjectCliTests(unittest.TestCase):
             'helper': ("def fill(box, code):\n    box['code'] = code\nbox = {}\nfill(box, input())\neval(box['code'])\n", True),
             'safe-rebind': ("box = {'code': 'safe'}\nalias = box\nalias = {}\nalias['code'] = input()\neval(box['code'])\n", False),
             'provider': ("from fastapi import Query, Depends\ndef provider(code=Query()):\n    box = {}\n    alias = box\n    alias['code'] = code\n    return box\ndef route(box=Depends(provider)):\n    eval(box['code'])\n", True),
+            'loop-append': ("values = ['safe']\nfor value in values:\n    eval(value)\n    values.append(input())\n", True),
+            'loop-break': ("values = ['safe']\nfor value in values:\n    eval(value)\n    values.append(input())\n    break\n", False),
+            'loop-rebind': ("values = ['safe']\nfor value in values:\n    eval(value)\n    values = [input()]\n", False),
         }
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-mutable-effects'
         artifacts.mkdir(parents=True, exist_ok=True)

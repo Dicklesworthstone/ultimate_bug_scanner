@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/python-comprehension-taint.yml
-      - test-suite/patches/python-comprehension.patch.gz
+      - test-suite/patches/python-call-unpacking.patch.gz
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
           ast-grep --version
-      - name: Validate reviewed source and preserve exact immutable objects
+      - name: Validate reviewed call unpacking and preserve exact immutable objects
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -70,8 +70,8 @@ jobs:
           allowed = sources | set(scripts) | {'SHA256SUMS'}
           check('base-checksums', ['./scripts/verify_checksums.sh'])
           check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
-          patch = gzip.decompress(Path('test-suite/patches/python-comprehension.patch.gz').read_bytes())
-          assert hashlib.sha256(patch).hexdigest() == 'f0f48e0be0afc44cc2576cefc77dc6543891f1db23834cb4493573aa49e162de'
+          patch = gzip.decompress(Path('test-suite/patches/python-call-unpacking.patch.gz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == 'b7459e9653dbde765beaf7b2635f6e20edf63e562bc5e06ac7fd2e88358cbf42'
           patch_file = output / 'implementation.patch'
           patch_file.write_bytes(patch)
           forward = subprocess.run(['git', 'apply', '--check', str(patch_file)], capture_output=True, text=True)

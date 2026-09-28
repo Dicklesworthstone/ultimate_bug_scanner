@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/analyzer-scheduling.patch.xz
+      - test-suite/patches/analyzer-output.patch.xz
       - .github/workflows/analyzer-scheduling.yml
   workflow_dispatch:
 
@@ -13,7 +14,7 @@ permissions:
 
 jobs:
   validate-scope:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     # Publish immutable blobs after validation, never commits or branch refs.
     permissions:
@@ -34,7 +35,7 @@ jobs:
           git rev-parse HEAD > "$RUNNER_TEMP/analyzer-scope-base.txt"
           git ls-files -s > "$RUNNER_TEMP/analyzer-scope-index.txt"
           git archive --format=tar.gz HEAD > "$RUNNER_TEMP/analyzer-scope-source.tar.gz"
-      - name: Apply reviewed scheduling implementation
+      - name: Apply reviewed scheduling and transactional output
         run: |
           python3 - <<'PY'
           import hashlib
@@ -52,11 +53,21 @@ jobs:
           }
           def blob(path):
               return subprocess.check_output(['git','hash-object',path],text=True).strip() if Path(path).is_file() else None
-          if not all(blob(path)==sha for path,sha in expected.items()):
+          final=dict(expected)
+          final['modules/helpers/ubs_core/cli.py']='5ab9f0a1231bcc552340669b3c91fd2d9c1d2099'
+          final['test-suite/quality/test_analyzer_output.py']='290739ae41a72a1ac2e3d778ae42d65e87b9a77e'
+          if not all(blob(path)==sha for path,sha in final.items()):
+              if not all(blob(path)==sha for path,sha in expected.items()):
+                  subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+                  subprocess.run(['git','apply','-'],input=patch,check=True)
+              assert all(blob(path)==sha for path,sha in expected.items()),'Scheduling source changed'
+              patch=lzma.decompress(Path('test-suite/patches/analyzer-output.patch.xz').read_bytes())
+              assert hashlib.sha256(patch).hexdigest()=='e72e77944bcf69787e6de48f64b76a9b2b85e95aae81909ce85d386cc0680b5e'
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
-          assert all(blob(path)==sha for path,sha in expected.items()),'Candidate source changed'
-          subprocess.run(['git','add','-N','test-suite/quality/test_analyzer_scheduling.py'],check=True)
+          assert all(blob(path)==sha for path,sha in final.items()),'Candidate source changed'
+          subprocess.run(['git','add','-N','test-suite/quality/test_analyzer_scheduling.py',
+                          'test-suite/quality/test_analyzer_output.py'],check=True)
           PY
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
@@ -88,7 +99,7 @@ jobs:
                       count+=1
                       print('ANALYZER_SELFTEST_PASS',analyzer.name,name,flush=True)
           assert count>0
-          for pattern in ('test_analyzer_scheduling.py','test_taint_python*.py','test_taint_go*.py',
+          for pattern in ('test_analyzer*.py','test_taint_python*.py','test_taint_go*.py',
                           'test_taint_js_modules.py','test_taint_js_commonjs.py'):
               suite=unittest.defaultTestLoader.discover('test-suite/quality',pattern=pattern)
               result=unittest.TextTestRunner(verbosity=2).run(suite)
@@ -118,7 +129,7 @@ jobs:
           changed=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
           source={'modules/helpers/ubs_core/registry.py','modules/helpers/ubs_core/cli.py',
                   'modules/helpers/ubs_core/analyzers/guards_py.py','modules/helpers/ubs_core/analyzers/narrowing_py.py',
-                  'test-suite/quality/test_analyzer_scheduling.py'}
+                  'test-suite/quality/test_analyzer_scheduling.py','test-suite/quality/test_analyzer_output.py'}
           allowed=source|{'ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed)<=allowed,changed

@@ -242,6 +242,21 @@ def report_diagnostics(report, path, root, text, exit_code, *, selected_paths=()
     if not isinstance(totals, dict) or type(totals.get('files')) is not int or totals['files'] < 1:
         raise ProtocolError('Scanner did not verify any source files')
     records = report.get('findings')
+    # findings_merge leaves a successful zero-count summary unchanged when
+    # no producer emitted a finding sink. An absent array is valid only with
+    # explicit, integer zero counters and successful execution. Null/malformed
+    # arrays, omitted counters and unaccounted findings must still fail closed.
+    if 'findings' not in report and exit_code == 0 and all(
+            type(totals.get(severity)) is int and totals[severity] == 0
+            for severity in ('critical', 'warning', 'info')):
+        scanners = report.get('scanners', [])
+        if not isinstance(scanners, list) or any(
+                not isinstance(scanner, dict) or any(
+                    type(scanner.get(severity, 0)) is not int or scanner.get(severity, 0) != 0
+                    for severity in ('critical', 'warning', 'info'))
+                for scanner in scanners):
+            raise ProtocolError('Scanner counters disagree with the empty findings ledger')
+        records = []
     ast_records = report.get('ast_findings', [])
     if not isinstance(records, list) or not isinstance(ast_records, list):
         raise ProtocolError('Scanner report has no valid findings ledger')

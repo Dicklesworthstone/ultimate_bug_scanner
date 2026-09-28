@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+from pathlib import Path
 from typing import Iterable, Sequence
 
 RULE_ID = "py.security.command-injection"
@@ -70,11 +71,53 @@ def keyword_value(call, name):
     for keyword in call.keywords:
         if keyword.arg == name:
             return keyword.value
+        if keyword.arg is None and isinstance(keyword.value, ast.Dict):
+            values = literal_keywords(keyword.value)
+            if name in values:
+                return values[name]
     return None
 
 
-def is_true(node):
-    return isinstance(node, ast.Constant) and node.value is True
+def literal_keywords(node):
+    """Read syntactic ** mappings without evaluating scanned code."""
+    values = {}
+    for key, value in zip(node.keys, node.values):
+        if key is None and isinstance(value, ast.Dict):
+            values.update(literal_keywords(value))
+        elif isinstance(key, ast.Constant) and isinstance(key.value, str):
+            values[key.value] = value
+    return values
+
+
+def positional_values(nodes):
+    for node in nodes:
+        if isinstance(node, ast.Starred) and isinstance(node.value, (ast.List, ast.Tuple)):
+            yield from positional_values(node.value.elts)
+        else:
+            yield node
+
+
+def argument_value(call, index, name):
+    value = keyword_value(call, name)
+    if value is not None:
+        return value
+    for position, value in enumerate(positional_values(call.args)):
+        if isinstance(value, ast.Starred):
+            # An unknown expansion has no reliable positional shape.
+            return None
+        if position == index:
+            return value
+    return None
+
+
+def may_enable_shell(node):
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant):
+        return bool(node.value)
+    # A supplied dynamic flag can enable shell interpretation. Do not treat
+    # shell=1 or shell=configuration as the default shell=False.
+    return True
 
 
 def const_string(node):
@@ -121,6 +164,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.raw_tainted_names = set()
         self.shell_command_vars = set()
         self.executable_vars = set()
+        self.argv_names = set()
         self.issues = []
         self.seen_lines = set()
 
@@ -166,6 +210,8 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
     def expr_is_dynamic_string(self, node):
         if self.expr_is_tainted(node):
             return True
+        if isinstance(node, ast.Name):
+            return node.id in self.shell_command_vars
         if isinstance(node, ast.JoinedStr):
             return any(isinstance(part, ast.FormattedValue) for part in node.values)
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
@@ -183,13 +229,13 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         if self.expr_is_tainted(node, shell=False):
             return True
         if isinstance(node, ast.Name):
-            return node.id in self.executable_vars or node.id in self.tainted_names
+            return node.id in self.executable_vars or node.id in self.shell_command_vars
         return self.expr_is_dynamic_string(node)
 
-    def shell_c_payload(self, node):
+    def shell_c_payload(self, node, executable=None):
         if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 3:
             return None
-        executable = const_string(node.elts[0])
+        executable = const_string(executable if executable is not None else node.elts[0])
         flag = const_string(node.elts[1])
         if shell_name(executable) in SHELL_NAMES and flag and flag.lower() in SHELL_FLAGS:
             return node.elts[2]
@@ -229,7 +275,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
             local = alias.asname or alias.name
             if module == 'subprocess' and alias.name in SUBPROCESS_CALLS:
                 self.direct_calls[local] = f'subprocess.{alias.name}'
-            elif module == 'os' and alias.name in (OS_COMMAND_CALLS | OS_EXEC_CALLS | OS_SPAWN_CALLS):
+            elif module == 'os' and alias.name in (OS_EXEC_CALLS | OS_SPAWN_CALLS | OS_COMMAND_CALLS):
                 self.direct_calls[local] = f'os.{alias.name}'
         self.generic_visit(node)
 
@@ -238,7 +284,16 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         raw_tainted = self.expr_is_tainted(value, shell=False)
         shell_command = self.expr_is_dynamic_string(value)
         dynamic_executable = self.list_executable_is_dynamic(value)
+        is_argv = isinstance(value, (ast.List, ast.Tuple)) or (
+            isinstance(value, ast.Name) and value.id in self.argv_names
+        )
+        if isinstance(value, ast.Name) and value.id in self.executable_vars:
+            dynamic_executable = True
         for name in names:
+            if is_argv:
+                self.argv_names.add(name)
+            else:
+                self.argv_names.discard(name)
             if raw_tainted:
                 self.raw_tainted_names.add(name)
             else:
@@ -270,17 +325,31 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def subprocess_arg_is_unsafe(self, node):
-        if not node.args:
+        command = argument_value(node, 0, 'args')
+        if command is None:
             return False
-        command = node.args[0]
-        shell_payload = self.shell_c_payload(command)
+        # The wrappers forward Popen's positional and keyword arguments.
+        executable = argument_value(node, 2, 'executable')
+        if isinstance(executable, ast.Constant) and executable.value is None:
+            executable = None
+        if executable is not None and self.executable_is_dynamic(executable):
+            return True
+        if may_enable_shell(argument_value(node, 8, 'shell')):
+            return self.arg_is_shell_command(command)
+        shell_payload = self.shell_c_payload(command, executable)
         if shell_payload is not None:
             return self.arg_is_shell_command(shell_payload)
-        if is_true(keyword_value(node, 'shell')):
-            return self.arg_is_shell_command(command)
-        return self.list_executable_is_dynamic(command) or (
-            isinstance(command, ast.Name) and command.id in self.executable_vars
-        )
+        if executable is not None:
+            # With an explicit fixed program, argv[0] is data, not the
+            # executable selector. A fixed shell override was checked above.
+            return False
+        if isinstance(command, (ast.List, ast.Tuple)):
+            return self.list_executable_is_dynamic(command)
+        if isinstance(command, ast.Name) and command.id in self.argv_names:
+            return command.id in self.executable_vars
+        # A scalar args value chooses the executable even without a shell;
+        # shell quoting does not authorize that program.
+        return self.executable_is_dynamic(command)
 
     def os_exec_arg_is_unsafe(self, node, func):
         if func in OS_SPAWN_CALLS:
@@ -298,7 +367,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
             unsafe = False
             if module == 'subprocess':
                 if func in {'getoutput', 'getstatusoutput'}:
-                    unsafe = bool(node.args and self.arg_is_shell_command(node.args[0]))
+                    unsafe = self.arg_is_shell_command(argument_value(node, 0, 'cmd'))
                 else:
                     unsafe = self.subprocess_arg_is_unsafe(node)
             elif module == 'os' and func in OS_COMMAND_CALLS:

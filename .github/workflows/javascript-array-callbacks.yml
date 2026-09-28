@@ -82,9 +82,9 @@ jobs:
                   assert blob('test-suite/js/test_taint_callbacks.py')==test_sha,filename
           assert blob(source)=='eb6fc2986b46a9d09fe8876473dea5245c3f2889'
           assert blob('test-suite/js/test_taint_callbacks.py')=='05969345000772215d3f9890977a2d8dbda10d8b'
-          apply('javascript-array-reductions.patch.xz','88f533bdad6c75d9be537d499732eba754dd21fd229dd234d66969e884968111')
-          assert blob(source)=='30eb5380494a8e6ed24570e9f4b097dd0d6189dc'
-          assert blob('test-suite/js/test_taint_callbacks.py')=='7bde6ebb9d4154b3185a6c5733373a6ba243f26e'
+          apply('javascript-array-reductions.patch.xz','656f1d854e2a11d40e64a2d6fc386a2c35d920b99b0322047a571cdbcd87a75a')
+          assert blob(source)=='39c2c9e5d6e48d5e5f86c3670eef627dfc2462e6'
+          assert blob('test-suite/js/test_taint_callbacks.py')=='3034e18f18d14afc825d39c0364632a941fe4d87'
           subprocess.run(['git','add','-N','test-suite/js/test_taint_callbacks.py'],check=True)
           PY
           python3 scripts/update_checksums.py

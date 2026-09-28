@@ -1,0 +1,164 @@
+name: JavaScript Array Callback Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/javascript-array-callbacks.patch.xz
+      - .github/workflows/javascript-array-callbacks.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  callback-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Temporary immutable object publication only; no commits or ref writes.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_HEAP_E2E: '1'
+      UBS_TAINT_E2E: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Retain exact input source including concurrent detector changes
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/js-callback-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/js-callback-source-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/js-callback-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: javascript-callback-current-source
+          path: ${{ runner.temp }}/js-callback-source*
+          retention-days: 3
+      - name: Apply exact reviewed source without replacing other detectors
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          from pathlib import Path
+          import subprocess
+          def blob(path):
+              return subprocess.check_output(['git','hash-object',path],text=True).strip()
+          def apply(filename, digest):
+              patch=lzma.decompress(Path('test-suite/patches',filename).read_bytes())
+              assert hashlib.sha256(patch).hexdigest()==digest,filename
+              subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+              subprocess.run(['git','apply','-'],input=patch,check=True)
+          source='modules/helpers/ubs_core/analyzers/taint_js.py'
+          if blob(source)=='5dc2d9daece893dd5515a6d2178941ff9ec88f33':
+              for filename,digest,sha in (
+                  ('javascript-heap-shapes.patch.xz','d0e155c96c5ca90ad940430bcf2d428105368124785ed249c333bef6fc2b6328','12c81cf151445b4c9c5549f1330add88dcced924'),
+                  ('javascript-native-identity.patch.xz','85bad85ebb7e10d52fb313bc5747d0248b481d3ea9132d9bc331180abadc5522','2041fe7138e24143b335ad69b257dc8154c08caa'),
+                  ('javascript-native-exports.patch.xz','3eb47660f1a7e36cf19ab3a489573c11202d42d238c329512a8fccdc4c0420d4','ba33ac4e17f45ebc5907dd2f66042d3a01373bf4'),
+                  ('javascript-heap-templates.patch.xz','63da65df02dd0f59a81ed3945b3cad5d6ea86d1df5c02ecf8a375d11e5858973','be3183c0a46d9e6de0100c3d65eb41ad5f005e00'),
+              ):
+                  apply(filename,digest)
+                  assert blob(source)==sha,filename
+          assert blob(source)=='be3183c0a46d9e6de0100c3d65eb41ad5f005e00'
+          apply('javascript-array-callbacks.patch.xz','75049d7a19d1492d0020d8307618a996e04af27917f0dee3006f28f68241eafc')
+          assert blob(source)=='49b2acef779f6c1aee79a0345d86d8c1f0e3b61c'
+          assert blob('test-suite/js/test_taint_callbacks.py')=='8eb4a7e2374764de07074d45d3c28d63e764fdec'
+          subprocess.run(['git','add','-N','test-suite/js/test_taint_callbacks.py'],check=True)
+          PY
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Install actual scanner and independent language controls
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli typescript@5.8.3
+      - name: Run all source and native regression methods without skips
+        run: |
+          command -v ast-grep
+          command -v node
+          command -v tsc
+          python3 - <<'PY'
+          import importlib.util
+          import unittest
+          result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('test-suite/js',pattern='test_taint*.py'))
+          assert result.wasSuccessful() and not result.skipped,(result.failures,result.errors,result.skipped)
+          print('JS_CALLBACK_SOURCE_PASS',result.testsRun,flush=True)
+          for path in ('test-suite/quality/test_taint_js_modules.py','test-suite/quality/test_taint_js_commonjs.py','test-suite/quality/test_taint_js_heap.py'):
+              spec=importlib.util.spec_from_file_location('regressions',path)
+              module=importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(module)
+              result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(module))
+              assert result.wasSuccessful() and not result.skipped,(path,result.failures,result.errors,result.skipped)
+              print('JS_CALLBACK_TEST_PASS',path,result.testsRun,flush=True)
+          PY
+      - name: Preserve JavaScript, Python detector and integrity quality gates
+        run: |
+          python3 -m unittest discover -s test-suite/quality -p '*js*.py' -v
+          python3 test-suite/quality/test_python_command_injection_dataflow.py
+          python3 test-suite/shareable/test_contract_checksums.py
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Verify deterministic regeneration and publish tested immutable objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          import urllib.request
+          changed=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          required={'modules/helpers/ubs_core/analyzers/taint_js.py','test-suite/js/test_taint_callbacks.py'}
+          allowed=required|{'test-suite/js/test_taint_heap.py','test-suite/quality/test_taint_js_heap.py','ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert required<=set(changed)<=allowed,changed
+          before={name:Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3','scripts/update_checksums.py'],check=True)
+          assert changed==subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          assert all(Path(name).read_bytes()==data for name,data in before.items())
+          for command in (['./scripts/verify_checksums.sh'],['./scripts/verify_sha256sums.sh'],['git','diff','--check']):
+              subprocess.run(command,check=True)
+          manifest=[]
+          with tarfile.open(Path(os.environ['RUNNER_TEMP'],'js-callback-verified.tar.gz'),'w:gz') as archive:
+              for name,data in before.items():
+                  sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+                  mode=subprocess.check_output(['git','ls-files','-s','--',name],text=True).split()[0]
+                  assert mode in {'100644','100755'}
+                  manifest.append({'path':name,'sha':sha,'mode':mode})
+                  archive.add(name,arcname=name)
+          Path(os.environ['RUNNER_TEMP'],'js-callback-verified.json').write_text(json.dumps(manifest,indent=2))
+          for entry in manifest:
+              request=urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/git/blobs',
+                  data=json.dumps({'encoding':'base64','content':base64.b64encode(before[entry['path']]).decode('ascii')}).encode(),
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/json','Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request,timeout=90) as response:
+                  result=json.load(response)
+              assert result['sha']==entry['sha'],entry['path']
+              print('JS_CALLBACK_OBJECT',entry['path'],entry['sha'],entry['mode'],flush=True)
+          print('JS_CALLBACK_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: javascript-callback-validation
+          path: |
+            ${{ runner.temp }}/js-callback-verified*
+            test-suite/artifacts/javascript-callbacks/
+            test-suite/artifacts/javascript-heap-shapes/
+            test-suite/artifacts/javascript-call-completions/
+            test-suite/artifacts/javascript-modules/
+            test-suite/artifacts/javascript-commonjs/
+            test-suite/artifacts/javascript-heap/
+          retention-days: 3

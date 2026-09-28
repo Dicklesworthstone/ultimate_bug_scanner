@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - test-suite/patches/javascript-array-callbacks.patch.xz
+      - test-suite/patches/javascript-callback-convergence.patch.xz
       - .github/workflows/javascript-array-callbacks.yml
   workflow_dispatch:
 
@@ -68,6 +69,9 @@ jobs:
           apply('javascript-array-callbacks.patch.xz','75049d7a19d1492d0020d8307618a996e04af27917f0dee3006f28f68241eafc')
           assert blob(source)=='49b2acef779f6c1aee79a0345d86d8c1f0e3b61c'
           assert blob('test-suite/js/test_taint_callbacks.py')=='8eb4a7e2374764de07074d45d3c28d63e764fdec'
+          apply('javascript-callback-convergence.patch.xz','7c261fa850d9d41d877b0aa2d6ac521133f46fbf4a64d9517fca6f01b33575c4')
+          assert blob(source)=='348c7a3795ca86303c9445e027ab910f7c64073f'
+          assert blob('test-suite/js/test_taint_callbacks.py')=='f1664635e7ce0cfedb71ef47f1f0124892e39e6b'
           subprocess.run(['git','add','-N','test-suite/js/test_taint_callbacks.py'],check=True)
           PY
           python3 scripts/update_checksums.py

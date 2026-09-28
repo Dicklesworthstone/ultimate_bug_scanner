@@ -309,7 +309,10 @@ class RunnerIntegrationTests(unittest.TestCase):
                                ("q=input()\ncursor.execute('select %s', (q,))\n", False),
                                ("match request.get_json():\n    case {**rest}:\n        cursor.execute(rest['query'])\n", True),
                                ("match cursor.execute:\n    case execute:\n        execute(input())\n", True),
-                               ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False)):
+                               ("match request.get_json():\n    case {**rest}:\n        cursor.execute('select %s', (rest,))\n", False),
+                               ("q='safe'\nmatch payload:\n    case _ if (q := input()) and False:\n        pass\n"
+                                "    case _:\n        cursor.execute(q)\n", True),
+                               ("match payload:\n    case _ if False:\n        cursor.execute(input())\n", False)):
             with self.subTest(code=code), tempfile.TemporaryDirectory(prefix='ubs-taint-e2e-') as tmp:
                 path = Path(tmp) / 'view.py'
                 path.write_text(code)

@@ -315,5 +315,210 @@ def run(value):
         self.assertEqual(taint_py._local_names(function), {'value', 'child'})
 
 
+class PatternControlFlowTests(SourceTest):
+    def test_false_guard_writes_flow_to_next_case_and_after_match(self):
+        for suffix in ('    case _:\n        eval(code)\n', 'eval(code)\n'):
+            with self.subTest(suffix=suffix):
+                self.assert_rules("code = 'safe'\nmatch payload:\n"
+                                  "    case _ if (code := input()) and False:\n"
+                                  "        pass\n" + suffix, 'eval')
+
+    def test_successful_pattern_captures_survive_a_false_guard(self):
+        self.assert_rules('''
+            match input():
+                case code if False:
+                    pass
+                case _:
+                    eval(code)
+        ''', 'eval')
+
+    def test_false_guard_does_not_execute_its_body(self):
+        for guard in ('False', '0', 'None', "''", '(flag := False)', 'not True'):
+            with self.subTest(guard=guard):
+                self.assert_rules(f'match payload:\n    case _ if {guard}:\n        eval(input())\n')
+
+    def test_literal_guard_short_circuits_sink_operands(self):
+        for guard in ('False and eval(input())', 'True or eval(input())',
+                      'not (False and eval(input()))', 'True if True else eval(input())'):
+            with self.subTest(guard=guard):
+                self.assert_rules(f'match payload:\n    case _ if {guard}:\n        pass\n')
+
+    def test_unknown_short_circuit_preserves_both_dataflow_paths(self):
+        self.assert_rules('''
+            code = input()
+            match payload:
+                case _ if flag and (code := 'safe'):
+                    pass
+            eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            code = input()
+            match payload:
+                case _ if flag or (code := 'safe'):
+                    eval(code)
+        ''', 'eval')
+
+    def test_and_guard_executed_assignment_is_visible_only_on_selected_edge(self):
+        self.assert_rules('''
+            code = input()
+            match payload:
+                case _ if flag and (code := 'safe'):
+                    eval(code)
+        ''')
+
+    def test_guard_failure_revokes_old_sanitizer_identity_for_later_cases(self):
+        self.assert_rules('''
+            import html as clean
+            match payload:
+                case _ if (clean := other) and False:
+                    pass
+                case _:
+                    HttpResponse(clean.escape(input()))
+        ''', 'xss')
+
+    def test_true_guard_prevents_later_case_guard_and_body_effects(self):
+        self.assert_rules('''
+            match payload:
+                case _ if True:
+                    pass
+                case _ if eval(input()):
+                    pass
+                case _:
+                    eval(input())
+        ''')
+
+    def test_guards_are_ordered_and_subject_is_not_reevaluated(self):
+        self.assert_rules('''
+            def scan():
+                code = input()
+                match (code := 'safe'):
+                    case _ if (code := input()) and False:
+                        pass
+                    case _:
+                        return code
+            eval(scan())
+        ''', 'eval')
+
+    def test_guard_mutation_is_visible_to_later_capture(self):
+        self.assert_rules('''
+            def fill(data):
+                data['code'] = input()
+                return False
+            data = {}
+            match data:
+                case _ if fill(data):
+                    pass
+                case {'code': code}:
+                    eval(code)
+        ''', 'eval')
+
+    def test_subject_identity_survives_guard_rebinding(self):
+        self.assert_rules('''
+            data = {}
+            saved = data
+            match data:
+                case _ if (data := {}) and False:
+                    pass
+                case alias:
+                    alias['code'] = input()
+            eval(saved['code'])
+        ''', 'eval')
+
+    def test_pattern_mismatch_does_not_evaluate_guard(self):
+        self.assert_rules('''
+            match 'safe':
+                case 'other' if eval(input()):
+                    pass
+                case _:
+                    pass
+        ''')
+
+    def test_literal_first_match_prevents_later_tainted_return(self):
+        self.assert_rules('''
+            def code():
+                match 'safe':
+                    case 'safe':
+                        return 'safe'
+                    case _:
+                        return input()
+            eval(code())
+        ''')
+
+    def test_singleton_identity_is_distinct_from_literal_equality(self):
+        self.assert_rules('''
+            match 1:
+                case True:
+                    eval(input())
+        ''')
+        self.assert_rules('''
+            match True:
+                case 1:
+                    eval(input())
+        ''', 'eval')
+
+    def test_strings_are_not_sequence_or_mapping_subjects(self):
+        for pattern in ('[code]', '{**rest}'):
+            with self.subTest(pattern=pattern):
+                self.assert_rules(f"match 'x':\n    case {pattern}:\n        eval(input())\n")
+
+    def test_unknown_pattern_keeps_unmatched_route_without_guard_effects(self):
+        self.assert_rules('''
+            code = input()
+            match payload:
+                case {'ok': _} if (code := 'safe'):
+                    pass
+                case _:
+                    eval(code)
+        ''', 'eval')
+
+    def test_guard_exception_routes_to_handler_not_later_cases(self):
+        self.assert_rules('''
+            def fail():
+                raise ValueError(input())
+            try:
+                match payload:
+                    case _ if fail():
+                        pass
+                    case _:
+                        cursor.execute(input())
+            except ValueError as error:
+                eval(str(error))
+        ''', 'eval')
+
+    def test_subject_exception_prevents_pattern_and_guard_effects(self):
+        self.assert_rules('''
+            def fail():
+                raise ValueError('safe')
+            match fail():
+                case _ if eval(input()):
+                    pass
+        ''')
+
+    def test_selected_return_still_runs_finally(self):
+        self.assert_rules('''
+            def scan():
+                code = 'safe'
+                try:
+                    match payload:
+                        case _ if (code := input()) and False:
+                            pass
+                        case _:
+                            return 'safe'
+                finally:
+                    eval(code)
+            scan()
+        ''', 'eval')
+
+    def test_loop_guard_writes_reach_break_and_continue_successors(self):
+        for exit_ in ('break', 'continue'):
+            with self.subTest(exit_=exit_):
+                self.assert_rules(f"code = 'safe'\nfor payload in records:\n"
+                                  "    match payload:\n"
+                                  "        case _ if (code := input()) and False:\n"
+                                  "            pass\n"
+                                  f"        case _:\n            {exit_}\n"
+                                  "eval(code)\n", 'eval')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

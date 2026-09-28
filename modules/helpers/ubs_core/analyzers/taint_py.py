@@ -549,6 +549,32 @@ def _irrefutable_pattern(pattern) -> bool:
     return False
 
 
+def _pattern_outcome(pattern, subject, binding):
+    """Prove only irrefutable or literal matches; dynamic shapes stay unknown."""
+    if _irrefutable_pattern(pattern):
+        return True
+    if isinstance(pattern, ast.MatchAs):
+        return _pattern_outcome(pattern.pattern, subject, binding)
+    if isinstance(pattern, ast.MatchOr):
+        outcomes = [_pattern_outcome(part, subject, binding) for part in pattern.patterns]
+        return True if True in outcomes else None if None in outcomes else False
+    if isinstance(subject, ast.Constant):
+        value = subject.value
+    elif isinstance(binding, _LiteralString):
+        value = binding.value
+    else:
+        return None
+    if isinstance(pattern, ast.MatchSingleton):
+        return value is pattern.value
+    if isinstance(pattern, ast.MatchValue) and isinstance(pattern.value, ast.Constant):
+        return value == pattern.value.value
+    # AST constants cannot be mappings or matchable sequences (str/bytes
+    # deliberately do not satisfy sequence patterns in Python).
+    if isinstance(pattern, (ast.MatchMapping, ast.MatchSequence)):
+        return False
+    return None
+
+
 @dataclass(frozen=True)
 class ExceptionSummary:
     exception_type: str | None
@@ -852,6 +878,42 @@ class _Flow:
                     self.mutate(references, _advance(fact, base.id), state)
                 else:
                     state[base.id] = join_facts(state.get(base.id, CLEAN), _advance(fact, base.id))
+
+    def condition(self, node, state):
+        """Return truthy/falsy successors, preserving ordered guard effects."""
+        if state is None or not state.reachable:
+            return None, None
+        if isinstance(node, ast.BoolOp):
+            stopped = []
+            continuation = state
+            for operand in node.values:
+                truthy, falsy = self.condition(operand, continuation)
+                if isinstance(node.op, ast.And):
+                    continuation = truthy
+                    stopped.append(falsy)
+                else:
+                    continuation = falsy
+                    stopped.append(truthy)
+            return ((continuation, _join_states(*stopped)) if isinstance(node.op, ast.And)
+                    else (_join_states(*stopped), continuation))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            truthy, falsy = self.condition(node.operand, state)
+            return falsy, truthy
+        if isinstance(node, ast.IfExp):
+            left, right = self.condition(node.test, state)
+            left_true, left_false = self.condition(node.body, left)
+            right_true, right_false = self.condition(node.orelse, right)
+            return _join_states(left_true, right_true), _join_states(left_false, right_false)
+        self.expr(node, state)
+        if not state.reachable:
+            return None, None
+        literal = node.value if isinstance(node, ast.NamedExpr) else node
+        if isinstance(literal, ast.Constant):
+            return (state, None) if bool(literal.value) else (None, state)
+        binding = self.expression_bindings.get(node)
+        if isinstance(binding, _LiteralString):
+            return (state, None) if binding.value else (None, state)
+        return state.copy(), state
 
     def bind_pattern(self, pattern, fact, state, binding=None, references=NO_REFERENCES):
         """Bind one successful pattern without executing the subject again.
@@ -1856,21 +1918,33 @@ class _Flow:
                     self.assign(target, CLEAN, state)
         elif hasattr(ast, 'Match') and isinstance(node, ast.Match):
             subject = self.expr(node.subject, state)
+            if not state.reachable:
+                return None
             binding = self.expression_bindings.get(node.subject)
             references = self.expression_references.get(node.subject, NO_REFERENCES)
             branches = []
-            exhaustive = False
+            remaining = state
             for case in node.cases:
-                branch = state.copy()
-                self.bind_pattern(case.pattern, subject, branch, binding, references)
-                self.expr(case.guard, branch)
-                branches.append(self.block(case.body, branch))
-                if case.guard is None and _irrefutable_pattern(case.pattern):
-                    exhaustive = True
+                if remaining is None:
                     break
-            if not exhaustive:
-                branches.append(state.copy())
-            return _join_states(*branches)
+                outcome = _pattern_outcome(case.pattern, node.subject, binding)
+                if outcome is False:
+                    continue
+                branch = remaining.copy()
+                # The subject is evaluated once, but earlier guards may write
+                # through its saved reference even after rebinding its name.
+                fact = join_facts(subject, *(branch.heap.get(ref, CLEAN) for ref in references))
+                current_binding = (_without_object_contract(binding) if references & branch.mutated else binding)
+                self.bind_pattern(case.pattern, fact, branch, current_binding, references)
+                # Failed partial-pattern bindings are unspecified by Python.
+                # Retain both pre-pattern and possibly captured definitions,
+                # without applying any guard effects to a failed pattern.
+                unmatched = _join_states(remaining, branch) if outcome is None else None
+                selected, rejected = ((branch, None) if case.guard is None
+                                      else self.condition(case.guard, branch))
+                branches.append(self.block(case.body, selected))
+                remaining = _join_states(unmatched, rejected)
+            return _join_states(*branches, remaining)
         else:
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, ast.expr):

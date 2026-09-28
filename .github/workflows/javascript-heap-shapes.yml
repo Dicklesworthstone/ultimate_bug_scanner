@@ -33,6 +33,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Retain exact current source and verify the existing integrity chain
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/js-shapes-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/js-shapes-source-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/js-shapes-source.tar.gz"
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: javascript-shapes-current-source
+          path: ${{ runner.temp }}/js-shapes-source*
+          retention-days: 3
       - name: Apply exact reviewed shape, identity and scheduled-summary increments
         run: |
           python3 - <<'PY'

@@ -92,6 +92,77 @@ class ContractChecksums(unittest.TestCase):
             after = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
             self.assertEqual(before, after)
 
+    def test_local_tool_caches_are_not_pinned(self) -> None:
+        # d58f0f2 pinned modules/helpers/ubs_core/analyzers/.ruff_cache/* into
+        # HELPER_CHECKSUMS and HELPER_ASSETS. Those files are gitignored, so an
+        # installed ubs tried to download them on every scan and got 404s.
+        with tempfile.TemporaryDirectory(prefix="ubs-contract-caches-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            core = root / "modules/helpers/ubs_core"
+            (core / "analyzers/.ruff_cache/0.16.9").mkdir(parents=True)
+            (core / "analyzers/__pycache__").mkdir(parents=True)
+            (core / "analyzers/real.py").write_text("X = 1\n", encoding="utf-8")
+            (core / "analyzers/.ruff_cache/CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
+            (core / "analyzers/.ruff_cache/0.16.9/123").write_bytes(b"\x00cache")
+            (core / "analyzers/__pycache__/real.cpython-314.pyc").write_bytes(b"\x00pyc")
+            (core / ".pytest_cache").mkdir()
+            (core / ".pytest_cache/README.md").write_text("cache\n", encoding="utf-8")
+            result = self.generate(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            runner = (root / "ubs").read_text(encoding="utf-8")
+            common = (root / "modules/lib/ubs-common.sh").read_text(encoding="utf-8")
+            for text in (runner, common):
+                self.assertIn("'helpers/ubs_core/analyzers/real.py'", text)
+                for cache in (".ruff_cache", "__pycache__", ".pytest_cache"):
+                    self.assertNotIn(cache, text)
+
+    def test_checkout_pins_only_tracked_helpers(self) -> None:
+        # Every HELPER_ASSETS entry is downloaded from the repository by an
+        # installed ubs, so each one must be a tracked file.
+        try:
+            tracked = subprocess.run(
+                ["git", "ls-files", "-z", "--", "modules"], cwd=REPO_ROOT,
+                capture_output=True, check=True, timeout=30,
+            ).stdout.decode("utf-8").split("\0")
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.skipTest(f"not a git checkout: {exc}")
+        tracked_set = {path[len("modules/"):] for path in tracked if path}
+        if not tracked_set:
+            self.skipTest("no tracked modules (exported tree)")
+        runner = (REPO_ROOT / "ubs").read_text(encoding="utf-8")
+        assets = re.search(r"HELPER_ASSETS=\(\n(.*?)\n\)", runner, re.S)
+        self.assertIsNotNone(assets)
+        listed = re.findall(r'^\s*"([^"]+)"', assets.group(1), re.M)
+        self.assertTrue(listed)
+        untracked = sorted(rel for rel in listed if rel not in tracked_set)
+        self.assertEqual(untracked, [], "HELPER_ASSETS lists files that are not in the repository")
+
+    def test_verifier_rejects_pin_for_file_not_in_tree(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-contract-stale-pin-") as tmp:
+            root = Path(tmp)
+            self.make_tree(root)
+            helper = root / "modules/helpers/ubs_core/gone.py"
+            helper.parent.mkdir(parents=True)
+            helper.write_text("X = 1\n", encoding="utf-8")
+            verifier = root / "scripts/verify_checksums.sh"
+            shutil.copy2(REPO_ROOT / "scripts/verify_checksums.sh", verifier)
+            result = self.generate(root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+            def verify() -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", str(verifier)], cwd=root, text=True,
+                    capture_output=True, check=False, timeout=30,
+                )
+
+            result = verify()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            helper.unlink()
+            result = verify()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("PINNED HELPER NOT IN TREE: modules/helpers/ubs_core/gone.py", result.stdout)
+
     def test_verifier_rejects_contract_drift_and_missing_asset(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-contract-verify-") as tmp:
             root = Path(tmp)

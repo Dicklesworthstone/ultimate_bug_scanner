@@ -93,7 +93,14 @@ def main():
     core_dir = modules_dir / "helpers" / "ubs_core"
     if core_dir.is_dir():
         for path in sorted(core_dir.rglob("*")):
-            if path.is_file() and "__pycache__" not in path.parts:
+            # Local tool caches (.ruff_cache/, .pytest_cache/, __pycache__/)
+            # are not shipped: a pinned path is also a download target in
+            # HELPER_ASSETS, and one that is not in the repository 404s on
+            # every installed scan.
+            parts = path.relative_to(core_dir).parts
+            if any(part == "__pycache__" or part.startswith(".") for part in parts):
+                continue
+            if path.is_file():
                 rel = "helpers/ubs_core/" + path.relative_to(core_dir).as_posix()
                 helper_map[rel] = rel
 

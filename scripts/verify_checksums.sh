@@ -150,8 +150,27 @@ done < <({
   # Enumerate the required root-level asset even when missing (or a symlink),
   # so deleting it cannot make checksum verification silently skip it.
   printf '%s\0' modules/contract.json
-  find modules/helpers modules/lib -type f ! -path "*__pycache__*" -print0
+  # Local tool caches (__pycache__/, .ruff_cache/, ...) are not shipped and
+  # not pinned; scripts/update_checksums.py skips the same paths.
+  find modules/helpers modules/lib -type f ! -path "*__pycache__*" ! -path "*/.*" -print0
 } | sort -z)
+
+# The other direction: every pinned helper is a download target
+# (HELPER_ASSETS), so a pin for a file that is not in the tree 404s on every
+# installed scan. A stray local cache swept into the tables did exactly that.
+for rel in "${!EXPECTED_HELPER_CHECKSUMS[@]}" "${!EXPECTED_COMMON_HELPER_CHECKSUMS[@]}"; do
+  if [[ ! -f "modules/$rel" ]]; then
+    echo -e "${RED}✗ PINNED HELPER NOT IN TREE: modules/$rel${NC}"
+    FAILED=1
+  fi
+done
+while IFS= read -r rel; do
+  [[ -z "$rel" ]] && continue
+  if [[ -z "${EXPECTED_HELPER_CHECKSUMS[$rel]:-}" ]]; then
+    echo -e "${RED}✗ HELPER_ASSETS ENTRY WITHOUT A PINNED CHECKSUM: $rel${NC}"
+    FAILED=1
+  fi
+done < <(sed -n '/^HELPER_ASSETS=(/,/^)/p' ubs | sed -n 's/^[[:space:]]*"\([^"]*\)".*/\1/p')
 
 if [[ $FAILED -eq 1 ]]; then
   echo ""

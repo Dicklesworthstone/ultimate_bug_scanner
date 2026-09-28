@@ -1,0 +1,157 @@
+name: Analyzer Scope and Parallelism
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/analyzer-scheduling.patch.xz
+      - .github/workflows/analyzer-scheduling.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-scope:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    # Publish immutable blobs after validation, never commits or branch refs.
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_TAINT_E2E: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Retain exact input revision
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/analyzer-scope-base.txt"
+          git ls-files -s > "$RUNNER_TEMP/analyzer-scope-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/analyzer-scope-source.tar.gz"
+      - name: Apply reviewed scheduling implementation
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import lzma
+          from pathlib import Path
+          import subprocess
+          patch=lzma.decompress(Path('test-suite/patches/analyzer-scheduling.patch.xz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest()=='dd3b2f9b861c32a6f74513e67f55c43a7039d6e0db95665b5f2ff6da4947db3f'
+          expected={
+              'modules/helpers/ubs_core/registry.py':'ab6113af2139ec0f7a7891e597f197afe40aa96f',
+              'modules/helpers/ubs_core/cli.py':'a8f550a0c02aa255ad5741d77813f380abfe74d4',
+              'modules/helpers/ubs_core/analyzers/guards_py.py':'21f56fe5dec48fb738d99dd050d861747be33882',
+              'modules/helpers/ubs_core/analyzers/narrowing_py.py':'48d453b17aa9a68ad8be2eea3eb200fb02d93388',
+              'test-suite/quality/test_analyzer_scheduling.py':'2f1ab6aa8d8aa179a06287646ef68471cba74fbf',
+          }
+          def blob(path):
+              return subprocess.check_output(['git','hash-object',path],text=True).strip() if Path(path).is_file() else None
+          if not all(blob(path)==sha for path,sha in expected.items()):
+              subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+              subprocess.run(['git','apply','-'],input=patch,check=True)
+          assert all(blob(path)==sha for path,sha in expected.items()),'Candidate source changed'
+          subprocess.run(['git','add','-N','test-suite/quality/test_analyzer_scheduling.py'],check=True)
+          PY
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Exercise full-selection analysis and existing native taint regressions
+        run: |
+          set -o pipefail
+          python3 - <<'PY' 2>&1 | tee "$RUNNER_TEMP/analyzer-scope-tests.log"
+          import importlib.util
+          import sys
+          import unittest
+          from pathlib import Path
+          sys.path.insert(0,str(Path('modules/helpers').resolve()))
+          from ubs_core import analyzers
+          from ubs_core.registry import all_analyzers
+          names={'guards_py','narrowing_py','taint_py','taint_go','taint_js'}
+          count=0
+          for analyzer in all_analyzers():
+              if analyzer.name in names:
+                  for name,fn in analyzer.selftests:
+                      fn()
+                      count+=1
+                      print('ANALYZER_SELFTEST_PASS',analyzer.name,name,flush=True)
+          assert count>0
+          for pattern in ('test_analyzer_scheduling.py','test_taint_python*.py','test_taint_go*.py',
+                          'test_taint_js_modules.py','test_taint_js_commonjs.py'):
+              suite=unittest.defaultTestLoader.discover('test-suite/quality',pattern=pattern)
+              result=unittest.TextTestRunner(verbosity=2).run(suite)
+              assert result.testsRun and result.wasSuccessful() and not result.skipped,(pattern,result.failures,result.errors,result.skipped)
+              print('ANALYZER_SCOPE_PASS',pattern,result.testsRun,flush=True)
+          PY
+      - name: Retain helper compatibility and shell integrity gates
+        run: |
+          python3 test-suite/shareable/test_helper_python_floor.py
+          python3 test-suite/shareable/test_contract_checksums.py
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+      - name: Verify regenerated integrity and publish immutable tested objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tarfile
+          import urllib.request
+          changed=subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          source={'modules/helpers/ubs_core/registry.py','modules/helpers/ubs_core/cli.py',
+                  'modules/helpers/ubs_core/analyzers/guards_py.py','modules/helpers/ubs_core/analyzers/narrowing_py.py',
+                  'test-suite/quality/test_analyzer_scheduling.py'}
+          allowed=source|{'ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed)<=allowed,changed
+          before={name:Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3','scripts/update_checksums.py'],check=True)
+          subprocess.run(['./scripts/update_sha256sums.sh'],check=True)
+          assert changed==subprocess.check_output(['git','diff','--name-only'],text=True).splitlines()
+          assert all(Path(name).read_bytes()==data for name,data in before.items())
+          for command in (['./scripts/verify_checksums.sh'],['./scripts/verify_sha256sums.sh'],['git','diff','--check']):
+              subprocess.run(command,check=True)
+          manifest=[]
+          with tarfile.open(Path(os.environ['RUNNER_TEMP'],'analyzer-scope-verified.tar.gz'),'w:gz') as archive:
+              for name,data in before.items():
+                  sha=hashlib.sha1(b'blob '+str(len(data)).encode()+b'\0'+data).hexdigest()
+                  mode=subprocess.check_output(['git','ls-files','-s','--',name],text=True).split()[0]
+                  assert mode in {'100644','100755'}
+                  manifest.append({'path':name,'sha':sha,'mode':mode,'type':'blob'})
+                  archive.add(name,arcname=name)
+          base=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          Path(os.environ['RUNNER_TEMP'],'analyzer-scope-verified.json').write_text(json.dumps({'base':base,'files':manifest},indent=2))
+          for entry in manifest:
+              request=urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/git/blobs',
+                  data=json.dumps({'encoding':'base64','content':base64.b64encode(before[entry['path']]).decode('ascii')}).encode(),
+                  headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Content-Type':'application/json','Accept':'application/vnd.github+json'})
+              with urllib.request.urlopen(request,timeout=90) as response:
+                  result=json.load(response)
+              assert result['sha']==entry['sha'],entry['path']
+              print('ANALYZER_SCOPE_OBJECT',entry['path'],entry['sha'],entry['mode'],flush=True)
+          print('ANALYZER_SCOPE_BASE',base,flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analyzer-scope-validation
+          path: ${{ runner.temp }}/analyzer-scope-*
+          retention-days: 3

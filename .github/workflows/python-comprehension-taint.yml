@@ -1,0 +1,138 @@
+name: Python Comprehension Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-comprehension-taint.yml
+      - test-suite/patches/python-comprehension.patch.gz
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  comprehension-dataflow:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install real scanner validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+          ast-grep --version
+      - name: Validate reviewed source and preserve exact immutable objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          output = Path(os.environ['RUNNER_TEMP']) / 'python-comprehension'
+          output.mkdir()
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def check(name, command, *, env=None):
+              print('RUN', name, flush=True)
+              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, env=env, timeout=900)
+              (output / (name + '.log')).write_text(result.stdout)
+              print(result.stdout, flush=True)
+              if result.returncode:
+                  raise RuntimeError(f'{name} exited {result.returncode}')
+              print('PASS', name, flush=True)
+          def api(endpoint, payload):
+              result = subprocess.run(['gh', 'api', f"repos/{os.environ['GH_REPO']}/{endpoint}",
+                                       '--method', 'POST', '--input', '-'], input=json.dumps(payload),
+                                      capture_output=True, text=True, check=True, timeout=120)
+              return json.loads(result.stdout)
+
+          base = git('rev-parse', 'HEAD')
+          sources = {'modules/helpers/ubs_core/analyzers/taint_py.py',
+                     'test-suite/quality/test_taint_python_effects.py'}
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                     *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          allowed = sources | set(scripts) | {'SHA256SUMS'}
+          check('base-checksums', ['./scripts/verify_checksums.sh'])
+          check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
+          patch = gzip.decompress(Path('test-suite/patches/python-comprehension.patch.gz').read_bytes())
+          assert hashlib.sha256(patch).hexdigest() == 'f0f48e0be0afc44cc2576cefc77dc6543891f1db23834cb4493573aa49e162de'
+          patch_file = output / 'implementation.patch'
+          patch_file.write_bytes(patch)
+          forward = subprocess.run(['git', 'apply', '--check', str(patch_file)], capture_output=True, text=True)
+          if forward.returncode == 0:
+              check('apply', ['git', 'apply', str(patch_file)])
+          else:
+              check('already-integrated', ['git', 'apply', '--reverse', '--check', str(patch_file)])
+          check('generate', ['python3', 'scripts/update_checksums.py'])
+          check('python-taint-unit', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
+                                    '-p', 'test_taint_python_*.py', '-v'])
+          check('command-injection-unit', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
+                                         '-p', 'test_python_command_injection_dataflow.py', '-v'])
+          check('go-taint-unit', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
+                                '-p', 'test_taint_go*.py', '-v'])
+          check('real-json-sarif', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
+                                  '-p', 'test_taint_python_effects.py', '-v'],
+                env=dict(os.environ, UBS_TAINT_E2E='1'))
+          check('python-dataflow-cli', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality',
+                                       '-p', 'test_taint_python_dataflow.py', '-v'],
+                env=dict(os.environ, UBS_TAINT_E2E='1'))
+          check('checksum-contract', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable',
+                                     '-p', 'test_contract_checksums.py', '-v'])
+          check('python-floor', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable',
+                                '-p', 'test_helper_python_floor.py', '-v'])
+          check('checksums', ['./scripts/verify_checksums.sh'])
+          check('release-checksums', ['./scripts/verify_sha256sums.sh'])
+          check('shellcheck', ['shellcheck', '-S', 'warning', *scripts])
+          check('diff', ['git', 'diff', '--check'])
+          changed = set(git('diff', '--name-only').splitlines()) | set(git('ls-files', '--others', '--exclude-standard').splitlines())
+          assert changed <= allowed, sorted(changed - allowed)
+          before = {path: git('rev-parse', 'HEAD:' + path) for path in changed}
+          snapshot = {path: Path(path).read_bytes() for path in allowed}
+          check('idempotence', ['python3', 'scripts/update_checksums.py'])
+          assert all(Path(path).read_bytes() == value for path, value in snapshot.items())
+          entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0], 'type': 'blob',
+                      'content': Path(path).read_text()} for path in sorted(changed)]
+          if changed:
+              subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
+              tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
+              assert tree == git('write-tree'), 'Stored tree differs from tested source'
+          else:
+              tree = git('rev-parse', 'HEAD^{tree}')
+          files = [{'path': entry['path'], 'mode': entry['mode'], 'type': 'blob',
+                    'sha': git('hash-object', entry['path']), 'before': before[entry['path']]} for entry in entries]
+          record = {'base': base, 'tree': tree, 'files': files,
+                    'source_hashes': {path: git('hash-object', path) for path in sorted(sources)}}
+          (output / 'publication.json').write_text(json.dumps(record, indent=2))
+          print('COMPREHENSION_TREE_VALIDATED', json.dumps(record), flush=True)
+          PY
+      - name: Preserve exact source and diagnostics
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/python-comprehension"
+          git diff HEAD > "$RUNNER_TEMP/python-comprehension/remaining.diff"
+          git ls-files -s > "$RUNNER_TEMP/python-comprehension/source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/python-comprehension/source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-comprehension-validation
+          path: |
+            ${{ runner.temp }}/python-comprehension
+            test-suite/artifacts/python-mutable-effects
+          retention-days: 3

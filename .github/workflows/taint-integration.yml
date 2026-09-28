@@ -25,13 +25,16 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
+          python-version: '3.9'
+      - uses: actions/setup-python@v5
+        with:
           python-version: '3.13'
       - name: Install real scanner validation dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Validate each preserved implementation and store immutable trees
+      - name: Validate each implementation and store immutable trees
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -45,7 +48,6 @@ jobs:
           from pathlib import Path
           import subprocess
 
-          root = Path.cwd()
           output = Path(os.environ['RUNNER_TEMP']) / 'taint-integration'
           output.mkdir()
           def git(*args):
@@ -75,6 +77,7 @@ jobs:
           sources = {analyzer, 'modules/helpers/ubs_core/analyzers/taint_go.py',
                      'test-suite/quality/test_taint_python_dataflow.py',
                      'test-suite/quality/test_taint_python_summaries.py',
+                     'test-suite/quality/test_taint_python_effects.py',
                      'test-suite/quality/test_taint_go_decoding.py'}
           allowed = sources | set(scripts) | {'SHA256SUMS'}
           stages = [
@@ -87,6 +90,9 @@ jobs:
               ('go-decoding', 'abccc04bf69bfe8b5755ed89b3c27721aafd36e3',
                'aa36c3ac72822c4745c45ef559e61e1312c2c10b66a55e749210ef9feda705d3',
                'feat(taint): integrate Go request decoding and output-parameter summaries'),
+              ('python-iterators', '426251daad20071276390a491821725afb398097',
+               'b2a418dfa1cd4e0bced9d788c1dd8276dec04c5986faa255a8b69c17cef566c8',
+               'fix(taint): propagate mutable iterable writes across Python loop back edges'),
           ]
           check('base-checksums', ['./scripts/verify_checksums.sh'])
           check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
@@ -104,11 +110,11 @@ jobs:
               check(name + '-generate', ['python3', 'scripts/update_checksums.py'])
               pattern = 'test_taint_go*.py' if name == 'go-decoding' else 'test_taint_python_*.py'
               check(name + '-unit', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', pattern, '-v'])
-              e2e = 'test_taint_go_decoding.py' if name == 'go-decoding' else 'test_taint_python_dataflow.py'
+              e2e = {'go-decoding': 'test_taint_go_decoding.py', 'python-iterators': 'test_taint_python_effects.py'}.get(name, 'test_taint_python_dataflow.py')
               check(name + '-e2e', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', e2e, '-v'],
                     env=dict(os.environ, UBS_TAINT_E2E='1'))
-              check(name + '-contract', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', 'test_contract_checksums.py', '-v'])
-              check(name + '-python-floor', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', 'test_helper_python_floor.py', '-v'])
+              check(name + '-contract', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable', '-p', 'test_contract_checksums.py', '-v'])
+              check(name + '-python-floor', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/shareable', '-p', 'test_helper_python_floor.py', '-v'])
               check(name + '-checksums', ['./scripts/verify_checksums.sh'])
               check(name + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
               check(name + '-shellcheck', ['shellcheck', '-S', 'warning', *scripts])
@@ -148,4 +154,5 @@ jobs:
           path: |
             ${{ runner.temp }}/taint-integration
             test-suite/artifacts/go-decoding
+            test-suite/artifacts/python-mutable-effects
           retention-days: 3

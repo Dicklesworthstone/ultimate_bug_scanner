@@ -7,6 +7,7 @@ on:
       - test-suite/patches/analyzer-scheduling.patch.xz
       - test-suite/patches/analyzer-output.patch.xz
       - test-suite/patches/core-worker-atomicity.patch.xz
+      - test-suite/patches/core-streaming.patch.xz
       - .github/workflows/analyzer-scheduling.yml
   workflow_dispatch:
 
@@ -15,7 +16,7 @@ permissions:
 
 jobs:
   validate-scope:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # Publish immutable blobs after validation, never commits or branch refs.
     permissions:
@@ -67,7 +68,12 @@ jobs:
               'test-suite/quality/test_core_parallel_scope.py':'02e5a67d4fd00315bb8c36e0fc4de0a543af2bb2',
               'test-suite/quality/test_core_scan_atomicity.py':'8dc2f204c2b10781f9812a5f8fe476468a459705',
           })
-          if not all(blob(path)==sha for path,sha in final.items()) and not all(blob(path)==sha for path,sha in integrated.items()):
+          streamed=dict(integrated)
+          streamed.update({
+              'modules/helpers/ubs_core/registry.py':'ab169a35d198450a1ed25bd6ddcfe0fba4a319ed',
+              'test-suite/quality/test_analyzer_streaming.py':'bc694f42389bc44443a838284eb32d70f7a4b1ed',
+          })
+          if not any(all(blob(path)==sha for path,sha in state.items()) for state in (final,integrated,streamed)):
               if not all(blob(path)==sha for path,sha in expected.items()):
                   subprocess.run(['git','apply','--check','-'],input=patch,check=True)
                   subprocess.run(['git','apply','-'],input=patch,check=True)
@@ -76,17 +82,24 @@ jobs:
               assert hashlib.sha256(patch).hexdigest()=='e72e77944bcf69787e6de48f64b76a9b2b85e95aae81909ce85d386cc0680b5e'
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
-          if not all(blob(path)==sha for path,sha in integrated.items()):
+          if not any(all(blob(path)==sha for path,sha in state.items()) for state in (integrated,streamed)):
               assert all(blob(path)==sha for path,sha in final.items()),'Candidate source changed'
               patch=lzma.decompress(Path('test-suite/patches/core-worker-atomicity.patch.xz').read_bytes())
               assert hashlib.sha256(patch).hexdigest()=='510a297fe8ba748a6f667cc50998c7a0166cd3005af333838282eb441152198d'
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
-          assert all(blob(path)==sha for path,sha in integrated.items()),'Integrated source changed'
+          if not all(blob(path)==sha for path,sha in streamed.items()):
+              assert all(blob(path)==sha for path,sha in integrated.items()),'Integrated source changed'
+              patch=lzma.decompress(Path('test-suite/patches/core-streaming.patch.xz').read_bytes())
+              assert hashlib.sha256(patch).hexdigest()=='fe1e7a95ad4cd8c63a9e85d04181fc9ce8550f2651ec80acbc52370d50c74cfc'
+              subprocess.run(['git','apply','--check','-'],input=patch,check=True)
+              subprocess.run(['git','apply','-'],input=patch,check=True)
+          assert all(blob(path)==sha for path,sha in streamed.items()),'Streaming source changed'
           subprocess.run(['git','add','-N','test-suite/quality/test_analyzer_scheduling.py',
                           'test-suite/quality/test_analyzer_output.py',
                           'test-suite/quality/test_core_parallel_scope.py',
-                          'test-suite/quality/test_core_scan_atomicity.py'],check=True)
+                          'test-suite/quality/test_core_scan_atomicity.py',
+                          'test-suite/quality/test_analyzer_streaming.py'],check=True)
           PY
           python3 scripts/update_checksums.py
           ./scripts/update_sha256sums.sh
@@ -160,7 +173,8 @@ jobs:
                   'modules/helpers/ubs_core/shards.py',
                   'modules/helpers/ubs_core/analyzers/guards_py.py','modules/helpers/ubs_core/analyzers/narrowing_py.py',
                   'test-suite/quality/test_analyzer_scheduling.py','test-suite/quality/test_analyzer_output.py',
-                  'test-suite/quality/test_core_parallel_scope.py','test-suite/quality/test_core_scan_atomicity.py'}
+                  'test-suite/quality/test_core_parallel_scope.py','test-suite/quality/test_core_scan_atomicity.py',
+                  'test-suite/quality/test_analyzer_streaming.py'}
           allowed=source|{'ubs','SHA256SUMS','modules/lib/ubs-common.sh','scripts/new-module.sh'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed)<=allowed,changed

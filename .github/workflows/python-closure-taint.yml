@@ -1,0 +1,138 @@
+name: Python Closure Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-closure-taint.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  closure-dataflow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Validate closure source and store immutable tested objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          output = Path(os.environ['RUNNER_TEMP']) / 'closure-candidate'
+          output.mkdir()
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+          def api(endpoint, payload=None):
+              args = ['gh', 'api', f"repos/{os.environ['GH_REPO']}/{endpoint}"]
+              if payload is not None:
+                  args += ['--method', 'POST', '--input', '-']
+              result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
+                                      text=True, capture_output=True, check=True, timeout=120)
+              return json.loads(result.stdout)
+          def check(name, command, *, env=None):
+              print('RUN', name, flush=True)
+              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, env=env, timeout=900)
+              (output / (name + '.log')).write_text(result.stdout)
+              print(result.stdout, flush=True)
+              if result.returncode:
+                  raise RuntimeError(f'{name} exited {result.returncode}')
+          base = git('rev-parse', 'HEAD')
+          expected = {
+              'modules/helpers/ubs_core/analyzers/taint_py.py': 'd7ae7027334940f51614ce59079df645082c5e67',
+              'test-suite/quality/test_taint_python_effects.py': 'cef517b9075df341add9008cdf1e95465eea8c45',
+          }
+          for path, digest in expected.items():
+              assert git('hash-object', path) == digest, f'Reconcile newer source: {path}'
+          check('base-checksums', ['./scripts/verify_checksums.sh'])
+          check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
+          pieces = []
+          for blob in ['649e75decab326cc47f04545143d30f742c38755', '8ff22480cc544df79b02de4edceada6b144ff0d8']:
+              data = base64.b64decode(api('git/blobs/' + blob)['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == blob
+              pieces.append(data)
+          packed = b''.join(pieces)
+          assert hashlib.sha256(packed).hexdigest() == 'f345b0dddd0f4402bd0772af86ab31eccc2a72c89534622bb49d440f76834f5b'
+          patch = gzip.decompress(packed)
+          assert hashlib.sha256(patch).hexdigest() == '24b7d5ed682df217e85e814ae07cefb579cbe3b76941296b5d8f0535387e446b'
+          patch_file = output / 'implementation.patch'
+          patch_file.write_bytes(patch)
+          check('apply-check', ['git', 'apply', '--check', str(patch_file)])
+          check('apply', ['git', 'apply', str(patch_file)])
+          check('generate', ['python3', 'scripts/update_checksums.py'])
+          for name, directory, pattern in [
+              ('all-taint', 'quality', 'test_taint*.py'),
+              ('command', 'quality', 'test_python_command_injection_dataflow.py'),
+              ('contract', 'shareable', 'test_contract_checksums.py'),
+              ('python-floor', 'shareable', 'test_helper_python_floor.py'),
+          ]:
+              check(name, ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/' + directory, '-p', pattern, '-v'])
+          for pattern in ['test_taint_python_effects.py', 'test_taint_python_dataflow.py', 'test_taint_go_decoding.py']:
+              check(pattern + '-cli', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', pattern, '-v'],
+                    env=dict(os.environ, UBS_TAINT_E2E='1'))
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          check('shellcheck', ['shellcheck', '-S', 'warning', *scripts])
+          check('checksums', ['./scripts/verify_checksums.sh'])
+          check('release-checksums', ['./scripts/verify_sha256sums.sh'])
+          check('diff', ['git', 'diff', '--check'])
+          changed = set(git('diff', '--name-only').splitlines())
+          assert changed == set(expected) | set(scripts) | {'SHA256SUMS'}, changed
+          assert not git('ls-files', '--others', '--exclude-standard')
+          snapshot = {path: Path(path).read_bytes() for path in changed}
+          check('idempotence', ['python3', 'scripts/update_checksums.py'])
+          assert all(Path(path).read_bytes() == value for path, value in snapshot.items())
+          entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0], 'type': 'blob',
+                      'content': Path(path).read_text()} for path in sorted(changed)]
+          tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
+          subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
+          assert tree == git('write-tree'), 'Remote tree differs from tested bytes'
+          record = {'base': base, 'tree': tree, 'files': [
+              {'path': entry['path'], 'mode': entry['mode'], 'type': 'blob', 'sha': git('hash-object', entry['path']),
+               'before': git('rev-parse', 'HEAD:' + entry['path'])} for entry in entries]}
+          (output / 'publication.json').write_text(json.dumps(record, indent=2))
+          print('VALIDATED_CLOSURE_TREE', json.dumps(record), flush=True)
+          PY
+      - name: Preserve source and validation evidence
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/closure-candidate"
+          git ls-files -s > "$RUNNER_TEMP/closure-candidate/source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/closure-candidate/source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: closure-candidate-validation
+          path: |
+            ${{ runner.temp }}/closure-candidate
+            test-suite/artifacts/python-mutable-effects
+          retention-days: 3

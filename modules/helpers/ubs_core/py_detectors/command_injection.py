@@ -36,7 +36,7 @@ SOURCE_RE = re.compile(
     r"event\s*\[|params\s*\[|input\s*\(|raw_input\s*\()",
     re.IGNORECASE,
 )
-SANITIZER_RE = re.compile(r"\b(?:shlex\.quote|pipes\.quote)\s*\(", re.IGNORECASE)
+SANITIZER_CALLS = {'shlex.quote', 'pipes.quote'}
 
 
 def call_name(node):
@@ -116,6 +116,9 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.os_modules = {'os'}
         self.direct_calls = {}
         self.tainted_names = set()
+        # Quoting protects a shell argument, not executable selection. Keep
+        # the unescaped provenance as a separate domain through assignments.
+        self.raw_tainted_names = set()
         self.shell_command_vars = set()
         self.executable_vars = set()
         self.issues = []
@@ -131,18 +134,34 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.issues.append(line_no)
 
     def expr_is_sanitized(self, node):
-        return bool(SANITIZER_RE.search(self.segment(node)))
+        # Only this call's returned value is escaped. A quoted sibling, an
+        # unused call, or sanitizer-looking string must not clean a parent.
+        return isinstance(node, ast.Call) and call_name(node.func) in SANITIZER_CALLS
 
     def expr_has_source(self, node):
-        return bool(SOURCE_RE.search(self.segment(node)))
+        if isinstance(node, ast.Call):
+            return bool(SOURCE_RE.search(call_name(node.func) + '('))
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            name = call_name(node)
+            return bool(SOURCE_RE.search(name)) or (
+                isinstance(node, ast.Subscript) and name in {'event', 'params'}
+            )
+        return False
 
     def names_in(self, node):
         return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
 
-    def expr_is_tainted(self, node):
-        if self.expr_is_sanitized(node):
+    def expr_is_tainted(self, node, *, shell=True):
+        if node is None or isinstance(node, ast.Constant):
             return False
-        return self.expr_has_source(node) or bool(self.names_in(node) & self.tainted_names)
+        if shell and self.expr_is_sanitized(node):
+            return False
+        names = self.tainted_names if shell else self.raw_tainted_names
+        if isinstance(node, ast.Name) and node.id in names:
+            return True
+        return self.expr_has_source(node) or any(
+            self.expr_is_tainted(child, shell=shell) for child in ast.iter_child_nodes(node)
+        )
 
     def expr_is_dynamic_string(self, node):
         if self.expr_is_tainted(node):
@@ -161,6 +180,8 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         return self.expr_is_dynamic_string(node)
 
     def executable_is_dynamic(self, node):
+        if self.expr_is_tainted(node, shell=False):
+            return True
         if isinstance(node, ast.Name):
             return node.id in self.executable_vars or node.id in self.tainted_names
         return self.expr_is_dynamic_string(node)
@@ -214,9 +235,14 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
 
     def mark_assignment(self, names, value):
         tainted = self.expr_is_tainted(value)
+        raw_tainted = self.expr_is_tainted(value, shell=False)
         shell_command = self.expr_is_dynamic_string(value)
         dynamic_executable = self.list_executable_is_dynamic(value)
         for name in names:
+            if raw_tainted:
+                self.raw_tainted_names.add(name)
+            else:
+                self.raw_tainted_names.discard(name)
             if tainted:
                 self.tainted_names.add(name)
             else:

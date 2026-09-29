@@ -38,7 +38,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
-          npm install --global @ast-grep/cli
+          export npm_config_cache="$RUNNER_TEMP/ubs-npm-cache-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          prefix="$RUNNER_TEMP/ubs-ast-grep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          npm install --global --prefix "$prefix" @ast-grep/cli
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          "$prefix/bin/ast-grep" --version
       - name: Require real Python 3.9 on x64
         if: runner.arch == 'X64'
         run: python3.9 --version

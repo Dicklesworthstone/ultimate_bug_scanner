@@ -1390,7 +1390,7 @@ class _Flow:
                     tuple(sorted(values.items())))
                 self.expression_references[node] = NO_REFERENCES
                 return CLEAN
-            summary = self.engine.summaries.get(function, FunctionSummary())
+            summary = self.engine.call_summary(function, values)
             for kind, line, column, label, fact in summary.effects:
                 propagated = self.substitute(fact, bound, call_name)
                 propagated = frozenset(trace for trace in propagated if not _safe_for(trace, kind, label))
@@ -2377,26 +2377,55 @@ class _Analysis:
             if not changed:
                 return bound
 
+    def call_summary(self, function, values):
+        """Request a symbolic summary for known callback identities.
+
+        Facts, heaps and evidence paths are NOT context keys. Only finite
+        source-level callable identities distinguish invocations; unresolved
+        alternatives stay opaque rather than certifying a sanitizer. A new
+        context starts at bottom and is solved by the normal fixed-point
+        loop, never by recursively interpreting callees on the Python stack.
+        """
+        context = []
+        for name, binding in sorted(values.items()):
+            if name.startswith('@global:'):
+                continue
+            choices = frozenset(value if isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                                else None for value in _binding_choices(binding))
+            if any(value is not None for value in choices):
+                context.append((name, _join_bindings(*choices)))
+        key = (function, tuple(context)) if context else function
+        return self.summaries.setdefault(key, FunctionSummary())
+
     def analyze(self):
         # A summary contains only finite source/parameter/sanitizer facts.
         # Equality excludes evidence paths, so recursive helpers terminate
         # without a depth cap that would silently lose longer call chains.
         while True:
+            previous_contexts = len(self.summaries)
             module = _Flow(self, self.tree)
             globals_ = module.block(self.tree.body, _State())
             if globals_ is None:
                 # Keep definitions and global facts established before a
                 # nonreturning call; they are still the callee's namespace.
                 globals_ = module.last_state if module.last_state is not None else _State()
-            changed = False
+            # Imported higher-order helpers may call a callback defined by
+            # this module. Publish this pass's namespace before solving those
+            # contexts, and iterate again when initialization facts change.
+            changed = globals_ != self.globals
+            self.globals = globals_
             flows = [module]
-            for function in self.functions:
-                local = self.locals[function]
-                flow = _Flow(self, function)
+            jobs = [(function, (), function) for function in self.functions]
+            jobs.extend((key[0], key[1], key) for key in list(self.summaries) if isinstance(key, tuple))
+            for function, context, summary_key in jobs:
+                owner = self.owner(function)
+                namespace = globals_ if owner is self else owner.globals
+                local = owner.locals[function]
+                flow = _Flow(owner, function)
                 state = _State({name: frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))})
-                                for name in self.global_names if name not in local},
-                               {name: target for name, target in globals_.bindings.items() if name not in local})
-                state.references.update({name: frozenset({f'@global:{name}'}) for name in self.global_names if name not in local})
+                                for name in owner.global_names if name not in local},
+                               {name: target for name, target in namespace.bindings.items() if name not in local})
+                state.references.update({name: frozenset({f'@global:{name}'}) for name in owner.global_names if name not in local})
                 for name in local:
                     state.bindings[name] = None
                 arguments = function.args
@@ -2404,16 +2433,18 @@ class _Analysis:
                 params.extend(arg for arg in (arguments.vararg, arguments.kwarg) if arg is not None)
                 for arg in params:
                     state[arg.arg] = frozenset({TaintTrace(arg.arg, parameter=arg.arg, path=(arg.arg,))})
-                    description = self.framework_inputs.get(function, {}).get(arg.arg)
+                    description = owner.framework_inputs.get(function, {}).get(arg.arg)
                     if description is not None and description.kind == 'request':
                         state.bindings[arg.arg] = '@request:' + description.name
                     else:
                         state.bindings[arg.arg] = _SymbolicValue(arg.arg)
                     state.references[arg.arg] = frozenset({arg.arg})
-                for name in self.closures[function]:
+                for name in owner.closures[function]:
                     state[name] = frozenset({TaintTrace(name, parameter=f'@free:{name}', path=(name,))})
                     state.bindings[name] = _SymbolicValue(f'@free:{name}')
                     state.references[name] = frozenset({f'@free:{name}'})
+                for name, binding in context:
+                    state.bindings[name.removeprefix('@free:')] = binding
                 if isinstance(function, ast.Lambda):
                     # Analyze lambda bodies once per fixed-point pass, not by
                     # recursively interpreting their call sites on our stack.
@@ -2431,11 +2462,14 @@ class _Analysis:
                     flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
                     flow.pending.extend(completed)
                 summary = flow.summary()
-                if summary != self.summaries.get(function, FunctionSummary()):
-                    self.summaries[function] = summary
+                if summary != self.summaries.get(summary_key, FunctionSummary()):
+                    self.summaries[summary_key] = summary
                     changed = True
-                flows.append(flow)
-            if not changed:
+                # Contextual effects belong to their calling invocation, not
+                # an invented standalone/framework entry into a foreign scope.
+                if not context:
+                    flows.append(flow)
+            if not changed and len(self.summaries) == previous_contexts:
                 self.globals = globals_
                 effects = {}
                 framework_bound = self.framework_bound(globals_)

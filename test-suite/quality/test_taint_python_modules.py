@@ -53,6 +53,41 @@ class PythonModuleTests(unittest.TestCase):
                     self.assertEqual(self.sites(got), [('helper.py', 2, 'python.taint.eval')])
                     self.assertIn('input(', got[0]['message'])
 
+    def test_imported_callback_helper_retains_sink_location_and_safe_context(self):
+        helper = 'def apply(callback, value):\n    callback(value)\n'
+        for callback, value, expected in [('eval', 'input()', [('helper.py', 2, 'python.taint.eval')]),
+                                          ('eval', '"safe"', []), ('lambda value: None', 'input()', [])]:
+            with self.subTest(callback=callback, value=value):
+                got = self.scan({'app.py': f'from helper import apply\napply({callback}, {value})\n', 'helper.py': helper})
+                self.assertEqual(self.sites(got), expected)
+
+    def test_imported_callback_context_uses_defining_globals(self):
+        for owner_value, caller_value, expected in [('input()', '"safe"', [('helper.py', 3, 'python.taint.eval')]),
+                                                   ('"safe"', 'input()', [])]:
+            got = self.scan({'helper.py': f'raw = {owner_value}\ndef apply(callback):\n    callback(raw)\n',
+                             'app.py': f'from helper import apply\nraw = {caller_value}\napply(eval)\n'})
+            self.assertEqual(self.sites(got), expected)
+
+    def test_imported_callback_returns_sanitized_values_without_global_pollution(self):
+        helper = 'def apply(callback, value):\n    return callback(value)\n'
+        for sink, expected in [('HttpResponse', []), ('eval', [('app.py', 2, 'python.taint.eval')])]:
+            got = self.scan({'helper.py': helper,
+                             'app.py': f'from helper import apply\n{sink}(apply(html.escape, input()))\n'})
+            self.assertEqual(self.sites(got), expected)
+
+    def test_callback_defined_in_caller_module_keeps_heap_effects(self):
+        got = self.scan({'helper.py': 'def apply(callback, box):\n    callback(box)\n',
+                         'app.py': 'from helper import apply\ndef fill(box): box.append(input())\n'
+                                   'target=[]\napply(fill, target)\neval(target[0])\n'})
+        self.assertEqual(self.sites(got), [('app.py', 5, 'python.taint.eval')])
+
+    def test_callback_roundtrip_reads_the_callers_defining_globals(self):
+        for value, expected in [('input()', [('app.py', 6, 'python.taint.eval')]), ('"safe"', [])]:
+            got = self.scan({'helper.py': 'raw=input()\ndef apply(callback, box): callback(box)\n',
+                             'app.py': f'from helper import apply\nraw={value}\n'
+                                       'def fill(box): box.append(raw)\ntarget=[]\napply(fill,target)\neval(target[0])\n'})
+            self.assertEqual(self.sites(got), expected)
+
     def test_module_and_function_aliases(self):
         for statement, call in [('import helper', 'helper.run'), ('import helper as h', 'h.run'),
                                  ('from helper import run as invoke', 'invoke')]:

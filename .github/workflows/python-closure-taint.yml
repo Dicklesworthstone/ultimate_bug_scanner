@@ -5,6 +5,11 @@ on:
     branches: [main]
     paths:
       - .github/workflows/python-closure-taint.yml
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/registry.py
+      - test-suite/quality/test_taint_python_*.py
+      - modules/lib/ubs-common.sh
+      - ubs
   workflow_dispatch:
 
 permissions:
@@ -17,9 +22,7 @@ jobs:
       matrix:
         runner: [ubuntu-22.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    permissions:
-      contents: write
+    timeout-minutes: 30
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -48,251 +51,40 @@ jobs:
       - name: Require real Python 3.9 on x64
         if: runner.arch == 'X64'
         run: python3.9 --version
-      - name: Validate each source stage and store immutable tested objects
+      - name: Verify checked-in runtime integrity before execution
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Exercise checked-in callback, closure and cross-language regressions
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/closure-validation"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint*.py' -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/all-taint.log"
+          python3 -m unittest discover -s test-suite/quality -p test_python_command_injection_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/command.log"
+          python3 -m unittest discover -s test-suite/shareable -p test_contract_checksums.py -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/contract.log"
+          python3 -m unittest discover -s test-suite/shareable -p test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/python-floor.log"
+      - name: Validate real JSON and SARIF output
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+          UBS_TAINT_E2E: '1'
         run: |
-          python3 - <<'PY'
-          import base64
-          import gzip
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-
-          output = Path(os.environ['RUNNER_TEMP']) / 'closure-candidate'
-          output.mkdir()
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          def api(endpoint, payload=None):
-              args = ['gh', 'api', f"repos/{os.environ['GH_REPO']}/{endpoint}"]
-              if payload is not None:
-                  args += ['--method', 'POST', '--input', '-']
-              result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
-                                      text=True, capture_output=True, check=True, timeout=120)
-              return json.loads(result.stdout)
-          def check(name, command, *, env=None):
-              print('RUN', name, flush=True)
-              result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                      text=True, env=env, timeout=900)
-              (output / (name + '.log')).write_text(result.stdout)
-              print(result.stdout, flush=True)
-              if result.returncode:
-                  raise RuntimeError(f'{name} exited {result.returncode}')
-          base = git('rev-parse', 'HEAD')
-          expected = {
-              'modules/helpers/ubs_core/analyzers/taint_py.py': 'd7ae7027334940f51614ce59079df645082c5e67',
-              'test-suite/quality/test_taint_python_effects.py': 'cef517b9075df341add9008cdf1e95465eea8c45',
-              'test-suite/quality/test_taint_python_summaries.py': '95391237edb05cf3796d3724a263f6cc14b1d120',
-              'test-suite/quality/test_taint_python_modules.py': '9fb044e600602751cb7ad88b1329f87a44859eab',
-          }
-          for path, digest in expected.items():
-              assert git('hash-object', path) == digest, f'Reconcile newer source: {path}'
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          allowed = set(expected) | set(scripts) | {'SHA256SUMS'}
-          check('base-checksums', ['./scripts/verify_checksums.sh'])
-          check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
-          stages = [
-              ('lexical-closures', ['649e75decab326cc47f04545143d30f742c38755', '8ff22480cc544df79b02de4edceada6b144ff0d8'],
-               'f345b0dddd0f4402bd0772af86ab31eccc2a72c89534622bb49d440f76834f5b',
-               '24b7d5ed682df217e85e814ae07cefb579cbe3b76941296b5d8f0535387e446b'),
-              ('callback-summaries', ['163a0ed11fc4b21957b7830cc2c13aedf94de4b0', '8725141113e3e010f5d70f20d7636c57ed298264',
-                                      '454b2ffe843dc2e3c39e342ffc547cbd0b04fb1e', 'c8de855c1e7afe80b6c30ec890e8df9083444a40'],
-               '5334f99779be5d41eacd8cee7b127496a793c55fe99993fc82b155f93cc2e073',
-               'de98f12911610a1de78e4f9fc60e220f8cfe722a90f02f30241fc6b370a2ea56'),
-              ('bound-callbacks', ['6692dfa4c5fd259c879f1e8cee000c24665c3f49'],
-               '254eb4bff72694eaab4383c6474f4998e171f95fc0e0bf66e38d832bb41388f2',
-               '27480dd5acbc5fe272120821c1812da7470dfd3245387bce23053416a2e7995b'),
-          ]
-          records = []
-          for stage, blobs, packed_sha, patch_sha in stages:
-              pieces = []
-              for blob in blobs:
-                  data = base64.b64decode(api('git/blobs/' + blob)['content'])
-                  assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == blob
-                  pieces.append(data)
-              packed = b''.join(pieces)
-              assert hashlib.sha256(packed).hexdigest() == packed_sha
-              patch = gzip.decompress(packed)
-              assert hashlib.sha256(patch).hexdigest() == patch_sha
-              patch_file = output / (stage + '.patch')
-              patch_file.write_bytes(patch)
-              check(stage + '-apply-check', ['git', 'apply', '--check', str(patch_file)])
-              check(stage + '-apply', ['git', 'apply', str(patch_file)])
-              check(stage + '-generate', ['python3', 'scripts/update_checksums.py'])
-              for name, directory, pattern in [
-                  ('all-taint', 'quality', 'test_taint*.py'),
-                  ('command', 'quality', 'test_python_command_injection_dataflow.py'),
-                  ('contract', 'shareable', 'test_contract_checksums.py'),
-                  ('python-floor', 'shareable', 'test_helper_python_floor.py'),
-              ]:
-                  check(stage + '-' + name, ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/' + directory, '-p', pattern, '-v'])
-              for pattern in ['test_taint_python_effects.py', 'test_taint_python_dataflow.py', 'test_taint_go_decoding.py']:
-                  check(stage + '-' + pattern + '-cli', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', pattern, '-v'],
-                        env=dict(os.environ, UBS_TAINT_E2E='1'))
-              check(stage + '-shellcheck', ['shellcheck', '-S', 'warning', *scripts])
-              check(stage + '-checksums', ['./scripts/verify_checksums.sh'])
-              check(stage + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
-              check(stage + '-diff', ['git', 'diff', '--check'])
-              changed = set(git('diff', '--name-only').splitlines())
-              required = set(expected) if stage != 'lexical-closures' else set(list(expected)[:2])
-              assert changed == required | set(scripts) | {'SHA256SUMS'}, changed
-              assert changed <= allowed
-              assert not git('ls-files', '--others', '--exclude-standard')
-              snapshot = {path: Path(path).read_bytes() for path in changed}
-              check(stage + '-idempotence', ['python3', 'scripts/update_checksums.py'])
-              assert all(Path(path).read_bytes() == value for path, value in snapshot.items())
-              entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0], 'type': 'blob',
-                          'content': Path(path).read_text()} for path in sorted(changed)]
-              tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
-              subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
-              assert tree == git('write-tree'), 'Remote tree differs from tested bytes'
-              record = {'stage': stage, 'base': base, 'tree': tree, 'files': [
-                  {'path': entry['path'], 'mode': entry['mode'], 'type': 'blob', 'sha': git('hash-object', entry['path']),
-                   'before': git('rev-parse', 'HEAD:' + entry['path'])} for entry in entries]}
-              records.append(record)
-              (output / 'publication.json').write_text(json.dumps(records, indent=2))
-              print('VALIDATED_CLOSURE_TREE', json.dumps(record), flush=True)
-              subprocess.run(['git', '-c', 'user.name=UBS Validation', '-c', 'user.email=noreply@github.com',
-                              'commit', '-qm', stage], check=True)
-          PY
-      - name: Preserve source and validation evidence
-        if: always()
+          set -o pipefail
+          for suite in test_taint_python_effects.py test_taint_python_dataflow.py test_taint_go_decoding.py; do
+            python3 -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/closure-validation/${suite%.py}-cli.log"
+          done
+      - name: Verify tests and checksum regeneration leave source unchanged
         run: |
-          mkdir -p "$RUNNER_TEMP/closure-candidate"
-          git ls-files -s > "$RUNNER_TEMP/closure-candidate/source-index.txt"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/closure-candidate/source.tar.gz"
+          python3 scripts/update_checksums.py
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: closure-candidate-${{ matrix.runner }}
+          name: closure-validation-${{ matrix.runner }}
           path: |
-            ${{ runner.temp }}/closure-candidate
+            ${{ runner.temp }}/closure-validation
             test-suite/artifacts/python-mutable-effects
-          retention-days: 3
-
-  source-object-transport:
-    runs-on: ubuntu-slim
-    timeout-minutes: 15
-    permissions:
-      contents: write
-    env:
-      PYTHONDONTWRITEBYTECODE: '1'
-      UBS_NO_AUTO_UPDATE: '1'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-      - name: Transfer exact reviewed source objects without changing branches
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import ast
-          import base64
-          import gzip
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
-          import subprocess
-          import urllib.request
-
-          output = Path(os.environ['RUNNER_TEMP']) / 'source-objects'
-          output.mkdir()
-          def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
-          def api(endpoint, payload=None):
-              request = urllib.request.Request(
-                  f"https://api.github.com/repos/{os.environ['GH_REPO']}/{endpoint}",
-                  data=json.dumps(payload).encode() if payload is not None else None,
-                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                           'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'},
-                  method='POST' if payload is not None else 'GET')
-              with urllib.request.urlopen(request, timeout=120) as response:
-                  return json.load(response)
-          def check(name, command):
-              result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT, timeout=300)
-              (output / (name + '.log')).write_text(result.stdout)
-              print(name, result.returncode, result.stdout, flush=True)
-              if result.returncode:
-                  raise RuntimeError(name)
-          # Read only the literal stage/input metadata from the full validation
-          # job in this exact checkout. No workflow code is evaluated here.
-          workflow = Path('.github/workflows/python-closure-taint.yml').read_text()
-          source = workflow.split("python3 - <<'PY'\n", 1)[1].split('\n          PY\n', 1)[0]
-          source = '\n'.join(line[10:] for line in source.splitlines())
-          metadata = {}
-          for node in ast.parse(source).body:
-              if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                  if node.targets[0].id in {'expected', 'stages'}:
-                      metadata[node.targets[0].id] = ast.literal_eval(node.value)
-          assert set(metadata) == {'expected', 'stages'}
-          for path, digest in metadata['expected'].items():
-              assert git('hash-object', path) == digest, path
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
-                     *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          allowed = set(metadata['expected']) | set(scripts) | {'SHA256SUMS'}
-          base = git('rev-parse', 'HEAD')
-          check('base-checksums', ['./scripts/verify_checksums.sh'])
-          check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
-          records = []
-          for stage, blobs, packed_sha, patch_sha in metadata['stages']:
-              parts = []
-              for blob in blobs:
-                  data = base64.b64decode(api('git/blobs/' + blob)['content'])
-                  assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == blob
-                  parts.append(data)
-              packed = b''.join(parts)
-              assert hashlib.sha256(packed).hexdigest() == packed_sha
-              patch = gzip.decompress(packed)
-              assert hashlib.sha256(patch).hexdigest() == patch_sha
-              path = output / (stage + '.patch')
-              path.write_bytes(patch)
-              check(stage + '-apply-check', ['git', 'apply', '--check', str(path)])
-              check(stage + '-apply', ['git', 'apply', str(path)])
-              check(stage + '-generate', ['python3', 'scripts/update_checksums.py'])
-              for name, directory, pattern in [
-                  ('python', 'quality', 'test_taint_python_*.py'),
-                  ('contract', 'shareable', 'test_contract_checksums.py'),
-              ]:
-                  check(stage + '-' + name, ['python3', '-m', 'unittest', 'discover',
-                        '-s', 'test-suite/' + directory, '-p', pattern, '-v'])
-              check(stage + '-checksums', ['./scripts/verify_checksums.sh'])
-              check(stage + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
-              check(stage + '-diff', ['git', 'diff', '--check'])
-              changed = set(git('diff', '--name-only').splitlines())
-              required = set(metadata['expected']) if stage != 'lexical-closures' else set(list(metadata['expected'])[:2])
-              assert changed == required | set(scripts) | {'SHA256SUMS'}
-              assert changed <= allowed and not git('ls-files', '--others', '--exclude-standard')
-              before = {path: git('rev-parse', 'HEAD:' + path) for path in changed}
-              snapshot = {path: git('hash-object', path) for path in changed}
-              check(stage + '-idempotence', ['python3', 'scripts/update_checksums.py'])
-              assert all(git('hash-object', path) == digest for path, digest in snapshot.items())
-              entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0],
-                          'type': 'blob', 'content': Path(path).read_text()} for path in sorted(changed)]
-              tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
-              subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
-              assert git('write-tree') == tree
-              records.append({'stage': stage, 'base': base, 'tree': tree,
-                              'validation_scope': 'Python and integrity checks only; full native matrix remains separate',
-                              'files': [{'path': item['path'], 'mode': item['mode'], 'type': 'blob',
-                                         'sha': snapshot[item['path']], 'before': before[item['path']]} for item in entries]})
-              (output / 'publication.json').write_text(json.dumps(records, indent=2))
-              print('SOURCE_OBJECTS_TRANSFERRED', json.dumps(records[-1]), flush=True)
-              subprocess.run(['git', '-c', 'user.name=UBS Validation', '-c', 'user.email=noreply@github.com',
-                              'commit', '-qm', stage], check=True)
-          PY
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: python-source-objects
-          path: ${{ runner.temp }}/source-objects
+            test-suite/artifacts/go-decoding
           retention-days: 3

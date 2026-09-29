@@ -520,5 +520,181 @@ class PatternControlFlowTests(SourceTest):
                                   "eval(code)\n", 'eval')
 
 
+class CallbackSummaryTests(SourceTest):
+    def test_callback_parameter_reaches_builtin_sink(self):
+        for callback, rule in [('eval', 'eval'), ('os.system', 'command'), ('cursor.execute', 'sql')]:
+            with self.subTest(callback=callback):
+                self.assert_rules(f'def apply(callback, value): callback(value)\napply({callback}, input())', rule)
+                self.assert_rules(f"def apply(callback, value): callback(value)\napply({callback}, 'safe')")
+
+    def test_source_callback_returns_input(self):
+        self.assert_rules('def read(callback): return callback()\neval(read(input))', 'eval')
+        self.assert_rules("def read(callback): return callback()\neval(read(lambda: 'safe'))")
+
+    def test_safe_callback_does_not_inherit_unused_argument(self):
+        self.assert_rules("def apply(callback, value): return callback(value)\neval(apply(lambda unused: 'safe', input()))")
+        self.assert_rules('def apply(callback, value): return callback(value)\neval(apply(lambda used: used, input()))', 'eval')
+
+    def test_callback_sanitizers_remain_domain_specific(self):
+        self.assert_rules('def apply(callback, value): return callback(value)\nHttpResponse(apply(html.escape, input()))')
+        self.assert_rules('def apply(callback, value): return callback(value)\neval(apply(html.escape, input()))', 'eval')
+        self.assert_rules('def apply(callback, value): return callback(value)\nos.system(apply(shlex.quote, input()))')
+
+    def test_unknown_callback_alternative_cannot_certify_sanitization(self):
+        for choice in ['html.escape if flag else opaque', 'html.escape if flag else (lambda value: value)']:
+            with self.subTest(choice=choice):
+                self.assert_rules(f'def apply(callback, value): return callback(value)\nHttpResponse(apply({choice}, input()))', 'xss')
+
+    def test_safe_and_unsafe_callback_contexts_do_not_pollute_each_other(self):
+        for order in ['clean\nunsafe', 'unsafe\nclean']:
+            calls = {'clean': "apply(lambda value: None, input())", 'unsafe': "apply(eval, 'safe')"}
+            self.assert_rules('def apply(callback, value): callback(value)\n' + '\n'.join(calls[key] for key in order.splitlines()))
+        self.assert_rules('def apply(callback, value): callback(value)\napply(lambda value: None, input())\napply(eval, input())', 'eval')
+
+    def test_captured_callback_is_specialized_without_comprehension(self):
+        for callback, expected in [('eval', ('eval',)), ('lambda value: None', ())]:
+            self.assert_rules(f'def handler(code):\n    run = {callback}\n    def send(): run(code)\n    send()\nhandler(input())', *expected)
+
+    def test_captured_callback_keeps_lexical_scope_in_comprehension(self):
+        self.assert_rules('''
+            def handler(code):
+                run = eval
+                def send(): run(code)
+                [send() for run in [lambda value: None] for code in ['safe']]
+            handler(input())
+        ''', 'eval')
+        self.assert_rules('''
+            def handler(code):
+                run = lambda value: None
+                def send(): run(code)
+                [send() for run in [eval] for code in [input()]]
+            handler('safe')
+        ''')
+
+    def test_keyword_default_and_unpacked_callback_bindings(self):
+        for call in ['apply(callback=eval, value=input())', 'apply(**{"callback": eval, "value": input()})', 'apply(*[eval, input()])']:
+            self.assert_rules('def apply(callback, value): callback(value)\n' + call, 'eval')
+        self.assert_rules('def apply(value, *, callback=eval): callback(value)\napply(input())', 'eval')
+        self.assert_rules('def apply(value, *, callback=eval): callback(value)\napply(input(), callback=lambda value: None)')
+
+    def test_callback_returns_an_alias_and_a_callable(self):
+        self.assert_rules('''
+            def apply(callback, value): return callback(value)
+            box = []
+            alias = apply(lambda value: value, box)
+            alias.append(input())
+            eval(box[0])
+        ''', 'eval')
+        self.assert_rules('def apply(callback): return callback()\napply(lambda: eval)(input())', 'eval')
+
+    def test_callback_heap_mutations_reach_the_caller(self):
+        self.assert_rules('''
+            def fill(box): box.append(input())
+            def apply(callback, box): callback(box)
+            target = []
+            apply(fill, target)
+            eval(target[0])
+        ''', 'eval')
+        self.assert_rules('''
+            def fill(box): box.append('safe')
+            def apply(callback, box): callback(box)
+            target = []
+            apply(fill, target)
+            eval(target[0])
+        ''')
+
+    def test_callback_exceptions_and_finally_preserve_tainted_payload(self):
+        self.assert_rules('''
+            def raise_code(value): raise ValueError(value)
+            def apply(callback, code):
+                try:
+                    callback(code)
+                except ValueError as error:
+                    eval(str(error))
+            apply(raise_code, input())
+        ''', 'eval')
+        self.assert_rules('''
+            def raise_code(value): raise ValueError(value)
+            def apply(callback, code):
+                try:
+                    callback(code)
+                finally:
+                    return 'safe'
+            eval(apply(raise_code, input()))
+        ''')
+
+    def test_async_callback_identity_is_kept_until_await(self):
+        self.assert_rules('''
+            async def apply(callback, value): callback(value)
+            async def route(): await apply(eval, input())
+        ''', 'eval')
+        self.assert_rules('async def apply(callback, value): callback(value)\napply(eval, input())')
+
+    def test_generator_callback_yields_the_returned_value(self):
+        self.assert_rules('''
+            def values(callback, value): yield callback(value)
+            for code in values(lambda value: value, input()): eval(code)
+        ''', 'eval')
+        self.assert_rules('''
+            def values(callback, value): yield callback(value)
+            for code in values(lambda value: 'safe', input()): eval(code)
+        ''')
+
+    def test_recursive_callback_context_reaches_a_fixed_point(self):
+        self.assert_rules('''
+            def apply(callback, value):
+                if condition: return apply(callback, value)
+                return callback(value)
+            apply(eval, input())
+        ''', 'eval')
+        self.assert_rules('''
+            def apply(callback, value):
+                if condition: return apply(callback, value)
+                return callback(value)
+            HttpResponse(apply(html.escape, input()))
+        ''')
+
+    def test_callback_changes_across_mutual_recursion(self):
+        self.assert_rules('''
+            def first(callback, value):
+                if condition: return second(eval, value)
+                return callback(value)
+            def second(callback, value): return first(callback, value)
+            first(lambda value: None, input())
+        ''', 'eval')
+
+    def test_long_callback_forwarding_chain_has_no_inline_depth_limit(self):
+        source = '\n'.join(f'def f{i}(callback, value): return f{i+1}(callback, value)' for i in range(24))
+        self.assert_rules(source + '\ndef f24(callback, value): return callback(value)\nf0(eval, input())', 'eval')
+
+    def test_context_keys_exclude_argument_taint_and_evidence(self):
+        source = 'def apply(callback, value): return callback(value)\n'
+        source += '\n'.join(f'apply(eval, {value})' for value in ['input()', "'safe'", 'request.args["x"]'] * 10)
+        engine = taint_py._Analysis(ast.parse(source))
+        engine.analyze()
+        contexts = [key for key in engine.summaries if isinstance(key, tuple)]
+        self.assertEqual(len(contexts), 1, contexts)
+
+    def test_cpython_callback_and_capture_oracles(self):
+        cases = [
+            ('def apply(cb, value): cb(value)\napply(eval, input())', ['untrusted']),
+            ('def apply(cb, value): cb(value)\napply(lambda value: None, input())', []),
+            ('def handler(value):\n run=eval\n def send(): run(value)\n'
+             " [send() for run in [lambda value: None] for value in ['safe']]\nhandler(input())", ['untrusted']),
+            ('def apply(cb, value): return cb(value)\n'
+             "eval(apply(lambda value: 'safe', input()))", ['safe']),
+        ]
+        for source, expected in cases:
+            with self.subTest(source=source):
+                events = []
+                # This is an independent Python semantic oracle, not analyzer
+                # execution of scanned code. Only fixed authored fixtures run;
+                # eval/input are harmless collectors, not real builtins.
+                namespace = {'__builtins__': {}, 'input': lambda: 'untrusted', 'eval': events.append}
+                exec(compile(source, '<safe-callback-oracle>', 'exec'), namespace)
+                self.assertEqual(events, expected)
+                self.assert_rules(source, *(['eval'] if 'untrusted' in expected else []))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

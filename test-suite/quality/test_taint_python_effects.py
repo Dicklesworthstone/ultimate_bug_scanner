@@ -1104,6 +1104,12 @@ class MutableObjectCliTests(unittest.TestCase):
             'closure-callable-clean': ("def handler(code):\n    run=lambda value: None\n    def source():\n        return run\n    [source()(code) for run in [eval]]\nhandler(input())\n", False),
             'closure-nested-taint': ("[[eval(source()) for code in ['safe']] for code in [input()] for source in [lambda: code]]\n", True),
             'closure-nested-clean': ("[[eval(source()) for code in [input()]] for code in ['safe'] for source in [lambda: code]]\n", False),
+            'callback-sink': ("def apply(callback, value): callback(value)\napply(eval, input())\n", True),
+            'callback-clean': ("def apply(callback, value): callback(value)\napply(lambda value: None, input())\n", False),
+            'callback-capture': ("def handler(value):\n    run=eval\n    def send(): run(value)\n    send()\nhandler(input())\n", True),
+            'callback-return-clean': ("def apply(callback, value): return callback(value)\neval(apply(lambda value: 'safe', input()))\n", False),
+            'callback-mutation': ("def fill(box): box.append(input())\ndef apply(callback, box): callback(box)\ntarget=[]\napply(fill, target)\neval(target[0])\n", True),
+            'callback-async': ("async def apply(callback, value): callback(value)\nasync def handler(): await apply(eval, input())\n", True),
         }
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-mutable-effects'
         artifacts.mkdir(parents=True, exist_ok=True)

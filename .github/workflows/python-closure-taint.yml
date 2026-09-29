@@ -40,9 +40,11 @@ jobs:
           sudo apt-get install -y jq ripgrep rsync shellcheck
           export npm_config_cache="$RUNNER_TEMP/ubs-npm-cache-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           prefix="$RUNNER_TEMP/ubs-ast-grep-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          npm install --global --prefix "$prefix" @ast-grep/cli
+          npm install --global --prefix "$prefix" @ast-grep/cli typescript@5.8.3
           echo "$prefix/bin" >> "$GITHUB_PATH"
           "$prefix/bin/ast-grep" --version
+          "$prefix/bin/tsc" --version
+          node -e 'const ts = require(process.argv[1]); if (typeof ts.resolveModuleName !== "function") process.exit(1)' "$prefix/lib/node_modules/typescript"
       - name: Require real Python 3.9 on x64
         if: runner.arch == 'X64'
         run: python3.9 --version

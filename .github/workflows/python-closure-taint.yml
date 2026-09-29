@@ -12,8 +12,12 @@ permissions:
 
 jobs:
   closure-dataflow:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: write
     env:
@@ -24,6 +28,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/setup-python@v5
+        if: runner.arch == 'X64'
         with:
           python-version: '3.9'
       - uses: actions/setup-python@v5
@@ -34,7 +39,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Validate closure source and store immutable tested objects
+      - name: Require real Python 3.9 on x64
+        if: runner.arch == 'X64'
+        run: python3.9 --version
+      - name: Validate each source stage and store immutable tested objects
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -71,56 +79,75 @@ jobs:
           expected = {
               'modules/helpers/ubs_core/analyzers/taint_py.py': 'd7ae7027334940f51614ce59079df645082c5e67',
               'test-suite/quality/test_taint_python_effects.py': 'cef517b9075df341add9008cdf1e95465eea8c45',
+              'test-suite/quality/test_taint_python_summaries.py': '95391237edb05cf3796d3724a263f6cc14b1d120',
+              'test-suite/quality/test_taint_python_modules.py': '9fb044e600602751cb7ad88b1329f87a44859eab',
           }
           for path, digest in expected.items():
               assert git('hash-object', path) == digest, f'Reconcile newer source: {path}'
+          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
+          allowed = set(expected) | set(scripts) | {'SHA256SUMS'}
           check('base-checksums', ['./scripts/verify_checksums.sh'])
           check('base-release-checksums', ['./scripts/verify_sha256sums.sh'])
-          pieces = []
-          for blob in ['649e75decab326cc47f04545143d30f742c38755', '8ff22480cc544df79b02de4edceada6b144ff0d8']:
-              data = base64.b64decode(api('git/blobs/' + blob)['content'])
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == blob
-              pieces.append(data)
-          packed = b''.join(pieces)
-          assert hashlib.sha256(packed).hexdigest() == 'f345b0dddd0f4402bd0772af86ab31eccc2a72c89534622bb49d440f76834f5b'
-          patch = gzip.decompress(packed)
-          assert hashlib.sha256(patch).hexdigest() == '24b7d5ed682df217e85e814ae07cefb579cbe3b76941296b5d8f0535387e446b'
-          patch_file = output / 'implementation.patch'
-          patch_file.write_bytes(patch)
-          check('apply-check', ['git', 'apply', '--check', str(patch_file)])
-          check('apply', ['git', 'apply', str(patch_file)])
-          check('generate', ['python3', 'scripts/update_checksums.py'])
-          for name, directory, pattern in [
-              ('all-taint', 'quality', 'test_taint*.py'),
-              ('command', 'quality', 'test_python_command_injection_dataflow.py'),
-              ('contract', 'shareable', 'test_contract_checksums.py'),
-              ('python-floor', 'shareable', 'test_helper_python_floor.py'),
-          ]:
-              check(name, ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/' + directory, '-p', pattern, '-v'])
-          for pattern in ['test_taint_python_effects.py', 'test_taint_python_dataflow.py', 'test_taint_go_decoding.py']:
-              check(pattern + '-cli', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', pattern, '-v'],
-                    env=dict(os.environ, UBS_TAINT_E2E='1'))
-          scripts = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *map(str, sorted(Path('modules').glob('ubs-*.sh')))]
-          check('shellcheck', ['shellcheck', '-S', 'warning', *scripts])
-          check('checksums', ['./scripts/verify_checksums.sh'])
-          check('release-checksums', ['./scripts/verify_sha256sums.sh'])
-          check('diff', ['git', 'diff', '--check'])
-          changed = set(git('diff', '--name-only').splitlines())
-          assert changed == set(expected) | set(scripts) | {'SHA256SUMS'}, changed
-          assert not git('ls-files', '--others', '--exclude-standard')
-          snapshot = {path: Path(path).read_bytes() for path in changed}
-          check('idempotence', ['python3', 'scripts/update_checksums.py'])
-          assert all(Path(path).read_bytes() == value for path, value in snapshot.items())
-          entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0], 'type': 'blob',
-                      'content': Path(path).read_text()} for path in sorted(changed)]
-          tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
-          subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
-          assert tree == git('write-tree'), 'Remote tree differs from tested bytes'
-          record = {'base': base, 'tree': tree, 'files': [
-              {'path': entry['path'], 'mode': entry['mode'], 'type': 'blob', 'sha': git('hash-object', entry['path']),
-               'before': git('rev-parse', 'HEAD:' + entry['path'])} for entry in entries]}
-          (output / 'publication.json').write_text(json.dumps(record, indent=2))
-          print('VALIDATED_CLOSURE_TREE', json.dumps(record), flush=True)
+          stages = [
+              ('lexical-closures', ['649e75decab326cc47f04545143d30f742c38755', '8ff22480cc544df79b02de4edceada6b144ff0d8'],
+               'f345b0dddd0f4402bd0772af86ab31eccc2a72c89534622bb49d440f76834f5b',
+               '24b7d5ed682df217e85e814ae07cefb579cbe3b76941296b5d8f0535387e446b'),
+              ('callback-summaries', ['163a0ed11fc4b21957b7830cc2c13aedf94de4b0', '8725141113e3e010f5d70f20d7636c57ed298264',
+                                      '454b2ffe843dc2e3c39e342ffc547cbd0b04fb1e', 'c8de855c1e7afe80b6c30ec890e8df9083444a40'],
+               '5334f99779be5d41eacd8cee7b127496a793c55fe99993fc82b155f93cc2e073',
+               'de98f12911610a1de78e4f9fc60e220f8cfe722a90f02f30241fc6b370a2ea56'),
+          ]
+          records = []
+          for stage, blobs, packed_sha, patch_sha in stages:
+              pieces = []
+              for blob in blobs:
+                  data = base64.b64decode(api('git/blobs/' + blob)['content'])
+                  assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == blob
+                  pieces.append(data)
+              packed = b''.join(pieces)
+              assert hashlib.sha256(packed).hexdigest() == packed_sha
+              patch = gzip.decompress(packed)
+              assert hashlib.sha256(patch).hexdigest() == patch_sha
+              patch_file = output / (stage + '.patch')
+              patch_file.write_bytes(patch)
+              check(stage + '-apply-check', ['git', 'apply', '--check', str(patch_file)])
+              check(stage + '-apply', ['git', 'apply', str(patch_file)])
+              check(stage + '-generate', ['python3', 'scripts/update_checksums.py'])
+              for name, directory, pattern in [
+                  ('all-taint', 'quality', 'test_taint*.py'),
+                  ('command', 'quality', 'test_python_command_injection_dataflow.py'),
+                  ('contract', 'shareable', 'test_contract_checksums.py'),
+                  ('python-floor', 'shareable', 'test_helper_python_floor.py'),
+              ]:
+                  check(stage + '-' + name, ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/' + directory, '-p', pattern, '-v'])
+              for pattern in ['test_taint_python_effects.py', 'test_taint_python_dataflow.py', 'test_taint_go_decoding.py']:
+                  check(stage + '-' + pattern + '-cli', ['python3', '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', pattern, '-v'],
+                        env=dict(os.environ, UBS_TAINT_E2E='1'))
+              check(stage + '-shellcheck', ['shellcheck', '-S', 'warning', *scripts])
+              check(stage + '-checksums', ['./scripts/verify_checksums.sh'])
+              check(stage + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
+              check(stage + '-diff', ['git', 'diff', '--check'])
+              changed = set(git('diff', '--name-only').splitlines())
+              required = set(expected) if stage == 'callback-summaries' else set(list(expected)[:2])
+              assert changed == required | set(scripts) | {'SHA256SUMS'}, changed
+              assert changed <= allowed
+              assert not git('ls-files', '--others', '--exclude-standard')
+              snapshot = {path: Path(path).read_bytes() for path in changed}
+              check(stage + '-idempotence', ['python3', 'scripts/update_checksums.py'])
+              assert all(Path(path).read_bytes() == value for path, value in snapshot.items())
+              entries = [{'path': path, 'mode': git('ls-files', '-s', '--', path).split()[0], 'type': 'blob',
+                          'content': Path(path).read_text()} for path in sorted(changed)]
+              tree = api('git/trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
+              subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
+              assert tree == git('write-tree'), 'Remote tree differs from tested bytes'
+              record = {'stage': stage, 'base': base, 'tree': tree, 'files': [
+                  {'path': entry['path'], 'mode': entry['mode'], 'type': 'blob', 'sha': git('hash-object', entry['path']),
+                   'before': git('rev-parse', 'HEAD:' + entry['path'])} for entry in entries]}
+              records.append(record)
+              (output / 'publication.json').write_text(json.dumps(records, indent=2))
+              print('VALIDATED_CLOSURE_TREE', json.dumps(record), flush=True)
+              subprocess.run(['git', '-c', 'user.name=UBS Validation', '-c', 'user.email=noreply@github.com',
+                              'commit', '-qm', stage], check=True)
           PY
       - name: Preserve source and validation evidence
         if: always()
@@ -131,7 +158,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: closure-candidate-validation
+          name: closure-candidate-${{ matrix.runner }}
           path: |
             ${{ runner.temp }}/closure-candidate
             test-suite/artifacts/python-mutable-effects

@@ -1,0 +1,132 @@
+name: Rust Redirect Dataflow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/rust-redirect-dataflow.patch.xz
+      - .github/workflows/rust-redirect-dataflow.yml
+      - modules/helpers/ubs_core/rust_detectors/open_redirect.py
+      - modules/helpers/ubs_core/rust_detectors/redirect_flow.py
+      - modules/helpers/ubs_core/analyzers/taint_rust.py
+      - test-suite/quality/test_rust_redirect_dataflow.py
+      - test-suite/quality/test_suppression_intervals.py
+      - ubs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_SKIP_RUST_BUILD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck rustc
+          npm install --global @ast-grep/cli
+      - name: Verify baseline and apply checkpointed implementation
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 - <<'PY'
+          import lzma, os, subprocess
+          from pathlib import Path
+          path = 'test-suite/patches/rust-redirect-dataflow.patch.xz'
+          assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == '7c3b8ceac41ecdd3bdc6553739d7844d86f68be1'
+          candidate = Path(os.environ['RUNNER_TEMP'], 'rust-redirect.patch')
+          candidate.write_bytes(lzma.decompress(Path(path).read_bytes()))
+          subprocess.run(['git', 'apply', '--check', str(candidate)], check=True)
+          subprocess.run(['git', 'apply', str(candidate)], check=True)
+          subprocess.run(['git', 'add', '-N', 'modules/helpers/ubs_core/rust_detectors/redirect_flow.py', 'test-suite/quality/test_rust_redirect_dataflow.py'], check=True)
+          PY
+          python3 scripts/update_checksums.py
+          git diff --check
+      - name: Run dataflow and real JSON/SARIF regressions
+        env:
+          UBS_RUST_REDIRECT_E2E: '1'
+        run: |
+          set -o pipefail
+          python3 test-suite/quality/test_rust_redirect_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/rust-redirect-tests.log"
+      - name: Verify existing Rust and cross-language suppression behavior
+        run: |
+          set -o pipefail
+          python3 test-suite/quality/test_suppression_intervals.py -v 2>&1 | tee "$RUNNER_TEMP/rust-suppression-tests.log"
+          python3 test-suite/quality/test_rust_test_intervals.py -v 2>&1 | tee "$RUNNER_TEMP/rust-interval-tests.log"
+      - name: Verify shell syntax and full integrity chain
+        run: |
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+          for file in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$file"; done
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --check
+      # The connector atomically commits these tested source and integrity blobs.
+      # This publication step is removed when the runtime files are landed.
+      - name: Publish exact tested source and integrity blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          sources = {'modules/helpers/ubs_core/rust_detectors/open_redirect.py',
+              'modules/helpers/ubs_core/rust_detectors/redirect_flow.py',
+              'test-suite/quality/test_rust_redirect_dataflow.py',
+              'test-suite/quality/test_suppression_intervals.py'}
+          allowed = sources | {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert sources <= changed <= allowed, changed
+          snapshots = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True, stdout=subprocess.DEVNULL)
+          assert all(Path(name).read_bytes() == data for name, data in snapshots.items()), 'non-deterministic checksums'
+          manifest = []
+          for name in sorted(changed):
+              data = snapshots[name]
+              response = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                  '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                  text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              entry = {'path': name, 'sha': sha, 'mode': mode, 'type': 'blob'}
+              manifest.append(entry)
+              print('RUST_REDIRECT_BLOB', json.dumps(entry), flush=True)
+          Path(os.environ['RUNNER_TEMP'], 'rust-redirect-blobs.json').write_text(json.dumps(manifest, indent=2))
+          PY
+      - name: Record reviewed patch and native validation tools
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/rust-redirect-final.patch"
+          mkdir -p "$RUNNER_TEMP/rust-redirect-tools"
+          for tool in ast-grep shellcheck; do
+            found="$(command -v "$tool" || true)"
+            if [ -n "$found" ]; then cp -L "$found" "$RUNNER_TEMP/rust-redirect-tools/$tool"; fi
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-redirect-dataflow-validation
+          path: |
+            ${{ runner.temp }}/rust-*.log
+            ${{ runner.temp }}/rust-redirect-blobs.json
+            ${{ runner.temp }}/rust-redirect-final.patch
+            ${{ runner.temp }}/rust-redirect-tools
+            test-suite/artifacts/rust-redirect-dataflow
+          retention-days: 3

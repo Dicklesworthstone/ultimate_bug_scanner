@@ -515,6 +515,70 @@ class ComprehensionEffectsTests(SourceTest):
             [run() for code in ['safe']]
         ''', 'eval')
 
+    def test_external_closure_reads_its_cell_not_the_iteration_target(self):
+        self.assert_rules('''
+            def handler(code):
+                def source():
+                    return code
+                [eval(source()) for code in ['safe']]
+            handler(input())
+        ''', 'eval')
+        self.assert_rules('''
+            def handler(code):
+                def source():
+                    return code
+                [eval(source()) for code in [input()]]
+            handler('safe')
+        ''')
+
+    def test_external_closure_mutates_the_original_captured_object(self):
+        self.assert_rules('''
+            def handler(box):
+                def fill():
+                    box.append(input())
+                [fill() for box in [[]]]
+            target = []
+            handler(target)
+            eval(target[0])
+        ''', 'eval')
+        self.assert_rules('''
+            def handler(box):
+                def fill():
+                    box.append('safe')
+                [fill() for box in [[input()]]]
+            target = []
+            handler(target)
+            eval(target[0])
+        ''')
+
+    def test_external_closure_keeps_its_returned_callable_identity(self):
+        self.assert_rules('''
+            def handler(code):
+                run = eval
+                def source():
+                    return run
+                [source()(code) for run in [lambda value: None]]
+            handler(input())
+        ''', 'eval')
+        self.assert_rules('''
+            def handler(code):
+                run = lambda value: None
+                def source():
+                    return run
+                [source()(code) for run in [eval]]
+            handler(input())
+        ''')
+
+    def test_nested_comprehension_restores_the_defining_closure_frame(self):
+        self.assert_rules('''
+            [[eval(source()) for code in ['safe']]
+             for code in [input()] for source in [lambda: code]]
+        ''', 'eval')
+        self.assert_rules('''
+            [[eval(source()) for code in [input()]]
+             for code in ['safe'] for source in [lambda: code]]
+        ''')
+
     def test_literals_preserve_element_aliases_and_callable_identities(self):
         self.assert_rules('''
             box = []
@@ -1032,6 +1096,14 @@ class MutableObjectCliTests(unittest.TestCase):
             'unpacking-unused': ("def execute(value, unused): eval(value)\nexecute(*['safe', input()])\n", False),
             'unpacking-namespace': ("eval(*['1', {'data': input()}])\n", False),
             'unpacking-provider': ("from fastapi import Query, Depends\ndef provider(value=Query()): return value\ndef route(value=Depends(*[provider])): eval(value)\n", True),
+            'closure-taint': ("def handler(code):\n    def source():\n        return code\n    [eval(source()) for code in ['safe']]\nhandler(input())\n", True),
+            'closure-clean': ("def handler(code):\n    def source():\n        return code\n    [eval(source()) for code in [input()]]\nhandler('safe')\n", False),
+            'closure-alias-taint': ("def handler(box):\n    def fill():\n        box.append(input())\n    [fill() for box in [[]]]\ntarget=[]\nhandler(target)\neval(target[0])\n", True),
+            'closure-alias-clean': ("def handler(box):\n    def fill():\n        box.append('safe')\n    [fill() for box in [[input()]]]\ntarget=[]\nhandler(target)\neval(target[0])\n", False),
+            'closure-callable-taint': ("def handler(code):\n    run=eval\n    def source():\n        return run\n    [source()(code) for run in [lambda value: None]]\nhandler(input())\n", True),
+            'closure-callable-clean': ("def handler(code):\n    run=lambda value: None\n    def source():\n        return run\n    [source()(code) for run in [eval]]\nhandler(input())\n", False),
+            'closure-nested-taint': ("[[eval(source()) for code in ['safe']] for code in [input()] for source in [lambda: code]]\n", True),
+            'closure-nested-clean': ("[[eval(source()) for code in [input()]] for code in ['safe'] for source in [lambda: code]]\n", False),
         }
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-mutable-effects'
         artifacts.mkdir(parents=True, exist_ok=True)

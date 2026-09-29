@@ -1016,6 +1016,34 @@ class _Flow:
                 return frozenset({TaintTrace(source, path=(source,))})
         return CLEAN
 
+    def closure_namespace(self, function, state):
+        """Read cells in the callee's lexical scope, retaining the live heap.
+
+        Comprehension targets shadow a caller's spelling, not the cells of
+        an already defined helper. A lambda created inside a comprehension
+        does capture that comprehension's cells, so preserve those frames.
+        """
+        ancestors = set()
+        owner = self.engine.enclosing(function)
+        while owner is not None:
+            ancestors.add(owner)
+            owner = self.engine.enclosing(owner)
+        namespace = state
+        for comprehension, outer in reversed(self.comprehension_environments):
+            if comprehension in ancestors:
+                continue
+            if namespace is state:
+                namespace = state.copy()
+            for name in self.engine.locals[comprehension]:
+                for destination, original in ((namespace, outer),
+                                              (namespace.bindings, outer.bindings),
+                                              (namespace.references, outer.references)):
+                    if name in original:
+                        destination[name] = original[name]
+                    else:
+                        destination.pop(name, None)
+        return namespace
+
     def global_arguments(self, function, state):
         """A helper reads its defining module, never a caller's same-name local."""
         owner = self.engine.owner(function)
@@ -1065,8 +1093,9 @@ class _Flow:
         if function.args.kwarg:
             accepted = set(positional) | {arg.arg for arg in function.args.kwonlyargs}
             bound[function.args.kwarg.arg] = join_facts(*(fact for name, fact in keywords.items() if name not in accepted))
+        captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
-            bound[f'@free:{name}'] = state.value(name)
+            bound[f'@free:{name}'] = captured.value(name)
         for key, fact, _refs, _value in self.global_arguments(function, state):
             bound[key] = fact
         return bound
@@ -1092,8 +1121,9 @@ class _Flow:
         if expanded:
             for name in positional:
                 bound[name] = bound.get(name, NO_REFERENCES) | expanded
+        captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
-            bound[f'@free:{name}'] = state.references.get(name, NO_REFERENCES)
+            bound[f'@free:{name}'] = captured.references.get(name, NO_REFERENCES)
         for key, _fact, refs, _value in self.global_arguments(function, state):
             bound[key] = refs
         if self.engine.project is not None:
@@ -1111,8 +1141,9 @@ class _Flow:
                      if name is not None)
         for name, value in self.engine.default_bindings.get(function, {}).items():
             bound.setdefault(name, value)
+        captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
-            bound[f'@free:{name}'] = state.bindings.get(name)
+            bound[f'@free:{name}'] = captured.bindings.get(name)
         for key, _fact, _refs, value in self.global_arguments(function, state):
             bound[key] = value
         return bound
@@ -1126,17 +1157,18 @@ class _Flow:
         """
         for key, fact, refs, value in self.global_arguments(function, state):
             bound[key], references[key], values[key] = fact, refs, value
+        captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
             owner = self.engine.enclosing(function)
             while owner is not None and not isinstance(owner, ast.Module):
                 if name in self.engine.locals.get(owner, set()):
                     break
                 owner = self.engine.enclosing(owner)
-            if owner is self.scope:
+            if owner is self.scope or any(owner is scope for scope, _outer in self.comprehension_environments):
                 key = f'@free:{name}'
-                bound[key] = state.value(name)
-                references[key] = state.references.get(name, NO_REFERENCES)
-                values[key] = state.bindings.get(name)
+                bound[key] = captured.value(name)
+                references[key] = captured.references.get(name, NO_REFERENCES)
+                values[key] = captured.bindings.get(name)
 
     @staticmethod
     def substitute(fact, bound, call_name):

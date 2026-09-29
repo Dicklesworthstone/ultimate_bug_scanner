@@ -168,6 +168,11 @@ def _compare_bounds(
 
 
 _TERMINATORS = (ast.Break, ast.Continue, ast.Return, ast.Raise)
+# Pattern-matching nodes exist only on Python >= 3.10; ubs still runs helpers
+# on 3.9 (macOS /usr/bin/python3), where a bare ast.MatchAs raises
+# AttributeError. An empty tuple makes isinstance() simply False there.
+_NAMED_PATTERNS = tuple(getattr(ast, n) for n in ("MatchAs", "MatchStar") if hasattr(ast, n))
+_MAPPING_PATTERNS = tuple(getattr(ast, n) for n in ("MatchMapping",) if hasattr(ast, n))
 
 
 def _early_exit_bounds(block: list[ast.stmt], upto: ast.AST,
@@ -334,9 +339,9 @@ def _string_binding(node: ast.AST, name: str) -> bool:
     if isinstance(node, ast.arg):
         return node.arg == name
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
-                         ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+                         ast.ExceptHandler) + _NAMED_PATTERNS):
         return node.name == name
-    if isinstance(node, ast.MatchMapping):
+    if isinstance(node, _MAPPING_PATTERNS):
         return node.rest == name
     return False
 

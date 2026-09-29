@@ -10,13 +10,37 @@ ubs_core module imports under a real Python < 3.10 when one is installed.
 from __future__ import annotations
 
 import ast
+import json
+import os
 import shutil
 import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS = REPO_ROOT / "modules" / "helpers"
+UBS = REPO_ROOT / "ubs"
+PY_FIXTURES = REPO_ROOT / "test-suite" / "python"
+
+# Reaches code paths a bare import does not: the bisect predecessor proof in
+# py_detectors/index_arithmetic walks every binding in scope, and read
+# ast.MatchAs at call time (AttributeError on 3.9, so the whole Python module
+# reported MODULE_INVALID_JSON).
+BISECT_LOOKUP = """
+from bisect import bisect_right
+
+
+def lookup(position):
+    offsets = [0, 10, 20]
+    cursor = bisect_right(offsets, position)
+    return offsets[cursor - 1]
+
+
+def neighbour(xs, i):
+    return xs[i + 1]
+"""
 FLOOR = (3, 9)
 
 IMPORT_ALL = r"""
@@ -80,6 +104,35 @@ class HelperPythonFloor(unittest.TestCase):
             capture_output=True, text=True, timeout=300, check=False,
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_python_scan_runs_on_python_39(self) -> None:
+        """The real entry path: `ubs --only=python` with python3 = 3.9 on PATH."""
+        exe = old_python()
+        if exe is None:
+            self.skipTest("no Python 3.9 interpreter installed")
+        with tempfile.TemporaryDirectory(prefix="ubs_py39_") as tmp:
+            shim = Path(tmp) / "bin"
+            shim.mkdir()
+            (shim / "python3").symlink_to(exe)
+            project = Path(tmp) / "project"
+            shutil.copytree(PY_FIXTURES, project, ignore=shutil.ignore_patterns("__pycache__"))
+            (project / "bisect_lookup.py").write_text(textwrap.dedent(BISECT_LOOKUP), encoding="utf-8")
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{shim}{os.pathsep}{env.get('PATH', '')}",
+                "NO_COLOR": "1", "UBS_NO_AUTO_UPDATE": "1", "UBS_SKIP_SIZE_CHECK": "1",
+            })
+            # Fixed argv built from the fixture paths above.
+            proc = subprocess.run(  # ubs:ignore[python.taint.command]
+                [str(UBS), "--only=python", "--format=json", str(project)],
+                cwd=tmp, env=env, capture_output=True, text=True, timeout=600, check=False,
+            )
+        try:
+            report = json.loads(proc.stdout)
+        except ValueError:
+            self.fail(f"not JSON (exit {proc.returncode}): {proc.stdout[-2000:]}{proc.stderr[-2000:]}")
+        self.assertEqual(report.get("failed_modules"), [], proc.stderr[-4000:])
+        self.assertEqual(report.get("status"), "ok", proc.stderr[-4000:])
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ jobs:
       matrix:
         runner: [ubuntu-22.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: write
     env:
@@ -102,6 +102,9 @@ jobs:
                                       '454b2ffe843dc2e3c39e342ffc547cbd0b04fb1e', 'c8de855c1e7afe80b6c30ec890e8df9083444a40'],
                '5334f99779be5d41eacd8cee7b127496a793c55fe99993fc82b155f93cc2e073',
                'de98f12911610a1de78e4f9fc60e220f8cfe722a90f02f30241fc6b370a2ea56'),
+              ('bound-callbacks', ['6692dfa4c5fd259c879f1e8cee000c24665c3f49'],
+               '254eb4bff72694eaab4383c6474f4998e171f95fc0e0bf66e38d832bb41388f2',
+               '27480dd5acbc5fe272120821c1812da7470dfd3245387bce23053416a2e7995b'),
           ]
           records = []
           for stage, blobs, packed_sha, patch_sha in stages:
@@ -134,7 +137,7 @@ jobs:
               check(stage + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
               check(stage + '-diff', ['git', 'diff', '--check'])
               changed = set(git('diff', '--name-only').splitlines())
-              required = set(expected) if stage == 'callback-summaries' else set(list(expected)[:2])
+              required = set(expected) if stage != 'lexical-closures' else set(list(expected)[:2])
               assert changed == required | set(scripts) | {'SHA256SUMS'}, changed
               assert changed <= allowed
               assert not git('ls-files', '--others', '--exclude-standard')
@@ -266,7 +269,7 @@ jobs:
               check(stage + '-release-checksums', ['./scripts/verify_sha256sums.sh'])
               check(stage + '-diff', ['git', 'diff', '--check'])
               changed = set(git('diff', '--name-only').splitlines())
-              required = set(metadata['expected']) if stage == 'callback-summaries' else set(list(metadata['expected'])[:2])
+              required = set(metadata['expected']) if stage != 'lexical-closures' else set(list(metadata['expected'])[:2])
               assert changed == required | set(scripts) | {'SHA256SUMS'}
               assert changed <= allowed and not git('ls-files', '--others', '--exclude-standard')
               before = {path: git('rev-parse', 'HEAD:' + path) for path in changed}

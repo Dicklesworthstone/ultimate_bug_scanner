@@ -58,27 +58,27 @@ jobs:
           tests = 'test-suite/js/test_taint_heap.py'
           stages = [
               ('javascript-heap-shapes.patch.xz', 'd0e155c96c5ca90ad940430bcf2d428105368124785ed249c333bef6fc2b6328',
-               '51c808a84550093b8368571aba022d938c9ff380', '9a9d33f718f58312f31a51d52d31f55354b64fcd'),
+               '4000b7f52c44851ce11564d28e1918f24f4021df', '9a9d33f718f58312f31a51d52d31f55354b64fcd'),
               ('javascript-native-identity.patch.xz', '85bad85ebb7e10d52fb313bc5747d0248b481d3ea9132d9bc331180abadc5522',
-               'f4e5997341da1547df687519ae9351bc196db879', 'a23f335861108e946d825373efec2a3802d84516'),
+               '2ce8ce9bd82545cbec71270fb3c347b31774a27f', 'a23f335861108e946d825373efec2a3802d84516'),
               ('javascript-native-exports.patch.xz', '3eb47660f1a7e36cf19ab3a489573c11202d42d238c329512a8fccdc4c0420d4',
-               '80a90b9772d16f85db17b0f6838b716d53a0fc63', 'e655e6787428e83b78594faac894b3d1f1f25237'),
+               '691f339f0736598848ad0d89782922b9f728fd78', 'e655e6787428e83b78594faac894b3d1f1f25237'),
           ]
           def apply(filename, digest):
               patch = lzma.decompress(Path('test-suite/patches',filename).read_bytes())
               assert hashlib.sha256(patch).hexdigest() == digest, filename
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
-          if blob(source) == '3b5a601ab85dcccc0aabc67d8c0e2be4140fa208':
+          if blob(source) == 'b72861ed6c2afb68bf616e05ec8eb0c49f84baa0':
               for filename, digest, source_sha, test_sha in stages:
                   apply(filename, digest)
                   assert blob(source) == source_sha and blob(tests) == test_sha, filename
           # The preceding exact candidate may have been activated meanwhile.
           # Never replace a newer or unrecognized implementation.
-          assert blob(source) == '80a90b9772d16f85db17b0f6838b716d53a0fc63'
+          assert blob(source) == '691f339f0736598848ad0d89782922b9f728fd78'
           assert blob(tests) == 'e655e6787428e83b78594faac894b3d1f1f25237'
           apply('javascript-heap-templates.patch.xz', '63da65df02dd0f59a81ed3945b3cad5d6ea86d1df5c02ecf8a375d11e5858973')
-          assert blob(source) == '488c7605f2693fc4268b1bfc184b9e7f0efff726'
+          assert blob(source) == 'ca35f99354cc981a1ec2d682093938459d843b22'
           assert blob('test-suite/quality/test_taint_js_heap.py') == 'd66a1ed2161ad4b0f9c202a8e2474eb665403d1b'
           print('JS_SHAPES_BASE',subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),flush=True)
           PY

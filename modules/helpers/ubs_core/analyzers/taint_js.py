@@ -62,6 +62,13 @@ SANITIZERS_BY_RULE = {
     ),
 }
 
+# A number carries no markup, SQL or shell syntax. Calls to these globals
+# (not a local or relatively imported function of the same name) return
+# untainted values.
+NUMERIC_CONVERSIONS = re.compile(
+    r'(?:parseInt|parseFloat|Number(?:\.(?:parseInt|parseFloat))?|Math\.[A-Za-z_$][\w$]*)'
+)
+
 CHILD_PROCESS_APIS = ('execFileSync', 'execFile', 'execSync', 'spawnSync', 'spawn', 'exec')
 CHILD_PROCESS_API_RE = r"(?:execFileSync|execFile|execSync|spawnSync|spawn|exec)"
 CHILD_PROCESS_MODULE_RE = r"['\"](?:node:)?child_process['\"]"
@@ -73,7 +80,6 @@ SINKS = [
     (re.compile(r"\binsertAdjacentHTML\s*\("), 'js.taint.xss', 'insertAdjacentHTML', True),
     (re.compile(r"\bdocument\.write\s*\("), 'js.taint.xss', 'document.write', True),
     (re.compile(r"\bres(?:ponse)?\.send\s*\("), 'js.taint.xss', 'HTTP send', True),
-    (re.compile(r"\bres(?:ponse)?\.json\s*\("), 'js.taint.xss', 'HTTP json send', True),
     (re.compile(r"\beval\s*\("), 'js.taint.eval', 'eval', True),
     (re.compile(r"\bnew\s+Function\s*\("), 'js.taint.eval', 'Function constructor', True),
     (re.compile(r"\bshell\.exec\s*\("), 'js.taint.command', 'shell.exec', True),
@@ -1969,6 +1975,18 @@ class _Flow:
                     previous = code[:match.start()].rstrip()
                     if not previous.endswith('.') and binding == 'imported':
                         call_fact = frozenset()
+                if binding == 'imported' and NUMERIC_CONVERSIONS.fullmatch(callee_name):
+                    before = match.start() - 1
+                    while before >= 0 and code[before].isspace():
+                        before -= 1
+                    if before < 0 or code[before] != '.':
+                        call_fact = frozenset()
+                if sink and sink[0] == 'js.taint.sql' and sink_binding == 'imported':
+                    # Rows returned by a query come from the database. The
+                    # arguments are checked at the SQL sink itself; they do
+                    # not make the result request input (bound parameters
+                    # are data, not the rows the query returns).
+                    call_fact = frozenset()
                 # Unknown calls may transform or serialize their arguments;
                 # their return is not proof of object identity.
                 call_fact = _materialize(call_fact, state.heap)

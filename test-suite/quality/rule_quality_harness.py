@@ -352,6 +352,11 @@ def build_rule_coverage(manifest: dict[str, Any]) -> dict[str, Any]:
         tags = set(case.get("tags", []))
         if language not in SECURITY_COVERAGE_LANGUAGES or "security" not in tags:
             continue
+        # A fixture pin re-scans a pair's buggy file to count one rule's hits
+        # (GH #147). It is not that file's pair case: letting it take the slug
+        # replaced the pair's substring and severity expectations with none.
+        if "fixture-pin" in tags:
+            continue
         side, slug = case_side_and_slug(case)
         if side and slug:
             grouped[(language, slug)][side] = case

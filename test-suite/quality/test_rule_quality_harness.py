@@ -335,6 +335,26 @@ class RuleInventoryCoverageInvariantTest(unittest.TestCase):
             )
 
 
+class SecurityPairCoverageTest(unittest.TestCase):
+    def test_fixture_pin_does_not_replace_the_pair_case_for_its_file(self) -> None:
+        # GH #147 pins re-scan a pair's buggy file for one rule's count. They
+        # must not take the pair slot and drop its substring/severity checks.
+        manifest = json.loads((REPO_ROOT / "test-suite" / "manifest.json").read_text(encoding="utf-8"))
+        by_id = {case["id"]: case for case in manifest["cases"]}
+        pin = by_id["js-buggy-fixture-pin-fetch-abort"]
+        self.assertEqual(pin["path"], by_id["js-typescript-fetch-cancellation-buggy"]["path"])
+        self.assertIn("fixture-pin", pin["tags"])
+        others = [case for case in manifest["cases"] if case["id"] != pin["id"]]
+        for cases in (others + [pin], [pin] + others):
+            with self.subTest(pin_first=cases[0] is pin):
+                coverage = rule_quality_harness.build_rule_coverage({"cases": cases})
+                pairs = [pair for pair in coverage["pairs"]
+                         if pair["buggy_path"] == rule_quality_harness.normalize_case_path(pin["path"])]
+                self.assertEqual([pair["buggy_case"] for pair in pairs],
+                                 ["js-typescript-fetch-cancellation-buggy"])
+                self.assertEqual(pairs[0]["buggy_require_count"], 1)
+
+
 class AstGrepRulePackHelperTest(unittest.TestCase):
     def test_elixir_dump_keeps_a_runnable_config_and_reports_copy_errors(self) -> None:
         spec = next(spec for spec in rule_quality_harness.AST_GREP_SARIF_CHECKS

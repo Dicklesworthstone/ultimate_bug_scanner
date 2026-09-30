@@ -1153,6 +1153,14 @@ class Renderer:
         return "\n".join(self.lines) + ("\n" if self.lines else "")
 
 
+def _record_category(record: dict) -> int:
+    """Category number of a record, from `category` or its category slug."""
+    category = record.get("category")
+    if isinstance(category, int):
+        return category
+    return _SLUG_TO_CATEGORY.get(record.get("category_id", "").replace("rust.", ""), 8)
+
+
 def replay_findings(scan: Scan, r: Renderer, cached_records: Sequence[dict]) -> None:
     if not cached_records:
         return
@@ -2361,7 +2369,16 @@ def main(argv: list[str] | None = None) -> int:
     scan.files = original_files
     scan.lines_map, scan.texts = full_lines_map, full_texts
     if defer_selection_wide:
+        replayed = len(scan.records)
         cat_9(scan, r)
+        # A cold scan emits category 9 between 8 and 10. Put the deferred
+        # records there too, so a warm scan's findings keep the cold order.
+        added = scan.records[replayed:]
+        if added:
+            del scan.records[replayed:]
+            at = next((index for index, record in enumerate(scan.records)
+                       if _record_category(record) > 9), len(scan.records))
+            scan.records[at:at] = added
 
     prefilter_file = os.environ.get("UBS_PREFILTER_FILE")
     if prefilter_file:

@@ -1404,9 +1404,10 @@ Options:
   --include-ext=CSV       Extra file extensions forwarded to the language modules
                           (e.g. --include-ext=js,ts,vue); language detection still
                           uses each module's default extensions unless --only is given
-  --rules=DIR             Directory of custom ast-grep rules merged into every module's
-                          built-in rule pack (YAML; see README "Custom AST-Grep Rules").
-                          Repeatable; a rule id defined twice refuses the scan
+  --rules=DIR             Directory of custom ast-grep rules that every language module
+                          runs (YAML, or an ast-grep project's ruleDirs; see README
+                          "Custom AST-Grep Rules"). Repeatable; a rule id defined twice
+                          refuses the scan
   --list-categories       Print each selected module's category numbers/names and exit
   --version               Print version and exit
   --ci                    CI mode (stable timestamps)
@@ -1560,7 +1561,7 @@ cat <<'JSON'
       {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
-      {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack. Repeatable; a rule id defined by two files refuses the scan (duplicate-rule-id)."},
+      {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules (or an ast-grep project, whose sgconfig ruleDirs are loaded) that every language module runs. Repeatable; a rule id defined by two files refuses the scan (duplicate-rule-id)."},
       {"name": "--skip", "args": "CSV", "example": "--skip=python.todo", "description": "Skip categories by stable id (e.g. python.todo) or category number."},
       {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|kotlin|ruby|swift|csharp|elixir|bash)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
@@ -2431,44 +2432,106 @@ from pathlib import Path
 # A top-level `id:` key starts each rule document (ast-grep YAML may hold
 # several documents separated by `---`); quoted and commented forms included.
 ID_LINE = re.compile(r"""^id:[ \t]*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
+# `ruleDirs:` in an ast-grep project's sgconfig, block or flow list.
+RULE_DIRS = re.compile(r"^ruleDirs:[ \t]*(\[[^\]]*\])?[ \t]*(?:#.*)?$")
+# `ast-grep new` writes the list unindented (`- rules`).
+LIST_ITEM = re.compile(r"^[ \t]*-[ \t]+(.*?)[ \t]*(?:#.*)?$")
 
 def failed(exc):
     raise exc
+
+def unquote(text):
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return text[1:-1]
+    return text
+
+def rule_roots(source):
+    """A standard ast-grep project (a shared rules repository) names its rule
+    directories in sgconfig; its rule-tests/, utils and the sgconfig itself
+    are not rules. Any other directory is walked whole."""
+    for name in ('sgconfig.yml', 'sgconfig.yaml'):
+        config = source / name
+        if not config.is_file():
+            continue
+        lines = config.read_text(encoding='utf-8').splitlines()
+        for index, line in enumerate(lines):
+            match = RULE_DIRS.match(line)
+            if not match:
+                continue
+            if match.group(1):
+                entries = [unquote(e) for e in match.group(1)[1:-1].split(',') if e.strip()]
+            else:
+                entries = []
+                for item in lines[index + 1:]:
+                    if not item.strip() or item.lstrip().startswith('#'):
+                        continue
+                    listed = LIST_ITEM.match(item)
+                    if not listed:
+                        break
+                    entries.append(unquote(listed.group(1)))
+            roots = [source / entry for entry in entries if entry]
+            for directory in roots:
+                if not directory.is_dir():
+                    raise ValueError(f'{config}: ruleDirs entry is not a directory: {directory}')
+            if not roots:
+                raise ValueError(f'{config}: ruleDirs lists no directories')
+            return roots
+        raise ValueError(f'{config}: an ast-grep project must list its ruleDirs')
+    return [source]
+
+def rule_files(directory):
+    """Every visible .yml/.yaml below ``directory``, following symlinked
+    subdirectories once each (a cycle is not an endless walk)."""
+    visited = set()
+    for root, directories, files in os.walk(directory, onerror=failed, followlinks=True):
+        real = os.path.realpath(root)
+        if real in visited:
+            directories[:] = []
+            continue
+        visited.add(real)
+        directories[:] = sorted(d for d in directories if not d.startswith('.'))
+        for name in sorted(files):
+            if Path(name).suffix in {'.yml', '.yaml'} and not name.startswith('.'):
+                yield Path(root) / name
 
 flat, sources = Path(sys.argv[1]), []
 for raw in sys.argv[2:]:
     if Path(raw) not in sources:   # the same directory named twice is one source
         sources.append(Path(raw))
 owners = {}
+loaded = set()   # a file reached twice (overlapping sources, a symlink) is one rule
 try:
     flat.mkdir()
     for source in sources:
         count = 0
-        for root, directories, files in os.walk(source, onerror=failed):
-            directories[:] = sorted(d for d in directories if not d.startswith('.'))
-            for name in sorted(files):
-                path = Path(root) / name
-                if path.suffix not in {'.yml', '.yaml'} or name.startswith('.'):
-                    continue
+        for rules_root in rule_roots(source):
+            for path in rule_files(rules_root):
                 if not path.is_file() or not os.access(path, os.R_OK):
                     raise ValueError(f'Custom rule is not a readable regular file: {path}')
+                real = path.resolve()
+                count += 1
+                if real in loaded:
+                    continue
+                loaded.add(real)
                 for line in path.read_text(encoding='utf-8').splitlines():
                     match = ID_LINE.match(line)
                     if not match:
                         continue
                     rule_id = next(group for group in match.groups() if group is not None)
-                    if rule_id in owners and owners[rule_id] != path:
+                    if rule_id in owners:
                         print(f'duplicate\t{rule_id}\t{owners[rule_id]}\t{path}')
                         sys.exit(3)
                     owners[rule_id] = path
-                stem = '__'.join(path.relative_to(source).with_suffix('').parts)
+                # The prefix keeps a project rule from sharing a file name with
+                # a built-in rule, which some modules would write over it.
+                stem = 'ubs-custom--' + '__'.join(path.relative_to(rules_root).with_suffix('').parts)
                 target = flat / f'{stem}.yml'
                 suffix = 1
                 while target.exists():
                     suffix += 1
                     target = flat / f'{stem}-{suffix}.yml'
                 shutil.copyfile(path, target)
-                count += 1
         if count == 0:
             print(f'empty\t{source}')
             sys.exit(4)

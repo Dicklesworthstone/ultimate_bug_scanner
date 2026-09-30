@@ -268,6 +268,75 @@ def check_rules_duplicate_id_refused() -> None:
                f"exit={proc.returncode} reason={reason}", proc)
 
 
+def check_rules_source_aliases_and_ast_grep_projects() -> None:
+    # Review of 38925df (GH #144): a rule file reached twice (overlapping
+    # sources, a symlink) is one rule, not a duplicate and not two findings;
+    # one file defining an id twice is a duplicate; a rule file named like a
+    # built-in rule is not overwritten by it; a symlinked subdirectory is
+    # walked; and a standard ast-grep project (sgconfig.yml + rule-tests/),
+    # the shape a shared rules repository takes, loads only its ruleDirs.
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        project = root / "proj"
+        project.mkdir()
+        (project / "app.py").write_text(
+            'import requests\nrequests.get("https://example.invalid")\n'
+            'requests.post("https://example.invalid")\neval("1")\n', encoding="utf-8")
+        team = root / "team"
+        _custom_rule(team / "nested", "get.yml", "custom.get", "requests.get($$$)")
+        alias = root / "alias"
+        alias.mkdir()
+        (alias / "get-link.yml").symlink_to(team / "nested" / "get.yml")
+        _custom_rule(root / "shared", "post.yml", "custom.post", "requests.post($$$)")
+        (team / "linked").symlink_to(root / "shared", target_is_directory=True)
+        _custom_rule(root / "builtin_name", "eval-exec.yml", "custom.eval", "eval($$$)")
+        pack = root / "pack"
+        _custom_rule(pack / "rules", "get.yml", "custom.pack-get", "requests.get($$$)")
+        # Unindented lists, as `ast-grep new` writes them.
+        (pack / "sgconfig.yml").write_text(
+            "ruleDirs:\n- rules\ntestConfigs:\n- testDir: rule-tests\n", encoding="utf-8")
+        (pack / "rule-tests").mkdir()
+        (pack / "rule-tests" / "get-test.yml").write_text(
+            "id: custom.pack-get\nvalid:\n  - 'x()'\ninvalid:\n  - 'requests.get(1)'\n", encoding="utf-8")
+        base = ["--only=python", "--ci", "--no-cache", "--format=json"]
+        cases = (
+            ("overlapping_sources", [f"--rules={team}", f"--rules={team / 'nested'}"],
+             {"custom.get": 1, "custom.post": 1}),
+            ("symlinked_file_alias", [f"--rules={team}", f"--rules={alias}"], {"custom.get": 1, "custom.post": 1}),
+            ("builtin_file_name", [f"--rules={root / 'builtin_name'}"], {"custom.eval": 1}),
+            ("ast_grep_project", [f"--rules={pack}"], {"custom.pack-get": 1}),
+        )
+        for name, flags, wanted in cases:
+            proc = run([*base, *flags, str(project)], env={"UBS_RULES": None})
+            try:
+                doc = json.loads(proc.stdout)
+                status = doc.get("status")
+                got: dict[str, int] = {}
+                for finding in doc.get("findings", []):
+                    rule = str(finding.get("rule_id", ""))
+                    if rule.startswith("custom."):
+                        got[rule] = got.get(rule, 0) + 1
+            except json.JSONDecodeError:
+                status, got = None, {}
+            report(f"rules_{name}", status == "ok" and got == wanted,
+                   f"exit={proc.returncode} status={status} got={got}", proc)
+        same_file = root / "same_file"
+        same_file.mkdir()
+        (same_file / "twice.yml").write_text(
+            "id: custom.twice\nlanguage: python\nseverity: error\nrule:\n  pattern: eval($$$)\n---\n"
+            "id: custom.twice\nlanguage: python\nseverity: hint\nrule:\n  pattern: eval($$$)\n",
+            encoding="utf-8")
+        proc = run(["--only=python", "--ci", "--format=json", f"--rules={same_file}", str(project)],
+                   env={"UBS_RULES": None})
+        try:
+            reason = json.loads(proc.stdout).get("reason")
+        except json.JSONDecodeError:
+            reason = None
+        report("rules_duplicate_id_in_one_file_refused",
+               proc.returncode == 2 and reason == "duplicate-rule-id" and "twice.yml" in proc.stderr,
+               f"exit={proc.returncode} reason={reason}", proc)
+
+
 # One rule per language, each matching one line of a one-file project. Go's
 # grammar needs a context for a bare call expression.
 _EVERY_MODULE_RULES = {
@@ -2379,6 +2448,7 @@ def main() -> int:
         check_rules_dir_nested_and_yaml_rules_are_loaded,
         check_rules_sources_repeatable_and_env,
         check_rules_duplicate_id_refused,
+        check_rules_source_aliases_and_ast_grep_projects,
         check_rules_every_module_reports_custom_rules,
         check_include_ext_forwarded,
         check_list_categories,

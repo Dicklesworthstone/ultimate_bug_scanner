@@ -1235,8 +1235,14 @@ ubs .                                              # both rule sets
 ubs --rules=./experimental .                       # --rules replaces UBS_RULES for this run
 ```
 
-A rule id defined in two files refuses the scan (`duplicate-rule-id`, exit 2) and names
-both files, rather than letting one rule silently shadow the other.
+A rule id defined twice, in two files or twice in one file, refuses the scan
+(`duplicate-rule-id`, exit 2) and names the files, rather than letting one rule silently
+shadow the other. A file reached twice (overlapping directories, a symlink) is one rule.
+
+A directory holding an ast-grep project (`sgconfig.yml` or `sgconfig.yaml`) contributes
+only the directories its `ruleDirs` lists, so a rules repository can keep its
+`rule-tests/` and still run under `ast-grep test`. Utility rules (`utilDirs`) are not
+loaded; a rule that `matches` one fails to parse and the scan ends as partial.
 
 Rules are read only from local directories. To share rules across repositories, keep
 them in a repository of their own and check it out (a git submodule, a pinned clone in

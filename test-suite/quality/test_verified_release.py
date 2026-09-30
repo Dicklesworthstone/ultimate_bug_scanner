@@ -87,6 +87,19 @@ exit "${INSTALL_EXIT:-0}"
 '''
 
 
+def host_path_without_ubs() -> list[str]:
+    """The host PATH minus directories that hold a `ubs` executable.
+
+    After installing, the real installer reports on and runs whichever `ubs`
+    PATH resolves (`--no-path-modify` keeps the fresh install off PATH). A
+    developer's own older ubs there would run inside the test with the
+    throwaway HOME and fetch its modules from raw.githubusercontent.com,
+    which these tests treat as an unsigned download.
+    """
+    return [entry for entry in os.environ.get('PATH', '').split(os.pathsep)
+            if entry and not os.access(os.path.join(entry, 'ubs'), os.X_OK)]
+
+
 class VerifiedReleaseTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='ubs-verified-release-')
@@ -105,7 +118,7 @@ class VerifiedReleaseTests(unittest.TestCase):
         self.version = (ROOT / 'VERSION').read_text().strip()
         self.env = {key: value for key, value in os.environ.items()
                     if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'COSIGN_', 'SIGSTORE_'))}
-        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ['PATH'],
+        self.env.update(PATH=os.pathsep.join([str(self.bin), *host_path_without_ubs()]),
                         HOME=str(self.home), TMPDIR=str(self.temp_root), NO_COLOR='1',
                         PYTHONDONTWRITEBYTECODE='1', UBS_VERSION=self.version,
                         UBS_ARTIFACT_BASE='https://release.example.invalid/v' + self.version,

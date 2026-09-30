@@ -15,11 +15,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 UBS_BIN = REPO_ROOT / "ubs"
 
 
-def run_ubs(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_ubs(args: list[str], env: dict[str, str],
+            binary: Path = UBS_BIN) -> subprocess.CompletedProcess[str]:
     merged_env = os.environ.copy()
+    # A developer's UBS_ENABLE_AUTO_UPDATE must not let a test run replace the
+    # scanner under test; a check that wants it can override this default.
+    merged_env["UBS_NO_AUTO_UPDATE"] = "1"
     merged_env.update(env)
     return subprocess.run(
-        [str(UBS_BIN), *args],
+        [str(binary), *args],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -777,9 +781,32 @@ def main() -> None:
         assert "UBS Doctor" in doctor.stdout, doctor.stdout + doctor.stderr
         assert_not_size_guarded(doctor)
 
-        update = run_ubs(["--update", "--quiet"], tight_limit_env)
+        # `--update` replaces the running scanner unless it sits in a
+        # development checkout. REPO_ROOT has no .git in a `git archive`
+        # export (release verification), so running it there would swap the
+        # scanner under test for the latest published release. Update a
+        # disposable dev-layout copy instead, from REPO_ROOT (the large tree
+        # the size guard must not trip on), with a downloader that refuses.
+        update_home = tmpdir / "update_self"
+        (update_home / ".git").mkdir(parents=True)
+        shutil.copy2(UBS_BIN, update_home / "ubs")
+        shutil.copy2(REPO_ROOT / "VERSION", update_home / "VERSION")
+        refusing_bin = tmpdir / "refusing_bin"
+        refusing_bin.mkdir()
+        for tool in ("curl", "wget"):
+            (refusing_bin / tool).write_text("#!/usr/bin/env bash\nexit 7\n")
+            (refusing_bin / tool).chmod(0o755)
+        scanner_before = UBS_BIN.read_bytes()
+        update = run_ubs(
+            ["--update", "--quiet"],
+            {**tight_limit_env,
+             "PATH": f"{refusing_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+            binary=update_home / "ubs",
+        )
         assert update.returncode == 0, update.stdout + update.stderr
         assert_not_size_guarded(update)
+        assert (update_home / "ubs").read_bytes() == scanner_before, "update rewrote the copy"
+        assert UBS_BIN.read_bytes() == scanner_before, "update rewrote the scanner under test"
 
         # Issue #44: --suggest-ignore exited 127 because
         # suggest_ignore_candidates was called before its definition.

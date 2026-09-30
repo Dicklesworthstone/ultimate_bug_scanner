@@ -6891,10 +6891,31 @@ def restore_workspace(text: str, a) -> str:
     not exist.
     """
     for workspace_path, real_path in mirror_pairs(a):
-        text = text.replace(workspace_path, real_path)
+        for spelling in workspace_spellings(workspace_path, a):
+            text = text.replace(spelling, real_path)
     if a.workspace:
-        text = text.replace(a.workspace, a.source)
+        for spelling in workspace_spellings(a.workspace, a):
+            text = text.replace(spelling, a.source)
     return text
+
+
+def workspace_spellings(path: str, a) -> list:
+    """`path` as the runner named it and as a module that resolves paths does.
+
+    The workspace lives under TMPDIR, which on macOS is behind a symlink
+    (/var -> /private/var, /tmp -> /private/tmp). A module that emits resolved
+    paths names the workspace by its real path, and replacing only the
+    unresolved spelling rewrote the tail of that path and reported
+    /private/private/... for the user's file. The resolved spelling is
+    replaced first; it contains the unresolved one as a suffix.
+    """
+    spellings = [path]
+    workspace = (a.workspace or "").rstrip("/")
+    if workspace and (path == a.workspace or path.startswith(workspace + "/")):
+        real = os.path.realpath(workspace)
+        if real != workspace:
+            spellings.insert(0, real + path[len(workspace):])
+    return spellings
 
 
 def restore_text(text: str, a) -> str:

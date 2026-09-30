@@ -141,7 +141,7 @@
       "fixture": "test-suite/rust/buggy/ast_grep_rule_pack_coverage.rs",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 339,
+      "result_count": 310,
       "result_rule_ids": [
         "rust.allocation.format-literal",
         "rust.allocation.to-owned-to-string",
@@ -534,7 +534,7 @@
       "fixture": "test-suite/js",
       "label": "js-rule-pack",
       "module": "ubs-js.sh",
-      "result_count": 1007,
+      "result_count": 1018,
       "result_rule_ids": [
         "javascript.ctcompare.unsafe_secret_compare",
         "javascript.guards.deep_unguarded_chain",
@@ -831,7 +831,7 @@
       "fixture": "test-suite/rust",
       "label": "rust-rule-pack",
       "module": "ubs-rust.sh",
-      "result_count": 685,
+      "result_count": 644,
       "result_rule_ids": [
         "rust.allocation.format-literal",
         "rust.allocation.to-owned-to-string",

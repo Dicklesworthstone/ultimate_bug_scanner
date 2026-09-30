@@ -692,7 +692,7 @@ def check_files_from_for_v2_modules() -> None:
             if [ -n "$report_json" ]; then
               : > "$report_json"
               for f in "${files[@]}"; do
-                echo "{\\"id\\":\\"js.fake.bug\\",\\"file\\":\\"$f\\",\\"line\\":1,\\"severity\\":\\"critical\\",\\"message\\":\\"Fake JS bug\\"}" >> "$report_json"
+                echo "{\\"rule\\":\\"js.fake.bug\\",\\"path\\":\\"$f\\",\\"line\\":1,\\"col\\":1,\\"severity\\":\\"critical\\",\\"message\\":\\"Fake JS bug\\"}" >> "$report_json"
               done
             fi
             exit 0

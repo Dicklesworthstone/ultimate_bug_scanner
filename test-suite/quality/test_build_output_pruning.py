@@ -9,6 +9,7 @@ uses the real runner, modules, contract and default traversal configuration.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -131,7 +132,14 @@ class BuildOutputListingTest(unittest.TestCase):
             paths.add(rel)
         for rel in ("space dir/bin/entry point", "newline/bin/entry\npoint",
                     os.fsdecode(b"non-utf8/bin/entry-\xff")):
-            self.write(rel)
+            try:
+                self.write(rel)
+            except OSError as exc:
+                # APFS and other Unicode-only filesystems refuse non-UTF-8
+                # names (EILSEQ); that name is only checked where it exists.
+                if exc.errno != errno.EILSEQ or not rel.startswith("non-utf8/"):
+                    raise
+                continue
             paths.add(rel)
         for mode in self.modes():
             with self.subTest(mode=mode):

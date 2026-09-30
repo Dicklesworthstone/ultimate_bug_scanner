@@ -11,6 +11,7 @@ Verifies:
 """
 from __future__ import annotations
 
+import errno
 import importlib  # ubs:ignore[py.deprecations.deprecated-api]
 import io
 import itertools
@@ -584,7 +585,12 @@ class PrefilterAdmissionTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "requires byte-preserving POSIX filenames")
     def test_non_utf8_filename_retains_the_scannable_file(self) -> None:
         target = self.root / os.fsdecode(b"entry-\xff.js")
-        target.write_text("danger();\n", encoding="utf-8")
+        try:
+            target.write_text("danger();\n", encoding="utf-8")
+        except OSError as exc:
+            if exc.errno != errno.EILSEQ:
+                raise
+            self.skipTest("filesystem refuses non-UTF-8 names (EILSEQ)")
         result = run_prefilter([target], self.index)
         self.assertIn("danger", result.candidate_rules_for(target))
         self.assertIn(target, result.ast_files)

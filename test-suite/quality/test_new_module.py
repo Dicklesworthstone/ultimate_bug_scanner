@@ -78,6 +78,34 @@ class NewModuleScaffoldTest(unittest.TestCase):
             proc = run(["shellcheck", "-S", "error", str(self.module)])
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
+    def prune_library_helper_pins(self, scaffold: Path) -> str:
+        """Reduce the synthetic library's helper table to the contract pin.
+
+        The real `ubs-common.sh` pins every shipped helper, and the verifier
+        rejects a pin whose file is not in the tree (each pin is a download
+        target). This throwaway root ships no helpers, so it keeps only the
+        `contract.json` pin, and the module and scaffold copy are re-pinned to
+        the pruned library. Returns the pruned library's sha256.
+        """
+        library = self.root / "modules" / "lib" / "ubs-common.sh"
+        text = library.read_text(encoding="utf-8")
+        real_hash = hashlib.sha256(library.read_bytes()).hexdigest()
+        declaration = "declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(\n"
+        start = text.index(declaration) + len(declaration)
+        end = text.index("\n)\n", start) + 1
+        kept = [line for line in text[start:end].splitlines(keepends=True)
+                if line.lstrip().startswith("['contract.json']=")]
+        self.assertEqual(len(kept), 1, "the library must pin contract.json")
+        library.write_text(text[:start] + "".join(kept) + text[end:], encoding="utf-8")
+        pruned_hash = hashlib.sha256(library.read_bytes()).hexdigest()
+        for target, source in ((self.module, self.module), (scaffold, SCAFFOLD)):
+            original = source.read_text(encoding="utf-8")
+            self.assertIn(f'UBS_LIB_CHECKSUM="{real_hash}"', original)
+            target.write_text(original.replace(f'UBS_LIB_CHECKSUM="{real_hash}"',
+                                               f'UBS_LIB_CHECKSUM="{pruned_hash}"'), encoding="utf-8")
+        scaffold.chmod(0o755)
+        return pruned_hash
+
     def test_verifier_rejects_stale_nested_library_pins(self) -> None:
         scripts = self.root / "scripts"
         scripts.mkdir()
@@ -85,8 +113,7 @@ class NewModuleScaffoldTest(unittest.TestCase):
         verifier = scripts / "verify_checksums.sh"
         shutil.copy2(REPO_ROOT / "scripts" / "verify_checksums.sh", verifier)
         scaffold = scripts / "new-module.sh"
-        shutil.copy2(SCAFFOLD, scaffold)
-        library_hash = hashlib.sha256(LIB.read_bytes()).hexdigest()
+        library_hash = self.prune_library_helper_pins(scaffold)
 
         def refresh_outer_digests() -> None:
             module_hash = hashlib.sha256(self.module.read_bytes()).hexdigest()
@@ -155,11 +182,12 @@ class NewModuleScaffoldTest(unittest.TestCase):
         helper_hash = hashlib.sha256(helper.read_bytes()).hexdigest()
         verifier = scripts / "verify_checksums.sh"
         shutil.copy2(REPO_ROOT / "scripts" / "verify_checksums.sh", verifier)
+        self.prune_library_helper_pins(scripts / "new-module.sh")
         library = self.root / "modules" / "lib" / "ubs-common.sh"
         original_library = library.read_text(encoding="utf-8")
         original_library_hash = hashlib.sha256(library.read_bytes()).hexdigest()
         original_module = self.module.read_text(encoding="utf-8")
-        original_scaffold = SCAFFOLD.read_text(encoding="utf-8")
+        original_scaffold = (scripts / "new-module.sh").read_text(encoding="utf-8")
         declaration = "declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(\n"
         self.assertIn(declaration, original_library)
 

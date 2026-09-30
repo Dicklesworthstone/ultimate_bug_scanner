@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
       contents: write
@@ -74,7 +74,9 @@ jobs:
       - name: Verify integrity and scan the changed runtime helper
         run: |
           shellcheck -S warning ubs
-          bash -n ubs
+          for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh; do
+            bash -n "$script"
+          done
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           ./ubs --ci --no-auto-update modules/helpers/ubs_core/analyzers/taint_py.py
@@ -89,12 +91,19 @@ jobs:
           from pathlib import Path
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           allowed = {'ubs', 'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_py.py',
-                     'test-suite/quality/test_taint_python_http.py'}
+                     'test-suite/quality/test_taint_python_http.py', 'modules/lib/ubs-common.sh',
+                     'scripts/new-module.sh'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed) <= allowed, changed
+          snapshots = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          assert all(Path(name).read_bytes() == data for name, data in snapshots.items()), 'Checksum generation is not idempotent'
+          assert changed == subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           records = []
           for name in changed:
-              data = Path(name).read_bytes()
-              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+              data = snapshots[name]
+              response = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                                        '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
                                         input=json.dumps({'content': data.decode(), 'encoding': 'utf-8'}),
                                         text=True, capture_output=True, check=True, timeout=90)
               sha = json.loads(response.stdout)['sha']

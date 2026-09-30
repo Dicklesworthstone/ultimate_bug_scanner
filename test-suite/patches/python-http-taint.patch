@@ -1,7 +1,11 @@
 diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index 11ccda5..9265195 100644
 --- a/modules/helpers/ubs_core/analyzers/taint_py.py
 +++ b/modules/helpers/ubs_core/analyzers/taint_py.py
-@@ -61,1 +61,17 @@
+@@ -61,7 +61,21 @@ SANITIZERS = {
+     'shlex.quote': 'command',
+ }
+ 
 -KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval')}
 +KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval', 'ssrf')}
 +
@@ -18,7 +22,23 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +    'httpx.request': 1,
 +    'httpx.stream': 1,
 +}
-@@ -1621,3 +1637,23 @@
+ 
+ 
+ _PARAMETER_MARKERS = {
+@@ -596,6 +610,10 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
+                            'subprocess', 'os', 'asyncio', 'builtins', 'eval', 'exec', 'input', 'raw_input',
+                            'render_template', 'render_template_string', 'HttpResponse', 'Response'}:
+                 return ''
++        # HTTP names are not legacy implicit identities. Once a real import
++        # is absent or shadowed, spelling alone cannot restore a network API.
++        if node.id in {'requests', 'httpx'}:
++            return ''
+         return node.id
+     if isinstance(node, ast.Attribute):
+         base = _qualified(node.value, aliases)
+@@ -1620,6 +1638,24 @@ class _Flow:
+         elif leaf in {'execute', 'executemany', 'text'} and name.split('.')[0] in {'cursor', 'session', 'conn', 'engine', 'db'}:
+             query = source_argument('sql', 'query', 'statement', 'operation')
              self.effect('sql', node, 'SQL engine execute' if name.split('.')[0] in {'engine', 'db'} else 'SQL execute', query)
 +        elif name in _HTTP_URL_POSITIONS:
 +            position = _HTTP_URL_POSITIONS[name]
@@ -40,13 +60,20 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +            self.effect('ssrf', node, 'HTTP request URL', destination)
          elif name in {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subprocess.check_output', 'subprocess.check_call'}:
              command_fact = source_argument('args')
-@@ -2875,4 +2911,5 @@
+             command_node = node.args[0] if node.args else keyword_nodes.get('args')
+@@ -2867,6 +2903,7 @@ _SEVERITY = {
+     "sql": "critical",
      "command": "critical",
      "eval": "critical",
 +    "ssrf": "critical",
  }
-@@ -2883,4 +2920,5 @@
+ 
+ _MESSAGE = {
+@@ -2874,6 +2911,7 @@ _MESSAGE = {
+     "sql": "User input flows into SQL execute() without parameters",
      "command": "User input reaches subprocess/os.system",
      "eval": "User input flows into eval/exec",
 +    "ssrf": "User input controls an outbound HTTP request URL (possible SSRF)",
  }
+ 
+ 

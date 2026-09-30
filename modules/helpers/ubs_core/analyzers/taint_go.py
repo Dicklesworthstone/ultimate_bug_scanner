@@ -1129,6 +1129,7 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
             path, line_starts = locations[index]
             position -= starts[index]
             line = bisect_right(line_starts, position)
+            # line_starts[0] == 0 <= position, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
             yield rule, path, line, position - line_starts[line - 1] + 1, path_desc
 
 

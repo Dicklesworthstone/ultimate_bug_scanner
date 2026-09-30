@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import operator
 import os
 import re
 import sys
@@ -183,6 +184,7 @@ CLEAN: Fact = frozenset()
 # raise TypeError on Python 3.9, which ubs still supports (python_is_3).
 References = frozenset[Union[ast.AST, str]]
 NO_REFERENCES: References = frozenset()
+_MISSING = object()  # absent-key sentinel for the state join
 
 
 @dataclass(frozen=True)
@@ -259,6 +261,11 @@ def _binding_choices(binding):
 
 
 def _join_bindings(*bindings):
+    if bindings and all(binding is bindings[0] for binding in bindings):
+        only = bindings[0]
+        if not isinstance(only, frozenset):
+            return only
+        return next(iter(only)) if len(only) == 1 else only
     choices = frozenset().union(*(_binding_choices(binding) for binding in bindings))
     if len(choices) == 1:
         return next(iter(choices))
@@ -313,6 +320,15 @@ def _expanded_call(node):
 
 def join_facts(*facts: Fact) -> Fact:
     """Finite powerset join, retaining deterministic shortest evidence."""
+    present = [fact for fact in facts if fact]
+    if not present:
+        return CLEAN
+    head = present[0]
+    # A lone fact, or one fact object joined with itself, is its own join:
+    # its traces are already distinct. Returning it keeps object identity,
+    # which lets repeated state joins take the identity fast path below.
+    if type(head) is frozenset and all(fact is head for fact in present):
+        return head
     traces: dict[TaintTrace, TaintTrace] = {}
     for fact in facts:
         for trace in fact:
@@ -493,17 +509,81 @@ def _join_states(*states):
     reachable = [state for state in states if state is not None and state.reachable]
     if not reachable:
         return None
-    names = set().union(*(state.keys() for state in reachable))
+    # Exception edges join the whole state at every expression that may raise
+    # inside a try suite, so this is the analyzer's hottest function. Values,
+    # heap cells and references have a neutral element for a missing key and
+    # an associative join, so they fold pairwise from a copy of the first
+    # state; an entry that is the very same object on both sides (the common
+    # case: most expressions change few names) is skipped without a join.
+    first, others = reachable[0], reachable[1:]
+    values = dict(first)
+    heap = dict(first.heap)
+    references = {key: frozenset(refs) for key, refs in first.references.items()}
+    for other in others:
+        for target, source in ((values, other), (heap, other.heap)):
+            for key, fact in source.items():
+                previous = target.get(key, _MISSING)
+                if previous is _MISSING:
+                    target[key] = fact
+                elif previous is not fact:
+                    target[key] = join_facts(previous, fact)
+        for key, refs in other.references.items():
+            previous = references.get(key, _MISSING)
+            if previous is _MISSING:
+                references[key] = frozenset(refs)
+            elif previous is not refs:
+                references[key] = previous | refs
+    # A missing binding is not neutral: it stands for the name's implicit
+    # identity, so bindings are joined over the full key union as before.
     bindings = {}
-    for name in set().union(*(state.bindings.keys() for state in reachable)):
-        bindings[name] = _join_bindings(*(state.bindings.get(name, _implicit_identity(name)) for state in reachable))
-    joined = _State({name: join_facts(*(state.get(name, CLEAN) for state in reachable)) for name in names}, bindings)
-    for name in set().union(*(state.references for state in reachable)):
-        joined.references[name] = frozenset().union(*(state.references.get(name, NO_REFERENCES) for state in reachable))
-    for ref in set().union(*(state.heap for state in reachable)):
-        joined.heap[ref] = join_facts(*(state.heap.get(ref, CLEAN) for state in reachable))
-    joined.mutated = set().union(*(state.mutated for state in reachable))
+    if len(others) == 1:
+        second = others[0].bindings
+        for name, binding in first.bindings.items():
+            other = second.get(name, _MISSING)
+            if other is binding and not isinstance(binding, frozenset):
+                bindings[name] = binding
+            else:
+                bindings[name] = _join_bindings(
+                    binding, _implicit_identity(name) if other is _MISSING else other)
+        for name, other in second.items():
+            if name not in bindings:
+                bindings[name] = _join_bindings(_implicit_identity(name), other)
+    elif others:
+        for name in set(first.bindings).union(*(state.bindings for state in others)):
+            bindings[name] = _join_bindings(*(
+                state.bindings[name] if name in state.bindings else _implicit_identity(name)
+                for state in reachable))
+    else:
+        for name, binding in first.bindings.items():
+            bindings[name] = _join_bindings(binding)
+    joined = _State(values, bindings)
+    joined.references = references
+    joined.heap = heap
+    joined.mutated = set(first.mutated).union(*(state.mutated for state in others))
     return joined
+
+
+def _identity_snapshot(state):
+    """The exact objects a state holds, for a join that would change nothing.
+
+    The tuples keep every value alive, so identity comparison stays sound.
+    """
+    return (tuple(state), tuple(state.values()),
+            tuple(state.bindings), tuple(state.bindings.values()),
+            tuple(state.references), tuple(state.references.values()),
+            tuple(state.heap), tuple(state.heap.values()),
+            frozenset(state.mutated))
+
+
+def _same_snapshot(left, right):
+    # Keys compare by equality; values must be the very same objects, since
+    # equal facts may still carry different (shorter) evidence paths.
+    return (left[0] == right[0] and left[2] == right[2] and left[4] == right[4]
+            and left[6] == right[6] and left[8] == right[8]
+            and all(map(operator.is_, left[1], right[1]))
+            and all(map(operator.is_, left[3], right[3]))
+            and all(map(operator.is_, left[5], right[5]))
+            and all(map(operator.is_, left[7], right[7])))
 
 
 def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
@@ -699,8 +779,21 @@ class _Flow:
         self.comprehension_environments = []
 
     def possible_exception(self, state):
-        if state.reachable and self.exception_states:
-            self.exception_states[-1] = _join_states(self.exception_states[-1], state)
+        if not (state.reachable and self.exception_states):
+            return
+        # Most expressions leave the state untouched, and joining the same
+        # state twice is idempotent: skip the join when this collector's last
+        # joined state holds exactly the same objects. The collector is only
+        # ever replaced, never mutated in place, so the snapshot recorded on
+        # it stays true for as long as it is the collector.
+        accumulated = self.exception_states[-1]
+        snapshot = _identity_snapshot(state)
+        previous = getattr(accumulated, 'last_joined', None)
+        if previous is not None and _same_snapshot(previous, snapshot):
+            return
+        joined = _join_states(accumulated, state)
+        joined.last_joined = snapshot
+        self.exception_states[-1] = joined
 
     @staticmethod
     def exception_type(node, state):
@@ -1044,6 +1137,13 @@ class _Flow:
                         destination.pop(name, None)
         return namespace
 
+    def definition_table(self, table, function):
+        """A callee's definition-time defaults, recorded as a job input."""
+        value = getattr(self.engine, table).get(function)
+        if self.engine.reads is not None:
+            self.engine.reads[(table, function)] = value
+        return value if value is not None else {}
+
     def global_arguments(self, function, state):
         """A helper reads its defining module, never a caller's same-name local."""
         owner = self.engine.owner(function)
@@ -1078,10 +1178,13 @@ class _Flow:
         defaults = dict(zip(positional[-len(function.args.defaults):], function.args.defaults)) if function.args.defaults else {}
         defaults.update((arg.arg, default) for arg, default in zip(function.args.kwonlyargs, function.args.kw_defaults)
                         if default is not None)
+        if defaults:
+            default_facts = self.definition_table('defaults', function)
+            default_references = self.definition_table('default_references', function)
         for name, default in defaults.items():
             if name not in bound:
-                references = self.engine.default_references.get(function, {}).get(name, NO_REFERENCES)
-                bound[name] = join_facts(self.engine.defaults.get(function, {}).get(name, CLEAN),
+                references = default_references.get(name, NO_REFERENCES)
+                bound[name] = join_facts(default_facts.get(name, CLEAN),
                                          *(state.heap.get(ref, CLEAN) for ref in references))
         expanded = join_facts(*(fact for arg, fact in zip(node.args, arguments) if isinstance(arg, ast.Starred)),
                               keywords.get(None, CLEAN))
@@ -1114,7 +1217,7 @@ class _Flow:
         for name, expression in keyword_nodes.items():
             if name in accepted:
                 bound[name] = self.expression_references.get(expression, NO_REFERENCES)
-        for name, references in self.engine.default_references.get(function, {}).items():
+        for name, references in self.definition_table('default_references', function).items():
             bound.setdefault(name, references)
         expanded = frozenset().union(*(self.expression_references.get(arg, NO_REFERENCES)
                                       for arg in node.args if isinstance(arg, ast.Starred)))
@@ -1139,7 +1242,7 @@ class _Flow:
             bound.update((name, None) for name in positional)
         bound.update((name, self.expression_bindings.get(value)) for name, value in keyword_nodes.items()
                      if name is not None)
-        for name, value in self.engine.default_bindings.get(function, {}).items():
+        for name, value in self.definition_table('default_bindings', function).items():
             bound.setdefault(name, value)
         captured = self.closure_namespace(function, state)
         for name in self.engine.closures.get(function, ()):
@@ -1778,17 +1881,17 @@ class _Flow:
                         zip(positional[len(positional) - len(signature.defaults):], signature.defaults)}
             defaults.update({arg.arg: self.expr(value, state) for arg, value in
                              zip(signature.kwonlyargs, signature.kw_defaults) if value is not None})
-            self.engine.defaults[node] = defaults
-            self.engine.default_references[node] = {
+            self.engine.define('defaults', node, defaults)
+            self.engine.define('default_references', node, {
                 arg.arg: self.expression_references.get(value, NO_REFERENCES)
                 for arg, value in (*zip(positional[len(positional) - len(signature.defaults):], signature.defaults),
                                    *zip(signature.kwonlyargs, signature.kw_defaults)) if value is not None
-            }
-            self.engine.default_bindings[node] = {
+            })
+            self.engine.define('default_bindings', node, {
                 arg.arg: self.expression_bindings.get(value)
                 for arg, value in (*zip(positional[len(positional) - len(signature.defaults):], signature.defaults),
                                    *zip(signature.kwonlyargs, signature.kw_defaults)) if value is not None
-            }
+            })
             return CLEAN
         if isinstance(node, ast.Compare):
             self.expr(node.left, state)
@@ -1969,7 +2072,7 @@ class _Flow:
             while True:
                 back = iteration(head.copy())
                 exits = _join_states(exits, back)
-                joined = _join_states(entering, back)
+                joined = _join_states(head, back)  # Ascending, as in loop().
                 if joined == head:
                     return exits
                 head = joined
@@ -2034,10 +2137,11 @@ class _Flow:
                 description = self.expression_bindings.get(default)
                 if isinstance(description, _FrameworkInput):
                     default_inputs[name] = description
-            self.engine.defaults[node] = default_facts
-            self.engine.default_references[node] = {name: self.expression_references.get(default, NO_REFERENCES)
-                                                    for name, default in defaults.items()}
-            self.engine.default_bindings[node] = {name: self.expression_bindings.get(default) for name, default in defaults.items()}
+            self.engine.define('defaults', node, default_facts)
+            self.engine.define('default_references', node, {
+                name: self.expression_references.get(default, NO_REFERENCES) for name, default in defaults.items()})
+            self.engine.define('default_bindings', node, {
+                name: self.expression_bindings.get(default) for name, default in defaults.items()})
             self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
             state[node.name] = CLEAN
             state.bindings[node.name] = node
@@ -2218,7 +2322,12 @@ class _Flow:
             exits = [_join_states(*exits, *(item.state for item in pending if item.kind == 'break'))]
             outgoing = _merge_completions([*outgoing, *(item for item in pending
                                                       if item.kind not in {'break', 'continue'})])
-            joined = _join_states(state, back, *(item.state for item in pending if item.kind == 'continue'))
+            # Accumulate into the head rather than recomputing entry ⊔ back:
+            # for a monotone body the two sequences are the same, and when a
+            # transfer is not monotone (a guard that reads a callable choice,
+            # say) the head can no longer oscillate between two states. A
+            # real pptx loop nest did exactly that for thousands of rounds.
+            joined = _join_states(head, back, *(item.state for item in pending if item.kind == 'continue'))
             if joined == head:
                 break
             head = joined
@@ -2284,6 +2393,10 @@ class _Analysis:
         self.framework_inputs = {}
         self.framework_values = {}
         self.framework_dependencies = {}
+        # While a job is solved: every summary and definition-time table
+        # entry it reads, so an unchanged job is not solved again.
+        self.reads = None
+        self.writes = None
         self.default_references = {}
         self.default_bindings = {}
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
@@ -2335,8 +2448,14 @@ class _Analysis:
             if description is not None:
                 inputs[arg.arg] = description
         # Capture import identities at the definition, before later rebinding.
-        self.framework_inputs[function] = inputs
-        self.framework_dependencies[function] = tuple(route_dependencies)
+        self.define('framework_inputs', function, inputs)
+        self.define('framework_dependencies', function, tuple(route_dependencies))
+
+    def define(self, table, node, value):
+        """Record a definition-time table entry; a reused job replays it."""
+        getattr(self, table)[node] = value
+        if self.writes is not None:
+            self.writes.append((table, node, value))
 
     def framework_bound(self, globals_):
         """Solve local dependency values on the same finite taint lattice.
@@ -2395,12 +2514,40 @@ class _Analysis:
             if any(value is not None for value in choices):
                 context.append((name, _join_bindings(*choices)))
         key = (function, tuple(context)) if context else function
-        return self.summaries.setdefault(key, FunctionSummary())
+        summary = self.summaries.setdefault(key, FunctionSummary())
+        if self.reads is not None:
+            self.reads[('summaries', key)] = summary
+        return summary
+
+    def reads_current(self, reads):
+        """Did every input a job read keep its value? Summaries by identity."""
+        for (table, key), value in reads.items():
+            current = getattr(self, table).get(key)
+            stale = (current is not value) if table == 'summaries' else (current != value)
+            if stale:
+                return False
+        return True
 
     def analyze(self):
         # A summary contains only finite source/parameter/sanitizer facts.
         # Equality excludes evidence paths, so recursive helpers terminate
         # without a depth cap that would silently lose longer call chains.
+        #
+        # Project analysis shares one summary table. A callback context that
+        # an earlier module requested for a foreign function was solved to
+        # its fixed point before that module became ready: its owner's
+        # namespace is final and its key fixes the callable identities, so
+        # nothing this module does can change it. Re-solving every inherited
+        # context on every pass of every later module made project scans
+        # quadratic in the module count; only contexts this module requests,
+        # or that belong to its own functions, are part of its fixed point.
+        inherited = {key for key in self.summaries
+                     if isinstance(key, tuple) and self.owner(key[0]) is not self}
+        # Worklist: a job is a deterministic function of its namespace, the
+        # summaries it requested and the definition-time tables it read. When
+        # none of those changed since its last solve, solving it again yields
+        # the same summary and the same flow, so the previous ones are reused.
+        solved = {}  # summary key -> (reads, writes, flow) of the job's last solve
         while True:
             previous_contexts = len(self.summaries)
             module = _Flow(self, self.tree)
@@ -2413,12 +2560,27 @@ class _Analysis:
             # this module. Publish this pass's namespace before solving those
             # contexts, and iterate again when initialization facts change.
             changed = globals_ != self.globals
+            if changed:
+                solved.clear()  # Every job of this module starts from the namespace.
             self.globals = globals_
             flows = [module]
             jobs = [(function, (), function) for function in self.functions]
-            jobs.extend((key[0], key[1], key) for key in list(self.summaries) if isinstance(key, tuple))
+            jobs.extend((key[0], key[1], key) for key in list(self.summaries)
+                        if isinstance(key, tuple) and key not in inherited)
             for function, context, summary_key in jobs:
                 owner = self.owner(function)
+                previous = solved.get(summary_key)
+                if previous is not None and owner.reads_current(previous[0]):
+                    # Replay its definition-time writes, in job order, so later
+                    # jobs read exactly what a fresh solve would have left.
+                    for table, node, value in previous[1]:
+                        getattr(owner, table)[node] = value
+                    if not context:
+                        flows.append(previous[2])
+                    continue
+                reads = {('framework_inputs', function): owner.framework_inputs.get(function)}
+                writes = []
+                owner.reads, owner.writes = reads, writes
                 namespace = globals_ if owner is self else owner.globals
                 local = owner.locals[function]
                 flow = _Flow(owner, function)
@@ -2462,6 +2624,8 @@ class _Analysis:
                     flow.normal_state, completed = flow.capture(function.body, state, exceptions=True)
                     flow.pending.extend(completed)
                 summary = flow.summary()
+                owner.reads = owner.writes = None
+                solved[summary_key] = (reads, writes, flow)
                 if summary != self.summaries.get(summary_key, FunctionSummary()):
                     self.summaries[summary_key] = summary
                     changed = True

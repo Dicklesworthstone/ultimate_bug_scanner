@@ -1031,6 +1031,7 @@ def _function_scopes(text, code):
             opening, closing = arrow_parameters[match.start()]
             start, params_start, params_end = opening, opening + 1, closing
         elif before.endswith(')') and end - 1 in pairs:
+            # pairs is a dict and the key was just tested — ubs:ignore[py.collections.index-arithmetic]
             opening = pairs[end - 1]
             start, params_start, params_end = opening, opening + 1, end - 1
         else:
@@ -3005,6 +3006,7 @@ def scan_project_findings(files):
             offset = start - module.start
             lines = line_starts[module.path]
             line = bisect_right(lines, offset)
+            # line_starts lists begin with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
             yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
 
 

@@ -58,32 +58,32 @@ jobs:
               subprocess.run(['git','apply','--check','-'],input=patch,check=True)
               subprocess.run(['git','apply','-'],input=patch,check=True)
           source='modules/helpers/ubs_core/analyzers/taint_js.py'
-          if blob(source)=='5dc2d9daece893dd5515a6d2178941ff9ec88f33':
+          if blob(source)=='3b5a601ab85dcccc0aabc67d8c0e2be4140fa208':
               for filename,digest,sha in (
-                  ('javascript-heap-shapes.patch.xz','d0e155c96c5ca90ad940430bcf2d428105368124785ed249c333bef6fc2b6328','12c81cf151445b4c9c5549f1330add88dcced924'),
-                  ('javascript-native-identity.patch.xz','85bad85ebb7e10d52fb313bc5747d0248b481d3ea9132d9bc331180abadc5522','2041fe7138e24143b335ad69b257dc8154c08caa'),
-                  ('javascript-native-exports.patch.xz','3eb47660f1a7e36cf19ab3a489573c11202d42d238c329512a8fccdc4c0420d4','ba33ac4e17f45ebc5907dd2f66042d3a01373bf4'),
-                  ('javascript-heap-templates.patch.xz','63da65df02dd0f59a81ed3945b3cad5d6ea86d1df5c02ecf8a375d11e5858973','be3183c0a46d9e6de0100c3d65eb41ad5f005e00'),
+                  ('javascript-heap-shapes.patch.xz','d0e155c96c5ca90ad940430bcf2d428105368124785ed249c333bef6fc2b6328','51c808a84550093b8368571aba022d938c9ff380'),
+                  ('javascript-native-identity.patch.xz','85bad85ebb7e10d52fb313bc5747d0248b481d3ea9132d9bc331180abadc5522','f4e5997341da1547df687519ae9351bc196db879'),
+                  ('javascript-native-exports.patch.xz','3eb47660f1a7e36cf19ab3a489573c11202d42d238c329512a8fccdc4c0420d4','80a90b9772d16f85db17b0f6838b716d53a0fc63'),
+                  ('javascript-heap-templates.patch.xz','63da65df02dd0f59a81ed3945b3cad5d6ea86d1df5c02ecf8a375d11e5858973','488c7605f2693fc4268b1bfc184b9e7f0efff726'),
               ):
                   apply(filename,digest)
                   assert blob(source)==sha,filename
-          if blob(source)=='be3183c0a46d9e6de0100c3d65eb41ad5f005e00':
+          if blob(source)=='488c7605f2693fc4268b1bfc184b9e7f0efff726':
               stages=(
                   ('javascript-array-callbacks.patch.xz','75049d7a19d1492d0020d8307618a996e04af27917f0dee3006f28f68241eafc',
-                   '49b2acef779f6c1aee79a0345d86d8c1f0e3b61c','8eb4a7e2374764de07074d45d3c28d63e764fdec'),
+                   '055fae28e7ee28db3c4b864d98d73ca38528dca2','8eb4a7e2374764de07074d45d3c28d63e764fdec'),
                   ('javascript-callback-convergence.patch.xz','7c261fa850d9d41d877b0aa2d6ac521133f46fbf4a64d9517fca6f01b33575c4',
-                   '348c7a3795ca86303c9445e027ab910f7c64073f','f1664635e7ce0cfedb71ef47f1f0124892e39e6b'),
+                   'c8bd1799fc6f1be63615d4ff582ecbda082ca336','f1664635e7ce0cfedb71ef47f1f0124892e39e6b'),
                   ('javascript-callback-postfix.patch.xz','57366d9c8afb6699c82311f4a6c65d710035aaf0882f42e08416e59f933c8603',
-                   'eb6fc2986b46a9d09fe8876473dea5245c3f2889','05969345000772215d3f9890977a2d8dbda10d8b'),
+                   '987211ca1d40f76ad67d2062fa25953a140ebda0','05969345000772215d3f9890977a2d8dbda10d8b'),
               )
               for filename,digest,source_sha,test_sha in stages:
                   apply(filename,digest)
                   assert blob(source)==source_sha,filename
                   assert blob('test-suite/js/test_taint_callbacks.py')==test_sha,filename
-          assert blob(source)=='eb6fc2986b46a9d09fe8876473dea5245c3f2889'
+          assert blob(source)=='987211ca1d40f76ad67d2062fa25953a140ebda0'
           assert blob('test-suite/js/test_taint_callbacks.py')=='05969345000772215d3f9890977a2d8dbda10d8b'
           apply('javascript-array-reductions.patch.xz','656f1d854e2a11d40e64a2d6fc386a2c35d920b99b0322047a571cdbcd87a75a')
-          assert blob(source)=='39c2c9e5d6e48d5e5f86c3670eef627dfc2462e6'
+          assert blob(source)=='f9bebd12e8399ae084532ae7a57aad42ea6c1ede'
           assert blob('test-suite/js/test_taint_callbacks.py')=='3034e18f18d14afc825d39c0364632a941fe4d87'
           subprocess.run(['git','add','-N','test-suite/js/test_taint_callbacks.py'],check=True)
           PY

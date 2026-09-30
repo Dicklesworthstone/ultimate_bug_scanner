@@ -1524,10 +1524,18 @@ verify_installation() {
   # Test 1: Command available. Not being on PATH yet is the normal state of a
   # clean first install (the completion banner tells the user to reload their
   # shell), so it is a warning, not a failure; only a missing binary is fatal.
+  # Tests 2 and 4 exercise the binary this run installed. PATH can resolve
+  # `ubs` to an older copy elsewhere (warn_if_stale_binary reports that); running
+  # it would vouch for the wrong scanner and, after an authenticated install,
+  # execute code the release verifier never checked.
   if command -v ubs >/dev/null 2>&1; then
     success "ubs command available in PATH"
     log "   Location: $(command -v ubs)"
-    ubs_cmd="ubs"
+    if [ -x "$installed_bin" ]; then
+      ubs_cmd="$installed_bin"
+    else
+      ubs_cmd="ubs"
+    fi
   elif [ -x "$installed_bin" ]; then
     warn "ubs command not found in PATH yet (installed at $installed_bin; reload your shell or add its directory to PATH)"
     ubs_cmd="$installed_bin"

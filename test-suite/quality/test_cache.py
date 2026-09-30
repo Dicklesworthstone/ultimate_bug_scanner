@@ -14,6 +14,7 @@ Verifies:
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import hashlib
 import json
 import os
@@ -98,10 +99,18 @@ class IncrementalCacheTests(unittest.TestCase):
         # whitespace filenames exactly; none are shell-interpolated.
         names = ["plain.py", 'quoted".py', "tab\tname.py", "line\nname.py",
                  "carriage\rname.py", "trailing.py "]
+        raw_name = os.fsdecode(b"raw-\xff.py")
         if os.name == "posix":
-            names.append(os.fsdecode(b"raw-\xff.py"))
-        for name in names:
-            (nested / name).write_text("VALUE = 1\n", encoding="utf-8")
+            names.append(raw_name)
+        for name in list(names):
+            try:
+                (nested / name).write_text("VALUE = 1\n", encoding="utf-8")
+            except OSError as exc:
+                # APFS and other Unicode-only filesystems refuse non-UTF-8
+                # names (EILSEQ); the byte name is only checked where it exists.
+                if exc.errno != errno.EILSEQ or name != raw_name:
+                    raise
+                names.remove(name)
         outside = self.project_dir / "outside.py"
         outside.write_text("VALUE = 1\n", encoding="utf-8")
         self._git("add", "--", "nested", "outside.py")
@@ -120,9 +129,9 @@ class IncrementalCacheTests(unittest.TestCase):
         (self.project_dir / ".gitignore").write_text("scratch/\n", encoding="utf-8")
         (ignored / "fresh.py").write_text("VALUE = 2\n", encoding="utf-8")
         self.assertIsNone(get_clean_git_blobs(ignored))
-        if os.name == "posix":
+        if raw_name in names:
             self._git("config", "core.quotePath", "false")
-            (nested / os.fsdecode(b"raw-\xff.py")).write_text("VALUE = 4\n", encoding="utf-8")
+            (nested / raw_name).write_text("VALUE = 4\n", encoding="utf-8")
             self.assertIsNone(get_clean_git_blobs(nested))
         (nested / "plain.py").write_text("VALUE = 3\n", encoding="utf-8")
         self.assertIsNone(get_clean_git_blobs(nested))

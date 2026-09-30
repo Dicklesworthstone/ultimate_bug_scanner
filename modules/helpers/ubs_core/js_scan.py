@@ -519,8 +519,12 @@ def main(argv: list[str] | None = None) -> int:
         # Async AST findings are calibrated to info in non-strict mode.
         # Replaying those records in a strict scan would suppress its warning
         # exit; the reverse transition would retain inflated severities.
-        extra=f"fail_on_warning={args.fail_on_warning};modules={module_graph.cache_context()}",
+        extra=f"fail_on_warning={args.fail_on_warning};modules=component",
     )
+    # Import topology keys each linked file's entry, not the whole selection:
+    # a selection-wide key made every subset, superset or single-file scan
+    # miss the cache for unrelated files.
+    cache.file_contexts = {str(path): context for path, context in module_graph.file_contexts().items()}
     cached_findings, files_to_scan = cache.partition_files(files)
     files_to_scan = _expand_module_misses(module_graph, files, cached_findings, files_to_scan, cache)
 

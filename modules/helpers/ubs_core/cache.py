@@ -284,6 +284,11 @@ class ScanCache:
         self.files_dir = self.cache_root / "files"
         self.dirs_dir = self.cache_root / "dirs"
         self.stat_cache: dict[str, tuple[int, int, str]] = {}  # path -> (mtime_ns, size, hash)
+        # Optional per-file analysis context (resolved path -> digest). A file
+        # whose findings depend on which other files are selected (a linked
+        # module component) is cached under its content hash plus that
+        # context, so other selections neither reuse nor evict its entry.
+        self.file_contexts: dict[str, str] = {}
 
         self.stats = {
             "hits": 0,
@@ -419,6 +424,15 @@ class ScanCache:
         except OSError:
             return None
 
+    def _entry_hash(self, path: Path, git_blobs: dict[str, str] | None) -> str | None:
+        """Content hash of a scanned file, qualified by its analysis context."""
+        content_hash = self._get_file_hash(path, git_blobs)
+        if content_hash and self.file_contexts:
+            context = self.file_contexts.get(str(path.resolve()))
+            if context:
+                return f"{content_hash}+{context}"
+        return content_hash
+
     def _inputs_valid(self, inputs: Any, git_blobs: dict[str, str] | None) -> bool:
         """Require every recorded external input to retain its content hash."""
         if not isinstance(inputs, dict):
@@ -455,7 +469,7 @@ class ScanCache:
         # 1. Compute file hashes for all target files
         file_hashes: dict[Path, str] = {}
         for f in files:
-            fh = self._get_file_hash(f, git_blobs)
+            fh = self._entry_hash(f, git_blobs)
             if fh:
                 file_hashes[f] = fh
 
@@ -561,7 +575,7 @@ class ScanCache:
         git_blobs = get_clean_git_blobs(self.project_dir)
         file_hashes: dict[Path, str] = {}
         for f in files:
-            fh = self._get_file_hash(f, git_blobs)
+            fh = self._entry_hash(f, git_blobs)
             if fh:
                 file_hashes[f] = fh
 

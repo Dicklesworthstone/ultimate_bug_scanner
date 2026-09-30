@@ -508,8 +508,25 @@ class ModuleGraph:
             unseen.difference_update(found)
             yield [self.modules[path] for path in sorted(found)]
 
-    def cache_context(self):
-        # Selection and link topology are part of cache identity. Component
-        # contents are invalidated by the normal per-file cache checks.
-        payload = [(str(path), sorted(map(str, targets))) for path, targets in sorted(self.edges.items())]
-        return hashlib.blake2b(json.dumps(payload, separators=(',', ':')).encode(), digest_size=16).hexdigest()
+    def file_contexts(self):
+        """Cache identity each linked module adds to its own content hash.
+
+        A module's findings depend on the import component it is analyzed in:
+        its members and their links. Each member of a linked component maps to
+        a digest of that component's topology, so its cached findings are
+        reused only when the same component is selected again. Unlinked
+        modules get no entry: their findings do not depend on what else is
+        selected, so scanning one file, a subset or the whole tree shares
+        their cache. Changed member contents are handled by the per-file
+        hashes plus the component-wide invalidation in js_scan.
+        """
+        contexts = {}
+        for component in self.components():
+            members = [module.path for module in component]
+            if len(members) == 1 and members[0] not in self.edges[members[0]]:
+                continue
+            payload = [(str(path), sorted(map(str, self.edges[path]))) for path in members]
+            digest = hashlib.blake2b(json.dumps(payload, separators=(',', ':')).encode(),
+                                     digest_size=16).hexdigest()
+            contexts.update((path, digest) for path in members)
+        return contexts

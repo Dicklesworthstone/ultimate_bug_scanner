@@ -188,11 +188,14 @@ class WatchTests(WatchFixture, unittest.TestCase):
         self.assertIn('not a regular file', invalid['stderr'])
         self.source.rename(self.work / 'fifo')
         outside = self.work / 'outside.py'
-        outside.write_text('BUG private\n')
+        # The outside file's contents must not leak into the report. The
+        # marker must not occur in a path: 'private' did, via macOS's
+        # /private/tmp, and failed the check on a correct report.
+        outside.write_text('BUG leak-marker-3f9c\n')
         self.source.symlink_to(outside)
         invalid = self.event('invalid')
         self.assertIn('outside', invalid['stderr'])
-        self.assertNotIn('private', invalid['stderr'])
+        self.assertNotIn('leak-marker-3f9c', invalid['stderr'])
         self.assertEqual(len(self.calls()), 1)
         self.source.rename(self.work / 'escape-link')
         self.source.symlink_to('a.py')

@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="f3eaa0cf48b49aa01bd1b6300ea9fdd6f14306c8e38d6f11e16c433595abb04c"
+UBS_LIB_CHECKSUM="4e36684e8335caef33862cdff665b5b4c5fad0b7eb6cd02af41f72448e28bd3b"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -502,7 +502,7 @@ run_contract_v2_go(){
     if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 from pathlib import Path
 from ubs_core.go_rules import generate
-generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
+generate(Path('$ast_rule_dir'))
 " 2>/dev/null; then
       ast_rule_dir=""
     fi
@@ -517,6 +517,9 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
     cp -R "$DUMP_RULES_DIR"/rules/. "$DUMP_RULES_DIR"/ 2>/dev/null || true
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  # A project policy is its own layer: the built-in pack consumes only the
+  # rule ids it knows, so --rules must not ride along inside it.
+  [[ -n "$USER_RULE_DIR" ]] && scan_args+=(--custom-rules "$USER_RULE_DIR")
   tally_file="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-tally.XXXXXX)"
   scan_args+=(--tally-out "$tally_file")
   case "$FORMAT" in

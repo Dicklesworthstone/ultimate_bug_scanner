@@ -433,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
     parser.add_argument("--project-dir", default="", help="base dir for relative sink paths")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
+    parser.add_argument("--custom-rules", default="", help="project --rules policy directory, scanned as its own layer")
     parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
     parser.add_argument("--json-out", default="", help="write the UBS summary JSON document here")
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
@@ -461,13 +462,15 @@ def main(argv: list[str] | None = None) -> int:
         lang="cpp",
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
-        custom_rules="",
+        custom_rules=args.custom_rules,
         extra=f"new_analyzers={args.enable_new_analyzers}",
     )
     cached_findings, files_to_scan = cache.partition_files(files)
     suppressions = SourceSuppressions("cpp")
 
     capturing_sink = None
+    # A layer that could not complete makes the scan partial, never clean.
+    scan_errors: list[str] = []
     if files_to_scan:
         cpp_analyzers = [a.name for a in analyzers_for_lang("cpp")]
         prefilter_index = build_prefilter_index(
@@ -482,9 +485,14 @@ def main(argv: list[str] | None = None) -> int:
         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
-        cache.store_scanned_files(files_to_scan, {
-            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
-        })
+        if args.custom_rules:
+            from ubs_core.external_tools import scan_custom_rules
+            scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "cpp", scan_errors)
+        # An incomplete analysis must never become the cached answer.
+        if not scan_errors:
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -528,6 +536,10 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1 if counters["critical"] else 0
     if args.fail_on_warning and (counters["critical"] + counters["warning"]) > 0:
         exit_code = 1
+    if scan_errors:
+        exit_code = 2  # Incompleteness dominates severity (#111).
+    for problem in scan_errors:
+        sys.stderr.write(f"ubs-cpp: analysis incomplete: {problem}\n")
 
     if args.json_out:
         records = read_ndjson(args.sink)
@@ -550,10 +562,13 @@ def main(argv: list[str] | None = None) -> int:
             "warning": counters["warning"],
             "info": counters["info"],
             "version": args.version,
-            "status": "ok",
+            "status": "partial" if scan_errors else "ok",
             "findings": records,
             "extras": {"profile": profile_data},
         }
+        if scan_errors:
+            doc["module_error"] = "ANALYZER_ERROR"
+            doc["message"] = ("C/C++ analysis did not complete: " + "; ".join(scan_errors[:5]))[:500]
         if os.environ.get("UBS_PROFILE") == "1":
             doc["profile"] = profile_data
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")

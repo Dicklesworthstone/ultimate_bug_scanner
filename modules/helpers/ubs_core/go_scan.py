@@ -905,6 +905,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-dir", default="", help="base dir recorded in outputs")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir (sgconfig-*.yml + manifest.json)")
+    parser.add_argument("--custom-rules", default="", help="project --rules policy directory, scanned as its own layer")
     parser.add_argument("--tally-out", default="", help="write the category-16 rule tally JSON here")
     parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
     parser.add_argument("--json-out", default="", help="write the UBS summary JSON document here")
@@ -940,14 +941,15 @@ def main(argv: list[str] | None = None) -> int:
 
     patterns = load_patterns()
 
-    from ubs_core.cache import CapturingSink, ScanCache
+    from ubs_core.cache import CapturingSink, ScanCache, hash_rules_dir
 
     cache = ScanCache(
         lang="golang",
         project_dir=args.project_dir or args.project or ".",
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
-        extra=f"new_analyzers={args.enable_new_analyzers};package_inputs={_package_cache_context(files)}",
+        extra=(f"new_analyzers={args.enable_new_analyzers};package_inputs={_package_cache_context(files)};"
+               f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
     files_to_scan = _expand_package_misses(files, cached_findings, files_to_scan, cache)
@@ -1000,6 +1002,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         for record in computed_checks(files_to_scan, ast_matches, skip, single_file):
             capturing_sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if args.custom_rules:
+            from ubs_core.external_tools import scan_custom_rules
+            scan_custom_rules(args.custom_rules, files_to_scan, capturing_sink, "go", scan_errors)
         # An incomplete analysis must never become the cached answer: the next
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111).

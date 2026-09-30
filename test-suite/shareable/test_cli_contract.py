@@ -193,6 +193,134 @@ def check_rules_dir_nested_and_yaml_rules_are_loaded() -> None:
                f"exit={proc.returncode} status={status} found={sorted(found)}", proc)
 
 
+def _custom_rule(directory: Path, name: str, rule_id: str, pattern: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(
+        f"id: {rule_id}\nlanguage: python\nseverity: warning\nmessage: {rule_id}\n"
+        f"rule:\n  pattern: {pattern}\n", encoding="utf-8")
+
+
+def _custom_findings(proc: subprocess.CompletedProcess) -> tuple[str | None, set[str]]:
+    try:
+        doc = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None, set()
+    found = {f.get("rule_id", "") for f in doc.get("findings", [])}
+    return doc.get("status"), {rule for rule in found if rule.startswith("custom.")}
+
+
+def check_rules_sources_repeatable_and_env() -> None:
+    # GH #144: a team rule set and a project's own rules run together, from
+    # repeated --rules or from UBS_RULES; an explicit --rules replaces the env.
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        team, local = root / "team", root / "local"
+        _custom_rule(team, "no-get.yml", "custom.team-get", "requests.get($$$)")
+        _custom_rule(local, "no-post.yaml", "custom.local-post", "requests.post($$$)")
+        project = root / "proj"
+        project.mkdir()
+        (project / "app.py").write_text(
+            'import requests\nrequests.get("https://example.invalid")\nrequests.post("https://example.invalid")\n',
+            encoding="utf-8")
+        base = ["--only=python", "--ci", "--no-cache", "--format=json"]
+        both = {"custom.team-get", "custom.local-post"}
+        cases = (
+            ("repeated_flag", [f"--rules={team}", "--rules", str(local)], {"UBS_RULES": None}, both),
+            ("env", [], {"UBS_RULES": f"{team}::{local}:"}, both),
+            ("flag_replaces_env", [f"--rules={local}"], {"UBS_RULES": str(team)}, {"custom.local-post"}),
+            ("same_dir_twice", [f"--rules={team}", f"--rules={team}/."], {"UBS_RULES": None}, {"custom.team-get"}),
+        )
+        for name, flags, env, wanted in cases:
+            proc = run([*base, *flags, str(project)], env={"UBS_NO_CACHE": "1", **env})
+            status, found = _custom_findings(proc)
+            report(f"rules_sources_{name}", status == "ok" and found == wanted,
+                   f"exit={proc.returncode} status={status} found={sorted(found)}", proc)
+
+
+def check_rules_duplicate_id_refused() -> None:
+    with tempfile.TemporaryDirectory(prefix="ubs-rules-") as tmp:
+        root = Path(tmp)
+        _custom_rule(root / "team", "a.yml", "custom.same", "requests.get($$$)")
+        _custom_rule(root / "local" / "nested", "b.yaml", "'custom.same'", "requests.post($$$)")
+        project = root / "proj"
+        project.mkdir()
+        (project / "app.py").write_text("print(1)\n", encoding="utf-8")
+        for name, flags, env in (
+            ("flags", [f"--rules={root / 'team'}", f"--rules={root / 'local'}"], {"UBS_RULES": None}),
+            ("env", [], {"UBS_RULES": f"{root / 'team'}:{root / 'local'}"}),
+        ):
+            proc = run(["--only=python", "--ci", "--format=json", *flags, str(project)], env=env)
+            try:
+                reason = json.loads(proc.stdout).get("reason")
+            except json.JSONDecodeError:
+                reason = None
+            ok = (proc.returncode == 2 and reason == "duplicate-rule-id"
+                  and "custom.same" in proc.stderr and "a.yml" in proc.stderr and "b.yaml" in proc.stderr)
+            report(f"rules_duplicate_id_refused_{name}", ok, f"exit={proc.returncode} reason={reason}", proc)
+        proc = run(["--only=python", "--ci", "--format=json", str(project)],
+                   env={"UBS_RULES": str(root / "absent")})
+        try:
+            reason = json.loads(proc.stdout).get("reason")
+        except json.JSONDecodeError:
+            reason = None
+        report("rules_env_invalid_directory_refused",
+               proc.returncode == 2 and reason == "invalid-rules-directory" and "UBS_RULES" in proc.stderr,
+               f"exit={proc.returncode} reason={reason}", proc)
+
+
+# One rule per language, each matching one line of a one-file project. Go's
+# grammar needs a context for a bare call expression.
+_EVERY_MODULE_RULES = {
+    "python": ("python", "print($$$A)", "a.py", 'print("x")\n'),
+    "js": ("javascript", "console.log($$$A)", "a.js", 'console.log("x");\n'),
+    "java": ("java", "System.out.println($$$A)", "A.java",
+             'class A { void f() { System.out.println("x"); } }\n'),
+    "golang": ("go", '{ context: "func f() { fmt.Println($$$A) }", selector: call_expression }', "a.go",
+               'package main\n\nimport "fmt"\n\nfunc main() {\n\tfmt.Println("x")\n}\n'),
+    "rust": ("rust", "dbg!($$$A)", "a.rs", "fn main() { dbg!(1); }\n"),
+    "ruby": ("ruby", "puts($$$A)", "a.rb", 'puts("x")\n'),
+    "kotlin": ("kotlin", "println($$$A)", "a.kt", 'fun main() { println("x") }\n'),
+    "swift": ("swift", "print($$$A)", "a.swift", 'print("x")\n'),
+    "csharp": ("csharp", "Console.WriteLine($$$A)", "A.cs",
+               'class A { void F() { Console.WriteLine("x"); } }\n'),
+    "cpp": ("cpp", "printf($$$A)", "a.cpp", '#include <cstdio>\nint main() { printf("x"); return 0; }\n'),
+    "elixir": ("elixir", "IO.puts($$$A)", "a.ex", 'defmodule A do\n  def f, do: IO.puts("x")\nend\n'),
+    "bash": ("bash", "echo $$$A", "a.sh", "#!/usr/bin/env bash\necho hi\n"),
+}
+
+
+def check_rules_every_module_reports_custom_rules() -> None:
+    # A10: java, rust, ruby, kotlin, cpp and go used to drop --rules entirely
+    # while reporting status ok. Every module must report a matching project
+    # rule, top-level or nested, with its authored severity.
+    contract = json.loads((REPO_ROOT / "modules" / "contract.json").read_text(encoding="utf-8"))
+    missing = set(contract["modules"]) - set(_EVERY_MODULE_RULES)
+    report("rules_every_module_covered", not missing, f"uncovered={sorted(missing)}")
+    for lang, (grammar, pattern, name, source) in _EVERY_MODULE_RULES.items():
+        with tempfile.TemporaryDirectory(prefix=f"ubs-rules-{lang}-") as tmp:
+            root = Path(tmp)
+            rules, project = root / "rules", root / "proj"
+            (rules / "nested").mkdir(parents=True)
+            project.mkdir()
+            for path, rule_id, severity in ((rules / "top.yml", f"custom.top-{lang}", "error"),
+                                            (rules / "nested" / "n.yaml", f"custom.nested-{lang}", "warning")):
+                path.write_text(f"id: {rule_id}\nlanguage: {grammar}\nseverity: {severity}\nmessage: m\n"
+                                f"rule:\n  pattern: {pattern}\n", encoding="utf-8")
+            (project / name).write_text(source, encoding="utf-8")
+            proc = run(["--ci", "--no-cache", f"--only={lang}", "--format=json", f"--rules={rules}", str(project)],
+                       cwd=root, env={"UBS_NO_CACHE": "1"})
+            try:
+                doc = json.loads(proc.stdout)
+                got = {f.get("rule_id"): f.get("severity") for f in doc.get("findings", [])
+                       if str(f.get("rule_id", "")).startswith("custom.")}
+                status = doc.get("status")
+            except json.JSONDecodeError:
+                got, status = {}, None
+            wanted = {f"custom.top-{lang}": "critical", f"custom.nested-{lang}": "warning"}
+            report(f"rules_module_{lang}_reports_custom_rules", status == "ok" and got == wanted,
+                   f"exit={proc.returncode} status={status} got={got}", proc)
+
+
 def check_include_ext_forwarded() -> None:
     with tempfile.TemporaryDirectory(prefix="ubs-ext-") as tmp:
         proj = Path(tmp) / "proj"
@@ -2249,6 +2377,9 @@ def main() -> int:
         check_output_flag_json,
         check_rules_dir_custom_rule_in_sarif,
         check_rules_dir_nested_and_yaml_rules_are_loaded,
+        check_rules_sources_repeatable_and_env,
+        check_rules_duplicate_id_refused,
+        check_rules_every_module_reports_custom_rules,
         check_include_ext_forwarded,
         check_list_categories,
         check_env_skip_type_narrowing,

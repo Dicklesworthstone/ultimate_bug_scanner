@@ -2207,6 +2207,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--fail-on-warning", action="store_true")
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir")
+    parser.add_argument("--custom-rules", default="", help="project --rules policy directory, scanned as its own layer")
     parser.add_argument("--text-out", default="", help="render the legacy text report here")
     parser.add_argument("--checks-out", default="",
                         help="legacy findings[] aggregation (severity/count/category/title/description/samples)")
@@ -2231,7 +2232,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from ubs_core.prefilter import build_prefilter_index, run_prefilter
 
-    from ubs_core.cache import ScanCache
+    from ubs_core.cache import ScanCache, hash_rules_dir
 
     original_files = list(scan.files)
     cache = ScanCache(
@@ -2242,7 +2243,8 @@ def main(argv: list[str] | None = None) -> int:
         # A manifest-only change can turn an integration root into production.
         # Never replay a cached warning after its qualifying context disappears.
         extra=(f"exclude_tests={args.exclude_tests};skip_narrowing={args.skip_type_narrowing};"
-               f"panic_context_v1={json.dumps(sorted(scan.integration_test_roots))}"),
+               f"panic_context_v1={json.dumps(sorted(scan.integration_test_roots))};"
+               f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
     )
     cached_findings, files_to_scan = cache.partition_files(original_files)
 
@@ -2321,6 +2323,15 @@ def main(argv: list[str] | None = None) -> int:
                     _sub(scan, r, scan.ast_hits([slug]),
                          f"rust.{_CATEGORY_SLUGS[category]}.{slug.replace('_', '-')}",
                          category, severity, message)
+
+        if args.custom_rules:
+            # A project policy is its own layer, never filtered through the
+            # built-in pack's slugs; its records render like replayed ones.
+            from io import StringIO
+            from ubs_core.external_tools import scan_custom_rules
+            policy = StringIO()
+            scan_custom_rules(args.custom_rules, files_to_scan, policy, "rust", scan.scan_errors)
+            replay_findings(scan, r, [json.loads(line) for line in policy.getvalue().splitlines()])
 
         by_file: dict[str, list[dict]] = {}
         for record in scan.records:

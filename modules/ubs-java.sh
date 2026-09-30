@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="f3eaa0cf48b49aa01bd1b6300ea9fdd6f14306c8e38d6f11e16c433595abb04c"
+UBS_LIB_CHECKSUM="4e36684e8335caef33862cdff665b5b4c5fad0b7eb6cd02af41f72448e28bd3b"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -465,6 +465,9 @@ generate(Path('$ast_rule_dir'))
     fi
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")
+  # A project policy is its own layer: the built-in pack's allowlist and
+  # severity calibration must not drop or reweigh it.
+  [[ -n "$USER_RULE_DIR" ]] && scan_args+=(--custom-rules "$USER_RULE_DIR")
   if [[ -n "$DUMP_RULES_DIR" ]]; then
     mkdir -p "$DUMP_RULES_DIR" 2>/dev/null || true
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "

@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='a4778f08b58e46266bb8197d179a34fdc95cf44929fe3eff16d70f45e65e7375'
-  [cpp]='79ebf31fdcc37fc329bda7fd23ea50633d73b8a45722baae0fe7119b4f483096'
-  [csharp]='f97e68551c16741e8f6d53a042e61be404c505366aa3c28e46d9a19f678f25ce'
-  [elixir]='56da0b75b82895dc49430fccb865c062621c3119a1d8b235ba46fe67a8aaa4ce'
-  [golang]='c040642de0a9a6eaa7d5f253ce5da8681a8f4564e3976bb250a787f562c2cf94'
-  [java]='e989df96ce2dd54778d95da3a537a8ad3abe333c39bf4a0ed704d807e7abab57'
-  [js]='8514ce6133329a249281e1fc694378cc402cd1dbcd0e0da433c931985e35abbc'
-  [kotlin]='33c3829d5ba9bdba89db2adbaf2596d9b2024cd9c299784953ba1d33310afac4'
-  [python]='6d02391bc4fda7ed27a71dc0bed48e811f3bf6b36cd0fb6eb7d51854418fe75d'
-  [ruby]='6b70e8ee5a51e89d3d2f8267608a1b441717d9f8263116811254662403a8f4b0'
-  [rust]='3909a84960931b2ec2116726a0355b3bd7e15564df9277beff7f08d72fb348dc'
-  [swift]='3a56aa8ce007dc5a4e657b50bf45ed0e7e88748d9248e244f4ac686ad2ff8757'
+  [bash]='0c5996477467dc05e25fdba872a0802fcd0b2812b253a9bfbc781caa90dc090a'
+  [cpp]='281210fc6a6eb92b56e06f5e1281a52ee68480d8ba1518e04743e39659a3d1a7'
+  [csharp]='a2cf23d24b4563e617bc32114d04503217978b3bfb88ba09f39ce8e5c040b745'
+  [elixir]='6c88e7597b04389071568d9828a909d13921156041553fed7112d31d8f468c0c'
+  [golang]='4b5012a99ab1c50e0cdab133cb38199090dbdcb8a48c040abf8c504191fb9b39'
+  [java]='7e07ad1d6b164d7fa9c88a4c3ec4d7dd211863be06f491c6805d23c2454628f1'
+  [js]='71baf755890a74fc4d2742f608cddf6c364564ff9227d920c9b67adf64d1ee04'
+  [kotlin]='08614bacf8a05256a43b3d3c29ecfe21ca4bea2e5ba06b0d2c14488bfd4657e0'
+  [python]='443f90c8c0635f17f2cffd0e80c72d6281b032da24f0637e51d5bc26c167abab'
+  [ruby]='1cb3c775305d58b384def6d0eaa96913e6edb423f48b83415a9d5542659a3290'
+  [rust]='3d8d44887277b3a2873fe9b31a3e528273c5555c2a186fb75bbefa01657e5e6f'
+  [swift]='dc7ec3d947420fb8d7f738e3d3278e92847ab5a91d0160a37cd48b349a9bef59'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -191,7 +191,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/cpp_patterns/numeric.py']='fc04ecf9b703ab8f5aadd435fa5a137c7541028b1c92e74b6d2dc5448fb58444'
   ['helpers/ubs_core/cpp_patterns/ub_zone.py']='61b92efa13a0c9876ef657d9e56c600ef15f8e3486ad0b64ff4f4ad4c26327aa'
   ['helpers/ubs_core/cpp_rules.py']='c624f73f3ddab13aafb6026875fd9211d2fef4efe71b866e46c1dc6023049255'
-  ['helpers/ubs_core/cpp_scan.py']='80ed4d85824f0ef27ac9393124183864b3c877938aa9f6315f0b823b66596fa9'
+  ['helpers/ubs_core/cpp_scan.py']='9cd1b02c203f813168a758f599d1354af9b5b6c3af7b5f4566188b4ba0eaade8'
   ['helpers/ubs_core/csharp_ast.py']='0a581c0d1c80edb60bb867b1177371060d25f98c4da80fb3d0afba67435b72ce'
   ['helpers/ubs_core/csharp_detectors/__init__.py']='bf8a8383f6143a5e585e78fec84580e86c40ee180f05a7bbce386c496d420063'
   ['helpers/ubs_core/csharp_detectors/_common.py']='19c996f1744588d23085e986e50a461089af0c8d350fdd4e950d6f71074e4dac'
@@ -230,7 +230,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='d61aa7f4f865e18858a5cb43c4a51b671345e9505bafc10896c0cec598877ead'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
-  ['helpers/ubs_core/external_tools.py']='8aed8e93c5ab5260647b86f9439a0b9443c93d3a53e99a6e963045c68a1b44ba'
+  ['helpers/ubs_core/external_tools.py']='af1727d4296709182a904ce51246e92b1a80734c6fcc6fd678eee9857f8340f3'
   ['helpers/ubs_core/findings_merge.py']='6d86f7a03310053d268656ac514592ef2cc5a711a8471fd566d00a4d47160715'
   ['helpers/ubs_core/go_ast.py']='7cb83f089c6fa8b562483c4d84bafa22bb4273c8b5d3dab5079825f74385527b'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
@@ -254,7 +254,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/go_patterns/json_fs.py']='e561c18ac8d49ca7d3a0644381b5624d3d0e5f975c43a3056e4ad177538a7b6b'
   ['helpers/ubs_core/go_patterns/misc.py']='d23874e0fd10bc3538fd0c9b4eae998dbcb3076dd66020a6c764c7bb297506bd'
   ['helpers/ubs_core/go_rules.py']='a11e1036d06d313c102fda792f9842af7af69ad6250ec9dcb0c21ceaddc00ce1'
-  ['helpers/ubs_core/go_scan.py']='d57b5c970c32c30e932172de9658e8ee4f3cccc764a13df167893dd8fd69013e'
+  ['helpers/ubs_core/go_scan.py']='b2b75743f3962cb7f6d745ca5606e1ff8588ccb7fe8c337b776e283c6cc58542'
   ['helpers/ubs_core/io.py']='3f0415f899245019ae6cdecbd8a0558c6e5d16ca43f8856e960fa3ca26d7d320'
   ['helpers/ubs_core/java_ast.py']='32a7c928810eced7c09ec3fcae874fffcf56e0c70360a58cae08a78ed8501c49'
   ['helpers/ubs_core/java_detectors/__init__.py']='ef52ffa7d353633e7bb1d1caa697c3b3bf83c6d7dc1ec111a3a4b71e2aa2d8f0'
@@ -280,7 +280,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/java_patterns/resource_lifecycle.py']='0a8f38417321c16bbcae6bdf42aa68c15d6f6e3ca6d70a84e3aa29c6f6ac5d1c'
   ['helpers/ubs_core/java_patterns/security_rg.py']='d1ddb0626ec8729133b915dd27401ea2823df452acd18920c2efd919119864fa'
   ['helpers/ubs_core/java_rules.py']='25646798a89ca69b7a101901456ab0970ad28abdffef5fab33458ff8b900a9cf'
-  ['helpers/ubs_core/java_scan.py']='e1d39a3790f943feca57062ff77be558ae766a87fffbffd374f98fe50fbb4997'
+  ['helpers/ubs_core/java_scan.py']='94601afe958cc32064d1cd6f90eca6cb88a4b2844c824b5002aa5861f7a63b19'
   ['helpers/ubs_core/js_ast.py']='cc0ee3b63512bb043ac5167dfbb8b67b7c2cbdbe5ae8e9d11d6828c62451da5f'
   ['helpers/ubs_core/js_modules.py']='c9d688b7e65842cc5ed907d6a439fe958f3831de639a2a7a429ebf66bc2a2c6f'
   ['helpers/ubs_core/js_patterns/__init__.py']='0529d2e73e888d4ff04bea182fb241f259eee345d04ef3bb19478b74e5353851'
@@ -293,7 +293,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/js_rules.py']='e038f6d8a7ad177e7cce78aa236580c3d2f8cb6dae65bfad172f3961465ebc4a'
   ['helpers/ubs_core/js_scan.py']='791fd001bccffc8544dcf5efa42914e0c767f25bb724c6c14caec9882a5faf81'
   ['helpers/ubs_core/kotlin_rules.py']='6dd77c16cd9fbba0e555162e2a8f378858ce70b4d70668f64ec8142983ba3c35'
-  ['helpers/ubs_core/kotlin_scan.py']='2ea25fa756000235c64be1b02dad721d5e5d57284522648de73dcec36be14fde'
+  ['helpers/ubs_core/kotlin_scan.py']='167c65f9a2112299ba6e9ee72428560cfc58d5eaaa38c83beef8327b1949a361'
   ['helpers/ubs_core/lexer.py']='5b0ea23b77e1d414ca0d9cafdc8bd6ed8a6f2b12c20aa83e6af82b275db15686'
   ['helpers/ubs_core/prefilter.py']='c8a3cf0c8706953e84577166ed9bb659cd5ddf907d0d499af27b1c0e081ad2af'
   ['helpers/ubs_core/py_ast.py']='8dcc78151e3e4242e0b58b1628041ec77b2ce90ad58dc9ad89e3fdeb1c7ee762'
@@ -368,7 +368,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/ruby_patterns/shell_io.py']='65b858569d34639c6e7e7edb59374f9dbd37eef9b0460c588de082af88349b8a'
   ['helpers/ubs_core/ruby_patterns/vars_quality.py']='f68007ffbde60d8e11b574d45815f1f0d8ca6e70eccfa748ce9dc4eb3d6dfd1d'
   ['helpers/ubs_core/ruby_rules.py']='e8445052f9492794411bd0ab1a816d8927997313ff046a4d22771af13b924f79'
-  ['helpers/ubs_core/ruby_scan.py']='cd78b54a68f06de87989e7a1249bc84f8be9bf71bf5bf167359b0184077d069e'
+  ['helpers/ubs_core/ruby_scan.py']='6230eab04d6e1cff78eb5d1e6f1af37a353355ffbf00e86469246e59353a2f5d'
   ['helpers/ubs_core/rust_ast.py']='e1c5440116ca4fff3b12a238284ef05be38ad799baece2fac556aa83fc56e94e'
   ['helpers/ubs_core/rust_detectors/__init__.py']='b238f38c0768683ea44b5bfd8e4e4c8a94e2bbbe98ddd77de32230a47bdd7799'
   ['helpers/ubs_core/rust_detectors/archive_entry_path.py']='fcedd0f3194b08ee4fc09ed71d81a97fa289d3399feeef71a19f4235945f014d'
@@ -392,7 +392,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/tls_indirect.py']='120501344abdcddf96e6a40c7b4b38617dd0649b83cfc81a0863f38027b0a755'
   ['helpers/ubs_core/rust_detectors/unbounded_request_body.py']='72eaedc5e99846eadaab246cb6398dc189f541ca14ae62e8a305a316bde69f5f'
   ['helpers/ubs_core/rust_rules.py']='d35a4d6cb061f0eb7ff70a799b415414016a3ce8e10c8331e8a9ee4b484be211'
-  ['helpers/ubs_core/rust_scan.py']='ea4c6ae62f9042a964b6e1bff48daedf579c322baf40200425933d7319dfabd2'
+  ['helpers/ubs_core/rust_scan.py']='048020766b602240e71358084378f93d6ed6be5a1a02c41328299e4da5b319d0'
   ['helpers/ubs_core/scheduler.py']='662a2555f571e9cc6fba5755103948fa8b8e8b87f8d9038686225ccf6b6405bb'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
@@ -416,7 +416,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='168a59a4414cfe39bb8e9032174bbe1a1ef264ec2c5251c4bb47ac9049c5719b'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
-  ['lib/ubs-common.sh']='f3eaa0cf48b49aa01bd1b6300ea9fdd6f14306c8e38d6f11e16c433595abb04c'
+  ['lib/ubs-common.sh']='4e36684e8335caef33862cdff665b5b4c5fad0b7eb6cd02af41f72448e28bd3b'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1290,6 +1290,7 @@ SKIP_TYPE_NARROWING=0
 [[ "${UBS_SKIP_TYPE_NARROWING:-0}" == "1" ]] && SKIP_TYPE_NARROWING=1
 INCLUDE_EXT=""             # csv forwarded to modules as --include-ext=
 USER_RULES_DIR=""          # forwarded to modules as --rules= (custom ast-grep rules)
+USER_RULES_SOURCES=()      # every --rules DIR (repeatable), else the UBS_RULES entries
 USER_RULES_REQUESTED=0     # distinguish an absent option from --rules=
 OUTPUT_FILE=""             # tee the rendered report to this file (--output / PROJECT_DIR OUTPUT_FILE)
 LIST_CATEGORIES=0
@@ -1404,7 +1405,8 @@ Options:
                           (e.g. --include-ext=js,ts,vue); language detection still
                           uses each module's default extensions unless --only is given
   --rules=DIR             Directory of custom ast-grep rules merged into every module's
-                          built-in rule pack (YAML; see README "Custom AST-Grep Rules")
+                          built-in rule pack (YAML; see README "Custom AST-Grep Rules").
+                          Repeatable; a rule id defined twice refuses the scan
   --list-categories       Print each selected module's category numbers/names and exit
   --version               Print version and exit
   --ci                    CI mode (stable timestamps)
@@ -1487,6 +1489,7 @@ Environment Variables:
   UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
   UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
+  UBS_RULES=DIR[:DIR...]      Custom rule directories used when no --rules is given
   UBS_NO_CACHE=1              Disable scan caching (like --no-cache)
   UBS_CACHE_DIR=PATH          Override root directory for scan cache (like --cache-dir)
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
@@ -1557,7 +1560,7 @@ cat <<'JSON'
       {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
-      {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack."},
+      {"name": "--rules", "args": "DIR", "example": "--rules=./rules", "description": "Directory of custom ast-grep YAML rules merged into every module's rule pack. Repeatable; a rule id defined by two files refuses the scan (duplicate-rule-id)."},
       {"name": "--skip", "args": "CSV", "example": "--skip=python.todo", "description": "Skip categories by stable id (e.g. python.todo) or category number."},
       {"name": "--skip-LANG", "args": "CSV", "example": "--skip-js=8", "description": "Skip categories in one language (LANG = js|python|cpp|rust|golang|java|kotlin|ruby|swift|csharp|elixir|bash)."},
       {"name": "--category", "args": "CSV", "example": "--category=resource-lifecycle", "description": "Focus on a category pack (currently resource-lifecycle)."},
@@ -1634,6 +1637,7 @@ cat <<'JSON'
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
     {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
+    {"name": "UBS_RULES", "value": "DIR[:DIR...]", "description": "Custom rule directories (':'-separated, like PATH) used when no --rules is given; empty entries are ignored."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
     {"name": "CI", "value": "true", "description": "Disables the auto-update check like --ci."},
@@ -2242,10 +2246,10 @@ else
       --include-ext)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; INCLUDE_EXT="$1"; shift;;
-      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_DIR="${1#*=}"; shift;;
+      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_SOURCES+=("${1#*=}"); shift;;
       --rules)
         if [[ $# -lt 2 ]]; then say_err "ERROR: --rules requires a directory"; exit 2; fi
-        USER_RULES_REQUESTED=1; shift; USER_RULES_DIR="$1"; shift;;
+        USER_RULES_REQUESTED=1; shift; USER_RULES_SOURCES+=("$1"); shift;;
       --output=*) OUTPUT_FILE="${1#*=}"; shift;;
       --output|-o)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -2381,64 +2385,116 @@ fi
 # A requested policy is part of the scan contract, not an optional hint.
 # Validate before detection so even an empty project cannot silently accept a
 # typo, and anchor relative paths before modules enter their shadow workspace.
+#
+# Sources: every --rules DIR (repeatable), or, when none is given, the
+# ':'-separated directories in UBS_RULES, so a hook, CI and an agent's manual
+# run can share one policy without a wrapper script. Only local directories:
+# a rule source is never fetched at scan time.
+_rules_origin="--rules"
+if [[ "$USER_RULES_REQUESTED" -eq 0 && -n "${UBS_RULES:-}" && "$RUN_SCAN_GUARDS" -eq 1 ]]; then
+  _rules_origin="UBS_RULES"
+  IFS=':' read -r -a _rules_entries <<<"$UBS_RULES"
+  for _rules_entry in "${_rules_entries[@]}"; do
+    [[ -n "$_rules_entry" ]] && USER_RULES_SOURCES+=("$_rules_entry")
+  done
+  [[ ${#USER_RULES_SOURCES[@]} -gt 0 ]] && USER_RULES_REQUESTED=1
+  unset _rules_entries _rules_entry
+fi
 if [[ "$USER_RULES_REQUESTED" -eq 1 ]]; then
-  if [[ -z "$USER_RULES_DIR" || ! -d "$USER_RULES_DIR" || ! -r "$USER_RULES_DIR" || ! -x "$USER_RULES_DIR" ]]; then
-    refuse_scan "invalid-rules-directory" "--rules requires a readable directory: $USER_RULES_DIR" "" \
-      "No scan was performed because the requested custom policy could not be loaded."
-  fi
-  if ! USER_RULES_DIR="$(cd -- "$USER_RULES_DIR" && pwd -P)"; then
-    refuse_scan "invalid-rules-directory" "Cannot resolve the --rules directory" ""
-  fi
+  _rules_resolved=()
+  for _rules_source in "${USER_RULES_SOURCES[@]}"; do
+    if [[ -z "$_rules_source" || ! -d "$_rules_source" || ! -r "$_rules_source" || ! -x "$_rules_source" ]]; then
+      refuse_scan "invalid-rules-directory" "$_rules_origin requires a readable directory: $_rules_source" "" \
+        "No scan was performed because the requested custom policy could not be loaded."
+    fi
+    if ! _rules_source="$(cd -- "$_rules_source" && pwd -P)"; then
+      refuse_scan "invalid-rules-directory" "Cannot resolve the $_rules_origin directory" ""
+    fi
+    _rules_resolved+=("$_rules_source")
+  done
   # Modules load only the top level of a rules directory, and some only
   # `*.yml`. Hand every module one flat directory holding every rule below
-  # the requested one, so a rule in `python/x.yaml` is not silently dropped
-  # by the modules that do not recurse (GH #144). Hidden paths below the root
-  # (`.git/`, `.github/`) are not rules.
+  # every requested source, so a rule in `python/x.yaml` is not silently
+  # dropped by the modules that do not recurse (GH #144). Hidden paths below a
+  # source (`.git/`, `.github/`) are not rules. One rule id defined twice would
+  # let one policy silently shadow the other, so that refuses the scan.
   ensure_tmpdir_run
   _flat_rules_dir="$TMPDIR_RUN/custom-rules"
-  if ! _custom_rule_count="$(python3 - "$USER_RULES_DIR" "$_flat_rules_dir" <<'PYRULES'
+  _rules_status=0
+  _custom_rule_report="$(python3 - "$_flat_rules_dir" "${_rules_resolved[@]}" <<'PYRULES'
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
 
+# A top-level `id:` key starts each rule document (ast-grep YAML may hold
+# several documents separated by `---`); quoted and commented forms included.
+ID_LINE = re.compile(r"""^id:[ \t]*(?:"([^"]*)"|'([^']*)'|([^\s#]+))""")
+
 def failed(exc):
     raise exc
 
-source, flat = Path(sys.argv[1]), Path(sys.argv[2])
-count = 0
+flat, sources = Path(sys.argv[1]), []
+for raw in sys.argv[2:]:
+    if Path(raw) not in sources:   # the same directory named twice is one source
+        sources.append(Path(raw))
+owners = {}
 try:
     flat.mkdir()
-    for root, directories, files in os.walk(source, onerror=failed):
-        directories[:] = sorted(d for d in directories if not d.startswith('.'))
-        for name in sorted(files):
-            path = Path(root) / name
-            if path.suffix not in {'.yml', '.yaml'} or name.startswith('.'):
-                continue
-            if not path.is_file() or not os.access(path, os.R_OK):
-                raise ValueError(f'Custom rule is not a readable regular file: {path}')
-            stem = '__'.join(path.relative_to(source).with_suffix('').parts)
-            target = flat / f'{stem}.yml'
-            suffix = 1
-            while target.exists():
-                suffix += 1
-                target = flat / f'{stem}-{suffix}.yml'
-            shutil.copyfile(path, target)
-            count += 1
-except (OSError, ValueError) as exc:
+    for source in sources:
+        count = 0
+        for root, directories, files in os.walk(source, onerror=failed):
+            directories[:] = sorted(d for d in directories if not d.startswith('.'))
+            for name in sorted(files):
+                path = Path(root) / name
+                if path.suffix not in {'.yml', '.yaml'} or name.startswith('.'):
+                    continue
+                if not path.is_file() or not os.access(path, os.R_OK):
+                    raise ValueError(f'Custom rule is not a readable regular file: {path}')
+                for line in path.read_text(encoding='utf-8').splitlines():
+                    match = ID_LINE.match(line)
+                    if not match:
+                        continue
+                    rule_id = next(group for group in match.groups() if group is not None)
+                    if rule_id in owners and owners[rule_id] != path:
+                        print(f'duplicate\t{rule_id}\t{owners[rule_id]}\t{path}')
+                        sys.exit(3)
+                    owners[rule_id] = path
+                stem = '__'.join(path.relative_to(source).with_suffix('').parts)
+                target = flat / f'{stem}.yml'
+                suffix = 1
+                while target.exists():
+                    suffix += 1
+                    target = flat / f'{stem}-{suffix}.yml'
+                shutil.copyfile(path, target)
+                count += 1
+        if count == 0:
+            print(f'empty\t{source}')
+            sys.exit(4)
+except (OSError, UnicodeError, ValueError) as exc:
     print(exc, file=sys.stderr)
     sys.exit(2)
-print(count)
 PYRULES
-)"; then
-    refuse_scan "invalid-rule-file" "Cannot read the requested custom rules: $USER_RULES_DIR" ""
-  fi
-  if [[ "$_custom_rule_count" -eq 0 ]]; then
-    refuse_scan "empty-rules-directory" "--rules directory contains no .yml or .yaml files: $USER_RULES_DIR" ""
-  fi
+)" || _rules_status=$?
+  case "$_rules_status" in
+    0) ;;
+    3)
+      IFS=$'\t' read -r _ _dup_id _dup_first _dup_second <<<"$_custom_rule_report"
+      refuse_scan "duplicate-rule-id" "Custom rule id '$_dup_id' is defined twice: $_dup_first and $_dup_second" "" \
+        "One rule would silently shadow the other; rename or remove one of them."
+      ;;
+    4)
+      refuse_scan "empty-rules-directory" "$_rules_origin directory contains no .yml or .yaml files: ${_custom_rule_report#empty$'\t'}" ""
+      ;;
+    *)
+      refuse_scan "invalid-rule-file" "Cannot read the requested custom rules: ${_rules_resolved[*]}" ""
+      ;;
+  esac
   USER_RULES_DIR="$_flat_rules_dir"
-  unset _custom_rule_count _flat_rules_dir
+  unset _custom_rule_report _flat_rules_dir _rules_status _rules_resolved _rules_source _dup_id _dup_first _dup_second
 fi
+unset _rules_origin
 
 # Load ignore patterns early so size checks can respect .ubsignore
 if [[ "$MODE" != "doctor" && "$UPDATE_ONLY" -eq 0 ]]; then

@@ -1034,13 +1034,14 @@ Rule Control:
                            category reports "Not evaluated" instead of "clean"; targeted scans
                            (files, --staged, --diff) skip cargo automatically for the same reason.
   --rules=DIR              Additional ast-grep rules directory
-                           Rules are merged with built-in rules
+                           Rules are merged with built-in rules; repeatable
   --no-auto-update         Disable automatic self-update
   --suggest-ignore         Print large-directory candidates to add to .ubsignore (no changes applied)
 
 Environment Variables:
   JOBS                     Same as --jobs=N
   UBS_SKIP_RUST_BUILD=1    Same as --no-cargo (Rust static-only mode)
+  UBS_RULES=DIR[:DIR...]   Custom rule directories used when no --rules is given
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
@@ -1220,7 +1221,27 @@ message: "Never mutate state directly - use setState()"
 `error` as critical. `critical` is not an ast-grep level, so ast-grep refuses to parse
 the rule and the scan ends as partial (exit 2). Rules may sit in subdirectories of the
 `--rules` directory, as `.yml` or `.yaml`; hidden directories such as `.github/` are
-skipped.
+skipped. Every language module runs your rules as their own layer: each finding keeps
+its rule id and the severity you gave it.
+
+**Several rule sets, one policy.** `--rules` is repeatable, so a team-wide rule set and
+a project's own rules can run together. When no `--rules` is given, `UBS_RULES` supplies
+the directories, separated by `:` like `PATH`, so a pre-commit hook, CI and a manual
+`ubs <changed files>` all enforce the same rules without a wrapper script:
+
+```bash
+export UBS_RULES="$HOME/.config/ubs/team-rules:$PWD/.ubs/rules"
+ubs .                                              # both rule sets
+ubs --rules=./experimental .                       # --rules replaces UBS_RULES for this run
+```
+
+A rule id defined in two files refuses the scan (`duplicate-rule-id`, exit 2) and names
+both files, rather than letting one rule silently shadow the other.
+
+Rules are read only from local directories. To share rules across repositories, keep
+them in a repository of their own and check it out (a git submodule, a pinned clone in
+CI); UBS does not fetch rule packs at scan time, since that would make every scan depend
+on the network and on code you have not reviewed.
 
 ### **Excluding False Positives**
 

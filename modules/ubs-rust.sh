@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="f3eaa0cf48b49aa01bd1b6300ea9fdd6f14306c8e38d6f11e16c433595abb04c"
+UBS_LIB_CHECKSUM="4e36684e8335caef33862cdff665b5b4c5fad0b7eb6cd02af41f72448e28bd3b"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -959,6 +959,8 @@ generate(Path('$DUMP_RULES_DIR'))
     --text-out "$text_out"
     --project-dir "$PROJECT_DIR" --skip "$v2_skip" --detail-limit "$DETAIL_LIMIT")
   [[ -n "$rule_dir" ]] && scan_args+=(--ast-rule-dir "$rule_dir")
+  # A project policy is its own layer; the built-in pack knows only its slugs.
+  [[ -n "$USER_RULE_DIR" ]] && scan_args+=(--custom-rules "$USER_RULE_DIR")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   [[ "${EXCLUDE_TESTS:-0}" -eq 1 ]] && scan_args+=(--exclude-tests)
   [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -eq 1 ]] && scan_args+=(--skip-type-narrowing)

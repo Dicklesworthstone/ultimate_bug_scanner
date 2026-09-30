@@ -276,6 +276,69 @@ def scan_ast_config(config: Path, paths: Sequence[Path],
         raise RuntimeError("; ".join(failures))
 
 
+_CUSTOM_SEVERITY = {
+    "error": "critical", "critical": "critical", "fatal": "critical",
+    "warning": "warning", "warn": "warning",
+    "info": "info", "hint": "info", "note": "info",
+}
+
+
+def custom_rule_files(rules_dir: str | Path) -> list[Path]:
+    """Every .yml/.yaml policy below ``rules_dir``; hidden paths are not rules."""
+    root = Path(rules_dir)
+    found = []
+    for directory, subdirs, names in os.walk(root):
+        subdirs[:] = sorted(d for d in subdirs if not d.startswith("."))
+        found.extend(Path(directory) / name for name in sorted(names)
+                     if not name.startswith(".") and Path(name).suffix in {".yml", ".yaml"})
+    return found
+
+
+def scan_custom_rules(rules_dir: str | Path, paths: Sequence[Path], sink: TextIO,
+                      lang: str, errors: list[str], *, ast_grep_bin: str = "ast-grep") -> int:
+    """Run the project's ``--rules`` policy over ``paths`` as its own layer.
+
+    Built-in rule packs recalibrate severities and keep only the ids their
+    legacy reports counted; a project policy is not a built-in rule and gets
+    neither treatment. Every match keeps its rule id and its authored
+    severity (ast-grep ``error`` is critical). ast-grep applies each rule only
+    to files of the rule's language, so a module sees only its own matches.
+    Source ``ubs:ignore`` markers apply as for any other finding. A policy
+    that cannot be loaded or run is an incomplete scan, never a clean one.
+    Returns the number of findings written.
+    """
+    if not paths:
+        return 0
+    rules = custom_rule_files(rules_dir)
+    if not rules:
+        errors.append(f"custom rules: no .yml or .yaml rules in {rules_dir}")
+        return 0
+    suppressions = SourceSuppressions(lang)
+    written = 0
+    with tempfile.TemporaryDirectory(prefix="ubs-custom-rules-") as tmp:
+        config = Path(tmp) / "sgconfig.yml"
+        # JSON strings are valid YAML scalars for any path spelling.
+        config.write_text("ruleDirs: " + json.dumps([str(p.resolve()) for p in rules]) + "\n",
+                          encoding="utf-8")
+        for match in scan_ast_config(config, list(paths), errors, ast_grep_bin=ast_grep_bin):
+            severity = _CUSTOM_SEVERITY.get(match["severity"])
+            if severity is None:
+                continue  # severity: off
+            rule = match["ruleId"]
+            start = match["range"]["start"]
+            line = start["line"] + 1
+            if suppressions.is_suppressed(match["file"], line, rule):
+                continue
+            message = (match.get("message") or "").strip() or rule
+            sink.write(json.dumps({
+                "rule": rule, "category_id": "custom", "path": match["file"],
+                "line": line, "col": start["column"] + 1, "severity": severity,
+                "message": f"{rule}: {message}"[:300], "suppressed": False,
+            }, ensure_ascii=False) + "\n")
+            written += 1
+    return written
+
+
 class RubyFindings:
     def __init__(self, files: Sequence[Path], root: Path, sink: TextIO) -> None:
         self.root, self.sink = root, sink

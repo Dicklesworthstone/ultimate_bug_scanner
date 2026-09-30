@@ -1,0 +1,123 @@
+name: Python HTTP Destination Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - test-suite/quality/test_taint_python_http.py
+      - test-suite/patches/python-http-taint.patch
+      - test-suite/patches/python-http-taint-tests.py
+      - .github/workflows/python-http-taint.yml
+  pull_request:
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - test-suite/quality/test_taint_python_http.py
+      - .github/workflows/python-http-taint.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      UBS_HTTP_E2E: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Prepare exact candidate and prove the baseline regression
+        run: |
+          if git ls-files --error-unmatch test-suite/quality/test_taint_python_http.py >/dev/null 2>&1; then
+            echo 'Testing canonical runtime and regressions already on this ref'
+          else
+            cp test-suite/patches/python-http-taint-tests.py test-suite/quality/test_taint_python_http.py
+            PYTHONPATH=test-suite/quality python3 - <<'PY'
+          import os, subprocess
+          from pathlib import Path
+          run = subprocess.run(['python3', '-m', 'unittest',
+                                'test_taint_python_http.HTTPDestinationTests.test_control_flow_and_reassignment', '-v'],
+                               capture_output=True, text=True)
+          output = run.stdout + run.stderr
+          Path(os.environ['RUNNER_TEMP'], 'http-baseline.log').write_text(output)
+          print(output, flush=True)
+          assert run.returncode == 1 and 'AssertionError' in output and 'python.taint.ssrf' in output, output
+          assert 'ERROR:' not in output, output
+          PY
+            git apply --recount --unidiff-zero --check test-suite/patches/python-http-taint.patch
+            git apply --recount --unidiff-zero test-suite/patches/python-http-taint.patch
+            git add -N test-suite/quality/test_taint_python_http.py
+          fi
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+          git diff --check
+      - name: Run Python dataflow regressions and real JSON/SARIF scans
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python*.py' -v 2>&1 | tee "$RUNNER_TEMP/http-dataflow.log"
+          python3 -m unittest discover -s test-suite/quality -p test_ubs_core.py -v 2>&1 | tee "$RUNNER_TEMP/http-core.log"
+      - name: Verify integrity and scan the changed runtime helper
+        run: |
+          shellcheck -S warning ubs
+          bash -n ubs
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          ./ubs --ci --no-auto-update modules/helpers/ubs_core/analyzers/taint_py.py
+      - name: Store tested immutable objects, without changing branches or tags
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'ubs', 'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_py.py',
+                     'test-suite/quality/test_taint_python_http.py'}
+          assert set(changed) <= allowed, changed
+          records = []
+          for name in changed:
+              data = Path(name).read_bytes()
+              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                                        input=json.dumps({'content': data.decode(), 'encoding': 'utf-8'}),
+                                        text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              before = subprocess.run(['git', 'rev-parse', '--verify', 'HEAD:' + name], capture_output=True, text=True)
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha,
+                              'before': before.stdout.strip() if before.returncode == 0 else None})
+          manifest = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': records}
+          Path(os.environ['RUNNER_TEMP'], 'http-publication.json').write_text(json.dumps(manifest, indent=2))
+          print('HTTP_TAINT_TESTED', json.dumps(manifest), flush=True)
+          PY
+      - name: Retain source and diagnostic evidence
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/http-final.diff"
+          git ls-files -s > "$RUNNER_TEMP/http-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/http-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-http-taint-validation
+          path: |
+            ${{ runner.temp }}/http-*
+            test-suite/artifacts/python-http-taint/
+          retention-days: 5

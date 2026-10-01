@@ -14,6 +14,17 @@ _No changes yet._
 
 ---
 
+## [v5.4.17] - 2026-10-01 [Release]
+
+### Fixed
+
+- `ubs --update` exits 0 after a successful update. Since v5.4.9 the updater restarted the newly installed `ubs` with an empty argument list, because option parsing had already consumed the command line. The new binary then scanned the current directory and `ubs --update` returned that scan's exit code. `--update` now stops after installing and prints `Update check complete.` The opt-in auto-update (`UBS_ENABLE_AUTO_UPDATE=1` before a scan) restarts the new version with the command line exactly as it was typed (`6ba9943`).
+- The updater's cleanup no longer fails when its work directory is already gone, so the cleanup can no longer trigger the error handler.
+
+Updating from v5.4.16 or earlier still uses the old updater, so that one update may print scan output and return a scan's exit code even though v5.4.17 installed correctly. Run `ubs --version` to confirm.
+
+---
+
 ## [v5.4.16] - 2026-10-01 [Release]
 
 First published release since [v5.4.9](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.4.9). The tags v5.4.10 through v5.4.15 exist in git but never got release assets, so `ubs --update` and the `curl | bash` installer stayed on v5.4.9; everything those tags contained is included here.

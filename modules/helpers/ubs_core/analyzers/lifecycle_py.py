@@ -80,7 +80,8 @@ class ResourceRecord:
 class Binding:
     """A resource, collection, supervisor, or context owner; not binding history."""
 
-    __slots__ = ("record", "items", "ordered", "awaited", "cancel_children", "context", "closes_context", "symbol")
+    __slots__ = ("record", "items", "ordered", "awaited", "cancel_children", "context", "closes_context", "symbol",
+                 "releases")
 
     def __init__(
         self,
@@ -93,6 +94,7 @@ class Binding:
         context: Optional[Binding] = None,
         closes_context: bool = False,
         symbol: Optional[str] = None,
+        releases: tuple[ResourceRecord, ...] = (),
     ) -> None:
         self.record = record
         self.items = items
@@ -102,6 +104,9 @@ class Binding:
         self.context = context
         self.closes_context = closes_context
         self.symbol = symbol
+        # A nested function that releases enclosing-scope resources: calling
+        # it releases them; merely defining it does not.
+        self.releases = releases
 
 
 UNKNOWN_BINDING = Binding()
@@ -114,6 +119,9 @@ class Scope:
         self.attribute_children: dict[str, set[str]] = {}
         self.globals: set[str] = set()
         self.nonlocals: set[str] = set()
+        # Enclosing-scope resources this function body releases. They count
+        # only where the function is called.
+        self.deferred_releases: list[ResourceRecord] = []
 
 
 class _ScopeNames(ast.NodeVisitor):
@@ -262,6 +270,8 @@ class Analyzer(ast.NodeVisitor):
                 self.visit(statement)
         finally:
             self.scope_stack.pop()
+        if scope.deferred_releases and not isinstance(node, ast.Lambda):
+            self._bind_name(node.name, Binding(releases=tuple(scope.deferred_releases)))
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         for value in (*node.decorator_list, *node.bases):
@@ -485,6 +495,10 @@ class Analyzer(ast.NodeVisitor):
 
     def _handle_release(self, node: ast.Call) -> None:
         func = node.func
+        if isinstance(func, ast.Name):
+            binding = self._lookup_execution_binding(func.id)
+            if binding is not None:
+                self._release_records(binding.releases)
         if isinstance(func, ast.Attribute):
             binding = self._binding_from_expr(func.value)
             record = binding.record
@@ -492,6 +506,30 @@ class Analyzer(ast.NodeVisitor):
                 record.released = True
             elif func.attr == "cancel" and binding.cancel_children:
                 self._release_awaitable(binding)
+            elif record is None and self.current_scope.kind == "function":
+                # A closure releasing an enclosing-scope resource: that
+                # release happens only if and when this function is called.
+                name = self._dotted_name(func.value)
+                outer = self._lookup_symbol_binding(name) if name is not None else None
+                if (outer is not None and outer.record is not None
+                        and func.attr in RELEASE_METHODS[outer.record.kind]):
+                    self.current_scope.deferred_releases.append(outer.record)
+
+    def _release_records(self, records: tuple[ResourceRecord, ...]) -> None:
+        """Calling a closure releases what it releases, in this frame or later."""
+        if not records:
+            return
+        if self.current_scope.kind != "function":
+            for record in records:
+                record.released = True
+            return
+        owned = {id(binding.record) for binding in self.current_scope.by_name.values()
+                 if binding.record is not None}
+        for record in records:
+            if id(record) in owned:
+                record.released = True
+            else:
+                self.current_scope.deferred_releases.append(record)
 
     def _first_argument(
         self, node: ast.Call, name: str, allowed_keywords: set[str], *, max_positional: int

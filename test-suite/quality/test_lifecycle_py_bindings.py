@@ -118,6 +118,28 @@ class LifecycleBindingsTests(unittest.TestCase):
     def test_uncalled_lambda_cannot_release_outer_resource(self):
         self.assertLeaks("handle = open('x')\ncleanup = lambda: handle.close()", [("file_handle", 1)])
 
+    def test_called_closure_releases_enclosing_resource(self):
+        # test_resource_helper's nested-scope case: inner() runs the close.
+        self.assertLeaks("""
+            import asyncio
+            def outer():
+                fh = open('x')
+                async def inner():
+                    fh.close()
+                asyncio.run(inner())
+        """, [])
+        self.assertLeaks("handle = open('x')\ndef cleanup():\n    handle.close()\ncleanup()", [])
+
+    def test_uncalled_closure_does_not_release_enclosing_resource(self):
+        self.assertLeaks("handle = open('x')\ndef cleanup():\n    handle.close()", [("file_handle", 1)])
+        self.assertLeaks("""
+            def outer():
+                fh = open('x')
+                def inner():
+                    fh.close()
+                return 1
+        """, [("file_handle", 2)])
+
     def test_same_named_inner_binding_does_not_release_outer(self):
         self.assertLeaks("""
             handle = open('outer')

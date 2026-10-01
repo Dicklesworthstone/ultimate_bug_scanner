@@ -67,6 +67,21 @@ METADATA_TERMS = {
     'count', 'len', 'length', 'scope', 'scopes',
 }
 
+# `SIG_DFL`, `SIG_IGN`, `SIG_ERR`, `SIG_BLOCK`, ... are POSIX signal
+# dispositions and mask operations (`previous == signal.SIG_DFL`), not
+# signatures. Real signal numbers (`SIGTERM`) are one term and never match.
+SIGNAL_DISPOSITION_TERMS = {'dfl', 'ign', 'err', 'hold', 'block', 'unblock', 'setmask'}
+# A signature of code, not of data: `call_signature`, `function_sig`,
+# `method_signature`, `type_signature`. The qualifier must directly precede
+# the term, so `webhook_signature` and `request_sig` stay sensitive.
+# `reference`/`ref` are deliberately absent: `reference_signature` is how
+# verification code names the expected MAC.
+CODE_SIGNATURE_TERMS = {'signature', 'sig'}
+CODE_SIGNATURE_QUALIFIERS = {
+    'call', 'function', 'func', 'fn', 'method', 'type', 'overload',
+    'callable', 'parameter', 'param',
+}
+
 # Unkeyed hashlib constructors (GH #102). ``hashlib.new`` is unkeyed too but is
 # only accepted with the explicit ``hashlib.`` owner, because a bare ``new`` may
 # be ``from hmac import new``. blake2b/blake2s become keyed MACs with ``key=``.
@@ -140,6 +155,11 @@ def name_is_sensitive(name):
     for idx, term in enumerate(terms):
         if term in STRONG_TERMS:
             follower = terms[idx + 1] if idx + 1 < len(terms) else ''
+            leader = terms[idx - 1] if idx > 0 else ''
+            if term == 'sig' and follower in SIGNAL_DISPOSITION_TERMS:
+                continue  # signal.SIG_DFL / SIG_IGN: a handler disposition
+            if term in CODE_SIGNATURE_TERMS and leader in CODE_SIGNATURE_QUALIFIERS:
+                continue  # call_signature / method_sig: a code-shape signature
             if follower not in METADATA_TERMS:
                 return True
             continue
@@ -150,6 +170,31 @@ def name_is_sensitive(name):
             return True
     return False
 
+def value_names_non_secret_vocabulary(value):
+    """A call whose name uses secret vocabulary in a non-secret sense.
+
+    `sig = self._call_signature(node)` binds a code signature: the callee's
+    name carries a strong/weak term (`signature`) that its own qualifiers
+    already classify as non-secret. The binding's abbreviated name (`sig`)
+    adds nothing, so it inherits that classification instead of being judged
+    on its own. A callee with no such vocabulary (`sig = compute(body)`) says
+    nothing about the value, and the name alone still decides.
+    """
+    if not isinstance(value, ast.Call):
+        return False
+    name = call_name(value.func).rsplit('.', 1)[-1]
+    terms = identifier_terms(name)
+    vocabulary = any(term in STRONG_TERMS or term in WEAK_TERMS for term in terms)
+    return vocabulary and not name_is_sensitive(name)
+
+
+def is_constant_display(node):
+    """A tuple/list/set display built only from literals: `("a", "b")`."""
+    return isinstance(node, (ast.Tuple, ast.List, ast.Set)) and all(
+        isinstance(elt, ast.Constant) for elt in node.elts
+    )
+
+
 class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def __init__(self, path, lines):
         self.path = path
@@ -158,6 +203,9 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
         # Names bound to an unkeyed hashlib object fed only non-secret data
         # (GH #102): their .digest()/.hexdigest() is a checksum, not a tag.
         self.unkeyed_hash_names = set()
+        # Names whose secret-looking spelling is explained by a non-secret
+        # binding (`sig = self._call_signature(node)`).
+        self.explained_names = set()
         self.issues = []
         self.seen_lines = set()
 
@@ -175,7 +223,9 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
 
     def expr_is_sensitive(self, node):
         if isinstance(node, ast.Name):
-            return node.id in self.sensitive_names or name_is_sensitive(node.id)
+            return node.id in self.sensitive_names or (
+                node.id not in self.explained_names and name_is_sensitive(node.id)
+            )
         if isinstance(node, ast.Attribute):
             # Judge only the attribute being compared. Including the receiver
             # made ORM column comparisons like `Token.user_id == user_uuid`
@@ -237,16 +287,21 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
 
     def mark_assignment(self, names, value):
         value_sensitive = self.expr_is_sensitive(value)
+        explained = not value_sensitive and value_names_non_secret_vocabulary(value)
         unkeyed_hash = (
             isinstance(value, ast.Call)
             and self.is_unkeyed_hash_ctor(value)
             and not self.call_input_is_sensitive(value)
         )
         for name in names:
-            if name_is_sensitive(name) or value_sensitive:
+            if value_sensitive or (name_is_sensitive(name) and not explained):
                 self.sensitive_names.add(name)
             else:
                 self.sensitive_names.discard(name)
+            if explained:
+                self.explained_names.add(name)
+            else:
+                self.explained_names.discard(name)
             if unkeyed_hash and not name_is_sensitive(name):
                 self.unkeyed_hash_names.add(name)
             else:
@@ -255,8 +310,10 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         old_sensitive = set(self.sensitive_names)
         old_unkeyed = set(self.unkeyed_hash_names)
+        old_explained = set(self.explained_names)
         self.sensitive_names.clear()
         self.unkeyed_hash_names.clear()
+        self.explained_names.clear()
         for arg in list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs):
             if name_is_sensitive(arg.arg):
                 self.sensitive_names.add(arg.arg)
@@ -268,6 +325,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             self.visit(stmt)
         self.sensitive_names = old_sensitive
         self.unkeyed_hash_names = old_unkeyed
+        self.explained_names = old_explained
 
     def visit_AsyncFunctionDef(self, node):
         self.visit_FunctionDef(node)
@@ -304,8 +362,12 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             # Comparing against a number, boolean, or None (e.g.
             # `total_tokens == 0`) can never leak secret material through
             # timing; only string/bytes comparisons are timing-sensitive (#64).
+            # A literal tuple/list/set (`sig == ("socket", "socketpair")`) is
+            # a structured key, never a secret string or bytes value; the
+            # comparison is a shape dispatch, not a credential check.
             non_secret_literal = any(
                 isinstance(value, ast.Constant) and not isinstance(value.value, (str, bytes))
+                or is_constant_display(value)
                 for value in values
             )
             if not non_secret_literal and any(self.expr_is_sensitive(value) for value in values):
@@ -479,6 +541,40 @@ def _selftest_digest_role_positive() -> None:
     assert [line for _path, line, _code in issues] == [3, 5, 7, 11, 13], issues
 
 
+def _selftest_code_signature_negative() -> None:
+    code = (
+        "import signal\n"
+        "def dispatch(self, node, completion):\n"
+        "    sig = self._call_signature(node)\n"
+        "    if sig == ('socket', 'socketpair'):\n"
+        "        return 1\n"
+        "    if sig[1] == 'closing':\n"
+        "        return 2\n"
+        "    if self._reference_signature(completion) == ('asyncio', 'ALL_COMPLETED'):\n"
+        "        return 3\n"
+        "    return signal.getsignal(signal.SIGTERM) == signal.SIG_DFL\n"
+    )
+    assert not _scan_code(code), _scan_code(code)
+
+
+def _selftest_signature_positive_controls() -> None:
+    code = (
+        "import signal\n"
+        "def check(request, sig, expected):\n"
+        "    webhook_signature = request.headers['X-Signature']\n"
+        "    if webhook_signature == expected:\n"
+        "        return 1\n"
+        "    if sig == expected:\n"
+        "        return 2\n"
+        "    computed_sig = compute(request.body)\n"
+        "    if computed_sig == request.headers['X-Sig']:\n"
+        "        return 3\n"
+        "    return (sig, 'v1') == (expected, 'v1')\n"
+    )
+    lines = [line for _path, line, _code in _scan_code(code)]
+    assert lines == [4, 6, 9], lines
+
+
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("secret_eq_positive", _selftest_secret_eq_positive),
     ("ubs_ignore_suppression", _selftest_ubs_ignore_suppression),
@@ -487,6 +583,8 @@ SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("run_finds_secret_eq", _selftest_run_finds_secret_eq),
     ("public_checksum_negative", _selftest_public_checksum_negative),
     ("digest_role_positive", _selftest_digest_role_positive),
+    ("code_signature_negative", _selftest_code_signature_negative),
+    ("signature_positive_controls", _selftest_signature_positive_controls),
 )
 
 register(Analyzer(layer="ctcompare", lang="python", name="ctcompare_py", run=run, selftests=SELF_TESTS))

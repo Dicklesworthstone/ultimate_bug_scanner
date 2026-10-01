@@ -59,8 +59,14 @@ PATTERNS: list[Pattern] = [
         category=7,
         rule_id="py.security.shell-true",
         title="Shell command injection risk",
+        # A `def` whose only `shell=True` is a parameter default declares an
+        # option; it runs nothing. The call that forwards it (`run(cmd,
+        # shell=shell)`) is the command-injection detector's job. A def line
+        # that also has a call with `shell=True` after its `)` still matches.
         regex=re.compile(
-            r"(?m)^[^#\n]*\b[A-Za-z_][A-Za-z0-9_.]*\([^#\n]*shell[ \t]*=[ \t]*True"
+            r"(?m)^(?![ \t]*(?:async[ \t]+)?def[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\("
+            r"[^()\n]*\)(?:(?!shell[ \t]*=[ \t]*True)[^\n])*$)"
+            r"[^#\n]*\b[A-Za-z_][A-Za-z0-9_.]*\([^#\n]*shell[ \t]*=[ \t]*True"
         ),
         thresholds=((0, "critical"),),
         exclude_regex=re.compile(r"pattern:"),

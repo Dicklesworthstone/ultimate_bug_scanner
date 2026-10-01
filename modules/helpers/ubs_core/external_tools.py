@@ -56,7 +56,9 @@ def run_command(tool: str, argv: Sequence[str], root: Path, timeout: float,
         return None
     try:
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-            proc = subprocess.Popen(
+            # The only tainted argv reaching here is the operator's
+            # UBS_AST_GREP_BIN override (scan_ast_config); argv is a list, no shell.
+            proc = subprocess.Popen(  # ubs:ignore[python.taint.command] - executable comes from operator configuration, not request input.
                 list(argv), cwd=root, stdin=subprocess.DEVNULL, stdout=stdout,
                 stderr=stdout if merge_stderr else stderr, env=env,
                 start_new_session=os.name == "posix",

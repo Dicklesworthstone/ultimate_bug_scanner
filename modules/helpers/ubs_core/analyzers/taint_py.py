@@ -327,7 +327,7 @@ def join_facts(*facts: Fact) -> Fact:
     # A lone fact, or one fact object joined with itself, is its own join:
     # its traces are already distinct. Returning it keeps object identity,
     # which lets repeated state joins take the identity fast path below.
-    if type(head) is frozenset and all(fact is head for fact in present):
+    if type(head) is frozenset and all(fact is head for fact in present):  # ubs:ignore[py.comparison.type-equality,py.type-equality] - exact type on purpose: only a plain frozenset is known immutable with stock hashing/equality.
         return head
     traces: dict[TaintTrace, TaintTrace] = {}
     for fact in facts:

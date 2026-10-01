@@ -47,7 +47,7 @@ _TIMEOUT = 600.0
 
 def _validated_match(line: str) -> dict:
     """Validate the analyzer boundary before filtering or counting evidence."""
-    match = json.loads(line)
+    match = json.loads(line)  # ubs:ignore[py.parsing.json-loads-no-try] - JSONDecodeError is a ValueError, which the only caller catches and reports.
     if not isinstance(match, dict):
         raise ValueError("expected a diagnostic object")
     rule_id = match.get("ruleId") or match.get("rule_id")

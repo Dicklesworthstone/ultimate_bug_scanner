@@ -47,6 +47,14 @@ import re
 
 from ubs_core.py_scan import Pattern
 
+# One parameter: optional separator (`*,` / `/,`) first, then a name with
+# its annotation and default. One level of brackets/parens is allowed so the
+# commas inside `dict[str, int]` or `f(a, b)` stay inside the parameter.
+_PARAM = (
+    r"[ \t]*(?:[*/][ \t]*,[ \t]*)?(?![ \t]*[*/][ \t]*[,)])"
+    r"(?:[^,()\[\]\n]|\[[^\[\]\n]*\]|\([^()\n]*\))+"
+)
+
 PATTERNS: list[Pattern] = [
     # ── Category 8: FUNCTION & SCOPE ISSUES ─────────────────────────────────
     Pattern(
@@ -62,10 +70,17 @@ PATTERNS: list[Pattern] = [
         category=8,
         rule_id="py.functions.high-param-count",
         title="Functions with >6 parameters",
-        # Six commas inside the parens = >=7 parameters; `[^)]*,` x6 mirrors
-        # the legacy repetition (commas may sit inside the span).
+        # Seven parameters on the `def` line, counted as parameters rather
+        # than commas: a leading `self`/`cls` receiver is not one, nor is a
+        # bare `*` or `/` separator, and a comma inside an annotation's
+        # brackets (`dict[str, int]`, `tuple[Fact, ...]`) separates nothing.
+        # Six parameters and a trailing comma at the end of the line mean the
+        # list continues, so the seventh is on the next line.
         regex=re.compile(
-            r"def[ \t]+[A-Za-z_][A-Za-z0-9_]*\((?:[^)\n]*,){6}[^)\n]*[,)]"
+            r"(?m)def[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\([ \t]*"
+            r"(?:(?:self|cls)[ \t]*(?::[^,()\n]*)?,|(?![ \t]*(?:self|cls)\b))"
+            r"(?:" + _PARAM + r",){6}"
+            r"(?:" + _PARAM + r"|[ \t]*(?:#[^\n]*)?$)"
         ),
         thresholds=((3, "warning"),),
     ),

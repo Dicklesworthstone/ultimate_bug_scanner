@@ -509,7 +509,7 @@ def scan_ast_rules(
     for i in range(0, len(file_strs), batch_size):
         batch = file_strs[i:i + batch_size]
         try:
-            proc = subprocess.run(
+            proc = subprocess.run(  # ubs:ignore[py.security.command-injection,python.taint.command] - UBS_AST_GREP_BIN is the operator's own ast-grep path (the runner verifies and exports it); argv is a list, no shell.
                 [ast_bin, "scan", "-c", str(config), "--json=stream", *batch],
                 capture_output=True,
                 encoding="utf-8",

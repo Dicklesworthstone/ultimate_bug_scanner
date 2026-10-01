@@ -2339,7 +2339,8 @@ def main(argv: list[str] | None = None) -> int:
             from ubs_core.external_tools import scan_custom_rules
             policy = StringIO()
             scan_custom_rules(args.custom_rules, files_to_scan, policy, "rust", scan.scan_errors)
-            replay_findings(scan, r, [json.loads(line) for line in policy.getvalue().splitlines()])
+            # scan_custom_rules wrote these lines with json.dumps just above.
+            replay_findings(scan, r, [json.loads(line) for line in policy.getvalue().splitlines()])  # ubs:ignore[py.parsing.json-loads-no-try]
 
         by_file: dict[str, list[dict]] = {}
         for record in scan.records:

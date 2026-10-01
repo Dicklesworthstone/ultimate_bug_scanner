@@ -122,10 +122,15 @@ PATTERNS: list[Pattern] = [
         rule_id="py.control-flow.finally-transfer",
         title="Control transfer in finally",
         # legacy 11475-11476: `finally:[[:space:]]*$` headers + `grep -A3 -E
-        # 'return|break|continue'` → transfer line within the 3 lines after
-        # finally: (substring match — faithful to the unbounded grep -E).
+        # 'return|break|continue'` → transfer within the 3 lines after
+        # finally:. The transfer must be a statement inside the finally block:
+        # indented deeper than the header and starting with the keyword. A
+        # substring match reported comments ("returns survive") and code that
+        # follows the block (`self.handled.pop()` then a dedented `return`).
         regex=re.compile(
-            r"[^\n]*finally:[ \t]*\n(?:[^\n]*\n){0,2}?[^\n]*(?:return|break|continue)"
+            r"(?m)^([ \t]*)finally:[ \t]*(?:#[^\n]*)?\n"
+            r"(?:(?:\1[ \t]+[^\n]*|[ \t]*)\n){0,2}?"
+            r"\1[ \t]+(?:return|break|continue)\b"
         ),
         thresholds=((0, "warning"),),
     ),

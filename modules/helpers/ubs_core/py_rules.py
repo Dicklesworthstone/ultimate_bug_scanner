@@ -435,6 +435,8 @@ rule:
   any:
     - pattern: type($X) == $T
     - pattern: type($X) is $T
+  not:
+    pattern: type($X) is int
 severity: warning
 message: "Use isinstance(x, T) instead of type(x) == T"
 ''',

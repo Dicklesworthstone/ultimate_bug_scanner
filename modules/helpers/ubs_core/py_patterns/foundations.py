@@ -77,7 +77,16 @@ PATTERNS: list[Pattern] = [
         rule_id="py.comparison.type-equality",
         title="type equality used",
         # legacy: warning >0 "type equality used" (10875-10877).
-        regex=re.compile(r"type\([^\n)]+\)[ \t]*(==|is)[ \t]*[A-Za-z_][A-Za-z0-9_.]*"),
+        # Only the builtin `type(...)`: `self.exception_type(node) is not
+        # None` is a method call whose name merely ends in "type". The
+        # identity form against `int` (`type(n) is int`, `is not int`) is the
+        # idiom that rejects bool, which isinstance(n, int) would accept, so
+        # the suggested rewrite would change behaviour. The `==` spelling and
+        # every other type stay reported.
+        regex=re.compile(
+            r"(?<![A-Za-z0-9_.])type\([^\n)]+\)[ \t]*"
+            r"(?:==[ \t]*|is[ \t]+(?:not[ \t]+)?(?!(?:not|int)\b))[A-Za-z_][A-Za-z0-9_.]*"
+        ),
         thresholds=((0, "warning"),),
     ),
 ]

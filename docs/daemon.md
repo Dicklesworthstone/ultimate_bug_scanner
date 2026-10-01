@@ -2,8 +2,9 @@
 
 The checkout now provides `ubs-daemon serve` and `ubs-daemon client`. This is a
 standalone optional frontend to the real scanner, not a replacement detector
-engine. `ubs serve` / `ubs --client`, automatic installation and in-process
-analysis are not implemented yet.
+engine. Serving or querying it through `ubs` itself (a serve subcommand or a
+client flag), automatic installation and in-process analysis are not
+implemented yet.
 
 ```bash
 ./ubs-daemon serve --repo /path/to/project

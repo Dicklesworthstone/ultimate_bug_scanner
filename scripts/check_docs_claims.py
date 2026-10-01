@@ -163,7 +163,10 @@ def check_helpers() -> None:
     on_disk = {
         p.relative_to(ROOT / "modules").as_posix()
         for p in (ROOT / "modules" / "helpers").rglob("*")
-        if p.is_file() and not p.name.startswith(".") and "__pycache__" not in p.parts
+        # Same rule as verify_checksums.sh / update_checksums.py: tool caches
+        # (__pycache__/, .ruff_cache/, other dot entries) are not shipped helpers.
+        if p.is_file() and "__pycache__" not in p.parts
+        and not any(part.startswith(".") for part in p.relative_to(ROOT / "modules" / "helpers").parts)
     }
     # The shared module library ships through the same checksum channel.
     on_disk |= {f"lib/{p.name}" for p in (ROOT / "modules" / "lib").glob("*.sh")}

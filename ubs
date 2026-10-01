@@ -1337,6 +1337,11 @@ JSONL_DETAIL=1               # 1=include findings, 0=summary only (for backward 
 AST_GREP_BIN=""
 AST_GREP_SOURCE=""
 
+# The command line exactly as the user typed it. Option parsing below consumes
+# "$@", so a self-update that re-execs the freshly installed binary must
+# replay this saved copy — the live "$@" is empty by then.
+UBS_ORIGINAL_ARGS=("$@")
+
 if [[ "${1:-}" == "doctor" ]]; then
   MODE="doctor"
   shift
@@ -5704,7 +5709,9 @@ check_and_update_self(){
     return $?
   }
   # shellcheck disable=SC2064
-  trap "rm -f '$work_dir/SHA256SUMS' '$work_dir/SHA256SUMS.minisig' '$work_dir/ubs'; rmdir '$work_dir' 2>/dev/null" RETURN
+  # RETURN traps are global, so the trap clears itself after firing once;
+  # `|| true` keeps a failed rmdir from tripping the ERR trap (errtrace).
+  trap "rm -f '$work_dir/SHA256SUMS' '$work_dir/SHA256SUMS.minisig' '$work_dir/ubs'; rmdir '$work_dir' 2>/dev/null || true; trap - RETURN" RETURN
 
   # 1. Fetch the release checksum manifest (fail closed — no manifest, no update).
   local sums_file="$work_dir/SHA256SUMS"
@@ -5797,12 +5804,21 @@ check_and_update_self(){
       fi
       # Update check timestamp
       date +%s > "$last_check_file"
+      # `ubs --update` asked for nothing beyond the update: it is done, and
+      # the caller reports success and exits 0 (the RETURN trap cleans up).
+      # Re-exec'ing here used to start the new binary with an empty argv
+      # (parsing had consumed "$@"), which ran a full scan of the working
+      # directory and returned the scan's exit code instead of the update's.
+      if [[ "${UPDATE_ONLY:-0}" -eq 1 ]]; then
+        return 0
+      fi
       # Clean up staged artifacts now: exec replaces the process, so the
-      # RETURN trap below never fires on this path.
+      # RETURN trap never fires on this path.
       rm -f "$work_dir/SHA256SUMS" "$work_dir/SHA256SUMS.minisig" "$work_dir/ubs"
       rmdir "$work_dir" 2>/dev/null || true
-      # Re-exec self to run the new version
-      exec "$self_path" "$@"
+      # Otherwise (opt-in auto-update ahead of real work) hand the user's
+      # original command line to the new version.
+      exec "$self_path" ${UBS_ORIGINAL_ARGS[@]+"${UBS_ORIGINAL_ARGS[@]}"}
     else
       rm -f "$tmp_self"
       self_update_fail "failed to replace $self_path"
@@ -5829,7 +5845,7 @@ fi
 # the update could not be performed or verified (issue #87); the opt-in
 # background check reports success so it never breaks a scan.
 SELF_UPDATE_STATUS=0
-check_and_update_self "$@" || SELF_UPDATE_STATUS=$?
+check_and_update_self || SELF_UPDATE_STATUS=$?
 
 if [[ "$UPDATE_ONLY" -eq 1 ]]; then
   if [[ "$SELF_UPDATE_STATUS" -eq 0 ]]; then

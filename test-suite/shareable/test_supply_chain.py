@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -584,6 +585,95 @@ def test_self_update_bad_signature_refused() -> None:
         )
 
 
+def _self_update_release(p: Path, marker: Path) -> tuple[Path, Path, dict[str, str]]:
+    """Install a ubs copy plus a verified fake release under a scratch HOME.
+
+    The release payload is a stub "newer" ubs that records its argv in
+    `marker` and exits 7, so a test can tell whether (and how) the updated
+    binary was re-executed. HOME/XDG_CACHE_HOME point into `p` so nothing
+    touches the real user's cache or installed binaries.
+    """
+    home = p / "home"
+    home.mkdir()
+    bin_dir = p / "bin"
+    bin_dir.mkdir()
+    installed_ubs = bin_dir / "ubs"
+    shutil.copy2(UBS, installed_ubs)
+    installed_ubs.chmod(0o755)
+
+    release_dir = p / "release"
+    release_dir.mkdir()
+    payload = (
+        "#!/usr/bin/env bash\n"
+        'UBS_VERSION="99.0.0"\n'
+        f"printf '%s\\n' \"argc=$#\" \"$@\" > {shlex.quote(str(marker))}\n"
+        "exit 7\n"
+    )
+    (release_dir / "ubs").write_text(payload, encoding="utf-8")
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    (release_dir / "SHA256SUMS").write_text(f"{digest}  ubs\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    for key in ("UBS_MINISIGN_PUBKEY", "UBS_NO_AUTO_UPDATE", "CI", "FORCE_SELF_UPDATE", "UBS_ENABLE_AUTO_UPDATE"):
+        env.pop(key, None)
+    env.update({
+        "HOME": str(home),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "UBS_RELEASE_BASE": f"file://{release_dir}",
+        "NO_COLOR": "1",
+    })
+    return installed_ubs, release_dir / "ubs", env
+
+
+def test_self_update_only_exits_zero_without_rerun() -> None:
+    """`ubs --update` that installs a new version exits 0 and does not re-run (scan) with the new binary."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-update-ok-") as tmp:
+        p = Path(tmp)
+        marker = p / "rerun-argv"
+        installed_ubs, payload, env = _self_update_release(p, marker)
+        work = p / "work"
+        work.mkdir()
+        proc = subprocess.run([str(installed_ubs), "--update"], cwd=work, env=env, capture_output=True, text=True, timeout=120)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied UBS --update installs a test-owned local release in a scratch HOME.
+        replaced = installed_ubs.read_bytes() == payload.read_bytes()
+        ok = (
+            proc.returncode == 0
+            and replaced
+            and not marker.exists()
+            and "Updated successfully" in proc.stderr
+        )
+        report(
+            "test_self_update_only_exits_zero_without_rerun",
+            ok,
+            f"exit={proc.returncode} replaced={replaced} reran={marker.exists()}",
+            proc,
+        )
+
+
+def test_auto_update_reexecs_with_original_args() -> None:
+    """Opt-in auto-update ahead of real work re-execs the new binary with the user's original argv."""
+    with tempfile.TemporaryDirectory(prefix="ubs-sc-autoupdate-") as tmp:
+        p = Path(tmp)
+        marker = p / "rerun-argv"
+        installed_ubs, payload, env = _self_update_release(p, marker)
+        env["UBS_ENABLE_AUTO_UPDATE"] = "1"
+        target = p / "target dir"
+        target.mkdir()
+        (target / "a.py").write_text("x = 1\n", encoding="utf-8")
+        argv = ["--format=json", "--only=python", str(target)]
+        proc = subprocess.run([str(installed_ubs), *argv], cwd=p, env=env, capture_output=True, text=True, timeout=120)  # ubs:ignore[python.taint.command] - trusted test-runner env; auto-update against a test-owned local release in a scratch HOME.
+        replaced = installed_ubs.read_bytes() == payload.read_bytes()
+        recorded = marker.read_text(encoding="utf-8").splitlines() if marker.exists() else []
+        expected = [f"argc={len(argv)}", *argv]
+        ok = proc.returncode == 7 and replaced and recorded == expected
+        report(
+            "test_auto_update_reexecs_with_original_args",
+            ok,
+            f"exit={proc.returncode} replaced={replaced} argv={recorded!r}",
+            proc,
+        )
+
+
 def test_sha256sums_coverage() -> None:
     """Assert SHA256SUMS exists, covers required release files, and all digests match."""
     sums_file = REPO_ROOT / "SHA256SUMS"
@@ -653,6 +743,8 @@ def main() -> int:
         test_tampered_module_refused,
         test_corrupted_ast_grep_zip_refused,
         test_self_update_bad_signature_refused,
+        test_self_update_only_exits_zero_without_rerun,
+        test_auto_update_reexecs_with_original_args,
         test_sha256sums_coverage,
     ):
         try:

@@ -14,6 +14,55 @@ _No changes yet._
 
 ---
 
+## [v5.4.16] - 2026-10-01 [Release]
+
+First published release since [v5.4.9](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.4.9). The tags v5.4.10 through v5.4.15 exist in git but never got release assets, so `ubs --update` and the `curl | bash` installer stayed on v5.4.9; everything those tags contained is included here.
+
+### Custom rules
+
+- Shared rule packs ([#144](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/144)). `--rules` can be given more than once, `UBS_RULES=DIR[:DIR...]` supplies rule directories when no `--rules` is passed, and a project's own rules load in every language module, not just JavaScript and Python. Several directories load as one policy. Nested rule directories and `.yaml` rule files are no longer dropped (`d58f0f2`, `38925df`, `fb193d3`).
+- `--rules=DIR` now applies to the Bash module, and a missing `--rules` directory is an error instead of being accepted silently ([#138](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/138)).
+- `py.security.sql-injection` accepts a configurable list of identifier sanitizers, so a validated table or column name is no longer reported ([#133](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/133)).
+
+### Missed or wrong findings
+
+- Python and C++ taint findings no longer vanish when the project itself sits under a directory named `build`, `dist`, `.cache` or `node_modules` ([#151](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/151)).
+- A directory named `bin/` is scanned instead of being skipped as build output ([#136](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/136)).
+- Rust: a partly cached scan reports exactly what a cold scan reports. It no longer duplicates `guarded-later-unwrap` findings or loses the tech-debt total, and a warm scan keeps tech-debt findings in category order ([#150](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/150)).
+- JavaScript: lockfiles and manifests (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) are no longer scanned as code, so integrity hashes are not reported as loose equality ([#149](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/149)).
+- JavaScript: `window.fetch()` without an abort signal is reported even when a formatter puts `.fetch(` on the line after `window` ([#148](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/148)).
+- JavaScript taint: a property name or object key that happens to match a tainted variable's name no longer carries that variable's taint ([#146](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/146)). Numbers, database query rows and `res.json(...)` are no longer treated as injection vectors.
+- `ctcompare` no longer pairs operands across `||` / `&&` (a `typeof` guard was reported as an unsafe secret comparison, [#135](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/135)) and no longer treats an authorization scope label as a secret ([#143](https://github.com/Dicklesworthstone/ultimate_bug_scanner/issues/143)).
+- Python: five rules stopped reporting code that is not a bug. `python.ctcompare.secret_eq` no longer treats a code signature (`sig = self._call_signature(node)`), a literal tuple key or `signal.SIG_DFL` as a secret; `py.security.shell-true` ignores a `def` whose parameter defaults to `shell=True`; the type-equality rules ignore methods whose names end in `type` and the bool-rejecting `type(n) is int` idiom; `py.control-flow.finally-transfer` requires the `return`/`break`/`continue` to be inside the `finally` block; and `py.functions.high-param-count` no longer counts `self`, a bare `*` or commas inside type annotations (`eb4de96`).
+- Python resource lifecycle: a closure that is called releases the resource it closes over, and ownership tracking was tightened.
+- `--staged` scans the content staged in the git index, not the working-tree bytes.
+
+### Deeper analysis
+
+- Taint analysis for Python, JavaScript/TypeScript and Go now follows data through local function summaries, across files in the selected set (ESM, TypeScript and CommonJS imports in JS; selected modules in Python; packages in Go), through object fields and arrays, callbacks (`map`, `reduce`, `reduceRight` and other native array methods), exceptions and `catch` bindings, comprehensions, `match` statements, and FastAPI request inputs. Python adds URL-aware SSRF detection and finds interpreter payloads passed to process-execution APIs. Go follows request decoding into pointer destinations.
+- Analyzers fail closed: a malformed AST result or a crashed analyzer is reported as incomplete coverage instead of a clean result, and findings already produced are kept.
+- The pre-filter that skips checks for files that cannot match only excludes a check when it can prove that, and keeps candidates when the optimizer fails.
+
+### New in a checkout: local scan service and editor diagnostics
+
+These are optional frontends that ship in the repository; the installer does not install them yet.
+
+- `ubs-daemon serve` / `ubs-daemon client` run a repository-local scan service that agents and save hooks can call, with explicit-file, directory and git-scoped scans, bounded parallel workers, per-scan cancellation and `watch` rescans. A missing daemon falls back to an ordinary scan. See `docs/daemon.md`.
+- `ubs-lsp` publishes UBS findings to editors over LSP for saved files, with an opt-in mode that scans unsaved buffers in an isolated snapshot. See `docs/editor.md`.
+
+### Install and supply chain
+
+- `verify.sh` can verify a whole release, including every pinned module and helper, without running anything (`--verify-only`), and can export the verified runtime as a portable bundle for offline machines (`--bundle-output FILE.tar.gz`).
+- A verified install no longer re-executes the unsigned installer from `main`, and post-install checks run the `ubs` that was just installed rather than whichever one is first on `PATH`.
+- The installer does not add a UBS Claude hook on top of an existing dcg hook, and repairs user-scope hook paths.
+- Helper checksum generation skips git-ignored files such as `.ruff_cache`, so a local cache can no longer end up pinned as a helper asset.
+
+### Assets
+
+`install.sh`, `ubs`, `verify.sh`, `git_safety_guard.py`, `SHA256SUMS` signed with the release minisign key (`SHA256SUMS.minisig`), `ubs.rb` and `sbom.spdx.json`, the same set as v5.4.9. The release was cut and signed locally; Cosign bundles, SLSA provenance and the GHCR image are produced only by GitHub Actions and are not part of it.
+
+---
+
 ## [v5.4.9] - 2026-09-19 [Release]
 
 ### Target selection

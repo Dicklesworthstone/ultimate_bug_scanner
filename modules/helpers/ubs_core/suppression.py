@@ -43,6 +43,9 @@ _HASH_LANGS = frozenset({"python", "ruby", "elixir"})
 _BLOCK_KEYWORDS = {"ruby": ("def ", "end"), "elixir": ("do", "end")}
 _C_CONTINUATION = ("\\", "(", "[", ",", "&&", "||", "=>", "=", "+", "-", "*", "/", "?", "|", "&", "<", ">", ".")
 _PY_CONTINUATION = ("\\", "(", "[", "{", ",", "&", "|", "+", ".", "->", "do", "then", "else")
+# Ruby/Elixir keywords that leave a statement open. They continue a statement
+# only as whole words: `x = todo` or `pseudo` must not swallow the next line.
+_KEYWORD_CONTINUATION = re.compile(r"(?<![\w?!@$])(?:do|then|else)$")
 
 
 def may_have_markers(text: str) -> bool:
@@ -344,8 +347,15 @@ def _python_indent_blocks(lines: list[str]) -> list[Interval]:
 def _continues(code: str, paren_open: bool, lang: str) -> bool:
     if paren_open:
         return True
-    suffixes = _PY_CONTINUATION if lang in _HASH_LANGS else _C_CONTINUATION
-    return code.endswith(tuple(suffixes))
+    if lang in _HASH_LANGS:
+        if code.endswith(("do", "then", "else")):
+            return bool(_KEYWORD_CONTINUATION.search(code))
+        return code.endswith(_PY_CONTINUATION)
+    # A postfix increment/decrement completes a statement (Go, Swift, JS
+    # without semicolons); it is not a dangling binary `+`/`-`.
+    if code.endswith(("++", "--")):
+        return False
+    return code.endswith(_C_CONTINUATION)
 
 
 def build_index(text: str, lang: str = "python") -> SuppressionIndex:

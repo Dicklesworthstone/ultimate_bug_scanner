@@ -1441,6 +1441,38 @@ mod tests {
         self.assertFalse(cfg_implies_test(many_tokens), "High token count cfg must fail closed")
 
 
+class StatementBoundaryTests(unittest.TestCase):
+    """A marker on one statement never leaks onto the next one."""
+
+    def test_identifier_ending_in_keyword_does_not_continue_python(self) -> None:
+        code = (
+            "def f(password, provided, todo):\n"
+            "    expected = todo  # ubs:ignore[python.ctcompare.secret_eq]\n"
+            "    return password == provided\n"
+            "    pseudo = 1  # ubs:ignore\n"
+            "    return password != provided\n"
+        )
+        index = build_index(code, lang="python")
+        self.assertTrue(index.is_suppressed(2, "python.ctcompare.secret_eq"))
+        self.assertFalse(index.is_suppressed(3, "python.ctcompare.secret_eq"))
+        self.assertFalse(index.is_suppressed(5, "python.ctcompare.secret_eq"))
+
+    def test_ruby_keyword_continuation_still_whole_word(self) -> None:
+        code = "x = undo # ubs:ignore[ruby.rule]\nsecret == given\n"
+        self.assertFalse(build_index(code, lang="ruby").is_suppressed(2, "ruby.rule"))
+        code = "value = if ok then\n  secret == given # ubs:ignore[ruby.rule]\nend\n"
+        self.assertTrue(build_index(code, lang="ruby").is_suppressed(1, "ruby.rule"))
+
+    def test_postfix_increment_completes_statement(self) -> None:
+        code = "i++ // ubs:ignore[go.rule]\nif token == expected {\n}\nj--\nok := a == b // ubs:ignore[go.rule]\n"
+        index = build_index(code, lang="go")
+        self.assertFalse(index.is_suppressed(2, "go.rule"))
+        self.assertFalse(index.is_suppressed(4, "go.rule"))
+        # A dangling binary operator still continues the statement.
+        code = "total := a +\n    b // ubs:ignore[go.rule]\n"
+        self.assertTrue(build_index(code, lang="go").is_suppressed(1, "go.rule"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

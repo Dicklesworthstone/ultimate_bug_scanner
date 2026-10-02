@@ -246,6 +246,60 @@ def cargo_integration_test_root(path: Path) -> bool:
         return False
 
 
+def _shadow_mirror_pairs(mirror_map: str) -> list[tuple[str, str]]:
+    """(workspace path, real path) pairs the meta-runner recorded, longest first."""
+    try:
+        fields = Path(mirror_map).read_text(encoding="utf-8", errors="surrogateescape").split("\0")
+    except OSError:
+        return []
+    pairs = [(fields[i], fields[i + 1]) for i in range(0, len(fields) - 1, 2)
+             if fields[i] and fields[i + 1]]
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    return pairs
+
+
+def shadow_source_path(path: Path, environ=None) -> Path | None:
+    """Map a shadow-workspace copy back to the source path it was copied from.
+
+    Targeted multi-file and git-mode scans copy the named files into a shadow
+    workspace that deliberately has no Cargo.toml (so cargo phases skip it).
+    Manifest-backed context such as ``cargo_integration_test_root`` must be
+    judged at the file's real location, or the same file is classified
+    differently depending on how many files were passed (GH #152). The
+    meta-runner exports the workspace root, the directory it mirrors and the
+    map of targets mirrored from outside that directory.
+    """
+    env = os.environ if environ is None else environ
+    workspace = env.get("UBS_SHADOW_WORKSPACE_DIR", "")
+    source = env.get("UBS_SHADOW_SOURCE_DIR", "")
+    if not workspace or not source:
+        return None
+    candidate = os.path.abspath(path)
+    roots: list[tuple[str, str]] = []
+    mirror_map = env.get("UBS_WORKSPACE_MIRROR_MAP", "")
+    if mirror_map:
+        roots.extend(_shadow_mirror_pairs(mirror_map))
+    roots.append((workspace, source))
+    for shadow, real in roots:
+        # A symlinked TMPDIR (macOS /var -> /private/var) can reach the
+        # workspace under either spelling.
+        for spelling in dict.fromkeys((os.path.abspath(shadow), os.path.realpath(shadow))):
+            if candidate.startswith(spelling.rstrip(os.sep) + os.sep):
+                relative = candidate[len(spelling.rstrip(os.sep)) + 1:]
+                if not relative or any(part in ("", ".", "..") for part in relative.split(os.sep)):
+                    return None
+                return Path(real) / relative
+    return None
+
+
+def integration_test_root_in_context(path: Path, environ=None) -> bool:
+    """``cargo_integration_test_root`` at the file's real location (GH #152)."""
+    if cargo_integration_test_root(path):
+        return True
+    source = shadow_source_path(path, environ)
+    return source is not None and cargo_integration_test_root(source)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Conservative three-valued cfg evaluation (test=False)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +808,7 @@ class Scan:
             self.suppressions.index(path, text)
         self.test_only: set[str] = set()
         self.integration_test_roots = {
-            str(path) for path in self.files if cargo_integration_test_root(path)
+            str(path) for path in self.files if integration_test_root_in_context(path)
         }
         self.boundary_cache: dict[str, int] = {}
         self.test_scope_cache: dict[str, TestScopeIndex] = {}

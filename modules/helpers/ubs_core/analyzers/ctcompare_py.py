@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import build_index
 
 ROOT: Path = Path.cwd()
 BASE_DIR: Path = ROOT
@@ -130,13 +131,7 @@ def source_line(lines, line_no):
         return lines[idx].strip()
     return ''
 
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
+RULE_ID = 'python.ctcompare.secret_eq'
 
 def target_names(target):
     if isinstance(target, ast.Name):
@@ -196,9 +191,17 @@ def is_constant_display(node):
 
 
 class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, lines):
+    def __init__(self, path, lines, suppressions=None):
         self.path = path
         self.lines = lines
+        # Shared comment-owned statement index (GH #153, #154): a marker on any
+        # physical line of the comparison's statement (or a standalone marker
+        # directly above it) suppresses it, but only a bare marker or one that
+        # lists this rule id; marker text inside string literals never counts.
+        self.suppressions = (
+            suppressions if suppressions is not None
+            else build_index('\n'.join(lines), lang='python')
+        )
         self.sensitive_names = set()
         # Names bound to an unkeyed hashlib object fed only non-secret data
         # (GH #102): their .digest()/.hexdigest() is a checksum, not a tag.
@@ -216,7 +219,7 @@ class ConstantTimeCompareAnalyzer(ast.NodeVisitor):
             return self.path.name
 
     def remember_issue(self, line_no):
-        if has_ignore(self.lines, line_no) or line_no in self.seen_lines:
+        if line_no in self.seen_lines or self.suppressions.is_suppressed(line_no, RULE_ID):
             return
         self.seen_lines.add(line_no)
         self.issues.append((self.relative_path(), line_no, source_line(self.lines, line_no)))
@@ -381,7 +384,7 @@ def analyze(path, issues):
     except Exception:
         return
     lines = text.splitlines()
-    analyzer = ConstantTimeCompareAnalyzer(path, lines)
+    analyzer = ConstantTimeCompareAnalyzer(path, lines, build_index(text, lang='python'))
     analyzer.visit(tree)
     issues.extend(analyzer.issues)
 
@@ -404,7 +407,6 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-_RULE_KIND = "secret_eq"
 _SEVERITY = "critical"
 _MESSAGE = (
     "Secret, signature, or token compared with ==/!=; "
@@ -427,7 +429,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
                 except ValueError:
                     display = str(path)
             yield {
-                "rule": f"python.ctcompare.{_RULE_KIND}",
+                "rule": RULE_ID,
                 "path": display,
                 "line": line_no,
                 "col": 1,
@@ -462,6 +464,87 @@ def _selftest_ubs_ignore_suppression() -> None:
         "    return password == stored  # ubs:ignore\n"
     )
     assert not _scan_code(code)
+
+
+def _selftest_rule_scoped_suppression_matrix() -> None:
+    # GH #154: only a bare marker or one listing this rule suppresses; an
+    # unrelated rule scope, a malformed scope, and marker text inside a string
+    # literal leave the comparison reported.
+    code = (
+        "def none(password, provided):\n"
+        "    return password == provided\n"
+        "def right(password, provided):\n"
+        "    return password == provided  # ubs:ignore[python.ctcompare.secret_eq]\n"
+        "def wrong(password, provided):\n"
+        "    return password == provided  # ubs:ignore[python.taint.sql] -- unrelated\n"
+        "def listed(password, provided):\n"
+        "    return password == provided  # ubs:ignore[python.taint.sql, python.ctcompare.secret_eq]\n"
+        "def bare(password, provided):\n"
+        "    return password == provided  # ubs:ignore -- reviewed\n"
+        "def in_string(password, provided):\n"
+        "    return password == provided or 'ubs:ignore' == provided\n"
+        "def malformed(password, provided):\n"
+        "    return password == provided  # ubs:ignore[python.ctcompare.secret_eq\n"
+    )
+    lines = [line for _path, line, _code in _scan_code(code)]
+    assert lines == [2, 6, 12, 14], lines
+
+
+def _selftest_multiline_statement_suppression() -> None:
+    # GH #153: a marker on any physical line of the comparison's statement, or
+    # a standalone marker directly above the statement, suppresses it; a
+    # trailing marker on the previous statement does not.
+    code = (
+        "def closing(password, provided):\n"
+        "    return (\n"
+        "        password == provided\n"
+        "    )  # ubs:ignore[python.ctcompare.secret_eq] -- closing line\n"
+        "def above(password, provided):\n"
+        "    # ubs:ignore[python.ctcompare.secret_eq] -- above the statement\n"
+        "    return (\n"
+        "        password == provided\n"
+        "    )\n"
+        "def opening(password, provided):\n"
+        "    return (  # ubs:ignore[python.ctcompare.secret_eq]\n"
+        "        password == provided\n"
+        "    )\n"
+        "def unrelated_multiline(password, provided):\n"
+        "    return (\n"
+        "        password == provided\n"
+        "    )  # ubs:ignore[python.taint.sql]\n"
+        "def previous_statement(password, provided):\n"
+        "    other = 1  # ubs:ignore[python.ctcompare.secret_eq]\n"
+        "    return password == provided\n"
+        "def control(password, provided):\n"
+        "    return (\n"
+        "        password == provided\n"
+        "    )\n"
+    )
+    lines = [line for _path, line, _code in _scan_code(code)]
+    assert lines == [16, 20, 23], lines
+
+
+def _selftest_run_honours_rule_scoped_markers(tmp_prefix: str = "ubs_core_ctcompare_py_sup_") -> None:
+    # The registry path (what `ubs` runs) drops suppressed comparisons at the
+    # producer and keeps the unannotated control and the wrong-scope finding.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "secrets.py"
+        target.write_text(
+            "def plain(password, provided):\n"
+            "    return password == provided\n"
+            "def annotated(password, provided):\n"
+            "    return (\n"
+            "        password == provided\n"
+            "    )  # ubs:ignore[python.ctcompare.secret_eq] -- reviewed\n"
+            "def unrelated(password, provided):\n"
+            "    return password == provided  # ubs:ignore[python.taint.sql]\n",
+            encoding="utf-8",
+        )
+        findings = list(run(RunContext(lang="python", files=[target])))
+    assert [(f["rule"], f["line"]) for f in findings] == [
+        (RULE_ID, 2), (RULE_ID, 8)
+    ], findings
 
 
 def _selftest_counter_compare_negative() -> None:
@@ -578,6 +661,9 @@ def _selftest_signature_positive_controls() -> None:
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("secret_eq_positive", _selftest_secret_eq_positive),
     ("ubs_ignore_suppression", _selftest_ubs_ignore_suppression),
+    ("rule_scoped_suppression_matrix", _selftest_rule_scoped_suppression_matrix),
+    ("multiline_statement_suppression", _selftest_multiline_statement_suppression),
+    ("run_honours_rule_scoped_markers", _selftest_run_honours_rule_scoped_markers),
     ("counter_compare_negative", _selftest_counter_compare_negative),
     ("hmac_digest_positive", _selftest_hmac_digest_positive),
     ("run_finds_secret_eq", _selftest_run_finds_secret_eq),

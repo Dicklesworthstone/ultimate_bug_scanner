@@ -355,6 +355,15 @@ run_contract_v2_js
         # resolver. Declaration-only files intentionally have a different
         # taint policy and are covered by explicit clean/unsafe tests instead.
         compiler=Path(shutil.which('tsc')).resolve().parents[1]
+        # TypeScript 7 is the native compiler and ships no JavaScript API
+        # (its package entry is lib/version.cjs). Runner images now carry it
+        # as the global tsc; javascript-modules.yml pins 5.8.3 and refuses
+        # skips, so the oracle still runs in CI.
+        probe=subprocess.run(['node','-e',
+            'process.exit(typeof require(process.argv[1]).resolveModuleName==="function"?0:3)',
+            str(compiler)],capture_output=True,text=True,timeout=10)
+        if probe.returncode:
+            self.skipTest(f'{compiler} has no JavaScript compiler API (TypeScript 7+)')
         cases=[
             ('./lib.js', ['lib.ts']), ('./lib.js', ['lib.tsx']),
             ('./lib.js', ['lib.ts','lib.tsx','lib.js']),
@@ -397,7 +406,8 @@ console.log(JSON.stringify(result.resolvedModule?.resolvedFileName ?? null));
                 resolved=graph.resolve(graph.modules[paths[0]],specifier)
                 result=subprocess.run(['node','-e',program,str(compiler),json.dumps({
                     'files':list(map(str,paths)), 'importer':str(paths[0]), 'specifier':specifier})],
-                    capture_output=True,text=True,timeout=10,check=True)
+                    capture_output=True,text=True,timeout=10)
+                self.assertEqual(result.returncode,0,result.stderr)
                 expected=json.loads(result.stdout)
                 self.assertEqual(str(resolved.path) if resolved else None, expected)
 

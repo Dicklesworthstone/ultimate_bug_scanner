@@ -276,7 +276,7 @@ class CommonJSTaintTests(unittest.TestCase):
                    'lib/index.js': 'exports.read=()=>"safe";',
                    'app.cjs': 'const {read}=require("./lib");res.send(read());'}, ('app.cjs','xss'))
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()  # graph keys are resolved; macOS /var -> /private/var
             paths = self.write(root, {'lib.cjs': 'module.exports=x=>"safe";',
                                       'app.cjs': 'const f=require("./lib");res.send(f(req.query.html));'})
             graph = ModuleGraph(paths)
@@ -290,7 +290,7 @@ class CommonJSTaintTests(unittest.TestCase):
                    'app.cjs': 'const {f}=require("./a.cjs");res.send(f(req.query.html));'}
         self.scan(sources, ('app.cjs','xss'))
         with tempfile.TemporaryDirectory() as tmp:
-            paths = self.write(Path(tmp), sources)
+            paths = self.write(Path(tmp).resolve(), sources)
             graph = ModuleGraph(paths)
             self.assertIsNone(graph.exported(graph.modules[paths[0]], 'f'))
             self.assertIsNone(graph.exported(graph.modules[paths[1]], 'value'))

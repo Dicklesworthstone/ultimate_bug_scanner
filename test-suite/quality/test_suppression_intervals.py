@@ -620,7 +620,11 @@ class RustDetectorSuppressionTests(unittest.TestCase):
             with self.subTest(detector=detector.__name__, marker="unrelated sink"):
                 self.assertEqual(self.lines(detector, fixture(sink_marker=" // ubs:ignore[rust.other]")), [4])
             with self.subTest(detector=detector.__name__, marker="bare source"):
-                self.assertEqual(self.lines(detector, fixture(source_marker=" // ubs:ignore")), [])
+                # Redirect dataflow applies suppression to reported sinks,
+                # never to transfer functions. An ignored source statement
+                # cannot silently erase an unsuppressed downstream redirect.
+                expected = [4] if detector is open_redirect else []
+                self.assertEqual(self.lines(detector, fixture(source_marker=" // ubs:ignore")), expected)
             for marker in (f" // ubs:ignore[{detector.RULE_ID}]", " // ubs:ignore"):
                 with self.subTest(detector=detector.__name__, sink_marker=marker):
                     self.assertEqual(self.lines(detector, fixture(sink_marker=marker)), [])

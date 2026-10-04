@@ -82,6 +82,23 @@ def _regex_start_context(text: str, idx: int) -> bool:
     return not (ch in ')]')
 
 
+# Keywords a string literal may follow with no space (`return"x"`,
+# `import'./a'` in minified code). After any other identifier character a
+# quote cannot open a string in valid JS, so it is JSX/prose text: the
+# apostrophe of `<p>Don't {a == b}</p>` must not swallow the rest of the line.
+_QUOTE_KEYWORDS = _REGEX_KEYWORDS | {'import', 'from', 'export'}
+
+
+def _quote_opens_string(text: str, idx: int) -> bool:
+    j = idx - 1
+    if j < 0 or not (text[j].isalnum() or text[j] in '_$'):
+        return True
+    k = j
+    while k >= 0 and (text[k].isalnum() or text[k] in '_$'):
+        k -= 1
+    return text[k + 1:j + 1] in _QUOTE_KEYWORDS
+
+
 def _blank(out: list[str], a: int, b: int) -> None:
     """Replace ``out[a:b)`` with spaces, keeping newlines so offsets and line
     numbers stay identical to the input."""
@@ -131,7 +148,7 @@ def _mask_code(text: str, out: list[str], start: int, *, interpolation: bool) ->
             _blank(out, i, end)
             i = end
             continue
-        if c in '\'"':
+        if c in '\'"' and _quote_opens_string(text, i):
             j = i + 1
             while j < n:
                 ch = text[j]
@@ -165,9 +182,8 @@ def _mask_code(text: str, out: list[str], start: int, *, interpolation: bool) ->
                 j += 1
             i = j
             continue
-        if c == '/' and nxt == '=':
-            i += 2  # /= division-assignment: code, but not a $L / $R node
-            continue
+        # Regex context first: `/=` can only assign after an operand, so
+        # `return /=x/` and `(/==/)` are regex literals, not `/=`.
         if c == '/' and not _jsx_punct(text, i) and _regex_start_context(text, i):
             j = i + 1
             in_class = False
@@ -193,6 +209,9 @@ def _mask_code(text: str, out: list[str], start: int, *, interpolation: bool) ->
                 _blank(out, i, end)
                 i = end
                 continue
+        if c == '/' and nxt == '=':
+            i += 2  # /= division-assignment: code, but not a $L / $R node
+            continue
         i += 1
     return n
 

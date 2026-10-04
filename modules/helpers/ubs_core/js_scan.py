@@ -131,6 +131,9 @@ class Pattern:
     # Match against executable code only: comments, string and template text
     # and regex literals are blanked (``${...}`` bodies stay visible), so an
     # operator rule cannot fire on `'pkg==1.0'` or `// a == b` (GH #157).
+    # scan_patterns skips the masker for files whose raw text has no match,
+    # which assumes blanking never creates one: the regex must not require
+    # whitespace that a blanked delimiter could supply.
     code_only: bool = False
 
 
@@ -157,10 +160,12 @@ def iter_matches(
 ) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for matches, skipping excluded lines.
 
-    ``text`` is the view the regex runs against (the code view for code_only
-    patterns); ``raw_text`` is the original source used for the ubs:ignore
-    check, the exclude_regex post-filter and the reported line. Both views and
-    any mask_regex blanking share one coordinate system."""
+    ``text`` is the view the regex and the exclude_regex post-filter run
+    against (the code view for code_only patterns, so `// prefer ===` cannot
+    drop a real `==` on the same line); ``raw_text`` is the original source
+    used for the ubs:ignore check, which lives in comments, and for the
+    reported line. Both views and any mask_regex blanking share one
+    coordinate system."""
     source = raw_text if raw_text is not None else text
     haystack = text if pattern.mask_regex is None else _mask_spans(text, pattern.mask_regex)
     for match in pattern.regex.finditer(haystack):
@@ -172,7 +177,7 @@ def iter_matches(
         line_text = source[line_start:line_end]
         if MARKER in line_text:
             continue  # legacy count_lines drops marker lines from counts
-        if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
+        if pattern.exclude_regex is not None and pattern.exclude_regex.search(text[line_start:line_end]):
             continue
         yield line_no, line_text.strip()[:240]
 
@@ -251,7 +256,7 @@ def scan_patterns(
             scan_text = text
             if pattern.code_only:
                 if not pattern.regex.search(text):
-                    continue  # blanking only removes matches; skip the masker
+                    continue  # no candidate to blank away (see Pattern.code_only)
                 if path not in code_views:
                     code_views[path] = code_view(text)
                 scan_text = code_views[path]

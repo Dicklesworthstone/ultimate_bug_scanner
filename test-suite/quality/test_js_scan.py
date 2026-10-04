@@ -674,6 +674,25 @@ class LooseEqualityCodeOnlyTests(unittest.TestCase):
         ]) + "\n"
         self.assertEqual(self.lines(src), [1, 2, 3, 4, 5])
 
+    def test_exclusion_reads_code_and_marker_reads_comments(self) -> None:
+        src = "\n".join([
+            "expect(x == y).toBe(true); // prefer ===",  # 1: `===` only in a comment
+            "log('use !=='); if (a != b) {}",             # 2: `!==` only in a string
+            "if (a == b && c === d) {}",                  # legacy: strict on the line drops it
+            "if (a == b) {} // ubs:ignore",               # the marker is a comment: honoured
+        ]) + "\n"
+        self.assertEqual(self.lines(src), [1, 2])
+
+    def test_lexer_edges_neither_hide_code_nor_expose_literals(self) -> None:
+        src = "\n".join([
+            "<p>Don't {a == b ? 'x' : 'y'}</p>",  # 1: a JSX apostrophe opens no string
+            "return /==/.test(s);",               # a regex literal starting with `=`
+            "f(/=x==y/.test(s));",                # same, after `(`
+            'return"a==b";',                      # minified keyword + string
+            "x /= 2; if (y == z) {}",             # 5: `/=` after an operand still assigns
+        ]) + "\n"
+        self.assertEqual(self.lines(src), [1, 5])
+
 
 class AnalyzerCategoryTests(unittest.TestCase):
     """GH #134: analyzer findings must resolve to the category number that

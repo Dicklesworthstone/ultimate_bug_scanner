@@ -34,7 +34,10 @@ SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts'}
 PATH_LIMIT = 5
 ROUTE_PARAM_FIELDS = r"(?:id|slug|user|username|email|name|status|tenant|account|role|filter|search|sort|limit|offset|where|order|table|column)"
-ROUTE_PARAM_OBJECT = re.compile(r"^\s*\(?\s*(?:await\s+)?((?:context\.)?params)\s*\)?\s*$", re.IGNORECASE)
+# Each whitespace run has exactly one owner: `\s*\(?\s*` split a run of N
+# blanks N ways on every failed match, and callers pass expressions whose
+# calls are blanked, so a large describe() body cost seconds per call (GH #156).
+ROUTE_PARAM_OBJECT = re.compile(r"^\s*(?:\(\s*)?(?:await\s+)?((?:context\.)?params)\s*(?:\)\s*)?$", re.IGNORECASE)
 
 SOURCE_PATTERNS = [
     (re.compile(r"\b(?:req|request|ctx\.request|context\.req)\.(?:body|query|params)[\w\.\[\]'\"]*", re.IGNORECASE), 'HTTP request payload'),

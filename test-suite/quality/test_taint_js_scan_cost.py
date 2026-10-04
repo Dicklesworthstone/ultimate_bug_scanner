@@ -5,8 +5,8 @@ The taint engine hands each expression, with its calls blanked, to
 assignment_sources; for `describe(..., () => { ... })` that is the whole
 test body as one run of spaces. ROUTE_PARAM_OBJECT's `^\\s*\\(?\\s*` split
 such a run N ways on every failed match, so single Jest files hit the 300 s
-module timeout. The bounds below are two orders of magnitude above the
-fixed cost and far below the quadratic one.
+module timeout. Measured here: the 30k-blank match takes ~2 ms (old: ~20 s,
+bound 1 s) and the Jest-shaped file 0.5 s (old: 71.5 s, bound 30 s).
 """
 from __future__ import annotations
 
@@ -39,7 +39,9 @@ class RouteParamObjectTests(unittest.TestCase):
                 self.assertIsNone(taint_js.ROUTE_PARAM_OBJECT.match(expr))
 
     def test_failed_match_is_linear_in_whitespace(self) -> None:
-        blank = " " * 200_000
+        # ~2 ms linear; the quadratic form took ~9 s at 20k, so a regression
+        # fails here within seconds instead of hanging the suite.
+        blank = " " * 30_000
         for label, expr in (("blank", blank), ("trailing", "params" + blank + "x"),
                             ("paren", "(" + blank + "x")):
             with self.subTest(case=label):

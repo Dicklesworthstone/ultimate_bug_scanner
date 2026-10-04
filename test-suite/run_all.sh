@@ -228,8 +228,18 @@ else
   PY=(python3)
 fi
 
+# Real-scanner and daemon/LSP integration cases are opt-in so a single test
+# file stays fast to iterate on; the full gate runs them (export one as 0 to
+# skip it). Without these, 32 quality tests skipped silently on every run.
+export UBS_TAINT_E2E="${UBS_TAINT_E2E:-1}" UBS_HEAP_E2E="${UBS_HEAP_E2E:-1}" \
+  UBS_HTTP_E2E="${UBS_HTTP_E2E:-1}" UBS_RUST_REDIRECT_E2E="${UBS_RUST_REDIRECT_E2E:-1}" \
+  UBS_LSP_E2E="${UBS_LSP_E2E:-1}" UBS_DAEMON_E2E="${UBS_DAEMON_E2E:-1}"
+
 run_step rule-quality-harness "${PY[@]}" quality/rule_quality_harness.py
 run_step quality-unittests "${PY[@]}" -m unittest discover -s quality -p 'test_*.py'
+# The JavaScript taint engine's own suites live beside its fixtures; until
+# now only path-filtered workflows ran them.
+run_step js-taint-unittests "${PY[@]}" -m unittest discover -s js -p 'test_taint*.py'
 run_step contract-conformance "${PY[@]}" quality/contract_conformance.py
 run_step manifest "${PY[@]}" ./run_manifest.py "$@"
 run_step shareable-reports "${PY[@]}" shareable/test_shareable_reports.py
@@ -244,6 +254,13 @@ run_step skip-categories "${PY[@]}" shareable/test_skip_categories.py
 # heuristic findings; the other languages are reported (json has no per-finding
 # records for them yet, bead K2).
 run_step sarif-parity "${PY[@]}" shareable/test_sarif_parity.py --assert=python,rust,ruby,elixir,cpp
+run_step go-analyzers "${PY[@]}" shareable/test_go_analyzers.py
+run_step ruby-analyzers "${PY[@]}" shareable/test_ruby_analyzers.py
+run_step optional-analyzers "${PY[@]}" shareable/test_optional_analyzers.py
+run_step installed-contract "${PY[@]}" shareable/test_installed_contract.py
+run_step contract-checksums "${PY[@]}" shareable/test_contract_checksums.py
+run_step helper-python-floor "${PY[@]}" shareable/test_helper_python_floor.py
+run_step git-safety-guard "${PY[@]}" python/tests/test_git_safety_guard.py
 run_step python-resource-helper "${PY[@]}" python/tests/test_resource_helper.py
 run_step java-resource-lifecycle-helper "${PY[@]}" java/tests/test_resource_lifecycle_helper.py
 run_step csharp-helper-scanners "${PY[@]}" csharp/tests/test_helper_scanners.py

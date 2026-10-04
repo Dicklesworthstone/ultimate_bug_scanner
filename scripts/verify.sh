@@ -230,6 +230,24 @@ source, stage = Path(sys.argv[1]), Path(sys.argv[2])
 root = stage / 'archive-input'
 max_compressed, max_expanded = 128 * 1024 * 1024, 512 * 1024 * 1024
 max_member, max_entries = 64 * 1024 * 1024, 16384
+max_metadata = 1024 * 1024
+metadata_types = (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE,
+                  tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK)
+
+
+class BoundedTarInfo(tarfile.TarInfo):
+    """Refuse a member by its declared header before tarfile reads its body.
+
+    BoundedReads caps single reads, but tarfile from 3.14.7 reads extended
+    headers in 1 MiB chunks (CPython gh-151497), so only the declared size
+    bounds the total. Sparse members are refused here too: they are never
+    accepted, and their extension blocks would otherwise be parsed first."""
+    def _proc_member(self, archive):
+        if self.type in metadata_types and self.size > max_metadata:
+            raise ValueError('oversized archive metadata')
+        if self.type == tarfile.GNUTYPE_SPARSE:
+            raise ValueError('archive links, sparse and special files are not allowed: ' + self.name)
+        return super()._proc_member(archive)
 
 
 class BoundedReads:
@@ -274,7 +292,7 @@ try:
     root.mkdir(mode=0o700)
     entries, paths = set(), {}
     with (stage / 'input.tar').open('rb') as incoming:
-        with tarfile.open(fileobj=BoundedReads(incoming), mode='r:') as archive:
+        with tarfile.open(fileobj=BoundedReads(incoming), mode='r:', tarinfo=BoundedTarInfo) as archive:
             for member in archive:
                 name = member.name
                 if member.isdir() and name.endswith('/'):

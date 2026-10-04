@@ -498,17 +498,37 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
         self.import_archive(output)
 
     def test_archive_import_rejects_member_and_metadata_bombs_before_allocation(self):
-        for index, kind in enumerate((tarfile.REGTYPE, tarfile.XHDTYPE, tarfile.GNUTYPE_LONGNAME)):
-            member = tarfile.TarInfo('oversized')
-            member.type, member.size = kind, 65 * 1024 * 1024
-            output = self.work / f'oversized-{index}.tar.gz'
-            # A header alone is enough to assert the size guard. Do not allocate
-            # the advertised body, and do not change production limits for tests.
-            output.write_bytes(gzip.compress(member.tobuf() + b'\0' * 1024))
-            result = self.import_archive(output, expected=1)
-            self.assertTrue('64 MiB' in result.stderr or 'oversized archive metadata' in result.stderr,
-                            result.stderr)
-            self.assertEqual(self.events(), [])
+        kinds = ((tarfile.REGTYPE, 'archive member exceeds 64 MiB'),
+                 (tarfile.XHDTYPE, 'oversized archive metadata'),
+                 (tarfile.GNUTYPE_LONGNAME, 'oversized archive metadata'))
+        for index, (kind, reason) in enumerate(kinds):
+            with self.subTest(kind=kind):
+                member = tarfile.TarInfo('oversized')
+                member.type, member.size = kind, 65 * 1024 * 1024
+                output = self.work / f'oversized-{index}.tar.gz'
+                # A header alone is enough to assert the size guard. Do not allocate
+                # the advertised body, and do not change production limits for tests.
+                output.write_bytes(gzip.compress(member.tobuf() + b'\0' * 1024))
+                result = self.import_archive(output, expected=1)
+                self.assertIn(reason, result.stderr)
+                self.assertEqual(self.events(), [])
+
+    def test_archive_import_bounds_complete_metadata_regardless_of_read_chunking(self):
+        # GH #155: tarfile from Python 3.14.7 reads extended headers in 1 MiB
+        # chunks, so a per-read cap no longer bounds them. A complete 2 MiB
+        # body must still be refused by its declared size, on every version.
+        body = 2 * 1024 * 1024
+        pax = tarfile.TarInfo('modules/pax.py')
+        pax.pax_headers = {'comment': 'x' * body}
+        longname = tarfile.TarInfo('modules/' + 'n' * body)
+        for label, member, fmt in (('pax', pax, tarfile.PAX_FORMAT),
+                                   ('gnu-longname', longname, tarfile.GNU_FORMAT)):
+            with self.subTest(kind=label):
+                output = self.work / f'populated-{label}.tar.gz'
+                output.write_bytes(gzip.compress(member.tobuf(fmt) + b'\0' * 1024))
+                result = self.import_archive(output, expected=1)
+                self.assertIn('oversized archive metadata', result.stderr)
+                self.assertEqual(self.events(), [])
 
     def test_archive_import_rejects_truncated_and_corrupt_gzip_streams(self):
         good = self.work / 'good.tar.gz'

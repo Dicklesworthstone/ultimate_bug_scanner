@@ -128,6 +128,10 @@ class Pattern:
     mask_regex: re.Pattern[str] | None = None
     gate_regex: re.Pattern[str] | None = None  # legacy project-wide precondition
     suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide count-comparison
+    # Match against executable code only: comments, string and template text
+    # and regex literals are blanked (``${...}`` bodies stay visible), so an
+    # operator rule cannot fire on `'pkg==1.0'` or `// a == b` (GH #157).
+    code_only: bool = False
 
 
 def _mask_spans(text: str, mask: re.Pattern[str]) -> str:
@@ -136,19 +140,36 @@ def _mask_spans(text: str, mask: re.Pattern[str]) -> str:
     return mask.sub(lambda m: " " * (m.end() - m.start()), text)
 
 
-def iter_matches(pattern: Pattern, text: str) -> Iterable[tuple[int, str]]:
+def code_view(text: str) -> str:
+    """Offset-preserving copy of JS/TS source with all non-code blanked."""
+    from ubs_core.analyzers.spec_division import _mask_non_code
+    try:
+        masked = _mask_non_code(text)
+    except Exception:  # a masker failure must not lose the rule
+        return text
+    # Every reported line number and sample comes from the raw text at the
+    # same offsets; a length change would misplace them, so raw is safer.
+    return masked if len(masked) == len(text) else text
+
+
+def iter_matches(
+    pattern: Pattern, text: str, raw_text: str | None = None
+) -> Iterable[tuple[int, str]]:
     """Yield (line_number, line_text) for matches, skipping excluded lines.
 
-    Line text is always taken from the original source, even when the search
-    ran over a masked copy."""
+    ``text`` is the view the regex runs against (the code view for code_only
+    patterns); ``raw_text`` is the original source used for the ubs:ignore
+    check, the exclude_regex post-filter and the reported line. Both views and
+    any mask_regex blanking share one coordinate system."""
+    source = raw_text if raw_text is not None else text
     haystack = text if pattern.mask_regex is None else _mask_spans(text, pattern.mask_regex)
     for match in pattern.regex.finditer(haystack):
-        line_no = text.count("\n", 0, match.start()) + 1
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line_end = text.find("\n", match.start())
+        line_no = source.count("\n", 0, match.start()) + 1
+        line_start = source.rfind("\n", 0, match.start()) + 1
+        line_end = source.find("\n", match.start())
         if line_end == -1:
-            line_end = len(text)
-        line_text = text[line_start:line_end]
+            line_end = len(source)
+        line_text = source[line_start:line_end]
         if MARKER in line_text:
             continue  # legacy count_lines drops marker lines from counts
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
@@ -197,6 +218,7 @@ def scan_patterns(
             texts[path] = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+    code_views: dict[Path, str] = {}
     for pattern in active:
         if defer_global_checks:
             if pattern.gate_regex is not None or pattern.suppress_when_regex is not None:
@@ -226,7 +248,14 @@ def scan_patterns(
         for path, text in texts.items():
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue
-            for line_no, line_text in iter_matches(pattern, text):
+            scan_text = text
+            if pattern.code_only:
+                if not pattern.regex.search(text):
+                    continue  # blanking only removes matches; skip the masker
+                if path not in code_views:
+                    code_views[path] = code_view(text)
+                scan_text = code_views[path]
+            for line_no, line_text in iter_matches(pattern, scan_text, text):
                 key = (path, line_no)
                 if key in seen:
                     continue

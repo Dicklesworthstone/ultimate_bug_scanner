@@ -62,6 +62,9 @@ PATTERNS: list[Pattern] = [
         # it), so those comparisons are blanked before the search. Any other
         # `==` on the same line still counts.
         mask_regex=_NULLISH_LOOSE_EQUALITY,
+        # `pip install pkg==1.0` in a string, or `a == b` in a comment, is not
+        # a comparison (GH #157); `${a == b}` interpolations remain code.
+        code_only=True,
     ),
     Pattern(
         category=4,

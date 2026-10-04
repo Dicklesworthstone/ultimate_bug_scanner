@@ -638,6 +638,43 @@ class LooseEqualityNullishTests(unittest.TestCase):
         self.assertEqual(self.hits(src), [1, 2, 3, 4, 5, 6])
 
 
+class LooseEqualityCodeOnlyTests(unittest.TestCase):
+    """GH #157: `==` inside a string, template text, comment or regex literal
+    is not a comparison; `${...}` interpolation bodies are code and count."""
+
+    def lines(self, src: str) -> list[int]:
+        patterns = [p for p in load_patterns() if p.rule_id == "js.type-coercion.loose-equality"]
+        self.assertTrue(patterns[0].code_only)
+        with tempfile.TemporaryDirectory(prefix="ubs-js157-") as tmp:
+            path = Path(tmp) / "repro.ts"
+            path.write_text(src, encoding="utf-8")
+            sink = io.StringIO()
+            scan_patterns(patterns, [path], sink, skip=set())
+        return [json.loads(line)["line"] for line in sink.getvalue().splitlines()]
+
+    def test_non_code_text_is_not_a_comparison(self) -> None:
+        src = "\n".join([
+            "const s = 'pip install pkg==1.0.0';",
+            'const t = "a != b";',
+            "const u = `x == y`;",
+            "// comment a == b",
+            "/* block a != b */",
+            "const r = /a==b/.test(s);",
+        ]) + "\n"
+        self.assertEqual(self.lines(src), [])
+
+    def test_real_comparisons_still_report(self) -> None:
+        src = "\n".join([
+            "const u = `x == ${a == b} y`;",    # 1: interpolation is code
+            "if (a == b) {}",                   # 2
+            "const m = y != z; // tail a == b", # 3: code before the comment
+            "const q = `${`in ${p == q}`}`;",   # 4: nested interpolation
+            "const s = 'pkg==1' == other;",     # 5: string blanked, operator kept
+            "const n = x == null;",             # nullish idiom: still exempt
+        ]) + "\n"
+        self.assertEqual(self.lines(src), [1, 2, 3, 4, 5])
+
+
 class AnalyzerCategoryTests(unittest.TestCase):
     """GH #134: analyzer findings must resolve to the category number that
     --skip and the text renderer use, whatever prefix their rule id carries."""
@@ -710,6 +747,12 @@ class MetaRunnerRegressionTests(unittest.TestCase):
         loose = [f for s in report["scanners"] for f in s.get("findings", [])
                  if f["rule"] == "js.type-coercion.loose-equality"]
         self.assertEqual([(Path(f["path"]).name, f["line"]) for f in loose], [("loose.ts", 2)])
+
+    def test_gh157_version_pin_in_string_is_not_loose_equality(self) -> None:
+        (self.project / "repro.ts").write_text("const s = 'pip install pkg==1.0.0';\n")
+        report, rules = self.scan()
+        self.assertEqual(rules, [], report)
+        self.assertEqual(report["totals"]["critical"], 0, report)
 
     def test_gh149_lockfile_integrity_padding_is_not_js_code(self) -> None:
         (self.project / "package-lock.json").write_text(

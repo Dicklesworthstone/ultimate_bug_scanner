@@ -15,13 +15,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 from ubs_core.io import parse_ndjson_lines
-from ubs_core.registry import LAYERS, RunContext, get as get_analyzer, run_layer, run_scan
+from ubs_core.registry import (
+    LAYERS, RunContext, analyzers_for_lang, get as get_analyzer, run_layer, run_scan,
+)
 
 PROGRAM = "python3 -m ubs_core"
+
+
+def _worker_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("jobs must be an integer between 1 and 64") from exc
+    if not 1 <= count <= 64:
+        raise argparse.ArgumentTypeError("jobs must be an integer between 1 and 64")
+    return count
 
 
 def _load_json_option(value: str | None) -> dict:
@@ -59,7 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
         p.add_argument("--rules", default=None, help="rule pack JSON")
         p.add_argument("--profile", default=None, help="profile JSON (e.g. disabled_rules)")
-        p.add_argument("--jobs", type=int, default=1, help="parallel worker count for work-stealing file shards")
+        p.add_argument("--jobs", type=_worker_count, default=1,
+                       help="analysis workers (1–64); cross-file input scopes are preserved")
         p.add_argument("--out", default="-", help="NDJSON output path ('-' = stdout)")
         return p
 
@@ -132,72 +149,74 @@ def _run_suppress(args: argparse.Namespace) -> int:
             continue
         kept.append(finding)
 
-    def _emit(handle) -> None:
-        for finding in kept:
-            handle.write(json.dumps(finding, ensure_ascii=False) + "\n")
-
-    if args.out in ("-", ""):
-        _emit(sys.stdout)
-    else:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            _emit(handle)
+    _write_ndjson(kept, args.out)
     return 0
 
 
 def _write_ndjson(findings_iter, out_path: str) -> int:
-    count = 0
-    if out_path in ("-", ""):
-        for finding in findings_iter:
-            sys.stdout.write(json.dumps(finding, ensure_ascii=False) + "\n")
-            count += 1
-    else:
-        with open(out_path, "w", encoding="utf-8") as handle:
+    """Publish a complete analyzer result, never a prefix from a failed run.
+
+    Stage output on disk before touching the destination. This also bounds
+    writer memory independently of report size. A file target is replaced
+    atomically in its own directory; stdout is copied only after every finding
+    has been produced and encoded successfully. A broken stdout transfer can
+    still be partial and is reported as an error, never a successful scan.
+    """
+    def write(handle):
+        count = 0
+        try:
             for finding in findings_iter:
-                handle.write(json.dumps(finding, ensure_ascii=False) + "\n")
+                handle.write(json.dumps(finding, ensure_ascii=False, allow_nan=False) + "\n")
                 count += 1
+        except SystemExit as exc:
+            # Only the CLI owns process completion. An analyzer calling
+            # sys.exit(0) has not completed its requested finding stream.
+            raise RuntimeError("Analyzer exited before report completion") from exc
+        handle.flush()
+        return count
+
+    if out_path in ("-", ""):
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="\n") as staged:
+            count = write(staged)
+            staged.seek(0)
+            shutil.copyfileobj(staged, sys.stdout, length=65536)
+            sys.stdout.flush()
+            return count
+
+    destination = Path(out_path).absolute()
+    try:
+        if not stat.S_ISREG(destination.lstat().st_mode):
+            raise ValueError("--out must name a regular file, not a symlink or special file")
+    except FileNotFoundError:
+        pass
+    # The temporary file and rename share a filesystem. Generated reports
+    # are owner-only on POSIX, including when replacing a public report.
+    with tempfile.TemporaryDirectory(prefix=".ubs-output-", dir=destination.parent) as directory:
+        staged = Path(directory) / "findings.ndjson"
+        with staged.open("w", encoding="utf-8", newline="\n") as handle:
+            count = write(handle)
+            staged.chmod(0o600)
+        os.replace(staged, destination)
     return count
 
 
 def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
     files = _read_files_from(args.files_from)
-    jobs = getattr(args, "jobs", 1) or 1
+    jobs = getattr(args, "jobs", 1)
     rules = _load_json_option(args.rules)
     profile = _load_json_option(args.profile)
 
-    if jobs > 1 and len(files) > 1:
-        from ubs_core.shards import run_work_stealing
-
-        def _process_shard(shard_files: list[Path]) -> list[dict]:
-            ctx = RunContext(
-                lang=args.lang,
-                files=shard_files,
-                rules=rules,
-                profile=profile,
-            )
-            return list(run_scan(ctx) if layer == "scan" else run_layer(layer, ctx))
-
-        if args.lang == 'javascript' and layer in {'taint', 'scan'}:
-            # Module summaries require both endpoints in the same analysis.
-            # Parallelize independent components, never split an import edge.
-            from concurrent.futures import ThreadPoolExecutor
-            from ubs_core.js_modules import ModuleGraph
-            graph = ModuleGraph(files)
-            groups = [[module.path for module in component] for component in graph.components()]
-            grouped = {path for group in groups for path in group}
-            groups.extend([path] for path in files if path.resolve() not in grouped)
-            with ThreadPoolExecutor(max_workers=jobs) as executor:
-                findings = [finding for group in executor.map(_process_shard, groups) for finding in group]
-        else:
-            findings = run_work_stealing(files, _process_shard, num_workers=jobs)
-    else:
-        ctx = RunContext(
-            lang=args.lang,
-            files=files,
-            rules=rules,
-            profile=profile,
-        )
-        findings = run_scan(ctx) if layer == "scan" else run_layer(layer, ctx)
-    _write_ndjson(findings, args.out)
+    ctx = RunContext(lang=args.lang, files=files, rules=rules, profile=profile)
+    findings = run_scan(ctx, jobs=jobs) if layer == "scan" else run_layer(layer, ctx, jobs=jobs)
+    try:
+        _write_ndjson(findings, args.out)
+    finally:
+        # Serialization/destination errors can stop consumption while producer
+        # queues are full. Close explicitly, not eventually through refcounting
+        # or cyclic GC, so the registry releases and joins its worker threads.
+        close = getattr(findings, "close", None)
+        if close is not None:
+            close()
     return 0
 
 
@@ -259,16 +278,27 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return 2
 
-    if args.layer == "suppress":
-        return _run_suppress(args)
-
-    if args.layer != "scan":
+    if args.layer == "scan":
+        if not analyzers_for_lang(args.lang):
+            parser.error(f"no analyzers registered for lang={args.lang!r}")
+    elif args.layer != "suppress":
         try:
             get_analyzer(args.layer, args.lang)
         except KeyError as exc:
             parser.error(str(exc.args[0]))
 
-    return _run_layer_cmd(args.layer, args)
+    try:
+        if args.layer == "suppress":
+            return _run_suppress(args)
+        return _run_layer_cmd(args.layer, args)
+    except SystemExit as exc:
+        print(f"{PROGRAM}: analyzer exited before completion (code {exc.code!r})", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        # Analyzer/input/output errors are environment failures. Staged output
+        # leaves any previous file report intact and emits no analysis prefix.
+        print(f"{PROGRAM}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

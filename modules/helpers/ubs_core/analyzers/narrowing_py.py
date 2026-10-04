@@ -328,4 +328,5 @@ SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("run_finds_partial_none_guard", _selftest_run),
 )
 
-register(Analyzer(layer="narrowing", lang="python", name="narrowing_py", run=run, selftests=SELF_TESTS))
+register(Analyzer(layer="narrowing", lang="python", name="narrowing_py", run=run,
+                  selftests=SELF_TESTS, file_independent=True))

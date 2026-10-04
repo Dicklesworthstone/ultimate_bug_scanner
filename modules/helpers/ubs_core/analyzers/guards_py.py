@@ -270,4 +270,5 @@ SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("main_emit_dialect", _selftest_main_emit_dialect),
 )
 
-register(Analyzer(layer="guards", lang="python", name="guards_py", run=run, selftests=SELF_TESTS))
+register(Analyzer(layer="guards", lang="python", name="guards_py", run=run,
+                  selftests=SELF_TESTS, file_independent=True))

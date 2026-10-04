@@ -27,15 +27,19 @@ class ShardQueue:
     """Thread-safe queue of file shards for work stealing across workers."""
 
     def __init__(self, shards: Sequence[Sequence[Path]]) -> None:
-        self._queue: queue.Queue[list[Path]] = queue.Queue()
-        for shard in shards:
-            self._queue.put(list(shard))
+        self._queue: queue.Queue[tuple[int, list[Path]]] = queue.Queue()
+        for index, shard in enumerate(shards):
+            self._queue.put((index, list(shard)))
 
     @property
     def remaining(self) -> int:
         return self._queue.qsize()
 
     def get_shard(self) -> list[Path] | None:
+        task = self._get_task()
+        return None if task is None else task[1]
+
+    def _get_task(self) -> tuple[int, list[Path]] | None:
         try:
             return self._queue.get_nowait()
         except queue.Empty:
@@ -54,7 +58,12 @@ def run_work_stealing(
     """Process files in shards pulled from a shared queue across worker threads.
 
     If num_workers <= 1 or len(files) <= 1, processes files directly on the
-    calling thread without concurrency overhead.
+    calling thread without concurrency overhead. Results retain input-shard
+    order, not worker completion order. Any failed worker invalidates the whole
+    result; running callbacks are joined and unstarted work is abandoned.
+
+    Callers must supply independent shards. This executor cannot infer import,
+    package or other whole-selection dependencies on their behalf.
     """
     if not files:
         return []
@@ -73,42 +82,56 @@ def run_work_stealing(
 
     q = ShardQueue(shards)
     workers_count = min(num_workers, len(shards))
-    worker_results: list[list[T]] = [[] for _ in range(workers_count)]
-    worker_errors: list[Exception] = []
+    shard_results: list[list[T] | None] = [None] * len(shards)
+    worker_errors: list[BaseException] = []
     errors_lock = threading.Lock()
+    stop = threading.Event()
 
-    def _worker(worker_id: int) -> None:
-        results: list[T] = []
-        try:
-            while True:
-                shard = q.get_shard()
-                if shard is None:
-                    break
-                try:
-                    res = process_shard_fn(shard)
-                    results.extend(res)
-                finally:
-                    q.task_done()
-        except Exception as exc:
-            with errors_lock:
-                worker_errors.append(exc)
-        finally:
-            worker_results[worker_id] = results
+    def _worker() -> None:
+        while not stop.is_set():
+            task = q._get_task()
+            if task is None:
+                return
+            index, shard = task
+            try:
+                if not stop.is_set():
+                    # Exhaust the iterator before publishing this shard. A
+                    # yield followed by failure is not a completed analysis.
+                    shard_results[index] = list(process_shard_fn(shard))
+            except BaseException as exc:
+                # SystemExit (even code 0) and worker-local interrupts otherwise
+                # vanish at the thread boundary, producing incomplete success.
+                with errors_lock:
+                    worker_errors.append(exc)
+                stop.set()
+            finally:
+                q.task_done()
 
     threads: list[threading.Thread] = []
-    for wid in range(workers_count):
-        t = threading.Thread(target=_worker, args=(wid,), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
+    try:
+        for _ in range(workers_count):
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+    finally:
+        # A launch failure or caller interruption must not leave callbacks
+        # consuming inputs after the caller starts handling the failed run.
+        stop.set()
+        for t in threads:
+            t.join()
 
     if worker_errors:
-        raise worker_errors[0]
+        error = worker_errors[0]
+        if not isinstance(error, Exception):
+            raise RuntimeError(f"Shard worker terminated before completion: {type(error).__name__}") from error
+        raise error
 
     combined: list[T] = []
-    for res_list in worker_results:
+    for res_list in shard_results:
+        if res_list is None:
+            raise RuntimeError("Shard processing finished without a complete result")
         combined.extend(res_list)
     return combined
 

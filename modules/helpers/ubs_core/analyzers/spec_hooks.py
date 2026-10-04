@@ -765,7 +765,7 @@ def _selftest_run_record_shape(tmp_prefix: str = "ubs_core_spec_hooks_run_") -> 
             assert set(rec) == {"rule", "category_id", "path", "line", "col", "severity", "message"}, rec
             assert rec["category_id"] == "js.hooks", rec
             assert rec["severity"] == SEVERITIES[rec["rule"]], rec
-            assert rec["path"] == "panel.tsx", rec
+            assert rec["path"] == str(target.resolve()), rec  # absolute since 516a189
             assert rec["rule"].startswith("js.hooks."), rec
         assert {r["severity"] for r in records} == {"critical", "warning"}, records
 

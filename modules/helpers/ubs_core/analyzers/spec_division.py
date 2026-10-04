@@ -86,7 +86,7 @@ def _regex_start_context(text: str, idx: int) -> bool:
 # `import'./a'` in minified code). After any other identifier character a
 # quote cannot open a string in valid JS, so it is JSX/prose text: the
 # apostrophe of `<p>Don't {a == b}</p>` must not swallow the rest of the line.
-_QUOTE_KEYWORDS = _REGEX_KEYWORDS | {'import', 'from', 'export'}
+_QUOTE_KEYWORDS = _REGEX_KEYWORDS | {'import', 'from', 'export', 'default'}
 
 
 def _quote_opens_string(text: str, idx: int) -> bool:
@@ -614,8 +614,27 @@ def _selftest_run_record_shape(
         assert rec["message"].startswith("Division operations found"), rec
 
 
+def _selftest_quote_and_regex_context(
+    tmp_prefix: str = "ubs_core_spec_division_lexer_",
+) -> None:
+    import tempfile
+
+    src = "\n".join([
+        "const el = <p>Don't</p>; const r = a / b;",  # 1: the apostrophe opens no string
+        "return /=x/.test(s);",                       # a regex literal, not `/=`
+        "const t = f(/==/.test(s));",                 # same, after `(`
+        'export default"a / b";',                     # minified keyword + string
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "lexer.jsx"
+        target.write_text(src, encoding="utf-8")
+        findings = list(scan_file_divisions(target))
+        assert [f[0] for f in findings] == [1], findings
+
+
 SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("variable-denominators-flagged", _selftest_variable_denominators_flagged),
+    ("quote-and-regex-context", _selftest_quote_and_regex_context),
     ("gh73-safe-denominators-clean", _selftest_gh73_safe_denominators_clean),
     ("zero-and-unguarded-risky", _selftest_zero_and_unguarded_risky),
     ("non-code-never-matches", _selftest_non_code_never_matches),

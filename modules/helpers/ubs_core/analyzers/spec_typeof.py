@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from ubs_core.analyzers.spec_division import _quote_opens_string
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
@@ -120,7 +121,7 @@ def _mask_non_code(text: str) -> str:
                 j += 1
             i = j
             continue
-        if c in '\'"':
+        if c in '\'"' and _quote_opens_string(text, i):  # `Don't` opens nothing
             j = i + 1
             while j < n:
                 ch = text[j]
@@ -362,8 +363,26 @@ def _selftest_run_record_shape(
         assert rec["message"].startswith("Invalid typeof comparison"), rec
 
 
+def _selftest_jsx_apostrophe_opens_no_string(
+    tmp_prefix: str = "ubs_core_spec_typeof_jsx_",
+) -> None:
+    import tempfile
+
+    src = "\n".join([
+        "const el = <p>Don't</p>; if (typeof x === 'array') {}",  # 1
+        "if (typeof y == 'strng') {} // it's fine",                # 2
+        "return\"typeof z === 'array'\";",                         # minified string
+    ])
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "jsx.jsx"
+        target.write_text(src, encoding="utf-8")
+        findings = list(scan_file_findings(target))
+        assert [(f[0], f[2]) for f in findings] == [(1, 'array'), (2, 'strng')], findings
+
+
 SELF_TESTS: tuple[tuple[str, object], ...] = (
     ("invalid-literals-flagged", _selftest_invalid_literals_flagged),
+    ("jsx-apostrophe-opens-no-string", _selftest_jsx_apostrophe_opens_no_string),
     ("valid-literals-clean", _selftest_valid_literals_clean),
     ("reversed-form-flagged", _selftest_reversed_form_flagged),
     ("non-string-operands-ignored", _selftest_non_string_operands_ignored),

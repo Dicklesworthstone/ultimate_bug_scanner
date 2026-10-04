@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
@@ -41,6 +42,191 @@ class HeapTaintTests(unittest.TestCase):
             self.assertGreater(finding['col'], 0)
             self.assertIn(' -> ', finding['message'])
         return findings
+
+    def test_factory_chain_reuses_symbolic_input_summaries(self):
+        count = 40
+        source = 'function f0(value) { return {html:value}; }\n'
+        source += '\n'.join(f'function f{i}(value) {{ return f{i-1}(value); }}'
+                            for i in range(1, count + 1))
+        source += f'\nres.send(f{count}(req.query.html).html);'
+        text, code = taint.lexical_views(source)
+        engine = taint._Engine(text, code)
+        findings = list(engine.findings())
+        self.assertEqual([(rule, message.split(' -> ')[0]) for _, rule, message in findings],
+                         [('js.taint.xss', 'req.query.html')], findings)
+        # Origin names are not distinct heap states. This bounds actual solved
+        # contexts as well as requiring the real detector's finding above.
+        self.assertLessEqual(len(engine.heap_calls), 8 * (count + 1))
+
+    def test_factory_template_keeps_each_callers_source(self):
+        findings = self.scan('function make(x) { return {html:x}; }\n'
+                             'function wrap(x) { return make(x); }\n'
+                             'res.send(wrap(req.query.first).html);\n'
+                             'res.send(wrap(req.query.second).html);', 'xss', 'xss')
+        self.assertIn('req.query.first', findings[0]['message'])
+        self.assertNotIn('req.query.second', findings[0]['message'])
+        self.assertIn('req.query.second', findings[1]['message'])
+        self.assertNotIn('req.query.first', findings[1]['message'])
+
+    def test_factory_template_keeps_clean_and_tainted_formals_separate(self):
+        self.scan('function make(a,b) { return {first:a,second:b}; }\n'
+                  'function wrap(a,b) { return make(a,b); }\n'
+                  'res.send(wrap("safe",req.query.html).first);\n'
+                  'res.send(wrap(req.query.html,"safe").second);')
+        self.scan('function make(a,b) { return {first:a,second:b}; }\n'
+                  'function wrap(a,b) { return make(a,b); }\n'
+                  'res.send(wrap(req.query.html,"safe").first);', 'xss')
+
+    def test_factory_template_preserves_multiple_input_origins(self):
+        source = 'function make(x) { return {html:x}; }\n'
+        source += 'function wrap(x) { return make(x); }\n'
+        source += 'res.send(wrap(req.query.a + req.query.b).html);'
+        text, code = taint.lexical_views(source)
+        engine = taint._Engine(text, code)
+        self.assertEqual(len(list(engine.findings())), 1)
+        effects = engine.summaries[(engine.root, 'js.taint.xss')][1]
+        origins = {trace.origin for facts in effects.values() for trace in facts}
+        self.assertIn(('source', 'req.query.a'), origins)
+        self.assertIn(('source', 'req.query.b'), origins)
+        self.assertFalse(any(origin[0] == 'heap-input' for origin in origins), origins)
+
+    def test_factory_template_preserves_callee_sources_and_overwrites(self):
+        self.scan('function make(x) { const o={html:x};o.html=req.query.local;return o; }\n'
+                  'function wrap(x) { return make(x); }\nres.send(wrap("safe").html);', 'xss')
+        self.scan('function make(x) { const o={html:x};o.html="safe";return o; }\n'
+                  'function wrap(x) { return make(x); }\nres.send(wrap(req.query.html).html);')
+
+    def test_factory_template_restores_sink_effects(self):
+        findings = self.scan('function make(x) { res.send(x);return {html:"safe"}; }\n'
+                             'function wrap(x) { return make(x); }\n'
+                             'wrap("safe");wrap(req.query.html);', 'xss')
+        self.assertIn('req.query.html', findings[0]['message'])
+        self.assertEqual(findings[0]['line'], 1)
+
+    def test_factory_template_restores_throw_payloads_and_heap_writes(self):
+        self.scan('function make(o,x) { o.html=x;throw {value:x}; }\n'
+                  'function wrap(o,x) { make(o,x); }\nconst o={};\n'
+                  'try {wrap(o,req.query.html);} catch(e) {res.send(e.value);}\n'
+                  'res.send(o.html);', 'xss', 'xss')
+
+    def test_factory_template_restores_captured_writes(self):
+        self.scan('let saved;function make(x) { saved=x;return {}; }\n'
+                  'function wrap(x) { return make(x); }\n'
+                  'wrap(req.query.html);res.send(saved);', 'xss')
+
+    def test_factory_template_does_not_merge_fresh_results(self):
+        self.scan('function make(x) { return {html:x}; }\n'
+                  'function wrap(x) { return make(x); }\n'
+                  'const a=wrap(req.query.html);const b=wrap("safe");\n'
+                  'a.html="safe";res.send(b.html);')
+        self.scan('function make(x) { return {html:x}; }\n'
+                  'function wrap(x) { return make(x); }\n'
+                  'const a=wrap(req.query.html);const b=wrap(req.query.other);\n'
+                  'a.html="safe";res.send(b.html);', 'xss')
+
+    def test_factory_template_keeps_borrowed_alias_relationships(self):
+        self.scan('function make(a,b,x) {a.html=x;return {value:b.html};}\n'
+                  'function wrap(a,b,x) {return make(a,b,x);}\n'
+                  'const a={};const b={};res.send(wrap(a,b,req.query.html).value);')
+        self.scan('function make(a,b,x) {a.html=x;return {value:b.html};}\n'
+                  'function wrap(a,b,x) {return make(a,b,x);}\n'
+                  'const a={};res.send(wrap(a,a,req.query.html).value);', 'xss')
+
+    def test_factory_template_sanitizer_effects_remain_domain_specific(self):
+        self.scan('function make(x) {return {html:DOMPurify.sanitize(x)};}\n'
+                  'function wrap(x) {return make(x);}\n'
+                  'const o=wrap(req.query.html);res.send(o.html);eval(o.html);', 'eval')
+
+    def test_factory_template_recursion_keeps_return_and_throw_sources(self):
+        self.scan('function make(x) {if(flag){return {html:x};}return make(x);}\n'
+                  'res.send(make(req.query.html).html);', 'xss')
+        self.scan('function make(x) {if(flag){throw {html:x};}return make(x);}\n'
+                  'try {make(req.query.html);} catch(e){res.send(e.html);}', 'xss')
+
+    def test_dependency_queue_does_not_replay_every_partial_mutation_prefix(self):
+        count = 50
+        source = '\n'.join(f'function f{i}(o,x){{o.push(x);f{i+1}(o,x);}}'
+                           for i in range(count))
+        source += f'\nfunction f{count}(o,x){{o.push(x);}}\n'
+        source += 'const o=[];f0(o,req.query.html);res.send(o);'
+        text, code = taint.lexical_views(source)
+        engine = taint._Engine(text, code)
+        with patch.object(engine, 'analyze_heap', wraps=engine.analyze_heap) as evaluate:
+            findings = list(engine.findings())
+        self.assertEqual(len(findings), 1, findings)
+        self.assertEqual(findings[0][1], 'js.taint.xss')
+        self.assertIn('req.query.html', findings[0][2])
+        self.assertLessEqual(evaluate.call_count, 4 * (count + 1))
+        self.assertFalse(engine.pending or engine.prerequisites or engine.queued)
+
+    def test_sink_domain_selection_keeps_clean_controls_and_mixed_sinks(self):
+        text, code = taint.lexical_views('const o={html:DOMPurify.sanitize(req.query.html)};'
+                                       'res.send(o.html);eval(o.html);')
+        engine = taint._Engine(text, code)
+        self.assertEqual([rule for _, rule, _ in engine.findings()], ['js.taint.eval'])
+        self.assertEqual({rule for scope, rule in engine.summaries},
+                         {'js.taint.xss', 'js.taint.eval'})
+        self.scan('const o={x:req.query.html};res.send(o.x);eval(o.x);'
+                  'db.query(o.x);shell.exec(o.x);', 'xss', 'eval', 'sql', 'command')
+
+    def test_sink_domain_selection_includes_writes_and_command_aliases(self):
+        self.scan('const {exec: run}=require("child_process");'
+                  'const o={x:req.query.html};element.innerHTML=o.x;run(o.x);', 'xss', 'command')
+
+    def test_component_without_sinks_does_not_evaluate_function_bodies(self):
+        text, code = taint.lexical_views('function f(x){return {x:f(x)};}f(req.query.html);')
+        engine = taint._Engine(text, code)
+        with patch.object(engine, 'analyze', wraps=engine.analyze) as evaluate:
+            self.assertEqual(list(engine.findings()), [])
+        evaluate.assert_not_called()
+        self.assertEqual(engine.heap_calls, {})
+
+    def test_dependency_queue_keeps_branch_and_exception_stores(self):
+        self.scan('function a(o,x){o.push(x);if(flag){b(o,x);}else{o.length=0;}}'
+                  'function b(o,x){o.push(x);throw {html:x};}'
+                  'const o=[];try{a(o,req.query.html);}catch(e){res.send(e.html);}'
+                  'res.send(o.join(""));', 'xss', 'xss')
+
+    def test_dependency_queue_reaches_seeded_recursive_effects(self):
+        self.scan('function a(o,x){if(flag){b(o,x);}else{o.html=x;}}'
+                  'function b(o,x){a(o,x);}'
+                  'const o={};b(o,req.query.html);res.send(o.html);', 'xss')
+
+    def test_capture_worklist_keeps_transitive_closure_bindings(self):
+        self.scan('function outer(x){let html=x;function a(){return b();}'
+                  'function b(){if(flag){return c();}return a();}'
+                  'function c(){return {html:html};}return a();}'
+                  'res.send(outer(req.query.html).html);', 'xss')
+
+    def test_heap_requirement_worklist_keeps_forward_factories(self):
+        count = 50
+        source = '\n'.join(f'function f{i}(x){{return f{i+1}(x);}}' for i in range(count))
+        source += f'\nfunction f{count}(x){{return {{html:x}};}}\nres.send(f0(req.query.html).html);'
+        self.scan(source, 'xss')
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for fixed-fixture semantic checks')
+    def test_dependency_queue_fixed_execution_controls(self):
+        # Only authored fixtures are executed, never repository/user input.
+        prefix = ('const req={query:{html:"UBS_TAINT",other:"UBS_TAINT"}};'
+                  'const results=[];const res={send(value){if(JSON.stringify(value)?.includes("UBS_TAINT"))results.push("xss");}};')
+        cases = [
+            'function make(x){return {html:x};}function wrap(x){return make(x);}res.send(wrap(req.query.html).html);',
+            'function make(a,b){return {html:a};}function wrap(a,b){return make(a,b);}res.send(wrap("safe",req.query.html).html);',
+            'function make(x){return {html:x};}const a=make(req.query.html);const b=make(req.query.other);a.html="safe";res.send(b.html);',
+            'function put(a,b,x){a.html=x;return b;}const a={},b={};res.send(put(a,b,req.query.html).html);',
+            'function put(a,b,x){a.html=x;return b;}const a={};res.send(put(a,a,req.query.html).html);',
+            'function make(x){throw {html:x};}function wrap(x){return make(x);}try{wrap(req.query.html);}catch(e){res.send(e.html);}',
+            'let saved;function make(x){saved=x;return {};}function wrap(x){return make(x);}wrap(req.query.html);res.send(saved);',
+            'function make(x){return {safe:"hello",html:x};}function wrap(x){return make(x);}res.send(wrap(req.query.html).safe);',
+        ]
+        chain = '\n'.join(f'function f{i}(o,x){{o.push(x);f{i+1}(o,x);}}' for i in range(101))
+        cases.append(chain + '\nfunction f101(o,x){o.push(x);}const o=[];f0(o,req.query.html);res.send(o.join(""));')
+        for source in cases:
+            with self.subTest(source=source):
+                result = subprocess.run(['node', '-e', prefix + source + ';console.log(JSON.stringify(results));'],
+                                        text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 0, (source, result.stdout, result.stderr))
+                self.scan(source, *json.loads(result.stdout))
 
     def test_write_through_alias_reaches_original(self):
         self.scan('const box = {}; const alias = box; alias.html = req.query.html; res.send(box.html);', 'xss')
@@ -538,7 +724,15 @@ class HeapTaintTests(unittest.TestCase):
             ('helper-array', 'function add(a,x){a.push(x);} const a=[]; add(a,req.query.code); eval(a[0]);', {'eval'}),
             ('wrapper-allocation-isolation', 'function make(){return {};} function pair(){return {a:make(),b:make()};} const p=pair(); p.a.html=req.query.html; res.send(p.b.html);', set()),
             ('helper-sanitizer-domain', 'function clear(o,x){o.html=DOMPurify.sanitize(x);} const a={}; clear(a,req.query.html); res.send(a.html); eval(a.html);', {'eval'}),
+            ('factory-template-throw', 'function make(x){throw {html:x};} function wrap(x){return make(x);} try{wrap(req.query.html);}catch(e){res.send(e.html);}', {'xss'}),
+            ('factory-template-clean', 'function make(a,b){return {html:a};} function wrap(a,b){return make(a,b);} res.send(wrap("safe",req.query.html).html);', set()),
         ]
+        factory_chain = 'function f0(x){return {html:x};}\n'
+        factory_chain += '\n'.join(f'function f{i}(x){{return f{i-1}(x);}}' for i in range(1, 102))
+        cases.append(('factory-template-long-chain', factory_chain + '\nres.send(f101(req.query.html).html);', {'xss'}))
+        setter_chain = '\n'.join(f'function f{i}(o,x){{o.push(x);f{i+1}(o,x);}}' for i in range(101))
+        setter_chain += '\nfunction f101(o,x){o.push(x);}\nconst o=[];f0(o,req.query.html);res.send(o);'
+        cases.append(('heap-template-mutation-chain', setter_chain, {'xss'}))
         for name, source, expected in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory(prefix='ubs-heap-meta-') as tmp:
                 target = Path(tmp) / 'app.js'

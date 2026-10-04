@@ -363,7 +363,9 @@ run_contract_v2_js
             'process.exit(typeof require(process.argv[1]).resolveModuleName==="function"?0:3)',
             str(compiler)],capture_output=True,text=True,timeout=10)
         if probe.returncode:
-            self.skipTest(f'{compiler} has no JavaScript compiler API (TypeScript 7+)')
+            errors=[line.strip() for line in probe.stderr.splitlines() if 'Error' in line]
+            reason=errors[0] if errors else 'resolveModuleName is not a function'
+            self.skipTest(f'{compiler} has no JavaScript compiler API (TypeScript 7+?): {reason}')
         cases=[
             ('./lib.js', ['lib.ts']), ('./lib.js', ['lib.tsx']),
             ('./lib.js', ['lib.ts','lib.tsx','lib.js']),

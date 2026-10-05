@@ -151,8 +151,78 @@ def shell_name(value):
     return os.path.basename(value).lower()
 
 
+class CommandAnalysisLimit(ValueError):
+    """A bounded analysis must fail visibly instead of reporting a clean file."""
+
+
+class LocalBindings(ast.NodeVisitor):
+    """Names owned by a Python scope, excluding child scopes' local bindings."""
+    def __init__(self):
+        self.names = set()
+        self.external = set()
+
+    def visit_Name(self, node):
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            self.names.add(node.id)
+
+    def visit_Import(self, node):
+        self.names.update(alias.asname or alias.name.split('.')[0] for alias in node.names)
+
+    def visit_ImportFrom(self, node):
+        self.names.update(alias.asname or alias.name for alias in node.names)
+
+    def visit_Global(self, node):
+        self.external.update(node.names)
+
+    visit_Nonlocal = visit_Global
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    def visit_MatchAs(self, node):
+        if node.name:
+            self.names.add(node.name)
+        self.generic_visit(node)
+
+    visit_MatchStar = visit_MatchAs
+
+    def visit_MatchMapping(self, node):
+        if node.rest:
+            self.names.add(node.rest)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        self.names.add(node.name)
+        for expr in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+            if expr is not None:
+                self.visit(expr)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        self.names.add(node.name)
+        for expr in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(expr)
+
+    def visit_Lambda(self, node):
+        for expr in [*node.args.defaults, *node.args.kw_defaults]:
+            if expr is not None:
+                self.visit(expr)
+
+    def visit_comprehension(self, node):
+        # Comprehension targets are local; a walrus in their expressions is not.
+        self.visit(node.iter)
+        for condition in node.ifs:
+            self.visit(condition)
+
+
 class CommandInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, text, lines):
+    _SET_FIELDS = ('tainted_names', 'raw_tainted_names', 'shell_command_vars',
+                   'executable_vars', 'argv_names', 'subprocess_modules', 'os_modules')
+
+    def __init__(self, text, lines, *, max_steps=100_000):
         self.text = text
         self.lines = lines
         self.subprocess_modules = {'subprocess'}
@@ -167,6 +237,346 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.argv_names = set()
         self.issues = []
         self.seen_lines = set()
+        self.remaining_steps = max_steps
+        self.exception_states = []
+        self.class_enclosing = []
+
+    def state(self):
+        return tuple(frozenset(getattr(self, name)) for name in self._SET_FIELDS) + (
+            frozenset((name, call) for name, calls in self.direct_calls.items() for call in calls),)
+
+    def restore(self, state):
+        for name, value in zip(self._SET_FIELDS, state):
+            setattr(self, name, set(value))
+        self.direct_calls = {}
+        for name, call in state[-1]:
+            self.direct_calls.setdefault(name, set()).add(call)
+
+    @staticmethod
+    def merge(*states):
+        states = [state for state in states if state is not None]
+        if not states:
+            return None
+        # Taint and sink bindings are may facts. In contrast, argv is a must
+        # fact: one scalar alternative must not inherit another branch's
+        # exemption for a fixed executable followed by untrusted arguments.
+        return tuple(frozenset.intersection(*(state[index] for state in states))
+                     if index == 4 else frozenset.union(*(state[index] for state in states))
+                     for index in range(len(states[0])))
+
+    def merge_exits(self, *flows):
+        result = {}
+        for flow in flows:
+            for kind, state in flow.items():
+                result[kind] = self.merge(result.get(kind), state)
+        return result
+
+    def forget(self, names):
+        for field in self._SET_FIELDS:
+            getattr(self, field).difference_update(names)
+        for name in names:
+            self.direct_calls.pop(name, None)
+
+    def observe(self, state):
+        for index, previous in enumerate(self.exception_states):
+            self.exception_states[index] = self.merge(previous, state)
+
+    def suite(self, statements, initial):
+        flow = {'normal': initial}
+        for statement in statements:
+            current = flow.pop('normal', None)
+            if current is None:
+                break
+            self.remaining_steps -= 1
+            if self.remaining_steps < 0:
+                raise CommandAnalysisLimit('command-injection control-flow budget exceeded')
+            self.restore(current)
+            self.observe(current)
+            exits = self.statement(statement)
+            for state in exits.values():
+                self.observe(state)
+            flow = self.merge_exits(flow, exits)
+        return flow
+
+    def statement(self, node):
+        if isinstance(node, ast.If):
+            self.visit(node.test)
+            entry = self.state()
+            if isinstance(node.test, ast.Constant):
+                return self.suite(node.body if node.test.value else node.orelse, entry)
+            return self.merge_exits(self.suite(node.body, entry), self.suite(node.orelse, entry))
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            return self.loop(node)
+        if isinstance(node, (ast.Try, getattr(ast, 'TryStar', ast.Try))):
+            return self.try_statement(node)
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    self.mark_assignment(target_names(item.optional_vars), item.context_expr)
+            flow = self.suite(node.body, self.state())
+            if 'raise' in flow:
+                # A context manager may suppress an exception; do not assume
+                # a raising path is dead after an unknown __exit__ method.
+                flow['normal'] = self.merge(flow.get('normal'), flow['raise'])
+            return flow
+        if isinstance(node, getattr(ast, 'Match', ())):
+            self.visit(node.subject)
+            entry = self.state()
+            flow = {}
+            exhaustive = False
+            for case in node.cases:
+                self.restore(entry)
+                bindings = LocalBindings()
+                bindings.visit(case.pattern)
+                self.mark_assignment(bindings.names, node.subject)
+                self.argv_names.difference_update(bindings.names)
+                if case.guard is not None:
+                    self.visit(case.guard)
+                flow = self.merge_exits(flow, self.suite(case.body, self.state()))
+                if case.guard is None and isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None:
+                    exhaustive = True
+            if not exhaustive:
+                flow = self.merge_exits(flow, {'normal': entry})
+            return flow
+        if isinstance(node, ast.Return):
+            if node.value is not None:
+                self.visit(node.value)
+            return {'return': self.state()}
+        if isinstance(node, ast.Raise):
+            for expr in (node.exc, node.cause):
+                if expr is not None:
+                    self.visit(expr)
+            return {'raise': self.state()}
+        if isinstance(node, (ast.Break, ast.Continue)):
+            return {'break' if isinstance(node, ast.Break) else 'continue': self.state()}
+        self.visit(node)
+        return {'normal': self.state()}
+
+    def loop(self, node):
+        is_for = isinstance(node, (ast.For, ast.AsyncFor))
+        if is_for:
+            self.visit(node.iter)
+        entry = self.state()
+        header = entry
+        while True:
+            self.restore(header)
+            if is_for:
+                self.mark_assignment(target_names(node.target), node.iter)
+                self.argv_names.difference_update(target_names(node.target))
+                exhausted = header
+            else:
+                self.visit(node.test)
+                exhausted = self.state()
+                if isinstance(node.test, ast.Constant) and not node.test.value:
+                    return self.suite(node.orelse, exhausted)
+            body = self.suite(node.body, self.state())
+            updated = self.merge(entry, body.get('normal'), body.get('continue'))
+            if updated == header:
+                break
+            header = updated
+        result = {kind: state for kind, state in body.items() if kind in ('return', 'raise')}
+        if is_for or not (isinstance(node.test, ast.Constant) and node.test.value):
+            result = self.merge_exits(result, self.suite(node.orelse, exhausted))
+        if 'break' in body:
+            result = self.merge_exits(result, {'normal': body['break']})
+        return result
+
+    def try_statement(self, node):
+        entry = self.state()
+        self.exception_states.append(entry)
+        body = self.suite(node.body, entry)
+        exceptional = self.exception_states.pop()
+        normal = body.pop('normal', None)
+        result = self.merge_exits(body, {'raise': exceptional})
+        if normal is not None:
+            result = self.merge_exits(result, self.suite(node.orelse, normal))
+        for handler in node.handlers:
+            self.restore(exceptional)
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name:
+                self.forget([handler.name])
+            flow = self.suite(handler.body, self.state())
+            if handler.name:
+                for kind, state in flow.items():
+                    self.restore(state)
+                    self.forget([handler.name])
+                    flow[kind] = self.state()
+            result = self.merge_exits(result, flow)
+        if node.finalbody:
+            finalized = {}
+            for pending, state in result.items():
+                flow = self.suite(node.finalbody, state)
+                normal = flow.pop('normal', None)
+                if normal is not None:
+                    flow = self.merge_exits(flow, {pending: normal})
+                finalized = self.merge_exits(finalized, flow)
+            result = finalized
+        return result
+
+    def visit_Module(self, node):
+        entry = self.state()
+        flow = self.suite(node.body, entry)
+        self.restore(flow.get('normal', entry))
+
+    def visit_FunctionDef(self, node):
+        for expr in [*node.decorator_list, *node.args.defaults, *node.args.kw_defaults]:
+            if expr is not None:
+                self.visit(expr)
+        self.forget([node.name])
+        outer = self.state()
+        inherited = self.class_enclosing[-1] if self.class_enclosing else outer
+        self.restore(inherited)
+        bindings = LocalBindings()
+        for statement in node.body:
+            bindings.visit(statement)
+        parameters = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]]
+        parameters.extend(arg.arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)
+        self.forget((bindings.names - bindings.external) | set(parameters))
+        exceptions, classes = self.exception_states, self.class_enclosing
+        self.exception_states, self.class_enclosing = [], []
+        try:
+            self.suite(node.body, self.state())
+        finally:
+            self.restore(outer)
+            self.exception_states, self.class_enclosing = exceptions, classes
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        for expr in [*node.decorator_list, *node.bases, *node.keywords]:
+            self.visit(expr)
+        self.forget([node.name])
+        outer = self.state()
+        self.class_enclosing.append(self.class_enclosing[-1] if self.class_enclosing else outer)
+        try:
+            self.suite(node.body, outer)
+        finally:
+            self.class_enclosing.pop()
+            self.restore(outer)
+
+    def visit_Lambda(self, node):
+        for expr in [*node.args.defaults, *node.args.kw_defaults]:
+            if expr is not None:
+                self.visit(expr)
+        outer = self.state()
+        parameters = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]]
+        parameters.extend(arg.arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)
+        self.forget(parameters)
+        try:
+            self.visit(node.body)
+        finally:
+            self.restore(outer)
+
+    def visit_IfExp(self, node):
+        self.visit(node.test)
+        if isinstance(node.test, ast.Constant):
+            self.visit(node.body if node.test.value else node.orelse)
+            return
+        entry = self.state()
+        self.visit(node.body)
+        left = self.state()
+        self.restore(entry)
+        self.visit(node.orelse)
+        self.restore(self.merge(left, self.state()))
+
+    def visit_BoolOp(self, node):
+        result = None
+        for value in node.values:
+            self.visit(value)
+            result = self.merge(result, self.state())
+            if isinstance(value, ast.Constant) and (
+                    (isinstance(node.op, ast.And) and not value.value) or
+                    (isinstance(node.op, ast.Or) and value.value)):
+                break
+        self.restore(result)
+
+    def visit_ListComp(self, node):
+        # Only the first iterable is evaluated in the enclosing scope. The
+        # remaining iterables, filters and values run in the comprehension's
+        # private scope, possibly zero times. Reuse the ordinary loop solver
+        # so backedges and filters do not become unconditional assignments.
+        first = node.generators[0]
+        self.visit(first.iter)
+        outer = self.state()
+        temporary = '\0comprehension_iterable'
+        self.mark_assignment([temporary], first.iter)
+        local_names = {name for generator in node.generators
+                       for name in target_names(generator.target)}
+        self.forget(local_names)
+        values = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+        body = [ast.Expr(value=value) for value in values]
+        for index in range(len(node.generators) - 1, -1, -1):
+            generator = node.generators[index]
+            for condition in reversed(generator.ifs):
+                body = [ast.If(test=condition, body=body, orelse=[])]
+            iterable = ast.Name(id=temporary, ctx=ast.Load()) if index == 0 else generator.iter
+            body = [ast.For(target=generator.target, iter=iterable, body=body, orelse=[])]
+        # Assignment expressions may escape; iteration targets never do.
+        escaped = LocalBindings()
+        escaped.visit(node)
+        names = escaped.names - local_names
+        observers = self.exception_states
+        self.exception_states = [self.state()]
+        try:
+            flow = self.suite(body, self.state())
+            observed = self.exception_states[0]
+            changed = self.merge(outer, *flow.values())
+        finally:
+            self.exception_states = observers
+            self.restore(outer)
+
+        def export(state):
+            fields = [frozenset((before - names) | (after & names))
+                      for before, after in zip(outer[:-1], state[:-1])]
+            aliases = frozenset((name, call) for name, call in outer[-1] if name not in names)
+            aliases |= frozenset((name, call) for name, call in state[-1] if name in names)
+            return (*fields, aliases)
+
+        self.observe(export(self.merge(outer, observed)))
+        self.restore(export(changed))
+
+    visit_SetComp = visit_ListComp
+    visit_DictComp = visit_ListComp
+    # A generator can be consumed later. Retain possible escaping effects,
+    # but never assume that its body executes just because it was created.
+    visit_GeneratorExp = visit_ListComp
+
+    def visit_Delete(self, node):
+        self.generic_visit(node)
+        self.forget([name for target in node.targets for name in target_names(target)])
+
+    def visit_NamedExpr(self, node):
+        self.visit(node.value)
+        self.mark_assignment(target_names(node.target), node.value)
+
+    def safe_argv_extension(self, node):
+        """A literal tail with no dynamic or untrusted values cannot change argv[0].
+
+        Keep this narrower than general list concatenation: an unknown tail
+        may supply a shell flag or payload and must retain the conservative
+        fallback until vector mutation has a complete positional model.
+        """
+        if isinstance(node, ast.IfExp):
+            return self.safe_argv_extension(node.body) and self.safe_argv_extension(node.orelse)
+        return isinstance(node, (ast.List, ast.Tuple)) and all(
+            not isinstance(value, ast.Starred)
+            and not self.expr_is_dynamic_string(value)
+            and not self.expr_is_tainted(value, shell=False)
+            for value in node.elts
+        )
+
+    def visit_AugAssign(self, node):
+        self.visit(node.value)
+        if (isinstance(node.op, ast.Add) and isinstance(node.target, ast.Name)
+                and node.target.id in self.argv_names
+                and self.safe_argv_extension(node.value)):
+            # Preserve the existing executable/payload provenance, including
+            # dangerous prefixes. Adding safe options is not string building.
+            return
+        value = ast.BinOp(left=node.target, op=node.op, right=node.value)
+        self.mark_assignment(target_names(node.target), value)
 
     def segment(self, node):
         return ast.get_source_segment(self.text, node) or ''
@@ -198,6 +608,10 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
     def expr_is_tainted(self, node, *, shell=True):
         if node is None or isinstance(node, ast.Constant):
             return False
+        if isinstance(node, ast.NamedExpr):
+            return self.expr_is_tainted(node.value, shell=shell)
+        if isinstance(node, ast.IfExp) and isinstance(node.test, ast.Constant):
+            return self.expr_is_tainted(node.body if node.test.value else node.orelse, shell=shell)
         if shell and self.expr_is_sanitized(node):
             return False
         names = self.tainted_names if shell else self.raw_tainted_names
@@ -210,6 +624,14 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
     def expr_is_dynamic_string(self, node):
         if self.expr_is_tainted(node):
             return True
+        if isinstance(node, ast.NamedExpr):
+            return self.expr_is_dynamic_string(node.value)
+        if isinstance(node, ast.IfExp):
+            if isinstance(node.test, ast.Constant):
+                return self.expr_is_dynamic_string(node.body if node.test.value else node.orelse)
+            return self.expr_is_dynamic_string(node.body) or self.expr_is_dynamic_string(node.orelse)
+        if isinstance(node, ast.BoolOp):
+            return any(self.expr_is_dynamic_string(value) for value in node.values)
         if isinstance(node, ast.Name):
             return node.id in self.shell_command_vars
         if isinstance(node, ast.JoinedStr):
@@ -246,23 +668,28 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
             return self.executable_is_dynamic(node.elts[0])
         return False
 
-    def canonical_call(self, node):
+    def canonical_calls(self, node):
         name = call_name(node.func)
         if name in self.direct_calls:
-            return self.direct_calls[name]
+            return sorted(self.direct_calls[name])
         for module in self.subprocess_modules:
             for func in SUBPROCESS_CALLS:
                 if name == f'{module}.{func}':
-                    return f'subprocess.{func}'
+                    return [f'subprocess.{func}']
         for module in self.os_modules:
             for func in OS_COMMAND_CALLS | OS_EXEC_CALLS | OS_SPAWN_CALLS:
                 if name == f'{module}.{func}':
-                    return f'os.{func}'
-        return ''
+                    return [f'os.{func}']
+        return []
+
+    def canonical_call(self, node):
+        calls = self.canonical_calls(node)
+        return calls[0] if calls else ''
 
     def visit_Import(self, node):
         for alias in node.names:
-            local = alias.asname or alias.name
+            local = alias.asname or alias.name.split('.')[0]
+            self.forget([local])
             if alias.name == 'subprocess':
                 self.subprocess_modules.add(local)
             elif alias.name == 'os':
@@ -273,10 +700,11 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         module = node.module or ''
         for alias in node.names:
             local = alias.asname or alias.name
+            self.forget([local])
             if module == 'subprocess' and alias.name in SUBPROCESS_CALLS:
-                self.direct_calls[local] = f'subprocess.{alias.name}'
+                self.direct_calls[local] = {f'subprocess.{alias.name}'}
             elif module == 'os' and alias.name in (OS_EXEC_CALLS | OS_SPAWN_CALLS | OS_COMMAND_CALLS):
-                self.direct_calls[local] = f'os.{alias.name}'
+                self.direct_calls[local] = {f'os.{alias.name}'}
         self.generic_visit(node)
 
     def mark_assignment(self, names, value):
@@ -290,6 +718,9 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         if isinstance(value, ast.Name) and value.id in self.executable_vars:
             dynamic_executable = True
         for name in names:
+            self.subprocess_modules.discard(name)
+            self.os_modules.discard(name)
+            self.direct_calls.pop(name, None)
             if is_argv:
                 self.argv_names.add(name)
             else:
@@ -312,17 +743,20 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
                 self.executable_vars.discard(name)
 
     def visit_Assign(self, node):
+        self.visit(node.value)
         names = [name for target in node.targets for name in target_names(target)]
         if names:
             self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+        for target in node.targets:
+            self.visit(target)
 
     def visit_AnnAssign(self, node):
         if node.value is not None:
+            self.visit(node.value)
             names = target_names(node.target)
             if names:
                 self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+        self.visit(node.target)
 
     def subprocess_arg_is_unsafe(self, node):
         command = argument_value(node, 0, 'args')
@@ -361,8 +795,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         return self.executable_is_dynamic(node.args[executable_index])
 
     def visit_Call(self, node):
-        canonical = self.canonical_call(node)
-        if canonical:
+        for canonical in self.canonical_calls(node):
             module, func = canonical.rsplit('.', 1)
             unsafe = False
             if module == 'subprocess':
@@ -391,5 +824,5 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
         lines = text.splitlines()
         analyzer = CommandInjectionAnalyzer(text, lines)
         analyzer.visit(tree)
-        for line_no in analyzer.issues:
+        for line_no in sorted(analyzer.issues):
             yield path, line_no, 1, source_line(lines, line_no)[:240]

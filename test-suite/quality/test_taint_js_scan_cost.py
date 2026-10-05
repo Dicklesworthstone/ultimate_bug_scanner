@@ -54,6 +54,53 @@ class RouteParamObjectTests(unittest.TestCase):
                 self.assertLess(time.perf_counter() - started, 1.0)
 
 
+class ComponentSpanTests(unittest.TestCase):
+    def run_case(self, name, check) -> None:
+        started = time.perf_counter()
+        print(f"[{name}] RUN", flush=True)
+        try:
+            check()
+        except Exception:
+            print(f"[{name}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{name}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def test_masked_lists_keep_component_coordinates(self) -> None:
+        self.run_case("c6-component-coordinates", self.check_masked_lists)
+
+    def check_masked_lists(self) -> None:
+        code = taint_js._ComponentCode("LEFT{a,(b,c)}RIGHT", "{x,[y,z]}", 4)
+        expected = {4: 12, 12: 4, 7: 11, 11: 7}
+        self.assertEqual(taint_js._pairs(code, 4, 13), expected)
+        self.assertEqual(taint_js._pairs(code), expected)
+        chunks = list(taint_js._chunks(code, 5, 12))
+        self.assertEqual(chunks, [(5, 6), (7, 12)])
+        self.assertEqual([code[left:right] for left, right in chunks], ["x", "[y,z]"])
+
+    def test_assignment_operators_across_span_boundaries_stay_intact(self) -> None:
+        self.run_case("c6-component-operator-boundaries", self.check_assignment_operators)
+
+    def check_assignment_operators(self) -> None:
+        for text, start, end in (("!=value", 1, 2), ("x=>value", 1, 2),
+                                 ("x==value", 1, 2), ("x<=value", 2, 3)):
+            with self.subTest(text=text):
+                code = taint_js._ComponentCode(text, text, 0)
+                self.assertEqual(list(taint_js._chunks(code, start, end, '=')), [(start, end)])
+        code = taint_js._ComponentCode("xx a=b yy", "a=b", 3)
+        self.assertEqual(list(taint_js._chunks(code, 3, 6, '=')), [(3, 4), (5, 6)])
+
+    def test_empty_and_reversed_spans_do_not_parse_incomplete_bindings(self) -> None:
+        self.run_case("c6-component-empty-spans", self.check_empty_spans)
+
+    def check_empty_spans(self) -> None:
+        code = taint_js._ComponentCode("prefix {x,y} suffix", "{a,b}", 7)
+        for start, end in ((7, 7), (9, 7), (1, -1)):
+            with self.subTest(start=start, end=end):
+                self.assertEqual(taint_js._pairs(code, start, end), {})
+                self.assertEqual(list(taint_js._chunks(code, start, end)), [(start, end)])
+        self.assertEqual(taint_js._binding_paths("{x,y"), [])
+
+
 class JestShapedFileCostTests(unittest.TestCase):
     def test_long_describe_body_scans_in_bounded_time(self) -> None:
         lines = ["describe('orders', () => {"]

@@ -767,7 +767,7 @@ class _Scope:
     parent: object = None
     children: list = field(default_factory=list)
     code: str | _ComponentCode = ''
-    statements: list = field(default_factory=list)
+    statements: list | None = None
     parameter_sources: dict = field(default_factory=dict)
     asynchronous: bool = False
     generator: bool = False
@@ -820,9 +820,12 @@ class _HeapOutput:
 
 def _pairs(code, start=0, end=None):
     stack, pairs = [], {}
+    if end is not None and start >= end:
+        return pairs
     close_to_open = {')': '(', ']': '[', '}': '{'}
-    for index in range(start, len(code) if end is None else end):
-        char = code[index]
+    # Materialize this span once; masked component views otherwise dispatch
+    # every character through Python while retaining shared component storage.
+    for index, char in enumerate(code[start:end], start):
         if char in '([{':
             stack.append((char, index))
         elif char in close_to_open and stack and stack[-1][0] == close_to_open[char]:
@@ -834,21 +837,28 @@ def _pairs(code, start=0, end=None):
 
 def _chunks(code, start, end, separator=','):
     """Split balanced lists without splitting strings or template expressions."""
-    pairs = _pairs(code, start, end)
-    cursor = part = start
-    while cursor < end:
-        if code[cursor] in '([{' and cursor in pairs:
+    if start >= end:
+        yield start, end
+        return
+    fragment = code[start:end]
+    pairs = _pairs(fragment)
+    cursor = part = 0
+    while cursor < len(fragment):
+        if fragment[cursor] in '([{' and cursor in pairs:
             cursor = pairs[cursor] + 1
             continue
-        if code[cursor] == separator:
-            if separator == '=' and (code[cursor:cursor + 2] in {'=>', '=='}
-                                     or code[cursor - 1:cursor] in {'=', '!', '<', '>'}):
+        if fragment[cursor] == separator:
+            # Operators can cross the requested span's boundary. Check the
+            # original code, then keep yielded coordinates component-relative.
+            absolute = start + cursor
+            if separator == '=' and (code[absolute:absolute + 2] in {'=>', '=='}
+                                     or code[absolute - 1:absolute] in {'=', '!', '<', '>'}):
                 cursor += 1
                 continue
-            yield part, cursor
+            yield start + part, absolute
             part = cursor + 1
         cursor += 1
-    yield part, end
+    yield start + part, end
 
 
 def _parameters(text, code, start, end):
@@ -2444,8 +2454,14 @@ class _Engine:
         self.heap_calls = {}
         self.current_task = None
         self.pending, self.queued = deque(), set()
+        self.binding_regions = {}
         for scope in self.scopes:
             scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
+            if scope.parent is not None:
+                # Keep lexical identities, not every function's parsed body.
+                # Evaluation reparses this immutable source span for its task.
+                self.binding_regions[scope] = self.regions(scope)
+                scope.statements = None
         for root, module in self.module_roots.items():
             for begin, end, names in module.commonjs_imports:
                 root.statements.append(_Statement('commonjs_import', module.start + begin,
@@ -2472,7 +2488,9 @@ class _Engine:
                                   or (fn.name == literal and fn.declaration)]
                     if len(candidates) == 1:
                         self.commonjs_targets[root, key] = candidates[0]
-        self.binding_regions = {scope: self.regions(scope) for scope in self.scopes}
+        for scope in self.scopes:
+            if scope.parent is None:
+                self.binding_regions[scope] = self.regions(scope)
         for root, module in self.module_roots.items():
             self.binding_regions[root].extend((root.body_start, root.body_end, name) for name in module.imports)
         self.capture_keys = {}
@@ -2777,8 +2795,9 @@ class _Engine:
 
     def analyze_heap(self, context):
         scope, rule = context.scope, context.rule
+        statements = self.scope_statements(scope)
         state = context.incoming.copy()
-        for name in self.declarations(scope.statements):
+        for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
         for names, _, _ in scope.params:
@@ -2796,7 +2815,7 @@ class _Engine:
                 flow.returns.append((value, final.copy()))
             final = None
         else:
-            final = flow.block(scope.statements, state)
+            final = flow.block(statements, state)
         exits = [*(exit_state for _, exit_state in flow.returns), *([final] if final is not None else [])]
         output = _join_states(*exits)
         exceptional = _join_states(*(exit_state for _, exit_state in flow.throws))
@@ -2926,9 +2945,16 @@ class _Engine:
                 pending.extend((child, False) for child in (*node.body, *node.alternate))
         return names
 
+    def scope_statements(self, scope):
+        if scope.statements is not None:
+            # Module bodies include resolved CommonJS/default-export nodes.
+            return scope.statements
+        return [] if scope.concise else _Parser(scope).sequence(scope.body_start, scope.body_end)
+
     def analyze(self, scope, rule):
+        statements = self.scope_statements(scope)
         state = _State()
-        for name in self.declarations(scope.statements):
+        for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
         for names, _, _ in scope.params:
@@ -2947,7 +2973,7 @@ class _Engine:
                 flow.returns.append((value, final.copy()))
             final = None
         else:
-            final = flow.block(scope.statements, state)
+            final = flow.block(statements, state)
         self.final_states[(scope, rule)] = final or state
         exits = [*(exit_state for _, exit_state in flow.returns), *([final] if final is not None else [])]
         joined = _join_states(*exits)

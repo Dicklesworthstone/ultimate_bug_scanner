@@ -14,6 +14,15 @@ _No changes yet._
 
 ---
 
+## [v5.4.19] - 2026-10-05 [Tag]
+
+### Fixed
+
+- JavaScript taint discovers the component's actual sinks before constructing function scopes and capture relationships. Components without supported sinks avoid that work; components with sinks solve only the relevant rules and release each rule's flow state after retaining its concrete findings.
+- JavaScript JSON reports write findings incrementally. Cache reconciliation preserves selection-wide thresholds, gates and suppressors without creating another whole findings collection, and releases cached records before rendering reports.
+
+---
+
 ## [v5.4.18] - 2026-10-05 [Tag]
 
 ### Fixed

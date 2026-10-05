@@ -198,7 +198,7 @@ class JsonReportMemoryTests(unittest.TestCase):
     def check_summary(self, artifacts: Path) -> int:
         with tempfile.TemporaryDirectory(prefix="summary-", dir=artifacts) as tmp:
             root = Path(tmp)
-            report = root / "summary.json"
+            report = artifacts / "summary.json"
             peak = artifacts / "peak-rss-kib.txt"
             script = (
                 "import sys; from ubs_core.js_scan import _write_summary; "

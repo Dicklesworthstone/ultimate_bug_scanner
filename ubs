@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.18"
+UBS_VERSION="5.4.19"
 # Module / helper fetches must be checksum-stable for an installed
 # release, so they pin to the tagged tree matching this script's
 # UBS_VERSION. main is reserved for the self-update probe below
@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='59ff4d8803bdc7c46fea416244a5ce171d1f86e0d4c35cb4f34fb491d2e3463f'
-  [cpp]='5cca9bc55309897eecc5c4445d2c30a5ddd96d58133269a0c7a9f5b8a96caf86'
-  [csharp]='cc2e8f49684934514fa2743f0ef01ddf06c1205cf2929c8fabe435aeafd5cdb6'
-  [elixir]='6bb112b0a9575ebb643f4d3844865612126808fdf96b9de07e278268653477e7'
-  [golang]='14aa70c5db2e998a1064d76e210305834b07b0ef40c883acd9dc8dc477368e8c'
-  [java]='3b63a48088a3c3d8b67059c9e7e6f593d61abc7495d3caee4633c87d06aeb8f2'
-  [js]='bf4d2b3473d31bdfcbcecfef048ea3f8b19365edfceb0efba8ed59d9878b4007'
-  [kotlin]='610f17be2815aabe9887da41bb417939ab0145cf13adf7c2700bff9b7067285b'
-  [python]='095fdd9169dcfe8ed0d16af4e321831a52afec3697a0528f6177fa60e75b56c5'
-  [ruby]='cd2a810c163b8fd887c44c4ebd9319f4aec9b98c3b20383a9fd940e1d77906d3'
-  [rust]='4039303eb8a6bcc29233148d848cb6f038019c396d659e6fccbc405a51c6b869'
-  [swift]='85954eb130481309352f4846919c9dbc2c927f034bd41e171ee0d0cac179410e'
+  [bash]='afdd49dfa6ef7569b3784abb7510bb56a0b4bf6bbf23e46f401a6e69819227d9'
+  [cpp]='7dff28876ae21947c7619a4f1ae7d595b26df6cdfc1213c4dd30bee1228ed0c9'
+  [csharp]='63731049d624d09c16b5d3b974bb34c918575a0cadf4c91b77e1d05dcb913dfe'
+  [elixir]='9296125f00a68b319f7a6944d7fd76efd94b1d3c3d2a952cf52d43b1c30c0ddb'
+  [golang]='10312488a1f0d285466dde6c17ae904803c4a885149409c80fc6d879ae0cc3c9'
+  [java]='7c41cd1c5e0a082c0d4c761187980823cbd3e02470520df6f4eac854d48fec6d'
+  [js]='e3efa8a349f5e80e0c82f02002a16ea32e33688dd327864de99683cb29b2a8e0'
+  [kotlin]='aefa58dec448caf443969d441730f26602131f6d2387180486134028f8ec4c36'
+  [python]='5f940546895566df64bb711533519dc6feadf1d5de7abb7a0a307dfe07011d88'
+  [ruby]='fdad6efdc69d8c8373cf976253d787e732ccea34ee2d60b7b27476074d38d1c8'
+  [rust]='ab8c41a8cd17d2fde7b438b48b9e7c10e39b8de6ccc84b3b082e5401e2dc14a7'
+  [swift]='8b597f5e42c1731a8ea3e8ec78c37a4f780ef37a5ba967ff532cb9094268d2aa'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -160,7 +160,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_go.py']='a45ebab2939d64064aebc0cddcf2290d0be1ba37783ad28b065c0a71e8708e95'
   ['helpers/ubs_core/analyzers/taint_java_redirect.py']='39fb0763494056f30a450f8c9296b02effc9a18a06d6560b8beeefa67310dc90'
   ['helpers/ubs_core/analyzers/taint_java_traversal.py']='c73cbe618a30944ca491dac09aa667f3e2599b1c54f95a8a9747bdad9135dcfd'
-  ['helpers/ubs_core/analyzers/taint_js.py']='a4292d7596c8db23ef81889b88cdf4d8de10e24f9a1b7f86b115ff4f8f9ad426'
+  ['helpers/ubs_core/analyzers/taint_js.py']='b9c92b9f247ab3b81a9e5b68b9637997e84b0ded762a7bc269803733ebbb2516'
   ['helpers/ubs_core/analyzers/taint_py.py']='1e700e958a08d309e0ade8f88fcaf1b052b2d30160d5db71fdd34d6facb11ec9'
   ['helpers/ubs_core/analyzers/taint_ruby_traversal.py']='b1d3923df019a1422e2b6541700736eeee908e8f9030c27edecdd60894e629e0'
   ['helpers/ubs_core/analyzers/taint_ruby_url.py']='410e91804a8edabe0c10c495ec6bf34141cb5aed698aec7331a210d38efbac5c'
@@ -417,7 +417,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='80c6745cbc35cb6e325b9b6dd16e356d2a1bdeaa374ce0fc1212e31157e817b6'
+  ['lib/ubs-common.sh']='16bce64840f9bda33dbf15977545f42d5f0acfbb70c293eefae8ba5ad991e401'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

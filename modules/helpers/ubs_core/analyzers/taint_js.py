@@ -2394,6 +2394,22 @@ class _Engine:
                 offset = module.end + 3
             text, code = ''.join(chunks), ''.join(masks)
         self.text, self.code = text, code
+        sinks = []
+        for left, right in ([(m.start, m.end) for m in modules] if modules else [(0, len(text))]):
+            aliases, functions = child_process_bindings(text[left:right].splitlines())
+            sinks.extend((a + left, b + left, rule, label, call)
+                         for a, b, rule, label, call in
+                         child_process_sinks(text[left:right], code[left:right], aliases, functions))
+        for regex, rule, label, call in SINKS:
+            sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
+        self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
+        self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
+        if not sinks:
+            # No rule can emit a finding without one of these exact sinks.
+            # Avoid parsing scopes and constructing their capture graph for
+            # sink-free components; every selected module was still inspected.
+            self.scopes = []
+            return
         if modules:
             self.functions, roots = [], []
             for module in modules:
@@ -2429,16 +2445,6 @@ class _Engine:
         self.heap_calls = {}
         self.current_task = None
         self.pending, self.queued = deque(), set()
-        sinks = []
-        for left, right in ([(m.start, m.end) for m in modules] if modules else [(0, len(text))]):
-            aliases, functions = child_process_bindings(text[left:right].splitlines())
-            sinks.extend((a + left, b + left, rule, label, call)
-                         for a, b, rule, label, call in
-                         child_process_sinks(text[left:right], code[left:right], aliases, functions))
-        for regex, rule, label, call in SINKS:
-            sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
-        self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
-        self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
         for scope in self.scopes:
             scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
         for root, module in self.module_roots.items():

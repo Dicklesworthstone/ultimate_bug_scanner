@@ -142,6 +142,60 @@ class RuleStateTests(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
+class SinkFreeComponentCostTests(unittest.TestCase):
+    def test_large_sink_free_import_component_stays_bounded(self) -> None:
+        case = "c6-sink-free-component"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                for index in range(100):
+                    body = [f"import {{next as importedNext}} from './part_{(index + 1) % 100:04d}';",
+                            f"const payload = req.query.field{index};",
+                            "export function next(value) {",
+                            "  return {value, payload};", "}"]
+                    for callback in range(199):
+                        body += [f"export function visit{callback}(value) {{",
+                                 "  const box = importedNext(value);", "  box.value = payload;",
+                                 "  return box;", "}"]
+                    self.assertEqual(len(body), 1000)
+                    (root / f"part_{index:04d}.ts").write_text("\n".join(body) + "\n")
+                script = (
+                    "import json, sys; from pathlib import Path; "
+                    "from ubs_core.analyzers import taint_js; "
+                    "from ubs_core.registry import RunContext; "
+                    "files = sorted(Path(sys.argv[1]).glob('*.ts')); "
+                    "findings = list(taint_js.run(RunContext(lang='javascript', files=files))); "
+                    "print(json.dumps({'selected': len(files), 'findings': findings}))"
+                )
+                env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+                peak = artifacts / "peak-rss-kib.txt"
+                result = subprocess.run(
+                    ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                     "-c", script, str(root)],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=60,
+                )
+                (artifacts / "stdout.log").write_text(result.stdout)
+                (artifacts / "stderr.log").write_text(result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"selected": 100, "findings": []})
+                rss_kib = int(peak.read_text())
+                self.assertLess(rss_kib, 200 * 1024,
+                                f"sink-free component peaked at {rss_kib / 1024:.1f} MiB")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text()}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class ProjectMemoryTests(unittest.TestCase):
     def test_400k_line_scan_preserves_findings_below_200_mib(self) -> None:
         self.check_project(connected=False)

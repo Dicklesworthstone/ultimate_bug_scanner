@@ -2971,7 +2971,11 @@ class _Engine:
 
     def findings(self):
         found = {}
+        active_rules = {rule for rule, _label in self.call_sinks.values()}
+        active_rules.update(rule for _location, _expr_start, rule, _label in self.write_sinks)
         for rule in KIND_BY_RULE:
+            if rule not in active_rules:
+                continue
             self.pending, self.queued = deque(reversed(self.scopes)), set(self.scopes)
             while self.pending:
                 task = self.pending.popleft()
@@ -3004,6 +3008,14 @@ class _Engine:
                     if concrete:
                         key = (location, rule, label)
                         found[key] = _join(found.get(key, frozenset()), concrete)
+            # Every summary, capture and heap-call context belongs to this
+            # rule. Concrete source traces no longer need its flow states;
+            # retain only those findings while solving the next rule.
+            self.summaries.clear()
+            self.final_states.clear()
+            self.captures.clear()
+            self.dependents.clear()
+            self.heap_calls.clear()
         for (location, rule, label), fact in sorted(found.items()):
             trace = min(fact, key=lambda item: (len(item.path), item.path))
             yield location, rule, format_path(trace.path, label)

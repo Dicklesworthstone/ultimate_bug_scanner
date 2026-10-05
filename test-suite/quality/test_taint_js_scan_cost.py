@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,58 @@ class JestShapedFileCostTests(unittest.TestCase):
             elapsed = time.perf_counter() - started
         self.assertEqual(findings, [])
         self.assertLess(elapsed, 30.0, f"taint_js took {elapsed:.1f}s on {len(lines)} lines")
+
+
+class RuleStateTests(unittest.TestCase):
+    def test_imported_heap_source_and_sanitizer_keep_rule_specific_findings(self) -> None:
+        sources = {
+            "lib.ts": (
+                "export function read(req) { return {input: req.query.value}; }\n"
+                "export function cleanHtml(value) { return DOMPurify.sanitize(value); }\n"
+            ),
+            "app.ts": (
+                "import {read, cleanHtml} from './lib';\n"
+                "import {exec as launch} from 'node:child_process';\n"
+                "const box = read(req);\n"
+                "res.send(box.input);\n"
+                "eval(box.input);\n"
+                "launch(box.input);\n"
+                "db.query(box.input);\n"
+                "res.send(cleanHtml(box.input));\n"
+                "eval(cleanHtml(box.input));\n"
+                "db.query('SELECT 1');\n"
+                "res.send('constant');\n"
+            ),
+            "quiet.ts": (
+                "export function collect(req) { return {input: req.query.value}; }\n"
+                "const example = 'eval(req.query.value)';\n"
+                "// res.send(req.query.value);\n"
+            ),
+        }
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "c6-rule-state"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="taint-js-rules-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            paths = []
+            for name, source in sources.items():
+                path = root / name
+                path.write_text(source, encoding="utf-8")
+                paths.append(path)
+            expected = Counter({("app.ts", "javascript.taint.xss", 4): 1,
+                                ("app.ts", "javascript.taint.eval", 5): 1,
+                                ("app.ts", "javascript.taint.command", 6): 1,
+                                ("app.ts", "javascript.taint.sql", 7): 1,
+                                ("app.ts", "javascript.taint.eval", 9): 1})
+            for selected in (paths, list(reversed(paths))):
+                with self.subTest(order=[path.name for path in selected]):
+                    findings = list(taint_js.run(RunContext(lang="javascript", files=selected)))
+                    actual = Counter((Path(item["path"]).name, item["rule"], item["line"])
+                                     for item in findings)
+                    self.assertEqual(actual, expected, findings)
+                    for item in findings:
+                        self.assertEqual(item["severity"], "critical", item)
+                        self.assertIn("lib.ts:read()", item["message"], item)
+            self.assertEqual(list(taint_js.run(RunContext(lang="javascript", files=[paths[-1]]))), [])
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")

@@ -74,6 +74,76 @@ class JestShapedFileCostTests(unittest.TestCase):
         self.assertEqual(findings, [])
         self.assertLess(elapsed, 30.0, f"taint_js took {elapsed:.1f}s on {len(lines)} lines")
 
+    def test_sink_free_callbacks_complete_without_disabling_taint_rules(self) -> None:
+        # Mirrors the allocation/loop shape of the monitoring test that hit
+        # the default 300s module timeout. Include real request sources: the
+        # absence of a sink, not an assumption that test code is safe, matters.
+        lines = ["describe('monitoring', () => {",
+                 "  function windows(value) {",
+                 "    return new Map([[7, { ratio: value }], [30, { ratio: value }]]);",
+                 "  }"]
+        for index in range(360):
+            lines += [f"  it('case {index}', () => {{",
+                      "    const rows = [{ name: req.query.name, windows: windows(0.9) }];",
+                      "    for (const row of rows) {",
+                      "      const updated = { ...row, windows: windows(1) };",
+                      "      expect(updated.name).toBe(req.query.name);",
+                      "    }",
+                      "  });"]
+        lines.append("});")
+        with tempfile.TemporaryDirectory(prefix="taint-js-no-sink-") as tmp:
+            path = Path(tmp) / "monitoring.test.ts"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(HELPERS_DIR)
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 "import sys; from pathlib import Path; "
+                 "from ubs_core.analyzers.taint_js import scan_file_findings; "
+                 "assert list(scan_file_findings(Path(sys.argv[1]))) == []",
+                 str(path)],
+                capture_output=True, text=True, env=env, timeout=10,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_every_sink_domain_still_reports_request_data(self) -> None:
+        source = "\n".join([
+            "import { execSync as run } from 'node:child_process';",
+            "export function handle(req, res) {",
+            "  const input = req.query.command;",
+            "  res.send(input);",
+            "  eval(input);",
+            "  run(`echo ${input}`);",
+            "  db.query(input);",
+            "}",
+        ])
+        with tempfile.TemporaryDirectory(prefix="taint-js-sink-domains-") as tmp:
+            path = Path(tmp) / "handler.ts"
+            path.write_text(source + "\n", encoding="utf-8")
+            findings = list(taint_js.scan_file_findings(path))
+        self.assertEqual([(rule, line) for rule, line, _col, _trace in findings], [
+            ("js.taint.xss", 4), ("js.taint.eval", 5),
+            ("js.taint.command", 6), ("js.taint.sql", 7),
+        ])
+
+    def test_sink_in_importer_keeps_source_only_dependency_in_analysis(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="taint-js-imported-sink-") as tmp:
+            root = Path(tmp)
+            provider = root / "provider.ts"
+            provider.write_text(
+                "export function read(req) { return req.query.html; }\n",
+                encoding="utf-8",
+            )
+            handler = root / "handler.ts"
+            handler.write_text(
+                "import { read } from './provider';\n"
+                "export function handle(req, res) { res.send(read(req)); }\n",
+                encoding="utf-8",
+            )
+            findings = list(taint_js.scan_project_findings([provider, handler]))
+        self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _trace
+                          in findings], [("handler.ts", "js.taint.xss", 2)])
+
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class ProjectMemoryTests(unittest.TestCase):

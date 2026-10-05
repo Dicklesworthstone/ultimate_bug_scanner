@@ -2971,7 +2971,15 @@ class _Engine:
 
     def findings(self):
         found = {}
+        # Effects originate only at these already resolved sink locations.
+        # Solving a sink-free domain cannot emit a finding, but can spend
+        # minutes joining callback/loop heaps. Use component-wide sinks so a
+        # source-only dependency still participates in its importer's flow.
+        active_rules = {rule for rule, _label in self.call_sinks.values()}
+        active_rules.update(rule for _start, _expr, rule, _label in self.write_sinks)
         for rule in KIND_BY_RULE:
+            if rule not in active_rules:
+                continue
             self.pending, self.queued = deque(reversed(self.scopes)), set(self.scopes)
             while self.pending:
                 task = self.pending.popleft()

@@ -32,7 +32,7 @@ jobs:
           test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = ccb29797e9e2b6e52f3a122da2be41f1ed75dde7
           echo "FLOW_VALIDATION_BASE $(git rev-parse HEAD)"
           cp modules/helpers/ubs_core/py_detectors/command_injection.py "$RUNNER_TEMP/original-command.py"
-          gh api "repos/$GH_REPO/git/blobs/eb1b0c3f88b88aa19fd6f095f94424fbffea1e7b" --jq .content | base64 --decode > "$RUNNER_TEMP/command-flow-candidate.xz"
+          gh api "repos/$GH_REPO/git/blobs/eb1b0c3f88b88aa19fd6f095f94424fbffea1e7b" --jq .content | python3 -c 'import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > "$RUNNER_TEMP/command-flow-candidate.xz"
           python3 - <<'PY'
           import hashlib
           import json
@@ -49,8 +49,12 @@ jobs:
           assert not test.exists(), 'do not overwrite a concurrent test addition'
           test.write_text(candidate['test'], encoding='utf-8')
           PY
-          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = a199fce30311ea276cebd05846a5aebc01392bae
-          test "$(git hash-object test-suite/quality/test_command_control_flow.py)" = 52c6ede0d5b39a408f834f4de07528f2d3536584
+          gh api "repos/$GH_REPO/git/blobs/1342ce469e69c7a1ca40057a26c14ea96e4f789c" --jq .content | python3 -c 'import base64,sys;sys.stdout.buffer.write(base64.b64decode(sys.stdin.buffer.read()))' > "$RUNNER_TEMP/command-flow-python39.patch"
+          test "$(git hash-object "$RUNNER_TEMP/command-flow-python39.patch")" = 1342ce469e69c7a1ca40057a26c14ea96e4f789c
+          git apply --check "$RUNNER_TEMP/command-flow-python39.patch"
+          git apply "$RUNNER_TEMP/command-flow-python39.patch"
+          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = 46c506d09415bbb1ce4b45f0383a2315f2a14cf3
+          test "$(git hash-object test-suite/quality/test_command_control_flow.py)" = 8eb1d7fed486b169982faa6f0500710f1c35c73d
       - name: Run invocation and control-flow regression suites
         run: |
           python3 --version

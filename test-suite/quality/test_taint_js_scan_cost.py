@@ -77,6 +77,61 @@ class JestShapedFileCostTests(unittest.TestCase):
 
 
 class RuleStateTests(unittest.TestCase):
+    def test_heap_escapes_keep_borrowed_objects_cell_writes_and_exceptions(self) -> None:
+        case = "c6-heap-escapes"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        try:
+            self.check_heap_escapes()
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def check_heap_escapes(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "c6-heap-escapes"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            helper = root / "lib.ts"
+            helper.write_text(
+                "export let delivered;\n"
+                "export function mutate(box, value) { const junk = {value: 'discard'}; "
+                "box.value = value; box = null; return {status: 'ok', junk}; }\n"
+                "export function publish(value) { const junk = {value: 'discard'}; "
+                "delivered = {value}; delivered.loop = delivered; return 'fixed'; }\n"
+                "export function reject(box, value) { const junk = {value: 'discard'}; "
+                "box.value = value; throw {value}; }\n",
+                encoding="utf-8",
+            )
+            main = root / "app.ts"
+            main.write_text(
+                "import {mutate, publish, reject, delivered} from './lib';\n"
+                "const box = {value: 'safe'};\n"
+                "mutate(box, req.query.value);\n"
+                "res.send(box.value);\n"
+                "mutate(box, 'safe');\n"
+                "res.send(box.value);\n"
+                "publish(req.query.value);\n"
+                "res.send(delivered);\n"
+                "try { reject(box, req.query.value); } catch (error) { res.send(error.value); }\n"
+                "res.send(box.value);\n"
+                "try { reject(box, 'safe'); } catch (error) { res.send(error.value); }\n"
+                "res.send(box.value);\n",
+                encoding="utf-8",
+            )
+            expected = Counter({("app.ts", "javascript.taint.xss", line): 1
+                                for line in (4, 8, 9, 10)})
+            for selected in ([main, helper], [helper, main]):
+                with self.subTest(order=[path.name for path in selected]):
+                    findings = list(taint_js.run(RunContext(lang="javascript", files=selected)))
+                    actual = Counter((Path(item["path"]).name, item["rule"], item["line"])
+                                     for item in findings)
+                    self.assertEqual(actual, expected, findings)
+                    for item in findings:
+                        self.assertEqual(item["severity"], "critical", item)
+                        self.assertIn("req.query.value", item["message"], item)
+
     def test_block_closures_keep_cells_and_call_time_heap_values(self) -> None:
         case = "c6-block-closures"
         started = time.perf_counter()

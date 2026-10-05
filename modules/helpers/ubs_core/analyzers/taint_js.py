@@ -811,6 +811,13 @@ class _HeapCall:
     readers: set = field(default_factory=set)
 
 
+@dataclass(slots=True)
+class _HeapOutput:
+    heap: dict
+    weak_refs: set
+    array_lengths: dict
+
+
 def _pairs(code, start=0, end=None):
     stack, pairs = [], {}
     close_to_open = {')': '(', ']': '[', '}': '{'}
@@ -2796,8 +2803,32 @@ class _Engine:
         def writes(store):
             return {} if store is None else {key: value for key, value in store.cells.items()
                                             if key[0] is not scope and key in store.written_cells}
-        return (_join(*(value for value, _ in flow.returns)), flow.effects, writes(output), output,
-                _join(*(value for value, _ in flow.throws)), writes(exceptional), exceptional)
+        returned = _join(*(value for value, _ in flow.returns))
+        thrown = _join(*(value for value, _ in flow.throws))
+        normal_writes, throw_writes = writes(output), writes(exceptional)
+
+        def escaped_heap(store, value, changes):
+            if store is None:
+                return None
+            # Borrowed objects remain observable through caller aliases even
+            # after a formal is rebound. Local allocations only escape through
+            # a returned value, an exception, or a write to a captured cell.
+            pending = [*context.incoming.heap, *_refs(value)]
+            for fact in changes.values():
+                pending.extend(_refs(fact))
+            heap = {}
+            while pending:
+                ref = pending.pop()
+                if ref in heap or ref not in store.heap:
+                    continue
+                slots = heap[ref] = store.heap[ref]
+                for fact in slots.values():
+                    pending.extend(_refs(fact) - heap.keys())
+            return _HeapOutput(heap, store.weak_refs & heap.keys(),
+                               {ref: length for ref, length in store.array_lengths.items() if ref in heap})
+
+        return (returned, flow.effects, normal_writes, escaped_heap(output, returned, normal_writes),
+                thrown, throw_writes, escaped_heap(exceptional, thrown, throw_writes))
 
     def regions(self, scope):
         """Static lexical identities; dataflow state still supplies values."""

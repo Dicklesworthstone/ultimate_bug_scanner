@@ -32,6 +32,7 @@ MAX_TEXT_TOTAL = 16 * 1024 * 1024
 MAX_DOCUMENTS = 64
 MAX_OUTPUT = 8 * 1024 * 1024
 MAX_DIAGNOSTICS = 2000
+MAX_DIAGNOSTIC_REQUESTS = 64
 
 
 class ProtocolError(ValueError):
@@ -1033,6 +1034,93 @@ class Server:
         self.published_group = set()
         self.register_watches = False
         self.registration_pending = False
+        self.pull_mode = False
+        self.pull_session = os.urandom(16)
+        self.pulls = OrderedDict()
+        self.client_ready = False
+        self.refresh_supported = False
+        self.refresh_dirty = False
+        self.refresh_pending = False
+        self.refresh_deadline = 0
+
+    def pull_error(self, request_id, code, message, *, retrigger=None):
+        self.pulls.pop(request_id, None)
+        error = {'code': code, 'message': message}
+        if retrigger is not None:
+            error['data'] = {'retriggerRequest': retrigger}
+        self.send({'jsonrpc': '2.0', 'id': request_id, 'error': error})
+
+    def cancel_pulls(self, uri=None, *, retrigger=True):
+        for request_id, request in list(self.pulls.items()):
+            if uri is None or request['uri'] == uri:
+                self.pull_error(request_id, -32802, 'Diagnostic input was invalidated', retrigger=retrigger)
+
+    def diagnostic_request(self, request_id, params):
+        if not self.pull_mode:
+            raise ProtocolError('Negotiate textDocument.diagnostic before requesting diagnostics')
+        if ((isinstance(request_id, str) and len(request_id) > 256)
+                or (type(request_id) is int and not -(2**31) <= request_id < 2**31)):
+            raise ProtocolError('Diagnostic request id exceeds limit')
+        if request_id in self.pulls:
+            # One id cannot identify two outstanding requests. Fail it once;
+            # never let the duplicate replace a subscriber to another source.
+            self.pull_error(request_id, -32600, 'Duplicate outstanding diagnostic request id')
+            return
+        item = params.get('textDocument')
+        if not isinstance(item, dict):
+            raise ProtocolError('Missing textDocument')
+        uri = item.get('uri')
+        document_path(uri, self.root)
+        if uri not in self.documents:
+            raise ProtocolError('Open and synchronize the document before pulling diagnostics')
+        if 'identifier' in params and params['identifier'] != 'ubs':
+            raise ProtocolError('Unknown diagnostic provider')
+        previous = params.get('previousResultId')
+        if 'previousResultId' in params and (not isinstance(previous, str) or len(previous) > 256):
+            raise ProtocolError('Invalid previous diagnostic result id')
+        if len(self.pulls) >= MAX_DIAGNOSTIC_REQUESTS:
+            self.pull_error(request_id, -32802, 'Too many outstanding diagnostic requests', retrigger=False)
+            return
+        generation = self.documents[uri]['generation']
+        running = (uri in self.pending
+                   or any(target == uri and current == generation and not cancel.is_set()
+                          for target, current, cancel in self.active.values())
+                   or self.batch_pending is not None and uri in self.batch_pending
+                   or self.batch is not None and not self.batch[2].is_set() and uri in self.batch[1])
+        if not running:
+            # A result id saves transport bytes, not analysis. Re-run the real
+            # scanner instead of blessing old diagnostics after unobserved disk,
+            # policy or dependency changes. Concurrent pulls share this scan.
+            self.queue(uri)
+        self.pulls[request_id] = {'uri': uri, 'generation': self.documents[uri]['generation'],
+                                  'previous': previous, 'deadline': time.monotonic() + self.timeout + 1}
+
+    def finish_pulls(self, uri, diagnostics):
+        selected = [(request_id, request) for request_id, request in self.pulls.items()
+                    if request['uri'] == uri and request['generation'] == self.documents[uri]['generation']]
+        if not selected:
+            return
+        doc = self.documents[uri]
+        digest = hashlib.sha256(self.pull_session)
+        # Scope opaque ids to this session, URI, exact editor version/content
+        # and complete displayed result. Reopening or editing cannot revive an
+        # earlier version's empty report merely because its diagnostics match.
+        for value in (uri, str(doc.get('sync_version', doc['version'])),
+                      doc.get('wire_text', doc['text']), json.dumps(diagnostics, ensure_ascii=True, sort_keys=True)):
+            digest.update(value.encode('utf-8'))
+            digest.update(b'\0')
+        result_id = digest.hexdigest()
+        for request_id, request in selected:
+            result = {'kind': 'unchanged', 'resultId': result_id} if request['previous'] == result_id else {
+                'kind': 'full', 'resultId': result_id, 'items': diagnostics}
+            self.pulls.pop(request_id)
+            self.send({'jsonrpc': '2.0', 'id': request_id, 'result': result})
+
+    def refresh_diagnostics(self):
+        # Only input/lifecycle notifications request refresh, never a pull or
+        # its completion. Otherwise refresh -> pull -> scan becomes a loop.
+        if self.pull_mode and self.refresh_supported:
+            self.refresh_dirty = True
 
     def cancel_batch(self, *, announce=True):
         selected = set(self.batch_pending or (self.batch[1] if self.batch and not self.batch[2].is_set() else {})) | self.published_group
@@ -1042,6 +1130,7 @@ class Server:
             self.batch[2].set()
         for uri in selected if announce else ():
             if uri in self.documents:
+                self.cancel_pulls(uri)
                 message = ('Buffer snapshot invalidated; updated buffer analysis is pending.' if self.buffer_mode else
                            'Selected-document scan invalidated; rescan after saving all documents.')
                 self.publish(uri, [note('ubs.unverified', message, 3)])
@@ -1051,9 +1140,11 @@ class Server:
         if uri in self.documents:
             doc = self.documents[uri]
             params['version'] = doc['version'] if doc['synchronized'] else doc.get('sync_version', doc['version'])
-        self.send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': params})
+        if not self.pull_mode:
+            self.send({'jsonrpc': '2.0', 'method': 'textDocument/publishDiagnostics', 'params': params})
 
     def invalidate(self, uri):
+        self.cancel_pulls(uri, retrigger=not self.shutdown)
         # Any document/scope change makes a grouped result obsolete, including
         # changes to a different file on which a clean result may depend.
         if self.batch_pending is not None or self.batch is not None or self.published_group:
@@ -1106,9 +1197,24 @@ class Server:
             result = {uri: ([note('ubs.unverified', 'UBS could not verify this document: ' + str(exc))], None) for uri in documents}
         for uri in documents:
             self.publish(uri, result[uri][0])
+            self.finish_pulls(uri, result[uri][0])
         return True
 
     def tick(self):
+        now = time.monotonic()
+        for request_id, request in list(self.pulls.items()):
+            if now >= request['deadline']:
+                self.pull_error(request_id, -32802, 'Diagnostic request timed out', retrigger=False)
+        if self.refresh_pending and now >= self.refresh_deadline:
+            self.refresh_pending = self.refresh_supported = False
+            self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {
+                'type': 2, 'message': 'Diagnostic refresh was not acknowledged; pull again after input changes.'}})
+        if (not self.shutdown and self.client_ready and self.refresh_supported
+                and self.refresh_dirty and not self.refresh_pending):
+            self.refresh_dirty = False
+            self.refresh_pending = True
+            self.refresh_deadline = now + 10
+            self.send({'jsonrpc': '2.0', 'id': 'ubs-diagnostic-refresh', 'method': 'workspace/diagnostic/refresh'})
         for future, (uri, generation, cancel) in list(self.active.items()):
             if not future.done():
                 continue
@@ -1143,6 +1249,15 @@ class Server:
             self.active[future] = (uri, generation, cancel)
 
     def handle(self, message):
+        if (isinstance(message, dict) and message.get('jsonrpc') == '2.0' and 'method' not in message
+                and message.get('id') == 'ubs-diagnostic-refresh'):
+            if self.refresh_pending:
+                self.refresh_pending = False
+                if 'error' in message or message.get('result', False) is not None:
+                    self.refresh_supported = False
+                    self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {
+                        'type': 2, 'message': 'Editor rejected diagnostic refresh; pull again after input changes.'}})
+            return
         if (isinstance(message, dict) and message.get('jsonrpc') == '2.0' and 'method' not in message
                 and message.get('id') == 'ubs-watch-registration' and self.registration_pending):
             self.registration_pending = False
@@ -1181,9 +1296,15 @@ class Server:
                 workspace = capabilities.get('workspace') or {} if isinstance(capabilities, dict) else {}
                 watches = workspace.get('didChangeWatchedFiles') or {} if isinstance(workspace, dict) else {}
                 self.register_watches = isinstance(watches, dict) and watches.get('dynamicRegistration') is True and watches.get('relativePatternSupport') is True
+                text_capabilities = capabilities.get('textDocument') if isinstance(capabilities, dict) else None
+                self.pull_mode = isinstance(text_capabilities, dict) and isinstance(text_capabilities.get('diagnostic'), dict)
+                diagnostic_workspace = workspace.get('diagnostics') if isinstance(workspace, dict) else None
+                self.refresh_supported = isinstance(diagnostic_workspace, dict) and diagnostic_workspace.get('refreshSupport') is True
                 self.initialized = True
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {
                     'capabilities': {'positionEncoding': 'utf-16',
+                                     **({'diagnosticProvider': {'identifier': 'ubs', 'interFileDependencies': True,
+                                                               'workspaceDiagnostics': False}} if self.pull_mode else {}),
                                      'experimental': {'ubs': {
                                          'sourceMode': 'buffer' if self.buffer_mode else 'saved',
                                          'workspaceStrategy': 'incremental' if self.workspace_cache is not None else
@@ -1199,21 +1320,37 @@ class Server:
                 return
             if method == 'shutdown' and is_request:
                 self.shutdown = True
+                self.cancel_pulls(retrigger=False)
                 self.cancel_batch(announce=False)
                 self.pending.clear()
                 for _, _, cancel in self.active.values():
                     cancel.set()
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': None})
                 return
+            if method == 'textDocument/diagnostic' and is_request:
+                self.diagnostic_request(request_id, params)
+                return
+            if method == '$/cancelRequest' and not is_request:
+                cancelled_id = params.get('id')
+                if type(cancelled_id) not in (str, int):
+                    raise ProtocolError('Invalid cancellation id')
+                if cancelled_id in self.pulls:
+                    # Detach only this subscriber; another pull or automatic
+                    # analysis may still need the same running scanner.
+                    self.pull_error(cancelled_id, -32800, 'Diagnostic request cancelled')
+                return
             if method == 'workspace/executeCommand' and is_request:
                 if params.get('command') != 'ubs.scanOpenDocuments' or params.get('arguments', []) != []:
                     raise ProtocolError('Only ubs.scanOpenDocuments without arguments is supported')
                 self.queue_documents()
+                self.refresh_diagnostics()
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'result': {'queued': len(self.documents)}})
                 return
             if is_request:
                 self.send({'jsonrpc': '2.0', 'id': request_id, 'error': {'code': -32601, 'message': 'Method not found'}})
                 return
+            if method == 'initialized':
+                self.client_ready = True
             if method == 'initialized' and self.register_watches:
                 self.register_watches = False
                 self.registration_pending = True
@@ -1231,6 +1368,7 @@ class Server:
                     document_path(change.get('uri'), self.root)
                 if changes:
                     self.queue_documents()
+                    self.refresh_diagnostics()
                 return
             if method in ('initialized', '$/cancelRequest', '$/setTrace'):
                 return
@@ -1242,11 +1380,13 @@ class Server:
             uri = item.get('uri')
             path = document_path(uri, self.root)
             if method == 'textDocument/didClose':
+                self.cancel_pulls(uri, retrigger=False)
                 self.invalidate(uri)
                 self.documents.pop(uri, None)
                 self.publish(uri, [])
                 if self.buffer_mode:
                     self.queue_documents()
+                self.refresh_diagnostics()
                 return
             if method == 'textDocument/didOpen':
                 if uri in self.documents or len(self.documents) >= MAX_DOCUMENTS:
@@ -1270,6 +1410,7 @@ class Server:
                 if 'text' in params and normalized_text(params['text']) != self.documents[uri]['text']:
                     raise ProtocolError('Save text disagrees with the synchronized editor document')
                 self.queue(uri)
+                self.refresh_diagnostics()
                 return
             if type(version) is not int:
                 raise ProtocolError('Document version must be an integer')
@@ -1286,6 +1427,7 @@ class Server:
                 self.queue(uri)
             else:
                 self.publish(uri, [note('ubs.unsaved', 'Save this document to run UBS; unsaved buffers are not scanned.', 3)])
+            self.refresh_diagnostics()
         except (ValueError, OSError, TypeError, RecursionError) as exc:
             if is_request:
                 self.send({'jsonrpc': '2.0', 'id': request_id if type(request_id) in (str, int) else None,
@@ -1306,9 +1448,12 @@ class Server:
                         doc = self.documents[uri]
                         doc['sync_version'] = max(version, doc.get('sync_version', doc['version']))
                     self.publish(uri, [note('ubs.unverified', str(exc))])
+                    self.refresh_diagnostics()
                 self.send({'jsonrpc': '2.0', 'method': 'window/logMessage', 'params': {'type': 1, 'message': str(exc)}})
 
     def close(self):
+        # EOF needs no replies, but must release every retained subscriber.
+        self.pulls.clear()
         self.cancel_batch(announce=False)
         self.pending.clear()
         for _, _, cancel in self.active.values():

@@ -1033,6 +1033,43 @@ class FloatEqualityPrecisionTests(unittest.TestCase):
             "clean.ipynb": json.dumps(clean, indent=2),
         }), [])
 
+    def test_real_cli_scans_notebook_operators_and_clean_controls(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "python-notebook-operators"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        for label, cell_type, code, expected in (
+            ("operators", "code", [f"value == {index}.0\n" for index in range(1, 5)], 4),
+            ("markdown", "markdown", [f"value == {index}.0\n" for index in range(1, 5)], 0),
+            ("quoted", "code", ["text = '== 1.0'\n"] * 4, 0),
+        ):
+            case = f"python-notebook-{label}"
+            started = time.perf_counter()
+            print(f"[{case}] RUN", flush=True)
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix=f"{label}-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                source = root / "input.ipynb"
+                source.write_text(json.dumps({"cells": [{"cell_type": cell_type, "source": code}],
+                                              "metadata": {}, "nbformat": 4, "nbformat_minor": 5}, indent=2))
+                env = os.environ.copy()
+                env.update(UBS_NO_CACHE="1", UBS_NO_AUTO_UPDATE="1")
+                result = subprocess.run(
+                    [str(REPO_ROOT / "ubs"), str(source), "--only=python", "--ci",
+                     "--fail-on-warning", "--format=json"], cwd=root, env=env,
+                    capture_output=True, text=True, timeout=60,
+                )
+                (artifacts / f"{label}-result.json").write_text(result.stdout)
+                (artifacts / f"{label}-stderr.log").write_text(result.stderr)
+                self.assertEqual(result.returncode, 1 if expected else 0, (result.stdout, result.stderr))
+                doc = json.loads(result.stdout)
+                self.assertEqual(doc["status"], "ok", (result.stdout, result.stderr))
+                self.assertEqual(doc["failed_modules"], [], (result.stdout, result.stderr))
+                hits = [finding for finding in doc.get("findings", [])
+                        if finding["rule_id"] == "py.numeric.float-equality"]
+                self.assertEqual(len(hits), expected, (result.stdout, result.stderr))
+                self.assertEqual(doc["totals"]["files"], 1, (result.stdout, result.stderr))
+                self.assertEqual(doc["totals"]["critical"], 0, (result.stdout, result.stderr))
+                self.assertEqual(doc["totals"]["warning"], expected, (result.stdout, result.stderr))
+                print(f"[{case}] PASS ({time.perf_counter() - started:.3f}s)", flush=True)
+
 
 class NdjsonReaderTests(unittest.TestCase):
     def test_iterator_consumes_only_requested_records(self) -> None:

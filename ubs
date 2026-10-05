@@ -49,18 +49,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='845ba318cae966f3b14674bd6deee515a9de812ce8930518948c980ce4d96724'
-  [cpp]='490c3e932ad7448f6f70f55c0da7ef96961acf1a95a60e5b759ea073cd85e554'
-  [csharp]='269d5c98716de97807467cb2dd01e1a860b03e9c1f594a9f308ed0b369d03f44'
-  [elixir]='6e539225f50247ae2f0120b2a9431abe7e787c0a1075238f0547cd6b4ae7b663'
-  [golang]='c2a890e39dad94fb71b6e71857ad272b34aaf5159df42e0eab9ef80c1e8bd0bc'
-  [java]='97d8910131f29d098fdf9bfdd9af4281cb1b73fcbc26147f47cef2ec437a9391'
-  [js]='af50eb5d5c1e8ff19724a00836a51aba63f1a5c2f7a1541a2dbeb98d5bc423ae'
-  [kotlin]='4c3d18f97b134671009a7fb5d9f3909496a3907b923b728bca5b25d4de6201bb'
-  [python]='d4e9b9955604ac9f3cc59e2f10c889e3e39baa52edc40bbdd7d3349c70c795d0'
-  [ruby]='18d7a6dfa69ed4abf746edfe4139a2f132e73fddcb2fb2a273dec326345b799e'
-  [rust]='5aea4244ee30d4e16dbd74300fa2735e453a0ae91de934e8e82a069290ce4039'
-  [swift]='ad17c2a8e836e5237e38225a5cde38855542112eefdbb18cbdc503439e9b16f3'
+  [bash]='7ecafd5339d66f14039935c2042ffda2bf6408902fa2f289f028d936a79b4fae'
+  [cpp]='ed1de490fbd03a60f90ed2abfa97f5bddd0297ad90e96d95cb49b4336ee85f90'
+  [csharp]='5eb0ed0d737a8bd5e0e897e2dccc4795547284b965c87b7e1d86569112ecc3a1'
+  [elixir]='c0fd1f02081f897c0eda2f256d52619665dbcb2adb557183428cfa998c6f2115'
+  [golang]='ae6f3b3c6d060fb979ab629af30fc4dea594b5913bbcd5a7a25f5de0ca0ace7b'
+  [java]='bf13ba26d0251b6ca2ac04d60e9584a5169507cac9a8ad22130ca6c13bbf9244'
+  [js]='0f09923839524d657a36fd1f1ce83cf02203aa86a6914f9770d902fbd813d4cf'
+  [kotlin]='de6aaf3048db3f2696c68a9b1349655a197e41d309ad2d470477a9d9ddcb293d'
+  [python]='e45255756a739b7a394060e45a95a948489c0f95779ba10f58129d33c66fb6b8'
+  [ruby]='5f23faba6c26380c31efac3ede0c7507dd80988e29a352f197eaab29cd1e3cc3'
+  [rust]='74777fe7fc1d23fd62945a9f0f0ffc3a6220e11da1e99e09e835897f722d8ff1'
+  [swift]='79467f402b34d93d76357e8b843a134e589d96a2e6ef77d51afef44444bc531f'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -154,7 +154,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_cpp_redirect.py']='4339f3e83f7fe09fe92c352be0ce15d457b4472273b6678922c2a70459d3f987'
   ['helpers/ubs_core/analyzers/taint_cpp_traversal.py']='6cdb8f9765fb1754b98fec2c47c7eeb9eb32073ff4018ece33de83df8d99c39f'
   ['helpers/ubs_core/analyzers/taint_csharp_redirect.py']='fc8cfe379e8748b2205b6abacfd4128c9940898f1e105ab51d5d953b8e2b819d'
-  ['helpers/ubs_core/analyzers/taint_csharp_request.py']='6e6a6f70d77f37047570b3b87a6020dfd898869ff1d00b44321ccca7513e0444'
+  ['helpers/ubs_core/analyzers/taint_csharp_request.py']='1cc1f002896912b22875394c1de95abdce735507ec1cc323d7454776d939e604'
   ['helpers/ubs_core/analyzers/taint_elixir_redirect.py']='4e81582673e27d3bb8e83d672f5f8164db779245ffba19e6afc1cf8b007824ac'
   ['helpers/ubs_core/analyzers/taint_elixir_traversal.py']='bf5ce9905dcbf0da435f3f5ef444020c66935a84fd1277c30a948b5410b218c9'
   ['helpers/ubs_core/analyzers/taint_go.py']='a45ebab2939d64064aebc0cddcf2290d0be1ba37783ad28b065c0a71e8708e95'
@@ -231,7 +231,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_scan.py']='d61aa7f4f865e18858a5cb43c4a51b671345e9505bafc10896c0cec598877ead'
   ['helpers/ubs_core/explain.py']='c2c440b5ef72c8f5cc87342d3ed6f8eee530bdf71eb425e7f4f771b4df4dc6ba'
   ['helpers/ubs_core/external_tools.py']='491d9bc4daae63be84dce73c772a33242f91911ffbb74be4594a915ee9c22cd7'
-  ['helpers/ubs_core/findings_merge.py']='6d86f7a03310053d268656ac514592ef2cc5a711a8471fd566d00a4d47160715'
+  ['helpers/ubs_core/findings_merge.py']='f544e01b5170ee1cdd482eb6c6ba13c08a8dce5ded15f8031e41682ac0b7d3e9'
   ['helpers/ubs_core/go_ast.py']='7cb83f089c6fa8b562483c4d84bafa22bb4273c8b5d3dab5079825f74385527b'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
   ['helpers/ubs_core/go_detectors/archive_extraction.py']='f57f33494fed091791358f3ccfa1040df43a8a0c39801fc533b2beebcfcd8181'
@@ -417,7 +417,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='0a4ceefe61df4edabeb7947c1cf4e63b3cc9be6b97edd51d9eba5ef886b8377e'
+  ['lib/ubs-common.sh']='cb99ac2fec6a3b0cf5142be43b978d9b4d921f8dfa51b523bf1f3977ad0fd193'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

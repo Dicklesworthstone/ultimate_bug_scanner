@@ -442,7 +442,133 @@ class DataflowDetectionTests(unittest.TestCase):
         self.assertEqual(list(cs.run(context)), [])
 
 
+class ByReferenceTests(unittest.TestCase):
+    scan = DataflowDetectionTests.scan
+    bad = DataflowDetectionTests.bad
+    clean = DataflowDetectionTests.clean
+
+    def test_out_parameter_carries_request_source_into_caller(self):
+        self.bad('class C { void Source(out string p) { p=Request.Query["p"]; } void H() { Source(out var path); File.Delete(path); } }')
+
+    def test_parameter_to_out_summary_uses_the_actual_input(self):
+        self.bad('class C { void Copy(string raw, out string p) { p=raw; } void H() { Copy(Request.Query["p"], out var path); File.Delete(path); } }')
+
+    def test_named_output_arguments_bind_by_parameter(self):
+        self.bad('class C { void Copy(string raw, out string p) { p=raw; } void H() { Copy(p: out var path, raw: Request.Query["p"]); File.Delete(path); } }')
+
+    def test_ref_parameter_can_introduce_a_new_request_source(self):
+        self.bad('class C { void Source(ref string p) { p=Request.Query["p"]; } void H() { var path="/safe"; Source(ref path); File.Delete(path); } }')
+
+    def test_ref_identity_preserves_the_callers_taint(self):
+        self.bad('class C { void Keep(ref string p) { Log(p); } void H() { var path=Request.Query["p"]; Keep(ref path); File.Delete(path); } }')
+
+    def test_ref_constant_assignment_kills_old_taint(self):
+        self.clean('class C { void Clear(ref string p) { p="/fixed"; } void H() { var path=Request.Query["p"]; Clear(ref path); File.Delete(path); } }')
+
+    def test_out_constant_assignment_kills_old_taint(self):
+        self.clean('class C { void Clear(out string p) { p="/fixed"; } void H() { var path=Request.Query["p"]; Clear(out path); File.Delete(path); } }')
+
+    def test_out_basename_is_a_transformation_not_a_global_sanitizer(self):
+        self.bad('class C { void Name(string raw, out string p) { p=Path.GetFileName(raw); } void H() { var raw=Request.Query["p"]; Name(raw, out var safe); File.Delete(safe); File.Delete(raw); } }')
+
+    def test_nested_output_helpers_propagate_writes(self):
+        self.bad('class C { void A(string x, out string p) { B(x, out p); } void B(string x, out string p) { p=x; } void H() { A(Request.Query["p"], out var p); File.Delete(p); } }')
+
+    def test_ref_conditional_write_joins_both_exits(self):
+        self.bad('class C { void Change(ref string p) { if (ok) p=Request.Query["p"]; } void H() { var p="/safe"; Change(ref p); File.Delete(p); } }')
+
+    def test_ref_conditional_clean_does_not_erase_untouched_branch(self):
+        self.bad('class C { void Change(ref string p) { if (ok) p="/safe"; } void H() { var p=Request.Query["p"]; Change(ref p); File.Delete(p); } }')
+
+    def test_outputs_are_taken_after_finally_on_return(self):
+        self.bad('class C { void Source(out string p) { p="/safe"; try { return; } finally { p=Request.Query["p"]; } } void H() { Source(out var p); File.Delete(p); } }')
+
+    def test_finally_can_clear_a_reference_before_returning(self):
+        self.clean('class C { void Clear(ref string p) { try { return; } finally { p="/safe"; } } void H() { var p=Request.Query["p"]; Clear(ref p); File.Delete(p); } }')
+
+    def test_aliased_ref_parameters_share_storage_inside_the_helper(self):
+        self.bad('class C { void Use(ref string p, ref string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var path="/safe"; Use(ref path, ref path); } }')
+
+    def test_nonaliased_ref_parameters_do_not_share_storage(self):
+        self.clean('class C { void Use(ref string p, ref string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var a="/safe"; var b="/safe"; Use(ref a, ref b); } }')
+
+    def test_alias_context_does_not_pollute_a_distinct_call(self):
+        self.bad('class C { void Use(ref string p, ref string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var a="/safe"; var b="/safe"; Use(ref a, ref a); Use(ref a, ref b); } }')
+
+    def test_second_aliased_assignment_overwrites_the_first(self):
+        self.clean('class C { void Change(ref string p, ref string q) { p=Request.Query["p"]; q="/safe"; } void H() { var path="/safe"; Change(ref path, ref path); File.Delete(path); } }')
+
+    def test_in_parameter_observes_writes_through_an_alias(self):
+        self.bad('class C { void Use(ref string p, in string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var path="/safe"; Use(ref path, in path); } }')
+
+    def test_by_value_parameter_does_not_alias_reference_storage(self):
+        self.clean('class C { void Use(ref string p, string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var path="/safe"; Use(ref path, path); } }')
+
+    def test_out_and_ref_alias_share_updates_inside_the_helper(self):
+        self.bad('class C { void Use(out string p, ref string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var path="/safe"; Use(out path, ref path); } }')
+
+    def test_distinct_outputs_are_applied_to_the_right_variables(self):
+        self.bad('class C { void Split(string raw, out string a, out string b) { a=raw; b="/safe"; } void H() { Split(Request.Query["p"], out var first, out var second); File.Delete(first); File.Delete(second); } }')
+
+    def test_unresolved_helper_cannot_hide_parameter_to_out_flow(self):
+        self.bad('External.Copy(Request.Query["p"], out var path); File.Delete(path);')
+
+    def test_unresolved_ref_call_does_not_assert_sanitization(self):
+        self.bad('var path=Request.Query["p"]; External.Clear(ref path); File.Delete(path);')
+
+    def test_output_evidence_survives_substitution(self):
+        findings = self.bad('class C { void Copy(string raw, out string p) { p=raw; } void H() { Copy(Request.Query["p"], out var path); File.Delete(path); } }')
+        self.assertIn('output', [step['kind'] for step in findings[0]['extras']['taint_path']])
+
+    def test_output_summaries_converge_through_mutual_recursion(self):
+        self.bad('class C { void A(string raw, out string p) { if (done) { p=raw; return; } B(raw,out p); } void B(string raw, out string p) { A(raw,out p); } void H() { B(Request.Query["p"],out var p); File.Delete(p); } }')
+
+
 class AnalysisBoundaryTests(unittest.TestCase):
+    def test_actual_helper_evidence_survives_combined_json_and_sarif(self):
+        import io
+        from ubs_core.csharp_scan import run_analyzers
+        from ubs_core.findings_merge import merge, to_sarif
+        with tempfile.TemporaryDirectory(prefix='ubs-csharp-evidence-') as tmp:
+            root = Path(tmp)
+            source = root / 'app.cs'
+            source.write_text('class C { void Read(string p) { File.Delete(p); } void H() { Read(Request.Query["p"]); } }')
+            sink = io.StringIO()
+            run_analyzers([source], sink, set(), root)
+            (root / 'csharp.findings.json').write_text(sink.getvalue())
+            combined = root / 'combined.json'
+            combined.write_text(json.dumps({'status': 'ok', 'scanners': [{'language': 'csharp', 'files': 1}]}))
+            merge(root, combined, project_dir=root)
+            report = json.loads(combined.read_text())
+            finding = next(f for f in report['findings'] if f['rule_id'] == RULE)
+            evidence = finding['extras']['taint_path']
+            self.assertIn('source', [step['kind'] for step in evidence])
+            self.assertIn('call', [step['kind'] for step in evidence])
+            sarif = to_sarif(report)
+            result = next(f for run in sarif['runs'] for f in run['results'] if f['ruleId'] == RULE)
+            locations = result['codeFlows'][0]['threadFlows'][0]['locations']
+            self.assertEqual(len(locations), len(evidence))
+            self.assertEqual(result['properties']['extras'], finding['extras'])
+            for original, location in zip(evidence, locations):
+                physical = location['location']['physicalLocation']
+                self.assertEqual(physical['artifactLocation']['uri'], original['path'])
+                self.assertEqual(physical['region']['startLine'], original['line'])
+                self.assertEqual(physical['region']['startColumn'], original['col'])
+
+    def test_invalid_evidence_coordinates_are_not_fabricated(self):
+        from ubs_core.findings_merge import to_sarif
+        finding = {'rule_id': RULE, 'file': 'a.cs', 'line': 1, 'severity': 'critical',
+                   'extras': {'taint_path': [{'path': 'a.cs', 'line': True, 'col': 1, 'kind': 'source', 'label': 'bad'}]}}
+        with self.assertRaisesRegex(ValueError, 'invalid evidence'):
+            to_sarif({'language': 'csharp', 'findings': [finding]})
+
+    def test_evidence_step_bound_is_explicit(self):
+        from ubs_core.findings_merge import to_sarif
+        finding = {'rule_id': RULE, 'file': 'a.cs', 'line': 1, 'severity': 'critical',
+                   'extras': {'taint_path': [{} for _ in range(65)]}}
+        with self.assertRaisesRegex(ValueError, 'at most 64'):
+            to_sarif({'language': 'csharp', 'findings': [finding]})
+
     def test_provenance_survives_the_real_csharp_scan_sink(self):
         import io
         from ubs_core.csharp_scan import run_analyzers

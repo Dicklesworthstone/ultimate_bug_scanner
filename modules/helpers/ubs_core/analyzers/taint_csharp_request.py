@@ -2,7 +2,9 @@
 
 A bounded lexical frontend lowers structured branches/loops to a CFG. The
 shared finite-lattice solver handles strong updates and cyclic control flow;
-method summaries carry parameter-to-return AND parameter-to-file-sink flows.
+method summaries carry parameter-to-return, ref/out write and file-sink flows.
+By-reference alias partitions are separate finite summary contexts; writes are
+observed at normal exits after finally cleanup, never at a premature return.
 Only explicitly selected source is read. This is not a C# compiler or a heap /
 virtual-dispatch model. Unknown calls conservatively propagate their arguments.
 """
@@ -198,6 +200,7 @@ class Function:
     expression: bool = False
     parent: int | None = None
     request_parameters: frozenset[str] = frozenset()
+    parameter_modes: tuple[str, ...] = ()
     body: tuple = ()
 
 
@@ -243,7 +246,7 @@ class Parser:
             if (not words or words[-1] in MODIFIERS or any(char in prefix for char in "=()!+\"'")
                     or words[0] in {"return", "throw", "new", "else", "case"}):
                 continue
-            parameters, request_parameters, defaults = [], set(), 0
+            parameters, request_parameters, parameter_modes, defaults = [], set(), [], 0
             for start, end in parts(self.code, opening + 1, close, generics=True):
                 declaration = self.code[start:end].split("=", 1)
                 ids = re.findall(r"@?[A-Za-z_]\w*", declaration[0])
@@ -251,6 +254,9 @@ class Parser:
                     break
                 parameter = ids[-1].lstrip("@")
                 parameters.append(parameter)
+                mode = "out" if "out" in ids[:-1] else "in" if "in" in ids[:-1] or (
+                    "ref" in ids[:-1] and "readonly" in ids[:-1]) else "ref" if "ref" in ids[:-1] else "value"
+                parameter_modes.append(mode)
                 if any(word in {"HttpRequest", "HttpRequestBase", "HttpContext"} for word in ids[:-1]):
                     request_parameters.add(parameter)
                 defaults += len(declaration) == 2
@@ -266,7 +272,8 @@ class Parser:
                 beginning = self.skip(beginning, match.start())
                 function = Function(match.start(), name, owner, beginning, start, end,
                                     tuple(parameters), defaults, expression,
-                                    request_parameters=frozenset(request_parameters))
+                                    request_parameters=frozenset(request_parameters),
+                                    parameter_modes=tuple(parameter_modes))
                 self.functions[function.key] = function
                 self.declarations[beginning] = function
         for function in self.functions.values():
@@ -403,12 +410,16 @@ class Action:
 class Summary:
     returned: Fact = CLEAN
     effects: dict[tuple[int, str], Fact] = field(default_factory=dict)
+    outputs: dict[int, Fact] = field(default_factory=dict)
 
     def merged(self, other):
         effects = dict(self.effects)
         for key, value in other.effects.items():
             effects[key] = join(effects.get(key, CLEAN), value)
-        return Summary(join(self.returned, other.returned), effects)
+        outputs = dict(self.outputs)
+        for key, value in other.outputs.items():
+            outputs[key] = join(outputs.get(key, CLEAN), value)
+        return Summary(join(self.returned, other.returned), effects, outputs)
 
 
 class CSharpFlow:
@@ -418,18 +429,23 @@ class CSharpFlow:
         self.parser = Parser(text, self.code)
         self.lines = [0, *(match.end() for match in re.finditer("\n", text))]
         self.budget = Budget()
-        self.summaries = {key: Summary() for key in self.parser.functions}
+        self.summaries = {(key, tuple(range(len(function.parameters)))): Summary()
+                          for key, function in self.parser.functions.items()}
         self.dependencies = defaultdict(set)
         self.graphs = {}
         self.function = None
+        self.context = None
         self.effects = {}
+        self.outputs = {}
         self.returned = CLEAN
         self.aliases = {m.group(1): re.sub(r"\s", "", m.group(2)) for m in re.finditer(
             r"\busing\s+([A-Za-z_]\w*)\s*=\s*([\w.:]+)\s*;", self.code)}
         top = Function(-1, "<top-level>", (), 0, 0, len(self.code), ())
         top.body = self.parser.block(0, len(self.code))
         self.parser.functions[-1] = top
-        self.summaries[-1] = Summary()
+        self.summaries[(-1, ())] = Summary()
+        self.pending = deque()
+        self.queued = set()
 
     def step(self, offset, kind, label):
         line = bisect_right(self.lines, offset)
@@ -446,17 +462,20 @@ class CSharpFlow:
             name = match.group(1).lstrip("@")
             scope.bindings[name] = f"{name}@{start + match.start(1)}"
 
-    def graph(self, function):
+    def graph(self, function, aliases):
         actions, edges = {}, {}
         counter = 0
-        scope = Scope({name: f"param:{index}" for index, name in enumerate(function.parameters)})
+        scope = Scope({name: f"param:{aliases[index]}" for index, name in enumerate(function.parameters)})
 
         def node(kind, span, current, successors=(), guard=None):
             nonlocal counter
+            self.budget.spend()
             result, counter = counter, counter + 1
             actions[result] = Action(kind, span, dict(current.bindings), guard)
             edges[result] = tuple(successors)
             return result
+
+        exit_node = node("exit", (function.end, function.end), scope)
 
         def block(statements, following, current, break_to=None, continue_to=None, unwind=()):
             snapshots = []
@@ -558,7 +577,7 @@ class CSharpFlow:
                     if kind in {"break", "continue"}:
                         target, depth = (break_to if kind == "break" else continue_to) or (None, 0)
                     elif kind in {"return", "throw"}:
-                        target, depth = None, 0
+                        target, depth = exit_node if kind == "return" else None, 0
                     # Abrupt completion still executes enclosing finally
                     # blocks. A loop's own break/continue stays inside the try.
                     for index in range(depth, len(unwind)):
@@ -568,8 +587,44 @@ class CSharpFlow:
                     entry = node(kind, span, local, () if target is None else (target,))
             return entry
 
-        entry = block(function.body, None, scope)
+        entry = block(function.body, exit_node, scope)
         return entry, actions, edges
+
+    def call_context(self, callee, args, values, bindings, state):
+        """Bind actual storage separately from values, preserving ref aliasing.
+
+        The finite context key is the equivalence partition of by-reference
+        parameters, not names or taint contents. Different calls can therefore
+        reuse one summary without mixing their mutable caller state.
+        """
+        actuals = {}
+        cells = {}
+        for index, ((keyword, low, high), fact) in enumerate(zip(args, values)):
+            slot = callee.parameters.index(keyword) if keyword in callee.parameters else index
+            if slot >= len(callee.parameters):
+                continue
+            mode = callee.parameter_modes[slot]
+            variable = re.fullmatch(r"\s*(?:(?:ref|out|in)\s+)?(?:(?:var|[\w.?<>\[\]]+)\s+)?(@?\w+)\s*", self.code[low:high])
+            cell = bindings.get(variable.group(1).lstrip("@")) if variable else None
+            if mode != "value" and cell is not None:
+                cells[slot] = cell
+                # Later argument evaluation may have changed this storage.
+                fact = CLEAN if mode == "out" else state.get(cell, CLEAN)
+            elif mode == "out":
+                fact = CLEAN
+            actuals[(callee.key, slot)] = fact
+        representatives = {}
+        aliases = []
+        for slot in range(len(callee.parameters)):
+            cell = cells.get(slot)
+            aliases.append(representatives.setdefault(cell, slot) if cell is not None else slot)
+        context = (callee.key, tuple(aliases))
+        if context not in self.summaries:
+            self.summaries[context] = Summary()
+            self.pending.append(context)
+            self.queued.add(context)
+        self.dependencies[context].add(self.context)
+        return self.summaries[context], actuals, cells
 
     def path_guard(self, span):
         """Recognize a root-bound prefix predicate, not a nearby magic name."""
@@ -703,17 +758,23 @@ class CSharpFlow:
                         candidates = self.resolve(name, len(args)) if root_name not in bindings or root_name == "this" else []
                         value = CLEAN
                         if candidates:
+                            outputs = {}
                             for callee in candidates:
-                                self.dependencies[callee.key].add(self.function.key)
-                                arguments = {}
-                                for index, ((keyword, _, _), fact) in enumerate(zip(args, values)):
-                                    parameter = callee.parameters.index(keyword) if keyword in callee.parameters else index
-                                    arguments[(callee.key, parameter)] = fact
-                                summary = self.summaries[callee.key]
+                                summary, arguments, cells = self.call_context(callee, args, values, bindings, state)
                                 call = self.step(position, "call", callee.name)
                                 value = join(value, substitute(summary.returned, arguments, call))
                                 for key, fact in summary.effects.items():
                                     self.effects[key] = join(self.effects.get(key, CLEAN), substitute(fact, arguments, call))
+                                for slot, cell in cells.items():
+                                    if callee.parameter_modes[slot] in {"ref", "out"}:
+                                        fact = substitute(summary.outputs.get(slot, CLEAN), arguments, call)
+                                        fact = advance(fact, self.step(position, "output", callee.parameters[slot]))
+                                        outputs[cell] = join(outputs.get(cell, CLEAN), fact)
+                            for cell, fact in outputs.items():
+                                if fact:
+                                    state[cell] = fact
+                                else:
+                                    state.pop(cell, None)
                         else:
                             canonical_name = name
                             root_name = name.split(".")[0]
@@ -746,6 +807,15 @@ class CSharpFlow:
                                         if cell:
                                             state[cell] = self.source_fact(position, name)
                                 value = CLEAN
+                            elif any(re.match(r"\s*(?:ref|out)\b", self.code[low:high]) for _, low, high in args):
+                                # An unresolved helper may copy any of its
+                                # inputs into ref/out storage; it cannot prove
+                                # that an already tainted ref becomes safe.
+                                for _, low, high in args:
+                                    output = re.fullmatch(r"\s*(?:ref|out)\s+(?:(?:var|[\w.?<>\[\]]+)\s+)?(@?\w+)\s*", self.code[low:high])
+                                    cell = bindings.get(output.group(1).lstrip("@")) if output else None
+                                    if cell:
+                                        state[cell] = join(state.get(cell, CLEAN), retag(all_values, remove=CANONICAL))
                             for index in self.sink_arguments(canonical_name, args):
                                 fact = advance(values[index], self.step(position, "sink", canonical_name))
                                 if fact:
@@ -785,6 +855,12 @@ class CSharpFlow:
     def transfer(self, action, state):
         start, end = action.span
         code = self.code[start:end]
+        if action.kind == "exit":
+            for slot, name in enumerate(self.function.parameters):
+                if self.function.parameter_modes[slot] in {"ref", "out"}:
+                    fact = state.get(action.bindings[name], CLEAN)
+                    self.outputs[slot] = join(self.outputs.get(slot, CLEAN), fact)
+            return state
         if action.kind == "guard":
             variable, root = action.guard
             cell, base = action.bindings.get(variable), action.bindings.get(root)
@@ -824,32 +900,40 @@ class CSharpFlow:
             self.evaluate(start, end, state, action.bindings)
         return state
 
-    def analyze_function(self, function):
+    def analyze_function(self, function, context):
         self.function = function
-        self.effects, self.returned = {}, CLEAN
-        if function.key not in self.graphs:
-            self.graphs[function.key] = self.graph(function)
-        entry, actions, edges = self.graphs[function.key]
+        self.context = context
+        self.effects, self.returned, self.outputs = {}, CLEAN, {}
+        aliases = context[1]
+        if context not in self.graphs:
+            self.graphs[context] = self.graph(function, aliases)
+        entry, actions, edges = self.graphs[context]
         if entry is not None:
-            initial = {f"param:{index}": frozenset({Trace("parameter", (function.key, index), evidence=(
-                self.step(function.key, "parameter", name),))}) for index, name in enumerate(function.parameters)}
+            initial = {}
+            for index, name in enumerate(function.parameters):
+                if function.parameter_modes[index] == "out":
+                    continue
+                cell = f"param:{aliases[index]}"
+                fact = frozenset({Trace("parameter", (function.key, index), evidence=(
+                    self.step(function.key, "parameter", name),))})
+                initial[cell] = join(initial.get(cell, CLEAN), fact)
             solve(entry, initial, edges, lambda key, state: self.transfer(actions[key], state), self.budget)
-        return Summary(self.returned, dict(self.effects))
+        return Summary(self.returned, dict(self.effects), dict(self.outputs))
 
     def analyze(self):
-        pending = deque(sorted(self.parser.functions))
-        queued = set(pending)
-        while pending:
+        self.pending = deque(sorted(self.summaries))
+        self.queued = set(self.pending)
+        while self.pending:
             self.budget.spend()
-            key = pending.popleft()
-            queued.remove(key)
-            summary = self.summaries[key].merged(self.analyze_function(self.parser.functions[key]))
+            key = self.pending.popleft()
+            self.queued.remove(key)
+            summary = self.summaries[key].merged(self.analyze_function(self.parser.functions[key[0]], key))
             if summary != self.summaries[key]:
                 self.summaries[key] = summary
                 for caller in sorted(self.dependencies[key]):
-                    if caller not in queued:
-                        pending.append(caller)
-                        queued.add(caller)
+                    if caller not in self.queued:
+                        self.pending.append(caller)
+                        self.queued.add(caller)
         effects = {}
         for summary in self.summaries.values():
             for key, fact in summary.effects.items():

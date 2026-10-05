@@ -633,6 +633,10 @@ def _normalize(
         "fingerprint": fp,
         "suppressed": bool(rec.get("suppressed", False)),
     }
+    if "extras" in rec:
+        if not isinstance(rec["extras"], dict):
+            raise ValueError("finding extras must be an object")
+        normalized["extras"] = dict(rec["extras"])
     if project_scoped:
         normalized["scope"] = rec["scope"]
         normalized["count"] = rec["count"]
@@ -895,6 +899,30 @@ def to_sarif(
                 res["locations"] = [loc]
 
             props: dict = {}
+            if "extras" in f:
+                extras = f["extras"]
+                if not isinstance(extras, dict):
+                    raise ValueError("finding extras must be an object")
+                props["extras"] = extras
+                if "taint_path" in extras:
+                    steps = extras["taint_path"]
+                    if not isinstance(steps, list) or len(steps) > 64:
+                        raise ValueError("taint_path must be an array of at most 64 evidence steps")
+                    locations = []
+                    for order, step in enumerate(steps):
+                        if (not isinstance(step, dict)
+                                or not isinstance(step.get("path"), str) or not step["path"]
+                                or type(step.get("line")) is not int or step["line"] < 1
+                                or type(step.get("col")) is not int or step["col"] < 1
+                                or not isinstance(step.get("kind"), str)
+                                or not isinstance(step.get("label"), str)):
+                            raise ValueError("taint_path contains an invalid evidence step")
+                        locations.append({"executionOrder": order, "kinds": [step["kind"]], "location": {
+                            "physicalLocation": {"artifactLocation": {"uri": step["path"]},
+                                                 "region": {"startLine": step["line"], "startColumn": step["col"]}},
+                            "message": {"text": step["kind"] + ": " + step["label"]}}})
+                    if locations:
+                        res["codeFlows"] = [{"threadFlows": [{"locations": locations}]}]
             if project_scoped:
                 props["scope"] = f["scope"]
                 props["count"] = f["count"]

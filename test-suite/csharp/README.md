@@ -21,6 +21,14 @@ Named arguments and generic/expression-bodied helpers are supported. Unknown
 calls conservatively propagate their inputs instead of being trusted merely
 because their names contain `Safe` or `Validate`.
 
+Helper `ref`/`out` effects propagate into caller locals, including nested and
+recursive helpers, conditional writes and cleanup in `finally`. A definite
+constant overwrite clears the old taint; a possibly untouched branch preserves
+it. Alias-partitioned summaries distinguish passing the same local twice from
+passing independent locals, including reads through an aliased `in` parameter.
+By-value parameters remain independent. Unknown by-reference helpers cannot be
+used as proof that a path was sanitized. Findings retain output-write evidence.
+
 Sinks inspect path parameters, not arbitrary arguments: request-controlled
 contents passed to a fixed-path `WriteAllText`/`WriteAllTextAsync` are not path
 traversal. Copy/move destinations and replace-backup paths are checked, as are
@@ -34,8 +42,8 @@ not treated as validation. A user-controlled root remains tainted. A guard on
 only one branch cannot sanitize paths that reach the sink through another.
 
 This remains a lexical, explicit-flow analyzer, not Roslyn: it does not resolve
-cross-file calls, virtual dispatch, heap fields, delegate targets, closure
-captures, or helper `ref`/`out` writes. `Request.*.TryGetValue(..., out value)` is
+cross-file calls, virtual dispatch, heap fields, delegate targets, or closure
+captures. `Request.*.TryGetValue(..., out value)` is
 modeled directly. Exception-handler edges are conservative. Conditional
 compilation, unbalanced syntax, unsupported `goto`, and exhausted analysis
 budgets produce an incomplete-analysis error rather than a verified clean scan.

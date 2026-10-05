@@ -24,6 +24,7 @@ _No changes yet._
 - JavaScript balanced-list parsing materializes only the requested source span before walking it, preserving component offsets and assignment operators across span boundaries.
 - JavaScript taint retains lexical bindings while parsing function statements for the scope being evaluated. Module bodies keep their resolved imports and exports; large import components no longer retain every function's parsed body together.
 - JavaScript JSON reports write findings incrementally. Cache reconciliation preserves selection-wide thresholds, gates and suppressors without creating another whole findings collection, and releases cached records before rendering reports.
+- Ruby scans return an environment error when the temporary AST rule directory cannot be created, instead of generating rules in the caller's working directory. Temporary paths are passed as arguments to the rule generator.
 
 ---
 

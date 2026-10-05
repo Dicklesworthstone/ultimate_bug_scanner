@@ -49,7 +49,7 @@ from ubs_core.py_scan import iter_matches  # noqa: E402
 from ubs_core.rust_detectors import jwt_verification  # noqa: E402
 from ubs_core.rust_detectors import security_randomness  # noqa: E402
 from ubs_core.rust_detectors import (  # noqa: E402
-    host_header_url, open_redirect, request_regex, request_url,
+    archive_entry_path, host_header_url, open_redirect, request_regex, request_url,
     response_header, sql_injection,
 )
 from ubs_core import rust_rules  # noqa: E402
@@ -895,15 +895,15 @@ class RustPanicContextTests(unittest.TestCase):
             args.extend(["--ast-rule-dir", str(self.rules)])
         if fail_on_warning:
             args.append("--fail-on-warning")
-        command = [sys.executable, "-m", "ubs_core.rust_scan"]
+        python_args = ["-m", "ubs_core.rust_scan"]
         if without_tomllib:
-            command = [sys.executable, "-c", (
+            python_args = ["-c", (
                 "import runpy,sys; sys.modules['tomllib']=None; "
                 "runpy.run_module('ubs_core.rust_scan',run_name='__main__')"
             )]
         env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR), PYTHONDONTWRITEBYTECODE="1",
                    UBS_NO_CACHE="0" if cache else "1", UBS_CACHE_DIR=str(self.root / "cache"))
-        result = subprocess.run(command + args, cwd=self.root, env=env,
+        result = subprocess.run([sys.executable, *python_args, *args], cwd=self.root, env=env,
                                 text=True, capture_output=True, timeout=30)
         self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
         try:
@@ -2062,6 +2062,481 @@ fn password_reset_token() {
                 partial = scan([secure, weak], repaired, "json", 1)
                 self.assertEqual(len(partial), len(cold) - 1)
                 self.assertEqual(scan([secure, weak], repaired, "sarif", 2), partial)
+
+
+class RustArchiveEntryPathTests(unittest.TestCase):
+    """Run the real archive-path detector on source and binding counterexamples."""
+
+    CASS_COLLECTIONS = '''use std::path::{Path, PathBuf};
+use std::fs;
+fn archive_aliases(zip_entry: &zip::read::ZipFile<'_>, destination: &Path) {
+    let entry_path = zip_entry.name();
+    let path = zip_entry.name();
+    destination.join(entry_path); // hazard: archive-alias
+}
+fn directory_size_bytes_best_effort(root: &Path) {
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(iter) = fs::read_dir(&current) else { continue; };
+        for entry in iter.flatten() {
+            let entry_path = entry.path();
+            match entry.metadata() {
+                Ok(metadata) if metadata.is_dir() => stack.push(entry_path),
+                _ => continue,
+            }
+        }
+    }
+}
+fn quarantine_summary(quarantine_dir: &Path) {
+    let mut quarantine_files: Vec<String> = Vec::new();
+    for file_name in ["watch-poison.jsonl", "index-poison.jsonl"] {
+        let path = quarantine_dir.join(file_name);
+        quarantine_files.push(path.display().to_string());
+    }
+}
+fn recursive_size_for_test(root: &Path) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        for entry in std::fs::read_dir(&path).unwrap().flatten() {
+            stack.push(entry.path());
+        }
+    }
+}
+fn oom_fixture_paths(amp_dir: &Path) {
+    let mut paths = Vec::new();
+    for idx in 0..4 {
+        let path = amp_dir.join(format!("thread-oom-{idx}.json"));
+        paths.push(path);
+    }
+}
+fn split_batch_fixture_paths(amp_dir: &Path) {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for idx in 0..4 {
+        let path = amp_dir.join(format!("thread-batch-oom-solo-ok-{idx}.json"));
+        paths.push(path);
+    }
+}
+fn filesystem_entry(entry: std::fs::DirEntry, destination: &Path) {
+    destination.join(entry.path());
+}
+'''
+
+    POSITIVES = '''use std::path::{Path, PathBuf};
+fn named_archive(zip_entry: &ZipFile, tar_entry: &TarEntry, destination: &Path) {
+    destination.join(zip_entry.name()); // hazard: zip-direct
+    let mut output = PathBuf::new();
+    output.push(tar_entry.path()); // hazard: tar-direct
+    let name = zip_entry.name();
+    destination.join(name); // hazard: named-alias
+    {
+        destination.join(name); // hazard: captured-alias
+    }
+}
+fn neutral_zip(item: &zip::read::ZipFile<'_>, destination: &Path) {
+    destination.join(item.name()); // hazard: typed-neutral-zip
+}
+fn neutral_tar(item: &mut tar::Entry<'_, std::fs::File>, destination: &mut PathBuf) {
+    destination.push(item.path()?); // hazard: typed-neutral-tar
+}
+fn collection_name_is_not_a_type(zip_entry: &ZipFile) {
+    let mut paths: PathBuf = PathBuf::new();
+    paths.push(zip_entry.name()); // hazard: path-named-like-collection
+}
+fn destination_shadow(zip_entry: &ZipFile) {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    paths.push(PathBuf::from(zip_entry.name()));
+    {
+        let mut paths = PathBuf::new();
+        paths.push(zip_entry.name()); // hazard: pathbuf-shadows-vector
+    }
+    paths.push(PathBuf::from(zip_entry.name()));
+}
+fn source_shadow(entry: std::fs::DirEntry, archive: &mut ZipArchive, destination: &Path) {
+    destination.join(entry.path());
+    {
+        let entry: zip::read::ZipFile<'_> = archive.by_index(0).unwrap();
+        destination.join(entry.name()); // hazard: archive-shadows-directory-entry
+    }
+    destination.join(entry.path());
+}
+'''
+
+    SCOPES = '''use std::path::Path;
+fn tainted_name(zip_entry: &ZipFile, destination: &Path) {
+    let name = zip_entry.name();
+    destination.join(name); // hazard: function-local-alias
+}
+fn other_function(name: &str, destination: &Path) {
+    destination.join(name);
+}
+fn lexical_scopes(zip_entry: &ZipFile, destination: &Path) {
+    let name = "fixed.txt";
+    {
+        let name = zip_entry.name();
+        destination.join(name); // hazard: inner-alias
+        {
+            destination.join(name); // hazard: nested-capture
+        }
+    }
+    destination.join(name);
+    let name = zip_entry.name();
+    destination.join(name); // hazard: before-clean-shadow
+    let name = "another-fixed.txt";
+    destination.join(name);
+}
+fn markers(zip_entry: &ZipFile, destination: &Path) {
+    destination.join(zip_entry.name()); // ubs:ignore[rust.security.archive-entry-path]
+    destination.join(zip_entry.name()); // ubs:ignore
+    destination.join(zip_entry.name()); // ubs:ignore[rust.security.other] hazard: wrong-scope
+}
+'''
+
+    PATTERN_SHADOWS = '''use std::path::PathBuf;
+trait ArchiveItem { fn name(&self) -> &str; }
+fn if_let_shadow(zip_entry: &impl ArchiveItem, candidate: Option<PathBuf>) {
+    let mut output: Vec<&str> = Vec::new();
+    output.push(zip_entry.name());
+    if let Some(mut output) = candidate {
+        output.push(zip_entry.name()); // hazard: if-let-pathbuf
+    }
+    output.push(zip_entry.name());
+}
+fn while_let_shadow(zip_entry: &impl ArchiveItem, mut candidates: Vec<PathBuf>) {
+    let mut output: Vec<&str> = Vec::new();
+    while let Some(mut output) = candidates.pop() {
+        output.push(zip_entry.name()); // hazard: while-let-pathbuf
+    }
+    output.push(zip_entry.name());
+}
+fn match_shadow(zip_entry: &impl ArchiveItem, candidate: Option<PathBuf>) {
+    let mut output: Vec<&str> = Vec::new();
+    match candidate {
+        Some(mut output) => {
+            output.push(zip_entry.name()); // hazard: match-pathbuf
+        }
+        None => {}
+    }
+    output.push(zip_entry.name());
+}
+fn closure_shadow(zip_entry: &impl ArchiveItem) {
+    let mut output: Vec<&str> = Vec::new();
+    let append = |mut output: PathBuf| output.push(zip_entry.name()); // hazard: braceless-pathbuf
+    append(PathBuf::new());
+    output.push(zip_entry.name());
+}
+fn collection_captures(zip_entry: &impl ArchiveItem, mut candidates: Vec<PathBuf>) {
+    let mut output: Vec<&str> = Vec::new();
+    if let Some(candidate) = candidates.pop() {
+        output.push(zip_entry.name());
+        drop(candidate);
+    }
+    while let Some(candidate) = candidates.pop() {
+        output.push(zip_entry.name());
+        drop(candidate);
+    }
+    match candidates.pop() {
+        Some(candidate) => {
+            output.push(zip_entry.name());
+            drop(candidate);
+        }
+        None => {}
+    }
+    let mut append = || output.push(zip_entry.name());
+    append();
+}
+'''
+
+    CONDITIONAL_VALUES = '''use std::path::Path;
+trait ArchiveItem { fn name(&self) -> &str; }
+fn conditional_values(zip_entry: &impl ArchiveItem, destination: &Path, keep: bool) {
+    let mut name = zip_entry.name();
+    name = if keep { name } else { "fixed.txt" };
+    destination.join(name); // hazard: if-value-retains-alias
+    name = "unconditionally-fixed.txt";
+    destination.join(name);
+    let mut other = zip_entry.name();
+    other = match keep {
+        true => other,
+        false => "another-fixed.txt",
+    };
+    destination.join(other); // hazard: match-value-retains-alias
+    other = "unconditionally-fixed-again.txt";
+    destination.join(other);
+}
+'''
+
+    ITERATOR_OUTPUTS = '''use std::path::Path;
+trait ArchiveItem { fn name(&self) -> &str; }
+fn iterator_outputs<E: ArchiveItem>(
+    root: &Path, destination: &Path, mut archive_entries: impl Iterator<Item = E>,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)?.map_while(|_| archive_entries.next()) {
+        destination.join(entry.name()); // hazard: direct-transform
+    }
+    let directory_entries = std::fs::read_dir(root)?;
+    for entry in directory_entries.map_while(|_| archive_entries.next()) {
+        destination.join(entry.name()); // hazard: named-iterator-transform
+    }
+    for entry in std::fs::read_dir(root)?.flatten() {
+        destination.join(entry.path());
+    }
+    let directory_entries = std::fs::read_dir(root)?;
+    for entry in directory_entries.flatten() {
+        destination.join(entry.path());
+    }
+    Ok(())
+}
+fn let_else_directory_iterator(root: &Path, destination: &Path) {
+    let Ok(iter) = std::fs::read_dir(root) else { return; };
+    for entry in iter.flatten() {
+        destination.join(entry.path());
+    }
+}
+'''
+
+    def assert_source_findings(self, source: str, labels: tuple[str, ...]) -> None:
+        # Expected sites are independently marked in Rust source. Compare full
+        # records as a multiset so duplicates cannot hide behind a set conversion.
+        lines = source.splitlines()
+        expected_lines = [
+            number for number, line in enumerate(lines, 1)
+            if any(f"hazard: {label}" in line for label in labels)
+        ]
+        self.assertEqual(len(expected_lines), len(labels))
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-archive-precision-") as tmp:
+            path = Path(tmp) / "source.rs"
+            path.write_text(source, encoding="utf-8")
+            self.assertCountEqual(
+                list(archive_entry_path.find([path])),
+                [(path, line, 1, lines[line - 1].strip()) for line in expected_lines],
+            )
+
+    def test_cass_collection_and_directory_paths_are_not_archive_destinations(self) -> None:
+        # These are the five CASS call flows, with one same-file archive alias
+        # source to expose the former whole-file taint of `path`/`entry_path`.
+        self.assert_source_findings(self.CASS_COLLECTIONS, ("archive-alias",))
+
+    def test_archive_destinations_survive_types_captures_and_receiver_shadowing(self) -> None:
+        self.assert_source_findings(self.POSITIVES, (
+            "zip-direct", "tar-direct", "named-alias", "captured-alias",
+            "typed-neutral-zip", "typed-neutral-tar", "path-named-like-collection",
+            "pathbuf-shadows-vector", "archive-shadows-directory-entry",
+        ))
+
+    def test_alias_lifetimes_clean_shadows_and_exact_marker_scopes(self) -> None:
+        self.assert_source_findings(self.SCOPES, (
+            "function-local-alias", "inner-alias", "nested-capture",
+            "before-clean-shadow", "wrong-scope",
+        ))
+
+    def test_pattern_and_braceless_closure_shadows_override_collection_safety(self) -> None:
+        self.assert_source_findings(self.PATTERN_SHADOWS, (
+            "if-let-pathbuf", "while-let-pathbuf", "match-pathbuf", "braceless-pathbuf",
+        ))
+
+    def test_conditional_rhs_retains_possible_alias_but_fixed_assignment_clears_it(self) -> None:
+        self.assert_source_findings(self.CONDITIONAL_VALUES, (
+            "if-value-retains-alias", "match-value-retains-alias",
+        ))
+
+    def test_transforming_iterators_are_not_directory_entry_proof(self) -> None:
+        self.assert_source_findings(self.ITERATOR_OUTPUTS, (
+            "direct-transform", "named-iterator-transform",
+        ))
+
+    def test_tuple_and_braceless_match_shadows_override_collection_safety(self) -> None:
+        source = '''use std::path::PathBuf;
+trait ArchiveItem { fn name(&self) -> &str; }
+fn destructuring(zip_entry: &impl ArchiveItem, candidate: Option<PathBuf>) {
+    let mut output: Vec<&str> = Vec::new();
+    output.push(zip_entry.name());
+    {
+        let (mut output, _) = (PathBuf::new(), ());
+        output.push(zip_entry.name()); // hazard: tuple-pathbuf
+    }
+    output.push(zip_entry.name());
+    match candidate {
+        Some(mut output) => output.push(zip_entry.name()), // hazard: braceless-match-pathbuf
+        None => (),
+    };
+    output.push(zip_entry.name());
+}
+'''
+        self.assert_source_findings(source, ("tuple-pathbuf", "braceless-match-pathbuf"))
+
+    def test_collection_constructor_chain_must_prove_its_final_receiver_kind(self) -> None:
+        source = '''use std::path::PathBuf;
+trait ArchiveItem { fn name(&self) -> &str; }
+fn constructor_chains(zip_entry: &impl ArchiveItem) {
+    let mut output = vec![PathBuf::from("root")].into_iter().collect::<PathBuf>();
+    output.push(zip_entry.name()); // hazard: collected-pathbuf
+    let mut output = Vec::<&str>::new();
+    output.push(zip_entry.name());
+    let mut output = vec![zip_entry.name()];
+    output.push(zip_entry.name());
+    let mut append = || output.push(zip_entry.name());
+    append();
+}
+'''
+        self.assert_source_findings(source, ("collected-pathbuf",))
+
+    def test_match_guards_preserve_captured_aliases_and_real_pattern_shadows(self) -> None:
+        source = '''use std::path::{Path, PathBuf};
+trait ArchiveItem { fn name(&self) -> &str; }
+fn guarded_alias(zip_entry: &impl ArchiveItem, destination: &Path) {
+    let name = zip_entry.name();
+    match true {
+        true if !name.is_empty() => {
+            destination.join(name); // hazard: braced-guard-capture
+        }
+        _ => {}
+    }
+    let _ = match true {
+        true if !name.is_empty() => destination.join(name), // hazard: braceless-guard-capture
+        _ => PathBuf::new(),
+    };
+    match Some("fixed.txt") {
+        Some(name) if !name.is_empty() => {
+            destination.join(name);
+        }
+        _ => {}
+    }
+    let _ = match Some("another-fixed.txt") {
+        Some(name) if !name.is_empty() => destination.join(name),
+        _ => PathBuf::new(),
+    };
+    destination.join(name); // hazard: alias-after-guarded-shadows
+}
+'''
+        self.assert_source_findings(source, (
+            "braced-guard-capture", "braceless-guard-capture",
+            "alias-after-guarded-shadows",
+        ))
+
+    def test_tuple_for_bindings_shadow_only_the_inner_collection_receiver(self) -> None:
+        source = '''use std::path::PathBuf;
+trait ArchiveItem { fn name(&self) -> &str; }
+fn enumerated_paths(zip_entry: &impl ArchiveItem, candidates: Vec<PathBuf>) {
+    let mut output: Vec<&str> = Vec::new();
+    output.push(zip_entry.name());
+    for (_index, mut output) in candidates.into_iter().enumerate() {
+        output.push(zip_entry.name()); // hazard: enumerated-pathbuf
+    }
+    output.push(zip_entry.name());
+    for (index, candidate) in [PathBuf::new()].into_iter().enumerate() {
+        output.push(zip_entry.name());
+        drop((index, candidate));
+    }
+}
+'''
+        self.assert_source_findings(source, ("enumerated-pathbuf",))
+
+    def test_nested_vec_type_does_not_exempt_path_writing_wrappers(self) -> None:
+        source = '''use std::marker::PhantomData;
+use std::path::PathBuf;
+trait ArchiveItem { fn name(&self) -> &str; }
+struct Destination<T> {
+    path: PathBuf,
+    tag: PhantomData<T>,
+}
+impl<T> Destination<T> {
+    fn push(&mut self, value: &str) {
+        self.path.push(value);
+    }
+}
+fn wrapped_parameter(zip_entry: &impl ArchiveItem, output: &mut Destination<Vec<u8>>) {
+    output.push(zip_entry.name()); // hazard: nested-vec-parameter
+}
+fn wrapped_local(zip_entry: &impl ArchiveItem) {
+    let mut output: Destination<Vec<u8>> = Destination {
+        path: PathBuf::new(),
+        tag: PhantomData,
+    };
+    output.push(zip_entry.name()); // hazard: nested-vec-local
+}
+fn owned_vector<'a>(zip_entry: &'a impl ArchiveItem, mut output: Vec<&'a str>) {
+    output.push(zip_entry.name());
+}
+fn borrowed_vector<'a>(zip_entry: &'a impl ArchiveItem, output: &mut Vec<&'a str>) {
+    output.push(zip_entry.name());
+}
+fn qualified_borrowed_vector<'a>(
+    zip_entry: &'a impl ArchiveItem, output: &mut std::vec::Vec<&'a str>,
+) {
+    output.push(zip_entry.name());
+}
+'''
+        self.assert_source_findings(source, ("nested-vec-parameter", "nested-vec-local"))
+
+    def test_long_masked_literal_and_whitespace_cannot_stall_match_arm_detection(self) -> None:
+        # A failed arrow search after this comma previously explored overlapping
+        # whitespace/capture partitions. Keep a real sink after the long span so
+        # returning early without scanning the rest of the source cannot pass.
+        source = "\n".join([
+            "fn ordinary() {",
+            '    let _ = ("' + "ordinary diagnostic text " * 2048 + '",',
+            " " * 32768 + "1usize);",
+            "}",
+            "fn extract(zip_entry: &ZipFile, destination: &Path) {",
+            "    destination.join(zip_entry.name());",
+            "}",
+        ])
+        program = """import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from ubs_core.rust_detectors.archive_entry_path import find
+records = [[str(path), line, col, code] for path, line, col, code in find([Path(sys.argv[2])])]
+print(json.dumps(records))
+"""
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-archive-bounded-") as tmp:
+            path = Path(tmp) / "long_source.rs"
+            path.write_text(source, encoding="utf-8")
+            command = [sys.executable, "-I", "-B", "-c", program, str(HELPERS_DIR), str(path)]
+            try:
+                proc = subprocess.run(
+                    command, cwd=tmp, text=True, capture_output=True, timeout=10,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                self.fail(
+                    "archive detector exceeded the 10-second liveness bound; "
+                    f"stdout={error.stdout!r}, stderr={error.stderr!r}"
+                )
+            context = f"exit={proc.returncode}, stdout={proc.stdout!r}, stderr={proc.stderr!r}"
+            self.assertEqual(proc.returncode, 0, context)
+            try:
+                records = json.loads(proc.stdout)
+            except json.JSONDecodeError as error:
+                self.fail(f"invalid archive detector record JSON: {error}; {context}")
+            self.assertEqual(
+                records,
+                [[str(path), 6, 1, "destination.join(zip_entry.name());"]],
+                context,
+            )
+
+    def test_source_replacement_and_file_order_do_not_reuse_archive_bindings(self) -> None:
+        tainted = """fn extract(zip_entry: &ZipFile, destination: &Path) {
+    let path = zip_entry.name();
+    destination.join(path);
+}
+"""
+        clean = """fn fixture(destination: &Path) {
+    let path = PathBuf::from("fixture.json");
+    destination.join(path);
+}
+"""
+        with tempfile.TemporaryDirectory(prefix="ubs-rust-archive-isolation-") as tmp:
+            first, second = Path(tmp) / "first.rs", Path(tmp) / "second.rs"
+            first.write_text(tainted, encoding="utf-8")
+            second.write_text(clean, encoding="utf-8")
+            expected = [(first, 3, 1, "destination.join(path);")]
+            self.assertEqual(list(archive_entry_path.find([first, second])), expected)
+            self.assertEqual(list(archive_entry_path.find([second, first])), expected)
+            first.write_text(clean, encoding="utf-8")
+            self.assertEqual(list(archive_entry_path.find([first, second])), [])
+            first.write_text(tainted, encoding="utf-8")
+            self.assertEqual(list(archive_entry_path.find([first])), expected)
 
 
 class RustPreparedSourceTests(unittest.TestCase):

@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="7234f219beb5b09f64b2aeb005de96b76e525a5089abbaa38dc14c60d6122fb8"
+UBS_LIB_CHECKSUM="2db12d849ec9a16e37ddd45d760cab18c297ecbb0caea7bc22f9c66de6c5e847"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -440,13 +440,21 @@ run_contract_v2_ruby(){
 
   local ast_rule_dir=""
   if command -v ast-grep >/dev/null 2>&1 && [[ "${UBS_TEST_FORCE_NO_AST_GREP:-0}" != "1" ]]; then
-    ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-rbv2-rules.XXXXXX)"
-    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+    # This function runs in an OR-list, so errexit cannot guard assignments.
+    # An empty Path would make the generator write its rules into the cwd.
+    if ! ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-rbv2-rules.XXXXXX)"; then
+      echo "ERROR: failed to create temporary AST rule directory" >&2
+      return 2
+    fi
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 - "$ast_rule_dir" <<'PYRULES'
 from pathlib import Path
+import sys
 from ubs_core.ruby_rules import generate
-generate(Path('$ast_rule_dir'))
-" 2>/dev/null; then
-      ast_rule_dir=""
+generate(Path(sys.argv[1]))
+PYRULES
+    then
+      echo "ERROR: failed to generate AST rules" >&2
+      return 2
     fi
   fi
   [[ -n "$ast_rule_dir" ]] && scan_args+=(--ast-rule-dir "$ast_rule_dir")

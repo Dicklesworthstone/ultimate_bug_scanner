@@ -4,6 +4,15 @@ on:
   push:
     branches: [main]
     paths:
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/quality/test_command_*.py
+      - .github/workflows/python-command-control-flow.yml
+  pull_request:
+    paths:
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/quality/test_command_*.py
       - .github/workflows/python-command-control-flow.yml
   workflow_dispatch:
 
@@ -12,187 +21,15 @@ permissions:
 
 jobs:
   control-flow:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      UBS_NO_AUTO_UPDATE: "1"
-      UBS_ENABLE_AUTO_UPDATE: "0"
-      UBS_SKIP_RUST_BUILD: "1"
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # Temporary staging publishes immutable blobs, never refs. The connector
-      # lands each tested source/checksum group and restores read-only CI.
-      - name: Stage first reviewed batch and prepare integrity publisher
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = ccb29797e9e2b6e52f3a122da2be41f1ed75dde7
-          echo "FLOW_VALIDATION_BASE $(git rev-parse HEAD)"
-          cp modules/helpers/ubs_core/py_detectors/command_injection.py "$RUNNER_TEMP/original-command.py"
-          python3 - <<'PY'
-          import base64
-          import hashlib
-          import json
-          import lzma
-          import os
-          import subprocess
-          from pathlib import Path
-          def blob(sha):
-              result = subprocess.run(['gh', 'api', f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], capture_output=True, text=True, check=True, timeout=90)
-              data = base64.b64decode(json.loads(result.stdout)['content'])
-              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
-              return data
-          candidate = json.loads(lzma.decompress(blob('eb1b0c3f88b88aa19fd6f095f94424fbffea1e7b')))
-          subprocess.run(['git', 'apply', '--check', '-'], input=candidate['patch'], text=True, check=True)
-          subprocess.run(['git', 'apply', '-'], input=candidate['patch'], text=True, check=True)
-          test = Path('test-suite/quality/test_command_control_flow.py')
-          assert not test.exists(), 'do not overwrite a concurrent test addition'
-          test.write_text(candidate['test'], encoding='utf-8')
-          patch = blob('1342ce469e69c7a1ca40057a26c14ea96e4f789c')
-          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
-          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
-          second = blob('91abc915e8b6b25426bbe21c021a4017cb599212')
-          (Path(os.environ['RUNNER_TEMP']) / 'command-argv.xz').write_bytes(second)
-          PY
-          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = 46c506d09415bbb1ce4b45f0383a2315f2a14cf3
-          test "$(git hash-object test-suite/quality/test_command_control_flow.py)" = 8eb1d7fed486b169982faa6f0500710f1c35c73d
-          cat > "$RUNNER_TEMP/publish-command-blobs.py" <<'PY'
-          import hashlib
-          import json
-          import os
-          import subprocess
-          import sys
-          from pathlib import Path
-          source = 'modules/helpers/ubs_core/py_detectors/command_injection.py'
-          tests = {'test-suite/quality/test_command_control_flow.py'}
-          if sys.argv[1] == 'ARGV':
-              tests.add('test-suite/quality/test_command_argv_provenance.py')
-          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', source} | tests
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | tests
-          assert {source, 'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh'} | tests <= changed <= allowed, changed
-          snapshots = {name: Path(name).read_bytes() for name in changed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True, stdout=subprocess.DEVNULL)
-          assert all(Path(name).read_bytes() == data for name, data in snapshots.items()), 'non-deterministic checksums'
-          for name in sorted(changed):
-              data = snapshots[name]
-              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
-                  text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(response.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              entry = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
-              mode = entry[0] if entry else '100644'
-              print(sys.argv[1] + '_BLOB', name, sha, mode, flush=True)
-          PY
-      - name: Test first batch and preserve existing fixtures
-        env:
-          PYTHONPATH: modules/helpers
+      - name: Test committed control flow and executable provenance
         run: |
           python3 --version
-          python3 test-suite/quality/test_python_command_injection_dataflow.py -v
-          python3 test-suite/quality/test_command_control_flow.py -v
-          python3 - <<'PY'
-          import importlib.util
-          import os
-          from pathlib import Path
-          from ubs_core.py_detectors import command_injection as current
-          spec = importlib.util.spec_from_file_location('original_command', Path(os.environ['RUNNER_TEMP']) / 'original-command.py')
-          original = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(original)
-          clean = Path('test-suite/python/security/command_injection_clean.py')
-          buggy = Path('test-suite/python/security/command_injection_buggy.py')
-          assert list(current.find([clean])) == [], 'existing clean fixture regressed'
-          before = {row[:3] for row in original.find([buggy])}
-          after = {row[:3] for row in current.find([buggy])}
-          assert before and before <= after, (before, after)
-          print('FLOW_FIXTURES PASS', len(before), len(after))
-          PY
-      - name: Generate first atomic integrity snapshot
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 scripts/update_checksums.py > "$RUNNER_TEMP/flow-checksums.log"
-          git diff --check
-          python3 "$RUNNER_TEMP/publish-command-blobs.py" FLOW
-      - name: Stage second reviewed batch and run all command regressions
-        run: |
-          python3 - <<'PY'
-          import json
-          import lzma
-          import os
-          import subprocess
-          from pathlib import Path
-          candidate = json.loads(lzma.decompress((Path(os.environ['RUNNER_TEMP']) / 'command-argv.xz').read_bytes()))
-          subprocess.run(['git', 'apply', '--check', '-'], input=candidate['patch'], text=True, check=True)
-          subprocess.run(['git', 'apply', '-'], input=candidate['patch'], text=True, check=True)
-          test = Path('test-suite/quality/test_command_argv_provenance.py')
-          assert not test.exists(), 'do not overwrite a concurrent test addition'
-          test.write_text(candidate['test'], encoding='utf-8')
-          PY
-          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = 905b55e85a655d3a8ab7c942f85c25912621b4e4
-          test "$(git hash-object test-suite/quality/test_command_argv_provenance.py)" = 4c1fd58dd07ef9de170c526c85808d3b53dbb8e5
-          python3 test-suite/quality/test_python_command_injection_dataflow.py -v
-          python3 test-suite/quality/test_command_control_flow.py -v
-          python3 test-suite/quality/test_command_argv_provenance.py -v
-      - name: Verify full installation integrity and CLI behavior
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq ripgrep rsync shellcheck
-          python3 scripts/update_checksums.py > "$RUNNER_TEMP/argv-checksums.log"
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-          for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh; do bash -n "$script"; done
-          git diff --check
-          python3 test-suite/shareable/test_contract_checksums.py -v
-          python3 test-suite/shareable/test_installed_contract.py -v
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-          import tempfile
-          from pathlib import Path
-          root = Path.cwd()
-          cases = {
-              'branch': ('import os\ncmd = input()\nif flag:\n cmd = "echo"\nos.system(cmd)\n', True),
-              'loop': ('import os\ncmd = "echo"\nwhile flag:\n os.system(cmd)\n cmd = input()\n', True),
-              'shell-alias': ('import subprocess\nargv = ["sh", "-c", input()]\nsubprocess.run(argv)\n', True),
-              'shell-exec': ('import os\nos.execve("/bin/sh", ["sh", "-c", input()], {})\n', True),
-              'scope-clean': ('import os\ndef first():\n cmd = input()\ndef second(cmd):\n os.system(cmd)\n', False),
-              'argv-clean': ('import subprocess\nargv = ["echo", input()]\nsubprocess.run(argv, check=True, timeout=5)\n', False),
-          }
-          def rules(value):
-              if isinstance(value, dict):
-                  yield value.get('rule_id', value.get('ruleId', value.get('rule')))
-                  for child in value.values():
-                      yield from rules(child)
-              elif isinstance(value, list):
-                  for child in value:
-                      yield from rules(child)
-          with tempfile.TemporaryDirectory(prefix='ubs-command-integration-') as scratch:
-              scratch = Path(scratch)
-              for name, (source, expected) in cases.items():
-                  project = scratch / name
-                  project.mkdir()
-                  (project / 'sample.py').write_text(source, encoding='utf-8')
-                  result = subprocess.run([str(root / 'ubs'), str(project), '--only=python', '--format=json'],
-                      cwd=scratch, env={**os.environ, 'HOME': str(scratch), 'XDG_CACHE_HOME': str(scratch / 'cache')},
-                      text=True, capture_output=True, timeout=180)
-                  assert result.returncode in (0, 1), (name, result.returncode, result.stdout, result.stderr)
-                  payload = json.loads(result.stdout)
-                  assert ('py.security.command-injection' in set(rules(payload))) == expected, (name, payload, result.stderr)
-                  print('COMMAND_REAL_SCAN', name, 'PASS', flush=True)
-          PY
-      - name: Generate second atomic integrity snapshot
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 "$RUNNER_TEMP/publish-command-blobs.py" ARGV
+          python3 -m unittest discover -s test-suite/quality -p 'test_*command*.py' -v

@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import shlex
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -189,6 +191,57 @@ class ExtensionlessShellAdmissionTest(unittest.TestCase):
 
     def test_staged_scan_admits_only_selected_extensionless_shell_scripts(self) -> None:
         self._check_extensionless_shell_admission(mode="staged")
+
+
+@unittest.skipUnless(shutil.which("ast-grep"), "AST rule generation requires ast-grep")
+class RubyTemporaryAllocationTest(unittest.TestCase):
+    def test_failed_rule_directory_allocation_does_not_write_into_cwd(self) -> None:
+        case_id = "ruby-rule-directory-allocation"
+        started = time.monotonic()
+        print(f"[{case_id}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite/artifacts/module-temp-failure"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="case-", dir=artifacts))
+        cwd = root / "cwd"
+        cwd.mkdir()
+        scratch = root / "scratch"
+        scratch.mkdir()
+        tools = root / "tools"
+        tools.mkdir()
+        fixture = root / "clean.rb"
+        fixture.write_text("def clean; 42; end\n", encoding="utf-8")
+        real_mktemp = shutil.which("mktemp")
+        self.assertIsNotNone(real_mktemp)
+        # Inject only allocation failure, while executing the actual module
+        # and allowing its temporary report files to use the real mktemp.
+        shim = tools / "mktemp"
+        shim.write_text(
+            '#!/usr/bin/env bash\nfor arg do\n'
+            '  if [[ "$arg" == "-d" ]]; then exit 1; fi\ndone\n'
+            f'exec {shlex.quote(real_mktemp)} "$@"\n', encoding="utf-8",
+        )
+        shim.chmod(0o755)
+        env = dict(os.environ, TMPDIR=str(scratch), TMP=str(scratch), TEMP=str(scratch),
+                   PYTHONDONTWRITEBYTECODE="1",
+                   PATH=str(tools) + os.pathsep + os.environ.get("PATH", ""))
+        try:
+            result = subprocess.run(
+                ["bash", str(REPO_ROOT / "modules/ubs-ruby.sh"), "--no-bundler",
+                 "--format=json", str(fixture)],
+                cwd=cwd, env=env, text=True, capture_output=True, timeout=45,
+            )
+            (root / "stdout.log").write_text(result.stdout, encoding="utf-8")
+            (root / "stderr.log").write_text(result.stderr, encoding="utf-8")
+            context = (f"exit={result.returncode}\nstdout:\n{result.stdout}"
+                       f"\nstderr:\n{result.stderr}")
+            self.assertEqual(result.returncode, 2, context)
+            self.assertIn("temporary AST rule directory", result.stderr, context)
+            self.assertFalse(result.stdout.strip(), context)
+            self.assertEqual(list(cwd.iterdir()), [], context)
+        except BaseException:
+            print(f"[{case_id}] FAIL ({time.monotonic() - started:.3f}s)", flush=True)
+            raise
+        print(f"[{case_id}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
 
 
 if __name__ == "__main__":

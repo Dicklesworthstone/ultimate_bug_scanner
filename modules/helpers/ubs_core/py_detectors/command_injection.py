@@ -148,7 +148,9 @@ def target_names(target):
 def shell_name(value):
     if not value:
         return ''
-    return os.path.basename(value).lower()
+    # The scanned program's platform need not match the scanner's platform.
+    name = os.path.basename(value.replace('\\', '/')).lower()
+    return name[:-4] if name.endswith('.exe') else name
 
 
 class CommandAnalysisLimit(ValueError):
@@ -220,7 +222,9 @@ class LocalBindings(ast.NodeVisitor):
 
 class CommandInjectionAnalyzer(ast.NodeVisitor):
     _SET_FIELDS = ('tainted_names', 'raw_tainted_names', 'shell_command_vars',
-                   'executable_vars', 'argv_names', 'subprocess_modules', 'os_modules')
+                   'executable_vars', 'argv_names', 'subprocess_modules', 'os_modules',
+                   'unsafe_shell_argv_names', 'unsafe_posix_payload_names',
+                   'unsafe_windows_payload_names')
 
     def __init__(self, text, lines, *, max_steps=100_000):
         self.text = text
@@ -235,6 +239,9 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.shell_command_vars = set()
         self.executable_vars = set()
         self.argv_names = set()
+        self.unsafe_shell_argv_names = set()
+        self.unsafe_posix_payload_names = set()
+        self.unsafe_windows_payload_names = set()
         self.issues = []
         self.seen_lines = set()
         self.remaining_steps = max_steps
@@ -654,16 +661,72 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
             return node.id in self.executable_vars or node.id in self.shell_command_vars
         return self.expr_is_dynamic_string(node)
 
-    def shell_c_payload(self, node, executable=None):
+    def shell_flag_payload(self, node):
         if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 3:
             return None
-        executable = const_string(executable if executable is not None else node.elts[0])
         flag = const_string(node.elts[1])
-        if shell_name(executable) in SHELL_NAMES and flag and flag.lower() in SHELL_FLAGS:
+        if flag and flag.lower() in SHELL_FLAGS:
             return node.elts[2]
         return None
 
+    def shell_c_payload(self, node, executable=None):
+        payload = self.shell_flag_payload(node)
+        if payload is None:
+            return None
+        executable = const_string(executable if executable is not None else node.elts[0])
+        return payload if shell_name(executable) in SHELL_NAMES else None
+
+    def argv_shell_is_unsafe(self, node, executable=None):
+        if isinstance(node, ast.IfExp):
+            if isinstance(node.test, ast.Constant):
+                return self.argv_shell_is_unsafe(node.body if node.test.value else node.orelse, executable)
+            return self.argv_shell_is_unsafe(node.body, executable) or self.argv_shell_is_unsafe(node.orelse, executable)
+        program = shell_name(const_string(executable)) if executable is not None else ''
+        if isinstance(node, ast.Name):
+            if executable is None:
+                return node.id in self.unsafe_shell_argv_names
+            if program not in SHELL_NAMES:
+                return False
+            names = self.unsafe_windows_payload_names if program in {'cmd', 'powershell', 'pwsh'} else self.unsafe_posix_payload_names
+            return node.id in names
+        payload = self.shell_c_payload(node, executable)
+        if payload is None:
+            return False
+        if executable is None:
+            program = shell_name(const_string(node.elts[0]))
+        # shlex.quote escapes POSIX tokens, not cmd/PowerShell programs. Keep
+        # their raw provenance even when the POSIX shell domain is clean.
+        return self.arg_is_shell_command(payload) or (
+            program in {'cmd', 'powershell', 'pwsh'} and self.expr_is_tainted(payload, shell=False)
+        )
+
+    def argv_payload_is_unsafe(self, node, *, windows=False):
+        if isinstance(node, ast.IfExp):
+            if isinstance(node.test, ast.Constant):
+                return self.argv_payload_is_unsafe(node.body if node.test.value else node.orelse, windows=windows)
+            return self.argv_payload_is_unsafe(node.body, windows=windows) or self.argv_payload_is_unsafe(node.orelse, windows=windows)
+        if isinstance(node, ast.Name):
+            names = self.unsafe_windows_payload_names if windows else self.unsafe_posix_payload_names
+            return node.id in names
+        payload = self.shell_flag_payload(node)
+        return payload is not None and (self.arg_is_shell_command(payload) or (
+            windows and self.expr_is_tainted(payload, shell=False)))
+
+    def expr_is_argv(self, node):
+        if isinstance(node, ast.IfExp):
+            if isinstance(node.test, ast.Constant):
+                return self.expr_is_argv(node.body if node.test.value else node.orelse)
+            return self.expr_is_argv(node.body) and self.expr_is_argv(node.orelse)
+        return isinstance(node, (ast.List, ast.Tuple)) or (
+            isinstance(node, ast.Name) and node.id in self.argv_names)
+
     def list_executable_is_dynamic(self, node):
+        if isinstance(node, ast.IfExp):
+            if isinstance(node.test, ast.Constant):
+                return self.list_executable_is_dynamic(node.body if node.test.value else node.orelse)
+            return self.list_executable_is_dynamic(node.body) or self.list_executable_is_dynamic(node.orelse)
+        if isinstance(node, ast.Name):
+            return node.id in self.executable_vars
         if isinstance(node, (ast.List, ast.Tuple)) and node.elts:
             return self.executable_is_dynamic(node.elts[0])
         return False
@@ -712,11 +775,10 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         raw_tainted = self.expr_is_tainted(value, shell=False)
         shell_command = self.expr_is_dynamic_string(value)
         dynamic_executable = self.list_executable_is_dynamic(value)
-        is_argv = isinstance(value, (ast.List, ast.Tuple)) or (
-            isinstance(value, ast.Name) and value.id in self.argv_names
-        )
-        if isinstance(value, ast.Name) and value.id in self.executable_vars:
-            dynamic_executable = True
+        is_argv = self.expr_is_argv(value)
+        unsafe_posix = self.argv_payload_is_unsafe(value)
+        unsafe_windows = self.argv_payload_is_unsafe(value, windows=True)
+        unsafe_shell = self.argv_shell_is_unsafe(value)
         for name in names:
             self.subprocess_modules.discard(name)
             self.os_modules.discard(name)
@@ -741,6 +803,14 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
                 self.executable_vars.add(name)
             else:
                 self.executable_vars.discard(name)
+            for field, unsafe in (
+                    ('unsafe_shell_argv_names', unsafe_shell),
+                    ('unsafe_posix_payload_names', unsafe_posix),
+                    ('unsafe_windows_payload_names', unsafe_windows)):
+                if unsafe:
+                    getattr(self, field).add(name)
+                else:
+                    getattr(self, field).discard(name)
 
     def visit_Assign(self, node):
         self.visit(node.value)
@@ -770,17 +840,14 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
             return True
         if may_enable_shell(argument_value(node, 8, 'shell')):
             return self.arg_is_shell_command(command)
-        shell_payload = self.shell_c_payload(command, executable)
-        if shell_payload is not None:
-            return self.arg_is_shell_command(shell_payload)
+        if self.argv_shell_is_unsafe(command, executable):
+            return True
         if executable is not None:
             # With an explicit fixed program, argv[0] is data, not the
             # executable selector. A fixed shell override was checked above.
             return False
-        if isinstance(command, (ast.List, ast.Tuple)):
+        if self.expr_is_argv(command):
             return self.list_executable_is_dynamic(command)
-        if isinstance(command, ast.Name) and command.id in self.argv_names:
-            return command.id in self.executable_vars
         # A scalar args value chooses the executable even without a shell;
         # shell quoting does not authorize that program.
         return self.executable_is_dynamic(command)
@@ -790,9 +857,21 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
             executable_index = 1
         else:
             executable_index = 0
-        if len(node.args) <= executable_index:
+        executable = argument_value(node, executable_index, 'file')
+        if executable is None:
+            executable = argument_value(node, executable_index, 'path')
+        if executable is None:
             return False
-        return self.executable_is_dynamic(node.args[executable_index])
+        if self.executable_is_dynamic(executable):
+            return True
+        if func.startswith(('execv', 'spawnv')):
+            argv = argument_value(node, executable_index + 1, 'args')
+        else:
+            arguments = list(positional_values(node.args))
+            # The last argument of the l*e variants is an environment mapping,
+            # not a command argument. argv[0] is still the program's display name.
+            argv = ast.List(elts=arguments[executable_index + 1:-1 if func.endswith('e') else None], ctx=ast.Load())
+        return self.argv_shell_is_unsafe(argv, executable)
 
     def visit_Call(self, node):
         for canonical in self.canonical_calls(node):
@@ -804,7 +883,8 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
                 else:
                     unsafe = self.subprocess_arg_is_unsafe(node)
             elif module == 'os' and func in OS_COMMAND_CALLS:
-                unsafe = bool(node.args and self.arg_is_shell_command(node.args[0]))
+                command = argument_value(node, 0, 'cmd' if func == 'popen' else 'command')
+                unsafe = command is not None and self.arg_is_shell_command(command)
             elif module == 'os' and func in (OS_EXEC_CALLS | OS_SPAWN_CALLS):
                 unsafe = self.os_exec_arg_is_unsafe(node, func)
             if unsafe:

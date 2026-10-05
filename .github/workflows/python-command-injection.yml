@@ -105,6 +105,8 @@ jobs:
               scratch = Path(scratch)
               cases = {
                   'buggy': ('import subprocess\nsubprocess.run(args=input(), shell=True)\n', True),
+                  'shell-alias': ('import subprocess\nargv = [\"sh\", \"-c\", input()]\nsubprocess.run(argv)\n', True),
+                  'shell-exec': ('import os\nos.execve(\"/bin/sh\", [\"sh\", \"-c\", input()], {})\n', True),
                   'branch': ('import os\ncmd = input()\nif flag:\n cmd = \"echo\"\nos.system(cmd)\n', True),
                   'loop': ('import os\ncmd = \"echo\"\nwhile flag:\n os.system(cmd)\n cmd = input()\n', True),
                   'scope-clean': ('import os\ndef first():\n cmd = input()\ndef second(cmd):\n os.system(cmd)\n', False),

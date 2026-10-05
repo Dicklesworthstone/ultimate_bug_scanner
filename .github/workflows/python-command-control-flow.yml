@@ -12,40 +12,32 @@ permissions:
 
 jobs:
   control-flow:
-    runs-on: windows-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     permissions:
       contents: write
-    defaults:
-      run:
-        shell: bash
     env:
       PYTHONDONTWRITEBYTECODE: "1"
-      PYTHONIOENCODING: utf-8
-      PYTHONUTF8: "1"
+      UBS_NO_AUTO_UPDATE: "1"
     steps:
-      - name: Preserve repository LF bytes before checkout
-        run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # Temporary immutable-blob publication only. The connector commits each
-      # tested source/integrity group; this workflow never changes a ref.
-      - name: Validate frozen functional batches against current source
+      # Temporary publication of reviewed immutable blobs only. No branch or
+      # tag is updated by this job. The connector lands the validated trees.
+      - name: Validate and publish the two frozen implementation batches
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import base64
           import hashlib
           import json
           import lzma
           import os
-          import runpy
           import subprocess
           import sys
-          import unittest
           from pathlib import Path
 
           def digest(data):
@@ -59,68 +51,41 @@ jobs:
               return data
 
           data = b''.join(get_blob(sha) for sha in (
-              '9702d64e3cf3fb4bcae8283e36b2f87c4cc0e088',
-              'c0235088fa421330154f709585b68e67b6fd5439',
-              '038e16b5b1652c1439f63f39e06cada1c7791cc3'))
-          assert digest(data) == '38ef7851c44350aa325d380a8f44792f850e7b6f'
+              'c38500bc75fbd66cab7266accc807f23c2aa227c',
+              'a1aa1aae9a893bcc65f9fc257ffd1b472d44b4b8',
+              'f54f6f1c23884a35b8ba7f58cd67aed8dcdc39c8'))
+          assert digest(data) == 'f8b0efa8e701c206bb6039c95dc69bb9d015d12d'
           bundle = json.loads(lzma.decompress(data))
-          source = 'modules/helpers/ubs_core/py_detectors/command_injection.py'
-          assert digest(Path(source).read_bytes()) == bundle['base'][source]
-          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-          print('FLOW_VALIDATION_BASE', head, flush=True)
-
-          # Run the unmodified official generator with LF output on Windows.
-          # No generator changes are committed and all generated hashes are
-          # checked again after a second complete generation.
-          original_write_text = Path.write_text
-          def write_lf(self, data, encoding=None, errors=None, newline=None):
-              with self.open('w', encoding=encoding, errors=errors, newline='\n') as stream:
-                  return stream.write(data)
-          def regenerate():
-              Path.write_text = write_lf
-              try:
-                  runpy.run_path('scripts/update_checksums.py', run_name='__main__')
-              finally:
-                  Path.write_text = original_write_text
+          for name, sha in bundle['base'].items():
+              assert digest(Path(name).read_bytes()) == sha, ('concurrent source changed', name)
+          print('FLOW_VALIDATION_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
 
           for batch, expected_tests in zip(bundle['batches'], (99, 138)):
-              entries = batch['entries']
-              functional = [entry for entry in entries if entry['path'] == source or
-                            entry['path'].startswith('test-suite/quality/test_command_')]
-              for entry in functional:
-                  if entry['path'] != source:
-                      assert not Path(entry['path']).exists(), entry['path']
-              command = ['git', 'apply', '--include=' + source,
-                         '--include=test-suite/quality/test_command_*']
               patch = batch['patch'].encode('utf-8')
-              subprocess.run(command + ['--check', '-'], input=patch, check=True)
-              subprocess.run(command + ['-'], input=patch, check=True)
-              for entry in functional:
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+              for entry in batch['entries']:
                   assert digest(Path(entry['path']).read_bytes()) == entry['sha'], entry
-              # Fresh process avoids carrying the first detector module into
-              # the second batch's regression discovery.
               test_code = (
                   "import unittest; s=unittest.defaultTestLoader.discover('test-suite/quality', "
                   "pattern='test_*command*.py'); r=unittest.TextTestRunner(verbosity=2).run(s); "
                   f"assert r.testsRun == {expected_tests} and r.wasSuccessful() and not r.skipped, "
                   "(r.testsRun, r.failures, r.errors, r.skipped)")
               subprocess.run([sys.executable, '-c', test_code], check=True, timeout=180)
-              regenerate()
-              snapshots = {entry['path']: Path(entry['path']).read_bytes() for entry in entries}
-              regenerate()
-              assert all(Path(name).read_bytes() == content for name, content in snapshots.items())
+              subprocess.run(['bash', 'scripts/verify_checksums.sh'], check=True, timeout=120)
+              subprocess.run(['bash', 'scripts/verify_sha256sums.sh'], check=True, timeout=120)
               subprocess.run(['git', 'diff', '--check'], check=True)
-              changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-              allowed = set(bundle['base'])
-              assert changed <= allowed, changed - allowed
-              for entry in entries:
+              snapshots = {entry['path']: Path(entry['path']).read_bytes() for entry in batch['entries']}
+              subprocess.run([sys.executable, 'scripts/update_checksums.py'], check=True, stdout=subprocess.DEVNULL, timeout=120)
+              assert all(Path(name).read_bytes() == content for name, content in snapshots.items()), 'checksum regeneration changed frozen bytes'
+              for entry in batch['entries']:
                   content = snapshots[entry['path']]
                   response = subprocess.run(['gh', 'api', '--method', 'POST',
                       f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
                       input=json.dumps({'content': content.decode('utf-8'), 'encoding': 'utf-8'}),
                       text=True, encoding='utf-8', capture_output=True, check=True, timeout=90)
                   sha = json.loads(response.stdout)['sha']
-                  assert sha == digest(content), entry['path']
+                  assert sha == entry['sha'] == digest(content), entry['path']
                   print(batch['label'] + '_BLOB', entry['path'], sha, entry['mode'], flush=True)
               print(batch['label'] + '_TESTS_PASS', expected_tests, flush=True)
           PY

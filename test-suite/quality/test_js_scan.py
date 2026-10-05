@@ -113,6 +113,64 @@ class ScanTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class TextReportMemoryTests(unittest.TestCase):
+    def test_bridge_recounts_400k_records_and_preserves_error_below_64_mib(self) -> None:
+        case = "c6-bridge-memory"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="bridge-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                sink = root / "findings.ndjson"
+                with sink.open("w", encoding="utf-8") as stream:
+                    for severity, count, category in (("critical", 399_970, "js.debug"),
+                                                      ("warning", 30, "js.typescript")):
+                        for index in range(count):
+                            stream.write(json.dumps({"severity": severity, "category_id": category,
+                                                     "message": f"sample {index}\u2028detail"},
+                                                    ensure_ascii=False) + "\n")
+                files = root / "files.0"
+                files.write_bytes(b"source.js\0")
+                module = (REPO_ROOT / "modules/ubs-js.sh").read_text()
+                begin = module.index("run_v2_legacy_parity_bridges(){")
+                end = module.index("\n}\n", begin) + 2
+                script = root / "bridge.sh"
+                script.write_text(module[begin:end] + '\nrun_v2_legacy_parity_bridges "$@"\n')
+                text_out = artifacts / "report.txt"
+                text_out.write_text("")
+                peak = artifacts / "peak-rss-kib.txt"
+                env = dict(os.environ, UBS_SKIP_TYPE_NARROWING="1")
+                # Exercise the production bridge independently of the scanner:
+                # it must retain findings and the scanner's incomplete exit.
+                result = subprocess.run(
+                    ["/usr/bin/time", "-f", "%M", "-o", str(peak),
+                     "bash", str(script), str(sink), str(files), "2", str(text_out)],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=60,
+                )
+                (artifacts / "stdout.log").write_text(result.stdout)
+                (artifacts / "stderr.log").write_text(result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                report = text_out.read_text()
+                self.assertIn("Files scanned: 1", report)
+                self.assertIn("Critical issues: 399970", report)
+                self.assertIn("Warning issues: 30", report)
+                self.assertIn("Info items: 0", report)
+                self.assertNotIn("DEBUGGING & PRODUCTION CODE", report)
+                self.assertNotIn("TYPESCRIPT STRICTNESS", report)
+                self.assertIn("NODE.JS I/O & MODULES", report)
+                rss_kib = int(peak.read_text().splitlines()[-1])
+                self.assertLess(rss_kib, 64 * 1024,
+                                f"bridge peaked at {rss_kib / 1024:.1f} MiB")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("report.txt", "stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text()}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
+
     def test_large_sink_keeps_counts_and_first_samples_below_64_mib(self) -> None:
         case = "c6-text-memory"
         started = time.perf_counter()

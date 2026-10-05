@@ -1,0 +1,111 @@
+name: Python Command Control Flow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-command-control-flow.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control-flow:
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Temporary candidate staging/publication is removed when its validated
+      # source and generated integrity files are committed atomically to main.
+      - name: Stage and verify the reviewed candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = ccb29797e9e2b6e52f3a122da2be41f1ed75dde7
+          echo "FLOW_VALIDATION_BASE $(git rev-parse HEAD)"
+          cp modules/helpers/ubs_core/py_detectors/command_injection.py "$RUNNER_TEMP/original-command.py"
+          gh api "repos/$GH_REPO/git/blobs/eb1b0c3f88b88aa19fd6f095f94424fbffea1e7b" --jq .content | base64 --decode > "$RUNNER_TEMP/command-flow-candidate.xz"
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import lzma
+          import os
+          import subprocess
+          from pathlib import Path
+          data = (Path(os.environ['RUNNER_TEMP']) / 'command-flow-candidate.xz').read_bytes()
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == 'eb1b0c3f88b88aa19fd6f095f94424fbffea1e7b'
+          candidate = json.loads(lzma.decompress(data))
+          subprocess.run(['git', 'apply', '--check', '-'], input=candidate['patch'], text=True, check=True)
+          subprocess.run(['git', 'apply', '-'], input=candidate['patch'], text=True, check=True)
+          test = Path('test-suite/quality/test_command_control_flow.py')
+          assert not test.exists(), 'do not overwrite a concurrent test addition'
+          test.write_text(candidate['test'], encoding='utf-8')
+          PY
+          test "$(git hash-object modules/helpers/ubs_core/py_detectors/command_injection.py)" = a199fce30311ea276cebd05846a5aebc01392bae
+          test "$(git hash-object test-suite/quality/test_command_control_flow.py)" = 52c6ede0d5b39a408f834f4de07528f2d3536584
+      - name: Run invocation and control-flow regression suites
+        run: |
+          python3 --version
+          python3 test-suite/quality/test_python_command_injection_dataflow.py -v
+          python3 test-suite/quality/test_command_control_flow.py -v
+      - name: Compare existing positive and negative fixtures
+        env:
+          PYTHONPATH: modules/helpers
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+          from ubs_core.py_detectors import command_injection as current
+          spec = importlib.util.spec_from_file_location('original_command', Path(os.environ['RUNNER_TEMP']) / 'original-command.py')
+          original = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(original)
+          clean = Path('test-suite/python/security/command_injection_clean.py')
+          buggy = Path('test-suite/python/security/command_injection_buggy.py')
+          assert list(current.find([clean])) == [], 'existing clean fixture regressed'
+          before = {row[:3] for row in original.find([buggy])}
+          after = {row[:3] for row in current.find([buggy])}
+          assert before and before <= after, (before, after)
+          print('FLOW_FIXTURES PASS', len(before), len(after))
+          PY
+      - name: Generate and publish deterministic integrity blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 scripts/update_checksums.py > "$RUNNER_TEMP/command-checksums.log"
+          git diff --check
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+          source = 'modules/helpers/ubs_core/py_detectors/command_injection.py'
+          test = 'test-suite/quality/test_command_control_flow.py'
+          allowed = {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', source, test}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | {test}
+          assert {source, test, 'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh'} <= changed <= allowed, changed
+          snapshots = {name: Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True, stdout=subprocess.DEVNULL)
+          assert all(Path(name).read_bytes() == data for name, data in snapshots.items()), 'non-deterministic checksums'
+          for name in sorted(changed):
+              data = snapshots[name]
+              response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                  text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(response.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              entry = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
+              mode = entry[0] if entry else '100644'
+              print('FLOW_BLOB', name, sha, mode, flush=True)
+          PY

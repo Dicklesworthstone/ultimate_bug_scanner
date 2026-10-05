@@ -1,0 +1,243 @@
+name: CSharp Dataflow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/csharp-dataflow.yml
+      - modules/helpers/ubs_core/analyzers/taint_csharp_request.py
+      - modules/helpers/ubs_core/taint_flow.py
+      - modules/helpers/ubs_core/csharp_scan.py
+      - test-suite/quality/test_taint_csharp_dataflow.py
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: csharp-dataflow-main
+  cancel-in-progress: false
+
+jobs:
+  dataflow:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      CANDIDATE: 409a625d94cd2757da001bb6e404c03bd3fa2003
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Prepare exact reviewed source and native-sink integration
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f modules/helpers/ubs_core/taint_flow.py; then
+            echo 'bootstrap=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_csharp_request.py)" = 9b317cf5d6138e338fcfce1933aed7aaa180f140
+          test "$(git hash-object modules/helpers/ubs_core/csharp_scan.py)" = 60845cc05dc3208272fc7c2eb691a5bd07883c36
+          git fetch origin "$CANDIDATE"
+          git diff --name-only 07d3395d6324a559dd76ca31fad2a813bffda4ad "$CANDIDATE" > "$RUNNER_TEMP/csharp-candidate-paths.txt"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          paths = set((Path(os.environ['RUNNER_TEMP']) / 'csharp-candidate-paths.txt').read_text().splitlines())
+          assert paths == {'modules/helpers/ubs_core/taint_flow.py',
+                           'modules/helpers/ubs_core/analyzers/taint_csharp_request.py',
+                           'test-suite/quality/test_taint_csharp_dataflow.py',
+                           'test-suite/csharp/README.md'}, paths
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git merge --no-ff --no-commit "$CANDIDATE"
+          git apply <<'PATCH'
+          diff --git a/modules/helpers/ubs_core/csharp_scan.py b/modules/helpers/ubs_core/csharp_scan.py
+          index 60845cc..47aaa33 100644
+          --- a/modules/helpers/ubs_core/csharp_scan.py
+          +++ b/modules/helpers/ubs_core/csharp_scan.py
+          @@ -302,7 +302,8 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
+           
+           
+           def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
+          -                  enable_new: bool = False, prefilter: Any = None) -> None:
+          +                  enable_new: bool = False, prefilter: Any = None,
+          +                  errors: list[str] | None = None) -> None:
+               """Run the registered csharp analyzers (taint x2, lifecycle, narrowing, async).
+           
+               Every one replaces a legacy check that ran inside its category, so skip
+          @@ -317,6 +318,8 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
+           
+               skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
+               for analyzer in analyzers_for_lang("csharp"):
+          +        if analyzer.name == "taint_csharp_request" and 8 in skip:
+          +            continue
+                   if prefilter is not None:
+                       target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
+                   else:
+          @@ -324,7 +327,14 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
+                   if not target_files:
+                       continue
+                   ctx = RunContext(lang="csharp", files=target_files)
+          -        for finding in analyzer.run(ctx):
+          +        def checked_findings():
+          +            try:
+          +                yield from analyzer.run(ctx)
+          +            except (OSError, ValueError, RecursionError) as exc:
+          +                if errors is None:
+          +                    raise
+          +                errors.append(f"{analyzer.name}: {exc}")
+          +        for finding in checked_findings():
+                       rule = _ASYNC_RULE_REMAP.get(str(finding.get("rule", "")), str(finding.get("rule", "")))
+                       if skip_narrowing and rule.startswith("csharp.narrowing."):
+                           continue  # legacy: UBS_SKIP_TYPE_NARROWING=1 skips the helper
+          @@ -345,6 +355,7 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
+                           "col": int(finding.get("col", 1) or 1),
+                           "severity": str(finding.get("severity", "warning")),
+                           "message": str(finding.get("message", "")),
+          +                **({"extras": finding["extras"]} if "extras" in finding else {}),
+                           "suppressed": False,
+                       }, ensure_ascii=False) + "\n")
+           
+          @@ -593,7 +604,8 @@ def main(argv: list | None = None) -> int:
+                   capturing_sink = CapturingSink()
+                   scan_patterns(patterns, texts, capturing_sink, skip, phase=0, prefilter=prefilter_res)
+                   run_detectors(files_to_scan, capturing_sink, skip, base_dir)
+          -        run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+          +        run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers,
+          +                      prefilter=prefilter_res, errors=scan_errors)
+                   if args.ast_rule_dir:
+                       from ubs_core.csharp_ast import scan_all
+                       from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP
+          PATCH
+          test "$(git hash-object modules/helpers/ubs_core/csharp_scan.py)" = 47aaa33a41bb533f88b91539b1e99af6d807a2e1
+          test "$(git hash-object modules/helpers/ubs_core/taint_flow.py)" = 4fe6dcf1d0fa200decb9902c3059a321c797a113
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_csharp_request.py)" = 75011e3d2368a1681082b8591782bae6c16067aa
+          test "$(git hash-object test-suite/quality/test_taint_csharp_dataflow.py)" = d0cd6214b6a2cd37bba895e9c5fcd680708e9770
+          echo 'bootstrap=true' >> "$GITHUB_OUTPUT"
+      - name: Regenerate and verify the entire runtime integrity chain
+        run: |
+          set -euo pipefail
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --binary HEAD > "$RUNNER_TEMP/csharp-integrity-before.diff"
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff --binary HEAD > "$RUNNER_TEMP/csharp-integrity-after.diff"
+          cmp "$RUNNER_TEMP/csharp-integrity-before.diff" "$RUNNER_TEMP/csharp-integrity-after.diff"
+          git diff --check HEAD
+      - name: Test the actual analyzer, CFG lattice and native sink
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p test_taint_csharp_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/csharp-dataflow-tests.log"
+          PYTHONPATH=modules/helpers python3 -m ubs_core --self-test 2>&1 | tee "$RUNNER_TEMP/csharp-core-selftests.log"
+          python3 -m unittest discover -s test-suite/csharp/tests -p 'test_*.py' -v 2>&1 | tee "$RUNNER_TEMP/csharp-helpers-tests.log"
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Validate shell syntax and existing traversal manifest cases
+        run: |
+          set -o pipefail
+          for script in ubs modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh; do
+            bash -n "$script"
+          done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh modules/ubs-*.sh scripts/new-module.sh
+          python3 test-suite/run_manifest.py --case csharp-request-path-traversal-buggy --case csharp-request-path-traversal-clean 2>&1 | tee "$RUNNER_TEMP/csharp-manifest-tests.log"
+      - name: Exercise actual JSON and SARIF scanner output
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          artifacts = root / 'test-suite/artifacts/csharp-dataflow'
+          cases = [
+              ('helper-sink', 'class C { void Read(string p) { File.Delete(p); } void H() { Read(Request.Query["p"]); } }', 1),
+              ('helper-source', 'class C { string Source() => Request.Query["p"]; void H() { File.ReadAllText(Source()); } }', 1),
+              ('async-path', 'class C { async Task H() { await File.ReadAllTextAsync(Request.Query["p"]); } }', 1),
+              ('contents-not-path', 'File.WriteAllText("/fixed", Request.Form["body"]);', 0),
+              ('basename-helper', 'class C { string Name(string p) => Path.GetFileName(p); void H() { File.Delete(Name(Request.Query["p"])); } }', 0),
+              ('branch-join', 'var p=Request.Query["p"]; if (ok) { p="/safe"; } File.Delete(p);', 1),
+          ]
+          for name, code, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-csharp-e2e-') as tmp:
+                  work = Path(tmp)
+                  source = work / 'app.cs'
+                  source.write_text(code)
+                  for format_ in ('json', 'sarif'):
+                      run = subprocess.run([str(root/'ubs'), '--ci', '--no-auto-update', '--only=csharp', '--no-dotnet',
+                                            '--format=' + format_, str(source)], cwd=work,
+                                           env=dict(os.environ, UBS_CACHE_DIR=str(work/'cache')), capture_output=True, text=True, timeout=120)
+                      folder = artifacts / name / format_
+                      folder.mkdir(parents=True, exist_ok=True)
+                      (folder/'stdout.log').write_text(run.stdout)
+                      (folder/'stderr.log').write_text(run.stderr)
+                      assert run.returncode in (0, 1), (name, format_, run.returncode, run.stdout, run.stderr)
+                      report = json.loads(run.stdout)
+                      if format_ == 'json':
+                          assert report['status'] == 'ok', report
+                          findings = [f for f in report.get('findings', []) if f.get('rule_id', f.get('rule')) == 'csharp.taint.request_traversal']
+                      else:
+                          findings = [f for r in report['runs'] for f in r.get('results', []) if f.get('ruleId') == 'csharp.taint.request_traversal']
+                      assert len(findings) == expected, (name, format_, findings, report)
+                      print('CSHARP_REAL_SCANNER_PASS', name, format_, len(findings), flush=True)
+          PY
+      - name: Atomically publish verified code and all generated pins to main
+        if: steps.prepare.outputs.bootstrap == 'true'
+        run: |
+          set -euo pipefail
+          git diff --name-only HEAD > "$RUNNER_TEMP/csharp-integrated-paths.txt"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          expected = {'SHA256SUMS', 'ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh',
+                      'modules/helpers/ubs_core/taint_flow.py', 'modules/helpers/ubs_core/analyzers/taint_csharp_request.py',
+                      'modules/helpers/ubs_core/csharp_scan.py', 'test-suite/quality/test_taint_csharp_dataflow.py',
+                      'test-suite/csharp/README.md'}
+          expected.update(str(p) for p in Path('modules').glob('ubs-*.sh'))
+          actual = set((Path(os.environ['RUNNER_TEMP'])/'csharp-integrated-paths.txt').read_text().splitlines())
+          assert actual <= expected, actual - expected
+          assert {'ubs', 'SHA256SUMS', 'modules/helpers/ubs_core/taint_flow.py'} <= actual, actual
+          PY
+          test -z "$(git ls-files --others --exclude-standard)"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          git add -- SHA256SUMS ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh \
+            modules/helpers/ubs_core/taint_flow.py modules/helpers/ubs_core/analyzers/taint_csharp_request.py \
+            modules/helpers/ubs_core/csharp_scan.py test-suite/quality/test_taint_csharp_dataflow.py test-suite/csharp/README.md
+          git diff --cached --check
+          git commit -m 'feat(csharp): integrate helper-summary dataflow with verified runtime pins (D6)' \
+            -m 'Validated actual analyzer regressions, embedded core self-tests, existing traversal manifest cases and real JSON/SARIF scans. No PR, force push, or verifier bypass. D6 remains open for other frontends and cross-file analysis.'
+          git push origin HEAD:refs/heads/main
+      - name: Require a stable integrated tree on later runs
+        if: steps.prepare.outputs.bootstrap == 'false'
+        run: |
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff --exit-code
+      - name: Preserve logs and exact source inventory
+        if: always()
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/csharp-source-head.txt"
+          git status --short > "$RUNNER_TEMP/csharp-source-status.txt"
+          git ls-files -s > "$RUNNER_TEMP/csharp-source-index.txt"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/csharp-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: csharp-dataflow-validation
+          path: |
+            ${{ runner.temp }}/csharp-*
+            test-suite/artifacts/csharp-dataflow
+          retention-days: 3

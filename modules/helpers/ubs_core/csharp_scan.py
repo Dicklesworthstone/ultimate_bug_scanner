@@ -302,7 +302,8 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
 
 
 def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
-                  enable_new: bool = False, prefilter: Any = None) -> None:
+                  enable_new: bool = False, prefilter: Any = None,
+                  errors: list[str] | None = None) -> None:
     """Run the registered csharp analyzers (taint x2, lifecycle, narrowing, async).
 
     Every one replaces a legacy check that ran inside its category, so skip
@@ -317,6 +318,8 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
 
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
+        if analyzer.name == "taint_csharp_request" and 8 in skip:
+            continue
         if prefilter is not None:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:
@@ -324,7 +327,14 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
         if not target_files:
             continue
         ctx = RunContext(lang="csharp", files=target_files)
-        for finding in analyzer.run(ctx):
+        def checked_findings():
+            try:
+                yield from analyzer.run(ctx)
+            except (OSError, ValueError, RecursionError) as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{analyzer.name}: {exc}")
+        for finding in checked_findings():
             rule = _ASYNC_RULE_REMAP.get(str(finding.get("rule", "")), str(finding.get("rule", "")))
             if skip_narrowing and rule.startswith("csharp.narrowing."):
                 continue  # legacy: UBS_SKIP_TYPE_NARROWING=1 skips the helper
@@ -345,6 +355,7 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
                 "col": int(finding.get("col", 1) or 1),
                 "severity": str(finding.get("severity", "warning")),
                 "message": str(finding.get("message", "")),
+                **({"extras": finding["extras"]} if "extras" in finding else {}),
                 "suppressed": False,
             }, ensure_ascii=False) + "\n")
 
@@ -593,7 +604,8 @@ def main(argv: list | None = None) -> int:
         capturing_sink = CapturingSink()
         scan_patterns(patterns, texts, capturing_sink, skip, phase=0, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip, base_dir)
-        run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_analyzers(files_to_scan, capturing_sink, skip, base_dir, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.csharp_ast import scan_all
             from ubs_core.csharp_rules import CATEGORY_MAP, SEVERITY_MAP

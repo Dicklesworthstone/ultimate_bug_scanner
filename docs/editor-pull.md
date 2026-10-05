@@ -67,10 +67,32 @@ Pull requests and their completion never trigger refresh themselves, avoiding a
 refresh/scan feedback loop. Without refresh support, configure the client to
 pull after saves and dependency changes, or invoke a fresh diagnostic pull.
 
+## Slow editors and bounded delivery
+
+Completed replies wait for space in the existing 16-MiB stdio output queue,
+reserving 4 MiB for cancellation, errors and lifecycle messages. Concurrent
+subscribers share one diagnostic array per completed document instead of
+retaining one array per request. Retained arrays have a separate 16-MiB budget
+measured by serialized payload size; this is not a limit on total process RSS.
+An exhausted payload budget produces an explicit error, never truncated success.
+
+Deferred replies remain cancellable and count toward request admission and
+absolute deadlines. Before moving them into the wire queue, the adapter checks
+the selected source identities again. Grouped reports validate all selected
+inputs before delivering any member; buffer reports also recheck their workspace
+context. Changed inputs invalidate the deferred group instead of releasing an
+obsolete clean result after the editor resumes reading. Checks are input
+observations, not a filesystem freeze after bytes enter the output queue.
+
+A later pull does not cancel an earlier completed response merely because it
+has not yet been delivered. It still starts fresh analysis rather than borrowing
+that old response. These guarantees apply to diagnostic result delivery; the
+existing global output limit remains the final guard against unbounded traffic.
+
 ## Verification
 
 ```bash
-python3 -m unittest discover -s test-suite/quality -p test_lsp_pull.py -v
+python3 -m unittest discover -s test-suite/quality -p 'test_lsp_pull*.py' -v
 ```
 
 The regression suite exercises the actual adapter and its stdio framing with

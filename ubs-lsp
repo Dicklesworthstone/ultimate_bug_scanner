@@ -33,6 +33,8 @@ MAX_DOCUMENTS = 64
 MAX_OUTPUT = 8 * 1024 * 1024
 MAX_DIAGNOSTICS = 2000
 MAX_DIAGNOSTIC_REQUESTS = 64
+MAX_DIAGNOSTIC_REPLY_BYTES = 16 * 1024 * 1024
+DIAGNOSTIC_CONTROL_RESERVE = MAX_MESSAGE // 2
 
 
 class ProtocolError(ValueError):
@@ -1010,8 +1012,9 @@ def scan_buffers(scanner, root, documents, root_id, timeout, cancel, policy=(), 
 
 class Server:
     def __init__(self, root, scanner, send, *, jobs=2, timeout=120, policy=(), buffer_mode=False,
-                 incremental_workspace=False):
+                 incremental_workspace=False, output_available=None):
         self.root, self.scanner, self.send = root, scanner, send
+        self.output_available = output_available or (lambda: 2 * MAX_MESSAGE)
         info = root.stat()
         self.root_id = (info.st_dev, info.st_ino)
         self.jobs, self.timeout = jobs, timeout
@@ -1037,14 +1040,23 @@ class Server:
         self.pull_mode = False
         self.pull_session = os.urandom(16)
         self.pulls = OrderedDict()
+        self.pull_reply_bytes = 0
         self.client_ready = False
         self.refresh_supported = False
         self.refresh_dirty = False
         self.refresh_pending = False
         self.refresh_deadline = 0
 
+    def drop_pull(self, request_id):
+        request = self.pulls.pop(request_id, None)
+        group = request.get('reply_group') if request is not None else None
+        if group is not None:
+            group['refs'] -= 1
+            if not group['refs']:
+                self.pull_reply_bytes -= group['bytes']
+
     def pull_error(self, request_id, code, message, *, retrigger=None):
-        self.pulls.pop(request_id, None)
+        self.drop_pull(request_id)
         error = {'code': code, 'message': message}
         if retrigger is not None:
             error['data'] = {'retriggerRequest': retrigger}
@@ -1091,30 +1103,74 @@ class Server:
             # A result id saves transport bytes, not analysis. Re-run the real
             # scanner instead of blessing old diagnostics after unobserved disk,
             # policy or dependency changes. Concurrent pulls share this scan.
-            self.queue(uri)
+            self.queue(uri, invalidate=False)
         self.pulls[request_id] = {'uri': uri, 'generation': self.documents[uri]['generation'],
                                   'previous': previous, 'deadline': time.monotonic() + self.timeout + 1}
 
-    def finish_pulls(self, uri, diagnostics):
+    def finish_pulls(self, uri, diagnostics, guard=None):
         selected = [(request_id, request) for request_id, request in self.pulls.items()
-                    if request['uri'] == uri and request['generation'] == self.documents[uri]['generation']]
+                    if request['uri'] == uri and 'reply' not in request
+                    and request['generation'] == self.documents[uri]['generation']]
         if not selected:
             return
         doc = self.documents[uri]
+        encoded = json.dumps(diagnostics, ensure_ascii=True, sort_keys=True)
         digest = hashlib.sha256(self.pull_session)
         # Scope opaque ids to this session, URI, exact editor version/content
         # and complete displayed result. Reopening or editing cannot revive an
         # earlier version's empty report merely because its diagnostics match.
         for value in (uri, str(doc.get('sync_version', doc['version'])),
-                      doc.get('wire_text', doc['text']), json.dumps(diagnostics, ensure_ascii=True, sort_keys=True)):
-            digest.update(value.encode('utf-8'))
-            digest.update(b'\0')
+                      doc.get('wire_text', doc['text']), encoded):
+            raw = value.encode('utf-8')
+            digest.update(len(raw).to_bytes(8, 'big'))
+            digest.update(raw)
         result_id = digest.hexdigest()
+        full_count = sum(request['previous'] != result_id for _, request in selected)
+        # One diagnostic array per completed document, not one copy per reader.
+        # The byte budget is serialized payload size, not a process RSS claim.
+        size = len(encoded)
+        if full_count and self.pull_reply_bytes + size > MAX_DIAGNOSTIC_REPLY_BYTES:
+            for request_id, _ in selected:
+                self.pull_error(request_id, -32802, 'Diagnostic reply memory limit exceeded', retrigger=False)
+            return
+        group = {'bytes': size, 'refs': full_count} if full_count else None
+        if full_count:
+            self.pull_reply_bytes += size
         for request_id, request in selected:
             result = {'kind': 'unchanged', 'resultId': result_id} if request['previous'] == result_id else {
                 'kind': 'full', 'resultId': result_id, 'items': diagnostics}
-            self.pulls.pop(request_id)
+            request['reply'] = result
+            request['guard'] = guard
+            request['reply_group'] = group if result['kind'] == 'full' else None
+            # Includes worst-case JSON escaping of a 256-character request id,
+            # envelope fields and Content-Length. Avoid serializing a blocked
+            # multi-MiB reply over and over on every event-loop iteration.
+            request['wire_bound'] = (size if result['kind'] == 'full' else 0) + 4096
+
+    def drain_pulls(self):
+        verified = set()
+        for request_id, request in list(self.pulls.items()):
+            if request_id not in self.pulls or 'reply' not in request:
+                continue
+            if request['wire_bound'] > self.output_available() - DIAGNOSTIC_CONTROL_RESERVE:
+                break
+            guard = request['guard']
+            if guard is not None and guard not in verified:
+                try:
+                    guard()
+                except (OSError, ValueError) as exc:
+                    # Every member of a grouped scan shares its input guard.
+                    # Validate the whole group before delivering any member,
+                    # including after a slow editor delayed the first reply.
+                    for other_id, other in list(self.pulls.items()):
+                        if other.get('guard') is guard:
+                            self.pull_error(other_id, -32802,
+                                            ('Diagnostic inputs changed before delivery: ' + str(exc))[:8192], retrigger=False)
+                    continue
+                verified.add(guard)
+            result = request['reply']
             self.send({'jsonrpc': '2.0', 'id': request_id, 'result': result})
+            self.drop_pull(request_id)
 
     def refresh_diagnostics(self):
         # Only input/lifecycle notifications request refresh, never a pull or
@@ -1157,18 +1213,20 @@ class Server:
         if uri in self.documents:
             self.documents[uri]['generation'] = self.generation
 
-    def queue(self, uri):
+    def queue(self, uri, *, invalidate=True):
         if self.buffer_mode:
-            self.queue_documents()
+            self.queue_documents(invalidate=invalidate)
             return
-        self.invalidate(uri)
+        if invalidate:
+            self.invalidate(uri)
         self.pending[uri] = self.documents[uri]['generation']
         self.publish(uri, [note('ubs.pending', 'UBS verification pending for this saved document.', 3)])
 
-    def queue_documents(self):
-        self.cancel_batch()
-        for uri in self.documents:
-            self.invalidate(uri)
+    def queue_documents(self, *, invalidate=True):
+        if invalidate:
+            self.cancel_batch()
+            for uri in self.documents:
+                self.invalidate(uri)
         self.pending.clear()
         self.batch_pending = {uri: dict(doc) for uri, doc in self.documents.items()} or None
         self.batch_due = time.monotonic() + 0.15
@@ -1195,9 +1253,24 @@ class Server:
                     raise ProtocolError('Selected source changed before diagnostics could be published')
         except Exception as exc:
             result = {uri: ([note('ubs.unverified', 'UBS could not verify this document: ' + str(exc))], None) for uri in documents}
+        # Retain source guards, not the entire multi-document findings ledger.
+        # Deferred replies do not keep unrelated diagnostic arrays alive.
+        identities = {uri: result[uri][1] for uri in documents}
+        def guard():
+            verified = set()
+            for uri, doc in documents.items():
+                if uri not in self.documents or self.documents[uri]['generation'] != doc['generation']:
+                    raise ProtocolError('Selected document generation changed')
+                identity = identities[uri]
+                if isinstance(identity, BufferWorkspace):
+                    if identity not in verified:
+                        identity.verify()
+                        verified.add(identity)
+                elif identity is not None and read_source(self.root, doc['path'], self.root_id) != (doc['text'], identity):
+                    raise ProtocolError('Selected source changed while the editor was not reading')
         for uri in documents:
             self.publish(uri, result[uri][0])
-            self.finish_pulls(uri, result[uri][0])
+            self.finish_pulls(uri, result[uri][0], guard)
         return True
 
     def tick(self):
@@ -1247,6 +1320,7 @@ class Server:
             cancel = threading.Event()
             future = self.pool.submit(scan, self.scanner, self.root, {uri: dict(doc)}, self.root_id, self.timeout, cancel, self.policy)
             self.active[future] = (uri, generation, cancel)
+        self.drain_pulls()
 
     def handle(self, message):
         if (isinstance(message, dict) and message.get('jsonrpc') == '2.0' and 'method' not in message
@@ -1317,6 +1391,9 @@ class Server:
                 if is_request:
                     self.send({'jsonrpc': '2.0', 'id': request_id, 'error': {
                         'code': -32002 if not self.initialized else -32600, 'message': 'Server is not running'}})
+                return
+            if is_request and request_id in self.pulls and method != 'textDocument/diagnostic':
+                self.pull_error(request_id, -32600, 'Duplicate outstanding diagnostic request id')
                 return
             if method == 'shutdown' and is_request:
                 self.shutdown = True
@@ -1454,6 +1531,7 @@ class Server:
     def close(self):
         # EOF needs no replies, but must release every retained subscriber.
         self.pulls.clear()
+        self.pull_reply_bytes = 0
         self.cancel_batch(announce=False)
         self.pending.clear()
         for _, _, cancel in self.active.values():
@@ -1491,7 +1569,8 @@ def main(argv=None):
         output_bytes += len(data)
     policy = (('--profile=' + args.profile,) if args.profile else ()) + (('--fail-on-warning',) if args.fail_on_warning else ())
     server = Server(root, scanner, send, jobs=args.jobs, timeout=args.scan_timeout, policy=policy,
-                    buffer_mode=args.buffer_mode != 'saved', incremental_workspace=args.buffer_mode == 'incremental')
+                    buffer_mode=args.buffer_mode != 'saved', incremental_workspace=args.buffer_mode == 'incremental',
+                    output_available=lambda: 2 * MAX_MESSAGE - output_bytes)
     framer = Framer()
     incoming, output = sys.stdin.fileno(), sys.stdout.fileno()
     old_in, old_out = os.get_blocking(incoming), os.get_blocking(output)

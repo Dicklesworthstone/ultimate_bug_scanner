@@ -131,9 +131,12 @@ class Pattern:
     # Match against executable code only: comments, string and template text
     # and regex literals are blanked (``${...}`` bodies stay visible), so an
     # operator rule cannot fire on `'pkg==1.0'` or `// a == b` (GH #157).
-    # scan_patterns skips the masker for files whose raw text has no match,
-    # which assumes blanking never creates one: the regex must not require
-    # whitespace that a blanked delimiter could supply.
+    # scan_patterns skips the masker for files whose raw text has no match.
+    # That is exact unless blanking creates a match, which needs a regex that
+    # accepts whitespace where a comment sat: `x == /* c */ 0.5` against
+    # `==\s*[0-9]` matches only once the comment is blank. When that is the
+    # file's only candidate the file is skipped and the match is missed, as
+    # it was before code_only; any other raw match brings the code view in.
     code_only: bool = False
 
 

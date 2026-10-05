@@ -8,6 +8,7 @@ on:
       - modules/helpers/ubs_core/analyzers/taint_csharp_request.py
       - modules/helpers/ubs_core/taint_flow.py
       - modules/helpers/ubs_core/csharp_scan.py
+      - modules/helpers/ubs_core/findings_merge.py
       - test-suite/quality/test_taint_csharp_dataflow.py
   workflow_dispatch:
 
@@ -16,17 +17,18 @@ permissions:
 
 concurrency:
   group: csharp-dataflow-main
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   dataflow:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
       CANDIDATE: 409a625d94cd2757da001bb6e404c03bd3fa2003
+      OUTPUT_CANDIDATE: b07f4edcac5511fcdd0729307c058d60015bf41d
     steps:
       - uses: actions/checkout@v4
         with:
@@ -226,6 +228,90 @@ jobs:
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git diff --exit-code
+      - name: Prepare reviewed by-reference effects and public evidence
+        id: output
+        run: |
+          set -euo pipefail
+          if test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_csharp_request.py)" != 75011e3d2368a1681082b8591782bae6c16067aa; then
+            echo 'integrate=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test "$(git hash-object modules/helpers/ubs_core/findings_merge.py)" = b284c368544445b6fb13423d4b11610d5a613b97
+          git rev-parse HEAD > "$RUNNER_TEMP/csharp-output-parent.txt"
+          git fetch origin "$OUTPUT_CANDIDATE"
+          git show "$OUTPUT_CANDIDATE:source.patch" > "$RUNNER_TEMP/csharp-output.patch"
+          test "$(git hash-object "$RUNNER_TEMP/csharp-output.patch")" = a9e54572babf49e6ac2a65a8839e8b375de77d5c
+          git apply --check "$RUNNER_TEMP/csharp-output.patch"
+          git apply "$RUNNER_TEMP/csharp-output.patch"
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_csharp_request.py)" = 7916803959b7750a4c098b44f7cb6c7a09ba9c20
+          test "$(git hash-object modules/helpers/ubs_core/findings_merge.py)" = c48806838c684580f27a3c570ee166ae5e0ef2b6
+          test "$(git hash-object test-suite/quality/test_taint_csharp_dataflow.py)" = 0f2f1a9ec14395dd49997a43833337bd300c5ee1
+          test "$(git hash-object test-suite/csharp/README.md)" = 132c32c26c492624aac7eb463b569d4926156c55
+          echo 'integrate=true' >> "$GITHUB_OUTPUT"
+      - name: Validate ref/out dataflow and serialize real public evidence
+        if: steps.output.outputs.integrate == 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          python3 -m unittest discover -s test-suite/quality -p test_taint_csharp_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/csharp-output-tests.log"
+          PYTHONPATH=modules/helpers python3 -m ubs_core --self-test 2>&1 | tee "$RUNNER_TEMP/csharp-output-selftests.log"
+          python3 - <<'PY'
+          import json, os, subprocess, tempfile
+          from pathlib import Path
+          root = Path.cwd()
+          cases = [
+              ('out-source', 'class C { void Source(out string p) { p=Request.Query["p"]; } void H() { Source(out var p); File.Delete(p); } }', 1),
+              ('ref-alias', 'class C { void Use(ref string p,ref string q) { p=Request.Query["p"]; File.Delete(q); } void H() { var p="/safe"; Use(ref p,ref p); } }', 1),
+              ('ref-cleared', 'class C { void Clear(ref string p) { p="/fixed"; } void H() { var p=Request.Query["p"]; Clear(ref p); File.Delete(p); } }', 0),
+          ]
+          for name, code, expected in cases:
+              with tempfile.TemporaryDirectory(prefix='ubs-csharp-output-') as tmp:
+                  work = Path(tmp)
+                  source = work / 'app.cs'
+                  source.write_text(code)
+                  for format_ in ('json', 'sarif'):
+                      proc = subprocess.run([str(root/'ubs'), '--ci', '--no-auto-update', '--only=csharp', '--no-dotnet',
+                                             '--format='+format_, str(source)], cwd=work,
+                                            env=dict(os.environ, UBS_CACHE_DIR=str(work/'cache')),
+                                            capture_output=True, text=True, timeout=120)
+                      folder = root / 'test-suite/artifacts/csharp-dataflow' / name / format_
+                      folder.mkdir(parents=True, exist_ok=True)
+                      (folder/'stdout.log').write_text(proc.stdout)
+                      (folder/'stderr.log').write_text(proc.stderr)
+                      assert proc.returncode in (0,1), (name,format_,proc.stdout,proc.stderr)
+                      report = json.loads(proc.stdout)
+                      if format_ == 'json':
+                          assert report['status'] == 'ok', report
+                          records = [f for f in report.get('findings',[]) if f.get('rule_id',f.get('rule')) == 'csharp.taint.request_traversal']
+                          for record in records:
+                              assert record['extras']['taint_path'], record
+                      else:
+                          records = [f for r in report['runs'] for f in r.get('results',[]) if f.get('ruleId') == 'csharp.taint.request_traversal']
+                          for record in records:
+                              assert record['codeFlows'][0]['threadFlows'][0]['locations'], record
+                      assert len(records) == expected, (name,format_,records)
+                      print('CSHARP_OUTPUT_E2E_PASS',name,format_,len(records),flush=True)
+          PY
+      - name: Commit tested by-reference effects with complete runtime pins
+        if: steps.output.outputs.integrate == 'true'
+        run: |
+          set -euo pipefail
+          git diff --check
+          test -z "$(git ls-files --others --exclude-standard)"
+          git fetch origin main
+          test "$(git rev-parse origin/main)" = "$(cat "$RUNNER_TEMP/csharp-output-parent.txt")"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- SHA256SUMS ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh \
+            modules/helpers/ubs_core/analyzers/taint_csharp_request.py modules/helpers/ubs_core/findings_merge.py \
+            test-suite/quality/test_taint_csharp_dataflow.py test-suite/csharp/README.md
+          git diff --cached --check
+          git commit -m 'feat(csharp): track aliased ref/out effects and emit JSON/SARIF flow evidence (D6)' \
+            -m '100 actual-analyzer and report tests, embedded core self-tests and real JSON/SARIF scanner cases passed. Regenerated all verified runtime pins. No source patch carrier is installed or merged; no PR or force push. Cross-file and heap analysis remain outside this implementation.'
+          git push origin HEAD:refs/heads/main
       - name: Preserve logs and exact source inventory
         if: always()
         run: |

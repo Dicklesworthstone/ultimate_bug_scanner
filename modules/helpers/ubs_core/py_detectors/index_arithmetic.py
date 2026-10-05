@@ -40,6 +40,10 @@ when any of these hold:
    its predecessor is in the valid Python index range ``[-1, n - 1]``.
    Empty sequences, shadowed bisect functions, optional bounds and aliases
    are deliberately outside this proof.
+6. **A private list collects bounded enumerate indices.** A fresh list whose
+   only writes append the unchanged index from a one-based enumerate loop
+   retains that lower bound when iterated later. Rebinding, escaping the list,
+   shadowing enumerate or changing the index invalidates the proof.
 
 A negative index is not an IndexError in Python (``x[-1]`` wraps), but it is
 still a logic bug, so an unguarded ``x[i - 1]`` under a plain
@@ -289,6 +293,8 @@ def _guarded(
         elif isinstance(parent, (ast.For, ast.AsyncFor)):
             if _loop_guards(parent.target, parent.iter, name, want_upper, offset):
                 return True
+            if _collected_enumerate_guarded(parent, name, want_upper, offset, parents):
+                return True
         elif isinstance(parent, ast.Try):
             if any(stmt is child for stmt in parent.body) and _handles_index_error(parent):
                 return True
@@ -418,6 +424,89 @@ def _enclosing_function(node: ast.AST, parents):
             return parent
         parent = parents.get(parent)
     return None
+
+
+def _collected_enumerate_guarded(loop, name, want_upper, offset, parents) -> bool:
+    """A private list can retain a proved lower bound across two loops."""
+    if (want_upper or not isinstance(loop, ast.For)
+            or not isinstance(loop.target, ast.Name) or loop.target.id != name
+            or not isinstance(loop.iter, ast.Name)):
+        return False
+    scope = _enclosing_function(loop, parents)
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    root = scope
+    while root in parents:
+        root = parents[root]
+    for candidate in ast.walk(root):
+        if (_string_binding(candidate, 'enumerate')
+                or isinstance(candidate, ast.Name) and candidate.id == 'enumerate'
+                and isinstance(candidate.ctx, (ast.Store, ast.Del))):
+            return False
+    for candidate in ast.walk(scope):
+        if (isinstance(candidate, (ast.Global, ast.Nonlocal))
+                or isinstance(candidate, ast.Call) and isinstance(candidate.func, ast.Name)
+                and candidate.func.id in {'exec', 'eval', 'globals', 'locals', 'vars'}):
+            return False
+    for candidate in ast.walk(loop):
+        if (isinstance(candidate, ast.Name) and candidate.id == name
+                and isinstance(candidate.ctx, (ast.Store, ast.Del)) and candidate is not loop.target):
+            return False
+        if _string_binding(candidate, name):
+            return False
+    sequence = loop.iter.id
+    initializers, appends = [], 0
+    for candidate in ast.walk(scope):
+        if _string_binding(candidate, sequence):
+            return False
+        if not isinstance(candidate, ast.Name) or candidate.id != sequence:
+            continue
+        if _enclosing_function(candidate, parents) is not scope:
+            return False
+        parent = parents.get(candidate)
+        if isinstance(candidate.ctx, ast.Store):
+            if isinstance(parent, ast.Assign) and len(parent.targets) == 1 and parent.targets[0] is candidate:
+                initializers.append(parent.value)
+            elif isinstance(parent, ast.AnnAssign) and parent.target is candidate:
+                initializers.append(parent.value)
+            else:
+                return False
+        elif isinstance(candidate.ctx, ast.Load):
+            if isinstance(parent, ast.For) and parent.iter is candidate:
+                continue
+            if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+                continue
+            if isinstance(parent, (ast.If, ast.While)) and parent.test is candidate:
+                continue
+            call = parents.get(parent)
+            if not (isinstance(parent, ast.Attribute) and parent.attr == 'append'
+                    and isinstance(call, ast.Call) and call.func is parent
+                    and len(call.args) == 1 and not call.keywords
+                    and isinstance(call.args[0], ast.Name)):
+                return False
+            index = call.args[0].id
+            collector = parents.get(call)
+            while collector is not None and not isinstance(collector, (ast.For, ast.FunctionDef, ast.AsyncFunctionDef)):
+                collector = parents.get(collector)
+            if not (isinstance(collector, ast.For) and isinstance(collector.target, (ast.Tuple, ast.List))
+                    and len(collector.target.elts) == 2
+                    and isinstance(collector.target.elts[0], ast.Name)
+                    and collector.target.elts[0].id == index
+                    and isinstance(collector.iter, ast.Call)
+                    and _enumerate_guards(collector.iter, False, offset)):
+                return False
+            for bound in ast.walk(collector):
+                if (isinstance(bound, ast.Name) and bound.id == index
+                        and isinstance(bound.ctx, (ast.Store, ast.Del))
+                        and bound is not collector.target.elts[0]):
+                    return False
+                if _string_binding(bound, index):
+                    return False
+            appends += 1
+        else:
+            return False
+    return (appends > 0 and len(initializers) == 1
+            and isinstance(initializers[0], ast.List) and not initializers[0].elts)
 
 
 def _private_nonempty_sequence(name: str, scope, root, parents) -> bool:

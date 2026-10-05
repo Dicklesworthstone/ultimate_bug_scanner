@@ -45,6 +45,7 @@ _PATTERN_CACHE_KIND = "_ubs_python_pattern"
 
 # Files whose text is a Python token stream (so string blanking is valid).
 _PY_SUFFIXES = frozenset({".py", ".pyi"})
+_PY_CODE_SUFFIXES = _PY_SUFFIXES | frozenset({".pyx", ".pxd", ".pxi", ".ipynb"})
 
 _CATEGORY_SLUGS = {
     1: "none", 2: "numeric", 3: "collections", 4: "comparison",
@@ -163,6 +164,78 @@ class Pattern:
     code_only: bool = False
 
 
+def _notebook_code_view(text: str, document: dict) -> str:
+    """Mask non-code notebook content while preserving JSON source offsets."""
+    code_cells = {index for index, cell in enumerate(document.get("cells", []))
+                  if isinstance(cell, dict) and cell.get("cell_type") == "code"}
+    decoder = json.JSONDecoder()
+    pieces: dict[int, list[tuple[int, int, str]]] = {}
+
+    def skip(cursor):
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        return cursor
+
+    def walk(cursor, path=()):
+        cursor = skip(cursor)
+        if text[cursor] == "{":
+            cursor = skip(cursor + 1)
+            while text[cursor] != "}":
+                key, cursor = decoder.raw_decode(text, cursor)
+                cursor = skip(cursor)
+                cursor = walk(cursor + 1, (*path, key))
+                cursor = skip(cursor)
+                if text[cursor] != ",":
+                    break
+                cursor = skip(cursor + 1)
+            return cursor + 1
+        if text[cursor] == "[":
+            cursor, index = skip(cursor + 1), 0
+            while text[cursor] != "]":
+                cursor = skip(walk(cursor, (*path, index)))
+                index += 1
+                if text[cursor] != ",":
+                    break
+                cursor = skip(cursor + 1)
+            return cursor + 1
+        value, end = decoder.raw_decode(text, cursor)
+        if (len(path) in (3, 4) and path[0] == "cells"
+                and path[1] in code_cells and path[2] == "source"
+                and (len(path) == 3 or isinstance(path[3], int)) and isinstance(value, str)):
+            pieces.setdefault(path[1], []).append((cursor, end, value))
+        return end
+
+    walk(0)
+    view = ['\n' if char == '\n' else ' ' for char in text]
+    for parts in pieces.values():
+        source = ''.join(value for _, _, value in parts)
+        code = strip_comments_and_strings(source, lang="python", strip_strings=True,
+                                         strip_comments=True, preserve_comments=False)
+        if len(code) != len(source):
+            raise ValueError("Notebook code mask changed source offsets")
+        source_offset = 0
+        for start, _end, value in parts:
+            cursor = start + 1
+            for index, char in enumerate(value):
+                stop = cursor + 1
+                if text[cursor] == "\\":
+                    if cursor + 1 >= _end - 1:
+                        raise ValueError("Truncated notebook source escape")
+                    escape = text[cursor + 1]
+                    stop = cursor + (6 if escape == "u" else 2)
+                    if (escape == "u" and 0xD800 <= int(text[cursor + 2:stop], 16) <= 0xDBFF
+                            and text[stop:stop + 2] == "\\u"
+                            and 0xDC00 <= int(text[stop + 2:stop + 6], 16) <= 0xDFFF):
+                        stop += 6
+                if code[source_offset + index] == char:
+                    view[cursor:stop] = text[cursor:stop]
+                cursor = stop
+            if cursor != _end - 1:
+                raise ValueError("Notebook source mapping changed JSON offsets")
+            source_offset += len(value)
+    return ''.join(view)
+
+
 def iter_matches(
     pattern: Pattern, text: str, raw_text: str | None = None
 ) -> Iterable[tuple[int, str]]:
@@ -251,16 +324,20 @@ def scan_patterns(
 
     def _scan_text(path: Path, text: str, code_only: bool = False) -> str:
         """Offset-preserving Python view, with optional comment masking."""
-        if path.suffix.lower() not in _PY_SUFFIXES:
+        suffix = path.suffix.lower()
+        if suffix not in (_PY_CODE_SUFFIXES if code_only else _PY_SUFFIXES):
             return text  # notebooks/requirements are not Python token streams
         key = (path, code_only)
         cached = masked.get(key)
         if cached is None:
             try:
-                cached = strip_comments_and_strings(
-                    text, lang="python", strip_strings=True,
-                    strip_comments=True, preserve_comments=not code_only,
-                )
+                if suffix == ".ipynb":
+                    cached = _notebook_code_view(text, json.loads(text))
+                else:
+                    cached = strip_comments_and_strings(
+                        text, lang="python", strip_strings=True,
+                        strip_comments=True, preserve_comments=not code_only,
+                    )
             except Exception:  # a masker failure must not lose the rule
                 cached = text
             if len(cached) != len(text):
@@ -298,7 +375,7 @@ def scan_patterns(
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
-            if pattern.code_only and path.suffix.lower() not in _PY_SUFFIXES:
+            if pattern.code_only and path.suffix.lower() not in _PY_CODE_SUFFIXES:
                 continue
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue

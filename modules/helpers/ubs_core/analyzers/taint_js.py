@@ -706,6 +706,54 @@ def _join_states(*states):
     return result
 
 
+class _ComponentCode:
+    """A masked module over shared component code, using component offsets.
+
+    Function masks only change their own module. Concatenating the unchanged
+    component prefix/suffix into every scope retained one component-sized
+    string per module with children; slices can assemble just the requested
+    range instead.
+    """
+
+    def __init__(self, component, masked, offset):
+        self.component = component
+        self.masked = masked
+        self.offset = offset
+
+    def __len__(self):
+        return len(self.component)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            start, end, step = key.indices(len(self))
+            if step != 1:
+                return ''.join(self[index] for index in range(start, end, step))
+            if start >= end:
+                return ''
+            left = max(start, self.offset)
+            right = min(end, self.offset + len(self.masked))
+            if left >= right:
+                return self.component[start:end]
+            return (self.component[start:left]
+                    + self.masked[left - self.offset:right - self.offset]
+                    + self.component[right:end])
+        index = key + len(self) if key < 0 else key
+        if not 0 <= index < len(self):
+            raise IndexError('component code index out of range')
+        if self.offset <= index < self.offset + len(self.masked):
+            return self.masked[index - self.offset]
+        return self.component[index]
+
+    def find(self, value, start=0, end=None):
+        if start is not None and start > len(self):
+            return -1
+        start, stop, _ = slice(start, end).indices(len(self))
+        if start > stop:
+            return -1
+        found = self[start:stop].find(value)
+        return start + found if found >= 0 else -1
+
+
 @dataclass(eq=False)
 class _Scope:
     start: int
@@ -718,20 +766,20 @@ class _Scope:
     concise: bool = False
     parent: object = None
     children: list = field(default_factory=list)
-    code: str = ''
+    code: str | _ComponentCode = ''
     statements: list = field(default_factory=list)
     parameter_sources: dict = field(default_factory=dict)
     asynchronous: bool = False
     generator: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class _Statement:
     kind: str
     start: int
     end: int
-    body: list = field(default_factory=list)
-    alternate: list = field(default_factory=list)
+    body: list | tuple = ()
+    alternate: list | tuple = ()
     extra: object = None
     catch_names: tuple = ()
     catch_range: tuple | None = None
@@ -1118,14 +1166,14 @@ class _Parser:
         if code[start] == '{' and start in self.pairs:
             closing = self.pairs[start]
             return _Statement('block', start, closing + 1, self.sequence(start + 1, closing)), closing + 1
-        keyword = re.match(r'(if|while|for|do|try|switch|return|throw|break|continue)\b', code[start:])
+        keyword = re.match(r'(if|while|for|do|try|switch|return|throw|break|continue)\b', code[start:end])
         if keyword and keyword.group(1) == 'try':
             body_start = self.skip(start + keyword.end(), end)
             if code[body_start:body_start + 1] == '{':
                 body, after = self.statement(body_start, end)
                 handlers, final, catch_names, catch_range = [], [], (), None
                 lookahead = self.skip(after, end)
-                if re.match(r'catch\b', code[lookahead:]):
+                if re.match(r'catch\b', code[lookahead:end]):
                     handler_start = self.skip(lookahead + 5, end)
                     if code[handler_start:handler_start + 1] == '(' and handler_start in self.pairs:
                         catch_range = (handler_start + 1, self.pairs[handler_start])
@@ -1135,7 +1183,7 @@ class _Parser:
                         handler, after = self.statement(handler_start, end)
                         handlers = [handler]
                     lookahead = self.skip(after, end)
-                if re.match(r'finally\b', code[lookahead:]):
+                if re.match(r'finally\b', code[lookahead:end]):
                     final_start = self.skip(lookahead + 7, end)
                     if code[final_start:final_start + 1] == '{':
                         tail, after = self.statement(final_start, end)
@@ -1146,7 +1194,7 @@ class _Parser:
             if body_start < end:
                 body, after = self.statement(body_start, end)
                 lookahead = self.skip(after, end)
-                if re.match(r'while\b', code[lookahead:]):
+                if re.match(r'while\b', code[lookahead:end]):
                     opening = self.skip(lookahead + 5, end)
                     if code[opening:opening + 1] == '(' and opening in self.pairs:
                         closing = self.pairs[opening]
@@ -1176,7 +1224,7 @@ class _Parser:
                         while cursor < body_end:
                             if code[cursor] in '([{' and cursor in self.pairs:
                                 cursor = self.pairs[cursor] + 1
-                            elif re.match(r'(case|default)\b', code[cursor:]):
+                            elif re.match(r'(case|default)\b', code[cursor:body_end]):
                                 break
                             else:
                                 cursor += 1
@@ -1192,7 +1240,7 @@ class _Parser:
                     body, after = self.statement(body_start, end)
                     alternate = []
                     lookahead = self.skip(after, end)
-                    if keyword.group(1) == 'if' and re.match(r'else\b', code[lookahead:]):
+                    if keyword.group(1) == 'if' and re.match(r'else\b', code[lookahead:end]):
                         other_start = self.skip(lookahead + 4, end)
                         if other_start < end:
                             other, after = self.statement(other_start, end)
@@ -1866,20 +1914,23 @@ class _Flow:
         facts = []
         sole_local_call = False
         call_pattern = re.compile(r'(?<![\w$])(?:new\s+)?([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(')
+        call_code, call_offset = ((code.masked, code.offset) if isinstance(code, _ComponentCode)
+                                  else (code, 0))
         cursor = start
         while cursor < end:
-            match = call_pattern.search(code, cursor, end)
+            match = call_pattern.search(call_code, cursor - call_offset, end - call_offset)
             if match is None:
                 break
-            opening = match.end() - 1
+            match_start, match_end = match.start() + call_offset, match.end() + call_offset
+            opening = match_end - 1
             closing = self.pairs.get(opening)
             if closing is None or closing >= end:
-                cursor = match.end()
+                cursor = match_end
                 continue
-            if cursor < match.start():
-                facts.append(self.operand_snapshot(cursor, match.start(), state))
-                remainder[cursor - start:match.start() - start] = [' '] * (match.start() - cursor)
-                source_remainder[cursor - start:match.start() - start] = [' '] * (match.start() - cursor)
+            if cursor < match_start:
+                facts.append(self.operand_snapshot(cursor, match_start, state))
+                remainder[cursor - start:match_start - start] = [' '] * (match_start - cursor)
+                source_remainder[cursor - start:match_start - start] = [' '] * (match_start - cursor)
             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
                          if code[left:right].strip()]
             # GetValue(callee) precedes ArgumentListEvaluation. An argument can
@@ -1898,8 +1949,8 @@ class _Flow:
                 callee = None
             if isinstance(callee, _Scope):
                 self.engine.import_captures(callee, state, self.rule)
-                deferred = callee.asynchronous and not re.search(r'\bawait\s*$', code[start:match.start()])
-                sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
+                deferred = callee.asynchronous and not re.search(r'\bawait\s*$', code[start:match_start])
+                sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
                 self.engine.dependents[(callee, self.rule)].add(self.scope)
                 throw_count = len(self.throws)
                 try:
@@ -1916,8 +1967,8 @@ class _Flow:
                         self.replace_state(state, merged)
                     call_fact = _join(*(fact for fact, _ in rejected))
                     facts.append(call_fact)
-                    remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
-                    source_remainder[match.start() - start:closing + 1 - start] = [' '] * (closing + 1 - match.start())
+                    remainder[match_start - start:closing + 1 - start] = [' '] * (closing + 1 - match_start)
+                    source_remainder[match_start - start:closing + 1 - start] = [' '] * (closing + 1 - match_start)
                     cursor = closing + 1
                     continue
                 if deferred:
@@ -1925,7 +1976,7 @@ class _Flow:
                 incoming = state.copy()
                 if self.engine.heap_required(callee, bound, incoming):
                     call_fact, effects, normal, thrown, exceptional = self.engine.heap_call(
-                        callee, self.rule, match.start(), bound, state)
+                        callee, self.rule, match_start, bound, state)
                     for (location, label), fact in effects.items():
                         self.effect(location, label, fact)
                     if exceptional is not None:
@@ -1962,24 +2013,24 @@ class _Flow:
                     call_fact = _join(call_fact, self.reference(receiver, state))
                 # Argument facts already retain precise local-call returns.
                 # Only a source in the callee itself introduces new input.
-                candidate = text[match.start():closing + 1]
+                candidate = text[match_start:closing + 1]
                 for pattern, _ in SOURCE_PATTERNS:
                     source_match = pattern.search(candidate)
-                    if source_match and source_match.start() <= opening - match.start():
+                    if source_match and source_match.start() <= opening - match_start:
                         source = source_match.group(0)
                         call_fact = _join(call_fact, frozenset({_Trace(('source', source), (source,))}))
-                sink = self.engine.call_sinks.get(match.start())
+                sink = self.engine.call_sinks.get(match_start)
                 if sink and sink[0] == self.rule and sink_binding == 'imported':
                     selected = argument_facts[:1] if self.rule == 'js.taint.sql' else argument_facts
-                    self.effect(match.start(), sink[1], _join(*selected), state)
+                    self.effect(match_start, sink[1], _join(*selected), state)
                 regex = SANITIZERS_BY_RULE.get(self.rule)
                 following = code[closing + 1:end].lstrip()
                 if regex and regex.match(candidate) and not following.startswith(('.', '[')):
-                    previous = code[:match.start()].rstrip()
+                    previous = code[:match_start].rstrip()
                     if not previous.endswith('.') and binding == 'imported':
                         call_fact = frozenset()
                 if binding == 'imported' and NUMERIC_CONVERSIONS.fullmatch(callee_name):
-                    before = match.start() - 1
+                    before = match_start - 1
                     while before >= 0 and code[before].isspace():
                         before -= 1
                     if before < 0 or code[before] != '.':
@@ -1995,7 +2046,7 @@ class _Flow:
                 call_fact = _materialize(call_fact, state.heap)
                 if mutation is not None:
                     call_fact = mutation
-                    sole_local_call = (code[start:match.start()].strip() in {'', 'await'} and closing + 1 == end)
+                    sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
                 # Unknown code may throw. Record the invocation-time store,
                 # not every unrelated statement prefix in a try block.
                 self.throws.append((_materialize(_join(*argument_facts), state.heap), state.copy()))
@@ -2006,10 +2057,10 @@ class _Flow:
                 call_fact = self.property(call_fact, key, state)
                 if unknown:
                     call_fact = _join(call_fact, selected)
-            sole_local_call = code[start:match.start()].strip() in {'', 'await'} and call_end == end
+            sole_local_call = code[start:match_start].strip() in {'', 'await'} and call_end == end
             facts.append(call_fact)
-            remainder[match.start() - start:call_end - start] = [' '] * (call_end - match.start())
-            source_remainder[match.start() - start:call_end - start] = [' '] * (call_end - match.start())
+            remainder[match_start - start:call_end - start] = [' '] * (call_end - match_start)
+            source_remainder[match_start - start:call_end - start] = [' '] * (call_end - match_start)
             cursor = call_end
         remaining = ''.join(remainder)
         for source, _ in assignment_sources(''.join(source_remainder)):
@@ -2355,8 +2406,8 @@ class _Engine:
                     scope.params = tuple((names, rest, None if default is None else
                                           (default[0] + module.start, default[1] + module.start))
                                          for names, rest, default in scope.params)
-                    scope.code = code if scope.code == module.code else (
-                        code[:module.start] + scope.code + code[module.end:])
+                    scope.code = code if scope.code == module.code else _ComponentCode(
+                        code, scope.code, module.start)
                 module.root = root
                 self.module_roots[root] = module
                 roots.append(root)

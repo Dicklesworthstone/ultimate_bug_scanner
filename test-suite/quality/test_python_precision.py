@@ -495,6 +495,59 @@ class IndexArithmeticGuardTests(unittest.TestCase):
         self.assertGreater(len(hits), index_arithmetic.WARNING_ABOVE)
         self.assertTrue(all(h[0] == "py.collections.index-arithmetic" for h in hits))
 
+    def test_collected_one_based_indices_retain_their_lower_bound(self) -> None:
+        case = "index-collected-enumerate-clean"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        source = """
+            def selected(lines):
+                indices: list[int] = []
+                for index, line in enumerate(lines, 1):
+                    if line.strip():
+                        indices.append(index)
+                if not indices:
+                    return
+                for index in indices:
+                    yield lines[index - 1]
+        """
+        hits = run_detector(index_arithmetic, {"collected.py": source})
+        print(f"[{case}] {'PASS' if not hits else 'FAIL'} ({time.perf_counter() - started:.3f}s)", flush=True)
+        self.assertEqual(hits, [], (source, hits))
+
+    def test_unproved_collected_indices_still_reach_warning_tier(self) -> None:
+        cases = (
+            ("zero-based", "", "enumerate(lines)", "", "index", "", ""),
+            ("value-not-index", "", "enumerate(lines, 1)", "", "line", "", ""),
+            ("rebound-collector", "", "enumerate(lines, 1)", "index = 0", "index", "", ""),
+            ("escaped-list", "", "enumerate(lines, 1)", "", "index", "other = indices; other.append(0)", ""),
+            ("extra-write", "", "enumerate(lines, 1)", "", "index", "indices.append(0)", ""),
+            ("rebound-list", "", "enumerate(lines, 1)", "", "index", "indices = [0]", ""),
+            ("rebound-reader", "", "enumerate(lines, 1)", "", "index", "", "index = 0"),
+            ("shadowed-enumerate", ", enumerate", "enumerate(lines, 1)", "", "index", "", ""),
+        )
+        for label, parameter, iterator, before_append, value, after_collect, before_read in cases:
+            case = f"index-collected-enumerate-{label}"
+            started = time.perf_counter()
+            print(f"[{case}] RUN", flush=True)
+            with self.subTest(case=label):
+                body = [f"def selected(lines{parameter}):", "    indices = []",
+                        f"    for index, line in {iterator}:"]
+                if before_append:
+                    body.append(f"        {before_append}")
+                body.append(f"        indices.append({value})")
+                if after_collect:
+                    body.append(f"    {after_collect}")
+                body.append("    for index in indices:")
+                if before_read:
+                    body.append(f"        {before_read}")
+                body.extend(["        yield lines[index - 1]"] * 13)
+                source = "\n".join(body) + "\n"
+                hits = run_detector(index_arithmetic, {"unproved.py": source})
+                passed = len(hits) == 13 and all(hit[0] == "py.collections.index-arithmetic" for hit in hits)
+                print(f"[{case}] {'PASS' if passed else 'FAIL'} ({time.perf_counter() - started:.3f}s)", flush=True)
+                self.assertEqual(len(hits), 13, (source, hits))
+                self.assertTrue(all(hit[0] == "py.collections.index-arithmetic" for hit in hits), hits)
+
     def test_below_threshold_is_the_info_tier(self) -> None:
         hits = run_detector(index_arithmetic, {"few.py": "def f(x, i):\n    return x[i + 1]\n"})
         self.assertEqual([h[0] for h in hits], ["py.collections.index-arithmetic-info"])
@@ -941,6 +994,43 @@ class FloatEqualityPrecisionTests(unittest.TestCase):
         self.assertTrue(all(record["severity"] == "warning" for record in records))
         self.assertEqual(run_patterns("py.numeric.float-equality", {
             "operators.py": "a == 1.0\nb == 2.0\nc == 3.0\n",
+        }), [])
+
+    def test_cython_operators_remain_visible(self) -> None:
+        for suffix in ("pyx", "pxd", "pxi"):
+            with self.subTest(suffix=suffix):
+                records = run_patterns("py.numeric.float-equality", {
+                    f"operators.{suffix}": "cdef double a\na == 1.0\nb == 2.0\nc == 3.0\nd == 4.0\n"
+                                            "# e == 5.0\ntext = '== 6.0'\n",
+                })
+                self.assertEqual([record["line"] for record in records], [2, 3, 4, 5])
+                self.assertTrue(all(record["severity"] == "warning" for record in records))
+
+    def test_notebook_code_cells_keep_json_locations_and_ignore_prose(self) -> None:
+        notebook = {
+            "metadata": {"notes": "== 9.0"},
+            "cells": [
+                {"cell_type": "markdown", "source": ["a == 1.0\n", "b == 2.0\n"]},
+                {"source": ["# a comment's == 7.0\n", "text = '== 8.0'\n",
+                            "a == 1.0\n", "b == 2.0\n", "c == 3.0\n", "d == 4.0\n"],
+                 "cell_type": "code", "outputs": [{"text": ["== 6.0\n"]}]},
+                {"cell_type": "code", "source": "# a == 1.0\nb == 2.0\n", "outputs": []},
+            ],
+            "nbformat": 4, "nbformat_minor": 5,
+        }
+        for ascii_only in (True, False):
+            with self.subTest(ascii_only=ascii_only):
+                notebook["cells"][1]["source"][2] = "emoji = '😀'; a == 1.0\n"
+                source = json.dumps(notebook, indent=2, ensure_ascii=ascii_only)
+                records = run_patterns("py.numeric.float-equality", {"operators.ipynb": source})
+                self.assertEqual([record["line"] for record in records], [17, 18, 19, 20, 33], (source, records))
+                self.assertEqual(len(records), 5, records)
+                self.assertTrue(all(record["severity"] == "warning" for record in records))
+        clean = {"cells": [{"cell_type": "markdown", "source": ["== 1.0\n"] * 4},
+                           {"cell_type": "code", "source": ["text = '== 1.0'\n"] * 4}],
+                 "metadata": {"notes": "== 1.0"}, "nbformat": 4}
+        self.assertEqual(run_patterns("py.numeric.float-equality", {
+            "clean.ipynb": json.dumps(clean, indent=2),
         }), [])
 
 

@@ -78,7 +78,13 @@ class JestShapedFileCostTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class ProjectMemoryTests(unittest.TestCase):
     def test_400k_line_scan_preserves_findings_below_200_mib(self) -> None:
-        case = "c6-source-memory"
+        self.check_project(connected=False)
+
+    def test_400k_connected_scan_preserves_findings_below_200_mib(self) -> None:
+        self.check_project(connected=True)
+
+    def check_project(self, *, connected: bool) -> None:
+        case = "c6-connected-source-memory" if connected else "c6-source-memory"
         started = time.perf_counter()
         print(f"[{case}] RUN", flush=True)
         artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
@@ -89,9 +95,11 @@ class ProjectMemoryTests(unittest.TestCase):
                 sources = root / "sources"
                 sources.mkdir()
                 for index in range(400):
-                    body = ["export function accumulate(value: number) {",
-                            "  let result = value;"]
-                    body.extend(["  result = result + 1;"] * 992)
+                    body = ([f"import './part_{max(0, index - 1):04d}';"]
+                            if connected else [])
+                    body += ["export function accumulate(value: number) {",
+                             "  let result = value;"]
+                    body.extend(["  result = result + 1;"] * (991 if connected else 992))
                     body += ["  return result;", "}"]
                     if index in (0, 399):
                         body += ["export function handle(req, res) {",

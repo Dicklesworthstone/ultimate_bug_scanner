@@ -10,11 +10,23 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+_No changes yet._
+
+---
+
+## [v5.4.18] - 2026-10-05 [Tag]
+
 ### Fixed
 
-- JavaScript scans release the source graph used for cache invalidation before analysis and detach completed import components' taint scopes. A cold 400,000-line synthetic scan peaked at 149 MiB; its 400 findings matched the original scan. This measurement covers independent modules, not a single large connected import component.
+- JavaScript scans release the source graph used for cache invalidation before analysis and detach completed import components' taint scopes. Masked scopes share component source and statement records use compact storage. Two cold 400,000-line synthetic regressions peaked at 177.7 MiB for connected imports and 56.8 MiB for independent modules; each retained its two planted XSS findings and clean controls. These are maintenance measurements, not a same-invocation comparison with an incumbent.
 - JavaScript text reports count NDJSON findings incrementally and retain only their displayed samples. Reading NDJSON no longer retains the whole serialized file, and Unicode line separators inside a JSON string stay intact.
-- Python float-equality warnings require Python code. Comparisons quoted in comments and dependency constraints no longer count toward the warning threshold; real comparisons keep their original locations and severity.
+- Python float-equality warnings require Python code. Comparisons quoted in comments and dependency constraints no longer count toward the warning threshold; real comparisons keep their original locations and severity. Cython source remains covered, and notebook code cells are distinguished from Markdown, outputs and metadata while retaining JSON source locations.
+- Python index analysis retains the lower bound of unchanged one-based indices collected in a private list. Unknown writes, aliases, rebinding and a shadowed `enumerate` retain their findings; the severity threshold is unchanged.
+
+### Deeper analysis and editor integration
+
+- C# request taint follows local helper summaries and aliased `ref`/`out` effects, with flow evidence in JSON and SARIF. The shared flow helper is pinned in the verified runtime.
+- LSP diagnostics support versioned pull requests and cancellable scan subscribers, with bounded delivery and revalidation before deferred results are published.
 
 ---
 

@@ -12,14 +12,25 @@ permissions:
 
 jobs:
   control-flow:
-    runs-on: ubuntu-slim
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04-arm, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       UBS_NO_AUTO_UPDATE: "1"
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
     steps:
+      - name: Preserve LF source bytes
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -76,7 +87,21 @@ jobs:
               subprocess.run(['bash', 'scripts/verify_sha256sums.sh'], check=True, timeout=120)
               subprocess.run(['git', 'diff', '--check'], check=True)
               snapshots = {entry['path']: Path(entry['path']).read_bytes() for entry in batch['entries']}
-              subprocess.run([sys.executable, 'scripts/update_checksums.py'], check=True, stdout=subprocess.DEVNULL, timeout=120)
+              # The official generator uses native text newline conversion.
+              # Keep Git's LF representation while running it on Windows too.
+              regeneration = """import runpy
+          from pathlib import Path
+          original = Path.write_text
+          def write_lf(self, data, encoding=None, errors=None, newline=None):
+              with self.open('w', encoding=encoding, errors=errors, newline='\\n') as stream:
+                  return stream.write(data)
+          Path.write_text = write_lf
+          try:
+              runpy.run_path('scripts/update_checksums.py', run_name='__main__')
+          finally:
+              Path.write_text = original
+          """
+              subprocess.run([sys.executable, '-c', regeneration], check=True, stdout=subprocess.DEVNULL, timeout=120)
               assert all(Path(name).read_bytes() == content for name, content in snapshots.items()), 'checksum regeneration changed frozen bytes'
               for entry in batch['entries']:
                   content = snapshots[entry['path']]

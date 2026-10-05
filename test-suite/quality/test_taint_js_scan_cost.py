@@ -77,6 +77,47 @@ class JestShapedFileCostTests(unittest.TestCase):
 
 
 class RuleStateTests(unittest.TestCase):
+    def test_block_closures_keep_cells_and_call_time_heap_values(self) -> None:
+        case = "c6-block-closures"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        try:
+            self.check_block_closures()
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def check_block_closures(self) -> None:
+        cases = {
+            "escape-tainted": ("const box = {value: req.query.value};", "", 1),
+            "escape-clean": ("const box = {value: 'safe'};", "", 0),
+            "write-before-call": ("const box = {value: 'safe'};", "box.value = req.query.value;", 1),
+            "clean-before-call": ("const box = {value: req.query.value};", "box.value = 'safe';", 0),
+        }
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "c6-block-closures"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+            target = Path(tmp) / "closures.ts"
+            for name, (binding, update, count) in cases.items():
+                with self.subTest(case=name):
+                    target.write_text(
+                        "let render;\n"
+                        "{\n"
+                        f"  {binding}\n"
+                        "  render = () => res.send(box.value);\n"
+                        f"  {update}\n"
+                        "}\n"
+                        "render();\n",
+                        encoding="utf-8",
+                    )
+                    findings = list(taint_js.run(RunContext(lang="javascript", files=[target])))
+                    self.assertEqual(len(findings), count, findings)
+                    for item in findings:
+                        self.assertEqual((item["rule"], item["line"], item["severity"]),
+                                         ("javascript.taint.xss", 4, "critical"), item)
+                        self.assertIn("req.query.value", item["message"], item)
+
     def test_imported_heap_source_and_sanitizer_keep_rule_specific_findings(self) -> None:
         case = "c6-rule-state"
         started = time.perf_counter()

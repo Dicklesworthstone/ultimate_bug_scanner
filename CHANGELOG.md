@@ -19,6 +19,7 @@ _No changes yet._
 ### Fixed
 
 - JavaScript taint discovers the component's actual sinks before constructing function scopes and capture relationships. Components without supported sinks avoid that work; components with sinks solve only the relevant rules and release each rule's flow state after retaining its concrete findings.
+- JavaScript closure analysis no longer builds an unused legacy table of whole block states. Captured cells and call-time heap effects continue through the current flow representation.
 - JavaScript JSON reports write findings incrementally. Cache reconciliation preserves selection-wide thresholds, gates and suppressors without creating another whole findings collection, and releases cached records before rendering reports.
 
 ---

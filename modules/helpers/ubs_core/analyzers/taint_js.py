@@ -1809,13 +1809,11 @@ class _Flow:
             kind, owner, name = trace.origin if trace.origin[0] != 'source' else ('source', None, None)
             if kind == 'parameter' and owner is callee:
                 incoming = bound.get(name, frozenset())
-            elif kind == 'free' and owner is callee and callee.parent is self.scope:
-                incoming = self.reference(name, state)
             else:
                 incoming = frozenset({trace})
             if incoming:
                 incoming = _step(incoming, self.engine.call_label(callee))
-                if kind in {'parameter', 'free'}:
+                if kind == 'parameter':
                     for name in trace.path[1:]:
                         incoming = _step(incoming, name)
             result = _join(result, incoming)
@@ -2222,11 +2220,6 @@ class _Flow:
                 state[name], state.bindings[name] = frozenset(), None
                 state.owners[name] = self.engine.binding(self.scope, name, node.start + 1)
             result = self.block(node.body, state)
-            for child in self.scope.children:
-                if node.start <= child.start < child.end <= node.end:
-                    captured = result if result is not None else state
-                    key = (child, self.rule)
-                    self.engine.captures[key] = _join_states(self.engine.captures.get(key), captured)
             for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
                 self.restore(exit_state, outer, local)
             for _, exit_state in (*self.returns[return_count:], *self.throws[throw_count:]):
@@ -2440,7 +2433,6 @@ class _Engine:
             self.root, self.functions = _function_scopes(text, code)
             self.scopes = [self.root, *self.functions]
         self.summaries, self.final_states = {}, {}
-        self.captures = {}
         self.dependents = defaultdict(set)
         self.heap_calls = {}
         self.current_task = None
@@ -2963,16 +2955,6 @@ class _Engine:
                     for step in trace.path:
                         resolved = _step(resolved, step)
                     result = _join(result, resolved)
-            elif trace.origin[0] == 'free' and trace.origin not in visited:
-                _, scope, name = trace.origin
-                parent = scope.parent
-                while parent is not None:
-                    state = self.captures.get((scope, rule), self.final_states.get((parent, rule), {}))
-                    if name in state:
-                        captured = _materialize(state[name], getattr(state, 'heap', {}))
-                        result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
-                        break
-                    parent = parent.parent
         return result
 
     def findings(self):
@@ -3014,12 +2996,11 @@ class _Engine:
                     if concrete:
                         key = (location, rule, label)
                         found[key] = _join(found.get(key, frozenset()), concrete)
-            # Every summary, capture and heap-call context belongs to this
+            # Every summary, final state and heap-call context belongs to this
             # rule. Concrete source traces no longer need its flow states;
             # retain only those findings while solving the next rule.
             self.summaries.clear()
             self.final_states.clear()
-            self.captures.clear()
             self.dependents.clear()
             self.heap_calls.clear()
         for (location, rule, label), fact in sorted(found.items()):

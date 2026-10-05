@@ -44,7 +44,7 @@ HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
 if str(HELPERS_DIR) not in sys.path:
     sys.path.insert(0, str(HELPERS_DIR))
 
-from ubs_core.io import parse_ndjson_lines, read_ndjson  # noqa: E402
+from ubs_core.io import iter_ndjson_lines, parse_ndjson_lines, read_ndjson  # noqa: E402
 from ubs_core.py_detectors import division, index_arithmetic, io_open_checks, is_literal  # noqa: E402
 from ubs_core.py_detectors import json_loads  # noqa: E402
 from ubs_core.py_detectors import missing_returns  # noqa: E402
@@ -920,7 +920,45 @@ class AstGrepProbeTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "eof")
 
 
+class FloatEqualityPrecisionTests(unittest.TestCase):
+    def test_comments_strings_and_dependency_constraints_stay_clean(self) -> None:
+        records = run_patterns("py.numeric.float-equality", {
+            "notes.py": "# a == 1.0\n# b == 2.0\n# c == 3.0\n# d == 4.0\n"
+                        "text = 'a == 1.0'\ntext = 'b == 2.0'\n"
+                        "text = 'c == 3.0'\ntext = 'd == 4.0'\n",
+            "uv.lock": 'requires-python = "==3.14.*"\n' * 4,
+            "notes.toml": "# a == 1.0\n# b == 2.0\n# c == 3.0\n# d == 4.0\n",
+        })
+        self.assertEqual(records, [])
+
+    def test_real_operators_keep_threshold_severity_and_locations(self) -> None:
+        records = run_patterns("py.numeric.float-equality", {
+            "operators.py": "a == 1.0  # a comment's apostrophe is not a string\n"
+                            "b == 2.0\nc == 3.0\nd == 4.0\n"
+                            "text = '== 5.0'  # e == 6.0\n",
+        })
+        self.assertEqual([record["line"] for record in records], [1, 2, 3, 4])
+        self.assertTrue(all(record["severity"] == "warning" for record in records))
+        self.assertEqual(run_patterns("py.numeric.float-equality", {
+            "operators.py": "a == 1.0\nb == 2.0\nc == 3.0\n",
+        }), [])
+
+
 class NdjsonReaderTests(unittest.TestCase):
+    def test_iterator_consumes_only_requested_records(self) -> None:
+        consumed = []
+
+        def lines():
+            for index in range(3):
+                consumed.append(index)
+                yield json.dumps({"index": index}) + "\n"
+
+        records = iter_ndjson_lines(lines(), "sink")
+        self.assertEqual(consumed, [])
+        self.assertEqual(next(records), {"index": 0})
+        self.assertEqual(consumed, [0])
+        self.assertEqual(list(records), [{"index": 1}, {"index": 2}])
+
     def test_malformed_line_is_skipped_not_fatal(self) -> None:
         stderr = io.StringIO()
         real, sys.stderr = sys.stderr, stderr
@@ -951,6 +989,13 @@ class NdjsonReaderTests(unittest.TestCase):
                 read_ndjson(sink),
                 [{"rule": "r", "line": 1}, {"rule": "s", "line": 2}],
             )
+
+    def test_unicode_line_separators_inside_records_survive(self) -> None:
+        record = {"message": "first\u0085second\u2028third\u2029fourth"}
+        with tempfile.TemporaryDirectory(prefix="ubs_ndjson_") as tmp:
+            sink = Path(tmp) / "s.ndjson"
+            sink.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
+            self.assertEqual(read_ndjson(sink), [record])
 
 
 class PythonPreviewOrderTests(unittest.TestCase):

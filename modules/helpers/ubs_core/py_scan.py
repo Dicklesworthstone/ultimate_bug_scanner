@@ -128,7 +128,7 @@ class Pattern:
     gate_regex expresses legacy project-wide preconditions;
     suppress_when_regex expresses count-comparison silences.
 
-    Two precision controls sit on top of the legacy semantics:
+    Precision controls sit on top of the legacy semantics:
 
     ``scan_strings`` — by default a pattern is matched against source with
     **string literals blanked out** (comments are kept, so marker rules such
@@ -143,6 +143,10 @@ class Pattern:
     rather than the line (a CLI entry point prints by design). It is applied to
     the same view the pattern is matched against, so prose in a docstring
     cannot make a library module look like a CLI.
+
+    ``code_only`` — require Python source and blank both comments and strings.
+    Operator evidence must come from executable source, while marker rules
+    keep their existing comment-aware view.
     """
 
     category: int
@@ -156,6 +160,7 @@ class Pattern:
     suppress_when_regex: re.Pattern[str] | None = None  # legacy project-wide silencer
     scan_strings: bool = False  # match inside string literals too
     exclude_file_regex: re.Pattern[str] | None = None  # skip files whose text matches
+    code_only: bool = False
 
 
 def iter_matches(
@@ -242,18 +247,19 @@ def scan_patterns(
                 texts[path] = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-    masked: dict[Path, str] = {}
+    masked: dict[tuple[Path, bool], str] = {}
 
-    def _scan_text(path: Path, text: str) -> str:
-        """String-blanked view of a Python source, comments preserved."""
+    def _scan_text(path: Path, text: str, code_only: bool = False) -> str:
+        """Offset-preserving Python view, with optional comment masking."""
         if path.suffix.lower() not in _PY_SUFFIXES:
             return text  # notebooks/requirements are not Python token streams
-        cached = masked.get(path)
+        key = (path, code_only)
+        cached = masked.get(key)
         if cached is None:
             try:
                 cached = strip_comments_and_strings(
                     text, lang="python", strip_strings=True,
-                    strip_comments=True, preserve_comments=True,
+                    strip_comments=True, preserve_comments=not code_only,
                 )
             except Exception:  # a masker failure must not lose the rule
                 cached = text
@@ -261,7 +267,7 @@ def scan_patterns(
                 # Offsets must line up with the raw text or every reported
                 # line number and code sample would be wrong; raw is safer.
                 cached = text
-            masked[path] = cached
+            masked[key] = cached
         return cached
 
     for pattern in active:
@@ -292,9 +298,11 @@ def scan_patterns(
         hits: list[tuple[Path, int, str]] = []
         seen: set[tuple[Path, int]] = set()
         for path, text in texts.items():
+            if pattern.code_only and path.suffix.lower() not in _PY_SUFFIXES:
+                continue
             if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                 continue
-            scan_text = text if pattern.scan_strings else _scan_text(path, text)
+            scan_text = text if pattern.scan_strings else _scan_text(path, text, pattern.code_only)
             if (pattern.exclude_file_regex is not None
                     and pattern.exclude_file_regex.search(scan_text)):
                 continue  # matched against the same view the rule sees

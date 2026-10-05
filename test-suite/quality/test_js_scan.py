@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -108,6 +109,71 @@ class ScanTests(unittest.TestCase):
                 counters = scan_patterns([_pat()], [src], sink, skip={11})
             self.assertEqual(counters["critical"], 0)
             self.assertEqual(sink_path.read_text(), "")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
+class TextReportMemoryTests(unittest.TestCase):
+    def test_large_sink_keeps_counts_and_first_samples_below_64_mib(self) -> None:
+        case = "c6-text-memory"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="sink-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                sink = root / "findings.ndjson"
+                with sink.open("w", encoding="utf-8") as stream:
+                    for rule, count, category in (("js.debug.debugger", 399_970, "js.debug"),
+                                                  ("js.security.sql-injection", 30, "js.security")):
+                        for index in range(count):
+                            stream.write(json.dumps({
+                                "rule": rule, "severity": "critical", "category_id": category,
+                                "path": "source.ts", "line": index + 1,
+                                "message": f"sample {index + 1}\u2028detail",
+                            }, ensure_ascii=False) + "\n")
+                peak = artifacts / "peak-rss-kib.txt"
+                report = artifacts / "report.txt"
+                script = (
+                    "import sys; from pathlib import Path; from types import SimpleNamespace; "
+                    "from ubs_core.js_scan import _render_text; "
+                    "args = SimpleNamespace(sink=sys.argv[1], text_out=sys.argv[2], "
+                    "project='project', project_dir='project'); "
+                    "_render_text(args, [Path('source.ts')], "
+                    "{'critical': 400000, 'warning': 0, 'info': 0})"
+                )
+                env = os.environ.copy()
+                env["PYTHONPATH"] = str(HELPERS_DIR)
+                result = subprocess.run(
+                    ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                     "-c", script, str(sink), str(report)],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=60,
+                )
+                (artifacts / "stdout.log").write_text(result.stdout, encoding="utf-8")
+                (artifacts / "stderr.log").write_text(result.stderr, encoding="utf-8")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                text = report.read_text(encoding="utf-8")
+                self.assertIn("(399970 found) — js.debug.debugger", text)
+                self.assertIn("(30 found) — js.security.sql-injection", text)
+                self.assertIn("Critical issues: 400000", text)
+                samples = [line for line in text.split("\n") if line.startswith("    source.ts:")]
+                self.assertEqual(len(samples), 30)
+                self.assertEqual(samples[:5],
+                                 [f"    source.ts:{i}  sample {i}\u2028detail" for i in range(1, 6)])
+                self.assertEqual(samples[5:],
+                                 [f"    source.ts:{i}  sample {i}\u2028detail" for i in range(1, 26)])
+                self.assertNotIn("good: No debugger statements found", text)
+                rss_kib = int(peak.read_text(encoding="utf-8"))
+                self.assertLess(rss_kib, 64 * 1024,
+                                f"text renderer peaked at {rss_kib / 1024:.1f} MiB")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("report.txt", "stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text(encoding='utf-8')}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
 
 
 class ExemplarPatternsTests(unittest.TestCase):

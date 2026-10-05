@@ -49,6 +49,7 @@ PATTERNS: list[Pattern] = [
         category=2,
         rule_id="py.numeric.float-equality",
         title="Float equality comparison",
+        code_only=True,
         # legacy: warning >3 "Float equality comparison" (10764-10766).
         regex=re.compile(r"==[ \t]*[0-9]+\.[0-9]+"),
         thresholds=((3, "warning"),),

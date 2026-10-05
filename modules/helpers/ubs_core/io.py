@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 def line_col(text: str, pos: int) -> tuple[int, int]:
@@ -112,7 +112,7 @@ def extract_statement_region(
     return text[idx:end], end
 
 
-def parse_ndjson_lines(lines: Iterable[str], source: str = "") -> list[dict]:
+def iter_ndjson_lines(lines: Iterable[str], source: str = "") -> Iterator[dict]:
     """Parse NDJSON records, skipping blank and malformed lines.
 
     The NDJSON sinks are written by this process and by helper subprocesses,
@@ -126,7 +126,6 @@ def parse_ndjson_lines(lines: Iterable[str], source: str = "") -> list[dict]:
     A skipped line is announced on stderr with its source and line number so
     the loss is visible rather than silent; everything else is returned.
     """
-    records: list[dict] = []
     for line_no, line in enumerate(lines, 1):
         if not line.strip():
             continue
@@ -139,25 +138,36 @@ def parse_ndjson_lines(lines: Iterable[str], source: str = "") -> list[dict]:
             )
             continue
         if isinstance(record, dict):
-            records.append(record)
-    return records
+            yield record
 
 
-def read_ndjson(
+def parse_ndjson_lines(lines: Iterable[str], source: str = "") -> list[dict]:
+    """Collect parsed records when a caller needs an in-memory result."""
+    return list(iter_ndjson_lines(lines, source))
+
+
+def iter_ndjson(
     path: Path | str, *, encoding: str = "utf-8", errors: str = "strict"
-) -> list[dict]:
-    """Read an NDJSON sink file through `parse_ndjson_lines`.
+) -> Iterator[dict]:
+    """Read an NDJSON sink one physical line at a time.
 
     A missing or unreadable sink yields no records rather than raising: an
     empty sink and an absent sink both mean "nothing was written".
     """
     file_path = Path(path)
     try:
-        text = file_path.read_text(encoding=encoding, errors=errors)
+        with file_path.open(encoding=encoding, errors=errors) as stream:
+            yield from iter_ndjson_lines(stream, str(file_path))
     except OSError as exc:
         sys.stderr.write(f"[ubs_core] cannot read NDJSON sink {file_path}: {exc}\n")
-        return []
+        return
     except UnicodeDecodeError as exc:
         sys.stderr.write(f"[ubs_core] cannot decode NDJSON sink {file_path}: {exc}\n")
-        return []
-    return parse_ndjson_lines(text.splitlines(), str(file_path))
+        return
+
+
+def read_ndjson(
+    path: Path | str, *, encoding: str = "utf-8", errors: str = "strict"
+) -> list[dict]:
+    """Collect sink records without retaining its serialized text as well."""
+    return list(iter_ndjson(path, encoding=encoding, errors=errors))

@@ -185,6 +185,7 @@ def _run_layer_cmd(layer: str, args: argparse.Namespace) -> int:
             groups = [[module.path for module in component] for component in graph.components()]
             grouped = {path for group in groups for path in group}
             groups.extend([path] for path in files if path.resolve() not in grouped)
+            del graph
             with ThreadPoolExecutor(max_workers=jobs) as executor:
                 findings = [finding for group in executor.map(_process_shard, groups) for finding in group]
         else:

@@ -10,7 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- JavaScript scans release the source graph used for cache invalidation before analysis and detach completed import components' taint scopes. A cold 400,000-line synthetic scan peaked at 149 MiB; its 400 findings matched the original scan. This measurement covers independent modules, not a single large connected import component.
+- JavaScript text reports count NDJSON findings incrementally and retain only their displayed samples. Reading NDJSON no longer retains the whole serialized file, and Unicode line separators inside a JSON string stay intact.
+- Python float-equality warnings require Python code. Comparisons quoted in comments and dependency constraints no longer count toward the warning threshold; real comparisons keep their original locations and severity.
 
 ---
 

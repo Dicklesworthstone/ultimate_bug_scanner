@@ -3017,18 +3017,27 @@ def scan_project_findings(files):
     graph = ModuleGraph(files)
     for modules in graph.components():
         engine = _Engine('', '', graph, modules)
-        starts = [module.start for module in modules]
-        line_starts = {module.path: [0] + [match.end() for match in re.finditer('\n', module.text)]
-                       for module in modules}
-        for start, rule, path_desc in engine.findings():
-            module = modules[bisect_right(starts, start) - 1]
-            if start >= module.end:
-                continue
-            offset = start - module.start
-            lines = line_starts[module.path]
-            line = bisect_right(lines, offset)
-            # line_starts lists begin with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
-            yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
+        try:
+            starts = [module.start for module in modules]
+            line_starts = {module.path: [0] + [match.end() for match in re.finditer('\n', module.text)]
+                           for module in modules}
+            for start, rule, path_desc in engine.findings():
+                module = modules[bisect_right(starts, start) - 1]
+                if start >= module.end:
+                    continue
+                offset = start - module.start
+                lines = line_starts[module.path]
+                line = bisect_right(lines, offset)
+                # line_starts lists begin with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
+                yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
+        finally:
+            # No import edge crosses a component boundary. Retaining these
+            # roots on the project graph kept every completed component's
+            # scopes, statements and combined code alive until the scan ended.
+            # Also detach them when a consumer closes the findings iterator.
+            for module in modules:
+                module.root = None
+            del engine
 
 
 def run(ctx: RunContext) -> Iterable[dict]:

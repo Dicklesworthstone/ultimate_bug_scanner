@@ -11,6 +11,9 @@ bound 1 s) and the Jest-shaped file 0.5 s (old: 71.5 s, bound 30 s).
 from __future__ import annotations
 
 import sys
+import json
+import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -70,6 +73,70 @@ class JestShapedFileCostTests(unittest.TestCase):
             elapsed = time.perf_counter() - started
         self.assertEqual(findings, [])
         self.assertLess(elapsed, 30.0, f"taint_js took {elapsed:.1f}s on {len(lines)} lines")
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
+class ProjectMemoryTests(unittest.TestCase):
+    def test_400k_line_scan_preserves_findings_below_200_mib(self) -> None:
+        case = "c6-source-memory"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                sources = root / "sources"
+                sources.mkdir()
+                for index in range(400):
+                    body = ["export function accumulate(value: number) {",
+                            "  let result = value;"]
+                    body.extend(["  result = result + 1;"] * 992)
+                    body += ["  return result;", "}"]
+                    if index in (0, 399):
+                        body += ["export function handle(req, res) {",
+                                 "  const html = req.query.html;",
+                                 "  res.send(html);", "}"]
+                    else:
+                        body += ["export function handle(req, res) {",
+                                 "  const html = 'constant response';",
+                                 "  res.send(html);", "}"]
+                    self.assertEqual(len(body), 1000)
+                    (sources / f"part_{index:04d}.ts").write_text(
+                        "\n".join(body) + "\n", encoding="utf-8")
+                env = os.environ.copy()
+                env.update(UBS_NO_CACHE="1", UBS_NO_AUTO_UPDATE="1", UBS_PROFILE="1")
+                peak = artifacts / "peak-rss-kib.txt"
+                with (artifacts / "result.json").open("w", encoding="utf-8") as stdout, \
+                        (artifacts / "stderr.log").open("w", encoding="utf-8") as stderr:
+                    result = subprocess.run(
+                        ["/usr/bin/time", "-f", "%M", "-o", str(peak),
+                         str(REPO_ROOT / "ubs"), str(sources), "--only=js", "--ci", "--format=json"],
+                        cwd=root, env=env, stdout=stdout, stderr=stderr, timeout=300,
+                    )
+                diagnostic = (artifacts / "stderr.log").read_text(encoding="utf-8")
+                doc = json.loads((artifacts / "result.json").read_text(encoding="utf-8"))
+                self.assertEqual(result.returncode, 1, diagnostic)
+                self.assertEqual(doc["status"], "ok", diagnostic)
+                self.assertEqual(doc["failed_modules"], [], diagnostic)
+                tainted = [(Path(f["file"]).name, f["line"]) for f in doc["findings"]
+                           if f["rule_id"] == "javascript.taint.xss"]
+                self.assertEqual(sorted(tainted), [("part_0000.ts", 999), ("part_0399.ts", 999)], diagnostic)
+                self.assertEqual(doc["totals"]["critical"], 2, diagnostic)
+                self.assertEqual(doc["totals"]["warning"], 0, diagnostic)
+                self.assertEqual(doc["totals"]["files"], 400, diagnostic)
+                self.assertEqual(doc["profile"]["cache_hits"], 0, diagnostic)
+                rss_kib = int(peak.read_text(encoding="utf-8").splitlines()[-1])
+                self.assertLess(rss_kib, 200 * 1024,
+                                f"400K-line scan peaked at {rss_kib / 1024:.1f} MiB\n{diagnostic}")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("result.json", "stderr.log"):
+                artifact = artifacts / name
+                if artifact.exists():
+                    print(f"{name}:\n{artifact.read_text(encoding='utf-8')}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
 
 
 if __name__ == "__main__":

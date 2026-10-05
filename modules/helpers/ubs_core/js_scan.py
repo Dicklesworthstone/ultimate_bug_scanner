@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from ubs_core.registry import RunContext
-from ubs_core.io import read_ndjson
+from ubs_core.io import iter_ndjson, read_ndjson
 
 MARKER = "ubs:ignore"
 _PATTERN_CACHE_KIND = "_ubs_js_pattern"
@@ -450,10 +450,17 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int],
     except ImportError:
         SUMMARY_MAP, REMEDIATION_MAP = {}, {}
 
-    records = read_ndjson(args.sink)
     by_rule: dict[str, list[dict]] = {}
-    for rec in records:
-        by_rule.setdefault(rec["rule"], []).append(rec)
+    rule_counts: dict[str, int] = {}
+    categories_with_records: set[str] = set()
+    for rec in iter_ndjson(args.sink):
+        rule = rec["rule"]
+        rule_counts[rule] = rule_counts.get(rule, 0) + 1
+        categories_with_records.add(rec.get("category_id", "").rsplit(".", 1)[-1])
+        samples = by_rule.setdefault(rule, [])
+        cap = 25 if rule.endswith("sql-injection") else 5
+        if len(samples) < cap:
+            samples.append(rec)
 
     lines = [
         f"UBS module: js (contract v2) — {args.project or args.project_dir}",
@@ -488,7 +495,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int],
             emitted_subheaders.add(subheader)
         severity = recs[0]["severity"]
         title = SUMMARY_MAP.get(rule, rule)
-        lines.append(f"[{severity}] {title} ({len(recs)} found) — {rule}")
+        lines.append(f"[{severity}] {title} ({rule_counts[rule]} found) — {rule}")
         remediation = REMEDIATION_MAP.get(rule)
         if remediation:
             lines.append(f"    {remediation}")
@@ -498,9 +505,6 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int],
 
     # Legacy "good" notes (print_finding "good") for emit groups whose
     # category produced no findings at all.
-    categories_with_records = {
-        rec.get("category_id", "").rsplit(".", 1)[-1] for rec in records
-    }
     for num, slug in _CATEGORY_SLUGS.items():
         good = _GOOD_LINES.get(slug)
         if not errors and good and slug not in categories_with_records:
@@ -561,6 +565,9 @@ def main(argv: list[str] | None = None) -> int:
     cache.file_contexts = {str(path): context for path, context in module_graph.file_contexts().items()}
     cached_findings, files_to_scan = cache.partition_files(files)
     files_to_scan = _expand_module_misses(module_graph, files, cached_findings, files_to_scan, cache)
+    # Cache keys and invalidation now hold only paths and topology digests.
+    # Release the source-bearing graph before the taint layer builds its own.
+    del module_graph
 
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
@@ -682,13 +689,8 @@ def main(argv: list[str] | None = None) -> int:
     # The sink is the single source of truth: recount severities from it so
     # every layer (patterns, analyzers, ast) is reflected in totals.
     counters = {"critical": 0, "warning": 0, "info": 0}
-    for line in Path(args.sink).read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            severity = json.loads(line).get("severity", "info")
-        except ValueError:
-            continue
+    for record in iter_ndjson(args.sink):
+        severity = record.get("severity", "info")
         counters[severity] = counters.get(severity, 0) + 1
 
     exit_code = 1 if counters["critical"] else 0

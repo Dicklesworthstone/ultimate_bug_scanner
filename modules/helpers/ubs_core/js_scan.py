@@ -29,10 +29,10 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from ubs_core.registry import RunContext
-from ubs_core.io import iter_ndjson, read_ndjson
+from ubs_core.io import iter_ndjson
 
 MARKER = "ubs:ignore"
 _PATTERN_CACHE_KIND = "_ubs_js_pattern"
@@ -290,7 +290,9 @@ def scan_patterns(
     return counters
 
 
-def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dict]) -> list[dict]:
+def reconcile_pattern_records(
+    patterns: Sequence[Pattern], records: Callable[[], Iterable[dict]],
+) -> Iterable[dict]:
     """Evaluate pattern thresholds and conditions for this complete selection.
 
     Cache source-local facts, including currently silent matches, rather than
@@ -300,7 +302,7 @@ def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dic
     counts: dict[str, int] = {}
     gates: set[str] = set()
     suppressors: set[str] = set()
-    for record in records:
+    for record in records():
         rule = record.get("rule", "")
         kind = record.get(_PATTERN_CACHE_KIND)
         if kind == "context":
@@ -322,8 +324,7 @@ def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dic
             continue
         severities[rule] = resolve_severity(pattern, count)
 
-    result: list[dict] = []
-    for record in records:
+    for record in records():
         kind = record.get(_PATTERN_CACHE_KIND)
         if kind == "context":
             continue
@@ -334,9 +335,7 @@ def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dic
             record = dict(record)
             record.pop(_PATTERN_CACHE_KIND)
             record["severity"] = severity
-        result.append(record)
-    return result
-
+        yield record
 
 
 def load_patterns() -> list[Pattern]:
@@ -353,6 +352,28 @@ def load_patterns() -> list[Pattern]:
         module = importlib.import_module(f"ubs_core.js_patterns.{module_info.name}")
         patterns.extend(getattr(module, "PATTERNS", []))
     return patterns
+
+
+def _write_summary(path: str | Path, doc: dict, records: Iterable[dict]) -> None:
+    """Write the complete report without collecting its finding stream."""
+    with Path(path).open("w", encoding="utf-8") as stream:
+        stream.write("{")
+        for index, (key, value) in enumerate(doc.items()):
+            if index:
+                stream.write(", ")
+            stream.write(json.dumps(key) + ": ")
+            if key == "findings":
+                stream.write("[")
+                for record_index, record in enumerate(records):
+                    if record_index:
+                        stream.write(", ")
+                    stream.write(json.dumps(record, ensure_ascii=False))
+                stream.write("]")
+            else:
+                stream.write(json.dumps(value, ensure_ascii=False))
+        stream.write("}\n")
+
+
 def _record_category(finding: dict) -> int | None:
     """Map an analyzer finding's rule id to its legacy category number."""
     rule = str(finding.get("rule", ""))
@@ -670,18 +691,20 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             pass
 
-    all_recs: list[dict] = []
-    for f in files:
-        recs = cached_findings.get(f)
-        if recs is None and capturing_sink is not None:
-            recs = capturing_sink.get_for_file(f)
-        if recs:
-            all_recs.extend(recs)
-    all_recs = reconcile_pattern_records(patterns, all_recs)
+    def selected_records():
+        for path in files:
+            records = cached_findings.get(path)
+            if records is None and capturing_sink is not None:
+                records = capturing_sink.by_file.get(str(path.resolve()), ())
+            yield from records or ()
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
-        for r in all_recs:
+        for r in reconcile_pattern_records(patterns, selected_records):
             sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+    # Cache writes and global reconciliation are complete. The NDJSON sink
+    # supplies counts and reports; their rendering needs no source collections.
+    cached_findings.clear()
+    capturing_sink = None
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
@@ -702,7 +725,6 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = 2
 
     if args.json_out:
-        records = read_ndjson(args.sink)
         import datetime
 
         doc = {
@@ -715,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
             "info": counters["info"],
             "version": args.version,
             "status": "partial" if scan_errors else "ok",
-            "findings": records,
+            "findings": None,
         }
         if scan_errors:
             doc["module_error"] = "ANALYZER_ERROR"
@@ -735,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
         extras = doc.get("extras", {}) if isinstance(doc.get("extras"), dict) else {}
         extras["profile"] = profile_data
         doc["extras"] = extras
-        Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+        _write_summary(args.json_out, doc, iter_ndjson(args.sink))
 
     if args.text_out:
         _render_text(args, files, counters, scan_errors)

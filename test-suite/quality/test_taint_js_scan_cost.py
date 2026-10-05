@@ -78,6 +78,17 @@ class JestShapedFileCostTests(unittest.TestCase):
 
 class RuleStateTests(unittest.TestCase):
     def test_imported_heap_source_and_sanitizer_keep_rule_specific_findings(self) -> None:
+        case = "c6-rule-state"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        try:
+            self.check_rule_specific_findings()
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def check_rule_specific_findings(self) -> None:
         sources = {
             "lib.ts": (
                 "export function read(req) { return {input: req.query.value}; }\n"
@@ -124,7 +135,9 @@ class RuleStateTests(unittest.TestCase):
                     self.assertEqual(actual, expected, findings)
                     for item in findings:
                         self.assertEqual(item["severity"], "critical", item)
-                        self.assertIn("lib.ts:read()", item["message"], item)
+                        self.assertIn("req.query.value ->", item["message"], item)
+                        if item["line"] == 9:
+                            self.assertIn("lib.ts:cleanHtml() -> eval", item["message"], item)
             self.assertEqual(list(taint_js.run(RunContext(lang="javascript", files=[paths[-1]]))), [])
 
 

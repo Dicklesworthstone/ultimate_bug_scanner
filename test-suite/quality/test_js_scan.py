@@ -176,6 +176,67 @@ class TextReportMemoryTests(unittest.TestCase):
         print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
+class JsonReportMemoryTests(unittest.TestCase):
+    def test_complete_400k_finding_summary_stays_below_64_mib(self) -> None:
+        case = "c6-json-memory"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            rss_kib = self.check_summary(artifacts)
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text(encoding='utf-8')}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
+
+    def check_summary(self, artifacts: Path) -> int:
+        with tempfile.TemporaryDirectory(prefix="summary-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            report = root / "summary.json"
+            peak = artifacts / "peak-rss-kib.txt"
+            script = (
+                "import sys; from ubs_core.js_scan import _write_summary; "
+                "doc = {'language': 'js', 'critical': 400000, 'status': 'partial', "
+                "'findings': None, 'module_error': 'ANALYZER_ERROR', "
+                "'extras': {'profile': {'cache_hits': 0}}}; "
+                "records = ({'rule': 'javascript.taint.xss', 'path': 'source.ts', "
+                "'line': i + 1, 'severity': 'critical', "
+                "'message': 'value\\u0085middle\\u2028next\\u2029end'} for i in range(400000)); "
+                "_write_summary(sys.argv[1], doc, records)"
+            )
+            env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+            result = subprocess.run(
+                ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                 "-c", script, str(report)],
+                cwd=root, env=env, capture_output=True, text=True, timeout=60,
+            )
+            (artifacts / "stdout.log").write_text(result.stdout, encoding="utf-8")
+            (artifacts / "stderr.log").write_text(result.stderr, encoding="utf-8")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with report.open(encoding="utf-8") as stream:
+                doc = json.load(stream)
+            self.assertEqual(doc["critical"], 400000)
+            self.assertEqual(doc["status"], "partial")
+            self.assertEqual(doc["module_error"], "ANALYZER_ERROR")
+            self.assertEqual(doc["extras"], {"profile": {"cache_hits": 0}})
+            records = doc["findings"]
+            self.assertEqual(len(records), 400000)
+            for line, record in enumerate(records, 1):
+                self.assertEqual(record, {"rule": "javascript.taint.xss", "path": "source.ts",
+                                          "line": line, "severity": "critical",
+                                          "message": "value\u0085middle\u2028next\u2029end"})
+            rss_kib = int(peak.read_text(encoding="utf-8"))
+            self.assertLess(rss_kib, 64 * 1024,
+                            f"JSON renderer peaked at {rss_kib / 1024:.1f} MiB")
+        return rss_kib
+
+
 class ExemplarPatternsTests(unittest.TestCase):
     def test_exemplar_module_loads(self) -> None:
         patterns = load_patterns()

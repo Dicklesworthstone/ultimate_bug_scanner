@@ -113,6 +113,64 @@ class ScanTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
 class TextReportMemoryTests(unittest.TestCase):
+    def test_bridge_recounts_400k_records_and_preserves_error_below_64_mib(self) -> None:
+        case = "c6-bridge-memory"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="bridge-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                sink = root / "findings.ndjson"
+                with sink.open("w", encoding="utf-8") as stream:
+                    for severity, count, category in (("critical", 399_970, "js.debug"),
+                                                      ("warning", 30, "js.typescript")):
+                        for index in range(count):
+                            stream.write(json.dumps({"severity": severity, "category_id": category,
+                                                     "message": f"sample {index}\u2028detail"},
+                                                    ensure_ascii=False) + "\n")
+                files = root / "files.0"
+                files.write_bytes(b"source.js\0")
+                module = (REPO_ROOT / "modules/ubs-js.sh").read_text()
+                begin = module.index("run_v2_legacy_parity_bridges(){")
+                end = module.index("\n}\n", begin) + 2
+                script = root / "bridge.sh"
+                script.write_text(module[begin:end] + '\nrun_v2_legacy_parity_bridges "$@"\n')
+                text_out = artifacts / "report.txt"
+                text_out.write_text("")
+                peak = artifacts / "peak-rss-kib.txt"
+                env = dict(os.environ, UBS_SKIP_TYPE_NARROWING="1")
+                # Exercise the production bridge independently of the scanner:
+                # it must retain findings and the scanner's incomplete exit.
+                result = subprocess.run(
+                    ["/usr/bin/time", "-f", "%M", "-o", str(peak),
+                     "bash", str(script), str(sink), str(files), "2", str(text_out)],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=60,
+                )
+                (artifacts / "stdout.log").write_text(result.stdout)
+                (artifacts / "stderr.log").write_text(result.stderr)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                report = text_out.read_text()
+                self.assertIn("Files scanned: 1", report)
+                self.assertIn("Critical issues: 399970", report)
+                self.assertIn("Warning issues: 30", report)
+                self.assertIn("Info items: 0", report)
+                self.assertNotIn("DEBUGGING & PRODUCTION CODE", report)
+                self.assertNotIn("TYPESCRIPT STRICTNESS", report)
+                self.assertIn("NODE.JS I/O & MODULES", report)
+                rss_kib = int(peak.read_text().splitlines()[-1])
+                self.assertLess(rss_kib, 64 * 1024,
+                                f"bridge peaked at {rss_kib / 1024:.1f} MiB")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("report.txt", "stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text()}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
+
     def test_large_sink_keeps_counts_and_first_samples_below_64_mib(self) -> None:
         case = "c6-text-memory"
         started = time.perf_counter()
@@ -174,6 +232,67 @@ class TextReportMemoryTests(unittest.TestCase):
                     print(f"{name}:\n{path.read_text(encoding='utf-8')}", flush=True)
             raise
         print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
+class JsonReportMemoryTests(unittest.TestCase):
+    def test_complete_400k_finding_summary_stays_below_64_mib(self) -> None:
+        case = "c6-json-memory"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            rss_kib = self.check_summary(artifacts)
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text(encoding='utf-8')}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
+
+    def check_summary(self, artifacts: Path) -> int:
+        with tempfile.TemporaryDirectory(prefix="summary-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            report = artifacts / "summary.json"
+            peak = artifacts / "peak-rss-kib.txt"
+            script = (
+                "import sys; from ubs_core.js_scan import _write_summary; "
+                "doc = {'language': 'js', 'critical': 400000, 'status': 'partial', "
+                "'findings': None, 'module_error': 'ANALYZER_ERROR', "
+                "'extras': {'profile': {'cache_hits': 0}}}; "
+                "records = ({'rule': 'javascript.taint.xss', 'path': 'source.ts', "
+                "'line': i + 1, 'severity': 'critical', "
+                "'message': 'value\\u0085middle\\u2028next\\u2029end'} for i in range(400000)); "
+                "_write_summary(sys.argv[1], doc, records)"
+            )
+            env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+            result = subprocess.run(
+                ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                 "-c", script, str(report)],
+                cwd=root, env=env, capture_output=True, text=True, timeout=60,
+            )
+            (artifacts / "stdout.log").write_text(result.stdout, encoding="utf-8")
+            (artifacts / "stderr.log").write_text(result.stderr, encoding="utf-8")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with report.open(encoding="utf-8") as stream:
+                doc = json.load(stream)
+            self.assertEqual(doc["critical"], 400000)
+            self.assertEqual(doc["status"], "partial")
+            self.assertEqual(doc["module_error"], "ANALYZER_ERROR")
+            self.assertEqual(doc["extras"], {"profile": {"cache_hits": 0}})
+            records = doc["findings"]
+            self.assertEqual(len(records), 400000)
+            for line, record in enumerate(records, 1):
+                self.assertEqual(record, {"rule": "javascript.taint.xss", "path": "source.ts",
+                                          "line": line, "severity": "critical",
+                                          "message": "value\u0085middle\u2028next\u2029end"})
+            rss_kib = int(peak.read_text(encoding="utf-8"))
+            self.assertLess(rss_kib, 64 * 1024,
+                            f"JSON renderer peaked at {rss_kib / 1024:.1f} MiB")
+        return rss_kib
 
 
 class ExemplarPatternsTests(unittest.TestCase):

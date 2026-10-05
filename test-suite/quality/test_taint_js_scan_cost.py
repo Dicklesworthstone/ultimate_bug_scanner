@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -143,6 +144,221 @@ class JestShapedFileCostTests(unittest.TestCase):
             findings = list(taint_js.scan_project_findings([provider, handler]))
         self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _trace
                           in findings], [("handler.ts", "js.taint.xss", 2)])
+
+
+class RuleStateTests(unittest.TestCase):
+    def test_heap_escapes_keep_borrowed_objects_cell_writes_and_exceptions(self) -> None:
+        case = "c6-heap-escapes"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        try:
+            self.check_heap_escapes()
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def check_heap_escapes(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "c6-heap-escapes"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            helper = root / "lib.ts"
+            helper.write_text(
+                "export let delivered;\n"
+                "export function mutate(box, value) { const junk = {value: 'discard'}; "
+                "box.value = value; box = null; return {status: 'ok', junk}; }\n"
+                "export function publish(value) { const junk = {value: 'discard'}; "
+                "delivered = {value}; delivered.loop = delivered; return 'fixed'; }\n"
+                "export function reject(box, value) { const junk = {value: 'discard'}; "
+                "box.value = value; throw {value}; }\n",
+                encoding="utf-8",
+            )
+            main = root / "app.ts"
+            main.write_text(
+                "import {mutate, publish, reject, delivered} from './lib';\n"
+                "const box = {value: 'safe'};\n"
+                "mutate(box, req.query.value);\n"
+                "res.send(box.value);\n"
+                "mutate(box, 'safe');\n"
+                "res.send(box.value);\n"
+                "publish(req.query.value);\n"
+                "res.send(delivered);\n"
+                "try { reject(box, req.query.value); } catch (error) { res.send(error.value); }\n"
+                "res.send(box.value);\n"
+                "try { reject(box, 'safe'); } catch (error) { res.send(error.value); }\n"
+                "res.send(box.value);\n",
+                encoding="utf-8",
+            )
+            expected = Counter({("app.ts", "javascript.taint.xss", line): 1
+                                for line in (4, 8, 9, 10)})
+            for selected in ([main, helper], [helper, main]):
+                with self.subTest(order=[path.name for path in selected]):
+                    findings = list(taint_js.run(RunContext(lang="javascript", files=selected)))
+                    actual = Counter((Path(item["path"]).name, item["rule"], item["line"])
+                                     for item in findings)
+                    self.assertEqual(actual, expected, findings)
+                    for item in findings:
+                        self.assertEqual(item["severity"], "critical", item)
+                        self.assertIn("req.query.value", item["message"], item)
+
+    def test_block_closures_keep_cells_and_call_time_heap_values(self) -> None:
+        case = "c6-block-closures"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        try:
+            self.check_block_closures()
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def check_block_closures(self) -> None:
+        cases = {
+            "escape-tainted": ("const box = {value: req.query.value};", "", 1),
+            "escape-clean": ("const box = {value: 'safe'};", "", 0),
+            "write-before-call": ("const box = {value: 'safe'};", "box.value = req.query.value;", 1),
+            "clean-before-call": ("const box = {value: req.query.value};", "box.value = 'safe';", 0),
+        }
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "c6-block-closures"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+            target = Path(tmp) / "closures.ts"
+            for name, (binding, update, count) in cases.items():
+                with self.subTest(case=name):
+                    target.write_text(
+                        "let render;\n"
+                        "{\n"
+                        f"  {binding}\n"
+                        "  render = () => res.send(box.value);\n"
+                        f"  {update}\n"
+                        "}\n"
+                        "render();\n",
+                        encoding="utf-8",
+                    )
+                    findings = list(taint_js.run(RunContext(lang="javascript", files=[target])))
+                    self.assertEqual(len(findings), count, findings)
+                    for item in findings:
+                        self.assertEqual((item["rule"], item["line"], item["severity"]),
+                                         ("javascript.taint.xss", 4, "critical"), item)
+                        self.assertIn("req.query.value", item["message"], item)
+
+    def test_imported_heap_source_and_sanitizer_keep_rule_specific_findings(self) -> None:
+        case = "c6-rule-state"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        try:
+            self.check_rule_specific_findings()
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s)", flush=True)
+
+    def check_rule_specific_findings(self) -> None:
+        sources = {
+            "lib.ts": (
+                "export function read(req) { return {input: req.query.value}; }\n"
+                "export function cleanHtml(value) { return DOMPurify.sanitize(value); }\n"
+            ),
+            "app.ts": (
+                "import {read, cleanHtml} from './lib';\n"
+                "import {exec as launch} from 'node:child_process';\n"
+                "const box = read(req);\n"
+                "res.send(box.input);\n"
+                "eval(box.input);\n"
+                "launch(box.input);\n"
+                "db.query(box.input);\n"
+                "res.send(cleanHtml(box.input));\n"
+                "eval(cleanHtml(box.input));\n"
+                "db.query('SELECT 1');\n"
+                "res.send('constant');\n"
+            ),
+            "quiet.ts": (
+                "export function collect(req) { return {input: req.query.value}; }\n"
+                "const example = 'eval(req.query.value)';\n"
+                "// res.send(req.query.value);\n"
+            ),
+        }
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "c6-rule-state"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="taint-js-rules-", dir=artifacts) as tmp:
+            root = Path(tmp)
+            paths = []
+            for name, source in sources.items():
+                path = root / name
+                path.write_text(source, encoding="utf-8")
+                paths.append(path)
+            expected = Counter({("app.ts", "javascript.taint.xss", 4): 1,
+                                ("app.ts", "javascript.taint.eval", 5): 1,
+                                ("app.ts", "javascript.taint.command", 6): 1,
+                                ("app.ts", "javascript.taint.sql", 7): 1,
+                                ("app.ts", "javascript.taint.eval", 9): 1})
+            for selected in (paths, list(reversed(paths))):
+                with self.subTest(order=[path.name for path in selected]):
+                    findings = list(taint_js.run(RunContext(lang="javascript", files=selected)))
+                    actual = Counter((Path(item["path"]).name, item["rule"], item["line"])
+                                     for item in findings)
+                    self.assertEqual(actual, expected, findings)
+                    for item in findings:
+                        self.assertEqual(item["severity"], "critical", item)
+                        self.assertIn("req.query.value ->", item["message"], item)
+                        if item["line"] == 9:
+                            self.assertIn("lib.ts:cleanHtml() -> eval", item["message"], item)
+            self.assertEqual(list(taint_js.run(RunContext(lang="javascript", files=[paths[-1]]))), [])
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")
+class SinkFreeComponentCostTests(unittest.TestCase):
+    def test_large_sink_free_import_component_stays_bounded(self) -> None:
+        case = "c6-sink-free-component"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp:
+                root = Path(tmp)
+                for index in range(100):
+                    body = [f"import {{next as importedNext}} from './part_{(index + 1) % 100:04d}';",
+                            f"const payload = req.query.field{index};",
+                            "export function next(value) {",
+                            "  return {value, payload};", "}"]
+                    for callback in range(199):
+                        body += [f"export function visit{callback}(value) {{",
+                                 "  const box = importedNext(value);", "  box.value = payload;",
+                                 "  return box;", "}"]
+                    self.assertEqual(len(body), 1000)
+                    (root / f"part_{index:04d}.ts").write_text("\n".join(body) + "\n")
+                script = (
+                    "import json, sys; from pathlib import Path; "
+                    "from ubs_core.analyzers import taint_js; "
+                    "from ubs_core.registry import RunContext; "
+                    "files = sorted(Path(sys.argv[1]).glob('*.ts')); "
+                    "findings = list(taint_js.run(RunContext(lang='javascript', files=files))); "
+                    "print(json.dumps({'selected': len(files), 'findings': findings}))"
+                )
+                env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+                peak = artifacts / "peak-rss-kib.txt"
+                result = subprocess.run(
+                    ["/usr/bin/time", "-f", "%M", "-o", str(peak), sys.executable,
+                     "-c", script, str(root)],
+                    cwd=root, env=env, capture_output=True, text=True, timeout=60,
+                )
+                (artifacts / "stdout.log").write_text(result.stdout)
+                (artifacts / "stderr.log").write_text(result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"selected": 100, "findings": []})
+                rss_kib = int(peak.read_text())
+                self.assertLess(rss_kib, 200 * 1024,
+                                f"sink-free component peaked at {rss_kib / 1024:.1f} MiB")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            for name in ("stdout.log", "stderr.log"):
+                path = artifacts / name
+                if path.exists():
+                    print(f"{name}:\n{path.read_text()}", flush=True)
+            raise
+        print(f"[{case}] PASS ({time.perf_counter() - started:.2f}s, {rss_kib / 1024:.1f} MiB)", flush=True)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")

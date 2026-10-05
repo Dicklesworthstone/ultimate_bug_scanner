@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="be4e51ffee3e7b1efa53929356f4623fc2cd4cb0b57343e4d2e0d77b3955d8b5"
+UBS_LIB_CHECKSUM="4aa1baabdc24512d2ee15978ad38a312b2491fe19485f5f110eda49c858e4944"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -378,11 +378,19 @@ SECTION = {1: "NULL SAFETY & DEFENSIVE PROGRAMMING", 2: "MATH & ARITHMETIC PITFA
            17: "TYPESCRIPT STRICTNESS", 18: "NODE.JS I/O & MODULES",
            19: "RESOURCE LIFECYCLE CORRELATION"}
 
+counts = {"critical": 0, "warning": 0, "info": 0}
+categories = set()
 try:
     with open(sink_path, encoding="utf-8") as fh:
-        records = [json.loads(line) for line in fh if line.strip()]
+        for line in fh:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            severity = record.get("severity", "info")
+            counts[severity if severity in counts else "info"] += 1
+            categories.add(record.get("category_id"))
 except OSError:
-    records = []
+    pass
 
 out = []
 
@@ -427,9 +435,9 @@ if run_tn:
         with open(sink_path, "a", encoding="utf-8") as fh:
             for rec in new_records:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        records.extend(new_records)
+        counts["warning"] += count
         if as_text:
-            if not any(r.get("category_id") == "js.typescript" for r in records[:-count]):
+            if "js.typescript" not in categories:
                 emit("TYPESCRIPT STRICTNESS")
             emit("Type narrowing validation")
             desc = "Examples: " + " ".join(previews[:3])
@@ -437,21 +445,17 @@ if run_tn:
                 desc += f" (and {count - 3} more)"
             emit(f"[warning] Potentially unsafe type narrowing ({count} found) — js.typescript.type-narrowing")
             emit(f"    {desc}")
+        categories.add("js.typescript")
 elif skip_tn and as_text:
     emit("Type narrowing validation")
     emit("  Type narrowing checks skipped")
     emit("    Set UBS_SKIP_TYPE_NARROWING=0 or remove --skip-type-narrowing to re-enable")
 
-counts = {"critical": 0, "warning": 0, "info": 0}
-for rec in records:
-    sev = rec.get("severity", "info")
-    counts[sev if sev in counts else "info"] += 1
-
 if as_text:
     for num in sorted(SECTION):
         if num in skip:
             continue
-        if not any(r.get("category_id") == f"js.{SLUG[num]}" for r in records):
+        if f"js.{SLUG[num]}" not in categories:
             emit(SECTION[num])
     emit("")
     emit("Summary Statistics:")

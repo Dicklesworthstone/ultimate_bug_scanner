@@ -811,6 +811,13 @@ class _HeapCall:
     readers: set = field(default_factory=set)
 
 
+@dataclass(slots=True)
+class _HeapOutput:
+    heap: dict
+    weak_refs: set
+    array_lengths: dict
+
+
 def _pairs(code, start=0, end=None):
     stack, pairs = [], {}
     close_to_open = {')': '(', ']': '[', '}': '{'}
@@ -1809,13 +1816,11 @@ class _Flow:
             kind, owner, name = trace.origin if trace.origin[0] != 'source' else ('source', None, None)
             if kind == 'parameter' and owner is callee:
                 incoming = bound.get(name, frozenset())
-            elif kind == 'free' and owner is callee and callee.parent is self.scope:
-                incoming = self.reference(name, state)
             else:
                 incoming = frozenset({trace})
             if incoming:
                 incoming = _step(incoming, self.engine.call_label(callee))
-                if kind in {'parameter', 'free'}:
+                if kind == 'parameter':
                     for name in trace.path[1:]:
                         incoming = _step(incoming, name)
             result = _join(result, incoming)
@@ -2222,11 +2227,6 @@ class _Flow:
                 state[name], state.bindings[name] = frozenset(), None
                 state.owners[name] = self.engine.binding(self.scope, name, node.start + 1)
             result = self.block(node.body, state)
-            for child in self.scope.children:
-                if node.start <= child.start < child.end <= node.end:
-                    captured = result if result is not None else state
-                    key = (child, self.rule)
-                    self.engine.captures[key] = _join_states(self.engine.captures.get(key), captured)
             for exit_state in (*self.breaks[break_count:], *self.continues[continue_count:]):
                 self.restore(exit_state, outer, local)
             for _, exit_state in (*self.returns[return_count:], *self.throws[throw_count:]):
@@ -2394,6 +2394,22 @@ class _Engine:
                 offset = module.end + 3
             text, code = ''.join(chunks), ''.join(masks)
         self.text, self.code = text, code
+        sinks = []
+        for left, right in ([(m.start, m.end) for m in modules] if modules else [(0, len(text))]):
+            aliases, functions = child_process_bindings(text[left:right].splitlines())
+            sinks.extend((a + left, b + left, rule, label, call)
+                         for a, b, rule, label, call in
+                         child_process_sinks(text[left:right], code[left:right], aliases, functions))
+        for regex, rule, label, call in SINKS:
+            sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
+        self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
+        self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
+        if not sinks:
+            # No rule can emit a finding without one of these exact sinks.
+            # Avoid parsing scopes and constructing their capture graph for
+            # sink-free components; every selected module was still inspected.
+            self.scopes = []
+            return
         if modules:
             self.functions, roots = [], []
             for module in modules:
@@ -2424,21 +2440,10 @@ class _Engine:
             self.root, self.functions = _function_scopes(text, code)
             self.scopes = [self.root, *self.functions]
         self.summaries, self.final_states = {}, {}
-        self.captures = {}
         self.dependents = defaultdict(set)
         self.heap_calls = {}
         self.current_task = None
         self.pending, self.queued = deque(), set()
-        sinks = []
-        for left, right in ([(m.start, m.end) for m in modules] if modules else [(0, len(text))]):
-            aliases, functions = child_process_bindings(text[left:right].splitlines())
-            sinks.extend((a + left, b + left, rule, label, call)
-                         for a, b, rule, label, call in
-                         child_process_sinks(text[left:right], code[left:right], aliases, functions))
-        for regex, rule, label, call in SINKS:
-            sinks.extend((match.start(), match.end(), rule, label, call) for match in regex.finditer(code))
-        self.call_sinks = {start: (rule, label) for start, _, rule, label, call in sinks if call}
-        self.write_sinks = [(start, expr_start, rule, label) for start, expr_start, rule, label, call in sinks if not call]
         for scope in self.scopes:
             scope.statements = _Parser(scope).sequence(scope.body_start, scope.body_end) if not scope.concise else []
         for root, module in self.module_roots.items():
@@ -2798,8 +2803,32 @@ class _Engine:
         def writes(store):
             return {} if store is None else {key: value for key, value in store.cells.items()
                                             if key[0] is not scope and key in store.written_cells}
-        return (_join(*(value for value, _ in flow.returns)), flow.effects, writes(output), output,
-                _join(*(value for value, _ in flow.throws)), writes(exceptional), exceptional)
+        returned = _join(*(value for value, _ in flow.returns))
+        thrown = _join(*(value for value, _ in flow.throws))
+        normal_writes, throw_writes = writes(output), writes(exceptional)
+
+        def escaped_heap(store, value, changes):
+            if store is None:
+                return None
+            # Borrowed objects remain observable through caller aliases even
+            # after a formal is rebound. Local allocations only escape through
+            # a returned value, an exception, or a write to a captured cell.
+            pending = [*context.incoming.heap, *_refs(value)]
+            for fact in changes.values():
+                pending.extend(_refs(fact))
+            heap = {}
+            while pending:
+                ref = pending.pop()
+                if ref in heap or ref not in store.heap:
+                    continue
+                slots = heap[ref] = store.heap[ref]
+                for fact in slots.values():
+                    pending.extend(_refs(fact) - heap.keys())
+            return _HeapOutput(heap, store.weak_refs & heap.keys(),
+                               {ref: length for ref, length in store.array_lengths.items() if ref in heap})
+
+        return (returned, flow.effects, normal_writes, escaped_heap(output, returned, normal_writes),
+                thrown, throw_writes, escaped_heap(exceptional, thrown, throw_writes))
 
     def regions(self, scope):
         """Static lexical identities; dataflow state still supplies values."""
@@ -2957,26 +2986,12 @@ class _Engine:
                     for step in trace.path:
                         resolved = _step(resolved, step)
                     result = _join(result, resolved)
-            elif trace.origin[0] == 'free' and trace.origin not in visited:
-                _, scope, name = trace.origin
-                parent = scope.parent
-                while parent is not None:
-                    state = self.captures.get((scope, rule), self.final_states.get((parent, rule), {}))
-                    if name in state:
-                        captured = _materialize(state[name], getattr(state, 'heap', {}))
-                        result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
-                        break
-                    parent = parent.parent
         return result
 
     def findings(self):
         found = {}
-        # Effects originate only at these already resolved sink locations.
-        # Solving a sink-free domain cannot emit a finding, but can spend
-        # minutes joining callback/loop heaps. Use component-wide sinks so a
-        # source-only dependency still participates in its importer's flow.
         active_rules = {rule for rule, _label in self.call_sinks.values()}
-        active_rules.update(rule for _start, _expr, rule, _label in self.write_sinks)
+        active_rules.update(rule for _location, _expr_start, rule, _label in self.write_sinks)
         for rule in KIND_BY_RULE:
             if rule not in active_rules:
                 continue
@@ -3012,6 +3027,13 @@ class _Engine:
                     if concrete:
                         key = (location, rule, label)
                         found[key] = _join(found.get(key, frozenset()), concrete)
+            # Every summary, final state and heap-call context belongs to this
+            # rule. Concrete source traces no longer need its flow states;
+            # retain only those findings while solving the next rule.
+            self.summaries.clear()
+            self.final_states.clear()
+            self.dependents.clear()
+            self.heap_calls.clear()
         for (location, rule, label), fact in sorted(found.items()):
             trace = min(fact, key=lambda item: (len(item.path), item.path))
             yield location, rule, format_path(trace.path, label)

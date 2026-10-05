@@ -1,0 +1,133 @@
+name: CSharp Project Taint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/csharp-project-taint.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  project-taint:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      UBS_NO_AUTO_UPDATE: "1"
+      UBS_ENABLE_AUTO_UPDATE: "0"
+      UBS_SKIP_RUST_BUILD: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+      # Temporary immutable-blob publication, never ref mutation. The connector
+      # lands each tested batch and restores read-only committed-source CI.
+      - name: Validate and publish two atomic functional batches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import lzma
+          import subprocess
+          import sys
+          from pathlib import Path
+          out = Path(os.environ['RUNNER_TEMP']) / 'csharp-project-publication'
+          out.mkdir()
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          (out / 'base-head.txt').write_text(base)
+          with (out / 'base-source.tar.gz').open('wb') as stream:
+              subprocess.run(['git', 'archive', '--format=tar.gz', 'HEAD'], stdout=stream, check=True)
+          shell_files = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh', *sorted(str(p) for p in Path('modules').glob('ubs-*.sh'))]
+          lint_base = out / 'lint-base'
+          for name in shell_files:
+              target = lint_base / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(subprocess.check_output(['git', 'show', f'HEAD:{name}']))
+          def lint(cwd):
+              result = subprocess.run(['shellcheck', '-S', 'warning', '-f', 'json', *shell_files], cwd=cwd, capture_output=True, text=True)
+              assert result.returncode in (0, 1), (result.returncode, result.stderr)
+              return json.loads(result.stdout)
+          baseline_lint = lint(lint_base)
+          def digest(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def candidate(sha):
+              result = subprocess.run(['gh', 'api', f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], capture_output=True, text=True, check=True, timeout=90)
+              data = base64.b64decode(json.loads(result.stdout)['content'])
+              assert digest(data) == sha
+              return json.loads(lzma.decompress(data))
+          functional = set()
+          for label, sha, count in (
+                  ('PROJECT', '21a3d29dd0b2bdf575c354b43827a58bcc791b4b', 135),
+                  ('INDEX', '548925e256d3d903dc0cd671c0caddccd4ccb03b', 136)):
+              batch = out / label
+              batch.mkdir()
+              payload = candidate(sha)
+              for name, expected in payload['base'].items():
+                  assert digest(Path(name).read_bytes()) == expected, ('concurrent source changed', name)
+              for name in set(payload['expected']) - set(payload['base']):
+                  assert not Path(name).exists(), ('concurrent addition', name)
+              subprocess.run(['git', 'apply', '--check', '-'], input=payload['patch'], text=True, check=True)
+              subprocess.run(['git', 'apply', '-'], input=payload['patch'], text=True, check=True)
+              for name, expected in payload['expected'].items():
+                  assert digest(Path(name).read_bytes()) == expected, name
+              functional.update(payload['expected'])
+              with (batch / 'generation.log').open('w') as log:
+                  subprocess.run([sys.executable, 'scripts/update_checksums.py'], stdout=log, check=True)
+              test_code = (
+                  "import unittest; s=unittest.defaultTestLoader.discover('test-suite/quality', pattern='test_taint_csharp_*.py'); "
+                  "r=unittest.TextTestRunner(verbosity=2).run(s); "
+                  f"assert r.testsRun >= {count} and r.wasSuccessful() and not r.skipped, (r.testsRun, r.failures, r.errors, r.skipped)")
+              with (batch / 'tests.log').open('w') as log:
+                  result = subprocess.run([sys.executable, '-c', test_code], stdout=log, stderr=subprocess.STDOUT, timeout=300)
+              if result.returncode:
+                  print((batch / 'tests.log').read_text(), flush=True)
+                  raise SystemExit(result.returncode)
+              with (batch / 'integrity.log').open('w') as log:
+                  for script in ('scripts/verify_checksums.sh', 'scripts/verify_sha256sums.sh'):
+                      subprocess.run(['bash', script], stdout=log, stderr=subprocess.STDOUT, check=True)
+                  subprocess.run([sys.executable, 'test-suite/shareable/test_contract_checksums.py', '-v'], stdout=log, stderr=subprocess.STDOUT, check=True)
+              for name in shell_files:
+                  subprocess.run(['bash', '-n', name], check=True)
+              assert lint(Path.cwd()) == baseline_lint, 'shell lint differs from the unchanged-source baseline'
+              subprocess.run(['git', 'diff', '--check'], check=True)
+              allowed = functional | {'SHA256SUMS', *shell_files}
+              changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()) | functional
+              assert functional | {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh'} <= changed <= allowed, changed
+              snapshots = {name: Path(name).read_bytes() for name in changed}
+              subprocess.run([sys.executable, 'scripts/update_checksums.py'], stdout=subprocess.DEVNULL, check=True)
+              assert all(Path(name).read_bytes() == data for name, data in snapshots.items()), 'integrity generation is not deterministic'
+              entries = []
+              for name, data in sorted(snapshots.items()):
+                  response = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'], input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}), text=True, capture_output=True, check=True, timeout=90)
+                  blob = json.loads(response.stdout)['sha']
+                  assert blob == digest(data), name
+                  tracked = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()
+                  mode = tracked[0] if tracked else '100644'
+                  entries.append(dict(path=name, sha=blob, mode=mode, type='blob'))
+                  target = batch / 'files' / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+                  print(label + '_BLOB', name, blob, mode, flush=True)
+              (batch / 'manifest.json').write_text(json.dumps(dict(base=base, entries=entries, tests=count, baseline_lint=len(baseline_lint)), indent=2))
+              print(label + '_TESTS_PASS', count, flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: csharp-project-publication
+          path: ${{ runner.temp }}/csharp-project-publication
+          retention-days: 3

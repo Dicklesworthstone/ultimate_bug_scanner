@@ -1,0 +1,35 @@
+name: Python Command Control Flow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/quality/test_command_*.py
+      - .github/workflows/python-command-control-flow.yml
+  pull_request:
+    paths:
+      - modules/helpers/ubs_core/py_detectors/command_injection.py
+      - test-suite/quality/test_python_command_injection_dataflow.py
+      - test-suite/quality/test_command_*.py
+      - .github/workflows/python-command-control-flow.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control-flow:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test committed control flow and executable provenance
+        run: |
+          python3 --version
+          python3 -m unittest discover -s test-suite/quality -p 'test_*command*.py' -v

@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
@@ -82,6 +82,7 @@ jobs:
               'test-suite/quality/test_rust_redirect_dataflow.py': '6728f5a1682a5d9d93ec8e10f5f960f6ebc3495e',
           }
           shell = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'] + sorted(str(p) for p in Path('modules').glob('ubs-*.sh'))
+          executables = (set(shell) - {'modules/lib/ubs-common.sh'}) | {'test-suite/quality/test_suppression_intervals.py'}
           allowed = set(shell) | {'SHA256SUMS', 'test-suite/quality/test_suppression_intervals.py'} | set(functional)
           for stage in (1, 2):
               if stage == 2:
@@ -119,7 +120,7 @@ jobs:
                   path = destination / 'files' / name
                   path.parent.mkdir(parents=True, exist_ok=True)
                   path.write_bytes(data)
-                  mode = '100755' if name in shell else '100644'
+                  mode = '100755' if name in executables else '100644'
                   manifest.append({'path': name, 'sha': blob(data), 'mode': mode, 'size': len(data)})
               (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
               print('RUST_STAGE_VALIDATED', stage, len(manifest), flush=True)
@@ -139,7 +140,7 @@ jobs:
   publish-objects:
     needs: validate
     if: github.event_name == 'push'
-    runs-on: ubuntu-26.04-arm
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
@@ -160,6 +161,7 @@ jobs:
           root = Path(os.environ['RUNNER_TEMP']) / 'rust-validated-files'
           shell = {'ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
           shell.update('modules/ubs-' + lang + '.sh' for lang in ('bash', 'cpp', 'csharp', 'elixir', 'golang', 'java', 'js', 'kotlin', 'python', 'ruby', 'rust', 'swift'))
+          executables = (shell - {'modules/lib/ubs-common.sh'}) | {'test-suite/quality/test_suppression_intervals.py'}
           allowed = shell | {'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_rust.py',
               'modules/helpers/ubs_core/rust_detectors/open_redirect.py',
               'modules/helpers/ubs_core/rust_detectors/redirect_flow.py',
@@ -183,7 +185,7 @@ jobs:
                   assert stat.S_ISREG(info.st_mode) and not path.is_symlink()
                   assert path.resolve().is_relative_to((directory / 'files').resolve())
                   assert 0 < info.st_size <= 1024 * 1024 and info.st_size == entry['size']
-                  assert entry['mode'] == ('100755' if name in shell else '100644')
+                  assert entry['mode'] == ('100755' if name in executables else '100644')
                   assert re.fullmatch('[0-9a-f]{40}', entry['sha'])
                   data = path.read_bytes()
                   sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()

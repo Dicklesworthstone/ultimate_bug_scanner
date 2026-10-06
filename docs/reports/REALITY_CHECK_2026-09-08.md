@@ -127,6 +127,8 @@ These first invoked the actual registered analyzers, then reproduced through the
 
 The actionable principle is to prove a sanitizer from its selected binding/body and dominating guard, attach that proof to the correct value/sink, and invalidate it on unsafe transformations. A function's reassuring name is not such proof. A fixed literal assignment must kill the old fact where language semantics permit it. Nearby guards must not protect unrelated variables or functions.
 
+Four additional ordinary-CLI controls preserve each unsafe helper's body and binding while renaming it to `identity`: Java, Ruby, Swift and Elixir then each report the expected target rule as one critical finding with exit 1. Changing only a reassuring name therefore changes the detection outcome without improving the program's safety. This rules out a missing source/sink recognizer as the explanation for those four misses. Evidence: `test-suite/artifacts/reality-cli-20261006-vGscXT/positive-controls.json`.
+
 ## Missing languages: value and feasible scope
 
 This is a prioritization inference, not a popularity-only ranking. Adoption, bug severity, existing infrastructure, parser/tool dependencies, false-positive risk, and maintenance cost all matter. GitHub's [2025 Octoverse contributor ranking](https://github.blog/news-insights/octoverse/octoverse-a-new-developer-joins-github-every-second-as-ai-leads-typescript-to-1/) includes PHP and HCL in its top ten; both are missing here. C and TypeScript are already covered and should not be counted as new languages.

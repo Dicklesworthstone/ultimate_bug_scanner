@@ -4,14 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/rust-redirect-dataflow.patch.xz
       - .github/workflows/rust-redirect-dataflow.yml
-      - modules/helpers/ubs_core/rust_detectors/open_redirect.py
-      - modules/helpers/ubs_core/rust_detectors/redirect_flow.py
-      - modules/helpers/ubs_core/analyzers/taint_rust.py
-      - test-suite/quality/test_rust_redirect_dataflow.py
-      - test-suite/quality/test_suppression_intervals.py
-      - ubs
   workflow_dispatch:
 
 permissions:
@@ -19,10 +12,10 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 20
     permissions:
-      contents: write
+      contents: read
     env:
       PYTHONDONTWRITEBYTECODE: '1'
       UBS_NO_AUTO_UPDATE: '1'
@@ -30,103 +23,183 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: 492ff8bc95968443c89ca54a9ca8468246d2bcb3
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Install real scanner dependencies
+      - name: Install scanner dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq ripgrep rsync shellcheck rustc
+          sudo apt-get update -qq
+          sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Verify baseline and apply checkpointed implementation
-        run: |
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-          python3 - <<'PY'
-          import lzma, os, subprocess
-          from pathlib import Path
-          path = 'test-suite/patches/rust-redirect-dataflow.patch.xz'
-          assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == '7c3b8ceac41ecdd3bdc6553739d7844d86f68be1'
-          candidate = Path(os.environ['RUNNER_TEMP'], 'rust-redirect.patch')
-          candidate.write_bytes(lzma.decompress(Path(path).read_bytes()))
-          subprocess.run(['git', 'apply', '--check', str(candidate)], check=True)
-          subprocess.run(['git', 'apply', str(candidate)], check=True)
-          subprocess.run(['git', 'add', '-N', 'modules/helpers/ubs_core/rust_detectors/redirect_flow.py', 'test-suite/quality/test_rust_redirect_dataflow.py'], check=True)
-          PY
-          python3 scripts/update_checksums.py
-          git diff --check
-      - name: Run dataflow and real JSON/SARIF regressions
-        env:
-          UBS_RUST_REDIRECT_E2E: '1'
-        run: |
-          set -o pipefail
-          python3 test-suite/quality/test_rust_redirect_dataflow.py -v 2>&1 | tee "$RUNNER_TEMP/rust-redirect-tests.log"
-      - name: Verify existing Rust and cross-language suppression behavior
-        run: |
-          set -o pipefail
-          python3 test-suite/quality/test_suppression_intervals.py -v 2>&1 | tee "$RUNNER_TEMP/rust-suppression-tests.log"
-          python3 test-suite/quality/test_rust_test_intervals.py -v 2>&1 | tee "$RUNNER_TEMP/rust-interval-tests.log"
-      - name: Verify shell syntax and full integrity chain
-        run: |
-          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
-          for file in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$file"; done
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-          git diff --check
-      # The connector atomically commits these tested source and integrity blobs.
-      # This publication step is removed when the runtime files are landed.
-      - name: Publish exact tested source and integrity blobs
+      - name: Read the already-reviewed plaintext patches
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 -I - <<'PY'
+          import base64, hashlib, json, os, subprocess
+          from pathlib import Path
+          target = Path(os.environ['RUNNER_TEMP']) / 'rust-reviewed-patches'
+          target.mkdir()
+          for sha in ('7695603c0e397f31f00bd68bcfd099a35976e820',
+                      '146bbc59a58d31572a42ab4128645e07c5b04290',
+                      '1810db78cb1ac06f3a56473fadd2195b0d71194e',
+                      '6a0d88904c5218fa3027037fc263f949b3e7ef82',
+                      '672370b7bd34fcbed9a3b8f4b798d959c4b3e6aa'):
+              response = subprocess.check_output(['gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs/{sha}'], timeout=60)
+              data = base64.b64decode(json.loads(response)['content'], validate=False)
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              data.decode('utf-8')
+              (target / (sha + '.patch')).write_bytes(data)
+          PY
+      - name: Validate both functional batches without write credentials
         run: |
           python3 - <<'PY'
-          import hashlib, json, os, subprocess
+          import hashlib, json, lzma, os, subprocess, sys
           from pathlib import Path
-          sources = {'modules/helpers/ubs_core/rust_detectors/open_redirect.py',
-              'modules/helpers/ubs_core/rust_detectors/redirect_flow.py',
-              'test-suite/quality/test_rust_redirect_dataflow.py',
-              'test-suite/quality/test_suppression_intervals.py'}
-          allowed = sources | {'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
-          assert sources <= changed <= allowed, changed
-          snapshots = {name: Path(name).read_bytes() for name in changed}
-          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True, stdout=subprocess.DEVNULL)
-          assert all(Path(name).read_bytes() == data for name, data in snapshots.items()), 'non-deterministic checksums'
-          manifest = []
-          for name in sorted(changed):
-              data = snapshots[name]
-              response = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
-                  '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
-                  text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(response.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
-              entry = {'path': name, 'sha': sha, 'mode': mode, 'type': 'blob'}
-              manifest.append(entry)
-              print('RUST_REDIRECT_BLOB', json.dumps(entry), flush=True)
-          Path(os.environ['RUNNER_TEMP'], 'rust-redirect-blobs.json').write_text(json.dumps(manifest, indent=2))
+          root = Path.cwd()
+          out = Path(os.environ['RUNNER_TEMP']) / 'rust-validated-files'
+          out.mkdir()
+          patches = Path(os.environ['RUNNER_TEMP']) / 'rust-reviewed-patches'
+          def run(argv, **kwargs):
+              subprocess.run(argv, check=True, timeout=240, **kwargs)
+          def blob(data):
+              return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+          def apply(data):
+              run(['git', 'apply', '--check', '-'], input=data)
+              run(['git', 'apply', '-'], input=data)
+          checkpoint = Path('test-suite/patches/rust-redirect-dataflow.patch.xz').read_bytes()
+          assert blob(checkpoint) == '7c3b8ceac41ecdd3bdc6553739d7844d86f68be1'
+          run(['bash', 'scripts/verify_checksums.sh'])
+          run(['bash', 'scripts/verify_sha256sums.sh'])
+          apply(lzma.decompress(checkpoint))
+          apply((patches / '7695603c0e397f31f00bd68bcfd099a35976e820.patch').read_bytes())
+          functional = {
+              'modules/helpers/ubs_core/analyzers/taint_rust.py': '2efb1e0d95ec3a6d3177248fb026841517b58670',
+              'modules/helpers/ubs_core/rust_detectors/open_redirect.py': '6e9419c55238622f09ffc54261d99f19b0a531b7',
+              'modules/helpers/ubs_core/rust_detectors/redirect_flow.py': '5dfd595d97a8d019b647f8588327364a5203a0a0',
+              'test-suite/quality/test_rust_redirect_dataflow.py': '6728f5a1682a5d9d93ec8e10f5f960f6ebc3495e',
+          }
+          shell = ['ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'] + sorted(str(p) for p in Path('modules').glob('ubs-*.sh'))
+          allowed = set(shell) | {'SHA256SUMS', 'test-suite/quality/test_suppression_intervals.py'} | set(functional)
+          for stage in (1, 2):
+              if stage == 2:
+                  for sha in ('146bbc59a58d31572a42ab4128645e07c5b04290',
+                              '1810db78cb1ac06f3a56473fadd2195b0d71194e',
+                              '6a0d88904c5218fa3027037fc263f949b3e7ef82',
+                              '672370b7bd34fcbed9a3b8f4b798d959c4b3e6aa'):
+                      apply((patches / (sha + '.patch')).read_bytes())
+                  functional['modules/helpers/ubs_core/rust_detectors/redirect_flow.py'] = 'c450b6a8c4e76c2f6cdff3208ec852bae3ffea3f'
+                  functional['modules/helpers/ubs_core/rust_scan.py'] = '5b746c15b959d73b9db85404d07a6de8e34bf760'
+                  functional['test-suite/quality/test_rust_redirect_dataflow.py'] = 'bc9c1a45d68fc04ef07a3bdd04555d1a6b5e49d9'
+                  allowed.add('modules/helpers/ubs_core/rust_scan.py')
+              for name, sha in functional.items():
+                  assert blob(Path(name).read_bytes()) == sha, name
+              run([sys.executable, 'scripts/update_checksums.py'])
+              destination = out / str(stage)
+              destination.mkdir()
+              with (destination / 'tests.log').open('w') as log:
+                  run([sys.executable, 'test-suite/quality/test_rust_redirect_dataflow.py', '-v'],
+                      env={**os.environ, 'UBS_RUST_REDIRECT_E2E': '1'}, stdout=log, stderr=subprocess.STDOUT)
+              for script in shell:
+                  run(['bash', '-n', script])
+              run(['shellcheck', '-S', 'warning', *shell])
+              run(['bash', 'scripts/verify_checksums.sh'])
+              run(['bash', 'scripts/verify_sha256sums.sh'])
+              run(['git', 'diff', '--check'])
+              changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+              changed |= {'modules/helpers/ubs_core/rust_detectors/redirect_flow.py', 'test-suite/quality/test_rust_redirect_dataflow.py'}
+              assert changed <= allowed, changed - allowed
+              snapshots = {name: Path(name).read_bytes() for name in changed}
+              run([sys.executable, 'scripts/update_checksums.py'], stdout=subprocess.DEVNULL)
+              assert all(Path(name).read_bytes() == data for name, data in snapshots.items())
+              manifest = []
+              for name, data in sorted(snapshots.items()):
+                  path = destination / 'files' / name
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_bytes(data)
+                  mode = '100755' if name in shell else '100644'
+                  manifest.append({'path': name, 'sha': blob(data), 'mode': mode, 'size': len(data)})
+              (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+              print('RUST_STAGE_VALIDATED', stage, len(manifest), flush=True)
+          for name in ('test-suite/quality/test_suppression_intervals.py',
+                       'test-suite/quality/test_rust_test_intervals.py',
+                       'test-suite/shareable/test_contract_checksums.py'):
+              run([sys.executable, name, '-v'])
+          run([sys.executable, '-m', 'unittest', 'discover', '-s', 'test-suite/quality', '-p', 'test_*command*.py', '-v'])
           PY
-      - name: Record reviewed patch and native validation tools
-        if: always()
-        run: |
-          git diff > "$RUNNER_TEMP/rust-redirect-final.patch"
-          mkdir -p "$RUNNER_TEMP/rust-redirect-tools"
-          for tool in ast-grep shellcheck; do
-            found="$(command -v "$tool" || true)"
-            if [ -n "$found" ]; then cp -L "$found" "$RUNNER_TEMP/rust-redirect-tools/$tool"; fi
-          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: rust-redirect-dataflow-validation
-          path: |
-            ${{ runner.temp }}/rust-*.log
-            ${{ runner.temp }}/rust-redirect-blobs.json
-            ${{ runner.temp }}/rust-redirect-final.patch
-            ${{ runner.temp }}/rust-redirect-tools
-            test-suite/artifacts/rust-redirect-dataflow
+          name: rust-validated-files
+          path: ${{ runner.temp }}/rust-validated-files
+          retention-days: 3
+
+  publish-objects:
+    needs: validate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # No repository checkout or repository Python imports in this job.
+      # Validated files are treated strictly as data; no branch ref is changed.
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-validated-files
+          path: ${{ runner.temp }}/rust-validated-files
+      - name: Publish only allowlisted, hash-verified UTF-8 Git objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import hashlib, json, os, re, stat, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'rust-validated-files'
+          shell = {'ubs', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
+          shell.update('modules/ubs-' + lang + '.sh' for lang in ('bash', 'cpp', 'csharp', 'elixir', 'golang', 'java', 'js', 'kotlin', 'python', 'ruby', 'rust', 'swift'))
+          allowed = shell | {'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_rust.py',
+              'modules/helpers/ubs_core/rust_detectors/open_redirect.py',
+              'modules/helpers/ubs_core/rust_detectors/redirect_flow.py',
+              'modules/helpers/ubs_core/rust_scan.py',
+              'test-suite/quality/test_rust_redirect_dataflow.py',
+              'test-suite/quality/test_suppression_intervals.py'}
+          published = {}
+          for stage in (1, 2):
+              directory = root / str(stage)
+              manifest_path = directory / 'manifest.json'
+              assert manifest_path.stat().st_size <= 32768
+              manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+              expected = allowed - ({'modules/helpers/ubs_core/rust_scan.py'} if stage == 1 else set())
+              assert isinstance(manifest, list) and len(manifest) == len(expected)
+              assert {entry['path'] for entry in manifest} == expected
+              published[str(stage)] = []
+              for entry in manifest:
+                  name = entry['path']
+                  path = directory / 'files' / name
+                  info = path.lstat()
+                  assert stat.S_ISREG(info.st_mode) and not path.is_symlink()
+                  assert path.resolve().is_relative_to((directory / 'files').resolve())
+                  assert 0 < info.st_size <= 1024 * 1024 and info.st_size == entry['size']
+                  assert entry['mode'] == ('100755' if name in shell else '100644')
+                  assert re.fullmatch('[0-9a-f]{40}', entry['sha'])
+                  data = path.read_bytes()
+                  sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+                  assert sha == entry['sha']
+                  response = subprocess.run(['gh', 'api', '--method', 'POST',
+                      f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/blobs', '--input', '-'],
+                      input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                      text=True, capture_output=True, check=True, timeout=60)
+                  assert json.loads(response.stdout)['sha'] == sha
+                  record = {'path': name, 'sha': sha, 'mode': entry['mode'], 'type': 'blob'}
+                  published[str(stage)].append(record)
+                  print('RUST_VALIDATED_BLOB', stage, json.dumps(record), flush=True)
+          (root / 'published.json').write_text(json.dumps(published, indent=2), encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-published-objects
+          path: ${{ runner.temp }}/rust-validated-files/published.json
           retention-days: 3

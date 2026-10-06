@@ -5842,7 +5842,7 @@ check_and_update_self(){
 
     # Publish the matching service first, retaining the old generation if
     # fetching, verification or publication of either payload fails.
-    local daemon_declaration daemon_expected daemon_actual daemon_target daemon_stage
+    local daemon_declaration daemon_expected daemon_manifest daemon_actual daemon_target daemon_stage
     daemon_declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
       END { if (count > 1) exit 1; print value }' "$new_self")" || {
       self_update_fail "ambiguous daemon checksum in release"; return $?;
@@ -5852,6 +5852,20 @@ check_and_update_self(){
         self_update_fail "invalid daemon checksum in release"; return $?
       fi
       daemon_expected="${BASH_REMATCH[1]}"
+      daemon_manifest="$(LC_ALL=C awk -v name="ubs-daemon" '
+        { sub(/\r$/, "") }
+        $2 == name || $2 == "*" name || $2 == "./" name || $2 == "*./" name {
+          count++
+          if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) bad = 1
+          digest = tolower($1)
+        }
+        END { if (count != 1 || bad) exit 1; print digest }
+      ' "$sums_file")" || {
+        self_update_fail "missing, malformed or duplicate daemon checksum in release manifest"; return $?;
+      }
+      if [[ "$daemon_manifest" != "$daemon_expected" ]]; then
+        self_update_fail "release daemon manifest does not match the runner checksum"; return $?
+      fi
       if ! self_update_fetch "$release_base/ubs-daemon" "$work_dir/ubs-daemon" \
           || ! sha256_into daemon_actual "$work_dir/ubs-daemon"; then
         self_update_fail "could not fetch or hash the release daemon"; return $?

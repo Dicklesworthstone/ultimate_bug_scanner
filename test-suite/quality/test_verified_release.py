@@ -24,9 +24,10 @@ ISSUER = 'https://token.actions.githubusercontent.com'
 
 TRANSPORT = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
+from urllib.parse import urlsplit
 args = sys.argv[1:]
 url = next(arg for arg in args if arg.startswith('https://'))
-name = url.rsplit('/', 1)[-1]
+name = urlsplit(url).path.rsplit('/', 1)[-1]
 log = pathlib.Path(os.environ['FETCH_LOG'])
 with log.open('a') as stream:
     stream.write(json.dumps({'name': name, 'url': url, 'args': args}) + '\n')
@@ -678,6 +679,73 @@ class DaemonInstallTests(unittest.TestCase):
         self.invoke('daemon', '--help')
         self.assertEqual([entry['name'] for entry in self.fetches()].count('ubs-daemon'), 1)
 
+    def test_local_install_prefers_the_runners_digest_generation(self):
+        source = self.bundle / 'ubs'
+        generation = self.generation(runner=source)
+        shutil.copy2(self.bundle / 'ubs-daemon', generation)
+        (self.bundle / 'ubs-daemon').write_text('raise SystemExit("unrelated generation")\n')
+        self.direct_install()
+        installed = self.generation(source=generation)
+        self.assertEqual(installed.read_bytes(), generation.read_bytes())
+        self.invoke('daemon', '--help')
+        self.assertFalse({'ubs', 'ubs-daemon', 'SHA256SUMS'} & {item['name'] for item in self.fetches()})
+
+    def test_bad_local_generation_never_falls_back_to_adjacent_daemon(self):
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        source_generation = self.generation(runner=self.bundle / 'ubs')
+        source_generation.symlink_to(self.bundle / 'missing')
+        self.direct_install(expected=1)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        self.assertTrue(source_generation.is_symlink())
+        self.invoke('serve', '--help')
+
+    def test_direct_remote_manifest_must_agree_with_the_runners_daemon(self):
+        original = (self.bundle / 'SHA256SUMS').read_text()
+        row = next(line for line in original.splitlines(True) if line.endswith('  ubs-daemon\n'))
+        self.env['UBS_MINISIGN_PUBKEY'] = 'test-public-key'
+        for index, manifest in enumerate((original.replace(row, ''),
+                                          original.replace(row, '0' * 64 + '  ubs-daemon\n'),
+                                          original + row)):
+            with self.subTest(manifest=manifest):
+                self.destination = self.home / ('manifest-case-' + str(index))
+                self.flags[-1] = str(self.destination)
+                self.sign(manifest=manifest)
+                self.direct_install(remote=True, expected=1)
+                self.assertFalse((self.destination / 'ubs').exists())
+
+    def prepare_main_payload(self, *, corrupt_companion=False):
+        main = self.root / 'unsigned-main'
+        main.mkdir()
+        original = (self.bundle / 'ubs-daemon').read_bytes()
+        payload = original + b'\n# distinct main generation\n'
+        old_pin = hashlib.sha256(original).hexdigest()
+        pin = hashlib.sha256(payload).hexdigest()
+        runner = (self.bundle / 'ubs').read_text().replace(
+            f'UBS_DAEMON_SHA256="{old_pin}"', f'UBS_DAEMON_SHA256="{pin}"')
+        (main / 'ubs').write_text(runner)
+        (main / 'ubs-daemon').write_bytes(b'raise SystemExit(99)\n' if corrupt_companion else payload)
+        self.env['UNSIGNED_UPDATE_FIXTURE'] = str(main)
+        self.flags.append('--insecure')
+        return main, payload
+
+    def test_insecure_main_installs_runner_and_daemon_from_the_same_source(self):
+        main, payload = self.prepare_main_payload()
+        self.direct_install(remote=True)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), (main / 'ubs').read_bytes())
+        self.assertEqual(self.generation(source=main / 'ubs-daemon').read_bytes(), payload)
+        self.invoke('--client', '--help')
+        requests = [item for item in self.fetches() if item['name'] in {'ubs', 'ubs-daemon'}]
+        self.assertEqual([item['name'] for item in requests], ['ubs', 'ubs-daemon'])
+        self.assertTrue(all(item['url'].startswith(
+            'https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/')
+            for item in requests), requests)
+
+    def test_insecure_main_still_rejects_a_mismatched_daemon(self):
+        self.prepare_main_payload(corrupt_companion=True)
+        self.direct_install(remote=True, expected=1)
+        self.assertFalse((self.destination / 'ubs').exists())
+
     def test_bad_local_sidecar_leaves_existing_runner_and_old_generation_usable(self):
         self.direct_install()
         before = (self.destination / 'ubs').read_bytes()
@@ -789,6 +857,25 @@ class DaemonInstallTests(unittest.TestCase):
         self.env['UBS_RELEASE_BASE'] = self.env['UBS_ARTIFACT_BASE']
         self.invoke('--update', expected=1)
         self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        self.invoke('serve', '--help')
+
+    def test_self_update_manifest_disagreement_preserves_current_generation(self):
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        generation = self.generation()
+        payload = generation.read_bytes()
+        next_runner = (ROOT / 'ubs').read_text().replace(
+            f'UBS_VERSION="{self.version}"', 'UBS_VERSION="9999.0.0"')
+        (self.bundle / 'ubs').write_text(next_runner)
+        self.sign()
+        manifest = (self.bundle / 'SHA256SUMS').read_text()
+        row = next(line for line in manifest.splitlines(True) if line.endswith('  ubs-daemon\n'))
+        self.sign(manifest=manifest.replace(row, '0' * 64 + '  ubs-daemon\n'))
+        self.env.update(UBS_RELEASE_BASE=self.env['UBS_ARTIFACT_BASE'],
+                        UBS_MINISIGN_PUBKEY='test-public-key')
+        self.invoke('--update', expected=1)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        self.assertEqual(generation.read_bytes(), payload)
         self.invoke('serve', '--help')
 
     def test_updated_runner_receives_original_scan_arguments(self):

@@ -613,14 +613,19 @@ verify_download_checksum() {
     error "Checksum file not available; cannot verify ${expected_name}."
     exit 1
   fi
-  local tmp_sum
-  tmp_sum=$(mktemp_in_workdir "${expected_name}.sha.XXXXXX")
-  if ! grep "  ${expected_name}$" "$CHECKSUM_FILE" > "$tmp_sum"; then
-    error "Checksum entry for ${expected_name} missing in SHA256SUMS"
-    exit 1
-  fi
   local expected_sum actual_sum
-  expected_sum="$(awk '{print $1}' "$tmp_sum" | head -n 1)"
+  expected_sum="$(LC_ALL=C awk -v name="$expected_name" '
+    { sub(/\r$/, "") }
+    $2 == name || $2 == "*" name || $2 == "./" name || $2 == "*./" name {
+      count++
+      if (NF != 2 || length($1) != 64 || $1 ~ /[^[:xdigit:]]/) bad = 1
+      digest = tolower($1)
+    }
+    END { if (count != 1 || bad) exit 1; print digest }
+  ' "$CHECKSUM_FILE")" || {
+    error "Missing, malformed or duplicate checksum entry for ${expected_name} in SHA256SUMS"
+    exit 1
+  }
   if ! actual_sum="$(compute_sha256 "$file_path")"; then
     error "No SHA256 tool found (need sha256sum, shasum, or openssl) to verify ${expected_name}."
     exit 1
@@ -3100,7 +3105,7 @@ determine_install_dir() {
 install_scanner_daemon() {
   # The selected runner supplies the literal companion digest. Do not execute
   # either payload to inspect its release metadata.
-  local runner="$1" local_source="$2" script_path="$3" use_sudo="$4"
+  local runner="$1" local_source="$2" script_path="$3" use_sudo="$4" source_base="$5"
   local declaration expected actual source staged target temporary
   declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
     END { if (count > 1) exit 1; print value }' "$runner")" || {
@@ -3113,18 +3118,23 @@ install_scanner_daemon() {
   expected="${BASH_REMATCH[1]}"
   staged="$(mktemp_in_workdir 'ubs-daemon.download.XXXXXX')" || return 1
   if [[ -n "$local_source" ]]; then
-    source="$(dirname "$local_source")/ubs-daemon"
+    # Match the loader: an existing generation takes precedence, including
+    # an invalid generation that must be rejected without another fallback.
+    source="${local_source}.daemon.${expected}.py"
     if [[ ! -e "$source" && ! -L "$source" ]]; then
-      source="${local_source}.daemon.${expected}.py"
+      source="$(dirname "$local_source")/ubs-daemon"
     fi
     if [[ ! -f "$source" || -L "$source" ]]; then
       error "Local runner requires its matching regular ubs-daemon; no network fallback"; return 1
     fi
     cp -- "$source" "$staged" || return 1
   else
-    if ! download_to_file "${ARTIFACT_BASE}/ubs-daemon" "$staged"; then
+    if ! download_to_file "${source_base}/ubs-daemon" "$staged"; then
       error "Could not fetch the matching release daemon"; return 1
     fi
+    # Secure downloads must satisfy the selected manifest as well as the
+    # runner pin. Explicit insecure mode skips only manifest authentication.
+    verify_download_checksum "$staged" "ubs-daemon"
   fi
   actual="$(compute_sha256 "$staged")" || return 1
   if [[ "$actual" != "$expected" || $(wc -c < "$staged") -gt 524288 ]]; then
@@ -3206,7 +3216,7 @@ install_scanner() {
   # Two deliberate cases install a local file: --local (./ubs, else the copy
   # next to this script), and running install.sh from a repository checkout
   # (ubs and VERSION next to the installer).
-  local local_source="" installer_dir=""
+  local local_source="" installer_dir="" daemon_source_base="$ARTIFACT_BASE"
   if [ -f "${BASH_SOURCE[0]:-}" ]; then
     installer_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
   fi
@@ -3264,6 +3274,7 @@ install_scanner() {
       # unpinned and unverified main.
       warn "Checksum verification skipped (--insecure set)"
       warn "Downloading unverified ${SCRIPT_NAME} from GitHub main..."
+      daemon_source_base="$REPO_URL"
 
       # Append cache-buster so users never get stale CDN copies
       local cache_buster
@@ -3306,7 +3317,7 @@ install_scanner() {
 
   # A daemon publication failure must leave the currently installed runner
   # usable. Stage both files beside their targets for atomic publication.
-  install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" || return 1
+  install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" "$daemon_source_base" || return 1
   local runner_stage
   runner_stage="$($use_sudo mktemp "${script_path}.install.XXXXXX")" || return 1
   if ! $use_sudo install -m 0755 "$temp_path" "$runner_stage" \

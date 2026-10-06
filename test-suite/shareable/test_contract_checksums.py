@@ -25,11 +25,13 @@ class ContractChecksums(unittest.TestCase):
         shutil.copy2(REPO_ROOT / "scripts/update_checksums.py", root / "scripts/update_checksums.py")
         (root / "ubs").write_text(
             "#!/usr/bin/env bash\n"
+            'UBS_DAEMON_SHA256="old"\n'
             "declare -A MODULE_CHECKSUMS=(\n)\n"
             "declare -A HELPER_CHECKSUMS=(\n)\n"
             "HELPER_ASSETS=(\n)\n", encoding="utf-8",
         )
         (root / "install.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (root / "ubs-daemon").write_text("# synthetic scan service\n", encoding="utf-8")
         (root / "modules/lib/ubs-common.sh").write_text(
             "declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(\n)\n", encoding="utf-8",
         )
@@ -62,7 +64,8 @@ class ContractChecksums(unittest.TestCase):
         for name in ("modules/ubs-rust.sh", "scripts/new-module.sh"):
             self.assertIn(f'UBS_LIB_CHECKSUM="{lib_digest}"', (root / name).read_text())
         self.assertIn(f"[rust]='{digest(root / 'modules/ubs-rust.sh')}'", runner)
-        expected = "".join(f"{digest(root / name)}  {name}\n" for name in ("install.sh", "ubs"))
+        self.assertIn(f'UBS_DAEMON_SHA256="{digest(root / "ubs-daemon")}"', runner)
+        expected = "".join(f"{digest(root / name)}  {name}\n" for name in ("install.sh", "ubs", "ubs-daemon"))
         self.assertEqual((root / "SHA256SUMS").read_text(), expected)
 
     def test_contract_propagates_and_generation_is_idempotent(self) -> None:

@@ -21,6 +21,9 @@ public final class OpenRedirectClean {
             }
             throw new IllegalArgumentException("blocked redirect");
         }
+        if (parsed.getRawAuthority() != null || parsed.toString().startsWith("//")) {
+            throw new IllegalArgumentException("blocked redirect authority");
+        }
         String path = parsed.getPath();
         if (path == null || !path.startsWith("/") || path.startsWith("//")) {
             throw new IllegalArgumentException("blocked redirect");

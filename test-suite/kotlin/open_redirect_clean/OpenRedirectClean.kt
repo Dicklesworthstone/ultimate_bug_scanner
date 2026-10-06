@@ -20,7 +20,7 @@ class CleanKotlinRedirects {
             require(uri.scheme == "https" && uri.host in allowedHosts) { "blocked redirect" }
             return uri.toString()
         }
-        require(uri.path.startsWith("/") && !uri.path.startsWith("//")) { "blocked redirect" }
+        require(uri.rawAuthority == null && !uri.toString().startsWith("//") && uri.path.startsWith("/") && !uri.path.startsWith("//")) { "blocked redirect" }
         return uri.toString()
     }
 

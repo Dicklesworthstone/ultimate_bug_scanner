@@ -2595,7 +2595,7 @@ class Second {
     Files.readString("path");
     // Files.readString(path);
     String inert = "request.getParameter(x); Files.readString(path)";
-    Files.readString(safeUnderRoot(path));
+    Files.readString(safeUnderRoot(path)); // unsafe: this selected helper is an identity
     Files.readString(unknown(path)); // unsafe
   }
 }'''
@@ -2904,6 +2904,516 @@ fun handler(request: jakarta.servlet.http.HttpServletRequest, again: Boolean) {
                 self.assertTrue(all(row['rule'] == lang + '.taint.path_traversal'
                                     and row['severity'] == 'critical' for row in findings), context)
                 self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+
+class JVMRedirectBindingTests(unittest.TestCase):
+    """Binding-equivalent regressions specified before the JVM policy changes."""
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='jvm-bindings-', dir=artifacts))
+
+    @staticmethod
+    def cases(lang):
+        java = lang == 'java'
+        def program(helper, body):
+            definition = ('String ' + helper + '(String value) { return value; }' if java else
+                          'fun ' + helper + '(value: String): String { return value }')
+            handler = ('void handler(Request request, Response response)' if java else
+                       'fun handler(request: Request, response: Response)')
+            return 'class Controller {\n  ' + definition + '\n  ' + handler + ' {\n' + body + '\n  }\n}\n'
+        declaration = 'String target' if java else 'var target'
+        source = '    ' + declaration + ' = request.getParameter("next");\n'
+        for name in ('safeRedirect', 'identity'):
+            yield name, program(name, source + '    response.sendRedirect(' + name + '(target));'), 'open_redirect', {5}
+        yield 'literal-overwrite', program('identity', source + '    target = "/fixed";\n    response.sendRedirect(target);'), 'open_redirect', set()
+        guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
+        reject = ('new ' if java else '') + 'SecurityException("blocked")'
+        yield 'local-url-guard', program('identity', source + '    if (!(' + guard + ')) { throw ' + reject + '; }\n    response.sendRedirect(target);'), 'open_redirect', set()
+        yield 'misleading-path-helper', program('safePath', source + '    ' + ('new ' if java else '') + 'FileInputStream(safePath(target));'), 'path_traversal', {5}
+        yield 'branch-retains-unsafe-path', program('identity', source + '    if (request.isEnabled()) { target = "/fixed"; }\n    response.sendRedirect(target);'), 'open_redirect', {6}
+        yield 'guard-overwritten', program('identity', source + '    if (!(' + guard + ')) { throw ' + reject + '; }\n    target = request.getParameter("other");\n    response.sendRedirect(target);'), 'open_redirect', {7}
+        if java:
+            yield 'generic-request-body-guard', ('class C { void handler(@RequestBody Box<String> target) {\n'
+                  'if (!(' + guard + ')) { return; }\n'
+                  'response.sendRedirect(target.toString());\n} }'), 'open_redirect', {3}
+            yield 'path-string-prefix', '''class C {
+  String choose(Path root, String raw) {
+    Path candidate=root.resolve(raw).normalize();
+    String rendered=candidate.toString();
+    String rootText=root.toString();
+    if (!rendered.startsWith(rootText)) { throw new SecurityException(); }
+    return rendered;
+  }
+  void handler(Request request, Path root) {
+    Files.readString(Path.of(choose(root, request.getParameter("file"))));
+  }
+}''', 'path_traversal', {3, 10}
+        if not java:
+            yield 'imported-require', ('import app.validation.require\n'
+                  'fun handler(request: Request, response: Response) {\n'
+                  '  val target=request.getParameter("next")\n'
+                  '  require(' + guard + ')\n'
+                  '  response.sendRedirect(target)\n}\n'), 'open_redirect', {5}
+            yield 'path-string-prefix', '''class C {
+  fun choose(root: Path, raw: String): String {
+    val candidate=root.resolve(raw).normalize()
+    val rendered=candidate.toString()
+    val rootText=root.toString()
+    if (!rendered.startsWith(rootText)) { throw SecurityException() }
+    return rendered
+  }
+  fun handler(request: Request, root: Path) {
+    Files.readString(Path.of(choose(root, request.getParameter("file"))))
+  }
+}''', 'path_traversal', {3, 10}
+            yield 'string-extension-uri-guard', '''import java.net.URI
+fun String.isAbsolute(): Boolean = false
+val String.rawAuthority: String? get() = null
+fun handler(request: Request, response: Response) {
+  val uri=URI.create(request.getParameter("next"))
+  if (!uri.path.startsWith("/") || uri.path.startsWith("//")) { return }
+  val target=uri.toString()
+  if (target.isAbsolute() || target.rawAuthority != null || target.startsWith("//")) { return }
+  response.sendRedirect(target)
+}
+''', 'open_redirect', {9}
+
+    def scan(self, code, lang='java', domain='open_redirect'):
+        from ubs_core.registry import RunContext
+        from ubs_core.analyzers import taint_java_redirect, taint_java_traversal
+        self.sequence = getattr(self, 'sequence', 0) + 1
+        path = self.root / ('Case' + str(self.sequence) + ('.java' if lang == 'java' else '.kt'))
+        code = textwrap.dedent(code).lstrip('\n')
+        path.write_text(code, encoding='utf-8')
+        analyzer = taint_java_redirect if domain == 'open_redirect' else taint_java_traversal
+        return list(analyzer.run(RunContext(lang=lang, files=[path])))
+
+    def check(self, code, lang='java', domain='open_redirect'):
+        code = textwrap.dedent(code).lstrip('\n')
+        expected = {line for line, text in enumerate(code.splitlines(), 1) if '// unsafe' in text}
+        findings = self.scan(code, lang, domain)
+        self.assertEqual({finding['line'] for finding in findings}, expected, (code, findings))
+        self.assertEqual(len(findings), len(expected), (code, findings))
+        self.assertTrue(all(finding['rule'] == 'java.taint.' + domain for finding in findings))
+        return findings
+
+    def test_baseline_cases_keep_binding_equivalence(self):
+        for lang in ('java', 'kotlin'):
+            for label, code, domain, expected in self.cases(lang):
+                with self.subTest(lang=lang, label=label):
+                    findings = self.scan(code, lang, domain)
+                    self.assertEqual({finding['line'] for finding in findings}, expected, (code, findings))
+
+    def test_selected_helpers_recursion_loops_and_scope_isolation(self):
+        code = '''class Flow {
+  String safeRedirect(String x) { return x; }
+  String fixed(String x) { return "/fixed"; }
+  String recursive(String x, int n) { if (n == 0) { return x; } return recursive(x, n - 1); }
+  void send(String x) { response.sendRedirect(x); } // unsafe
+  void handler(Request request, boolean again) {
+    String target = "/fixed";
+    while (again) { target = request.getParameter("next"); }
+    send(recursive(safeRedirect(target), 4));
+    response.sendRedirect(fixed(target));
+    response.sendRedirect(other.fixed(target)); // unsafe
+  }
+  void unrelated(Request request) { String target = request.getParameter("next"); }
+  void clean() { String target = "/fixed"; response.sendRedirect(target); }
+}'''
+        findings = self.check(code)
+        witness = findings[0]['extras']['taint_path']
+        self.assertTrue({'source', 'call', 'return', 'sink'} <= {step['kind'] for step in witness}, witness)
+        self.check('''fun safeRedirect(x: String): String = x
+fun fixed(x: String): String = "/fixed"
+fun recursive(x: String, n: Int): String {
+  if (n == 0) { return x }
+  return recursive(x, n - 1)
+}
+fun send(x: String) { response.sendRedirect(x) } // unsafe
+fun handler(request: Request, again: Boolean) {
+  var target = "/fixed"
+  while (again) { target = request.getParameter("next") }
+  send(recursive(safeRedirect(target), 4))
+  response.sendRedirect(fixed(target))
+}
+fun unrelated(request: Request) { val target = request.getParameter("next") }
+fun clean() { val target = "/fixed"; response.sendRedirect(target) }
+''', 'kotlin')
+
+    def test_guard_dominance_ignored_checks_other_values_and_mutations(self):
+        guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
+        prefix = 'String target = request.getParameter("next");\n'
+        cases = (
+            ('if (!(' + guard + ')) { return; }\nresponse.sendRedirect(target);', False),
+            ('if (' + guard + ') { response.sendRedirect(target); }', False),
+            ('if (!(' + guard + ')) { log("bad"); }\nresponse.sendRedirect(target);', True),
+            ('boolean ignored = ' + guard + ';\nresponse.sendRedirect(target);', True),
+            ('String other=request.getParameter("other"); if (!(' + guard.replace('target', 'other') + ')) { return; }\nresponse.sendRedirect(target);', True),
+            ('if (!(' + guard + ')) { return; }\ntarget=request.getParameter("other"); response.sendRedirect(target);', True),
+            ('if (!(' + guard + ')) { return; }\ntarget += request.getParameter("other"); response.sendRedirect(target);', True),
+            ('if (!(' + guard + ')) { return; }\nresponse.sendRedirect(target.replace("/", "//"));', True),
+            ('if (isAllowedRedirect(target)) { response.sendRedirect(target); }', True),
+            ('if (!(target.startsWith("/") && !target.startsWith("//"))) { return; }\nresponse.sendRedirect(target);', True),
+        )
+        for body, unsafe in cases:
+            with self.subTest(body=body):
+                code = 'class C { void handler(Request request) {\n' + prefix + body + (' // unsafe' if unsafe else '') + '\n} }'
+                self.check(code)
+
+    def test_real_guard_in_a_renamed_helper_is_a_summary(self):
+        guard = r'x.startsWith("/") && !x.startsWith("//") && !x.contains("\\") && !x.contains("\r") && !x.contains("\n") && !x.contains("\t")'
+        for name in ('choose', 'safeRedirect', 'identity'):
+            with self.subTest(name=name):
+                self.check('class C { String ' + name + '(String x) { if (!(' + guard + ')) { throw new SecurityException(); } return x; }\n'
+                           'void handler(Request request) { response.sendRedirect(' + name + '(request.getParameter("next"))); } }')
+
+    def test_uri_original_weak_relative_guards_remain_positive(self):
+        for filename in ('test-suite/java/security/OpenRedirectClean.java',
+                         'test-suite/kotlin/open_redirect_clean/OpenRedirectClean.kt'):
+            text = (REPO_ROOT / filename).read_text()
+            lang = 'java' if filename.endswith('.java') else 'kotlin'
+            self.assertEqual(self.scan(text, lang), [])
+            weak = text.replace('        if (parsed.getRawAuthority() != null || parsed.toString().startsWith("//")) {\n            throw new IllegalArgumentException("blocked redirect authority");\n        }\n', '')
+            weak = weak.replace('uri.rawAuthority == null && !uri.toString().startsWith("//") && ', '')
+            findings = self.scan(weak, lang)
+            self.assertEqual({finding['line'] for finding in findings}, {34, 38, 43, 48, 53} if lang == 'java' else {29, 34})
+            # Authority checks alone still accept ///attacker.example/login:
+            # java.net.URI removes two slashes from getPath(), while the
+            # serialized redirect retains a browser-interpreted authority.
+            authority_only = text.replace(' || parsed.toString().startsWith("//")', '').replace('!uri.toString().startsWith("//") && ', '')
+            self.assertEqual(len(self.scan(authority_only, lang)), 5 if lang == 'java' else 2)
+
+    def test_original_redirect_buggy_bytes_and_sink_locations_are_preserved(self):
+        cases = (
+            ('java', 'test-suite/java/security/OpenRedirectBuggy.java',
+             'c672817f6f59f0dbb5ebd1cf2e998146d05b61814f8f09258688d778ee32d54f', {15, 19, 24, 29, 34}),
+            ('kotlin', 'test-suite/kotlin/open_redirect_buggy/OpenRedirectBuggy.kt',
+             '5ee622d88a02e4b18ecdf1460a4c6e08fa534e3afe9c2785348b9cdd64589549', {15, 20}),
+        )
+        for lang, filename, digest, expected in cases:
+            path = REPO_ROOT / filename
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+            findings = self.scan(path.read_text(), lang)
+            self.assertEqual({finding['line'] for finding in findings}, expected)
+            self.assertEqual(len(findings), len(expected))
+
+    def test_uri_parser_oracle_rejects_the_original_clean_contract(self):
+        if shutil.which('java') is None:
+            self.skipTest('Java runtime unavailable for the independent URI oracle')
+        source = self.root / 'URIOracle.java'
+        source.write_text('''import java.net.URI;
+class URIOracle { public static void main(String[] args) {
+  URI uri = URI.create("//attacker.example/login");
+  if (uri.isAbsolute() || !uri.getPath().startsWith("/") || uri.getPath().startsWith("//")) throw new AssertionError();
+  if (!"attacker.example".equals(uri.getRawAuthority())) throw new AssertionError();
+  if (!"https://attacker.example/login".equals(URI.create("https://app.example/").resolve(uri).toString())) throw new AssertionError();
+  URI triple = URI.create("///attacker.example/login");
+  if (triple.isAbsolute() || triple.getRawAuthority() != null || !triple.getPath().startsWith("/") || triple.getPath().startsWith("//")) throw new AssertionError();
+  if (!"///attacker.example/login".equals(triple.toString())) throw new AssertionError();
+  System.out.println("original guard accepts a cross-origin URI");
+} }''')
+        proc = subprocess.run(['java', str(source)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        if shutil.which('node'):
+            browser_url = subprocess.run(['node', '-e', 'if (new URL("///attacker.example/login", "https://app.example/").origin !== "https://attacker.example") process.exit(1)'],
+                                         capture_output=True, text=True, timeout=30)
+            self.assertEqual(browser_url.returncode, 0, browser_url.stdout + browser_url.stderr)
+
+    def test_uri_wrong_value_or_changed_value_does_not_inherit_proof(self):
+        fixture = (REPO_ROOT / 'test-suite/java/security/OpenRedirectClean.java').read_text()
+        for before, after in (
+            ('return parsed.toString();', 'return raw;'),
+            ('return parsed.toString();', 'return parsed.getPath();'),
+            ('return parsed.toString();', 'return parsed.toString().replace("https", "http");'),
+            ('return parsed.toString();', 'parsed = URI.create(raw + "/other"); return parsed.toString();'),
+            ('ALLOWED_HOSTS.contains(parsed.getHost())', 'ALLOWED_HOSTS.contains("app.example.com")'),
+            ('private static final Set<String> ALLOWED_HOSTS', 'private static Set<String> ALLOWED_HOSTS'),
+            ('String path = parsed.getPath();', 'String path = external.getPath(parsed);'),
+        ):
+            with self.subTest(after=after):
+                findings = self.scan(fixture.replace(before, after))
+                self.assertTrue(findings, after)
+
+    def test_uri_helper_calls_do_not_share_guarded_object_identity(self):
+        self.check('''class C {
+  URI parse(String raw) { return URI.create(raw); }
+  void handler(Request request) {
+    URI first=parse(request.getParameter("first"));
+    URI second=parse(request.getParameter("second"));
+    if (first.isAbsolute() || first.getRawAuthority() != null || first.toString().startsWith("//")) { return; }
+    String path=first.getPath();
+    if (!path.startsWith("/") || path.startsWith("//")) { return; }
+    response.sendRedirect(first.toString());
+    response.sendRedirect(second.toString()); // unsafe
+  }
+}''')
+
+    def test_host_allowlist_declarations_require_executable_tokens_and_owner(self):
+        body = '''void handler(Request request) {
+  URI uri=URI.create(request.getParameter("next"));
+  if ("https".equals(uri.getScheme()) && HOSTS.contains(uri.getHost())) {
+    response.sendRedirect(uri.toString()); // unsafe
+  }
+}'''
+        declaration = 'private static final Set<String> HOSTS = Set.of("api.example");'
+        for fake in ('// ' + declaration + '\n', '/* ' + declaration + ' */\n',
+                     'String text="""\n' + declaration + '\n""";\n'):
+            with self.subTest(fake=fake):
+                self.check('class C {\n' + fake + body + '\n}')
+        self.check('class Trusted { ' + declaration + ' }\nclass Other extends Untrusted {\n' + body + '\n}')
+        self.check('class Trusted { ' + declaration + '\n' + body.replace(' // unsafe', '') + '\n}')
+
+    def test_kotlin_string_extensions_cannot_claim_uri_object_guards(self):
+        self.check('''import java.net.URI
+fun String.isAbsolute(): Boolean = false
+val String.rawAuthority: String? get() = null
+fun handler(request: Request, response: Response) {
+  val uri=URI.create(request.getParameter("next"))
+  if (!uri.path.startsWith("/") || uri.path.startsWith("//")) { return }
+  val target=uri.toString()
+  if (target.isAbsolute() || target.rawAuthority != null || target.startsWith("//")) { return }
+  response.sendRedirect(target) // unsafe: https://attacker.example/login passes these checks
+}
+''', 'kotlin')
+
+    def test_imported_require_cannot_validate_redirects(self):
+        guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
+        body = ('fun handler(request: Request, response: Response) {\n'
+                '  val target=request.getParameter("next")\n'
+                '  require(' + guard + ')\n'
+                '  response.sendRedirect(target) // unsafe\n}\n')
+        for imported in ('app.validation.require', 'app.validation.check as require', 'app.validation.*'):
+            with self.subTest(imported=imported):
+                self.check('import ' + imported + '\n' + body, 'kotlin')
+        self.check('import kotlin.require\n' + body.replace(' // unsafe', ''), 'kotlin')
+
+    def test_generic_and_array_parameters_do_not_inherit_argument_types(self):
+        guard = r'target.startsWith("/") && !target.startsWith("//") && !target.contains("\\") && !target.contains("\r") && !target.contains("\n") && !target.contains("\t")'
+        for parameter in ('Box<String> target',):
+            with self.subTest(parameter=parameter):
+                self.check('class C { void handler(@RequestBody ' + parameter + ') {\n'
+                           'if (!(' + guard + ')) { return; }\nresponse.sendRedirect(target.toString()); // unsafe\n} }')
+        self.check('class C { void handler(@RequestBody String target) {\n'
+                   'if (!(' + guard + ')) { return; }\nresponse.sendRedirect(target);\n} }')
+        for parameter in ('target: Box<String>', 'target: Array<String>'):
+            with self.subTest(parameter=parameter):
+                self.check('fun handler(' + parameter + ') {\n'
+                           'if (!(' + guard + ')) { return }\nresponse.sendRedirect(target.toString()) // unsafe\n}\n'
+                           'fun entry(request: Request) { handler(external.wrap(request.getParameter("next"))) }', 'kotlin')
+        for type_name in ('Box<Path>', 'Box<File>'):
+            with self.subTest(type=type_name):
+                self.check('class C { void handler(@RequestBody ' + type_name + ' target, Path root) {\n'
+                           'if (!target.normalize().startsWith(root)) { return; }\n'
+                           'Files.readString(Path.of(target.toString())); // unsafe\n} }', domain='path_traversal')
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        for suffix, declarations in (('.java', ('String[] target', 'String target[]', 'String... target', 'Path[] path', 'Box<File> file')),
+                                     ('.kt', ('target: Array<String>', 'target: List<Path>', 'target: Box<File>'))):
+            engine = Engine(self.root / ('Types' + suffix), '')
+            for declaration in declarations:
+                with self.subTest(declaration=declaration):
+                    self.assertEqual(engine.parameter_tags(declaration), frozenset())
+
+    def test_path_text_prefix_is_not_component_containment(self):
+        for conversion in ('candidate.toString()', 'candidate.normalize().toString()'):
+            with self.subTest(conversion=conversion):
+                self.check('''class C {
+  String choose(Path root, String raw) {
+    Path candidate=root.resolve(raw).normalize(); // unsafe
+    String rendered=CONVERSION;
+    String rootText=root.toString();
+    if (!rendered.startsWith(rootText)) { throw new SecurityException(); }
+    return rendered;
+  }
+  void handler(Request request, Path root) {
+    Files.readString(Path.of(choose(root, request.getParameter("file")))); // unsafe
+  }
+}'''.replace('CONVERSION', conversion), domain='path_traversal')
+        for conversion in ('candidate.getCanonicalPath()', 'candidate.getCanonicalFile().getCanonicalPath()'):
+            with self.subTest(conversion=conversion):
+                self.check('''class C {
+  String choose(File root, String raw) {
+    File candidate=new File(raw); // unsafe
+    String rendered=CONVERSION;
+    String rootText=root.getCanonicalPath();
+    if (!rendered.startsWith(rootText)) { throw new SecurityException(); }
+    return rendered;
+  }
+  void handler(Request request, File root) {
+    new FileInputStream(choose(root, request.getParameter("file"))); // unsafe
+  }
+}'''.replace('CONVERSION', conversion), domain='path_traversal')
+        self.check('''class C {
+  String choose(Path root, String raw) {
+    Path candidate=root.resolve(raw).normalize();
+    if (!candidate.startsWith(root)) { throw new SecurityException(); }
+    return candidate.toString();
+  }
+  void handler(Request request, Path root) {
+    Files.readString(Path.of(choose(root, request.getParameter("file"))));
+  }
+}''', domain='path_traversal')
+        if shutil.which('java'):
+            oracle = self.root / 'PathPrefixOracle.java'
+            oracle.write_text('''import java.nio.file.Path;
+class PathPrefixOracle { public static void main(String[] args) {
+  Path root=Path.of("/srv/root");
+  Path target=Path.of("/srv/root-evil/secret").normalize();
+  if (!target.toString().startsWith(root.toString()) || target.startsWith(root)) throw new AssertionError();
+} }''')
+            proc = subprocess.run(['java', str(oracle)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_uri_helper_calls_with_a_shared_source_keep_distinct_objects(self):
+        self.check('''class C {
+  URI parse(String raw) { return URI.create(raw); }
+  void handler(Request request) {
+    String raw=request.getParameter("next");
+    URI first=parse(raw);
+    URI second=parse(raw.replace("/safe", "//attacker.example"));
+    if (first.isAbsolute() || first.getRawAuthority() != null || first.toString().startsWith("//")) { return; }
+    String path=first.getPath();
+    if (!path.startsWith("/") || path.startsWith("//")) { return; }
+    response.sendRedirect(second.toString()); // unsafe
+  }
+}''')
+
+    def test_path_names_getters_and_receiver_identity(self):
+        self.check('''class C {
+  String safePath(String p) { return p; }
+  String getFileName(String p) { return p; }
+  void handler(Request request) {
+    String p = request.getParameter("file");
+    new FileInputStream(safePath(p)); // unsafe
+    new FileInputStream(getFileName(p)); // unsafe
+    new FileInputStream(external.getFileName(p)); // unsafe
+    new FileInputStream(Paths.get(p).getFileName().toString());
+  }
+}''', domain='path_traversal')
+
+    def test_redirect_does_not_use_path_containment_or_basename_as_url_validation(self):
+        self.check('''class C { void handler(Request request) {
+  String p=request.getParameter("next");
+  response.sendRedirect(Paths.get(p).getFileName().toString()); // unsafe
+  if (!p.normalize().startsWith(root)) { return; }
+  response.sendRedirect(p); // unsafe
+} }''')
+
+    def test_path_root_is_a_dependency_and_guarded_transforms_are_not_permanent(self):
+        self.check('''class C {
+  Path choose(Path root, String p) {
+    Path target=root.resolve(p).normalize(); // unsafe
+    if (!target.startsWith(root)) { throw new SecurityException(); }
+    return target;
+  }
+  void handler(Request request) {
+    Path untrusted=Path.of(request.getParameter("root")); // unsafe
+    Files.readString(choose(untrusted, request.getParameter("file"))); // unsafe
+  }
+}''', domain='path_traversal')
+        self.check('''class C {
+  Path choose(Path root, String p) {
+    Path target=root.resolve(p).normalize(); // unsafe
+    if (!target.startsWith(root)) { throw new SecurityException(); }
+    return target.resolve(p); // unsafe
+  }
+  void handler(Request request) {
+    Path root=Path.of("/srv/uploads");
+    Files.readString(choose(root, request.getParameter("file"))); // unsafe
+    String raw=request.getParameter("raw");
+    if (!raw.normalize().startsWith(root)) { return; }
+    new FileInputStream(raw); // unsafe
+  }
+}''', domain='path_traversal')
+        self.check('''class C { void handler(Request request) {
+  Path root=Path.of("/srv/uploads");
+  Path target=root.resolve(request.getParameter("file")).normalize(); // unsafe
+  if (!target.startsWith(root)) { return; }
+  Files.readString(target);
+} }''', domain='path_traversal')
+
+    def test_rule_scoped_suppression_and_lexical_decoys(self):
+        for lang in ('java', 'kotlin'):
+            code = '''String target=request.getParameter("next");
+response.sendRedirect(target); // ubs:ignore[LANG.taint.open_redirect]
+response.sendRedirect(target); // ubs:ignore[LANG.taint.path_traversal] // unsafe
+String inert="response.sendRedirect(request.getParameter(x))";
+'''.replace('LANG', lang)
+            if lang == 'kotlin':
+                code = code.replace('String ', 'val ')
+            self.check(code, lang)
+
+    def test_incomplete_and_disabled_paths_are_explicit(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine, run
+        from ubs_core.registry import RunContext
+        from ubs_core.taint_flow import AnalysisLimit
+        self.assertEqual(list(run(RunContext(lang='java', files=[Path('/absent.java')],
+                                            profile={'disabled_rules': ['java.taint.open_redirect']}))), [])
+        for code in ('response.sendRedirect(request.getParameter("next");',
+                     'class C { String x=request.getParameter("next"); void h(){response.sendRedirect(x);} }'):
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'incomplete'):
+                self.scan(code)
+        engine = RedirectEngine(self.root / 'Budget.java', 'response.sendRedirect(request.getParameter("next"));')
+        engine.budget.remaining = 0
+        with self.assertRaises(AnalysisLimit):
+            engine.analyze()
+
+    def test_binding_oracles_through_public_json_and_sarif(self):
+        for lang, suffix in (('java', '.java'), ('kotlin', '.kt')):
+            for label, code, rule, expected in self.cases(lang):
+                path = self.root / (lang + '-' + label + suffix)
+                path.write_text(code, encoding='utf-8')
+                json_extras = []
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(lang=lang, case=label, format=fmt):
+                        case = lang + '-' + label + '-' + fmt
+                        started = time.monotonic()
+                        print(f'[{case}] RUN', flush=True)
+                        command = [str(REPO_ROOT / 'modules' / ('ubs-' + lang + '.sh')),
+                                   '--ci', '--only=4', '--no-color', '--format=' + fmt, str(path)]
+                        env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1',
+                                   PYTHONDONTWRITEBYTECODE='1', ENABLE_UV_TOOLS='0')
+                        proc = subprocess.run(command, cwd=self.root, env=env,
+                                              capture_output=True, text=True, timeout=120)
+                        (self.root / (case + '.stdout.log')).write_text(proc.stdout)
+                        (self.root / (case + '.stderr.log')).write_text(proc.stderr)
+                        (self.root / (case + '.identity.json')).write_text(json.dumps({
+                            'command': command, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                            'python': sys.version, 'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+                        }, indent=2))
+                        context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                        self.assertEqual(proc.returncode, int(bool(expected)), context)
+                        report = json.loads(proc.stdout)
+                        if fmt == 'json':
+                            self.assertEqual(report['status'], 'ok', context)
+                            self.assertEqual(report['critical'], len(expected), context)
+                            found = [f for f in report['findings'] if f['rule'] == lang + '.taint.' + rule]
+                            actual = {f['line'] for f in found}
+                            json_extras = [f['extras'] for f in found]
+                            for finding in found:
+                                steps = finding['extras']['taint_path']
+                                self.assertEqual((steps[0]['kind'], steps[-1]['kind']), ('source', 'sink'), context)
+                                self.assertEqual(steps[-1]['line'], finding['line'], context)
+                                self.assertTrue(all(Path(step['path']) == path.resolve() and step['col'] > 0 for step in steps), context)
+                                if label in {'safeRedirect', 'identity', 'misleading-path-helper'}:
+                                    self.assertTrue({'call', 'return'} <= {step['kind'] for step in steps}, context)
+                        else:
+                            found = [f for run in report['runs'] for f in run['results']
+                                     if f['ruleId'] == lang + '.taint.' + rule]
+                            actual = {f['locations'][0]['physicalLocation']['region']['startLine'] for f in found}
+                            self.assertEqual([f['properties']['extras'] for f in found], json_extras, context)
+                            for finding, extras in zip(found, json_extras):
+                                locations = finding['codeFlows'][0]['threadFlows'][0]['locations']
+                                self.assertEqual(len(locations), len(extras['taint_path']), context)
+                                for location, step in zip(locations, extras['taint_path']):
+                                    physical = location['location']['physicalLocation']
+                                    self.assertEqual(location['kinds'], [step['kind']], context)
+                                    self.assertEqual(physical['artifactLocation']['uri'], step['path'], context)
+                                    self.assertEqual(physical['region'], {'startLine': step['line'], 'startColumn': step['col']}, context)
+                        self.assertEqual(len(found), len(expected), context)
+                        self.assertEqual(actual, expected, context)
+                        print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
 
 if __name__ == "__main__":

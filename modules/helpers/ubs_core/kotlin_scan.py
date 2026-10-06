@@ -258,6 +258,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                     "severity": "critical",
                     "message": finding.get("message", "Unvalidated redirect from request data"),
                     "suppressed": False,
+                    **({"extras": finding["extras"]} if finding.get("extras") else {}),
                 }, ensure_ascii=False) + "\n")
 
 

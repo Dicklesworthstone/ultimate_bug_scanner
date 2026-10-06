@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.suppression import SourceSuppressions
 from ubs_core.taint_flow import (AnalysisLimit, Budget, CLEAN, Fact, Step, Trace,
                                  advance, join, retag, solve, substitute)
 from bisect import bisect_right
@@ -43,17 +44,6 @@ ANNOTATED_PARAM_RE = re.compile(
     r'FormParam|MatrixParam)\b(?:\s*\([^)]*\))?(?:\s+@[A-Za-z_][A-Za-z0-9_.]*(?:\([^)]*\))?)*\s+'
     r'(?:final\s+)?(?:String|Path|File|Object|MultipartFile|Part|UploadedFile|FileUpload|'
     r'[A-Za-z_][A-Za-z0-9_<>, ?]*)\s+([A-Za-z_][A-Za-z0-9_]*)',
-    re.IGNORECASE,
-)
-SAFE_EXPR_RE = re.compile(
-    r'\b(?:safe(?:Path|Join|File|Filename|UploadPath|DownloadPath|UnderRoot)|'
-    r'secure(?:Path|Join|File|Filename|UploadPath|DownloadPath)|'
-    r'sanitize(?:Path|Filename|FileName)|cleanFilename|validate(?:Path|Filename|FileName)|'
-    r'resolveUnderRoot|withinRoot|insideRoot|isSafePath|allowedFile|safeUnderRoot)\b'
-    r'|\b(?:Path\.of|Paths\.get|new\s+File)\s*\([^;\n]*\)\s*\.\s*(?:getFileName|getName)\s*\('
-    r'|\b(?:Path|Paths\.get|Path\.of)\s*\([^;\n]*\)\s*\.\s*fileName\b'
-    r'|\bFile\s*\([^;\n]*\)\s*\.\s*name\b'
-    r'|\.\s*(?:getFileName|getName)\s*\(',
     re.IGNORECASE,
 )
 CONTAINMENT_NORMALIZE_RE = re.compile(r'\b(?:normalize|toRealPath|getCanonicalPath|getCanonicalFile)\s*\(')
@@ -206,10 +196,11 @@ class Function:
     body: tuple = ()
     declaration: int = -1
     captures: tuple = ()
+    parameter_declarations: tuple = ()
 
 
 class Parser:
-    def __init__(self, text, kotlin):
+    def __init__(self, text, kotlin, source_re=SOURCE_RE, sink_re=SINK_RE):
         self.text, self.kotlin = text, kotlin
         self.code = lexical_source(text, kotlin)
         self.pairs, stack = {}, []
@@ -227,6 +218,7 @@ class Parser:
         owners = []
         for match in re.finditer(r'\b(?:class|interface|object|enum)\s+([A-Za-z_]\w*)[^;{}]*\{', self.code):
             owners.append((match.start(), self.pairs[match.end() - 1], match.group(1)))
+        self.owners = tuple(owners)
         for match in re.finditer(r'\b([A-Za-z_]\w*)\s*\(', self.code):
             name, opening = match.group(1), match.end() - 1
             if name in {'if', 'while', 'for', 'switch', 'catch', 'try', 'synchronized', 'when'}:
@@ -251,10 +243,10 @@ class Parser:
                 continue
             if self.code[following] == '=' and not kotlin:
                 continue
-            parameters, sources = [], set()
+            parameters, sources, parameter_declarations = [], set(), []
             for low, high in self.parts(opening + 1, close, generics=True):
                 declaration = re.sub(r'@\w+(?:\s*\([^)]*\))?', ' ', self.code[low:high])
-                if '=' in declaration and (SOURCE_RE.search(declaration) or SINK_RE.search(declaration)):
+                if '=' in declaration and (source_re.search(declaration) or sink_re.search(declaration)):
                     raise ValueError('Executable Java/Kotlin parameter default needs call binding; analysis is incomplete')
                 if kotlin:
                     parameter = re.search(r'\b([A-Za-z_]\w*)\s*:', declaration)
@@ -265,6 +257,7 @@ class Parser:
                 if not parameter:
                     raise ValueError('Unsupported Java/Kotlin parameter shape; analysis is incomplete')
                 parameters.append(parameter)
+                parameter_declarations.append(declaration)
                 if ANNOTATED_PARAM_RE.search(self.code[low:high]):
                     sources.add(parameter)
             if self.code[following] == '{':
@@ -276,6 +269,7 @@ class Parser:
                 body = (Statement(start, end, 'return'),)
             owner = tuple(name for low, high, name in owners if low < match.start() < high)
             function = Function(match.start(), name, owner, start, end, tuple(parameters), frozenset(sources), body)
+            function.parameter_declarations = tuple(parameter_declarations)
             function.declaration = self.code.rfind('fun', boundary, match.start()) if kotlin else function.key
             self.functions[function.key] = function
         # Do not discard executable class/instance initialization while giving
@@ -287,7 +281,7 @@ class Parser:
                 if residual[index] not in '\r\n':
                     residual[index] = ' '
         outside = ''.join(residual)
-        if any(SOURCE_RE.search(outside[low:high + 1]) or SINK_RE.search(outside[low:high + 1])
+        if any(source_re.search(outside[low:high + 1]) or sink_re.search(outside[low:high + 1])
                for low, high, _ in owners):
             raise ValueError('Executable Java/Kotlin class initialization needs field-state analysis; analysis is incomplete')
         self.globals = ()
@@ -365,6 +359,17 @@ class Parser:
         if self.code[start] == '{':
             finish = self.pairs[start]
             return Statement(start, finish + 1, 'block', self.block(start + 1, finish)), finish + 1
+        requirement = re.match(r'require\s*\(', self.code[start:end]) if self.kotlin else None
+        if requirement:
+            opening = start + requirement.end() - 1
+            close = self.pairs[opening]
+            following = self.skip(close + 1, end)
+            if self.code[following:following + 1] == '{':
+                finish = self.pairs[following]
+                if self.code[following + 1:finish].strip() not in {'', '0'}:
+                    raise ValueError('Executable Kotlin require message needs callback analysis; analysis is incomplete')
+                following = finish + 1
+            return Statement(start, following, 'require', header=(opening + 1, close)), following
         control = re.match(r'(if|while|for|synchronized)\s*\(', self.code[start:end])
         if control:
             opening = start + control.end() - 1
@@ -442,9 +447,14 @@ class Summary:
 
 
 class Engine:
+    source_re = SOURCE_RE
+    sink_re = SINK_RE
+    sink_label = 'file sink'
+    path_constructors = True
+
     def __init__(self, path, text):
         self.path, self.text = path, text
-        self.parser = Parser(text, path.suffix.lower() in {'.kt', '.kts'})
+        self.parser = Parser(text, path.suffix.lower() in {'.kt', '.kts'}, self.source_re, self.sink_re)
         self.code = self.parser.code
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget = Budget()
@@ -463,7 +473,105 @@ class Engine:
     def record(self, offset, value):
         unsafe = frozenset(trace for trace in value if 'contained-path' not in trace.tags)
         if unsafe:
-            self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', 'file sink')))
+            self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', self.sink_label)))
+
+    def builtin_type(self, name):
+        return not re.search(r'\b(?:class|interface|object|enum|typealias)\s+' + name + r'\b|\bimport\s+(?!java\.(?:lang|io|net|util|nio\.file)\.)[\w.]+\.' + name + r'\b|\bimport\s+[\w.]+\s+as\s+' + name + r'\b', self.code)
+
+    def parameter_tags(self, declaration):
+        declaration = declaration.split('=', 1)[0].strip()
+        if self.parser.kotlin:
+            match = re.fullmatch(r'[A-Za-z_]\w*\s*:\s*([\w.]+)\s*\??', declaration)
+        else:
+            match = re.fullmatch(r'(?:final\s+)?([\w.]+)\s+[A-Za-z_]\w*', declaration)
+        if not match:
+            return frozenset()
+        actual = match.group(1)
+        types = {'String': 'jvm-string', 'java.lang.String': 'jvm-string', 'kotlin.String': 'jvm-string',
+                 'Path': 'jvm-path', 'java.nio.file.Path': 'jvm-path', 'File': 'jvm-path', 'java.io.File': 'jvm-path'}
+        tag = types.get(actual)
+        return frozenset({tag}) if tag and self.builtin_type(actual.rsplit('.', 1)[-1]) else frozenset()
+
+    def path_receiver(self, root, bindings, state):
+        binding = bindings.get(root, root)
+        receiver = state.get(binding, CLEAN)
+        if receiver:
+            return all('jvm-path' in trace.tags for trace in receiver)
+        # Clean values have no taint traces. A declaration's lexical identity
+        # still supplies its static type, including Kotlin constructor inference.
+        if '@' not in binding:
+            return False
+        offset = int(binding.rsplit('@', 1)[1])
+        prefix = self.code[max(0, offset - 80):offset]
+        tail = self.code[offset:]
+        declared = bool(re.search(r'\b(?:Path|File)\s+$', prefix)) or bool(re.match(re.escape(root) + r'\s*:\s*(?:Path|File)\b', tail))
+        inferred = bool(re.match(re.escape(root) + r'\s*=\s*(?:Paths\.get|Path\.of|File)\s*\(', tail))
+        return (declared or inferred) and all(self.builtin_type(name) for name in ('Path', 'Paths', 'File'))
+
+    def external_call(self, name, arguments, value, offset, bindings, state):
+        root, _, method = name.rpartition('.')
+        if name in {'File', 'Path.of', 'Paths.get'} and self.builtin_type(name.split('.')[0]) and name.split('.')[0] not in bindings:
+            return retag(value, add=frozenset({'jvm-path'}))
+        if method == 'resolve':
+            if self.path_receiver(root, bindings, state):
+                return retag(value, add=frozenset({'jvm-path'}), remove=frozenset({'contained-path', 'canonical-path'}))
+        if method in {'getFileName', 'getName'} and not arguments:
+            if self.path_receiver(root, bindings, state):
+                return CLEAN
+        if method in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'} and not arguments and self.path_receiver(root, bindings, state):
+            return retag(value, add=frozenset({'jvm-path'}))
+        if method in {'toString', 'toFile'} and not arguments:
+            return value
+        return retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
+
+    def member_value(self, name, value, offset, arguments=None):
+        if arguments and name in {'getFileName', 'getName', 'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile', 'toString', 'toFile'}:
+            return retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
+        if name in {'getFileName', 'getName', 'fileName', 'name'}:
+            return CLEAN if all('jvm-path' in trace.tags for trace in value) else value
+        if name in {'toString', 'getCanonicalPath'}:
+            return retag(value, remove=frozenset({'jvm-path', 'canonical-path'}))
+        if name in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'}:
+            return join(*(retag(frozenset({trace}), add=frozenset({'canonical-path'}))
+                          if 'jvm-path' in trace.tags else frozenset({trace}) for trace in value))
+        if name == 'resolve':
+            return retag(value, remove=frozenset({'contained-path', 'canonical-path'}))
+        return value
+
+    def call_sink(self, name, spans, arguments, value, offset):
+        if self.sink_re.search(name + '('):
+            if name in {'File', 'Path.of', 'Paths.get'} or name.endswith('.resolve'):
+                return True
+            self.record(offset, value)
+        return False
+
+    def summary_effect(self, summary, fact):
+        # Construction diagnostics are retained unless this selected helper
+        # proves containment for every return of the same symbolic value.
+        return frozenset(trace for trace in fact if 'path-construction' not in trace.tags or not (
+            (matches := [item for item in summary.returned if item.kind == trace.kind and item.key == trace.key])
+            and all('contained-path' in item.tags for item in matches)))
+
+    def summary_return(self, fact, offset):
+        return fact
+
+    def guard_facts(self, span):
+        condition = self.code[slice(*span)].strip()
+        guard = re.fullmatch(r'(!\s*)?([A-Za-z_]\w*)(\.(?:normalize|toRealPath|getCanonicalPath|getCanonicalFile)\s*\(\s*\))?\.startsWith\s*\(\s*([A-Za-z_]\w*)\s*\)', condition)
+        if guard:
+            return [(not bool(guard.group(1)), (guard.group(2), bool(guard.group(3)), guard.group(4)))]
+        return []
+
+    def apply_guard(self, guard, state, bindings):
+        name, canonical, root = guard
+        binding = bindings.get(name, name)
+        root_fact = state.get(bindings.get(root, root), CLEAN)
+        if any(trace.kind == 'source' for trace in root_fact):
+            return state
+        state[binding] = join(root_fact, *(retag(frozenset({trace}), add=frozenset({'contained-path'}))
+                              if 'jvm-path' in trace.tags and (canonical or 'canonical-path' in trace.tags) else frozenset({trace})
+                              for trace in state.get(binding, CLEAN)))
+        return state
 
     def expression(self, start, end, state, bindings, depth=0):
         if depth > 64:
@@ -492,23 +600,24 @@ class Engine:
             cursor += match.end()
             cursor = self.parser.skip(cursor, end)
             constructor = None
+            selected = False
+            arguments = None
             if cursor < end and self.code[cursor] == '(':
                 close = self.parser.pairs[cursor]
-                arguments = [self.expression(low, high, state, bindings, depth + 1)
-                             for low, high in self.parser.parts(cursor + 1, close)]
+                spans = list(self.parser.parts(cursor + 1, close))
+                arguments = [self.expression(low, high, state, bindings, depth + 1) for low, high in spans]
                 atom = join(atom, *arguments)
                 call_text = self.code[offset:close + 1]
                 # Arguments were evaluated above. Matching their text again
                 # here would resurrect a source after a known clean helper.
-                direct = SOURCE_RE.search(self.code[offset:cursor + 1])
+                direct = self.source_re.search(self.code[offset:cursor + 1])
                 if direct:
                     atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
                 candidates = [function for function in self.parser.functions.values()
                               if function.name == name.removeprefix('this.') and function.owner == self.function.owner
                               and len(function.parameters) == len(arguments)] if '.' not in name or name.startswith('this.') else []
-                if SAFE_EXPR_RE.search(name):
-                    atom = CLEAN
-                elif candidates:
+                if candidates:
+                    selected = True
                     returned = CLEAN
                     for function in candidates:
                         bound = {(function.key, index): fact for index, fact in enumerate(arguments)}
@@ -516,22 +625,23 @@ class Engine:
                             binding = bindings.get(capture, capture) if self.function.key == -1 else 'capture:' + capture
                             bound[(function.key, -index - 1)] = state.get(binding, CLEAN)
                         summary, call = self.summaries[function.key], self.step(offset, 'call', function.name + '()')
-                        returned = join(returned, substitute(summary.returned, bound, call))
+                        returned = join(returned, self.summary_return(substitute(summary.returned, bound, call), offset))
                         for sink, fact in summary.effects.items():
-                            self.effects[sink] = join(self.effects.get(sink, CLEAN), substitute(fact, bound, call))
+                            self.effects[sink] = join(self.effects.get(sink, CLEAN), substitute(self.summary_effect(summary, fact), bound, call))
                         for site, fact in summary.escapes.items():
                             self.escapes[site] = join(self.escapes.get(site, CLEAN), substitute(fact, bound, call))
                     atom = returned
-                elif SINK_RE.search(call_text[:call_text.index('(') + 1]):
-                    if name in {'File', 'Path.of', 'Paths.get'} or name.endswith('.resolve'):
+                else:
+                    if self.call_sink(name, spans, arguments, atom, offset):
                         constructor = offset
-                    else:
-                        self.record(offset, atom)
+                    atom = self.external_call(name, arguments, atom, offset, bindings, state)
                 cursor = close + 1
             else:
-                direct = SOURCE_RE.search(self.code[offset:cursor + 1])
+                direct = self.source_re.search(self.code[offset:cursor + 1])
                 if direct:
                     atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
+            if '.' in name and not selected:
+                atom = self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments)
             while cursor < end:
                 tail = self.parser.skip(cursor, end)
                 member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
@@ -541,27 +651,26 @@ class Engine:
                     cursor = close + 1
                 elif member:
                     method = member.group(1)
+                    arguments = None
                     cursor = self.parser.skip(tail + member.end(), end)
                     if cursor < end and self.code[cursor] == '(':
                         close = self.parser.pairs[cursor]
-                        atom = join(atom, *(self.expression(low, high, state, bindings, depth + 1)
-                                            for low, high in self.parser.parts(cursor + 1, close)))
+                        spans = list(self.parser.parts(cursor + 1, close))
+                        arguments = [self.expression(low, high, state, bindings, depth + 1) for low, high in spans]
+                        atom = join(atom, *arguments)
+                        if self.call_sink('.' + method, spans, arguments, atom, tail):
+                            constructor = tail
                         cursor = close + 1
-                    if method in {'getFileName', 'getName', 'fileName', 'name'}:
-                        atom = CLEAN
-                    elif method in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'}:
-                        atom = retag(atom, add=frozenset({'canonical-path'}))
-                    elif method == 'resolve':
+                    atom = self.member_value(method, atom, tail, arguments)
+                    if method == 'resolve' and self.path_constructors:
                         constructor = tail
                 else:
                     break
-            if name.endswith(('.normalize', '.toRealPath', '.getCanonicalPath', '.getCanonicalFile')):
-                atom = retag(atom, add=frozenset({'canonical-path'}))
-            if name.endswith(('.getFileName', '.getName', '.fileName', '.name')):
-                atom = CLEAN
             if constructor is not None:
-                self.record(constructor, atom)
+                self.record(constructor, retag(atom, add=frozenset({'path-construction'})))
             value = join(value, atom)
+        if '+' in self.code[start:end]:
+            value = retag(value, remove=frozenset({'contained-path', 'canonical-path'}))
         return value
 
     def assignment(self, span):
@@ -624,20 +733,27 @@ class Engine:
                 targets = () if entry is None else (entry,)
                 if kind == 'definition':
                     continue
+                if kind == 'require':
+                    imported = re.search(r'\bimport\s+(?!kotlin\.require\s*(?:;|\r?$))[^\r\n;]*(?:\.require\b|\bas\s+require\b|\.\*)', self.code, re.MULTILINE)
+                    if not imported and 'require' not in local and not any(item.name == 'require' for item in self.parser.functions.values()):
+                        for truth, guard in self.guard_facts(statement.header):
+                            if truth:
+                                entry = node('guard', statement.header, local, () if entry is None else (entry,), guard)
+                    entry = node('eval', statement.header, local, () if entry is None else (entry,))
+                    continue
                 if kind == 'block':
                     entry = block(statement.body, entry, dict(local), break_to, continue_to, unwind)
                 elif kind == 'if':
                     yes = block(statement.body, entry, dict(local), break_to, continue_to, unwind)
                     no = block(statement.otherwise, entry, dict(local), break_to, continue_to, unwind)
                     condition = self.code[slice(*statement.header)].strip()
-                    guard = re.fullmatch(r'(!\s*)?([A-Za-z_]\w*)(\.(?:normalize|toRealPath|getCanonicalPath|getCanonicalFile)\s*\(\s*\))?\.startsWith\s*\([^()]+\)', condition)
-                    if guard:
-                        safe = no if guard.group(1) else yes
-                        refined = node('guard', statement.header, local, () if safe is None else (safe,), (guard.group(2), bool(guard.group(3))))
-                        if guard.group(1):
-                            no = refined
-                        else:
+                    for truth, guard in self.guard_facts(statement.header):
+                        safe = yes if truth else no
+                        refined = node('guard', statement.header, local, () if safe is None else (safe,), guard)
+                        if truth:
                             yes = refined
+                        else:
+                            no = refined
                     branch_targets = (yes,) if condition == 'true' else (no,) if condition == 'false' else (yes, no)
                     entry = node('eval', statement.header, local, tuple(target for target in branch_targets if target is not None))
                 elif kind in {'while', 'for', 'do'}:
@@ -715,12 +831,7 @@ class Engine:
                     self.global_values[name] = join(self.global_values.get(name, CLEAN), fact)
             return state
         if kind == 'guard':
-            name, canonical = guard
-            binding = bindings.get(name, name)
-            state[binding] = join(*(retag(frozenset({trace}), add=frozenset({'contained-path'}))
-                                    if canonical or 'canonical-path' in trace.tags else frozenset({trace})
-                                    for trace in state.get(binding, CLEAN)))
-            return state
+            return self.apply_guard(guard, state, bindings)
         if kind == 'element':
             fact = self.expression(start, end, state, bindings)
             binding = bindings[guard]
@@ -735,6 +846,7 @@ class Engine:
             fact = self.expression(low, high, state, reads)
             if operator == '+=':
                 fact = join(state.get(reads.get(name, name), CLEAN), fact)
+                fact = retag(fact, remove=frozenset({'contained-path', 'canonical-path'}))
             fact = advance(fact, self.step(offset, 'assign', name))
             binding = bindings.get(name, name)
             if binding.startswith('capture:') and fact:
@@ -778,7 +890,9 @@ class Engine:
                     initial['capture:' + name] = frozenset({Trace('parameter', (key, -index - 1),
                         evidence=(self.step(key, 'parameter', 'global ' + name),))})
                 for index, name in enumerate(function.parameters):
-                    fact = frozenset({Trace('parameter', (key, index), evidence=(self.step(key, 'parameter', name),))})
+                    declaration = function.parameter_declarations[index] if index < len(function.parameter_declarations) else ''
+                    fact = frozenset({Trace('parameter', (key, index), tags=self.parameter_tags(declaration),
+                                           evidence=(self.step(key, 'parameter', name),))})
                     initial['param:' + str(index)] = fact
                 if entry is not None:
                     solve(entry, initial, edges, lambda node, state: self.transfer(actions[node], state), self.budget)
@@ -802,12 +916,15 @@ class Engine:
                         raise ValueError(f'{site.path}:{site.line}: Request-derived Kotlin global capture needs capture-state analysis; analysis is incomplete')
                     raise ValueError(f'{site.path}:{site.line}: Request-derived field/element write needs heap-state analysis; analysis is incomplete')
             for offset, fact in summary.effects.items():
+                fact = self.summary_effect(summary, fact)
                 if exposed:
                     fact = substitute(fact, exposed, self.step(key, 'entry', function.name))
                 concrete = frozenset(trace for trace in fact if trace.kind == 'source')
                 if concrete:
-                    line = self.step(offset, 'sink', 'file sink').line
-                    effects[line] = join(effects.get(line, CLEAN), concrete)
+                    sink = self.step(offset, 'sink', self.sink_label)
+                    # Entry exposure can append a call-site witness after a
+                    # callee effect. Every exported route ends at its exact sink.
+                    effects[sink.line] = join(effects.get(sink.line, CLEAN), advance(concrete, sink))
         return effects
 
 
@@ -817,8 +934,10 @@ def analyze(path, issues):
         return
     engine = Engine(path, text)
     lines = text.splitlines()
+    lang = 'kotlin' if path.suffix.lower() in {'.kt', '.kts'} else 'java'
+    suppressions = SourceSuppressions(lang)
     for line, fact in sorted(engine.analyze().items()):
-        if has_ignore(lines, line):
+        if suppressions.is_suppressed(path, line, lang + '.taint.path_traversal'):
             continue
         witness = min(fact, key=lambda trace: (len(trace.evidence), trace.evidence))
         path_desc = ' -> '.join(step.label for step in witness.evidence)
@@ -851,6 +970,9 @@ def run(ctx: RunContext) -> Iterable[dict]:
     BASE_DIR = Path.cwd()
     for path in ctx.files:
         if path.suffix.lower() not in {".java", ".kt", ".kts"}:
+            continue
+        lang = 'kotlin' if path.suffix.lower() in {'.kt', '.kts'} else 'java'
+        if not ctx.rule_enabled(lang + '.taint.path_traversal'):
             continue
         issues: list[tuple[str, int, str, dict]] = []
         analyze(path, issues)
@@ -901,10 +1023,16 @@ def _selftest_containment_guard_suppression() -> None:
     import tempfile
 
     code = (
-        "String name = request.getParameter(\"file\");\n"
-        "Path root = Paths.get(\"/srv/uploads\");\n"
-        "if (!name.normalize().startsWith(root)) { throw new IOException(\"bad\"); }\n"
-        "new FileInputStream(name.toString());\n"
+        'class Guarded {\n'
+        '  Path choose(Path root, String raw) {\n'
+        '    Path name = root.resolve(raw).normalize();\n'
+        '    if (!name.startsWith(root)) { throw new SecurityException("bad"); }\n'
+        '    return name;\n'
+        '  }\n'
+        '  void handler(Request request, Path root) {\n'
+        '    Files.readString(choose(root, request.getParameter("file")));\n'
+        '  }\n'
+        '}\n'
     )
     with tempfile.TemporaryDirectory(prefix="ubs_core_taint_java_traversal_") as tmp:
         target = Path(tmp) / "A.java"

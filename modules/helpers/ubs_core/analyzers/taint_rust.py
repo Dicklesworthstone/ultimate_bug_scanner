@@ -324,13 +324,35 @@ def _selftest_ubs_ignore_suppression(tmp_prefix: str = "ubs_core_taint_rust_ign_
     assert findings == [], findings
 
 
-def _selftest_validated_flow_suppression(tmp_prefix: str = "ubs_core_taint_rust_val_") -> None:
+def _selftest_unproven_predicate_detection(tmp_prefix: str = "ubs_core_taint_rust_pred_") -> None:
     import tempfile
 
     code = (
         "fn handler(params: Params) -> Result<Redirect, Error> {\n"
         "    let target = params.get(\"redirect_url\").unwrap_or_default();\n"
         "    if !is_allowed_redirect_host(&target) {\n"
+        "        return Err(Error::BadRedirect);\n"
+        "    }\n"
+        "    Redirect::to(&target)\n"
+        "}\n"
+    )
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "unproven.rs"
+        target.write_text(code, encoding="utf-8")
+        findings = list(run(RunContext(lang="rust", files=[target])))
+    assert len(findings) == 1, findings
+    assert findings[0]["rule"] == "rust.taint.open_redirect", findings
+    assert findings[0]["line"] == 6, findings
+
+
+def _selftest_validated_flow_suppression(tmp_prefix: str = "ubs_core_taint_rust_val_") -> None:
+    import tempfile
+
+    code = (
+        "fn handler(params: Params) -> Result<Redirect, Error> {\n"
+        "    let target = params.get(\"redirect_url\").unwrap_or_default();\n"
+        "    if !(target.starts_with('/') && !target.starts_with(\"//\")\n"
+        "        && !target.contains('\\\\') && !target.chars().any(char::is_control)) {\n"
         "        return Err(Error::BadRedirect);\n"
         "    }\n"
         "    Redirect::to(&target)\n"
@@ -385,6 +407,7 @@ def _selftest_main_dialect(tmp_prefix: str = "ubs_core_taint_rust_main_") -> Non
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("direct_flow_detects", _selftest_direct_flow),
     ("ubs_ignore_suppression", _selftest_ubs_ignore_suppression),
+    ("unproven_predicate_detection", _selftest_unproven_predicate_detection),
     ("validated_flow_suppression", _selftest_validated_flow_suppression),
     ("main_dialect_walk_and_file_list", _selftest_main_dialect),
 )

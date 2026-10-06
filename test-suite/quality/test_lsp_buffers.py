@@ -60,6 +60,18 @@ class BufferScanTests(BufferFixture, unittest.TestCase):
         self.assertEqual(call['files'][0][1], 'BUG\n')
         self.assertFalse(Path(call['cwd']).exists())
 
+    def test_git_pager_does_not_block_unsaved_buffer_analysis(self):
+        original = self.source.read_bytes()
+        with patch.dict(os.environ, {'GIT_PAGER': 'cat'}):
+            self.open('BUG\n')
+            self.drain()
+        result = self.diagnostics()[-1]
+        self.assertEqual(result['diagnostics'][0]['code'], 'test.bug')
+        self.assertEqual(result['diagnostics'][0]['data'], {'ubsSourceMode': 'buffer'})
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertNotEqual(self.calls()[0]['cwd'], str(self.root))
+        self.assertEqual(self.calls()[0]['files'][0][1], 'BUG\n')
+
     def test_real_stdio_buffer_mode_uses_unsaved_text_without_saving(self):
         process = subprocess.Popen([sys.executable, '-I', str(ROOT / 'ubs-lsp'), '--repo', str(self.root),
                                     '--scanner', str(self.scanner), '--buffer-mode=snapshot'],
@@ -271,8 +283,22 @@ class SnapshotTests(BufferFixture, unittest.TestCase):
 
     def test_git_redirects_are_rejected_without_starting_scanner(self):
         self.open('BUG')
-        with patch.dict(os.environ, {'GIT_DIR': '/somewhere'}), self.assertRaises(lsp.ProtocolError):
-            self.preview()
+        redirected_environments = (
+            {'GIT_DIR': '/somewhere'},
+            {'GIT_WORK_TREE': '/somewhere'},
+            {'GIT_INDEX_FILE': '/somewhere/index'},
+            {'GIT_CONFIG_GLOBAL': '/somewhere/config'},
+            {'GIT_CONFIG_SYSTEM': '/somewhere/config'},
+            {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.worktree',
+             'GIT_CONFIG_VALUE_0': '/somewhere'},
+            {'GIT_CONFIG_PARAMETERS': "'core.worktree=/somewhere'"},
+            {'GIT_PAGER_UNKNOWN': 'cat'},
+        )
+        for environment in redirected_environments:
+            with self.subTest(environment=environment):
+                with patch.dict(os.environ, {'GIT_PAGER': 'cat', **environment}), \
+                        self.assertRaisesRegex(lsp.ProtocolError, 'redirected Git environments'):
+                    self.preview()
         git = self.root / '.git'
         git.write_text('gitdir: /external')
         with self.assertRaises(lsp.ProtocolError):

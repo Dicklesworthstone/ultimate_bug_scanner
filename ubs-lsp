@@ -532,7 +532,9 @@ class BufferWorkspace:
 
     def validate_configuration(self):
         self.check()
-        if any(key.startswith('GIT_') for key in os.environ):
+        # A pager only changes presentation; all other Git overrides remain
+        # unsupported so snapshots cannot silently use redirected inputs.
+        if any(key.startswith('GIT_') and key != 'GIT_PAGER' for key in os.environ):
             raise ProtocolError('Buffer snapshots do not support redirected Git environments')
         if any((parent / '.git').exists() for parent in self.original.parents):
             raise ProtocolError('Buffer mode requires the complete repository root, not an inherited Git subdirectory')

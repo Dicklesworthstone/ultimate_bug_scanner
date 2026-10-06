@@ -192,8 +192,9 @@ class RedirectFlow(CSharpFlow):
                 stop = start + match.end()
                 header = match.group(2) == ".Location"
                 if match.group(2) == "[":
-                    close = self.parser.pairs[stop - 1]
-                    key = self.literal(stop, close)
+                    opening = start + match.start(2)
+                    close = self.parser.pairs[opening]
+                    key = self.literal(opening + 1, close)
                     header = key is not None and key.casefold() == "location"
                     stop = close + 1
                 assignment = re.match(r"\s*=(?!=|>)", self.code[stop:end])

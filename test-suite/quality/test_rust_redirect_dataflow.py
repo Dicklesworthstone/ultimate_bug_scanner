@@ -422,6 +422,256 @@ class SummaryTests(SourceCase):
                 next(findings)
 
 
+class QualifiedHelperTests(SourceCase):
+    def test_module_helper_summary_preserves_sink_and_source_locations(self):
+        helper = 'mod handlers {\n pub fn send(target: &str) {\n  Redirect::to(target);\n }\n}\n'
+        caller = f'fn handler(params: Params) {{ handlers::send({SOURCE}); handlers::send("/"); }}\n'
+        for code in (helper + caller, caller + helper):
+            with self.subTest(code=code):
+                got = self.scan(code)
+                site = code.index('Redirect::to')
+                self.assertEqual([row[1] for row in got], [code[:site].count('\n') + 1], got)
+                self.assertIn('Redirect::to(target)', got[0][3])
+                self.assertIn('params.get("next") -> redirect', got[0][3])
+                self.assertEqual(Source(code).solve(), {
+                    site: frozenset({Origin('source', code.index(SOURCE), SOURCE)})})
+
+    def test_module_constant_return_and_passthrough_are_distinct(self):
+        for returned, expected in (('"/safe"', 0), ('raw', 1)):
+            with self.subTest(returned=returned):
+                self.count(f'mod helpers {{pub fn target(raw: &str) -> &str {{{returned}}}}} '
+                           f'Redirect::to(helpers::target({SOURCE}));', expected)
+
+    def test_module_helper_can_prove_a_guarded_return(self):
+        guard = LOCAL_GUARD.replace('target', 'raw')
+        self.count(f'mod helpers {{pub fn target(raw: &str) -> &str {{'
+                   f'if {guard} {{raw}} else {{"/"}}}}}} '
+                   f'Redirect::to(helpers::target({SOURCE}));', 0)
+
+    def test_associated_helpers_and_self_across_separate_impls(self):
+        definitions = 'struct Handler {}\nimpl Handler {fn send(x: &str) {Redirect::to(x);}}\n'
+        for call in (f'fn handler(params: Params) {{Handler::send({SOURCE});}}',
+                     f'impl Handler {{fn handler(params: Params) {{Self::send({SOURCE});}}}}'):
+            for code in (definitions + call, call + definitions):
+                with self.subTest(code=code):
+                    self.assertEqual(len(self.scan(code)), 1)
+
+    def test_associated_constant_return_and_passthrough_are_distinct(self):
+        for returned, expected in (('"/safe"', 0), ('raw', 1)):
+            with self.subTest(returned=returned):
+                self.count(f'struct Handler {{}} impl Handler {{fn target(raw: &str) -> &str {{{returned}}}}} '
+                           f'Redirect::to(Handler::target({SOURCE}));', expected)
+
+    def test_module_and_type_value_bindings_do_not_shadow_namespaces(self):
+        self.count(f'mod handlers {{pub fn send(x: &str) {{Redirect::to(x);}}}} '
+                   f'let handlers=8; handlers::send({SOURCE});')
+        self.count(f'struct Handler {{}} impl Handler {{fn send(x: &str) {{Redirect::to(x);}}}} '
+                   f'let Handler=7; Handler::send({SOURCE});')
+
+    def test_sibling_modules_and_same_named_types_never_mix(self):
+        for selected, expected in (('safe', 0), ('unsafe_handlers', 1)):
+            code = f'''mod safe {{
+                pub struct Handler {{}}
+                impl Handler {{pub fn send(x: &str) {{Redirect::to("/");}}}}
+            }}
+            mod unsafe_handlers {{
+                pub struct Handler {{}}
+                impl Handler {{pub fn send(x: &str) {{Redirect::to(x);}}}}
+            }}
+            fn handler(params: Params) {{{selected}::Handler::send({SOURCE});}}'''
+            with self.subTest(selected=selected):
+                got = self.scan(code)
+                self.assertEqual(len(got), expected, got)
+                if expected:
+                    self.assertEqual(got[0][1], 7)
+
+    def test_module_qualification_does_not_fall_back_to_a_free_namesake(self):
+        self.count(f'fn send(x: &str) {{Redirect::to(x);}} external::send({SOURCE});', 0)
+        self.count(f'mod empty {{}} fn send(x: &str) {{Redirect::to(x);}} empty::send({SOURCE});', 0)
+        self.count(f'fn fixed(x: &str) -> &str {{"/"}} Redirect::to(external::fixed({SOURCE}));')
+
+    def test_self_qualification_ignores_block_local_function_names(self):
+        for module_value, local_value, expected in (('x', '"/"', 1), ('"/"', 'x', 0)):
+            with self.subTest(module_value=module_value):
+                got = self.scan(f'''fn send(x: &str) {{Redirect::to({module_value});}}
+                    fn handler(params: Params) {{
+                        fn send(x: &str) {{Redirect::to({local_value});}}
+                        self::send({SOURCE});
+                    }}''')
+                self.assertEqual(len(got), expected, got)
+
+    def test_self_and_super_follow_inline_module_ancestry(self):
+        got = self.scan(f'''mod outer {{
+            fn send(x: &str) {{Redirect::to(x);}}
+            mod middle {{mod inner {{
+                fn handler(params: Params) {{{{super::super::send({SOURCE});}}}}
+            }}}}
+            fn local(params: Params) {{self::send({SOURCE});}}
+        }}''')
+        self.assertEqual([row[1] for row in got], [2], got)
+
+    def test_crate_and_extern_roots_are_not_inferred_from_a_selected_file(self):
+        for path in ('crate::helpers', '::helpers', 'super::helpers'):
+            with self.subTest(path=path):
+                self.count(f'mod helpers {{pub fn fixed(x: &str) -> &str {{"/"}}}} '
+                           f'Redirect::to({path}::fixed({SOURCE}));')
+
+    def test_opaque_path_arguments_still_execute_known_sinks(self):
+        for path in ('external::dispatch', 'crate::dispatch', '::dispatch',
+                     'external::Type::<u8, u16>::dispatch'):
+            with self.subTest(path=path):
+                self.count(f'{path}(Redirect::to({SOURCE}));')
+
+    def test_block_local_module_shadows_only_its_lexical_region(self):
+        code = f'''mod helpers {{pub fn target(x: &str) -> &str {{x}}}}
+            fn handler(params: Params) {{
+                {{mod helpers {{pub fn target(x: &str) -> &str {{"/"}}}}
+                    Redirect::to(helpers::target({SOURCE}));}}
+                Redirect::to(helpers::target({SOURCE}));
+            }}'''
+        got = self.scan(code)
+        self.assertEqual([row[1] for row in got], [5], got)
+
+    def test_imported_modules_and_type_aliases_are_opaque_even_after_the_call(self):
+        for declaration, prefix in (('use external::helpers;', 'helpers'),
+                                    ('use external::{nested::{self as helpers}};', 'helpers'),
+                                    ('use external::Handler;', 'Handler'),
+                                    ('type Handler = external::Other;', 'Handler')):
+            code = f'''mod helpers {{pub fn fixed(x: &str) -> &str {{"/"}}}}
+                struct Handler {{}}
+                impl Handler {{fn fixed(x: &str) -> &str {{"/"}}}}
+                fn handler(params: Params) {{
+                    Redirect::to({prefix}::fixed({SOURCE}));
+                    {declaration}
+                }}'''
+            with self.subTest(declaration=declaration):
+                self.assertEqual(len(self.scan(code)), 1)
+
+    def test_grouped_and_glob_imports_block_outer_free_helpers(self):
+        for declaration in ('use external::fixed;', 'use external::{nested::{fixed}};',
+                            'use external::{nested::*};'):
+            with self.subTest(declaration=declaration):
+                got = self.scan(f'''fn fixed(x: &str) -> &str {{"/"}}
+                    fn handler(params: Params) {{Redirect::to(fixed({SOURCE})); {declaration}}}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_glob_imports_do_not_hide_explicit_local_declarations(self):
+        self.count(f'use external::*; mod helpers {{pub fn fixed(x: &str) -> &str {{"/"}}}} '
+                   f'Redirect::to(helpers::fixed({SOURCE}));', 0)
+
+    def test_generic_type_parameters_shadow_nominal_types(self):
+        got = self.scan(f'''struct Handler {{}}
+            impl Handler {{fn fixed(x: &str) -> &str {{"/"}}}}
+            fn handler<Handler: ExternalTrait>(params: Params) {{
+                Redirect::to(Handler::fixed({SOURCE}));
+            }}''')
+        self.assertEqual(len(got), 1, got)
+
+    def test_const_parameters_and_lifetimes_do_not_shadow_nominal_types(self):
+        for generics in ('const Handler: usize', "'Handler"):
+            with self.subTest(generics=generics):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{fn send(x: &str) {{Redirect::to(x);}}}}
+                    fn handler<{generics}>(params: Params) {{Handler::send({SOURCE});}}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_generic_owner_and_ufcs_paths_never_rebind_the_trailing_leaf(self):
+        for path in ('external::Type::<u8>::fixed', 'external::Type :: <u8> :: fixed',
+                     '<Type as Trait>::fixed', '<Type<u8> as Trait>::fixed',
+                     'external::Type::<Vec<u8>>::fixed::<u16>',
+                     'external::Type::<u8, u16>::fixed',
+                     'external::Type::<Result<u8, E>>::fixed',
+                     'external::Type::<fn() -> Result<u8, E>>::fixed',
+                     '<Type<u8, u16> as Trait>::fixed'):
+            with self.subTest(path=path):
+                self.count(f'fn fixed(x: &str) -> &str {{"/"}} Redirect::to({path}({SOURCE}));')
+                self.count(f'fn fixed(x: &str) {{Redirect::to(x);}} {path}({SOURCE});', 0)
+
+    def test_generic_arguments_on_a_known_function_preserve_its_summary(self):
+        for returned, expected in (('x', 1), ('"/"', 0)):
+            for arguments in ('::<u8>', ':: <u8>', '::/*comment*/<u8>', '::<Result<u8, E>>'):
+                with self.subTest(returned=returned, arguments=arguments):
+                    self.count(f'mod helpers {{pub fn target<T>(x: &str) -> &str {{{returned}}}}} '
+                               f'Redirect::to(helpers::target{arguments}({SOURCE}));', expected)
+
+    def test_comparison_operators_do_not_merge_call_arguments(self):
+        self.count(f'fn choose(flag: bool, x: &str) -> &str {{x}} '
+                   f'Redirect::to(choose(flag < 3, {SOURCE}));')
+        self.count(f'fn choose(x: &str, flag: bool) -> &str {{x}} '
+                   f'Redirect::to(choose({SOURCE}, flag > 3));')
+
+    def test_unclosed_generic_lookahead_consumes_the_shared_work_budget(self):
+        source = Source('<' + 'UnknownType ' * 100, max_steps=100)
+        self.assertGreater(source.budget.remaining, 0)
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            source.path(0, len(source.code))
+
+    def test_ambiguous_comparison_lookahead_is_bounded_without_timing(self):
+        comparisons = ', '.join(['x < y'] * 250)
+        code = f'fn handler(params: Params) {{let flags=[{comparisons}]; Redirect::to({SOURCE});}}'
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            Source(code, max_steps=20_000).solve()
+        self.assertEqual(len(Source(code).solve()), 1)
+
+    def test_small_comparisons_and_unambiguous_less_equal_remain_supported(self):
+        for comparisons in ('x < y, y < z, x < z', ', '.join(['x <= y'] * 250)):
+            with self.subTest(comparisons=comparisons):
+                code = f'fn handler(params: Params) {{let flags=[{comparisons}]; Redirect::to({SOURCE});}}'
+                self.assertEqual(len(Source(code, max_steps=20_000).solve()), 1)
+
+    def test_trait_impl_methods_are_not_selected_as_inherent_methods(self):
+        got = self.scan(f'''struct Handler {{}}
+            trait External {{fn fixed(x: &str) -> &str;}}
+            impl External for Handler {{fn fixed(x: &str) -> &str {{"/"}}}}
+            fn handler(params: Params) {{Redirect::to(Handler::fixed({SOURCE}));}}''')
+        self.assertEqual(len(got), 1, got)
+
+    def test_inherent_method_is_not_confused_with_trait_namesake(self):
+        got = self.scan(f'''struct Handler {{}}
+            trait External {{fn send(x: &str);}}
+            impl External for Handler {{fn send(x: &str) {{Redirect::to("/");}}}}
+            impl Handler {{fn send(x: &str) {{Redirect::to(x);}}}}
+            fn handler(params: Params) {{Handler::send({SOURCE});}}''')
+        self.assertEqual([row[1] for row in got], [4], got)
+
+    def test_ambiguous_associated_methods_and_specializations_are_opaque(self):
+        for definitions, path in (
+            ('struct Handler {} impl Handler {fn fixed(x: &str) -> &str {"/"}} '
+             'impl Handler {fn fixed(x: &str) -> &str {x}}', 'Handler::fixed'),
+            ('struct Handler<T> {value: T} impl Handler<u8> {fn fixed(x: &str) -> &str {"/"}}',
+             'Handler::<u8>::fixed'),
+        ):
+            with self.subTest(definitions=definitions):
+                self.count(definitions + f'Redirect::to({path}({SOURCE}));')
+
+    def test_dynamic_method_dispatch_remains_opaque(self):
+        self.count(f'fn fixed(x: &str) -> &str {{"/"}} Redirect::to(service.fixed({SOURCE}));')
+
+    def test_impl_trait_function_signatures_are_not_type_boundaries(self):
+        for parameter, returned in (('Params', 'impl IntoResponse'), ('impl RequestParams', 'Redirect'),
+                                    ('impl RequestParams', 'impl IntoResponse')):
+            with self.subTest(parameter=parameter, returned=returned):
+                got = self.scan(f'''fn send(x: &str) {{Redirect::to(x);}}
+                    fn handler(params: {parameter}) -> {returned} {{send({SOURCE});}}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_bare_helpers_in_impl_methods_resolve_in_the_enclosing_module(self):
+        for header in ('impl Handler', 'impl External for Handler'):
+            for free, associated, expected in (('x', '"/"', 1), ('"/"', 'x', 0)):
+                with self.subTest(header=header, free=free):
+                    got = self.scan(f'''fn send(x: &str) {{Redirect::to({free});}}
+                        struct Handler {{}}
+                        {header} {{
+                            fn send(x: &str) {{Redirect::to({associated});}}
+                            fn handler(params: Params) {{send({SOURCE});}}
+                        }}''')
+                    self.assertEqual(len(got), expected, got)
+
+    def test_framework_static_sink_contract_survives_local_stand_ins(self):
+        self.count(f'struct Redirect {{}} impl Redirect {{fn to(x: &str) -> Self {{Redirect {{}}}}}} '
+                   f'Redirect::to({SOURCE});')
+
+
 class PatternFlowTests(SourceCase):
     def test_match_binding_reaches_sink(self):
         self.count(f'match {SOURCE} {{ Some(target) => Redirect::to(target), None => Redirect::to("/") }}')
@@ -610,6 +860,7 @@ class RealScannerTests(SourceCase):
             safe = project / 'safe.rs'
             safe.write_text('fn handler() { Redirect::to("/safe"); }\n', encoding='utf-8')
             cases = [('unsafe', dangerous, True), ('safe', safe, False)]
+            expected_lines = {'unsafe': 1}
             patterns = (
                 ('match', f'match {SOURCE} {{Some(target) => Redirect::to(target), _ => Redirect::to("/")}}', True),
                 ('if-let', f'if let Some(target)={SOURCE} {{Redirect::to(target);}}', True),
@@ -624,6 +875,44 @@ class RealScannerTests(SourceCase):
                 target = project / (name + '.rs')
                 target.write_text('fn handler(params: Params) {\n' + body + '\n}\n', encoding='utf-8')
                 cases.append((name, target, expected))
+                if expected:
+                    expected_lines[name] = 2
+            qualified = (
+                ('module-helper', 'mod helpers {\n pub fn send(x: &str) {\n  Redirect::to(x);\n }\n}\n'
+                 f'fn handler(params: Params) {{helpers::send({SOURCE});}}', 3),
+                ('module-constant', 'mod helpers {pub fn fixed(x: &str) -> &str {"/"}}\n'
+                 f'fn handler(params: Params) {{Redirect::to(helpers::fixed({SOURCE}));}}', None),
+                ('associated-helper', 'struct Handler {}\nimpl Handler {\n fn send(x: &str) {Redirect::to(x);}\n}\n'
+                 f'fn handler(params: Params) {{Handler::send({SOURCE});}}', 3),
+                ('self-helper', 'struct Handler {}\nimpl Handler {\n fn send(x: &str) {Redirect::to(x);}\n}\n'
+                 f'impl Handler {{fn handler(params: Params) {{Self::send({SOURCE});}}}}', 3),
+                ('module-collision-clean', 'mod first {pub fn send(x: &str) {Redirect::to(x);}}\n'
+                 'mod second {pub fn send(x: &str) {Redirect::to("/");}}\n'
+                 f'fn handler(params: Params) {{second::send({SOURCE});}}', None),
+                ('import-after-call', 'mod helpers {pub fn fixed(x: &str) -> &str {"/"}}\n'
+                 'fn handler(params: Params) {\n'
+                 f' Redirect::to(helpers::fixed({SOURCE}));\n use external::helpers;\n}}', 3),
+                ('type-alias-after-call', 'struct Handler {}\n'
+                 'impl Handler {fn fixed(x: &str) -> &str {"/"}}\n'
+                 'fn handler(params: Params) {\n'
+                 f' Redirect::to(Handler::fixed({SOURCE}));\n type Handler = external::Other;\n}}', 4),
+                ('generic-type-shadow', 'struct Handler {}\n'
+                 'impl Handler {fn fixed(x: &str) -> &str {"/"}}\n'
+                 'fn handler<Handler: ExternalTrait>(params: Params) {\n'
+                 f' Redirect::to(Handler::fixed({SOURCE}));\n}}', 4),
+                ('qualified-generic-opaque', 'fn fixed(x: &str) -> &str {"/"}\n'
+                 f'fn handler(params: Params) {{Redirect::to(external::Type::<Result<u8, E>>::fixed({SOURCE}));}}', 2),
+                ('impl-trait-handler', 'fn send(x: &str) {Redirect::to(x);}\n'
+                 f'fn handler(params: impl RequestParams) -> impl IntoResponse {{send({SOURCE});}}', 1),
+                ('impl-free-helper', 'fn send(x: &str) {Redirect::to(x);}\nstruct Handler {}\n'
+                 f'impl Handler {{fn handler(params: Params) {{send({SOURCE});}}}}', 1),
+            )
+            for name, code, line in qualified:
+                target = project / (name + '.rs')
+                target.write_text(code + '\n', encoding='utf-8')
+                cases.append((name, target, line is not None))
+                if line is not None:
+                    expected_lines[name] = line
             for fmt in ('json', 'sarif'):
                 for name, target, expected in cases:
                     result = subprocess.run([str(ROOT / 'ubs'), '--only=rust', '--ci', '--format=' + fmt, str(target)],
@@ -648,6 +937,18 @@ class RealScannerTests(SourceCase):
                     self.assertEqual(len(findings), int(expected), (payload, result.stderr))
                     if fmt == 'json':
                         self.assertEqual(payload['status'], 'ok', payload)
+                    if expected:
+                        finding = findings[0]
+                        if fmt == 'json':
+                            line, filename, message = finding['line'], finding['file'], finding['message']
+                        else:
+                            location = finding['locations'][0]['physicalLocation']
+                            line = location['region']['startLine']
+                            filename = location['artifactLocation']['uri']
+                            message = finding['message']['text']
+                        self.assertEqual(line, expected_lines[name], finding)
+                        self.assertEqual(Path(filename).name, target.name, finding)
+                        self.assertIn('params.get("next") -> redirect', message, finding)
                     print('RUST_REDIRECT_REAL_SCAN', fmt, name, 'PASS', flush=True)
 
     def test_malformed_source_is_partial_and_never_cached_as_clean(self):

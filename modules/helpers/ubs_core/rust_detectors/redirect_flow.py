@@ -106,6 +106,12 @@ class Summary:
     completes: bool = False
 
 
+@dataclass(frozen=True)
+class Namespace:
+    kind: str
+    site: int
+
+
 _IDENTIFIER = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*')
 _PATH = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*(?:\s*(?:::|\.)\s*(?:r#)?[A-Za-z_][A-Za-z_0-9]*)*')
 
@@ -141,19 +147,25 @@ class Source:
         self.braces = sorted(self.parents)
         self.lines = [0] + [m.end() for m in re.finditer('\n', text)]
         self.boundaries = {}
-        for opening in self.braces:
-            prefix = self.code[max(0, opening - 500):opening]
-            prefix = re.split(r'[;{}]', prefix)[-1]
-            if re.search(r'\b(?:mod|impl|trait)\b', prefix):
-                self.boundaries[opening] = 'module' if re.search(r'\bmod\b', prefix) else 'type'
         self.functions = []
         self.symbols = {}
         self.definitions = {}
+        # Rust's type/module namespace is separate from local value bindings.
+        # None records an imported, unsupported, or ambiguous declaration; it
+        # must stop lookup rather than falling through to an outer namesake.
+        self.namespaces = {}
+        self.imported_names = defaultdict(set)
+        self.glob_imports = set()
+        self.impl_headers = {}
+        self.impl_owners = {}
+        self.associated = {}
         for match in re.finditer(r'\bfn\s+((?:r#)?[A-Za-z_]\w*)', self.code):
             self.budget.spend()
             pos = self.skip(match.end())
+            generic_start, generic_end = pos, pos
             if pos < len(self.code) and self.code[pos] == '<':
-                pos = self.generic_end(pos, len(self.code))
+                generic_end = self.generic_end(pos, len(self.code))
+                pos = generic_end
                 pos = self.skip(pos)
             if pos not in self.pairs or self.code[pos] != '(':
                 continue
@@ -161,6 +173,8 @@ class Source:
             body = self.next_boundary(close + 1, len(self.code), '{;')
             if body >= len(self.code) or self.code[body] != '{' or body not in self.pairs:
                 continue
+            if generic_end > generic_start:
+                self.type_parameters(generic_start, generic_end, body)
             params = []
             for begin, end in self.parts(pos + 1, close, generics=True):
                 colon = self.next_boundary(begin, end, ':')
@@ -172,6 +186,21 @@ class Source:
             self.definitions[match.start()] = function
             key = (function.scope, function.name)
             self.symbols[key] = None if key in self.symbols else function
+        self.index_namespaces()
+        for opening, (begin, end) in self.impl_headers.items():
+            raw = self.code[begin:end].strip()
+            # Specializations and trait impls require type/trait resolution.
+            # Keep them opaque; do not associate their methods by leaf name.
+            if not re.fullmatch(r'(?:r#)?[A-Za-z_]\w*(?:\s*::\s*(?:r#)?[A-Za-z_]\w*)*', raw):
+                continue
+            owner = self.namespace_path(re.sub(r'\s+', '', raw).split('::'), opening)
+            if owner is not None and owner.kind == 'type':
+                self.impl_owners[opening] = owner
+        for function in self.functions:
+            owner = self.impl_owners.get(function.scope)
+            if owner is not None:
+                key = (owner.site, function.name)
+                self.associated[key] = None if key in self.associated else function
         self.summaries = {f: Summary() for f in self.functions}
         self.callers = defaultdict(set)
 
@@ -192,6 +221,9 @@ class Source:
     def generic_end(self, start, end):
         depth = 0
         for pos in range(start, end):
+            # Failed lookahead is work too: repeated ordinary comparisons
+            # must not hide an unbounded character scan from the solver.
+            self.budget.spend()
             char = self.code[pos]
             if char == '<':
                 depth += 1
@@ -223,9 +255,16 @@ class Source:
             elif pos in self.pairs:
                 pos = self.pairs[pos] + 1
                 continue
-            elif generics and self.code[pos] == '<':
-                pos = self.generic_end(pos, end)
-                continue
+            elif self.code[pos] == '<' and not self.code.startswith('<=', pos):
+                closing = self.generic_end(pos, end)
+                # Expression paths introduce type arguments with `::<...>`
+                # or a qualified `<Type as Trait>::...` owner. Their commas
+                # are not call-argument separators. Plain comparisons still
+                # split normally; only type contexts accept a bare `<...>`.
+                if (generics or self.code[start:pos].rstrip().endswith('::')
+                        or self.code.startswith('::', self.skip(closing, end))):
+                    pos = closing
+                    continue
             pos += 1
         if self.raw[begin:end].strip():
             result.append((begin, end))
@@ -308,14 +347,204 @@ class Source:
             scope = self.parents[scope]
         return scope
 
+    def declare_namespace(self, scope, name, namespace):
+        key = (scope, name.removeprefix('r#'))
+        self.namespaces[key] = None if key in self.namespaces else namespace
+
+    def type_parameters(self, start, end, scope):
+        for begin, finish in self.parts(start + 1, end - 1, generics=True):
+            begin = self.skip(begin, finish)
+            # Const parameters and lifetimes do not shadow type names.
+            if self.code[begin:begin + 1] == "'" or re.match(r'const\b', self.code[begin:finish]):
+                continue
+            token = _IDENTIFIER.match(self.code, begin, finish)
+            if token is not None:
+                self.declare_namespace(scope, token.group(), None)
+
+    def import_names(self, start, end, prefix=''):
+        names, wildcard = set(), False
+        for begin, finish in self.parts(start, end):
+            raw = self.code[begin:finish].strip()
+            alias = re.search(r'\bas\s+((?:r#)?[A-Za-z_]\w*)\s*$', raw)
+            if alias is not None:
+                if alias.group(1) != '_':
+                    names.add(alias.group(1).removeprefix('r#'))
+                continue
+            opening = self.next_boundary(begin, finish, '{')
+            if opening in self.pairs and self.pairs[opening] < finish:
+                tokens = list(_IDENTIFIER.finditer(self.code, begin, opening))
+                parent = tokens[-1].group() if tokens else prefix
+                nested, star = self.import_names(opening + 1, self.pairs[opening], parent)
+                names.update(nested)
+                wildcard |= star
+            elif '*' in raw:
+                wildcard = True
+            else:
+                tokens = list(_IDENTIFIER.finditer(raw))
+                if tokens:
+                    name = tokens[-1].group().removeprefix('r#')
+                    if name == 'self':
+                        name = tokens[-2].group() if len(tokens) > 1 else prefix
+                    if name and name not in {'self', 'super', 'crate', '_'}:
+                        names.add(name)
+        return names, wildcard
+
+    def index_namespaces(self):
+        for match in re.finditer(r'\b(mod|struct|enum|union|trait|type)\s+((?:r#)?[A-Za-z_]\w*)', self.code):
+            self.budget.spend()
+            kind, name = match.groups()
+            scope = self.scope_at(match.start())
+            namespace = None
+            if kind == 'mod':
+                opening = self.skip(match.end())
+                if self.code[opening:opening + 1] == '{' and opening in self.pairs:
+                    namespace = Namespace('module', opening)
+                    self.boundaries[opening] = 'module'
+            elif kind in {'struct', 'enum', 'union'}:
+                namespace = Namespace('type', match.start())
+            elif kind == 'trait':
+                opening = self.next_boundary(match.end(), len(self.code), '{;')
+                if opening in self.pairs and self.code[opening] == '{':
+                    self.boundaries[opening] = 'type'
+            self.declare_namespace(scope, name, namespace)
+        for match in re.finditer(r'\buse\s+', self.code):
+            self.budget.spend()
+            end = self.next_boundary(match.end(), len(self.code), ';')
+            scope = self.scope_at(match.start())
+            names, wildcard = self.import_names(match.end(), end)
+            self.imported_names[scope].update(names)
+            if wildcard:
+                self.glob_imports.add(scope)
+            for name in names:
+                self.declare_namespace(scope, name, None)
+        for match in re.finditer(r'\bextern\s+crate\s+((?:r#)?[A-Za-z_]\w*)(?:\s+as\s+((?:r#)?[A-Za-z_]\w*))?', self.code):
+            self.declare_namespace(self.scope_at(match.start()), match.group(2) or match.group(1), None)
+        function_starts = [function.start for function in self.functions]
+        for match in re.finditer(r'\bimpl\b', self.code):
+            self.budget.spend()
+            index = bisect_right(function_starts, match.start()) - 1
+            if index >= 0 and match.start() < self.functions[index].body:
+                # `impl Trait` parameters/returns are function signatures,
+                # not impl items defining an associated-method namespace.
+                continue
+            begin = self.skip(match.end())
+            generic_start, generic_end = begin, begin
+            if self.code[begin:begin + 1] == '<':
+                generic_end = self.generic_end(begin, len(self.code))
+                begin = self.skip(generic_end)
+            opening = self.next_boundary(begin, len(self.code), '{;')
+            if opening not in self.pairs or self.code[opening] != '{':
+                continue
+            self.boundaries[opening] = 'type'
+            self.impl_headers[opening] = (begin, opening)
+            if generic_end > generic_start:
+                self.type_parameters(generic_start, generic_end, opening)
+
+    def module_scope(self, scope):
+        while scope >= 0 and self.boundaries.get(scope) != 'module':
+            scope = self.parents[scope]
+        return scope
+
+    def lookup_namespace(self, name, scope):
+        while True:
+            key = (scope, name.removeprefix('r#'))
+            if key in self.namespaces:
+                return self.namespaces[key]
+            if scope in self.glob_imports or scope < 0 or self.boundaries.get(scope) == 'module':
+                return None
+            scope = self.parents[scope]
+
+    def namespace_path(self, parts, pos):
+        if not parts or not parts[0] or parts[0] == 'crate':
+            # The selected file may itself be an external module. Its text
+            # does not establish crate-root or extern-prelude identities.
+            return None
+        scope = self.scope_at(pos)
+        first, *rest = parts
+        if first == 'Self':
+            owner = scope
+            while owner >= 0 and self.boundaries.get(owner) != 'type':
+                owner = self.parents[owner]
+            namespace = self.impl_owners.get(owner)
+        elif first in {'self', 'super'}:
+            module = self.module_scope(scope)
+            if first == 'super':
+                if module < 0:
+                    return None
+                module = self.module_scope(self.parents[module])
+            while rest and rest[0] == 'super':
+                if module < 0:
+                    return None
+                module = self.module_scope(self.parents[module])
+                rest.pop(0)
+            namespace = Namespace('module', module)
+        else:
+            namespace = self.lookup_namespace(first, scope)
+        for name in rest:
+            if namespace is None or namespace.kind != 'module':
+                return None
+            namespace = self.namespaces.get((namespace.site, name.removeprefix('r#')))
+        return namespace
+
+    def path(self, start, end):
+        """Consume a complete path, including opaque UFCS/turbofish owners.
+
+        Never reinterpret a trailing qualified method as a free function when
+        its owner requires type inference that this front end does not perform.
+        """
+        pos = start
+        opaque = False
+        prefix = ''
+        if self.code.startswith('::', pos):
+            opaque, prefix = True, '::'
+            pos = self.skip(pos + 2, end)
+        elif self.code[pos:pos + 1] == '<':
+            if self.code.startswith('<=', pos):
+                return None
+            closing = self.skip(self.generic_end(pos, end), end)
+            if not self.code.startswith('::', closing):
+                return None
+            opaque, prefix = True, '<qualified>::'
+            pos = self.skip(closing + 2, end)
+        token = _PATH.match(self.code, pos, end)
+        if token is None:
+            return None
+        name = prefix + re.sub(r'\s+', '', token.group()).replace('r#', '')
+        pos = token.end()
+        while self.code.startswith('::', self.skip(pos, end)):
+            opening = self.skip(self.skip(pos, end) + 2, end)
+            if self.code[opening:opening + 1] != '<':
+                break
+            pos = self.skip(self.generic_end(opening, end), end)
+            if not self.code.startswith('::', pos):
+                break
+            opaque = True
+            token = _PATH.match(self.code, self.skip(pos + 2, end), end)
+            if token is None:
+                return name, end, True
+            name += '::' + re.sub(r'\s+', '', token.group()).replace('r#', '')
+            pos = token.end()
+        return name, pos, opaque
+
     def resolve(self, name, pos, state):
-        if name in state.values or '.' in name or '::' in name:
+        if '.' in name:
+            return None
+        if '::' in name:
+            *owners, leaf = name.split('::')
+            namespace = self.namespace_path(owners, pos)
+            if namespace is None:
+                return None
+            if namespace.kind == 'module':
+                return self.symbols.get((namespace.site, leaf))
+            return self.associated.get((namespace.site, leaf))
+        if name in state.values:
             return None
         scope = self.scope_at(pos)
         while True:
             if self.boundaries.get(scope) != 'type' and (scope, name) in self.symbols:
                 return self.symbols[(scope, name)]
-            if scope < 0 or scope in self.boundaries:
+            if (name in self.imported_names[scope] or scope in self.glob_imports
+                    or scope < 0 or self.boundaries.get(scope) == 'module'):
                 return None
             scope = self.parents[scope]
 
@@ -415,7 +644,7 @@ class Flow:
                 pos = src.pairs.get(bracket, end - 1) + 1
                 continue
             # Items do not execute when their enclosing function executes.
-            item = re.match(r'(?:(?:pub(?:\([^)]*\))?|async|unsafe|const|extern)\s+)*(fn|mod|impl|trait|struct|enum|use)\b', src.code[pos:end])
+            item = re.match(r'(?:(?:pub(?:\([^)]*\))?|async|unsafe|const|extern)\s+)*(fn|mod|impl|trait|struct|enum|union|type|use)\b|extern\s+crate\b', src.code[pos:end])
             if item:
                 boundary = src.next_boundary(pos, end, '{;')
                 pos = src.pairs.get(boundary, boundary) + 1
@@ -451,7 +680,7 @@ class Flow:
             declaration = re.match(r'let\s+(?:mut\s+)?', src.code[begin:finish])
             equal = src.next_boundary(begin, finish, '=')
             assignment = (equal < finish and src.code[equal:equal + 2] not in {'==', '=>'}
-                          and (equal == begin or src.code[equal - 1] not in '=!<>'))
+                          and (equal == begin or (equal > 0 and src.code[equal - 1] not in '=!<>')))
             if assignment:
                 lhs_begin = begin + declaration.end() if declaration else begin
                 lhs = src.code[lhs_begin:equal].strip()
@@ -837,29 +1066,30 @@ class Flow:
                 result = join(result, receiver)
                 pos = src.pairs[pos] + 1
                 continue
-            match = _PATH.match(src.code, pos)
-            if not match:
+            path = src.path(pos, end)
+            if path is None:
                 if char not in '.?&*' and not char.isspace():
                     receiver = CLEAN
                 pos += 1
                 continue
-            name = re.sub(r'\s+', '', match.group()).replace('r#', '')
+            name, path_end, opaque_path = path
             chained = pos > start and src.code[start:pos].rstrip().endswith('.')
             base = name.split('.')[0]
             value = receiver if chained else state.values.get(base, CLEAN)
-            call = src.skip(match.end(), end)
+            call = src.skip(path_end, end)
             macro = call < end and src.code[call] == '!'
             if macro:
                 call = src.skip(call + 1, end)
-            if src.code.startswith('::<', call):
-                call = src.skip(src.generic_end(call + 2, end), end)
             if call in src.pairs and src.code[call] in '([' and src.pairs[call] < end:
                 close = src.pairs[call]
                 spans = src.parts(call + 1, close)
                 arguments = [self.expr(a, b, state) for a, b in spans]
                 if not state.reachable:
                     return CLEAN
-                local = src.resolve(name, pos, state) if not chained and not macro else None
+                catalogued = self.sink_target(name, spans, chained)
+                local = (src.resolve(name, pos, state)
+                         if not chained and not macro and not opaque_path
+                         and not ('::' in name and catalogued is not None) else None)
                 if local is not None:
                     if self.function is not None:
                         src.callers[local].add(self.function)
@@ -882,7 +1112,7 @@ class Flow:
                 direct = rules.source_re.match(raw_call)
                 if direct and rules.has_request_source(src.raw[pos:self.chain_end(close + 1, end)]):
                     value = join(value, frozenset({Origin('source', pos, ' '.join(direct.group().split()))}))
-                target = self.sink_target(name, spans, chained) if local is None and name not in state.values else None
+                target = catalogued if local is None and name not in state.values and not opaque_path else None
                 if target is not None:
                     self.emit(pos, arguments[target] if target >= 0 else arguments[0])
                     value = CLEAN
@@ -897,13 +1127,13 @@ class Flow:
                 result = join(result, value)
                 pos = close + 1
             else:
-                raw_name = src.raw[pos:match.end()]
+                raw_name = src.raw[pos:path_end]
                 direct = rules.source_re.fullmatch(raw_name)
                 if direct:
                     value = join(value, frozenset({Origin('source', pos, ' '.join(direct.group().split()))}))
                 receiver = value
                 result = join(result, value)
-                pos = match.end()
+                pos = path_end
         return result
 
     def sink_target(self, name, spans, chained):

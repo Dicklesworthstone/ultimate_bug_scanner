@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   validate-candidate:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 35
     # Temporary publication of tested immutable blobs only. No ref writes.
     permissions:

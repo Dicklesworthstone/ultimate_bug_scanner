@@ -1,11 +1,4 @@
-"""ubs_core.analyzers.taint_ruby_url — request-derived outbound URL taint (bead A2).
-
-Logic moved verbatim from the run_outbound_url_checks heredoc in
-modules/ubs-ruby.sh; the shell keeps its copy until that module's port bead
-lands (transitional duplication is sanctioned). main(argv) reproduces the
-heredoc's __COUNT__/__SAMPLE__ stdout byte-for-byte for the same argv;
-run(ctx) mirrors the same detection over RunContext.files as NDJSON findings.
-"""
+"""Outbound URL policy for the shared scoped Ruby taint frontend."""
 from __future__ import annotations
 
 import re
@@ -14,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.analyzers.taint_ruby_traversal import flow_findings
 
 ROOT = Path.cwd()
 BASE_DIR = ROOT
@@ -30,22 +24,6 @@ SOURCE_RE = re.compile(
     r'|\bRack::Request\.new\s*\([^)]*\)\.params\s*(?:\[[^\]]+\]|\.fetch\s*\(|\.dig\s*\()',
     re.IGNORECASE,
 )
-SAFE_EXPR_RE = re.compile(
-    r'\b(?:safe(?:_url|_uri|_outbound_url|_webhook_url|_callback_url|URL|Uri|URI|OutboundURL|WebhookURL|CallbackURL)|'
-    r'secure(?:_url|_uri|_outbound_url|URL|Uri|URI|OutboundURL)|'
-    r'allow(?:_url|_uri|_host|URL|Uri|URI|Host)|allowed(?:_url|_uri|_host|URL|Uri|URI|Host)|'
-    r'validate(?:_url|_uri|_host|_outbound_url|URL|Uri|URI|Host|OutboundURL)|'
-    r'sanitize(?:_url|_uri|URL|Uri|URI)|resolve_allowed(?:_url|_uri)|'
-    r'is_allowed_host|allowed_host\?|safe_url\?|safe_uri\?|safe_outbound_url\?)\b',
-    re.IGNORECASE,
-)
-URI_PARSE_RE = re.compile(r'\b(?:URI|Addressable::URI)\.(?:parse|join)\s*\(')
-HOST_CHECK_RE = re.compile(
-    r'\.(?:host|hostname|scheme)\b'
-    r'|\b(?:ALLOWED_HOSTS|allowed_hosts|allowlist|host_allowlist|trusted_hosts|allowed_host\?)\b'
-    r'|%w\['
-)
-REJECT_RE = re.compile(r'\b(?:raise|return\s+false|halt|head\s+:forbidden|forbidden|bad_request)\b', re.IGNORECASE)
 SINK_RE = re.compile(
     r'\b(?:URI|OpenURI)\.open\s*\('
     r'|\bopen\s*\('
@@ -54,8 +32,6 @@ SINK_RE = re.compile(
     r'|\.request\s*\('
     r'|\.get\s*\(',
 )
-ASSIGN_RE = re.compile(r'^\s*(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)$')
-PATH_LIMIT = 4
 
 def should_skip(path: Path) -> bool:
     try:
@@ -133,93 +109,9 @@ def relpath(path):
     except ValueError:
         return str(path)
 
-def is_safe_expr(expr):
-    return bool(SAFE_EXPR_RE.search(expr))
-
-def refs_in_expr(expr, tainted):
-    refs = []
-    for name in tainted:
-        if re.search(rf'\b{re.escape(name)}\b', expr):
-            refs.append(name)
-    return refs
-
-def taint_from_expr(expr, tainted):
-    if is_safe_expr(expr):
-        return None
-    direct = SOURCE_RE.search(expr)
-    if direct:
-        return {'path': [direct.group(0).strip('(')]}
-    refs = refs_in_expr(expr, tainted)
-    if not refs:
-        return None
-    ref = refs[0]
-    path = list(tainted.get(ref, {}).get('path', [ref]))
-    if len(path) >= PATH_LIMIT:
-        path = path[-(PATH_LIMIT - 1):]
-    path.append(ref)
-    return {'path': path}
-
-def has_allowlist_context(lines, line_no, refs):
-    if not refs:
-        return False
-    start = max(0, line_no - 24)
-    context = '\n'.join(strip_line_comments(line) for line in lines[start:line_no])
-    if not any(re.search(rf'\b{re.escape(ref)}\b', context) for ref in refs):
-        return False
-    for line in context.splitlines():
-        if SAFE_EXPR_RE.search(line) and any(re.search(rf'\b{re.escape(ref)}\b', line) for ref in refs):
-            return True
-    return bool(URI_PARSE_RE.search(context) and HOST_CHECK_RE.search(context) and REJECT_RE.search(context))
-
 def analyze(path, issues):
-    try:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    except OSError:
-        return
-    if not (SOURCE_RE.search(text) and SINK_RE.search(text)):
-        return
-    lines = text.splitlines()
-    tainted = {}
-    seen = set()
-    for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
-        statement = logical_statement(lines, idx).strip()
-        if not statement:
-            continue
-        assign = ASSIGN_RE.match(statement)
-        if assign:
-            name = assign.group('lhs')
-            rhs = assign.group('rhs')
-            taint = taint_from_expr(rhs, tainted)
-            if taint:
-                tainted[name] = taint
-            elif name in tainted and is_safe_expr(rhs):
-                tainted.pop(name, None)
-        if not SINK_RE.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = SOURCE_RE.search(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_allowlist_context(lines, idx, refs):
-            continue
-        key = (relpath(path), idx)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            path_desc = f"{direct.group(0).strip('(')} -> outbound HTTP"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get('path', [ref]))
-            if len(seq) >= PATH_LIMIT:
-                seq = seq[-(PATH_LIMIT - 1):]
-            seq.append('outbound HTTP')
-            path_desc = ' -> '.join(seq)
-        issues.append((relpath(path), idx, f"{source_line(lines, idx)}  [{path_desc}]"))
+    for line, code, extras in flow_findings(path, 'url'):
+        issues.append((relpath(path), line, code))
 
 
 def _configure(root: Path) -> None:
@@ -251,23 +143,22 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
-    """Mirror the heredoc detection over ctx.files as NDJSON findings."""
+    """Emit the URL policy's findings and source-to-sink witnesses."""
     _configure(Path.cwd())
     for path in ctx.files:
         if not path.is_file() or path.suffix.lower() not in EXTS:
             continue
-        issues: list[tuple[str, int, str]] = []
-        analyze(path, issues)
-        for rel, line_no, code in issues:
+        for line_no, code, extras in flow_findings(path, 'url'):
             yield {
                 "rule": "ruby.taint.outbound_url",
-                "path": rel,
+                "path": relpath(path),
                 "line": line_no,
                 "col": 1,
                 "layer": "taint",
                 "lang": "ruby",
                 "severity": "critical",
                 "message": f"{MESSAGE}: {code}",
+                "extras": extras,
             }
 
 
@@ -291,7 +182,7 @@ def _selftest_positive_run() -> None:
     assert findings[0]["line"] == 4, findings
 
 
-def _selftest_validate_url_suppression() -> None:
+def _selftest_unproven_validate_url() -> None:
     import tempfile
 
     code = (
@@ -306,10 +197,10 @@ def _selftest_validate_url_suppression() -> None:
         target = Path(tmp) / "app.rb"
         target.write_text(code, encoding="utf-8")
         findings = list(run(RunContext(lang="ruby", files=[target])))
-    assert findings == [], findings
+    assert len(findings) == 1 and findings[0]['line'] == 4, findings
 
 
-def _selftest_allowlist_context_suppression() -> None:
+def _selftest_host_only_guard_is_not_url_validation() -> None:
     import tempfile
 
     code = (
@@ -327,7 +218,7 @@ def _selftest_allowlist_context_suppression() -> None:
         target = Path(tmp) / "app.rb"
         target.write_text(code, encoding="utf-8")
         findings = list(run(RunContext(lang="ruby", files=[target])))
-    assert findings == [], findings
+    assert len(findings) == 1 and findings[0]['line'] == 7, findings
 
 
 def _selftest_main_emit_dialect() -> None:
@@ -356,8 +247,8 @@ def _selftest_main_emit_dialect() -> None:
 
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("positive_run", _selftest_positive_run),
-    ("validate_url_suppression", _selftest_validate_url_suppression),
-    ("allowlist_context_suppression", _selftest_allowlist_context_suppression),
+    ("unproven_validate_url", _selftest_unproven_validate_url),
+    ("host_only_guard_is_not_url_validation", _selftest_host_only_guard_is_not_url_validation),
     ("main_emit_dialect", _selftest_main_emit_dialect),
 )
 

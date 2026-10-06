@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="aab7fe4bb0076074f5bae4b16dfd77d4bca7e8a3e155975efacce2019d417e54"
+UBS_LIB_CHECKSUM="6eb0507bec1a17a13f2b34e3d659d517065ada85ce1b4e6798aa2c448a3c0d42"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -315,19 +315,31 @@ fi
 # ── Legacy-parity bridges: record-less section headers + summary + exit ─────
 run_v2_legacy_parity_bridges_ruby(){
   local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}"
+  local completion_out="$6" json_out="$7"
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$scan_exit" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$scan_exit" "$completion_out" "$json_out" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import sys
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, scan_exit_raw) = sys.argv[1:7]
+(completion_path, json_out, project) = sys.argv[7:10]
 files_n = int(files_raw or 0)
-fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
 scan_exit = int(scan_exit_raw or "0")
 as_text = bool(text_out)
+receipt = {}
+try:
+    with open(completion_path, encoding="utf-8") as fh:
+        receipt = json.load(fh)
+    complete = (isinstance(receipt, dict) and receipt.get("language") == "ruby"
+                and receipt.get("status") == "ok"
+                and all(type(receipt.get(key)) is int and receipt[key] >= 0
+                        for key in ("files", "critical", "warning", "info")))
+except (OSError, ValueError, RecursionError):
+    complete = False
+incomplete = not complete or scan_exit not in (0, 1)
 
 # Mirror ruby_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header
 # titles). Category 18 has no slug (its pack findings never joined totals).
@@ -349,17 +361,48 @@ SECTION = {1: "1. NIL / DEFENSIVE PROGRAMMING", 2: "2. NUMERIC / ARITHMETIC PITF
 SUBHEAD = {8: "Resource lifecycle correlation",
            16: "Async error path coverage"}
 
+records = []
 try:
     with open(sink_path, encoding="utf-8") as fh:
-        records = [json.loads(line) for line in fh if line.strip()]
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("invalid finding record")
+                records.append(record)
+            except (ValueError, RecursionError):
+                incomplete = True
 except OSError:
-    records = []
+    incomplete = True
 
 # Final severity recount over the whole sink, legacy exit formula inputs.
 counts = {"critical": 0, "warning": 0, "info": 0}
 for rec in records:
     sev = rec.get("severity", "info")
     counts[sev if sev in counts else "info"] += 1
+
+if incomplete:
+    message = receipt.get("message", "") if isinstance(receipt, dict) else ""
+    message = message or f"Ruby analysis did not complete (analyzer exit {scan_exit}); no valid complete report"
+    sys.stderr.write("ubs-ruby: analysis incomplete: " + message + "\n")
+    if json_out:
+        try:
+            with open(json_out, encoding="utf-8") as fh:
+                report = json.load(fh)
+            if not isinstance(report, dict):
+                raise ValueError("invalid report")
+        except (OSError, ValueError, RecursionError):
+            report = {"language": "ruby", "project": project, "files": files_n,
+                      "version": "2.0.1", "findings": records, **counts}
+        report.update(status="partial", module_error="ANALYZER_ERROR", message=message)
+        with open(json_out, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False)
+            fh.write("\n")
+    if text_out:
+        with open(text_out, "a", encoding="utf-8") as fh:
+            fh.write("Partial: [ANALYZER_ERROR] " + message + "\n")
 
 out = []
 
@@ -389,27 +432,19 @@ if as_text:
     with open(text_out, "a", encoding="utf-8") as fh:
         fh.write("\n".join(out) + "\n")
 
-# Issue #111 (the shape #103 fixed for Python): this recount used to overwrite
-# an abnormal scanner status with the ordinary finding exit 1 whenever
-# criticals existed, so "the scanner could not finish" and "the scanner found
-# bugs" became the same exit code. Execution failures dominate severity: a scan
-# that did not complete is reported as incomplete (exit 2) whatever it managed
-# to find, and the findings are still emitted so the partial evidence is kept.
-if scan_exit not in (0, 1):
-    exit_code = scan_exit
-else:
-    exit_code = 1 if counts["critical"] else scan_exit
-    if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
-        exit_code = 1
-sys.exit(exit_code)
+# The driver decides finding severity. This bridge returns only rendering /
+# completion status, so an uncaught Python exit 1 cannot impersonate findings.
+sys.exit(2 if incomplete else 0)
 PYV2BRIDGE
   return "$bridge_rc"
 }
 
 run_contract_v2_ruby(){
-  local list_file sink exit_code=0 text_out="" v2_json_out=""
+  local list_file sink exit_code=0 text_out="" v2_json_out="" completion_out=""
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-sink.XXXXXX)"
+  completion_out="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-complete.XXXXXX)" || return 2
+  cleanup_add "$completion_out"
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
@@ -431,7 +466,7 @@ run_contract_v2_ruby(){
     done
     v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
   fi
-  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR" --completion-out "$completion_out")
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   if [[ "$ENABLE_BUNDLER_TOOLS" -eq 1 && ",$v2_skip," != *",19,"* ]]; then
@@ -485,11 +520,11 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
     "${scan_args[@]}" --version "2.0.1" || exit_code=$?
 
   run_v2_legacy_parity_bridges_ruby "$sink" "$list_file" "$exit_code" "$text_out" \
-    "$v2_skip" || exit_code=$?
+    "$v2_skip" "$completion_out" "$v2_json_out" || exit_code=2
 
   if [[ "$FORMAT" == "sarif" ]]; then
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" 2>/dev/null || true
+      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=2
     fi
   fi
 

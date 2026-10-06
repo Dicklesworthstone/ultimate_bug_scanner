@@ -336,6 +336,7 @@ def run_analyzers(
     skip: set[int] | None = None,
     enable_new: bool = False,
     prefilter: Any = None,
+    errors: list[str] | None = None,
 ) -> None:
     """Run registered ruby analyzers (taint, lifecycle, guards).
 
@@ -351,32 +352,45 @@ def run_analyzers(
     for analyzer in analyzers_for_lang("ruby"):
         if analyzer.layer == "narrowing" and not enable_new:
             continue
+        # Disabled security analysis must not fail the selected categories on
+        # request-flow syntax it deliberately does not support.
+        if skip and 6 in skip and analyzer.layer == "taint":
+            continue
         if prefilter is not None:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:
             target_files = list(files)
         if not target_files:
             continue
-        ctx = RunContext(lang="ruby", files=target_files)
-        for finding in analyzer.run(ctx):
-            rule = finding.get("rule", "")
-            if rule == "ruby.guards.guarded":
-                continue
-            if skip and _record_category(finding) in skip:
-                continue
-            severity = finding.get("severity", "warning")
-            if rule in _LIFECYCLE_SEVERITY:
-                severity = _LIFECYCLE_SEVERITY[rule]
-            sink.write(json.dumps({
-                "rule": rule,
-                "category_id": finding.get("category_id", "ruby.security"),
-                "path": finding.get("path", ""),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": severity,
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        for path in target_files:
+            ctx = RunContext(lang="ruby", files=[path])
+            try:
+                for finding in analyzer.run(ctx):
+                    rule = finding.get("rule", "")
+                    if rule == "ruby.guards.guarded":
+                        continue
+                    if skip and _record_category(finding) in skip:
+                        continue
+                    severity = finding.get("severity", "warning")
+                    if rule in _LIFECYCLE_SEVERITY:
+                        severity = _LIFECYCLE_SEVERITY[rule]
+                    record = {
+                        "rule": rule,
+                        "category_id": finding.get("category_id", "ruby.security"),
+                        "path": finding.get("path", ""),
+                        "line": int(finding.get("line", 0) or 0),
+                        "col": int(finding.get("col", 1) or 1),
+                        "severity": severity,
+                        "message": finding.get("message", ""),
+                        "suppressed": False,
+                    }
+                    if finding.get("extras"):
+                        record["extras"] = finding["extras"]
+                    sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
 
 
 def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
@@ -542,7 +556,7 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int],
         1: "No nil equality comparisons",
     }
     for num, note in good_notes.items():
-        if num not in categories_with_records and num not in skip:
+        if not errors and num not in categories_with_records and num not in skip:
             lines.append(f"good: {note}")
 
     lines += [
@@ -562,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m ubs_core.ruby_scan")
     parser.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
+    parser.add_argument("--completion-out", default="", help="Bounded receipt written after all analysis and reports finish")
     parser.add_argument("--project-dir", default="", help="base dir for relative sink paths")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir (sgconfig-*.yml + manifest.json)")
@@ -634,7 +649,8 @@ def main(argv: list[str] | None = None) -> int:
         capturing_sink = CapturingSink()
         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip)
-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.ruby_ast import scan_all
             from ubs_core.ruby_rules import CATEGORY_MAP, SEVERITY_MAP
@@ -781,6 +797,12 @@ def main(argv: list[str] | None = None) -> int:
         "prefilter": prefilter_res.to_dict(),
         "errors": scan_errors,
     }) + "\n")
+    if args.completion_out:
+        receipt = {"language": "ruby", "status": "partial" if scan_errors else "ok",
+                   "files": len(files), **counters}
+        if scan_errors:
+            receipt["message"] = ("Ruby analysis did not complete: " + "; ".join(scan_errors[:5]))[:500]
+        Path(args.completion_out).write_text(json.dumps(receipt) + "\n", encoding="utf-8")
     return exit_code
 
 

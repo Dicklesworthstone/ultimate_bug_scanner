@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import io
+import contextlib
+from dataclasses import replace
+import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -196,6 +202,115 @@ class RubyToolTests(unittest.TestCase):
             self.assertTrue(errors)
 
 
+class RubyDriverFailures(unittest.TestCase):
+    def setUp(self):
+        self.artifact = ROOT / 'test-suite/artifacts/ruby-driver-failures' / (self._testMethodName + '-' + uuid.uuid4().hex[:12])
+        self.artifact.mkdir(parents=True)
+
+    def test_unexpected_analyzer_failure_is_partial_keeps_siblings_and_is_not_cached(self):
+        from ubs_core import analyzers, ruby_scan
+        from ubs_core.registry import analyzers_for_lang
+
+        bad, good = self.artifact / 'bad.rb', self.artifact / 'good.rb'
+        for target in (bad, good):
+            target.write_text('target = params[:url]\nNet::HTTP.get(URI.parse(target))\n')
+        selected = self.artifact / 'files.nul'
+        selected.write_bytes(os.fsencode(bad) + b'\0' + os.fsencode(good) + b'\0')
+        registered = analyzers_for_lang('ruby')
+        url_analyzer = next(analyzer for analyzer in registered if analyzer.name == 'taint_ruby_url')
+
+        def fail_one_file(ctx):
+            if ctx.files == [bad]:
+                raise RuntimeError('injected unexpected analyzer failure')
+            yield from url_analyzer.run(ctx)
+
+        configured = [replace(analyzer, run=fail_one_file) if analyzer is url_analyzer else analyzer
+                      for analyzer in registered]
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                prefix = self.artifact / str(attempt)
+                command = ['--files-from', str(selected), '--sink', str(prefix) + '.ndjson',
+                           '--json-out', str(prefix) + '.json', '--text-out', str(prefix) + '.txt',
+                           '--completion-out', str(prefix) + '.complete.json',
+                           '--project-dir', str(self.artifact)]
+                stdout, stderr = io.StringIO(), io.StringIO()
+                started = time.monotonic()
+                with patch.dict(os.environ, UBS_CACHE_DIR=str(self.artifact / 'cache'), UBS_NO_CACHE='0'), \
+                     patch('ubs_core.registry.analyzers_for_lang', return_value=configured), \
+                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    status = ruby_scan.main(command)
+                Path(str(prefix) + '.stdout.log').write_text(stdout.getvalue())
+                Path(str(prefix) + '.stderr.log').write_text(stderr.getvalue())
+                Path(str(prefix) + '.identity.json').write_text(json.dumps({
+                    'command': [sys.executable, '-m', 'ubs_core.ruby_scan', *command],
+                    'injected_failure': 'RuntimeError in taint_ruby_url for bad.rb only',
+                    'python': sys.version, 'exit': status, 'elapsed': time.monotonic() - started,
+                    'driver_sha256': hashlib.sha256(Path(ruby_scan.__file__).read_bytes()).hexdigest(),
+                }, indent=2))
+                report = json.loads(Path(str(prefix) + '.json').read_text())
+                receipt = json.loads(Path(str(prefix) + '.complete.json').read_text())
+                self.assertEqual(status, 2, stderr.getvalue())
+                self.assertEqual(report['status'], 'partial', report)
+                self.assertEqual(receipt['status'], 'partial', receipt)
+                self.assertIn('RuntimeError', report['message'])
+                self.assertIn('bad.rb', report['message'])
+                targets = [(Path(row['path']).name, row['line']) for row in report['findings']
+                           if row['rule'] == 'ruby.taint.outbound_url']
+                self.assertEqual(targets, [('good.rb', 2)], report)
+                self.assertEqual(report['extras']['profile']['cache_hits'], 0, report)
+                self.assertEqual(report['extras']['profile']['cache_misses'], 2, report)
+                self.assertNotIn('good: ', Path(str(prefix) + '.txt').read_text())
+
+    def test_unfinished_driver_never_reports_a_successful_scan(self):
+        # Fault only the driver process; all module logic, rendering, helper
+        # integrity checks, and SARIF conversion remain real.
+        target = self.artifact / 'app.rb'
+        target.write_text('Net::HTTP.get(URI.parse(params[:url]))\n')
+        executable = self.artifact / 'python3'
+        executable.write_text('#!/bin/sh\n'
+                              'if [ "$1" = -m ] && [ "$2" = ubs_core.ruby_scan ]; then\n'
+                              '  echo "injected unexpected Ruby driver termination" >&2\n'
+                              '  exit "$RUBY_DRIVER_FAULT_EXIT"\nfi\n'
+                              + 'exec ' + shlex.quote(sys.executable) + ' "$@"\n')
+        executable.chmod(0o755)
+        for injected_status in (0, 1, 70):
+            for fmt in ('json', 'sarif', 'text'):
+                with self.subTest(status=injected_status, format=fmt):
+                    command = ['bash', str(ROOT / 'modules/ubs-ruby.sh'), str(target),
+                               '--no-bundler', '--format=' + fmt]
+                    env = dict(os.environ, PATH=str(self.artifact) + os.pathsep + os.environ['PATH'],
+                               RUBY_DRIVER_FAULT_EXIT=str(injected_status), UBS_NO_AUTO_UPDATE='1',
+                               UBS_TEST_FORCE_NO_AST_GREP='1', PYTHONDONTWRITEBYTECODE='1')
+                    env.pop('UBS_ALLOW_UNVERIFIED_HELPERS', None)
+                    env.pop('UBS_VERIFIED_ASSET_DIR', None)
+                    started = time.monotonic()
+                    result = subprocess.run(command, cwd=self.artifact, env=env,
+                                            text=True, capture_output=True, timeout=60)
+                    prefix = self.artifact / f'{injected_status}-{fmt}'
+                    Path(str(prefix) + '.stdout.log').write_text(result.stdout)
+                    Path(str(prefix) + '.stderr.log').write_text(result.stderr)
+                    Path(str(prefix) + '.identity.json').write_text(json.dumps({
+                        'command': command, 'cwd': str(self.artifact), 'python': sys.version,
+                        'injected_exit': injected_status, 'exit': result.returncode,
+                        'elapsed': time.monotonic() - started,
+                        'module_sha256': hashlib.sha256((ROOT / 'modules/ubs-ruby.sh').read_bytes()).hexdigest(),
+                    }, indent=2))
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn('injected unexpected Ruby driver termination', result.stderr)
+                    if fmt == 'json':
+                        report = json.loads(result.stdout)
+                        self.assertEqual(report['status'], 'partial', report)
+                        self.assertEqual(report['module_error'], 'ANALYZER_ERROR', report)
+                        self.assertEqual(report['files'], 1, report)
+                    elif fmt == 'sarif':
+                        report = json.loads(result.stdout)
+                        self.assertTrue(any(not invocation['executionSuccessful']
+                                            for run in report['runs'] for invocation in run['invocations']), report)
+                    else:
+                        self.assertIn('Partial: [ANALYZER_ERROR]', result.stdout)
+                        self.assertNotIn('good: ', result.stdout)
+
+
 class RubyIntegration(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="ubs-ruby-integration-")
@@ -303,6 +418,32 @@ sys.exit(cfg.get("exit", 0))
             with self.subTest(arg=arg):
                 self.assert_scan(self.run_scan("json", arg), 0)
                 self.assertFalse(self.log.exists())
+
+    def test_disabled_security_does_not_run_unsupported_request_flow(self) -> None:
+        self.source.write_text('fetch = ->(target) { Net::HTTP.get(URI.parse(target)) }\n'
+                               'fetch.call(params[:url])\n')
+        artifact = ROOT / 'test-suite/artifacts/ruby-driver-failures' / ('category-scope-' + uuid.uuid4().hex[:12])
+        artifact.mkdir(parents=True)
+        (artifact / 'app.rb').write_text(self.source.read_text())
+        for index, (extra, expected) in enumerate((((), 2), (('--skip=6',), 0),
+                                                  (('--only=1',), 0), ((), 2))):
+            with self.subTest(extra=extra, attempt=index):
+                result = self.run_scan('json', '--no-bundler', *extra)
+                (artifact / f'{index}.stdout.log').write_text(result.stdout)
+                (artifact / f'{index}.stderr.log').write_text(result.stderr)
+                (artifact / f'{index}.identity.json').write_text(json.dumps({
+                    'command': result.args, 'cwd': str(self.base), 'python': sys.version,
+                    'exit': result.returncode,
+                }, indent=2))
+                report = self.assert_scan(result, expected)
+                self.assertEqual(report['status'], 'partial' if expected else 'ok', report)
+                self.assertFalse(any(row['rule'].startswith('ruby.taint.')
+                                     for row in report['findings']), report)
+                if expected:
+                    self.assertEqual(report['module_error'], 'ANALYZER_ERROR', report)
+                    self.assertEqual(report['extras']['profile']['cache_hits'], 0, report)
+                else:
+                    self.assertEqual(report['critical'], 0, report)
 
     def test_warning_finding_obeys_ubs_severity_policy(self) -> None:
         doc = rubocop_doc()

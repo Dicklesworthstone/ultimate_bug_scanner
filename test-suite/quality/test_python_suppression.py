@@ -263,6 +263,38 @@ class PythonSourceSuppressionTests(unittest.TestCase):
                     self.assertEqual(doc["warning"], 0)
                     self.assertEqual(code, 0)
 
+    def test_bare_disable_aliases_apply_at_the_reporting_boundary(self) -> None:
+        for marker in ("ubs: disable", "nolint", "noqa"):
+            self.source.write_text(REPRO.replace("ubs:ignore -- caller closes it", marker), encoding="utf-8")
+            for mode in ("cold", "warm", "disabled"):
+                with self.subTest(marker=marker, cache=mode):
+                    code, records, doc, _ = self.scan(no_cache=mode == "disabled")
+                    self.assertEqual(self.sites(records, LIFECYCLE), [7])
+                    self.assertEqual(doc["critical"], 1)
+                    self.assertEqual(code, 1)
+
+    def test_source_marker_does_not_erase_downstream_taint(self) -> None:
+        self.source.write_text('value = input()  # ubs:ignore\n\neval(value)\n', encoding="utf-8")
+        for mode in ("cold", "warm", "disabled"):
+            with self.subTest(cache=mode):
+                code, records, _, _ = self.scan(no_cache=mode == "disabled")
+                self.assertEqual(self.sites(records, "python.taint.eval"), [3])
+                self.assertEqual(code, 1)
+
+    def test_patterns_use_rule_scope_and_ignore_literal_marker_text(self) -> None:
+        self.source.write_text(
+            'value == None; note = "ubs:ignore"\n'
+            'value == None  # ubs:ignore[python.unrelated.rule]\n'
+            'value == None  # ubs:ignore[py.none.equality]\n'
+            '# ubs: disable\n'
+            'value == None\n'
+            '\n'
+            'value == None\n', encoding="utf-8")
+        for mode in ("cold", "warm", "disabled"):
+            with self.subTest(cache=mode):
+                _, records, _, _ = self.scan(no_cache=mode == "disabled")
+                self.assertEqual(self.sites(records, "py.none.equality"), [1, 2, 7])
+
     @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
     def test_public_ci_json_text_and_sarif_agree_with_lifecycle_sink(self) -> None:
         for only_marked in (False, True):

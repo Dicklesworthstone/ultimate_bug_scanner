@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.27"
+UBS_VERSION="5.4.28"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="5016469099336eb215179a04d432643e00fdde653a01481c55d4e2861c2e0ad7"
@@ -106,18 +106,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='fc862e6547cfb448275dc9d2b095d224ae838ef4db5cd76556636ecd56aba07c'
-  [cpp]='c6a9d4eafedeb01e812ddbf5278b647a69db084c46af073bbbbea94ed06a4bd7'
-  [csharp]='2eac0b1196eefe4caf965f9d7fc230924c94f929da1bb5a31bc2080cfec072e4'
-  [elixir]='8353380d807b1f83e372f3b330334e06815d616460c674d30b97b42c9441a207'
-  [golang]='e3c958c44ac4eeeda23896c7e0a9a43722e85518e2ac296812c5d053264c40e9'
-  [java]='c4117b1c1792506d6f9df3373b97196efe686568ec83ad77c2a9096fcf7d445e'
-  [js]='4d8bdfc95de04444b009dd07f41bf77a62ce7f387eda728fcdeb8cf424bd45c9'
-  [kotlin]='7224224960b98597b02fd9e9d0f4b02def3fbd1b58b6eb5944ef4be4798e6462'
-  [python]='cd3e37b95a37341573e54ca72b93e9fc874f673c6230cb25be130984c1fbd333'
-  [ruby]='3cce02014b6526f2356c929255e5adb5d839f863dfb99d1344ae52aabb690c8b'
-  [rust]='f63ddb7b1c1d18a362c8aae862ce7d26fe1d8ff0c223aba328872c48628d3662'
-  [swift]='6401a2a8d7349e5306d2de86ea03226f0404cd16ce3bee3b88287018d05fc361'
+  [bash]='176fabc1b036bad7cb4f51a493f0d6eb20411ba8c74378368cb1d524114c58c9'
+  [cpp]='617de1b155385dc9dba92f85cce909403c8267206cba7090542e2f99715a91a2'
+  [csharp]='06c9cf38504aeab4185043721378b1ad2973cc1757abf794e137975b97f2ffa6'
+  [elixir]='931698ae12d70c246b131c9785a710cbe0cce56b32a07125847dd0f18d34ea12'
+  [golang]='8f0cf61be9a81d12d3cd9a416e4ca7ba5fed8ad19de6c256a3fcc5c599e81830'
+  [java]='bd18f01c533a0ce3b9fdf501bc9091502d2883fa568248e194080ea7f0f5e8e6'
+  [js]='f2c25ece9f261f88746dc603118e4c30d785ea4184068ba410bf77eb5d3ebf0e'
+  [kotlin]='f23ae3ad1cf6be6ea792ba33d2538309c4dbc0fcb2396bafbe2fddfe2989febd'
+  [python]='b5c7402bb720b8239f5b76e96e258616a94b11ef5e1b76ec47d0abcc190a8034'
+  [ruby]='6ab6616729da4e5e91fc854690dcce9c20151cf7e51f4609aa9cf049eaf27e54'
+  [rust]='38041d905ea7a56c790ae8c3b79dc711d0f4425b1147917e6a81c3b3a653df2d'
+  [swift]='73e7175e64345325933863e585e9419add2c18dfa90da6a0ded88aeca57bff6f'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -403,7 +403,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/quality.py']='d2e5a31537312523a9e342b642db37e9a87cc6c1ab0d4f4bfd05ea922ab6885c'
   ['helpers/ubs_core/py_patterns/security_rg.py']='72add761922edef8a654d3e7798aa9393db604d0c7bc24c067300871018e8ffb'
   ['helpers/ubs_core/py_rules.py']='e35ae329bddcaed0a0e9d4244b9907455d00d76abe9d46d3dad2a69a1313db13'
-  ['helpers/ubs_core/py_scan.py']='3e7fecd22bcdf500359e5f9232197c610e1518efffa6629c6d488c23aba71581'
+  ['helpers/ubs_core/py_scan.py']='19072e1a57948bbee755b7c16b8cabeb108ed73341b4206c4d1f673aaa150c7a'
   ['helpers/ubs_core/registry.py']='45f598b29e9108dec30bb7340cc3d76952274e8c3c33389f1a3615b9523b2c07'
   ['helpers/ubs_core/ruby_ast.py']='1db038deb6c7501a0420252b613d6abdeba0b49b7bc673050debb50c81a30758'
   ['helpers/ubs_core/ruby_detectors/__init__.py']='7b5ef3809ebd50136d741ade03d1c56b4b16053753dd79a8d90dd9021ebb0db7'
@@ -475,7 +475,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='65d2b1acd003f173de108f20f963adb9aad89a1b6664752373098dfa9abda8af'
+  ['lib/ubs-common.sh']='c355a335fbfa66efdca4daeb378ab26301140851c2ad9c4e12f625fd517980ac'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

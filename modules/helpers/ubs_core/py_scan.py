@@ -39,6 +39,7 @@ from typing import Iterable, Sequence
 from ubs_core.io import read_ndjson
 from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import RunContext
+from ubs_core.suppression import SourceSuppressions
 
 MARKER = "ubs:ignore"
 _PATTERN_CACHE_KIND = "_ubs_python_pattern"
@@ -242,8 +243,8 @@ def iter_matches(
     """Yield (line_number, line_text) for matches, skipping excluded lines.
 
     ``text`` is what the regex runs against (string-blanked unless the pattern
-    opted out); ``raw_text`` is the original source used for the ubs:ignore
-    check, the exclude_regex post-filter and the reported code sample. Blanking
+    opted out); ``raw_text`` is the original source used for the
+    exclude_regex post-filter and the reported code sample. Blanking
     preserves offsets, so both share one coordinate system.
     """
     source = raw_text if raw_text is not None else text
@@ -254,8 +255,6 @@ def iter_matches(
         if line_end == -1:
             line_end = len(source)
         line_text = source[line_start:line_end]
-        if MARKER in line_text:
-            continue  # legacy count_lines drops marker lines from counts
         if pattern.exclude_regex is not None and pattern.exclude_regex.search(line_text):
             continue
         yield line_no, line_text.strip()[:240]
@@ -277,6 +276,7 @@ def scan_patterns(
     jobs: int = 1,
     *,
     defer_global_checks: bool = False,
+    suppressions: SourceSuppressions | None = None,
 ) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
@@ -301,6 +301,8 @@ def scan_patterns(
     active = [p for p in patterns if p.category not in skip]
     if not active:
         return counters
+    if suppressions is None:
+        suppressions = SourceSuppressions("python")
 
     def _read_text(p: Path) -> tuple[Path, str]:
         try:
@@ -383,7 +385,10 @@ def scan_patterns(
             if (pattern.exclude_file_regex is not None
                     and pattern.exclude_file_regex.search(scan_text)):
                 continue  # matched against the same view the rule sees
+            suppression = suppressions.index(path, text)
             for line_no, line_text in iter_matches(pattern, scan_text, text):
+                if suppression.is_suppressed(line_no, pattern.rule_id):
+                    continue
                 key = (path, line_no)
                 if key in seen:
                     continue
@@ -790,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
     patterns = load_patterns()
     from ubs_core.cache import CapturingSink, ScanCache
 
+    suppressions = SourceSuppressions("python")
     cache = ScanCache(
         lang="python",
         project_dir=args.project_dir or args.project or ".",
@@ -830,7 +836,8 @@ def main(argv: list[str] | None = None) -> int:
 
         capturing_sink = CapturingSink()
         scan_patterns(patterns, files_to_scan, capturing_sink, skip,
-                      prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True)
+                      prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True,
+                      suppressions=suppressions)
         run_detectors(files_to_scan, capturing_sink, skip)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res, taint=False)
@@ -858,7 +865,9 @@ def main(argv: list[str] | None = None) -> int:
         # run would hit the cache and report the findings this one could not
         # produce as a clean, finished scan (#111, same shape as #103).
         if not scan_errors:
-            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+            cache.store_scanned_files(files_to_scan, {
+                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -883,8 +892,6 @@ def main(argv: list[str] | None = None) -> int:
         if recs:
             all_recs.extend(recs)
 
-    all_recs = reconcile_pattern_records(patterns, all_recs)
-
     # Imported helpers can change findings in otherwise unchanged files. Keep
     # this selected-project pass out of per-file caches and literal prefilters;
     # all other analyzer layers retain their existing incremental behavior.
@@ -893,6 +900,11 @@ def main(argv: list[str] | None = None) -> int:
                   project_dir=args.project_dir or args.project or ".")
     for f in files:
         all_recs.extend(taint_sink.get_for_file(f))
+
+    # Suppress only emitted findings, preserving source facts and helper flow.
+    # Recheck cached records too, before project-wide severity thresholds and
+    # the common sink determine every report, total and exit status.
+    all_recs = reconcile_pattern_records(patterns, suppressions.filter(all_recs))
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for r in all_recs:

@@ -781,7 +781,9 @@ class _Scope:
     generator: bool = False
 
 
-@dataclass(slots=True)
+# Slots reduce the retained statement graph on runtimes whose dataclasses
+# support them; Python 3.9 uses the same generated behavior without slots.
+@dataclass(**({'slots': True} if sys.version_info >= (3, 10) else {}))
 class _Statement:
     kind: str
     start: int
@@ -819,7 +821,7 @@ class _HeapCall:
     readers: set = field(default_factory=set)
 
 
-@dataclass(slots=True)
+@dataclass(**({'slots': True} if sys.version_info >= (3, 10) else {}))
 class _HeapOutput:
     heap: dict
     weak_refs: set

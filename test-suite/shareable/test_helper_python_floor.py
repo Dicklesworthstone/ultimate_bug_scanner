@@ -9,6 +9,7 @@ exercise the same interpreter-selection, doctor and scan contract there.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import shutil
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -133,6 +135,32 @@ def clean_env(scratch: Path) -> dict:
         "PYTHONDONTWRITEBYTECODE": "1",
     })
     return env
+
+
+def public_probe(case: str, args: list[str], scratch: Path, env: dict,
+                 source: Path) -> subprocess.CompletedProcess:
+    """Keep actual scanner output and source identity for each runtime probe."""
+    runner_digest = hashlib.sha256(UBS.read_bytes()).hexdigest()
+    destination = (REPO_ROOT / "test-suite" / "artifacts" / "helper-python-floor"
+                   / f"{sys.version_info.major}.{sys.version_info.minor}-{runner_digest[:12]}" / case)
+    destination.mkdir(parents=True, exist_ok=True)
+    command = [str(UBS), *args]
+    started = time.perf_counter()
+    proc = subprocess.run(command, cwd=scratch, env=env, capture_output=True,
+                          text=True, timeout=300, check=False)
+    (destination / "stdout.log").write_text(proc.stdout, encoding="utf-8")
+    (destination / "stderr.log").write_text(proc.stderr, encoding="utf-8")
+    (destination / source.name).write_bytes(source.read_bytes())
+    (destination / "result.json").write_text(json.dumps({
+        "case": case, "command": command, "cwd": str(scratch),
+        "python": sys.version, "executable": sys.executable,
+        "runner_sha256": runner_digest,
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "duration_sec": time.perf_counter() - started, "exit_code": proc.returncode,
+        "environment": {key: env[key] for key in ("PATH", "UBS_PYTHON", "UBS_NO_AUTO_UPDATE")
+                        if key in env},
+    }, indent=2) + "\n", encoding="utf-8")
+    return proc
 
 
 class HelperPythonFloor(unittest.TestCase):
@@ -273,6 +301,78 @@ class HelperCurrentRuntime(unittest.TestCase):
 
     def test_explicit_interpreter_doctor_and_real_scans_agree(self) -> None:
         self.check_doctor_and_scans(override=True)
+
+    def test_public_json_and_sarif_preserve_rule_sites_across_languages(self) -> None:
+        cases = (
+            ("python", "sample.py", "VALUE = 42\n", "value = input()\neval(value)\n",
+             "python.taint.eval", 2),
+            ("js", "sample.js", "export const answer = 42;\n",
+             "const box = {};\nbox.html = req.query.html;\nres.send(box.html);\n",
+             "javascript.taint.xss", 3),
+            ("rust", "sample.rs", 'fn handler() -> Redirect { Redirect::to("/home") }\n',
+             'fn handler(params: Params) -> Redirect {\n'
+             '    let target = params.get("next").unwrap_or_default();\n'
+             '    Redirect::to(&target)\n}\n', "rust.security.open-redirect", 3),
+        )
+        with tempfile.TemporaryDirectory(prefix="ubs_runtime_formats_") as tmp:
+            scratch = Path(tmp)
+            env = clean_env(scratch)
+            env["UBS_PYTHON"] = sys.executable
+            for language, filename, clean, buggy, rule, line in cases:
+                for dirty, contents in ((False, clean), (True, buggy)):
+                    project = scratch / f"{language}-{'buggy' if dirty else 'clean'}"
+                    project.mkdir()
+                    source = project / filename
+                    source.write_text(contents, encoding="utf-8")
+                    for output_format in ("json", "sarif"):
+                        case = f"{project.name}-{output_format}"
+                        with self.subTest(case=case):
+                            proc = public_probe(case, [f"--only={language}", f"--format={output_format}",
+                                                      "--ci", str(source)], scratch, env, source)
+                            detail = proc.stdout + proc.stderr
+                            self.assertEqual(proc.returncode, int(dirty), detail)
+                            self.assertNotIn("Traceback (most recent call last)", detail)
+                            report = json.loads(proc.stdout)
+                            if output_format == "json":
+                                self.assertEqual(report.get("status"), "ok", report)
+                                self.assertEqual(report.get("failed_modules"), [], report)
+                                self.assertEqual(report["totals"]["files"], 1, report)
+                                selected = [finding for finding in report.get("findings", [])
+                                            if finding["rule_id"] == rule]
+                                sites = [(Path(finding["file"]).name, finding["line"])
+                                         for finding in selected]
+                                if dirty:
+                                    self.assertEqual([finding["severity"] for finding in selected], ["critical"])
+                                    self.assertGreater(report["totals"]["critical"], 0, report)
+                                else:
+                                    self.assertEqual(report["totals"]["critical"], 0, report)
+                            else:
+                                self.assertEqual(report["version"], "2.1.0", report)
+                                selected = [finding for run in report["runs"]
+                                            for finding in run.get("results", []) if finding["ruleId"] == rule]
+                                sites = [(Path(location["physicalLocation"]["artifactLocation"]["uri"]).name,
+                                          location["physicalLocation"]["region"]["startLine"])
+                                         for finding in selected for location in finding["locations"]]
+                            self.assertEqual(sites, [(filename, line)] if dirty else [], report)
+
+    def test_usage_and_malformed_rules_stay_errors_on_the_selected_runtime(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs_runtime_errors_") as tmp:
+            scratch = Path(tmp)
+            source = scratch / "sample.js"
+            source.write_text("export const answer = 42;\n", encoding="utf-8")
+            env = clean_env(scratch)
+            env["UBS_PYTHON"] = sys.executable
+            usage = public_probe("invalid-format", ["--format=invalid-floor-probe", str(source)],
+                                 scratch, env, source)
+            self.assertEqual(usage.returncode, 2, usage.stdout + usage.stderr)
+            self.assertNotIn("Traceback (most recent call last)", usage.stdout + usage.stderr)
+            rules = scratch / "rules"
+            rules.mkdir()
+            (rules / "broken.yml").write_text("id: broken\nlanguage: JavaScript\nrule: [\n", encoding="utf-8")
+            failure = public_probe("malformed-rules", ["--only=js", "--format=json", f"--rules={rules}", str(source)],
+                                   scratch, env, source)
+            self.assertEqual(failure.returncode, 2, failure.stdout + failure.stderr)
+            self.assertIn(json.loads(failure.stdout).get("status"), ("error", "partial"), failure.stdout)
 
 
 if __name__ == "__main__":

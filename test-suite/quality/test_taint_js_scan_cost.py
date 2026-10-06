@@ -196,6 +196,72 @@ class JestShapedFileCostTests(unittest.TestCase):
                           in findings], [("handler.ts", "js.taint.xss", 2)])
 
 
+class LoopStateConvergenceTests(unittest.TestCase):
+    def run(self, result=None):
+        case = "c6-loop-pending-heap-summary"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        result = super().run(result)
+        failed = any(test is self or getattr(test, "test_case", None) is self
+                     for test, _ in (*result.failures, *result.errors))
+        print(f"[{case}] {'FAIL' if failed else 'PASS'} "
+              f"({time.perf_counter() - started:.2f}s)", flush=True)
+        return result
+
+    def test_pending_heap_calls_do_not_reset_loop_fixed_point(self) -> None:
+        case = "c6-loop-pending-heap-summary"
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        loops = (
+            ("for-of", "for (const value of values) {", "}"),
+            ("for", "for (let i = 0; flag; i++) {", "}"),
+            ("while", "while (flag) {", "}"),
+            ("do", "do {", "} while (flag);"),
+        )
+        for label, opening, closing in loops:
+            with self.subTest(loop=label):
+                scratch = tempfile.mkdtemp(prefix=case + "-", dir=artifacts)
+                path = Path(scratch) / "handler.ts"
+                source = "\n".join([
+                    "function context() { return {options: ['safe'], nested: {safe: 'clean'}}; }",
+                    "function verify(box) { if (flag) { throw box; } return box; }",
+                    "const values = [req.query.html];",
+                    "try {",
+                    opening,
+                    "  const box = {html: req.query.html, context: context()};",
+                    "  verify(box);",
+                    "  document.body.innerHTML = box.html;",
+                    "  document.body.innerHTML = box.context.nested.safe;",
+                    closing,
+                    "} catch (error) {",
+                    "  document.body.innerHTML = error.html;",
+                    "  document.body.innerHTML = error.context.nested.safe;",
+                    "}",
+                ])
+                path.write_text(source + "\n", encoding="utf-8")
+                env = dict(os.environ, PYTHONPATH=str(HELPERS_DIR))
+                command = [sys.executable, "-c",
+                           "import json, sys; from pathlib import Path; "
+                           "from ubs_core.analyzers.taint_js import scan_file_findings; "
+                           "print(json.dumps([(rule, line) for rule, line, _, _ "
+                           "in scan_file_findings(Path(sys.argv[1]))]))", str(path)]
+                try:
+                    result = subprocess.run(command, capture_output=True, text=True,
+                                            env=env, timeout=10)
+                except subprocess.TimeoutExpired as exc:
+                    self.fail(f"{label} did not converge: {source}\n"
+                              f"stdout={exc.stdout!r}\nstderr={exc.stderr!r}")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                try:
+                    findings = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"{label} returned invalid JSON: {exc}\n"
+                              f"stdout={result.stdout}\nstderr={result.stderr}")
+                self.assertEqual(findings, [
+                    ["js.taint.xss", 8], ["js.taint.xss", 12],
+                ], source + "\n" + result.stdout + result.stderr)
+
+
 class CallStateLifetimeTests(unittest.TestCase):
     def test_finished_call_flows_release_without_cyclic_collection(self) -> None:
         case = "c6-call-state-lifetime"

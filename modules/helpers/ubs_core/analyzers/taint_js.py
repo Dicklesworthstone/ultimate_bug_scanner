@@ -1876,7 +1876,8 @@ class _Flow:
             else:
                 self.assign(target, fact, state, start, self.callable(rhs, end, state))
             for location, expr_start, rule, label in self.engine.write_sinks:
-                if rule == self.rule and start <= location < rhs <= expr_start:
+                if (rule == self.rule and start <= location < expr_start <= rhs
+                        and not code[expr_start:rhs].strip()):
                     self.effect(location, label, fact, state)
             return fact
         if access and access[2] == end:
@@ -2371,7 +2372,10 @@ class _Flow:
                     except _NoNormalCompletion:
                         after = None
                 exits.extend(self.breaks)
-                merged = _join_states(entry, after)
+                # A pending heap-call summary has no normal output yet.
+                # Keep earlier iterations rather than resetting to entry and
+                # alternating forever between populated and empty heaps.
+                merged = _join_states(entry, current, after)
                 if merged == current:
                     break
                 current = merged

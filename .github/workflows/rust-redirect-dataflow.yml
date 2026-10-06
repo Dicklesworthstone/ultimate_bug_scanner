@@ -73,7 +73,9 @@ jobs:
           assert blob(checkpoint) == '7c3b8ceac41ecdd3bdc6553739d7844d86f68be1'
           run(['bash', 'scripts/verify_checksums.sh'])
           run(['bash', 'scripts/verify_sha256sums.sh'])
-          apply(lzma.decompress(checkpoint))
+          # This exact, hash-verified repository checkpoint uses a 512 MiB
+          # LZMA dictionary. Keep decoding bounded above that known requirement.
+          apply(lzma.decompress(checkpoint, memlimit=600 * 1024 * 1024))
           apply((patches / '7695603c0e397f31f00bd68bcfd099a35976e820.patch').read_bytes())
           functional = {
               'modules/helpers/ubs_core/analyzers/taint_rust.py': '2efb1e0d95ec3a6d3177248fb026841517b58670',

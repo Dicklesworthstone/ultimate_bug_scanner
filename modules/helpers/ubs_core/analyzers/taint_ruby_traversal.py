@@ -47,6 +47,16 @@ SINK_RE = re.compile(
 )
 PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path'})
 VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name'})
+RUBY_EXCEPTION_BASES = {
+    'Exception': None, 'StandardError': 'Exception', 'RuntimeError': 'StandardError',
+    'ArgumentError': 'StandardError', 'TypeError': 'StandardError', 'IOError': 'StandardError',
+    'EOFError': 'IOError', 'IndexError': 'StandardError', 'KeyError': 'IndexError',
+    'NameError': 'StandardError', 'NoMethodError': 'NameError', 'ZeroDivisionError': 'StandardError',
+    'RangeError': 'StandardError', 'RegexpError': 'StandardError', 'SystemCallError': 'StandardError',
+    'SecurityError': 'Exception', 'SystemExit': 'Exception', 'Interrupt': 'Exception',
+    'ScriptError': 'Exception', 'SyntaxError': 'ScriptError', 'LoadError': 'ScriptError',
+    'NotImplementedError': 'ScriptError', 'NoMemoryError': 'Exception', 'SystemStackError': 'Exception',
+}
 
 def should_skip(path: Path) -> bool:
     try:
@@ -314,6 +324,8 @@ class RubyStatement:
     body: tuple = ()
     alternate: tuple = ()
     names: tuple = ()
+    handlers: tuple = ()
+    finalizer: tuple = ()
 
 
 @dataclass
@@ -403,6 +415,38 @@ class RubyParser:
         self.end()
         return RubyStatement(kind, condition, body, alternate)
 
+    def exception_body(self, owner):
+        """Parse explicit begin and Ruby's implicit method/block exception body."""
+        body = self.block({'rescue', 'else', 'ensure', 'end'}, owner)
+        handlers, alternate, finalizer = [], (), ()
+        while self.value() == 'rescue':
+            self.position += 1
+            header = self.take()
+            binding = split_tokens(header, {'=>'})
+            names = ()
+            if len(binding) > 2 or (len(binding) == 2 and
+                    (len(binding[1]) != 1 or not re.fullmatch(r'[a-z_]\w*', binding[1][0].value))):
+                raise ValueError('Unsupported Ruby exception binding; analysis is incomplete')
+            if len(binding) == 2:
+                names = (binding[1][0].value,)
+            if binding[0] and not re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*(?:,(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*)*', token_text(binding[0])):
+                raise ValueError('Dynamic Ruby rescue classes need dispatch analysis; analysis is incomplete')
+            caught = self.block({'rescue', 'else', 'ensure', 'end'}, owner)
+            handlers.append(RubyStatement('handler', header, caught, names=names))
+        if self.value() == 'else':
+            if not handlers:
+                raise ValueError('Ruby exception else needs a rescue clause; analysis is incomplete')
+            self.position += 1
+            alternate = self.block({'ensure', 'end'}, owner)
+        if self.value() == 'ensure':
+            self.position += 1
+            finalizer = self.block({'end'}, owner)
+        self.end()
+        if handlers or alternate or finalizer:
+            return (RubyStatement('rescue', body=body, alternate=alternate,
+                                  handlers=tuple(handlers), finalizer=finalizer),)
+        return body
+
     def statement(self, owner):
         start, kind = self.position, self.value()
         if kind in {'class', 'module', 'def'}:
@@ -441,8 +485,7 @@ class RubyParser:
                     body = (RubyStatement('simple', self.take()),)
                 else:
                     self.separators()
-                    body = self.block({'end'}, function_owner)
-                    self.end()
+                    body = self.exception_body(function_owner)
                 key = self.tokens[start].start
                 self.functions[key] = RubyFunction(key, method, function_owner, tuple(parameters), body, singleton,
                                                    defaults=tuple(defaults), parameter_kinds=tuple(kinds))
@@ -451,8 +494,7 @@ class RubyParser:
                     previous = self.singleton_scope
                     self.singleton_scope = True
                     self.separators()
-                    body = self.block({'end'}, owner)
-                    self.end()
+                    body = self.exception_body(owner)
                     self.singleton_scope = previous
                     return RubyStatement('block', body=body)
                 name = token_text(split_tokens(header, {'<'})[0])
@@ -460,8 +502,7 @@ class RubyParser:
                 previous = self.singleton_scope
                 self.singleton_scope = False
                 self.separators()
-                body = self.block({'end'}, child_owner)
-                self.end()
+                body = self.exception_body(child_owner)
                 self.singleton_scope = previous
                 key = self.tokens[start].start
                 self.functions[key] = RubyFunction(key, '<' + kind + '>', child_owner, (), body, scope=True)
@@ -486,12 +527,7 @@ class RubyParser:
             return RubyStatement(kind, condition, body, names=names)
         if kind == 'begin':
             self.position += 1
-            body = self.block({'rescue', 'ensure', 'end'}, owner)
-            if self.value() != 'end':
-                # Continuing past exception handlers would turn a rejected
-                # validation into a false proof. The driver reports partial.
-                raise ValueError('Ruby rescue/ensure flow needs exception analysis; analysis is incomplete')
-            self.end()
+            body = self.exception_body(owner)
             return RubyStatement('block', body=body)
         tokens = self.take({'do'})
         if any(tokens[index].value == '-' and tokens[index + 1].value == '>' for index in range(len(tokens) - 1)) or any(token.kind == 'code' and token.value in {'lambda', 'proc'} for token in tokens):
@@ -536,9 +572,10 @@ class RubyParser:
                     raise ValueError('Unterminated Ruby block parameters; analysis is incomplete')
                 self.position += 1
             self.separators()
-            body = self.block({'end'}, owner)
-            self.end()
+            body = self.exception_body(owner)
             return RubyStatement('iterate', tokens, body, names=tuple(names))
+        if len(split_tokens(tokens, {'rescue'})) > 1:
+            raise ValueError('Ruby modifier rescue needs expression binding analysis; analysis is incomplete')
         for modifier in ('unless', 'if', 'while', 'until'):
             parts = split_tokens(tokens, {modifier})
             if len(parts) == 2:
@@ -551,6 +588,7 @@ class RubySummary:
     returned: Fact = CLEAN
     effects: dict = field(default_factory=dict)
     mutations: dict = field(default_factory=dict)
+    raised: Fact = CLEAN
 
     def merged(self, other):
         effects = dict(self.effects)
@@ -559,7 +597,8 @@ class RubySummary:
         mutations = dict(self.mutations)
         for parameter, fact in other.mutations.items():
             mutations[parameter] = join(mutations.get(parameter, CLEAN), fact)
-        return RubySummary(join(self.returned, other.returned), effects, mutations)
+        return RubySummary(join(self.returned, other.returned), effects, mutations,
+                           join(self.raised, other.raised))
 
 
 def tainted(fact):
@@ -585,6 +624,7 @@ class RubyEngine:
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
         self.contexts, self.summaries = {}, {}
+        self.pending_raises = CLEAN
         self.constants = {}
         # Only unconditional, literal constant definitions can be an allowlist
         # or trusted root. A second definition invalidates that static proof.
@@ -601,11 +641,16 @@ class RubyEngine:
 
     def step(self, offset, kind, label):
         offset = max(0, offset)
-        line = bisect_right(self.lines, offset)
-        return Step(str(self.path), line, offset - self.lines[line - 1] + 1, kind, label[:160])
+        line_index = bisect_right(self.lines, offset) - 1
+        return Step(str(self.path), line_index + 1, offset - self.lines[line_index] + 1, kind, label[:160])
 
     def source(self, offset, label):
         return frozenset({Trace('source', (str(self.path), offset, label), evidence=(self.step(offset, 'source', label),))})
+
+    def exception_value(self, value, kind):
+        previous = frozenset(tag for trace in value for tag in trace.tags if tag.startswith('exception-type:'))
+        return join(retag(tainted(value), add=frozenset({'exception-type:' + kind}),
+                          remove=VALUE_TAGS | previous), frozenset({Trace('exception', (kind,))}))
 
     def literal(self, tokens):
         tokens = ungroup(tokens)
@@ -709,7 +754,8 @@ class RubyEngine:
                            if ('contained-path' not in trace.tags if self.policy == 'path'
                                else not {'url-host', 'url-scheme'} <= trace.tags)
                            and not (self.policy == 'path' and 'basename-path' in trace.tags
-                                    and ('not-dot-name' in trace.tags or operation in {'read', 'binread', 'write', 'binwrite', 'open', 'truncate'})))
+                                    and ('not-dot-name' in trace.tags or operation == 'send_file'
+                                         or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
             label = 'file sink' if self.policy == 'path' else 'outbound URL sink'
             self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
@@ -756,6 +802,7 @@ class RubyEngine:
                 bound = tuple(advance(value, call) for value in values)
                 summary = self.summaries[self.context(function, bound)]
                 returned = join(returned, advance(summary.returned, call))
+                self.pending_raises = join(self.pending_raises, advance(summary.raised, call))
                 for site, fact in summary.effects.items():
                     self.effects[site] = join(self.effects.get(site, CLEAN), fact)
                 for index, fact in summary.mutations.items():
@@ -767,6 +814,7 @@ class RubyEngine:
                 raise ValueError('Ruby selected helper arguments could not bind; analysis is incomplete')
         method = name.rsplit('.', 1)[-1]
         value = join(receiver, *arguments)
+        self.pending_raises = join(self.pending_raises, self.exception_value(value, '*'))
         if method == 'new':
             owner = tuple(name.rsplit('.', 1)[0].split('::'))
             if any(function.scope and function.owner == owner for function in self.parser.functions.values()):
@@ -828,7 +876,9 @@ class RubyEngine:
                 indexes = tuple(range(len(arguments)))
             for index in indexes:
                 if 0 <= index < len(arguments):
-                    self.record(token.start, arguments[index], method)
+                    self.record(token.start, arguments[index], name)
+        if method in {'message', 'full_message', 'to_s', 'to_str'} and any(trace.kind == 'exception' for trace in receiver):
+            return frozenset(trace for trace in value if trace.kind != 'exception')
         if method in {'freeze', 'to_s', 'to_str'}:
             return value
         if method in {'host', 'hostname', 'scheme', 'path', 'query', 'fragment', 'port'}:
@@ -987,60 +1037,205 @@ class RubyEngine:
         actions, edges = {}, {}
 
         def node(kind, tokens=(), targets=(), extra=None):
+            self.budget.spend()
             key = len(actions)
             actions[key], edges[key] = (kind, tokens, extra), tuple(targets)
             return key
 
         exit_node = node('exit')
+        raise_exit = node('raise-exit')
 
-        def block(statements, following, break_to=None, next_to=None):
+        def evaluate(kind, tokens, targets, exception_to):
+            ordinary = node(kind, tokens, targets)
+            # Each expression can fail before its assignment commits. The
+            # exception action evaluates calls separately and joins their
+            # possible side effects with the pre-expression bindings.
+            exceptional = node('exception', tokens, (exception_to,))
+            return node('branch', targets=(ordinary, exceptional))
+
+        def block(statements, following, break_to=None, next_to=None,
+                  return_to=exit_node, exception_to=raise_exit, retry_to=None):
             for statement in reversed(statements):
                 kind, tokens = statement.kind, statement.tokens
                 if kind == 'block':
-                    following = block(statement.body, following, break_to, next_to)
+                    following = block(statement.body, following, break_to, next_to,
+                                      return_to, exception_to, retry_to)
+                elif kind == 'rescue':
+                    restart = node('branch')
+                    cleaned, restored = {}, {}
+                    exception_scope = 'rescue:' + str(restart)
+
+                    def cleanup(target):
+                        if target is None or not statement.finalizer:
+                            return target
+                        if target not in cleaned:
+                            saved = 'ensure:' + str(len(actions))
+                            restore = node('restore-result', targets=(target,), extra=saved)
+                            finalizer = block(statement.finalizer, restore, break_to, next_to,
+                                              return_to, exception_to, retry_to)
+                            cleaned[target] = node('save-result', targets=(finalizer,), extra=saved)
+                        return cleaned[target]
+
+                    def restore_exception(target):
+                        if target is not None and target not in restored:
+                            restored[target] = node('restore-exception', targets=(target,), extra=exception_scope)
+                        return restored.get(target)
+
+                    finished = restore_exception(cleanup(following))
+                    leave_return, leave_raise = restore_exception(cleanup(return_to)), cleanup(exception_to)
+                    leave_break, leave_next, leave_retry = (restore_exception(cleanup(target))
+                                                           for target in (break_to, next_to, retry_to))
+                    normal = block(statement.alternate, finished, leave_break, leave_next,
+                                   leave_return, leave_raise, leave_retry) if statement.alternate else finished
+                    previous, handlers = [], []
+                    for handler in statement.handlers:
+                        classes = tuple(token_text(part).removeprefix('::') for part in
+                                        split_tokens(split_tokens(handler.tokens, {'=>'})[0], {','}) if part) or ('StandardError',)
+                        caught = block(handler.body, finished, leave_break, leave_next,
+                                       leave_return, leave_raise, restore_exception(restart))
+                        caught = node('catch', targets=(caught,), extra=handler.names)
+                        handlers.append(node('exception-match', targets=(caught,), extra=(classes, tuple(previous))))
+                        previous.extend(classes)
+                    unhandled = node('exception-match', targets=(leave_raise,), extra=((), tuple(previous)))
+                    dispatch = node('branch', targets=(*handlers, unhandled)) if handlers else leave_raise
+                    protected = block(statement.body, normal, leave_break, leave_next,
+                                      leave_return, dispatch, leave_retry)
+                    edges[restart] = (protected,)
+                    following = node('save-exception', targets=(restart,), extra=exception_scope)
                 elif kind in {'if', 'unless'}:
-                    yes = block(statement.body, following, break_to, next_to) if statement.body else node('nil', targets=(following,))
-                    no = block(statement.alternate, following, break_to, next_to) if statement.alternate else node('nil', targets=(following,))
+                    yes = block(statement.body, following, break_to, next_to, return_to, exception_to, retry_to) if statement.body else node('nil', targets=(following,))
+                    no = block(statement.alternate, following, break_to, next_to, return_to, exception_to, retry_to) if statement.alternate else node('nil', targets=(following,))
                     true_guard = node('guard', tokens, (yes if kind == 'if' else no,), True)
                     false_guard = node('guard', tokens, (no if kind == 'if' else yes,), False)
                     targets = (true_guard,) if token_text(tokens) == 'true' else (false_guard,) if token_text(tokens) in {'false', 'nil'} else (true_guard, false_guard)
-                    following = node('condition', tokens, targets)
+                    following = evaluate('condition', tokens, targets, exception_to)
                 elif kind in {'while', 'until', 'for', 'iterate'}:
-                    loop = node('condition', tokens)
+                    loop = node('branch')
                     after = node('nil', targets=(following,))
                     break_target = following
+                    return_target, raise_target = return_to, exception_to
                     saved = (str(tokens[0].start) if tokens else str(loop), statement.names)
                     if kind == 'iterate' and statement.names:
                         after = node('restore', targets=(after,), extra=saved)
                         break_target = node('restore', targets=(following,), extra=saved)
-                    body = block(statement.body, loop, break_target, loop)
+                        return_target = node('restore', targets=(return_to,), extra=saved)
+                        raise_target = node('restore', targets=(exception_to,), extra=saved)
+                    body = block(statement.body, loop, break_target, loop, return_target, raise_target, retry_to)
                     if statement.names:
-                        body = node('bind', tokens, (body,), statement.names)
+                        bound = node('bind', tokens, (body,), statement.names)
+                        body = node('branch', targets=(bound, node('exception', tokens, (raise_target,))))
                     yes = node('guard', tokens, (body,), kind != 'until')
                     no = node('guard', tokens, (after,), kind == 'until')
-                    edges[loop] = (yes, no)
+                    edges[loop] = (evaluate('condition', tokens, (yes, no), raise_target),)
                     following = node('save', targets=(loop,), extra=saved) if kind == 'iterate' and statement.names else loop
                 else:
                     first = tokens[0].value if tokens and tokens[0].kind == 'code' else ''
                     if first == 'return':
-                        following = node('simple', tokens[1:], (exit_node,))
+                        following = evaluate('simple', tokens[1:], (return_to,), exception_to)
                     elif first in {'raise', 'fail', 'throw', 'abort', 'exit'}:
-                        following = node('condition', tokens[1:])
+                        following = node('raise', tokens[1:], (exception_to,))
                     elif first in {'break', 'next'}:
                         target = break_to if first == 'break' else next_to
                         if target is None:
                             raise ValueError('Ruby nonlocal block completion needs closure analysis; analysis is incomplete')
-                        following = node('simple', tokens[1:], (target,))
+                        following = evaluate('simple', tokens[1:], (target,), exception_to)
+                    elif first == 'retry':
+                        if retry_to is None:
+                            raise ValueError('Ruby retry outside a rescue clause; analysis is incomplete')
+                        following = node('branch', targets=(retry_to,))
                     else:
-                        following = node('simple', tokens, (following,))
+                        following = evaluate('simple', tokens, (following,), exception_to)
             return following
 
         return block(function.body, exit_node), actions, edges
 
     def transfer(self, action, state):
         kind, tokens, extra = action
+        if not state.get('@reachable'):
+            return state
+        self.pending_raises = CLEAN
+        if kind == 'branch':
+            return state
         if kind == 'exit':
             self.returned = join(self.returned, state.get('@result', CLEAN))
+            return state
+        if kind == 'raise-exit':
+            self.raised = join(self.raised, state.get('@exception', CLEAN))
+            return state
+        if kind in {'save-result', 'restore-result'}:
+            saved = '@result:' + extra
+            pending = '@exception:' + extra
+            if kind == 'save-result':
+                state[saved] = state.get('@result', CLEAN)
+                state[pending] = state.get('@exception', CLEAN)
+            else:
+                state['@result'] = state.pop(saved, CLEAN)
+                state['@exception'] = state.pop(pending, CLEAN)
+            return state
+        if kind in {'save-exception', 'restore-exception'}:
+            saved = '@exception:' + extra
+            if kind == 'save-exception':
+                state[saved] = state.get('@exception', CLEAN)
+            else:
+                state['@exception'] = state.get(saved, CLEAN)
+            return state
+        if kind == 'catch':
+            for name in extra:
+                state[name] = state.get('@exception', CLEAN)
+            return state
+        if kind == 'exception-match':
+            classes, previous = extra
+            def matches(raised, caught):
+                if raised == '*' or any(name not in RUBY_EXCEPTION_BASES for name in caught):
+                    return None
+                parents, current = {raised}, raised
+                while current in RUBY_EXCEPTION_BASES and RUBY_EXCEPTION_BASES[current]:
+                    current = RUBY_EXCEPTION_BASES[current]
+                    parents.add(current)
+                return bool(parents.intersection(caught))
+            kinds = {trace.key[0] for trace in state.get('@exception', CLEAN) if trace.kind == 'exception'} or {'*'}
+            admitted = {name for name in kinds if matches(name, previous) is not True
+                        and (not classes or matches(name, classes) is not False)}
+            if not admitted:
+                return {}
+            state['@exception'] = frozenset(trace for trace in state.get('@exception', CLEAN)
+                                            if (trace.kind != 'exception' or trace.key[0] in admitted)
+                                            and (not tainted(frozenset({trace})) or
+                                                 any('exception-type:' + name in trace.tags for name in admitted)))
+            return state
+        if kind in {'exception', 'raise'}:
+            before = dict(state)
+            expression = split_tokens(tokens, {'=', '+=', '-=', '||=', '&&='})[-1]
+            value = self.expression(expression, state)
+            if kind == 'exception':
+                raised = self.pending_raises
+                # A bare, unresolved Ruby identifier can be a zero-argument
+                # method. Operators can also dispatch to user-defined code.
+                bare_call = len(expression) == 1 and expression[0].kind == 'code' and re.fullmatch(r'[a-z_]\w*[!?]?', expression[0].value) and expression[0].value not in before and expression[0].value not in {'nil', 'true', 'false'}
+                operators = any(token.kind == 'code' and token.value in {'+', '-', '*', '/', '==', '!=', '<', '>', '<=', '>='} for token in expression)
+                if bare_call or operators:
+                    raised = join(raised, self.exception_value(value, '*'))
+                if not raised:
+                    return {}
+                for name, fact in before.items():
+                    state[name] = join(fact, state.get(name, CLEAN))
+            elif not tokens:
+                raised = state.get('@exception') or frozenset({Trace('exception', ('RuntimeError',))})
+            else:
+                exception_class = tokens[0].value if tokens[0].value in RUBY_EXCEPTION_BASES else None
+                if exception_class and any(function.owner and function.owner[-1] == exception_class and function.scope for function in self.parser.functions.values()):
+                    exception_class = None
+                existing = frozenset(trace for trace in value if trace.kind == 'exception')
+                unknown_class = tokens[0].kind == 'code' and tokens[0].value[:1].isupper() and not exception_class
+                known_string = any(trace.kind == 'constant' and trace.key[0] == 'literal' for trace in value) and not tainted(value)
+                raised = value if existing and not exception_class else self.exception_value(
+                    value, exception_class or ('*' if unknown_class or not known_string else 'RuntimeError'))
+                # Evaluation of a raise argument can itself raise before the
+                # surrounding raise executes. Keep each exception's message
+                # correlated with its class through handler selection.
+                raised = join(raised, self.pending_raises)
+            state['@exception'] = join(retag(tainted(raised), remove=VALUE_TAGS),
+                                       frozenset(trace for trace in raised if trace.kind == 'exception'))
             return state
         if kind == 'guard':
             for name, tags in self.proof(tokens, extra, state).items():
@@ -1114,9 +1309,10 @@ class RubyEngine:
             contexts = tuple(self.contexts.items())
             for key, function in contexts:
                 self.budget.spend()
-                self.function, self.effects, self.returned, self.mutations = function, {}, CLEAN, {}
+                self.function, self.effects, self.returned, self.mutations, self.raised = function, {}, CLEAN, {}, CLEAN
                 self.parameter_values = dict(enumerate(key[1]))
-                state = {'params': shape('request-params', function.key), 'env': shape('environment', function.key),
+                state = {'@reachable': constant('reachable'),
+                         'params': shape('request-params', function.key), 'env': shape('environment', function.key),
                          **{name: shape('request', function.key) for name in ('request', 'req', 'rack_request')}}
                 for (owner, name), fact in self.constants.items():
                     if function.owner[:len(owner)] == owner:
@@ -1130,7 +1326,7 @@ class RubyEngine:
                     self.graphs[function.key] = self.graph(function)
                 entry, actions, edges = self.graphs[function.key]
                 solve(entry, state, edges, lambda node, incoming: self.transfer(actions[node], incoming), self.budget)
-                updated = self.summaries[key].merged(RubySummary(self.returned, self.effects, self.mutations))
+                updated = self.summaries[key].merged(RubySummary(self.returned, self.effects, self.mutations, self.raised))
                 if updated != self.summaries[key]:
                     self.summaries[key], changed = updated, True
             changed = changed or len(contexts) != len(self.contexts)

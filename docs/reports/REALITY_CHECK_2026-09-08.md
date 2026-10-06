@@ -23,6 +23,7 @@ README.md (2,880 lines), repository AGENTS.md (873 lines), and `/data/projects/A
 | Documentation claim checker | 13/13 checks passed | Selected mechanical claims agree, including 169 flags, 12 languages, 353 helpers, and version 5.4.23 |
 | Embedded core self-tests | 427/427 passed | Broad internal regression evidence |
 | Native buggy/clean CLI cases | 24/24 passed across all 12 modules | Every current module runs and meets its existing fixture assertions |
+| Native SARIF entry points | 12/12 emitted parseable SARIF 2.1.0 envelopes | Minimal clean sources; optional compiler/dependency phases disabled where applicable; envelope validation is not full schema or detection-accuracy proof |
 | Focused Python/C#/Rust/secret-comparison tests | 354 run: 350 passed, 4 skipped | Stronger semantic evidence; three optional Rust E2Es and one optional taint E2E were skipped |
 | Full 490-case manifest | 490/490 passed; zero failures, zero skipped | Existing expectations retained without modification; all twelve languages represented |
 | Native project self-scan | Exit 0; 443 files; 0 critical, 0 warning, 6,054 info; no failed modules | September's red self-scan finding is superseded; informational noise still deserves scrutiny |
@@ -31,7 +32,7 @@ README.md (2,880 lines), repository AGENTS.md (873 lines), and `/data/projects/A
 
 All new audit artifacts are under `test-suite/artifacts/`. Temporary files were retained, with cleanup intercepted in the test environment to honor the explicit no-deletion instruction. Finding assertions were unchanged. The first retention harness was defective and its failing run was rejected; the corrected harness produced the results above. This audit **does not certify cleanup behavior or an unmodified full `run_all.sh` run**. The self-scan overlapped other work and is not a controlled performance benchmark. Optional compiler, dependency-audit, macOS, Windows, and Nix paths were not locally verified.
 
-Artifacts: `reality-core-20261006-6bfga367` (core); `reality-cli-20261006-HPO8eX` (24-case sweep); `reality-cli-20261006-wEWXr6/unittest.log` (focused tests); `reality-cli-20261006-uUTBu5` (full manifest); `reality-cli-20261006-Mo0Mc0` (self-scan); `reality-port-probes-0lu8r1nq/results.json` (six analyzer probes); `reality-cli-20261006-dI9tvS/probe-results.json` (the same six through the actual meta-runner, each scanning one file successfully). These are ignored scratch evidence, not release artifacts.
+Artifacts: `reality-core-20261006-6bfga367` (core); `reality-cli-20261006-HPO8eX` (24-case sweep); `reality-cli-20261006-wEWXr6/unittest.log` (focused tests); `reality-cli-20261006-uUTBu5` (full manifest); `reality-cli-20261006-Mo0Mc0` (self-scan); `reality-port-probes-0lu8r1nq/results.json` (six analyzer probes); `reality-cli-20261006-dI9tvS/probe-results.json` (the same six through the actual meta-runner, each scanning one file successfully); `reality-cli-20261006-aOH8C0/sarif-envelope-results.json` (twelve native SARIF envelopes). These are ignored scratch evidence, not release artifacts.
 
 The latest published release inspected was [v5.4.17, October 1](https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/v5.4.17). Its asset list does not contain `ubs-daemon` or Sigstore bundles. Checkout service functionality and current installer wiring cannot therefore be assumed to exist in that release. The LSP documentation explicitly describes a checkout-only entry point, which is honest. Current focused CI evidence includes failing [Taint Integration](https://github.com/Dicklesworthstone/ultimate_bug_scanner/actions/runs/37518311400) and [Python Closure Taint](https://github.com/Dicklesworthstone/ultimate_bug_scanner/actions/runs/37518311268), and passing [Editor Diagnostics](https://github.com/Dicklesworthstone/ultimate_bug_scanner/actions/runs/37443556613) and [Local Scan Service](https://github.com/Dicklesworthstone/ultimate_bug_scanner/actions/runs/37438172383).
 
@@ -68,6 +69,7 @@ The latest published release inspected was [v5.4.17, October 1](https://github.c
 | 25 | Current release exposes current capabilities | PARTIAL | Checkout 5.4.23 versus published 5.4.17; daemon asset absent; release observation required |
 | 26 | Native Kotlin coverage matches advertised breadth | PARTIAL / inadequately tracked | Twenty-two headings but one native Pattern and one native AST rule; borrowed Java security/path logic supplies much of the substance |
 | 27 | Broad usefulness across today's project stacks | PARTIAL / NO_BEAD for missing languages | PHP, SQL, HCL, PowerShell, Dart, and Lua have no modules; stage additions by real ecosystem value and proof cost |
+| 28 | Persistent repository scan settings from feedback plan §4.1 | NOT_STARTED / NO_BEAD | README recommends a shell wrapper; session `--config-dir` and installer `install.conf` do not implement scan excludes/languages/rule overrides |
 
 ### Answers to the five reality-check questions
 
@@ -75,7 +77,7 @@ The latest published release inspected was [v5.4.17, October 1](https://github.c
 2. **What does not meet the vision?** Python 3.9 currently breaks; effective language depth is unequal; some implemented checks remain inaccessible or advisory; empirical accuracy/confidence and general latency promises are unproven; the latest published distribution and disabled full workflows do not establish a current complete release journey.
 3. **What blocks completion?** Receiver-specific binding/flow semantics, independent positive and negative controls, trustworthy calibration data, maintained runtime/platform probes, current release observation, and measured incremental analysis work. Additional headings or rule counts will not remove those blockers.
 4. **Would all existing open work close the gap?** No. Before this audit, 263 of 289 visible beads were closed, with 17 open and 9 in progress. D5/D6/D7/J1/C6/C7/K4/H8/G6 cover major programs, but their descriptions sometimes lag the code or specify invalid guarantees. They do not explicitly cover the new runtime regression, all activation gaps, native Kotlin depth, the demonstrated weak-frontend errors, or missing-language additions. The closed-count ratio says little about delivered accuracy.
-5. **Which goals lack adequate tracked work?** The runtime regression needs a new concrete bug/probe; activation needs an ordinary-user integration task; weak-module upgrades need named receiver/sink scopes; Kotlin needs native detectors with proof; PHP/SQL/HCL need new language tasks. Existing accuracy/docs/release/performance beads should be refined rather than duplicated.
+5. **Which goals lack adequate tracked work?** The runtime regression needs a new concrete bug/probe; activation needs an ordinary-user integration task; weak-module upgrades need named receiver/sink scopes; Kotlin needs native detectors with proof; PHP/SQL/HCL need new language tasks; persistent scan configuration from the original feedback plan has no matching open task. Existing accuracy/docs/release/performance beads should be refined rather than duplicated.
 
 ## Module rankings
 
@@ -177,7 +179,7 @@ Each candidate was considered against robustness, reliability, performance, intu
 | 24 | Cross-language API/schema boundary analysis | 3323334342 | Cut from near-term plan; unresolved oracle and scope cost |
 | 25 | Whole-program universal heap/type engine | 5522224421 | Cut; impractical for this product's lightweight constraints |
 | 26 | Suppression reason/expiry review | 4444454344 | Defer; existing suppression semantics work, lower return than missed bugs |
-| 27 | New dependency-advisory layer | 3333344343 | Defer; existing external-tool hooks already cover much of this; avoid duplicate network machinery |
+| 27 | Validated persistent repository scan configuration | 4445554444 | Lower-priority bridge work for feedback-plan §4.1; current wrapper/session/installer configuration is not this capability |
 | 28 | Fresh signed/platform release journey verification | 5554555544 | Prerequisite maintenance, reuse E5/F7/G6/H8; do not create a competing release program |
 | 29 | New module scaffolding framework | 4444443344 | Reject as duplicate; `scripts/new-module.sh` and scaffold proof already exist |
 | 30 | Streaming RSS/performance campaign | 4454445543 | Reuse C6/C7; a separate campaign would duplicate open work |
@@ -216,6 +218,8 @@ Resolve the exact prescribed ShellCheck gate as maintenance: classify actual con
 **Then obtain immediate analysis value.** Qualify dormant checks, fix the named-sanitizer/literal-kill failures, implement Kotlin native semantics, and replace per-file resource/task arithmetic. Prioritize dangerous missed bugs plus false positives in daily workflows. No wholesale engine rewrite is required. Keep each receiver slice independent so a blocked Elixir parser does not block a Java literal-kill fix.
 
 **Then broaden proven families and ecosystems.** Add database binding, framework configuration, deadlines, crypto identity and error/result semantics; integrate precise coverage/calibration evidence. PHP is the first new module. HCL may ship before SQL because parser availability reduces its entry cost, even though SQL ranks higher in strategic value. PowerShell/Dart/Lua remain considered future work rather than immediate graph clutter.
+
+The feedback plan's remaining optional persistent scan settings deserve a bounded lower-priority task: one validated declarative schema, clear defaults/project/environment/CLI precedence, no executable shell configuration, and policy identity in cache/daemon invalidation. A session-log directory flag or installer defaults must not be counted as implementing it.
 
 **Finally meet quantified scale/latency targets.** Continue C6/C7/K4 with controlled cold/warm/edited-source measurements, actual context invalidation, and memory limits. Keep the original performance target visible while labeling unverified claims honestly. Do not weaken a gate, regenerate goldens to bless a defect, or count plan edits as implementation progress.
 

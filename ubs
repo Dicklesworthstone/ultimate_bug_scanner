@@ -28,7 +28,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="5.4.21"
+UBS_VERSION="5.4.22"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
 UBS_DAEMON_SHA256="5016469099336eb215179a04d432643e00fdde653a01481c55d4e2861c2e0ad7"
@@ -106,18 +106,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='29387a48c34ef90c1e2f54d1a536d884de42093bf3887c763239eaa0606885b6'
-  [cpp]='e93bf02a59f761e4c7b2a64d6c386d4c85e12bdeac0bfccddef12b642f77fef3'
-  [csharp]='f67d33e9404ca1142842a9714098f127788fe0c560fb75351826995cb8221bfc'
-  [elixir]='09f8f8dcacf5fdf7ab27d67558daf5185f9fcc0a8ac02f13526cb3ef5f772346'
-  [golang]='963502e6da9365bd5a664d3badeb429a601a330b2f4038b92bc4b5b7a328c383'
-  [java]='f4313956b6c381fa5afbd96dc059f5070ff62c1580a3ef36ca239006f89c601b'
-  [js]='c84f3f6488ee6dce091e808523d8f01b6f4942525d8b2ec3aca7a72b2dcad43b'
-  [kotlin]='81721b068741922fd665e281aa9bf082011df9da179f96b7ad44c37371cc482f'
-  [python]='887a92ca89f4f81114bc118d021fc79ed4aefc911b441be46b97bfcd5ee3dc96'
-  [ruby]='2425851704d6af6b94ca21661ab494399f04b3de11df5ff18d68802433c12d56'
-  [rust]='e614ac1b75626dc21a25f22ecd6a4d2d5d091adeff5ead6eacebb4bef4e7cb5a'
-  [swift]='f0031169a4410413fbc50fb0b5940dbcdc3732babe3a53c777ecc70860381ee6'
+  [bash]='01aa5c41f7799f37958926c7b3db38e1905250097bccebab9b67af8c54388bde'
+  [cpp]='056966e9cf8d11f1ad08646580c2f85cd3d24585ad559239c3adccbfca73986a'
+  [csharp]='6eb1d3f7a9db4ca2b0e99a7d100be1193f3c6f2ec437e2c0c57692f3d935a64d'
+  [elixir]='7688564b4fc1e305c22c2e7b6056a73eca32bca9c41bd1e71cd56b5b284d3b17'
+  [golang]='10fbc159c02283201f23343a6e3db07452c36a8012f2b64da6be44fac1356295'
+  [java]='8c5ffe039f4fffbae1dd0d1fa8253fd0816c9bec6f2d5128cbcb77afcd3c1d33'
+  [js]='06d74241dfa69118c802010798e58b1fa9088f2b0afb7ef698a13f1cc29c91a6'
+  [kotlin]='9d6d6f17efe9d7f07d0982b996a5f305b142c1df9c42f5c186c68546aaf4e4c9'
+  [python]='d3b4b13b236627805c89ce6e6685c306f7947553c2d23248c075780573b835e8'
+  [ruby]='8fda920b65e8b823f3f9887ef540466462ddc38a0256c47dcc38aafcc2b2b7d1'
+  [rust]='75557fbce74d18861c7279a21ebf9fc76236fa76345da3e865e8cb2905a48678'
+  [swift]='848c4020f485fcff707081b81c843c79587e312a9105425e0a3725de21fa8db1'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -440,7 +440,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/rust_detectors/loop_context.py']='c78aed29e2eca7487ba5d1176c7af7d2e7edaeb15283291b2b13cb806b0915b1'
   ['helpers/ubs_core/rust_detectors/open_redirect.py']='1a46af91b331690c946e62dae1926110fecf8a8a335d235571f2b68d84a5b619'
   ['helpers/ubs_core/rust_detectors/path_traversal.py']='349f549442c72df06cbac9f1bf7815c7ca72bdc92803a0479827a4c04422c32e'
-  ['helpers/ubs_core/rust_detectors/redirect_flow.py']='ac1d82af4d6bb73116afc102c299df8a73f7ddecd9f6e969317f8f231528e762'
+  ['helpers/ubs_core/rust_detectors/redirect_flow.py']='a06dfe441ccd2e83d72cb128be50baad2587c9816ed870482a505f21071215c1'
   ['helpers/ubs_core/rust_detectors/request_regex.py']='01b1ee7756d78a0f079cb785b69ac34ad655dc966fb9797ff9b13aa4962295e9'
   ['helpers/ubs_core/rust_detectors/request_url.py']='ec7351e3c5d4a1657a31bb1940f0ca4f4d6d785ae32f358b0462d73e1419a3b1'
   ['helpers/ubs_core/rust_detectors/response_header.py']='15ff23c265c318c0bd2b782c4b48e15332e07ffffbb1688955bac0700db6104f'
@@ -475,7 +475,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='8f67ae710db981bb77947b4db2cfbc4bb266c5df2232c3344467e89692136803'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='2d0133fb6bcf1344090992a6353bfdb2997c99bafdd59694b345292f403b5f7b'
+  ['lib/ubs-common.sh']='be36a2b13e1e2766a51ef76d04cc55af700ee06961d01ab6fd79050977424a63'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────

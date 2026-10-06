@@ -97,6 +97,9 @@ class Function:
     name: str
     params: tuple[tuple[str, ...], ...]
     scope: int
+    receiver: str | None = None
+    generic: bool = False
+    public: bool = False
 
 
 @dataclass
@@ -110,6 +113,7 @@ class Summary:
 class Namespace:
     kind: str
     site: int
+    generic: bool = False
 
 
 _IDENTIFIER = re.compile(r'(?:r#)?[A-Za-z_][A-Za-z_0-9]*')
@@ -157,6 +161,7 @@ class Source:
         self.imported_names = defaultdict(set)
         self.glob_imports = set()
         self.impl_headers = {}
+        self.generic_impls = set()
         self.impl_owners = {}
         self.associated = {}
         for match in re.finditer(r'\bfn\s+((?:r#)?[A-Za-z_]\w*)', self.code):
@@ -176,12 +181,23 @@ class Source:
             if generic_end > generic_start:
                 self.type_parameters(generic_start, generic_end, body)
             params = []
+            receiver = None
             for begin, end in self.parts(pos + 1, close, generics=True):
                 colon = self.next_boundary(begin, end, ':')
                 names = self.pattern_names(begin, colon)
+                if not params:
+                    raw = self.code[begin:end].strip()
+                    if re.fullmatch(r'(?:mut\s+)?self', raw):
+                        receiver, names = 'value', ('self',)
+                    else:
+                        borrowed = re.fullmatch(r'&\s*(mut\s+)?self', raw)
+                        if borrowed:
+                            receiver = 'mutable' if borrowed.group(1) else 'shared'
+                            names = ('self',)
                 params.append(names)
             function = Function(match.start(), body, self.pairs[body], match.group(1).removeprefix('r#'),
-                                tuple(params), self.scope_at(match.start()))
+                                tuple(params), self.scope_at(match.start()), receiver, generic_end > generic_start,
+                                self.public_function(match.start()))
             self.functions.append(function)
             self.definitions[match.start()] = function
             key = (function.scope, function.name)
@@ -209,6 +225,28 @@ class Source:
         while pos < end and self.code[pos].isspace():
             pos += 1
         return pos
+
+    def public_function(self, pos):
+        """Read only contiguous function modifiers, with budgeted lookbehind."""
+        while pos > 0:
+            previous = pos - 1
+            self.budget.spend()
+            if self.code[previous].isspace():
+                pos = previous
+                continue
+            end = pos
+            while pos > 0:
+                previous = pos - 1
+                self.budget.spend()
+                if not (self.code[previous].isalnum() or self.code[previous] == '_'):
+                    break
+                pos = previous
+            word = self.code[pos:end]
+            if word == 'pub':
+                return self.code[pos - 1:pos] != '#'
+            if word not in {'async', 'unsafe', 'const', 'extern'}:
+                return False
+        return False
 
     def trim(self, start, end):
         # Use comment-masked text here: string literals are expressions too.
@@ -401,7 +439,8 @@ class Source:
                     namespace = Namespace('module', opening)
                     self.boundaries[opening] = 'module'
             elif kind in {'struct', 'enum', 'union'}:
-                namespace = Namespace('type', match.start())
+                opening = self.skip(match.end())
+                namespace = Namespace('type', match.start(), self.code[opening:opening + 1] == '<')
             elif kind == 'trait':
                 opening = self.next_boundary(match.end(), len(self.code), '{;')
                 if opening in self.pairs and self.code[opening] == '{':
@@ -438,6 +477,7 @@ class Source:
             self.boundaries[opening] = 'type'
             self.impl_headers[opening] = (begin, opening)
             if generic_end > generic_start:
+                self.generic_impls.add(opening)
                 self.type_parameters(generic_start, generic_end, opening)
 
     def module_scope(self, scope):
@@ -536,7 +576,8 @@ class Source:
                 return None
             if namespace.kind == 'module':
                 return self.symbols.get((namespace.site, leaf))
-            return self.associated.get((namespace.site, leaf))
+            target = self.associated.get((namespace.site, leaf))
+            return target if target is not None and self.visible_from(target, pos) else None
         if name in state.values:
             return None
         scope = self.scope_at(pos)
@@ -547,6 +588,40 @@ class Source:
                     or scope < 0 or self.boundaries.get(scope) == 'module'):
                 return None
             scope = self.parents[scope]
+
+    def visible_from(self, function, pos):
+        if function.public:
+            return True
+        target = self.module_scope(function.scope)
+        scope = self.module_scope(self.scope_at(pos))
+        while True:
+            if scope == target:
+                return True
+            if scope < 0:
+                return False
+            scope = self.module_scope(self.parents[scope])
+
+    def resolve_receiver(self, function, name):
+        """A plain `self` receiver with the same exact inherent receiver type.
+
+        Borrowing or dereferencing to a different receiver type can select a
+        trait method before an inherent namesake. Without type inference,
+        only identical value/shared/mutable forms prove this dispatch target.
+        Cross-module visibility and receiver adjustments remain opaque here.
+        """
+        if (function is None or function.receiver is None or function.generic
+                or function.scope in self.generic_impls):
+            return None
+        match = re.fullmatch(r'self\.([A-Za-z_]\w*)', name)
+        owner = self.impl_owners.get(function.scope)
+        if match is None or owner is None or owner.generic:
+            return None
+        target = self.associated.get((owner.site, match.group(1)))
+        if (target is None or target.receiver != function.receiver or target.generic
+                or target.scope in self.generic_impls
+                or self.module_scope(target.scope) != self.module_scope(function.scope)):
+            return None
+        return target
 
     def solve(self):
         pending = deque(self.functions)
@@ -1090,12 +1165,17 @@ class Flow:
                 local = (src.resolve(name, pos, state)
                          if not chained and not macro and not opaque_path
                          and not ('::' in name and catalogued is not None) else None)
+                implicit_receiver = False
+                if local is None and not chained and not macro and not opaque_path:
+                    local = src.resolve_receiver(self.function, name)
+                    implicit_receiver = local is not None
                 if local is not None:
                     if self.function is not None:
                         src.callers[local].add(self.function)
                     summary = src.summaries[local]
+                    actuals = ([state.values.get('self', CLEAN)] if implicit_receiver else []) + arguments
                     def substitute(fact):
-                        return join(*(arguments[o.site] if o.kind == 'parameter' and o.site < len(arguments)
+                        return join(*(actuals[o.site] if o.kind == 'parameter' and o.site < len(actuals)
                                       else CLEAN if o.kind == 'parameter' else frozenset({o}) for o in fact))
                     value = substitute(summary.returned)
                     for site, fact in summary.sinks.items():

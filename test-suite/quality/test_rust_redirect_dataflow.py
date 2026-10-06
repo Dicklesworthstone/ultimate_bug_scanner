@@ -671,6 +671,265 @@ class QualifiedHelperTests(SourceCase):
         self.count(f'struct Redirect {{}} impl Redirect {{fn to(x: &str) -> Self {{Redirect {{}}}}}} '
                    f'Redirect::to({SOURCE});')
 
+    def test_private_qualified_inherent_target_cannot_hide_a_visible_trait(self):
+        for visibility, expected in (('', 1), ('pub ', 0), ('pub(crate) ', 1), ('pub(super) ', 1)):
+            with self.subTest(visibility=visibility):
+                code = f'''struct Handler {{}}
+                    mod child {{impl super::Handler {{{visibility}fn target(&self, x: &'static str) -> &'static str {{"/safe"}}}}}}
+                    trait Fallback {{fn target(&self, x: &'static str) -> &'static str;}}
+                    impl Fallback for Handler {{fn target(&self, x: &'static str) -> &'static str {{x}}}}
+                    fn handler(params: Params) {{
+                        let receiver=Handler {{}}; Redirect::to(Handler::target(&receiver, {SOURCE}));
+                    }}'''
+                got = self.scan(code)
+                self.assertEqual(len(got), expected, got)
+                if expected:
+                    self.assertEqual(got[0][1], 6)
+
+    def test_private_qualified_methods_are_visible_to_descendant_modules(self):
+        for returned, expected in (('"/"', 0), ('x', 1)):
+            with self.subTest(returned=returned):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{fn target(&self, x: &'static str) -> &'static str {{{returned}}}}}
+                    mod child {{fn handler(params: Params) {{
+                        let receiver=super::Handler {{}};
+                        Redirect::to(super::Handler::target(&receiver, {SOURCE}));
+                    }}}}''')
+                self.assertEqual(len(got), expected, got)
+
+    def test_sibling_module_private_methods_remain_opaque_but_public_methods_resolve(self):
+        for visibility, expected in (('', 1), ('pub ', 0)):
+            with self.subTest(visibility=visibility):
+                got = self.scan(f'''struct Handler {{}}
+                    mod first {{impl super::Handler {{{visibility}fn target(&self, x: &'static str) -> &'static str {{"/"}}}}}}
+                    trait Fallback {{fn target(&self, x: &'static str) -> &'static str;}}
+                    impl Fallback for Handler {{fn target(&self, x: &'static str) -> &'static str {{x}}}}
+                    mod second {{use super::Fallback; fn handler(params: Params) {{
+                        let receiver=super::Handler {{}};
+                        Redirect::to(super::Handler::target(&receiver, {SOURCE}));
+                    }}}}''')
+                self.assertEqual(len(got), expected, got)
+
+    def test_unrelated_pub_tokens_do_not_export_a_private_method(self):
+        for prefix in ('pub fn unrelated() {}', 'pub const ENABLED: bool = true;',
+                       '#[doc = "pub"]', '// pub\n', 'pub(crate) fn unrelated() {}',
+                       'const TEXT: &str = "pub";'):
+            with self.subTest(prefix=prefix):
+                got = self.scan(f'''struct Handler {{}}
+                    mod child {{impl super::Handler {{
+                        {prefix}
+                        fn target(&self, x: &'static str) -> &'static str {{"/"}}
+                    }}}}
+                    trait Fallback {{fn target(&self, x: &'static str) -> &'static str;}}
+                    impl Fallback for Handler {{fn target(&self, x: &'static str) -> &'static str {{x}}}}
+                    fn handler(params: Params) {{Redirect::to(Handler::target(&Handler {{}}, {SOURCE}));}}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_visibility_modifier_lookbehind_consumes_the_shared_work_budget(self):
+        code = 'pub' + ' ' * 1024 + 'fn helper() {}'
+        with self.assertRaisesRegex(AnalysisLimit, 'work limit.*incomplete'):
+            Source(code, max_steps=100)
+        self.assertEqual(Source(code, max_steps=2000).solve(), {})
+
+
+class ReceiverHelperTests(SourceCase):
+    def test_direct_self_sink_requires_matching_receiver_forms(self):
+        for caller, helper in (('&self', '&self'), ('&mut self', '&mut self'),
+                               ('self', 'self'), ('mut self', 'self'), ('self', 'mut self')):
+            with self.subTest(caller=caller, helper=helper):
+                code = f'''struct Handler {{}}
+                    impl Handler {{
+                        fn send({helper}, target: &str) {{Redirect::to(target);}}
+                        fn route({caller}, params: Params) {{self.send({SOURCE});}}
+                    }}'''
+                got = self.scan(code)
+                self.assertEqual([row[1] for row in got], [3], got)
+                self.assertIn('params.get("next") -> redirect', got[0][3])
+
+    def test_self_constant_return_and_passthrough_are_distinct(self):
+        for receiver in ('&self', '&mut self', 'self'):
+            for returned, expected in (('"/"', 0), ('raw', 1)):
+                with self.subTest(receiver=receiver, returned=returned):
+                    got = self.scan(f'''struct Handler {{}}
+                        impl Handler {{
+                            fn target({receiver}, raw: &str) -> &str {{{returned}}}
+                            fn route({receiver}, params: Params) {{Redirect::to(self.target({SOURCE}));}}
+                        }}''')
+                    self.assertEqual(len(got), expected, got)
+
+    def test_implicit_self_does_not_shift_explicit_argument_positions(self):
+        for first, second, expected in (('"/"', SOURCE, 0), (SOURCE, '"/"', 1)):
+            with self.subTest(first=first):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{
+                        fn first(&self, a: &str, b: &str) -> &str {{a}}
+                        fn route(&self, params: Params) {{Redirect::to(self.first({first}, {second}));}}
+                    }}''')
+                self.assertEqual(len(got), expected, got)
+
+    def test_receiver_fact_survives_a_known_method_return(self):
+        code = f'''struct Handler {{target: String}}
+            impl Handler {{
+                fn target(&self) -> String {{self.target.clone()}}
+                fn route(&self) {{Redirect::to(self.target());}}
+            }}
+            fn handler(params: Params) {{
+                let receiver=Handler {{target: {SOURCE}}};
+                Handler::route(&receiver);
+            }}'''
+        got = self.scan(code)
+        self.assertEqual([row[1] for row in got], [4], got)
+
+    def test_separate_impls_and_declaration_order_preserve_self_owner(self):
+        helper = 'impl Handler {fn send(&self, x: &str) {Redirect::to(x);}}\n'
+        route = f'impl Handler {{fn route(&self, params: Params) {{self.send({SOURCE});}}}}\n'
+        for definitions in (helper + route, route + helper):
+            with self.subTest(definitions=definitions):
+                self.assertEqual(len(self.scan('struct Handler {}\n' + definitions)), 1)
+
+    def test_unrelated_owners_with_the_same_method_name_never_mix(self):
+        for selected, expected in (('Safe', 0), ('Unsafe', 1)):
+            code = f'''struct Safe {{}}
+                struct Unsafe {{}}
+                impl Safe {{fn send(&self, x: &str) {{Redirect::to("/");}}}}
+                impl Unsafe {{fn send(&self, x: &str) {{Redirect::to(x);}}}}
+                impl {selected} {{fn route(&self, params: Params) {{self.send({SOURCE});}}}}'''
+            with self.subTest(selected=selected):
+                got = self.scan(code)
+                self.assertEqual(len(got), expected, got)
+                if expected:
+                    self.assertEqual(got[0][1], 4)
+
+    def test_matching_inherent_receiver_wins_over_trait_namesakes(self):
+        for inherent, trait, expected in (('"/"', 'x', 0), ('x', '"/"', 1)):
+            with self.subTest(inherent=inherent):
+                got = self.scan(f'''struct Handler {{}}
+                    trait External {{fn target(&self, x: &str) -> &str;}}
+                    impl External for Handler {{fn target(&self, x: &str) -> &str {{{trait}}}}}
+                    impl Handler {{
+                        fn target(&self, x: &str) -> &str {{{inherent}}}
+                        fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}
+                    }}''')
+                self.assertEqual(len(got), expected, got)
+
+    def test_trait_for_reference_does_not_override_matching_inherent_receiver(self):
+        got = self.scan(f'''struct Handler {{}}
+            trait External {{fn target(self, x: &str) -> &str;}}
+            impl External for &Handler {{fn target(self, x: &str) -> &str {{x}}}}
+            impl Handler {{
+                fn target(&self, x: &str) -> &str {{"/"}}
+                fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}
+            }}''')
+        self.assertEqual(got, [])
+
+    def test_mismatched_receiver_forms_may_select_a_trait_and_remain_opaque(self):
+        # rustc selects the trait for these valid receiver-form mismatches.
+        for caller, inherent in (('&self', '&mut self'), ('self', '&self'), ('&mut self', '&self')):
+            with self.subTest(caller=caller, inherent=inherent):
+                got = self.scan(f'''struct Handler {{}}
+                    trait External {{fn target({caller}, x: &str) -> &str;}}
+                    impl External for Handler {{fn target({caller}, x: &str) -> &str {{x}}}}
+                    impl Handler {{
+                        fn target({inherent}, x: &str) -> &str {{"/"}}
+                        fn route({caller}, params: Params) {{Redirect::to(self.target({SOURCE}));}}
+                    }}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_private_child_impl_does_not_override_visible_trait_dispatch(self):
+        # The private inherent method is inaccessible from route's module;
+        # rustc selects the visible trait method with the same receiver form.
+        got = self.scan(f'''struct Handler {{}}
+            mod helpers {{impl super::Handler {{fn target(&self, x: &'static str) -> &'static str {{"/"}}}}}}
+            trait External {{fn target(&self, x: &'static str) -> &'static str;}}
+            impl External for Handler {{fn target(&self, x: &'static str) -> &'static str {{x}}}}
+            impl Handler {{fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}}}''')
+        self.assertEqual(len(got), 1, got)
+
+    def test_typed_receivers_remain_opaque(self):
+        for caller, helper in (('self: &Self', '&self'), ('&self', 'self: &Self'),
+                               ('self: Box<Self>', '&self')):
+            with self.subTest(caller=caller, helper=helper):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{
+                        fn target({helper}, x: &str) -> &str {{"/"}}
+                        fn route({caller}, params: Params) {{Redirect::to(self.target({SOURCE}));}}
+                    }}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_generic_methods_and_callers_remain_opaque(self):
+        for helper, caller, call in (('<T>', '', 'self.target::<u8>'), ('', '<T>', 'self.target')):
+            with self.subTest(helper=helper, caller=caller):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{
+                        fn target{helper}(&self, x: &str) -> &str {{"/"}}
+                        fn route{caller}(&self, params: Params) {{Redirect::to({call}({SOURCE}));}}
+                    }}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_generic_impls_and_default_generic_types_remain_opaque(self):
+        for declaration, implementation in (('struct Handler<T> {value: T}', 'impl<T> Handler<T>'),
+                                             ('struct Handler<T=u8> {value: T}', 'impl Handler')):
+            with self.subTest(declaration=declaration):
+                got = self.scan(f'''{declaration}
+                    {implementation} {{
+                        fn target(&self, x: &str) -> &str {{"/"}}
+                        fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}
+                    }}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_self_in_a_trait_impl_remains_opaque(self):
+        got = self.scan(f'''struct Handler {{}}
+            impl Handler {{fn target(&self, x: &str) -> &str {{"/"}}}}
+            trait External {{fn route(&self, params: Params);}}
+            impl External for Handler {{fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}}}''')
+        self.assertEqual(len(got), 1, got)
+
+    def test_aliases_fields_chains_and_other_receivers_remain_opaque(self):
+        for expression in ('other.target', 'alias.target', 'self.other.target', '(*self).target'):
+            with self.subTest(expression=expression):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{
+                        fn target(&self, x: &str) -> &str {{"/"}}
+                        fn route(&self, other: External, params: Params) {{
+                            let alias=self;
+                            Redirect::to({expression}({SOURCE}));
+                        }}
+                    }}''')
+                self.assertEqual(len(got), 1, got)
+
+    def test_local_function_does_not_inherit_an_enclosing_receiver(self):
+        got = self.scan(f'''struct Handler {{}}
+            impl Handler {{
+                fn target(&self, x: &str) -> &str {{"/"}}
+                fn route(&self, params: Params) {{
+                    fn inner(handler: &Handler, params: Params) {{Redirect::to(handler.target({SOURCE}));}}
+                    inner(self, params);
+                }}
+            }}''')
+        self.assertEqual([row[1] for row in got], [5], got)
+
+    def test_local_header_method_body_wins_over_name_based_sink_catalog(self):
+        for destination, expected in (('"/"', 0), ('target', 1)):
+            with self.subTest(destination=destination):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{
+                        fn header(&self, key: &str, target: &str) {{Redirect::to({destination});}}
+                        fn route(&self, params: Params) {{self.header("Location", {SOURCE});}}
+                    }}''')
+                self.assertEqual(len(got), expected, got)
+                if expected:
+                    self.assertEqual(got[0][1], 3)
+
+    def test_self_source_or_sink_spellings_do_not_override_a_known_body(self):
+        for method in ('get', 'redirect'):
+            with self.subTest(method=method):
+                got = self.scan(f'''struct Handler {{}}
+                    impl Handler {{
+                        fn {method}(&self, raw: &str) -> &str {{"/"}}
+                        fn route(&self, params: Params) {{Redirect::to(self.{method}({SOURCE}));}}
+                    }}''')
+                self.assertEqual(got, [])
+
 
 class PatternFlowTests(SourceCase):
     def test_match_binding_reaches_sink(self):
@@ -906,6 +1165,40 @@ class RealScannerTests(SourceCase):
                  f'fn handler(params: impl RequestParams) -> impl IntoResponse {{send({SOURCE});}}', 1),
                 ('impl-free-helper', 'fn send(x: &str) {Redirect::to(x);}\nstruct Handler {}\n'
                  f'impl Handler {{fn handler(params: Params) {{send({SOURCE});}}}}', 1),
+                ('self-receiver-helper', 'struct Handler {}\nimpl Handler {\n'
+                 ' fn send(&self, x: &str) {Redirect::to(x);}\n'
+                 f' fn route(&self, params: Params) {{self.send({SOURCE});}}\n}}', 3),
+                ('self-receiver-constant', 'struct Handler {}\nimpl Handler {\n'
+                 ' fn target(&self, x: &str) -> &str {"/"}\n'
+                 f' fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}\n}}', None),
+                ('self-receiver-owner-clean', 'struct Safe {}\nstruct Unsafe {}\n'
+                 'impl Unsafe {fn send(&self, x: &str) {Redirect::to(x);}}\n'
+                 'impl Safe {fn send(&self, x: &str) {Redirect::to("/");}}\n'
+                 f'impl Safe {{fn route(&self, params: Params) {{self.send({SOURCE});}}}}', None),
+                ('self-receiver-trait-fallback', 'struct Handler {}\n'
+                 'trait External {fn target(&self, x: &str) -> &str;}\n'
+                 'impl External for Handler {fn target(&self, x: &str) -> &str {x}}\n'
+                 'impl Handler {\n fn target(&mut self, x: &str) -> &str {"/"}\n'
+                 f' fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}\n}}', 6),
+                ('self-receiver-private-fallback', 'struct Handler {}\n'
+                 'mod hidden {impl super::Handler {fn target(&self, x: &str) -> &str {"/"}}}\n'
+                 'trait External {fn target(&self, x: &str) -> &str;}\n'
+                 'impl External for Handler {fn target(&self, x: &str) -> &str {x}}\n'
+                 f'impl Handler {{fn route(&self, params: Params) {{Redirect::to(self.target({SOURCE}));}}}}', 5),
+                ('self-receiver-header-clean', 'struct Handler {}\nimpl Handler {\n'
+                 ' fn header(&self, key: &str, x: &str) {Redirect::to("/");}\n'
+                 f' fn route(&self, params: Params) {{self.header("Location", {SOURCE});}}\n}}', None),
+                ('self-receiver-header-helper', 'struct Handler {}\nimpl Handler {\n'
+                 ' fn header(&self, key: &str, x: &str) {Redirect::to(x);}\n'
+                 f' fn route(&self, params: Params) {{self.header("Location", {SOURCE});}}\n}}', 3),
+                ('qualified-private-trait-fallback', 'struct Handler {}\n'
+                 'mod hidden {impl super::Handler {fn target(&self, x: &\'static str) -> &\'static str {"/"}}}\n'
+                 'trait Fallback {fn target(&self, x: &\'static str) -> &\'static str;}\n'
+                 'impl Fallback for Handler {fn target(&self, x: &\'static str) -> &\'static str {x}}\n'
+                 f'fn handler(params: Params) {{Redirect::to(Handler::target(&Handler {{}}, {SOURCE}));}}', 5),
+                ('qualified-public-inherent-clean', 'struct Handler {}\n'
+                 'mod helpers {impl super::Handler {pub fn target(&self, x: &\'static str) -> &\'static str {"/"}}}\n'
+                 f'fn handler(params: Params) {{Redirect::to(Handler::target(&Handler {{}}, {SOURCE}));}}', None),
             )
             for name, code, line in qualified:
                 target = project / (name + '.rs')

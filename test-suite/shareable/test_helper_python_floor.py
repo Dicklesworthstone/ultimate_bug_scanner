@@ -107,7 +107,9 @@ def old_python() -> str | None:
         if not exe:
             continue
         try:
-            out = subprocess.run(
+            # The caller deliberately selects a trusted test interpreter;
+            # fixture contents never influence this executable or fixed argv.
+            out = subprocess.run(  # ubs:ignore[python.taint.command,py.security.command-injection] trusted test interpreter
                 [exe, "-c", "import sys; print(*sys.version_info[:2])"],
                 capture_output=True, text=True, timeout=30, check=False,
             )
@@ -151,7 +153,7 @@ class HelperPythonFloor(unittest.TestCase):
         exe = old_python()
         if exe is None:
             self.skipTest("no Python 3.9 interpreter installed")
-        proc = subprocess.run(
+        proc = subprocess.run(  # ubs:ignore[python.taint.command] trusted version-checked test interpreter
             [exe, "-B", "-S", "-c", IMPORT_ALL], cwd=HELPERS,
             capture_output=True, text=True, timeout=300, check=False,
         )
@@ -255,7 +257,10 @@ class HelperCurrentRuntime(unittest.TestCase):
                         detail = proc.stdout + proc.stderr
                         self.assertEqual(proc.returncode, 1 if dirty else 0, detail[-6000:])
                         self.assertNotIn("Traceback (most recent call last)", detail)
-                        report = json.loads(proc.stdout)
+                        try:
+                            report = json.loads(proc.stdout)
+                        except ValueError:
+                            self.fail(f"scanner did not emit JSON: {detail[-6000:]}")
                         self.assertEqual(report.get("status"), "ok", report)
                         self.assertEqual(report.get("failed_modules"), [], report)
                         if dirty:

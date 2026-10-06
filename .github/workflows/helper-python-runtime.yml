@@ -90,6 +90,7 @@ jobs:
           PATCH
           git apply --check "$RUNNER_TEMP/python-runtime.patch"
           git apply "$RUNNER_TEMP/python-runtime.patch"
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 4ddda88f4e76ce439828b37574f3fa6f6f5c802c
           "$(uv python find --managed-python 3.14)" scripts/update_checksums.py
           git diff --check
           git diff --stat
@@ -123,11 +124,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           python3 - <<'PY'
-          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
-          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py', 'ubs', 'SHA256SUMS'}
+          import base64, hashlib, json, os, pathlib, re, subprocess, urllib.request
+          source = 'modules/helpers/ubs_core/analyzers/taint_js.py'
+          expected = {source, 'ubs', 'SHA256SUMS', 'modules/lib/ubs-common.sh', 'scripts/new-module.sh'}
+          expected.update('modules/ubs-' + lang + '.sh' for lang in
+                          ('bash', 'cpp', 'csharp', 'elixir', 'golang', 'java', 'js', 'kotlin', 'python', 'ruby', 'rust', 'swift'))
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           assert set(changed) == expected, changed
           before = {name: pathlib.Path(name).read_bytes() for name in changed}
+          # The helper digest is repeated in the direct-entrypoint library;
+          # refreshing it cascades through the modules' library pins to ubs.
+          # Prove these generated changes are hashes only, not source edits.
+          for name, data in before.items():
+              if name != source:
+                  original = subprocess.check_output(['git', 'show', 'HEAD:' + name])
+                  assert re.sub(rb'[0-9a-f]{64}', b'<sha256>', original) == re.sub(rb'[0-9a-f]{64}', b'<sha256>', data), name
           subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
           assert all(pathlib.Path(name).read_bytes() == data for name, data in before.items())
           subprocess.run(['git', 'diff', '--check'], check=True)

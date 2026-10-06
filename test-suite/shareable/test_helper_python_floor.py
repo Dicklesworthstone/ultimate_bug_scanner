@@ -232,7 +232,8 @@ class HelperCurrentRuntime(unittest.TestCase):
             )
             detail = doctor.stdout + doctor.stderr
             self.assertEqual(doctor.returncode, 0, detail)
-            self.assertIn(f"python: ready {selected} Python {sys.version.split()[0]}", detail)
+            shim_note = " (via a per-run python3 shim)" if override else ""
+            self.assertIn(f"python: ready {selected}{shim_note} Python {sys.version.split()[0]}", detail)
             if override:
                 self.assertIn("python3 comes from UBS_PYTHON", detail)
             else:

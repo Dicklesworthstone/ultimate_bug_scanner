@@ -1,6 +1,6 @@
 # Reality Check — updated 2026-10-06 (v5.4.23)
 
-This update supersedes the September conclusions below. The historical report is retained intact for comparison. Scanner code was inspected at `40cc563`; the working checkout subsequently advanced to `b9de7ef` through another agent's fixture and evidence commits. No scanner implementation was changed by this audit.
+This update supersedes the September conclusions below. The historical report is retained intact for comparison. Scanner code was inspected at `40cc563`; another agent's fixture/evidence commits advanced the checkout to `b9de7ef`, followed by audit and work-graph snapshots. The findings below describe that inspected scanner code. No scanner implementation was changed by this audit.
 
 ## Current verdict
 
@@ -68,8 +68,8 @@ The latest published release inspected was [v5.4.17, October 1](https://github.c
 | 24 | Reliable current full CI/release pipeline | UNPROVEN / operational gap | Three main workflows disabled; focused successes cannot replace them; G6/H8 |
 | 25 | Current release exposes current capabilities | PARTIAL | Checkout 5.4.23 versus published 5.4.17; daemon asset absent; release observation required |
 | 26 | Native Kotlin coverage matches advertised breadth | PARTIAL / inadequately tracked | Twenty-two headings but one native Pattern and one native AST rule; borrowed Java security/path logic supplies much of the substance |
-| 27 | Broad usefulness across today's project stacks | PARTIAL / NO_BEAD for missing languages | PHP, SQL, HCL, PowerShell, Dart, and Lua have no modules; stage additions by real ecosystem value and proof cost |
-| 28 | Persistent repository scan settings from feedback plan §4.1 | NOT_STARTED / NO_BEAD | README recommends a shell wrapper; session `--config-dir` and installer `install.conf` do not implement scan excludes/languages/rule overrides |
+| 27 | Broad usefulness across today's project stacks | PARTIAL / newly tracked | PHP, SQL, HCL, PowerShell, Dart, and Lua have no modules; new tasks `mj1j.32/.34/.36` cover the first three with independent probes; the others remain explicitly deferred |
+| 28 | Persistent repository scan settings from feedback plan §4.1 | NOT_STARTED / newly tracked | README recommends a shell wrapper; session `--config-dir` and installer `install.conf` do not implement scan excludes/languages/rule overrides. New implementation `mj1j.40`, probe `mj1j.39` |
 
 ### Answers to the five reality-check questions
 
@@ -227,7 +227,44 @@ The feedback plan's remaining optional persistent scan settings deserve a bounde
 
 Every implementation task must name current donor/receiver files, selected semantic boundary, risks, public findings, prerequisites, and independent acceptance examples. Companion probes must exercise the real CLI or module in JSON and SARIF, check exact expected and forbidden public rule IDs and locations, and record command/tool/source identity, elapsed time, exit status and complete stdout/stderr under `test-suite/artifacts/`. Tests include comments/strings, shadowing, unrelated scopes, sanitizer mutation, malformed inputs, optional-tool failure, timeout/budget exhaustion, selected-file/ignore behavior, suppression/profile behavior, and cache/context invalidation where relevant. Required checksums/version/release work follows any future module/helper implementation; this audit did not change those assets.
 
-Three ambition rounds strengthened this plan: (1) reuse existing engines and require ordinary-user availability rather than library completeness; (2) make sanitizer/ownership evidence binding- and sink-specific rather than copy pattern counts; (3) make empirical calibration, release observation and edited-source correctness explicit barriers to broad quality/performance claims. The corresponding beads and refinement evidence are recorded below after graph access is acquired. Existing owners and graph structure are preserved; no existing implementation bead is closed by this audit.
+Three ambition rounds strengthened this plan: (1) reuse existing engines and require ordinary-user availability rather than library completeness; (2) make sanitizer/ownership evidence binding- and sink-specific rather than copy pattern counts; (3) make empirical calibration, release observation and edited-source correctness explicit barriers to broad quality/performance claims. The corresponding beads and refinement evidence are recorded below. Existing owners, statuses and prior dependencies are preserved; no implementation bead is closed by this audit.
+
+### Recorded implementation and probe graph
+
+Epic **`ultimate_bug_scanner-mj1j`** contains **43 new records**: the epic, twenty implementation tasks, twenty independent probe-authoring tasks, and two probe-authoring tasks for existing J1/D7 work. There are now 332 visible issues; the previously closed 263 remain closed. This is a detailed plan, not forty-three delivered improvements. All mutations used `br` while holding the graph reservation. The existing SQLite database refused admission because of a prior WAL recovery conflict; `br --no-db` safely recorded changes in the authoritative JSONL, without replacing the database or recovery files. `br --no-db sync --flush-only` reports nothing left to export.
+
+All suffixes below belong to `ultimate_bug_scanner-mj1j`. Every implementation depends on its own independently authored probe. Probe-authoring closure requires reviewed fixtures, a real baseline run and passing independent harness controls; an expected-red feature case establishes the starting defect. Implementation closure separately requires the same fixed-behavior cases green with cited native CLI artifacts. No reciprocal dependencies or artificial chains between unrelated receivers were added.
+
+| Work slice | Probe | Implementation | Priority |
+|---|---|---|---|
+| Restore actual Python 3.9 imports and CLI execution | `.1` | `.2` | P1 |
+| Java/Kotlin selected redirect/path sanitizer proof | `.3` | `.4` | P1 |
+| Ruby selected URL/path summaries and literal kills | `.5` | `.6` | P1 |
+| Swift sink-specific guard/helper proof | `.7` | `.8` | P2 |
+| Elixir selected clauses/pipelines and redirect/path proof | `.9` | `.10` | P2 |
+| C/C++ selected binding/guard proof | `.11` | `.12` | P3 |
+| Native Kotlin coroutine/cancellation/null analysis | `.13` | `.14` | P2 |
+| Qualify dormant checks for ordinary CLI use | `.15` | `.16` | P1 |
+| Ruby resource/thread and Kotlin resource ownership | `.17` | `.18` | P2 |
+| Swift/Elixir per-binding resource/task obligations | `.19` | `.20` | P2 |
+| JVM/Ruby/C#/Elixir SQL provenance and parameter binding | `.21` | `.22` | P2 |
+| Explicit framework security configuration | `.23` | `.24` | P2 |
+| Selected client deadlines/cancellation context | `.25` | `.26` | P2 |
+| Crypto/constant-time API identity and security context | `.27` | `.28` | P2 |
+| Native failure-bearing result observation | `.29` | `.30` | P2 |
+| Bounded PHP module and coherent integration | `.31` | `.32` | P2 |
+| PostgreSQL SQL module with explicit dialect boundaries | `.33` | `.34` | P2 |
+| Provider/resource-aware HCL/Terraform module | `.35` | `.36` | P2 |
+| Exact prescribed ShellCheck gate repair, as maintenance | `.37` | `.38` | P2 |
+| Validated persistent repository scan configuration | `.39` | `.40` | P3 |
+| Independent held-out accuracy/confidence oracle | `.41` | Existing `ultimate_bug_scanner-1b9j.7` (D7) | P2 |
+| Ordinary-CLI coverage/docs/provenance oracle | `.42` | Existing `ultimate_bug_scanner-jtst.1` (J1) | P1 |
+
+D7's description and acceptance now preserve the original corpus, interval, filtering and sequential-gate goals while correcting the invalid conformal claim. Its additional notes distinguish false-discovery proportion `FP/(TP+FP)` from false-positive rate `FP/(FP+TN)`, require explicit sampling units, weights and repository clustering, and prohibit treating missing labels as zero false positives. J1's original acceptance remains and is extended with the new coverage/provenance oracle. Existing D5/D6, G6, H8, D9, C7, K4 and H6 received detailed evidence and coordination comments; release/platform, memory/performance and daemon work were reused rather than duplicated.
+
+Five refinement passes are recorded as epic comments: (1) remove unnecessary cross-receiver prerequisites; (2) correct donor paths and Kotlin's actual inline architecture; (3) make sink, ownership, supervision, dialect and unknown-state boundaries explicit; (4) require independent exact-ID tests, real CLI activation and context invalidation; (5) inspect every persisted record and graph edge, clarify statistical denominators and classify lint repair as maintenance. Kotlin job/cancellation ownership belongs to `.14`; file/resource `use {}` ownership belongs to `.18`, preventing duplicate implementation and alerts. All new records include detailed test/artifact contracts, and no existing issue status changed.
+
+Final checks: `br --no-db dep cycles --json` and `bv --robot-insights` both report **zero cycles**; direct inspection confirms all twenty named implementation-to-probe edges, both reused J1/D7 probe edges, and no reciprocal probe blockers. `bv --robot-plan` identifies the runtime probe as the highest-impact new entry point. The first execution step is `.1`, followed by the real Python 3.9 repair `.2`; Java/Ruby flow and activation probes are independent next priorities. Full prescribed implementation checks remain mandatory after future code changes. This report/graph work cannot certify the unfinished platform, release, empirical accuracy or performance targets.
 
 ## Preserved historical report — September 8
 

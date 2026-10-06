@@ -1,0 +1,151 @@
+name: Shipped Python Runtime
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/helper-python-runtime.yml
+      - modules/helpers/**
+      - modules/lib/**
+      - modules/ubs-*.sh
+      - test-suite/shareable/test_helper_python_floor.py
+      - ubs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    # Temporary publication of tested immutable blobs only. No ref writes.
+    permissions:
+      contents: write
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10
+      - name: Install real floor and newer interpreters and scanner dependencies
+        run: |
+          uv python install 3.9 3.10 3.14
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep shellcheck
+          npm install --global @ast-grep/cli@0.45.3
+      - name: Preserve exact source for reproducibility
+        run: |
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/python-runtime-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/python-runtime-source-head.txt"
+      - name: Prove the original Python 3.9 import failure
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_js.py)" = 53de0ff31d38b7891655be3e99c22d0f918a0eb3
+          "$(uv python find --managed-python 3.9)" -B - <<'PY'
+          import subprocess, sys
+          assert sys.version_info[:2] == (3, 9), sys.version
+          result = subprocess.run([sys.executable, '-B', '-S', '-c', 'import ubs_core.analyzers'],
+                                  cwd='modules/helpers', text=True, capture_output=True)
+          print(result.stderr, flush=True)
+          assert result.returncode != 0 and 'TypeError' in result.stderr and 'slots' in result.stderr
+          print('PY39_ORIGINAL_FAILURE_CONFIRMED', flush=True)
+          PY
+      - name: Apply the exact minimal compatibility change in the candidate checkout
+        run: |
+          cat > "$RUNNER_TEMP/python-runtime.patch" <<'PATCH'
+          diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+          --- a/modules/helpers/ubs_core/analyzers/taint_js.py
+          +++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+          @@ -28,6 +28,10 @@
+           
+           from ubs_core.registry import Analyzer, RunContext, register
+           
+          +# Shipped helpers support Python 3.9; dataclass slots were added in 3.10.
+          +# Keep the existing compact layout on newer interpreters.
+          +_DATACLASS_SLOTS = {'slots': True} if sys.version_info >= (3, 10) else {}
+          +
+           ROOT: Path = Path()
+           BASE_DIR: Path = Path()
+           SKIP_DIRS = {'.git', '.hg', '.svn', '.venv', 'node_modules', '.next', '.nuxt', '.cache', 'dist', 'build', 'coverage', 'tmp', '.turbo'}
+          @@ -778,7 +782,7 @@
+               generator: bool = False
+           
+           
+          -@dataclass(slots=True)
+          +@dataclass(**_DATACLASS_SLOTS)
+           class _Statement:
+               kind: str
+               start: int
+          @@ -820,7 +824,7 @@
+               readers: set = field(default_factory=set)
+           
+           
+          -@dataclass(slots=True)
+          +@dataclass(**_DATACLASS_SLOTS)
+           class _HeapOutput:
+               heap: dict
+               weak_refs: set
+          PATCH
+          git apply --check "$RUNNER_TEMP/python-runtime.patch"
+          git apply "$RUNNER_TEMP/python-runtime.patch"
+          "$(uv python find --managed-python 3.14)" scripts/update_checksums.py
+          git diff --check
+          git diff --stat
+      - name: Audit newer-runtime API references without suppressing matches
+        run: |
+          rg -n 'ast\.(Match|TryStar)|\b(tomllib|ExceptionGroup|BaseExceptionGroup|TypeAlias|TypeGuard|Self|Never|Required|NotRequired|pairwise|StrEnum)\b|\b(slots|kw_only|weakref_slot|strict)\s*=' modules/helpers --glob '*.py' > "$RUNNER_TEMP/python-runtime-audit.txt" || test "$?" = 1
+          cat "$RUNNER_TEMP/python-runtime-audit.txt"
+      - name: Require real imports, doctor and scans on every selected runtime
+        run: |
+          export UBS_REQUIRE_PYTHON39=1
+          export UBS_TEST_PYTHON39="$(uv python find --managed-python 3.9)"
+          for version in 3.9 3.10 3.14; do
+            interpreter="$(uv python find --managed-python "$version")"
+            UBS_TEST_EXPECT_PYTHON="$version" "$interpreter" -B test-suite/shareable/test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/python-runtime-$version.log"
+          done
+      - name: Retain focused taint, scanner and integrity gates
+        run: |
+          PYTHON="$(uv python find --managed-python 3.14)"
+          "$PYTHON" -B -m unittest discover -s test-suite/quality -p 'test_taint_js*.py' -v
+          "$PYTHON" -B -m unittest discover -s test-suite/quality -p test_js_scan.py -v
+          "$PYTHON" -B test-suite/quality/test_python_command_injection_dataflow.py -v
+          "$PYTHON" -B test-suite/shareable/test_contract_checksums.py
+          shellcheck -S warning ubs modules/ubs-*.sh scripts/new-module.sh
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          UBS_PYTHON="$PYTHON" ./ubs --ci --fail-on-warning --only=python modules/helpers/ubs_core/analyzers/taint_js.py test-suite/shareable/test_helper_python_floor.py
+      - name: Publish only reviewed immutable source and checksum objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          expected = {'modules/helpers/ubs_core/analyzers/taint_js.py', 'ubs', 'SHA256SUMS'}
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(changed) == expected, changed
+          before = {name: pathlib.Path(name).read_bytes() for name in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          assert all(pathlib.Path(name).read_bytes() == data for name, data in before.items())
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for name, data in before.items():
+              sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + '/git/blobs',
+                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  result = json.load(response)
+              assert result['sha'] == sha, name
+              print('PYTHON_RUNTIME_OBJECT', name, sha, mode, flush=True)
+          print('PYTHON_RUNTIME_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-runtime-candidate-evidence
+          path: ${{ runner.temp }}/python-runtime-*
+          retention-days: 3

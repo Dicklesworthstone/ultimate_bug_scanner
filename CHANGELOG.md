@@ -20,6 +20,7 @@ _No changes yet._
 
 - JavaScript taint discovers the component's actual sinks before constructing function scopes and capture relationships. Components without supported sinks avoid that work; components with sinks solve only the relevant rules and release each rule's flow state after retaining its concrete findings.
 - JavaScript closure analysis no longer builds an unused legacy table of whole block states. Captured cells and call-time heap effects continue through the current flow representation.
+- JavaScript call analysis releases recursive argument-expansion closures when expansion finishes or raises, so completed transfers do not retain their input heaps while waiting for cyclic garbage collection.
 - JavaScript heap-call summaries retain borrowed objects and escaping results or cell writes, including exceptional exits. Allocations local to a completed helper no longer accumulate in its callers' heaps.
 - JavaScript balanced-list parsing materializes only the requested source span before walking it, preserving component offsets and assignment operators across span boundaries.
 - JavaScript taint retains lexical bindings while parsing function statements for the scope being evaluated. Module bodies keep their resolved imports and exports; large import components no longer retain every function's parsed body together.

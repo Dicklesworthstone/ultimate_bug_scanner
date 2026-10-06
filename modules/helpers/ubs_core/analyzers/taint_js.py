@@ -1750,8 +1750,13 @@ class _Flow:
                 fact = self.value(opening, right, state)
             actual.append((fact, raw in {'undefined', 'void 0'}))
 
-        for fact, (left, right) in zip(arguments, ranges):
-            expand(fact, left, right)
+        try:
+            for fact, (left, right) in zip(arguments, ranges):
+                expand(fact, left, right)
+        finally:
+            # Recursive closures otherwise retain the completed flow and its
+            # incoming heap until cyclic GC, including when expansion throws.
+            expand = None
         bound = {}
         default_flow = None
         default_state = None

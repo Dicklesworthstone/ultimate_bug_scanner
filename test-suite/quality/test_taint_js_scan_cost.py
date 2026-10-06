@@ -11,14 +11,17 @@ bound 1 s) and the Jest-shaped file 0.5 s (old: 71.5 s, bound 30 s).
 from __future__ import annotations
 
 import sys
+import gc
 import json
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+import weakref
 from collections import Counter
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPERS_DIR = REPO_ROOT / "modules" / "helpers"
@@ -191,6 +194,64 @@ class JestShapedFileCostTests(unittest.TestCase):
             findings = list(taint_js.scan_project_findings([provider, handler]))
         self.assertEqual([(path.name, rule, line) for path, rule, line, _col, _trace
                           in findings], [("handler.ts", "js.taint.xss", 2)])
+
+
+class CallStateLifetimeTests(unittest.TestCase):
+    def test_finished_call_flows_release_without_cyclic_collection(self) -> None:
+        case = "c6-call-state-lifetime"
+        started = time.perf_counter()
+        print(f"[{case}] RUN", flush=True)
+        flows = weakref.WeakSet()
+        created = 0
+        original_init = taint_js._Flow.__init__
+
+        def observe_init(flow, *args, **kwargs):
+            nonlocal created
+            original_init(flow, *args, **kwargs)
+            flows.add(flow)
+            created += 1
+
+        sources = {
+            "nested-spread": (
+                "function read(value) { return value; }\n"
+                "const box = {value: req.query.value};\n"
+                "res.send(read(...[...[box.value]]));\n"
+                "res.send(read(...['safe']));\n", 3),
+            "exception": (
+                "function read(value) { return value; }\n"
+                "function reject(value) { throw value; }\n"
+                "try { read(...[reject(req.query.value)]); }\n"
+                "catch (error) { res.send(error); }\n"
+                "res.send('safe');\n", 4),
+        }
+        artifacts = REPO_ROOT / "test-suite/artifacts" / case
+        artifacts.mkdir(parents=True, exist_ok=True)
+        collecting = gc.isenabled()
+        try:
+            with tempfile.TemporaryDirectory(prefix="corpus-", dir=artifacts) as tmp, \
+                    patch.object(taint_js._Flow, "__init__", observe_init):
+                gc.disable()
+                for name, (source, line) in sources.items():
+                    with self.subTest(case=name):
+                        target = Path(tmp) / (name + ".js")
+                        target.write_text(source, encoding="utf-8")
+                        findings = list(taint_js.run(RunContext(lang="javascript", files=[target])))
+                        self.assertEqual([(item["rule"], item["line"]) for item in findings],
+                                         [("javascript.taint.xss", line)], (source, findings))
+                        self.assertGreater(created, 0)
+                        # A completed transfer owns no live flow. Waiting for
+                        # cyclic GC retains its input heap across later calls.
+                        self.assertEqual(len(flows), 0, f"{name}: {len(flows)} completed flows retained")
+        except Exception:
+            print(f"[{case}] FAIL ({time.perf_counter() - started:.2f}s)", flush=True)
+            raise
+        finally:
+            if collecting:
+                gc.enable()
+            gc.collect()
+        failed = any(test is self or getattr(test, "test_case", None) is self
+                     for test, _ in self._outcome.result.failures + self._outcome.result.errors)
+        print(f"[{case}] {'FAIL' if failed else 'PASS'} ({time.perf_counter() - started:.2f}s)", flush=True)
 
 
 class RuleStateTests(unittest.TestCase):

@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: '1'
@@ -45,10 +45,25 @@ jobs:
         run: |
           git archive --format=tar.gz HEAD > "$RUNNER_TEMP/python-suppression-source.tar.gz"
           git rev-parse HEAD > "$RUNNER_TEMP/python-suppression-source-head.txt"
+      - name: Require the reported failure on unmodified production source
+        run: |
+          python3 - <<'PY' > "$RUNNER_TEMP/python-suppression-negative-control.log" 2>&1
+          import sys
+          import unittest
+          sys.path.insert(0, 'test-suite/quality')
+          from test_python_suppression import PythonSourceSuppressionTests
+          suite = unittest.TestSuite([PythonSourceSuppressionTests(
+              'test_reported_lifecycle_counts_text_and_exit_code')])
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun == 1 and len(result.failures) == 3 and not result.errors, result
+          assert all('Lists differ: [2, 7] != [7]' in detail for _, detail in result.failures)
+          print('Confirmed the exact GH-159 failure in cold, warm and disabled caches.')
+          PY
       - name: Prepare the reviewed GH-159 candidate without changing main
         run: |
           test "$(git hash-object modules/helpers/ubs_core/py_scan.py)" = 435a102f340ae7eba76d38ced37afbf1bb16f061
-          git apply - <<'PATCH'
+          test "$(cat VERSION)" = 5.4.24
+          git apply --unidiff-zero - <<'PATCH'
           diff --git a/modules/helpers/ubs_core/py_scan.py b/modules/helpers/ubs_core/py_scan.py
           index 435a102..5acd9ab 100644
           --- a/modules/helpers/ubs_core/py_scan.py
@@ -104,6 +119,24 @@ jobs:
                        sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
            
                cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+          diff --git a/VERSION b/VERSION
+          --- a/VERSION
+          +++ b/VERSION
+          @@ -1 +1 @@
+          -5.4.24
+          +5.4.25
+          diff --git a/ubs b/ubs
+          --- a/ubs
+          +++ b/ubs
+          @@ -31 +31 @@
+          -UBS_VERSION="5.4.24"
+          +UBS_VERSION="5.4.25"
+          diff --git a/README.md b/README.md
+          --- a/README.md
+          +++ b/README.md
+          @@ -12 +12 @@
+          -[![Version](https://img.shields.io/badge/version-5.4.24-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+          +[![Version](https://img.shields.io/badge/version-5.4.25-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
           PATCH
           test "$(git hash-object modules/helpers/ubs_core/py_scan.py)" = 5acd9abf8c7fe0d96f385ac2121d5f4609deccc2
           python3 scripts/update_checksums.py
@@ -165,7 +198,7 @@ jobs:
               return json.loads(result.stdout)
 
           allowed = {'modules/helpers/ubs_core/py_scan.py', 'modules/lib/ubs-common.sh',
-                     'ubs', 'SHA256SUMS', 'scripts/new-module.sh'}
+                     'ubs', 'SHA256SUMS', 'scripts/new-module.sh', 'VERSION', 'README.md'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           changed = set(git('diff', '--name-only').splitlines())
           assert changed == allowed, (changed, allowed)

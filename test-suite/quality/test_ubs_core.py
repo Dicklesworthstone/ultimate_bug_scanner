@@ -2336,5 +2336,575 @@ class AstIngestionTests(unittest.TestCase):
                     self.assertEqual(doc["profile"]["cache_hits"], 0, doc)
 
 
+class JavaKotlinDataflowTests(unittest.TestCase):
+    """D6 increment: real frontend/CLI checks, with preserved fixture pairs."""
+
+    def setUp(self) -> None:
+        self.started = time.monotonic()
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='d6-java-kotlin-', dir=artifacts))
+
+    def run(self, result=None):
+        print(f'[{self.id()}] RUN', flush=True)
+        started = time.monotonic()
+        result = super().run(result)
+        failed = any(test is self or getattr(test, 'test_case', None) is self
+                     for test, _ in result.failures + result.errors)
+        skipped = any(test is self for test, _ in result.skipped)
+        state = 'FAIL' if failed else 'SKIP' if skipped else 'PASS'
+        print(f'[{self.id()}] {state} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def helper(self, text, suffix='.java'):
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        path = self.root / ('Sample' + suffix)
+        path.write_text(textwrap.dedent(text).lstrip('\n'), encoding='utf-8')
+        engine = Engine(path, path.read_text())
+        return engine, engine.analyze()
+
+    def lines(self, text, marker='// unsafe'):
+        return {index for index, line in enumerate(text.splitlines(), 1) if marker in line}
+
+    def decode_report(self, proc):
+        try:
+            return json.loads(proc.stdout)
+        except ValueError as exc:
+            self.fail(f'invalid scanner JSON: {exc}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}')
+
+    def cli(self, path, lang, label, status=0):
+        directory = self.root / label
+        directory.mkdir()
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('UBS_', 'GIT_', 'XDG_'))}
+        env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1',
+                   UBS_SKIP_TYPE_NARROWING='1', ENABLE_UV_TOOLS='0',
+                   XDG_DATA_HOME=str(directory / 'data'), XDG_CACHE_HOME=str(directory / 'cache'))
+        command = [str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
+                   '--format=json', '--only=' + lang, '--', str(path)]
+        try:
+            proc = subprocess.run(command, cwd=directory, env=env,
+                                  capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired as exc:
+            self.fail(f'{label} timed out\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
+        (directory / 'stdout.log').write_text(proc.stdout)
+        (directory / 'stderr.log').write_text(proc.stderr)
+        context = f'{label}: exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+        self.assertEqual(proc.returncode, status, context)
+        try:
+            report = json.loads(proc.stdout)
+        except ValueError as exc:
+            self.fail(f'{exc}\n{context}')
+        self.assertEqual(report['status'], 'ok', context)
+        self.assertEqual(report['totals']['files'], 1, context)
+        self.assertEqual(report['failed_modules'], [], context)
+        self.assertEqual(len(report['scanners']), 1, context)
+        self.assertEqual(report['scanners'][0]['status'], 'ok', context)
+        findings = [finding for scanner in report['scanners'] for finding in scanner['findings']
+                    if finding['rule'] == lang + '.taint.path_traversal']
+        return findings, context
+
+    def test_shared_engine_branches_loops_local_summaries_and_evidence(self):
+        text = '''class Flow {
+  String relay(String value) { return value; }
+  void save(String value) { Files.readString(value); } // unsafe
+  String recursive(String value, int n) {
+    if (n == 0) { return value; }
+    return recursive(value, n - 1);
+  }
+  void handler(Request request, boolean again) {
+    String value = "fixed";
+    while (again) { value = request.getParameter("file"); }
+    save(relay(recursive(value, 2)));
+  }
+  void zeroIterations(Request request, boolean again) {
+    String value = request.getParameter("file");
+    while (again) { value = "fixed"; }
+    Files.readString(value); // unsafe
+  }
+  void branch(Request request, boolean condition) {
+    String value = request.getParameter("file");
+    if (condition) { value = "fixed"; } else { value = value; }
+    Files.readString(value); // unsafe
+  }
+  void bothClean(Request request, boolean condition) {
+    String value = request.getParameter("file");
+    if (condition) { value = "fixed"; } else { value = "other"; }
+    Files.readString(value);
+  }
+}'''
+        engine, effects = self.helper(text)
+        self.assertEqual(set(effects), self.lines(text))
+        witness = next(iter(effects[3]))
+        self.assertEqual(witness.evidence[0].kind, 'source')
+        self.assertIn('call', {step.kind for step in witness.evidence})
+        self.assertEqual(witness.evidence[-1].kind, 'sink')
+        self.assertTrue(all(step.path == str(engine.path) and step.line > 0 and step.column > 0
+                            for step in witness.evidence))
+        self.assertTrue(all(len(trace.evidence) <= 12 for fact in effects.values() for trace in fact))
+
+    def test_finally_replaces_or_preserves_the_evaluated_return(self):
+        text = '''class Flow {
+  String replaced(String value) { try { return value; } finally { return "fixed"; } }
+  String preserved(String value) { try { return value; } finally { value = "fixed"; } }
+  String nested(String value) {
+    try { try { return value; } finally { return "fixed"; } }
+    finally { return "outer"; }
+  }
+  void handler(Request request) {
+    Files.readString(replaced(request.getParameter("file")));
+    Files.readString(nested(request.getParameter("file")));
+    Files.readString(preserved(request.getParameter("file"))); // unsafe
+  }
+}'''
+        _, effects = self.helper(text)
+        self.assertEqual(set(effects), self.lines(text))
+
+    def test_native_json_and_sarif_preserve_helper_flow_evidence(self):
+        cases = (
+            ('java', '.java', '''class Flow {
+  String relay(String value) { return value; }
+  void handler(Request request) {
+    String path = request.getParameter("file");
+    Files.readString(relay(path));
+  }
+}''', 'request.getParameter("file")', 4, 5),
+            ('kotlin', '.kt', '''fun relay(value: String): String { return value }
+fun handler(request: Request) {
+  val path = request.queryParameters["file"]
+  Files.readString(relay(path))
+}''', 'request.queryParameters["file"]', 3, 4),
+        )
+        for lang, suffix, text, request, source_line, sink_line in cases:
+            with self.subTest(lang=lang):
+                source = self.root / ('Flow' + suffix)
+                source.write_text(text, encoding='utf-8')
+                findings, context = self.cli(source, lang, lang + '-json', status=1)
+                self.assertEqual(len(findings), 1, context)
+                self.assertEqual(findings[0]['line'], sink_line, context)
+                extras = findings[0]['extras']
+                steps = extras['taint_path']
+                self.assertEqual(extras['source_count'], 1, context)
+                self.assertGreaterEqual(len(steps), 3, context)
+                self.assertLessEqual(len(steps), 12, context)
+                self.assertEqual((steps[0]['kind'], steps[0]['line']), ('source', source_line), context)
+                self.assertEqual((steps[-1]['kind'], steps[-1]['line']), ('sink', sink_line), context)
+                self.assertIn('call', {step['kind'] for step in steps}, context)
+                self.assertTrue(all(Path(step['path']) == source.resolve() and step['col'] > 0
+                                    and step['line'] > 0 and step['label'] for step in steps), context)
+
+                directory = self.root / (lang + '-sarif')
+                directory.mkdir()
+                env = {key: value for key, value in os.environ.items()
+                       if not key.startswith(('UBS_', 'GIT_', 'XDG_'))}
+                env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1',
+                           UBS_SKIP_TYPE_NARROWING='1', ENABLE_UV_TOOLS='0',
+                           XDG_DATA_HOME=str(directory / 'data'), XDG_CACHE_HOME=str(directory / 'cache'))
+                proc = subprocess.run([str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
+                    '--format=sarif', '--only=' + lang, '--', str(source)], cwd=directory, env=env,
+                    capture_output=True, text=True, timeout=180)
+                (directory / 'stdout.log').write_text(proc.stdout)
+                (directory / 'stderr.log').write_text(proc.stderr)
+                context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                self.assertEqual(proc.returncode, 1, context)
+                report = self.decode_report(proc)
+                results = [finding for run in report['runs'] for finding in run['results']
+                           if finding['ruleId'] == lang + '.taint.path_traversal']
+                self.assertEqual(len(results), 1, context)
+                self.assertEqual(results[0]['properties']['extras'], extras, context)
+                locations = results[0]['codeFlows'][0]['threadFlows'][0]['locations']
+                self.assertEqual(len(locations), len(steps), context)
+                self.assertEqual([location['executionOrder'] for location in locations],
+                                 list(range(len(steps))), context)
+                for location, step in zip(locations, steps):
+                    physical = location['location']['physicalLocation']
+                    self.assertEqual(location['kinds'], [step['kind']], context)
+                    self.assertEqual(physical['artifactLocation']['uri'], step['path'], context)
+                    self.assertEqual(physical['region'],
+                                     {'startLine': step['line'], 'startColumn': step['col']}, context)
+
+                module = REPO_ROOT / 'modules' / ('ubs-' + lang + '.sh')
+                proc = subprocess.run([str(module), str(source), '--ci', '--no-color',
+                    '--format=sarif'], cwd=directory, env=env,
+                    capture_output=True, text=True, timeout=180)
+                (directory / 'module-stdout.log').write_text(proc.stdout)
+                (directory / 'module-stderr.log').write_text(proc.stderr)
+                context = f'direct module exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                self.assertEqual(proc.returncode, 1, context)
+                report = self.decode_report(proc)
+                results = [finding for run in report['runs'] for finding in run['results']
+                           if finding['ruleId'] == lang + '.taint.path_traversal']
+                self.assertEqual(len(results), 1, context)
+                self.assertEqual(results[0]['properties']['extras'], extras, context)
+                self.assertEqual(results[0]['codeFlows'][0]['threadFlows'][0]['locations'], locations, context)
+
+                source.write_text(text.replace(request, '"fixed"'), encoding='utf-8')
+                clean, context = self.cli(source, lang, lang + '-clean')
+                self.assertEqual(clean, [], context)
+
+    def test_method_class_overload_and_lexical_shadow_identity(self):
+        text = '''class First {
+  String relay(String value) { return value; }
+  String relay(String first, String second) { return "fixed"; }
+  void handler(Request request) {
+    String path = request.getParameter("file");
+    { String other = "fixed"; Files.readString(other); }
+    Files.readString(relay(path)); // unsafe
+    Files.readString(relay(path, "other"));
+  }
+  void unrelated() { String path = "fixed"; Files.readString(path); }
+}
+class Second {
+  String relay(String value) { return "fixed"; }
+  void handler(Request request) { Files.readString(relay(request.getParameter("file"))); }
+}'''
+        _, effects = self.helper(text)
+        self.assertEqual(set(effects), self.lines(text))
+        kotlin = '''fun handler(request: Request) {
+  val path = request.getParameter("file")
+  if (true) {
+    val path = path
+    Files.readString(path) // unsafe
+  }
+  if (true) {
+    val path = "fixed"
+    Files.readString(path)
+  }
+  Files.readString(path) // unsafe
+}'''
+        _, effects = self.helper(kotlin, '.kt')
+        self.assertEqual(set(effects), self.lines(kotlin))
+
+    def test_annotation_is_concretized_at_entry_not_in_literal_local_calls(self):
+        text = '''class Flow {
+  String expose(@RequestParam String value) { return value; }
+  void clean() { Files.readString(expose("fixed")); }
+  void exposed(@RequestParam String value) { Files.readString(value); } // unsafe
+  void alsoClean() { exposed("fixed"); }
+}'''
+        _, effects = self.helper(text)
+        self.assertEqual(set(effects), self.lines(text))
+        self.assertTrue(all('@request value' in trace.evidence[0].label
+                            for trace in effects[4]))
+
+    def test_comments_literals_sanitizers_and_unknown_calls(self):
+        text = '''class Flow {
+  String safeUnderRoot(String value) { return value; }
+  void handler(Request request) {
+    String path = request.getParameter("file");
+    Files.readString("path");
+    // Files.readString(path);
+    String inert = "request.getParameter(x); Files.readString(path)";
+    Files.readString(safeUnderRoot(path));
+    Files.readString(unknown(path)); // unsafe
+  }
+}'''
+        _, effects = self.helper(text)
+        self.assertEqual(set(effects), self.lines(text))
+
+    def test_enhanced_loops_and_continue_do_not_run_finally_prematurely(self):
+        text = '''class Flow {
+  void handler(Request request, boolean again) {
+    String path = "fixed";
+    try {
+      while (again) {
+        Files.readString(path); // unsafe
+        path = request.getParameter("file");
+        continue;
+      }
+    } finally { path = "fixed"; }
+    Files.readString(path);
+  }
+  void elements(Request request) {
+    for (String path : request.getParameterValues("files")) {
+      Files.readString(path); // unsafe
+    }
+  }
+}'''
+        _, effects = self.helper(text)
+        self.assertEqual(set(effects), self.lines(text))
+        kotlin = '''fun handler(request: Request) {
+  for (path in request.getParameterValues("files")) {
+    Files.readString(path) // unsafe
+  }
+}'''
+        _, effects = self.helper(kotlin, '.kt')
+        self.assertEqual(set(effects), self.lines(kotlin))
+
+    def test_executable_class_initialization_is_explicitly_incomplete(self):
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.taint_flow import AnalysisLimit
+        for code in (
+            'class A { String p = request.getParameter("x"); { Files.readString(p); } }',
+            'class A { String p = request.getParameter("x"); { Files.readString(p); } void method() {} }',
+        ):
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'field-state.*incomplete'):
+                Engine(self.root / 'Sample.java', code)
+        engine = Engine(self.root / 'Sample.java', 'String p=request.getParameter("x"); Files.readString(p);')
+        engine.budget.remaining = 0
+        with self.assertRaisesRegex(AnalysisLimit, 'incomplete'):
+            engine.analyze()
+
+    def test_unmodeled_writes_bind_symbolic_escapes_without_rejecting_clean_setters(self):
+        safe = '''class Flow {
+  void field(String value) { this.path = value; }
+  void element(String value) { values[0] = value; }
+  void safe(Request request) {
+    String value = request.getParameter("file");
+    value = "fixed";
+    field(value);
+    element("fixed");
+    Files.readString("fixed");
+  }
+}'''
+        _, effects = self.helper(safe)
+        self.assertEqual(effects, {})
+        bad = '''class Flow {
+  void field(String value) { this.path = value; }
+  void handler(Request request) {
+    field(request.getParameter("file"));
+    Files.readString(this.path);
+  }
+}'''
+        for text in (
+            bad,
+            'class Flow { void f(Request request) { values[0] = request.getParameter("x"); Files.readString(values[0]); } }',
+            'class Flow { void f(@RequestParam String value) { this.path = value; Files.readString(this.path); } }',
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'heap-state.*incomplete'):
+                self.helper(text)
+        safe_path = self.root / 'SafeSetter.java'
+        safe_path.write_text(safe)
+        findings, context = self.cli(safe_path, 'java', 'clean-setter', 0)
+        self.assertEqual(findings, [], context)
+        bad_path = self.root / 'UnsafeSetter.java'
+        bad_path.write_text(bad)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('UBS_', 'GIT_', 'XDG_'))}
+        env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1', ENABLE_UV_TOOLS='0')
+        proc = subprocess.run([str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
+                               '--format=json', '--only=java', '--', str(bad_path)],
+                              cwd=self.root, env=env, capture_output=True, text=True, timeout=180)
+        (self.root / 'unsafe-setter.stdout.log').write_text(proc.stdout)
+        (self.root / 'unsafe-setter.stderr.log').write_text(proc.stderr)
+        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+        self.assertEqual(proc.returncode, 2, context)
+        report = self.decode_report(proc)
+        self.assertEqual(report['status'], 'error', context)
+        self.assertTrue(report['failed_modules'], context)
+        self.assertIn('heap-state', proc.stdout + proc.stderr, context)
+
+    def test_kotlin_top_level_parameter_helpers_execute_with_original_offsets(self):
+        for suffix in ('.kt', '.kts'):
+            for unsafe in (True, False):
+                text = ('import java.nio.file.Files\n'
+                        'fun relay(value: String): String = value\n'
+                        'val unused = request.getParameter("unused")\n'
+                        'val path = ' + ('request.getParameter("file")' if unsafe else '"fixed"') + '\n'
+                        'val content = Files.readString(relay(path))\n')
+                with self.subTest(suffix=suffix, unsafe=unsafe):
+                    _, effects = self.helper(text, suffix)
+                    self.assertEqual(set(effects), {5} if unsafe else set())
+                    path = self.root / ('TopLevel' + ('Unsafe' if unsafe else 'Safe') + suffix)
+                    path.write_text(text)
+                    findings, context = self.cli(path, 'kotlin', 'native-' + path.name, 1 if unsafe else 0)
+                    self.assertEqual({row['line'] for row in findings}, {5} if unsafe else set(), context)
+                    self.assertTrue(all(row['severity'] == 'critical' for row in findings), context)
+
+    def test_kotlin_global_captures_are_clean_or_explicitly_incomplete(self):
+        safe = ('val unused = request.getParameter("unused")\n'
+                'val path = "fixed"\n'
+                'fun read() { Files.readString(path) }\n'
+                'read()\n')
+        _, effects = self.helper(safe, '.kts')
+        self.assertEqual(effects, {})
+        unsafe = ('val path = request.getParameter("file")\n'
+                  'fun read() { Files.readString(path) }\n'
+                  'read()\n')
+        for text in (
+            unsafe,
+            'var path=request.getParameter("file")\nfun read() { Files.readString(path) }\nread()\npath="fixed"\n',
+            'var path=request.getParameter("file")\nfun read() { Files.readString(path) }\nfun call(path: String) { read() }\ncall("fixed")\npath="fixed"\n',
+            'val path=request.getParameter("file")\nfun read() { Files.readString(path) }\n',
+        ):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'capture-state.*incomplete'):
+                self.helper(text, '.kts')
+        shadow = ('val path=request.getParameter("file")\n'
+                  'fun read(path: String) { Files.readString(path) }\n'
+                  'read("fixed")\n')
+        _, effects = self.helper(shadow, '.kts')
+        self.assertEqual(effects, {})
+        safe_path = self.root / 'SafeCapture.kts'
+        safe_path.write_text(safe)
+        findings, context = self.cli(safe_path, 'kotlin', 'clean-capture', 0)
+        self.assertEqual(findings, [], context)
+        bad_path = self.root / 'UnsafeCapture.kts'
+        bad_path.write_text(unsafe)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('UBS_', 'GIT_', 'XDG_'))}
+        env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1', ENABLE_UV_TOOLS='0')
+        proc = subprocess.run([str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
+                               '--format=json', '--only=kotlin', '--', str(bad_path)],
+                              cwd=self.root, env=env, capture_output=True, text=True, timeout=180)
+        (self.root / 'unsafe-capture.stdout.log').write_text(proc.stdout)
+        (self.root / 'unsafe-capture.stderr.log').write_text(proc.stderr)
+        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+        self.assertEqual(proc.returncode, 2, context)
+        report = self.decode_report(proc)
+        self.assertEqual(report['status'], 'error', context)
+        self.assertTrue(report['failed_modules'], context)
+        self.assertIn('capture-state', proc.stdout + proc.stderr, context)
+
+    def test_kotlin_nonlocal_writes_preserve_symbolic_escape_polarity(self):
+        safe = ('var path = "fixed"\n'
+                'fun write(value: String) { path = value }\n'
+                'fun read() { Files.readString(path) }\n'
+                'val unused = request.getParameter("unused")\n'
+                'write("fixed")\n'
+                'read()\n')
+        _, effects = self.helper(safe, '.kts')
+        self.assertEqual(effects, {})
+        direct = ('var path = "fixed"\n'
+                  'fun write(request: Request) { path = request.getParameter("file") }\n'
+                  'fun read() { Files.readString(path) }\n'
+                  'write(request)\n'
+                  'read()\n')
+        symbolic = safe.replace('write("fixed")', 'write(request.getParameter("file"))')
+        for text in (direct, symbolic):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'capture-state.*incomplete'):
+                self.helper(text, '.kts')
+        local = ('val path = "fixed"\n'
+                 'fun local(request: Request) { val path = request.getParameter("file"); Files.readString(path) }\n'
+                 'local(request)\n')
+        _, effects = self.helper(local, '.kts')
+        self.assertEqual(set(effects), {2})
+        safe_path = self.root / 'SafeNonlocalWrite.kts'
+        safe_path.write_text(safe)
+        findings, context = self.cli(safe_path, 'kotlin', 'clean-nonlocal-write', 0)
+        self.assertEqual(findings, [], context)
+        bad_path = self.root / 'UnsafeNonlocalWrite.kts'
+        bad_path.write_text(direct)
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(('UBS_', 'GIT_', 'XDG_'))}
+        env.update(PYTHONDONTWRITEBYTECODE='1', UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1', ENABLE_UV_TOOLS='0')
+        proc = subprocess.run([str(REPO_ROOT / 'ubs'), '--ci', '--no-color', '--no-cache',
+                               '--format=json', '--only=kotlin', '--', str(bad_path)],
+                              cwd=self.root, env=env, capture_output=True, text=True, timeout=180)
+        (self.root / 'unsafe-nonlocal-write.stdout.log').write_text(proc.stdout)
+        (self.root / 'unsafe-nonlocal-write.stderr.log').write_text(proc.stderr)
+        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+        self.assertEqual(proc.returncode, 2, context)
+        report = self.decode_report(proc)
+        self.assertEqual(report['status'], 'error', context)
+        self.assertTrue(report['failed_modules'], context)
+        self.assertIn('capture-state', proc.stdout + proc.stderr, context)
+
+    def test_original_real_cli_scope_reductions(self):
+        fixtures = {
+            'java-unsafe': 'class Sample {\n  void unsafe(jakarta.servlet.http.HttpServletRequest request) throws java.io.IOException {\n    String path = request.getParameter("file");\n    java.nio.file.Files.readString(java.nio.file.Path.of(path));\n  }\n}\n',
+            'java-clean-reassignment': 'class Sample {\n  void clean(jakarta.servlet.http.HttpServletRequest request) throws java.io.IOException {\n    String path = request.getParameter("file");\n    path = "fixed.txt";\n    java.nio.file.Files.readString(java.nio.file.Path.of(path));\n  }\n}\n',
+            'java-clean-method': 'class Sample {\n  void first(jakarta.servlet.http.HttpServletRequest request) {\n    String path = request.getParameter("file");\n  }\n  void clean() throws java.io.IOException {\n    String path = "fixed.txt";\n    java.nio.file.Files.readString(java.nio.file.Path.of(path));\n  }\n}\n',
+            'kotlin-unsafe': 'fun unsafe(request: jakarta.servlet.http.HttpServletRequest) {\n  val path = request.getParameter("file")\n  java.nio.file.Files.readString(java.nio.file.Path.of(path))\n}\n',
+            'kotlin-clean-reassignment': 'fun clean(request: jakarta.servlet.http.HttpServletRequest) {\n  var path = request.getParameter("file")\n  path = "fixed.txt"\n  java.nio.file.Files.readString(java.nio.file.Path.of(path))\n}\n',
+            'kotlin-clean-method': 'fun first(request: jakarta.servlet.http.HttpServletRequest) {\n  val path = request.getParameter("file")\n}\nfun clean() {\n  val path = "fixed.txt"\n  java.nio.file.Files.readString(java.nio.file.Path.of(path))\n}\n',
+        }
+        for lang, suffix, unsafe_line in (('java', '.java', 4), ('kotlin', '.kt', 3)):
+            for case in ('unsafe', 'clean-reassignment', 'clean-method'):
+                with self.subTest(lang=lang, case=case):
+                    original = self.root / (lang + '-' + case + suffix)
+                    original.write_text(fixtures[lang + '-' + case])
+                    findings, context = self.cli(original, lang, f'{lang}-{case}', 1 if case == 'unsafe' else 0)
+                    self.assertEqual([(row['rule'], row['line'], row['severity']) for row in findings],
+                                     [(lang + '.taint.path_traversal', unsafe_line, 'critical')] if case == 'unsafe' else [], context)
+
+    def test_real_cli_helpers_branch_loop_and_clean_controls(self):
+        sources = {
+            'java': '''class Sample {
+  String relay(String value) { return value; }
+  String safeUnderRoot(String value) { return "fixed"; }
+  void save(String value) { java.nio.file.Files.readString(value); } // unsafe
+  void handler(jakarta.servlet.http.HttpServletRequest request, boolean again) {
+    String path = request.getParameter("file");
+    if (again) { path = "fixed"; }
+    java.nio.file.Files.readString(path); // unsafe
+    String loop = "fixed";
+    while (again) { loop = request.getParameter("file"); }
+    java.nio.file.Files.readString(loop); // unsafe
+    save(relay(request.getParameter("file")));
+    java.nio.file.Files.readString(safeUnderRoot(path));
+    java.nio.file.Files.readString("path");
+    // java.nio.file.Files.readString(path);
+  }
+}''',
+            'kotlin': '''fun relay(value: String): String { return value }
+fun safeUnderRoot(value: String): String { return "fixed" }
+fun save(value: String) { java.nio.file.Files.readString(value) } // unsafe
+fun handler(request: jakarta.servlet.http.HttpServletRequest, again: Boolean) {
+  var path = request.getParameter("file")
+  if (again) { path = "fixed" }
+  java.nio.file.Files.readString(path) // unsafe
+  var loop = "fixed"
+  while (again) { loop = request.getParameter("file") }
+  java.nio.file.Files.readString(loop) // unsafe
+  save(relay(request.getParameter("file")))
+  java.nio.file.Files.readString(safeUnderRoot(path))
+  java.nio.file.Files.readString("path")
+  // java.nio.file.Files.readString(path)
+}''',
+        }
+        for lang, suffix in (('java', '.java'), ('kotlin', '.kt')):
+            with self.subTest(lang=lang):
+                text = sources[lang]
+                path = self.root / ('Interprocedural' + suffix)
+                path.write_text(text)
+                findings, context = self.cli(path, lang, 'interprocedural-' + lang, 1)
+                self.assertEqual({row['line'] for row in findings}, self.lines(text), context)
+                self.assertEqual(len(findings), len(self.lines(text)), context)
+                self.assertTrue(all(row['severity'] == 'critical' for row in findings), context)
+
+    def test_real_cli_unmodeled_initialization_cannot_be_reported_clean(self):
+        path = self.root / 'Initializer.java'
+        path.write_text('class A { String p = request.getParameter("x"); { java.nio.file.Files.readString(p); } void method() {} }')
+        directory = self.root / 'initialization'
+        directory.mkdir()
+        env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1',
+                   UBS_SKIP_TYPE_NARROWING='1', ENABLE_UV_TOOLS='0', PYTHONDONTWRITEBYTECODE='1')
+        proc = subprocess.run([str(REPO_ROOT / 'ubs'), '--ci', '--format=json', '--no-cache',
+                               '--only=java', '--', str(path)], cwd=directory, env=env,
+                              capture_output=True, text=True, timeout=180)
+        (directory / 'stdout.log').write_text(proc.stdout)
+        (directory / 'stderr.log').write_text(proc.stderr)
+        context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+        self.assertEqual(proc.returncode, 2, context)
+        report = self.decode_report(proc)
+        self.assertEqual(report['status'], 'error', context)
+        self.assertTrue(report['failed_modules'], context)
+        self.assertIn('field-state', proc.stdout + proc.stderr, context)
+
+    def test_existing_fixture_pairs_preserve_bytes_and_findings(self):
+        cases = (
+            ('java', 'test-suite/java/security/path_traversal_buggy.java',
+             '6775a3f001ce3473642edec380199056bd857ec3bd657b4e7046a90fde59d639',
+             {31, 36, 43, 44, 48, 49, 54, 55, 60, 61}),
+            ('java', 'test-suite/java/security/path_traversal_clean.java',
+             '2fd47fda15d868052b9812018c3a0ba6f1f2fdb0ccfa311c8c69427d1f5efd55', set()),
+            ('kotlin', 'test-suite/kotlin/path_traversal_buggy/RequestPaths.kt',
+             '06facb3d95e902bdf125512063ba1925d2a7d9cccbe3b5c748f51270b286c168',
+             {27, 28, 33, 38, 39, 43, 44, 49, 50}),
+            ('kotlin', 'test-suite/kotlin/path_traversal_clean/RequestPathsSafe.kt',
+             '12bb84e6e16d4ea33a8ef99789a71cedf23286bc26a03538281964a3f6272e43', set()),
+        )
+        for lang, name, digest, expected in cases:
+            with self.subTest(path=name):
+                path = REPO_ROOT / name
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+                findings, context = self.cli(path, lang, 'fixture-' + path.stem, 1 if expected else 0)
+                self.assertEqual({row['line'] for row in findings}, expected, context)
+                self.assertEqual(len(findings), len(expected), context)
+                self.assertTrue(all(row['rule'] == lang + '.taint.path_traversal'
+                                    and row['severity'] == 'critical' for row in findings), context)
+                self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+
 if __name__ == "__main__":
     unittest.main()

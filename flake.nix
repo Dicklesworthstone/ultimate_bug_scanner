@@ -20,9 +20,46 @@
             src = ./.;
             dontConfigure = true;
             dontBuild = true;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            buildInputs = [ pkgs.bash ];
             installPhase = ''
-              install -Dm755 ubs $out/bin/ubs
+              runHook preInstall
+              install -Dm755 ubs $out/libexec/ubs/ubs
+              # The verified loader executes these exact bytes. Keep this
+              # non-executable so patchShebangs cannot change its checksum.
+              install -Dm644 ubs-daemon $out/libexec/ubs/ubs-daemon
+              daemon_declaration="$(grep '^UBS_DAEMON_SHA256=' $out/libexec/ubs/ubs)"
+              daemon_sha="$(sha256sum $out/libexec/ubs/ubs-daemon | cut -d' ' -f1)"
+              test "$daemon_declaration" = "UBS_DAEMON_SHA256=\"$daemon_sha\""
+              makeWrapper $out/libexec/ubs/ubs $out/bin/ubs \
+                --run "$daemon_declaration" \
+                --prefix PATH : ${pkgs.lib.makeBinPath [
+                  pkgs.bash pkgs.coreutils pkgs.curl pkgs.git pkgs.jq
+                  pkgs.ripgrep pkgs.python314 pkgs.findutils pkgs.gnused
+                  pkgs.gawk pkgs.gnugrep pkgs.unzip
+                ]} \
+                --set-default UBS_NO_AUTO_UPDATE 1
               install -Dm644 README.md $out/share/doc/ultimate_bug_scanner/README.md
+              runHook postInstall
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+              cmp ubs-daemon $out/libexec/ubs/ubs-daemon
+              test ! -L $out/libexec/ubs/ubs-daemon
+              grep -Fx "$(grep '^UBS_DAEMON_SHA256=' $out/libexec/ubs/ubs)" $out/bin/ubs
+              $out/bin/ubs serve --help
+              $out/bin/ubs --client --help
+              # A runner-only payload must fail to load the canonical service.
+              mkdir missing-daemon
+              cp $out/libexec/ubs/ubs missing-daemon/ubs
+              if UBS_PYTHON=${pkgs.python314}/bin/python3 missing-daemon/ubs serve --help; then
+                echo "Runner-only package unexpectedly loaded the service" >&2
+                exit 1
+              else
+                test "$?" -eq 2
+              fi
+              runHook postInstallCheck
             '';
             meta = with pkgs.lib; {
               description = "Ultimate Bug Scanner meta-runner";

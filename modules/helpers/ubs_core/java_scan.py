@@ -329,6 +329,7 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                     "severity": finding.get("severity", "warning"),
                     "message": finding.get("message", ""),
                     "suppressed": False,
+                    **({"extras": finding["extras"]} if finding.get("extras") else {}),
                 }, ensure_ascii=False) + "\n")
 
 

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -629,7 +631,15 @@ class RealScannerTests(unittest.TestCase):
         # The environment is identical for the daemon, client and scanner.
         self.env['ENABLE_UV_TOOLS'] = '0'
         os.environ['ENABLE_UV_TOOLS'] = '0'
-        self.env['PATH'] = str(ROOT) + os.pathsep + self.env['PATH']
+        bin_ = self.work / 'hook-bin'
+        bin_.mkdir()
+        (bin_ / 'ubs').symlink_to(ROOT / 'ubs')
+        marker = self.work / 'unverified-client-executed'
+        unverified = bin_ / 'ubs-daemon'
+        unverified.write_text('#!/usr/bin/env python3\nfrom pathlib import Path\n'
+                              f'Path({str(marker)!r}).touch()\nraise SystemExit(2)\n')
+        unverified.chmod(0o755)
+        self.env['PATH'] = str(bin_) + os.pathsep + self.env['PATH']
         os.environ['PATH'] = self.env['PATH']
         self.env['CLAUDE_PROJECT_DIR'] = str(self.root)
         os.environ['CLAUDE_PROJECT_DIR'] = str(self.root)
@@ -652,7 +662,8 @@ class RealScannerTests(unittest.TestCase):
         clean = invoke()
         self.assertEqual(clean.returncode, 0, clean.stderr)
         self.assertEqual(clean.stdout + clean.stderr, '')
-        print('[daemon-real-hook] finding, warm service reuse, edited clean result PASS', flush=True)
+        self.assertFalse(marker.exists(), 'the canonical hook must not execute a PATH daemon')
+        print('[daemon-real-hook] pinned canonical client, warm service reuse, edited clean result PASS', flush=True)
 
 
 @unittest.skipUnless(os.name == 'posix', 'The save-hook daemon integration requires POSIX')
@@ -772,6 +783,201 @@ class SaveHookTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn('UBS found critical issues', result.stderr)
         self.assertEqual(Path(self.env['SCAN_COUNT']).read_text(), 'scan\n' * 3)
+
+
+@unittest.skipUnless(os.name == 'posix', 'The canonical service requires POSIX')
+class EntrypointTests(unittest.TestCase):
+    """Canonical routing plus real scanner parity, separate from protocol doubles."""
+
+    def setUp(self):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix='k4-canonical-', dir=artifacts))
+        self.root = self.work / 'project'
+        self.root.mkdir()
+        (self.work / 'run').mkdir(mode=0o700)
+        (self.work / 'home').mkdir()
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(('UBS_', 'GIT_', 'XDG_', 'CLAUDE_', 'SCAN_'))
+                    and key not in {'ENABLE_UV_TOOLS', 'UV_TOOLS'}}
+        # Both peers run in project/. A relative private runtime keeps socket
+        # paths short even when this persisted artifact directory is deep.
+        self.env.update(XDG_RUNTIME_DIR='../run', UBS_NO_AUTO_UPDATE='1',
+                        UBS_NO_CACHE='1', PYTHONDONTWRITEBYTECODE='1',
+                        ENABLE_UV_TOOLS='0', HOME=str(self.work / 'home'),
+                        XDG_CONFIG_HOME=str(self.work / 'config'),
+                        XDG_CACHE_HOME=str(self.work / 'cache'))
+        self.calls = []
+
+    def run(self, result=None):
+        case = 'k4-canonical:' + self._testMethodName
+        print(f'[{case}] RUN', flush=True)
+        started = time.monotonic()
+        result = result or self.defaultTestResult()
+        before = len(result.failures) + len(result.errors)
+        skipped_before = len(result.skipped)
+        super().run(result)
+        failed = len(result.failures) + len(result.errors) > before
+        if failed:
+            for args, stdout, stderr in getattr(self, 'calls', []):
+                print(f'[{case}] command={args!r}\nstdout:\n{stdout}\nstderr:\n{stderr}', flush=True)
+        status = 'FAIL' if failed else 'SKIP' if len(result.skipped) > skipped_before else 'PASS'
+        print(f'[{case}] {status} '
+              f'({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def cli(self, *args, runner=None, env=None, timeout=130):
+        command = [str(runner or ROOT / 'ubs'), *args]
+        result = subprocess.run(command, cwd=self.root, env=env or self.env,
+                                capture_output=True, text=True, timeout=timeout)
+        number = len(self.calls)
+        self.calls.append((command, result.stdout, result.stderr))
+        (self.work / f'{number}.stdout').write_text(result.stdout)
+        (self.work / f'{number}.stderr').write_text(result.stderr)
+        return result
+
+    def installation(self):
+        installed = self.work / 'installed'
+        installed.mkdir()
+        for name in ('ubs', 'ubs-daemon'):
+            shutil.copy2(ROOT / name, installed / name)
+        return installed
+
+    def report(self, result):
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f'Invalid service JSON: {exc}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}')
+
+    def test_pin_and_help_expose_the_existing_service(self):
+        pins = re.findall(r'^UBS_DAEMON_SHA256="([0-9a-f]{64})"$', (ROOT / 'ubs').read_text(), re.M)
+        self.assertEqual(pins, [hashlib.sha256(DAEMON.read_bytes()).hexdigest()])
+        result = self.cli('--help')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for spelling in ('ubs serve', 'ubs --client', 'ubs daemon'):
+            self.assertIn(spelling, result.stdout + result.stderr)
+
+    def test_service_help_precedes_scanner_dependency_and_update_probes(self):
+        bin_ = self.work / 'help-bin'
+        bin_.mkdir()
+        for name in ('bash', 'python3'):
+            (bin_ / name).symlink_to(shutil.which(name))
+        env = dict(self.env, PATH=str(bin_), UBS_ENABLE_AUTO_UPDATE='1', FORCE_SELF_UPDATE='1')
+        for args in (('serve', '--help'), ('--client', '--help'), ('daemon', '--help')):
+            with self.subTest(args=args):
+                result = self.cli(*args, env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('usage:', result.stdout)
+
+    def test_altered_or_missing_daemon_never_runs_a_replacement(self):
+        installed = self.installation()
+        marker = self.work / 'executed'
+        altered = f'from pathlib import Path\nPath({str(marker)!r}).touch()\n'
+        (installed / 'ubs-daemon').write_text(altered)
+        result = self.cli('serve', '--help', runner=installed / 'ubs')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('checksum mismatch', result.stderr)
+        (installed / 'ubs-daemon').rename(installed / 'ubs-daemon.saved')
+        replacement = self.root / 'ubs-daemon'
+        replacement.write_text('#!/usr/bin/env python3\n' + altered)
+        replacement.chmod(0o755)
+        result = self.cli('serve', '--help', runner=installed / 'ubs',
+                          env=dict(self.env, PATH=str(self.root) + os.pathsep + self.env['PATH']))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_symlink_special_file_and_oversized_daemon_are_refused(self):
+        installed = self.installation()
+        frontend = installed / 'ubs-daemon'
+        frontend.rename(installed / 'saved')
+        frontend.symlink_to(installed / 'saved')
+        result = self.cli('serve', '--help', runner=installed / 'ubs')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('symlinked', result.stderr)
+        frontend.rename(installed / 'link')
+        os.mkfifo(frontend)
+        result = self.cli('serve', '--help', runner=installed / 'ubs', timeout=3)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        frontend.rename(installed / 'pipe')
+        frontend.write_bytes(b' ' * (512 * 1024 + 1))
+        result = self.cli('serve', '--help', runner=installed / 'ubs')
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    def test_symlinked_runner_uses_its_verified_adjacent_daemon(self):
+        alias = self.root / 'ubs-link'
+        alias.symlink_to(ROOT / 'ubs')
+        (self.root / 'ubs-daemon').write_text('raise RuntimeError("planted daemon")')
+        result = self.cli('daemon', '--help', runner=alias)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_python_startup_and_project_imports_cannot_precede_verification(self):
+        marker = self.work / 'executed'
+        for name in ('sitecustomize.py', 'json.py', 'hashlib.py'):
+            (self.root / name).write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+        result = self.cli('daemon', '--help', env=dict(self.env, PYTHONPATH=str(self.root)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+        result = self.cli('daemon', '--help', env=dict(self.env, UBS_PYTHON='/missing/interpreter'))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+
+    @unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for actual scanner parity')
+    def test_real_canonical_fallback_service_and_edited_findings(self):
+        source = self.root / 'a.py'
+        source.write_text('eval(input())\n')
+        direct = self.cli('--ci', '--no-auto-update', '--no-color', '--format=json', '--', str(source))
+        fallback = self.cli('--client', '--repo', str(self.root), '--', 'a.py')
+        self.assertEqual(direct.returncode, 1, direct.stdout + direct.stderr)
+        self.assertEqual(fallback.returncode, direct.returncode, fallback.stdout + fallback.stderr)
+        expected = self.report(direct)['findings']
+        self.assertEqual(self.report(fallback)['findings'], expected)
+        self.assertTrue(any(f['rule_id'] == 'python.taint.eval' and f['line'] == 1 for f in expected))
+        with (self.work / 'serve.stdout').open('x') as stdout, (self.work / 'serve.stderr').open('x') as stderr:
+            process = subprocess.Popen([str(ROOT / 'ubs'), 'serve', '--repo', str(self.root), '--jobs=2'],
+                                       cwd=self.root, env=self.env, stdout=stdout, stderr=stderr)
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    status = self.cli('daemon', 'status', '--repo', str(self.root))
+                    if status.returncode == 0:
+                        break
+                    self.assertIsNone(process.poll(), (self.work / 'serve.stderr').read_text())
+                    time.sleep(0.02)
+                self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+                self.assertEqual(self.report(status)['max_scans'], 2)
+                for _ in range(2):
+                    result = self.cli('--client', '--repo', str(self.root), '--require-daemon', 'a.py')
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(self.report(result)['findings'], expected)
+                source.write_text('value = 1\n')
+                started = time.monotonic()
+                edited = self.cli('--client', '--repo', str(self.root), '--require-daemon', 'a.py')
+                elapsed = time.monotonic() - started
+                print(f'[k4-canonical-native] edited_request_ms={elapsed * 1000:.3f}; '
+                      'this is measured latency, not a <100ms acceptance claim', flush=True)
+                clean = self.cli('--ci', '--no-auto-update', '--no-color', '--format=json', '--', str(source))
+                self.assertEqual(edited.returncode, 0, edited.stdout + edited.stderr)
+                self.assertEqual(clean.returncode, edited.returncode, clean.stdout + clean.stderr)
+                for result in (edited, clean):
+                    report = self.report(result)
+                    diagnostic = result.stdout + result.stderr
+                    self.assertEqual(report['status'], 'ok', diagnostic)
+                    self.assertEqual(report['failed_modules'], [], diagnostic)
+                    self.assertEqual(report['totals']['critical'], 0, diagnostic)
+                    self.assertEqual(report['totals']['warning'], 0, diagnostic)
+                    self.assertEqual(report.get('findings', []), [], diagnostic)
+                self.assertEqual(self.report(edited).get('findings', []),
+                                 self.report(clean).get('findings', []))
+                stop = self.cli('daemon', 'stop', '--repo', str(self.root))
+                self.assertEqual(stop.returncode, 0, stop.stdout + stop.stderr)
+                process.wait(timeout=5)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
 
 
 if __name__ == '__main__':

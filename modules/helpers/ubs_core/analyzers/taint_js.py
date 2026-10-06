@@ -620,13 +620,21 @@ def _materialize(fact, heap, seen=frozenset()):
 
 
 def _join(*facts):
+    nonempty = [fact for fact in facts if fact]
+    if not nonempty:
+        return _Fact()
+    first = nonempty[0]
+    if all(fact is first for fact in nonempty):
+        # Facts and traces are immutable. Identity also preserves the exact
+        # evidence path; equality alone would miss shorter paths to one origin.
+        return first
     traces = {}
-    for fact in facts:
+    for fact in nonempty:
         for trace in fact:
             previous = traces.get(trace)
             if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
                 traces[trace] = trace
-    return _Fact(traces.values(), frozenset().union(*(_refs(fact) for fact in facts)))
+    return _Fact(traces.values(), frozenset().union(*(_refs(fact) for fact in nonempty)))
 
 
 def _step(fact, name):

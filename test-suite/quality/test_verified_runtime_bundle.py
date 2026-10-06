@@ -92,8 +92,11 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         path.write_bytes(data)
 
     def seal(self):
+        assets = ['install.sh', 'ubs', 'git_safety_guard.py']
+        if 'UBS_DAEMON_SHA256=' in (self.origin / 'ubs').read_text():
+            assets.append('ubs-daemon')
         manifest = ''.join(f'{digest((self.origin / name).read_bytes())}  {name}\n'
-                           for name in ('install.sh', 'ubs', 'git_safety_guard.py'))
+                           for name in assets)
         self.write('SHA256SUMS', manifest.encode())
         self.write('SHA256SUMS.sigstore.json', digest(manifest.encode()).encode())
 
@@ -286,6 +289,7 @@ if os.environ.get('LATE_OUTPUT'): pathlib.Path(os.environ['LATE_OUTPUT']).write_
         self.version = (ROOT / 'VERSION').read_text().strip().removeprefix('v')
         self.env['EXPECT_VERSION'] = self.version
         self.write('ubs', (ROOT / 'ubs').read_bytes())
+        self.write('ubs-daemon', (ROOT / 'ubs-daemon').read_bytes())
         shutil.copytree(ROOT / 'modules', self.origin / 'modules', dirs_exist_ok=True)
         self.seal()
         result = self.run_verify()
@@ -637,7 +641,7 @@ sys.exit(0 if expected == actual and args[args.index('-P')+1] == 'fixture-key' e
     def test_bundle_actual_scanner_runs_with_empty_cache_and_downloads_blocked(self):
         self.version = (ROOT / 'VERSION').read_text().strip().removeprefix('v')
         self.env['EXPECT_VERSION'] = self.version
-        for name in ('ubs', 'install.sh'):
+        for name in ('ubs', 'install.sh', 'ubs-daemon'):
             self.write(name, (ROOT / name).read_bytes())
         self.write('git_safety_guard.py', (ROOT / '.claude/hooks/git_safety_guard.py').read_bytes())
         shutil.copytree(ROOT / 'modules', self.origin / 'modules', dirs_exist_ok=True)
@@ -685,6 +689,66 @@ sys.exit(97)
         self.assertEqual(clean_report['totals']['critical'], 0, clean_report)
         self.assertEqual(clean_report['totals']['warning'], 0, clean_report)
         self.assertFalse(any(e[0] in {'fetch', 'blocked-network'} for e in self.events()), self.events())
+
+
+class DaemonBundleTests(unittest.TestCase):
+    """Real daemon bytes and archive verification; signatures use protocol doubles."""
+
+    setUp = RuntimeBundleTests.setUp
+    tearDown = RuntimeBundleTests.tearDown
+    tool = RuntimeBundleTests.tool
+    write = RuntimeBundleTests.write
+    rebuild = RuntimeBundleTests.rebuild
+    seal = RuntimeBundleTests.seal
+    _run_verify = RuntimeBundleTests.run_verify
+    events = RuntimeBundleTests.events
+    _export = RuntimeBundleTests.export
+
+    def run_verify(self, *args, **kwargs):
+        try:
+            return self._run_verify(*args, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            self.fail(f'Bundle verification timed out: {exc.cmd!r}\n'
+                      f'stdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
+
+    def export(self, *args, **kwargs):
+        try:
+            return self._export(*args, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            self.fail(f'Bundle export timed out: {exc.cmd!r}\n'
+                      f'stdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
+
+    def run(self, result=None):
+        case = 'k4-distribution:' + self._testMethodName
+        print(f'[{case}] RUN', flush=True)
+        started = time.monotonic()
+        result = result or self.defaultTestResult()
+        failures = len(result.failures) + len(result.errors)
+        skipped = len(result.skipped)
+        super().run(result)
+        failed = len(result.failures) + len(result.errors) > failures
+        status = 'FAIL' if failed else 'SKIP' if len(result.skipped) > skipped else 'PASS'
+        print(f'[{case}] {status} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def test_portable_bundle_contains_and_reverifies_signed_companion(self):
+        payload = (ROOT / 'ubs-daemon').read_bytes()
+        self.write('ubs-daemon', payload)
+        runner = (self.origin / 'ubs').read_text()
+        pin = hashlib.sha256(payload).hexdigest()
+        self.write('ubs', (runner + f'\nUBS_DAEMON_SHA256="{pin}"\n').encode())
+        self.seal()
+        output = self.work / 'portable.tar.gz'
+        self.export(output)
+        with tarfile.open(output) as archive:
+            self.assertEqual(archive.extractfile('ubs-daemon').read(), payload)
+            self.assertEqual(archive.getmember('ubs-daemon').mode, 0o755)
+            unpacked = self.work / 'unpacked'
+            archive.extractall(unpacked, filter='data')
+        self.origin = unpacked
+        self.run_verify()
+        self.write('ubs-daemon', payload + b'\n# corrupt\n')
+        self.run_verify(expected=1)
 
 
 if __name__ == '__main__':

@@ -31,6 +31,8 @@ LIB = REPO_ROOT / "modules" / "lib" / "ubs-common.sh"
 # `UBS_COMMON_HELPER_CHECKSUMS['contract.json']` pin already names.
 CONTRACT = REPO_ROOT / "modules" / "contract.json"
 CONTRACT_HASH = hashlib.sha256(CONTRACT.read_bytes()).hexdigest()
+DAEMON = REPO_ROOT / 'ubs-daemon'
+DAEMON_HASH = hashlib.sha256(DAEMON.read_bytes()).hexdigest()
 
 
 def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -50,6 +52,7 @@ class NewModuleScaffoldTest(unittest.TestCase):
         (self.root / "test-suite").mkdir()
         shutil.copy2(LIB, self.root / "modules" / "lib" / "ubs-common.sh")
         shutil.copy2(CONTRACT, self.root / "modules" / "contract.json")
+        shutil.copy2(DAEMON, self.root / 'ubs-daemon')
         (self.root / "test-suite" / "manifest.json").write_text('{"cases": []}\n')
         before = {str(p.relative_to(self.root)) for p in self.root.rglob("*")}
         proc = run([str(SCAFFOLD), "zig", "--extensions", "zig", "--display", "Zig", "--root", str(self.root)])
@@ -118,6 +121,7 @@ class NewModuleScaffoldTest(unittest.TestCase):
         def refresh_outer_digests() -> None:
             module_hash = hashlib.sha256(self.module.read_bytes()).hexdigest()
             (self.root / "ubs").write_text(
+                f'UBS_DAEMON_SHA256="{DAEMON_HASH}"\n'
                 f"declare -A MODULE_CHECKSUMS=(\n  [zig]='{module_hash}'\n)\n"
                 f"declare -A HELPER_CHECKSUMS=(\n  ['lib/ubs-common.sh']='{library_hash}'\n"
                 f"  ['contract.json']='{CONTRACT_HASH}'\n)\n",
@@ -202,6 +206,7 @@ class NewModuleScaffoldTest(unittest.TestCase):
                 (scripts / "new-module.sh").write_text(original_scaffold.replace(old_pin, new_pin), encoding="utf-8")
                 module_hash = hashlib.sha256(self.module.read_bytes()).hexdigest()
                 (self.root / "ubs").write_text(
+                    f'UBS_DAEMON_SHA256="{DAEMON_HASH}"\n'
                     f"declare -A MODULE_CHECKSUMS=(\n  [zig]='{module_hash}'\n)\n"
                     f"declare -A HELPER_CHECKSUMS=(\n  ['lib/ubs-common.sh']='{library_hash}'\n"
                     f"  ['contract.json']='{CONTRACT_HASH}'\n"

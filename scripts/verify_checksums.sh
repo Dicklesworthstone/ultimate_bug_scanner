@@ -51,6 +51,22 @@ done < <(sed -n '/^declare -g -A UBS_COMMON_HELPER_CHECKSUMS=/,/^)/p' modules/li
 
 # Verify each module
 FAILED=0
+echo "Verifying local scan service checksum..."
+daemon_expected=$(sed -n 's/^UBS_DAEMON_SHA256="\([0-9a-f]\{64\}\)"$/\1/p' ubs)
+if [[ ! -f ubs-daemon || -L ubs-daemon || -z "$daemon_expected" ]]; then
+  echo "ERROR: Missing daemon executable or checksum pin" >&2
+  FAILED=1
+else
+  if command -v sha256sum >/dev/null 2>&1; then
+    daemon_actual=$(sha256sum ubs-daemon | awk '{print $1}')
+  else
+    daemon_actual=$(shasum -a 256 ubs-daemon | awk '{print $1}')
+  fi
+  if [[ "$daemon_actual" != "$daemon_expected" ]]; then
+    echo "ERROR: ubs-daemon checksum mismatch" >&2
+    FAILED=1
+  fi
+fi
 for module in modules/ubs-*.sh; do
   if [[ ! -f "$module" ]]; then
     continue

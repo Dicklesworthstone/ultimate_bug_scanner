@@ -240,6 +240,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
                     "severity": "critical",
                     "message": finding.get("message", "Request-derived path reaches file read/write/serve sink"),
                     "suppressed": False,
+                    **({"extras": finding["extras"]} if finding.get("extras") else {}),
                 }, ensure_ascii=False) + "\n")
 
         redir_files = files
@@ -366,8 +367,9 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
 
 
 def _render_sarif(records: list[dict], counters: dict[str, int], project_path: str, files: Sequence[Path]) -> dict:
+    from ubs_core.findings_merge import to_sarif
+
     rules_map: dict[str, dict] = {}
-    sarif_results: list[dict] = []
     level_map = {"critical": "error", "warning": "warning", "info": "note"}
 
     for r in records:
@@ -378,38 +380,11 @@ def _render_sarif(records: list[dict], counters: dict[str, int], project_path: s
                 "shortDescription": {"text": _SUMMARY_TITLES.get(rid, rid)},
                 "defaultConfiguration": {"level": level_map.get(r.get("severity", "warning"), "warning")},
             }
-        p = r.get("path", "")
-        ln = int(r.get("line", 1) or 1)
-        col = int(r.get("col", 1) or 1)
-        sarif_results.append({
-            "ruleId": rid,
-            "level": level_map.get(r.get("severity", "warning"), "warning"),
-            "message": {"text": r.get("message", "")},
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": {"uri": p},
-                    "region": {
-                        "startLine": max(1, ln),
-                        "startColumn": max(1, col),
-                    },
-                },
-            }],
-        })
-
-    return {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "ubs-kotlin",
-                    "version": "0.1.0",
-                    "rules": list(rules_map.values()),
-                },
-            },
-            "results": sarif_results,
-        }],
-    }
+    # Use the same validated evidence conversion as the meta-runner and Java
+    # module, retaining Kotlin's existing rule descriptions.
+    report = to_sarif({"version": "0.1.0", "language": "kotlin", "findings": records})
+    report["runs"][0]["tool"]["driver"]["rules"] = list(rules_map.values())
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:

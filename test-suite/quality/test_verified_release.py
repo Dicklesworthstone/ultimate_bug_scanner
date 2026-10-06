@@ -13,7 +13,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 VERIFY = ROOT / 'scripts' / 'verify.sh'
@@ -119,12 +121,16 @@ class VerifiedReleaseTests(unittest.TestCase):
         (self.bundle / 'install.sh').write_text(INSTALLER)
         (self.bundle / 'ubs').write_text(f'#!/usr/bin/env bash\nUBS_VERSION="{self.version}"\nexit 0\n')
         (self.bundle / 'git_safety_guard.py').write_text('#!/usr/bin/env python3\nraise SystemExit(0)\n')
+        (self.bundle / 'ubs-daemon').write_bytes((ROOT / 'ubs-daemon').read_bytes())
         self.sign()
 
     def sign(self, *, identity=None, issuer=ISSUER, manifest=None):
         if manifest is None:
+            assets = ['install.sh', 'ubs', 'git_safety_guard.py']
+            if 'UBS_DAEMON_SHA256=' in (self.bundle / 'ubs').read_text():
+                assets.append('ubs-daemon')
             manifest = ''.join(f'{hashlib.sha256((self.bundle / name).read_bytes()).hexdigest()}  {name}\n'
-                               for name in ('install.sh', 'ubs', 'git_safety_guard.py'))
+                               for name in assets)
         (self.bundle / 'SHA256SUMS').write_text(manifest)
         claim = {'digest': hashlib.sha256(manifest.encode()).hexdigest(),
                  'identity': identity or IDENTITY + self.version, 'issuer': issuer}
@@ -471,6 +477,404 @@ class VerifiedReleaseTests(unittest.TestCase):
         self.env['UBS_INSTALLER_SELF_UPDATED'] = ''
         self.run_verify('--insecure')
         self.assertEqual(self.execution()['self_updated'], '')
+
+
+class DaemonInstallTests(unittest.TestCase):
+    """Real installer/runner publication; transport/signature tools stay doubles."""
+
+    sign = VerifiedReleaseTests.sign
+    fetches = VerifiedReleaseTests.fetches
+
+    def setUp(self):
+        VerifiedReleaseTests.setUp(self)
+        self.commands = []
+        (self.bundle / 'install.sh').write_bytes((ROOT / 'install.sh').read_bytes())
+        (self.bundle / 'ubs').write_bytes((ROOT / 'ubs').read_bytes())
+        (self.bundle / 'VERSION').write_text(self.version + '\n')
+        self.sign()
+        self.destination = self.home / 'bin'
+        self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'installer-work')
+        self.flags = ['--non-interactive', '--skip-ast-grep', '--skip-ripgrep', '--skip-jq',
+                      '--skip-bun', '--skip-type-narrowing', '--skip-typos', '--skip-toon',
+                      '--skip-doctor', '--skip-hooks', '--skip-version-check', '--no-path-modify',
+                      '--install-dir', str(self.destination)]
+
+    def run(self, result=None):
+        case = 'k4-distribution:' + self._testMethodName
+        print(f'[{case}] RUN', flush=True)
+        started = time.monotonic()
+        result = result or self.defaultTestResult()
+        failures = len(result.failures) + len(result.errors)
+        skipped = len(result.skipped)
+        super().run(result)
+        failed = len(result.failures) + len(result.errors) > failures
+        if failed:
+            for command, stdout, stderr in getattr(self, 'commands', []):
+                print(f'[{case}] command={command!r}\nstdout:\n{stdout}\nstderr:\n{stderr}', flush=True)
+        status = 'FAIL' if failed else 'SKIP' if len(result.skipped) > skipped else 'PASS'
+        print(f'[{case}] {status} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def command(self, command, *, expected=0, timeout=60, input=None):
+        try:
+            result = subprocess.run(command, cwd=self.project, env=self.env,
+                                    input=input, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            self.commands.append((command, exc.stdout, exc.stderr))
+            self.fail(f'Command timed out after {timeout}s: {command!r}\n'
+                      f'stdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
+        self.commands.append((command, result.stdout, result.stderr))
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
+
+    def run_verify(self, *args, expected=0):
+        return self.command(['bash', str(VERIFY), *args], expected=expected)
+
+    def generation(self, source=None, runner=None):
+        source = source or self.bundle / 'ubs-daemon'
+        runner = runner or self.destination / 'ubs'
+        checksum = hashlib.sha256(source.read_bytes()).hexdigest()
+        return runner.with_name(runner.name + '.daemon.' + checksum + '.py')
+
+    def decode_json(self, output):
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            self.fail(f'Invalid command JSON: {exc}\nFull output:\n{output}')
+
+    def invoke(self, *args, expected=0, runner=None, timeout=60):
+        return self.command([str(runner or self.destination / 'ubs'), *args],
+                            expected=expected, timeout=timeout)
+
+    def direct_install(self, *, remote=False, expected=0):
+        installer = self.bundle / 'install.sh'
+        if remote:
+            installer = self.root / 'standalone-install.sh'
+            shutil.copy2(self.bundle / 'install.sh', installer)
+        return self.command(['bash', str(installer), *self.flags], expected=expected)
+
+    def start_service(self, runner=None):
+        runner = runner or self.destination / 'ubs'
+        runtime = self.root / 'runtime'
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        self.env['XDG_RUNTIME_DIR'] = '../runtime'
+        command = [str(runner), 'serve', '--repo', str(self.project)]
+        process = subprocess.Popen(command, cwd=self.project, env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def cleanup():
+            if process.poll() is None:
+                process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=5)
+            self.commands.append((command, stdout, stderr))
+
+        self.addCleanup(cleanup)
+        deadline = time.monotonic() + 10
+        status = None
+        while time.monotonic() < deadline:
+            status_command = [str(runner), 'daemon', 'status', '--repo', str(self.project)]
+            try:
+                status = subprocess.run(status_command, cwd=self.project, env=self.env,
+                                        capture_output=True, text=True, timeout=3)
+            except subprocess.TimeoutExpired as exc:
+                self.commands.append((status_command, exc.stdout, exc.stderr))
+                self.fail(f'Service status timed out\nstdout:\n{exc.stdout}\nstderr:\n{exc.stderr}')
+            self.commands.append((status_command, status.stdout, status.stderr))
+            if status.returncode == 0:
+                return process
+            if process.poll() is not None:
+                stdout, stderr = process.communicate(timeout=5)
+                self.commands.append((command, stdout, stderr))
+                self.fail(f'Service exited before becoming ready\nstdout:\n{stdout}\nstderr:\n{stderr}')
+            time.sleep(0.03)
+        self.assertIsNotNone(status)
+        self.fail(f'Service did not become ready\nstdout:\n{status.stdout}\nstderr:\n{status.stderr}')
+
+    def test_local_install_publishes_pair_and_canonical_commands_work(self):
+        self.direct_install()
+        self.assertEqual((self.destination / 'ubs').read_bytes(), (self.bundle / 'ubs').read_bytes())
+        self.assertEqual(self.generation().read_bytes(), (self.bundle / 'ubs-daemon').read_bytes())
+        self.assertEqual(self.generation().stat().st_mode & 0o777, 0o644)
+        self.assertFalse((self.destination / 'ubs-daemon').exists())
+        self.invoke('serve', '--help')
+        self.invoke('--client', '--help')
+        self.assertFalse({'ubs', 'ubs-daemon', 'SHA256SUMS'} & {item['name'] for item in self.fetches()})
+
+    def remove_companion(self):
+        import re
+        # Exercise the real bounded removal function. Full uninstall probes
+        # belong in the private installer container: they also inspect
+        # /usr/local/bin, which may contain another agent's live runner.
+        functions = re.findall(r'^uninstall_scanner_daemon\(\) \{\n.*?^\}\n',
+                               (ROOT / 'install.sh').read_text(), re.M | re.S)
+        self.assertEqual(len(functions), 1)
+        harness = self.root / 'remove-companion.sh'
+        harness.write_text('set -Eeuo pipefail\n'
+                           'compute_sha256() { sha256sum "$1" | cut -d" " -f1; }\n'
+                           'warn() { printf "%s\\n" "$*" >&2; }\n'
+                           'success() { printf "%s\\n" "$*"; }\n'
+                           + functions[0] + '\nuninstall_scanner_daemon "$1" ""\n')
+        return self.command(['bash', str(harness), str(self.destination / 'ubs')])
+
+    def test_uninstall_removes_current_verified_companion_and_preserves_other_files(self):
+        self.direct_install()
+        runner = self.destination / 'ubs'
+        generation = self.generation()
+        historical_bytes = generation.read_bytes() + b'\n# prior companion\n'
+        historical_hash = hashlib.sha256(historical_bytes).hexdigest()
+        historical = runner.with_name(runner.name + '.daemon.' + historical_hash + '.py')
+        historical.write_bytes(historical_bytes)
+        unrelated = runner.with_name(runner.name + '.daemon.' + '0' * 64 + '.py')
+        unrelated.write_bytes(b'preserve unrelated user data\n')
+        before = runner.read_bytes()
+        result = self.remove_companion()
+        self.assertIn('Removed verified service companion', result.stdout)
+        self.assertFalse(generation.exists())
+        self.assertEqual(runner.read_bytes(), before)
+        self.assertEqual(historical.read_bytes(), historical_bytes)
+        self.assertEqual(unrelated.read_bytes(), b'preserve unrelated user data\n')
+
+    def test_uninstall_preserves_tampered_and_symlinked_companions(self):
+        self.direct_install()
+        generation = self.generation()
+        generation.rename(self.root / 'original-companion')
+        generation.write_bytes(b'preserve changed user file\n')
+        result = self.remove_companion()
+        self.assertIn('Leaving unverified service companion', result.stderr)
+        self.assertEqual(generation.read_bytes(), b'preserve changed user file\n')
+        generation.rename(self.root / 'changed-companion')
+        outside = self.root / 'outside'
+        outside.write_bytes((self.bundle / 'ubs-daemon').read_bytes())
+        generation.symlink_to(outside)
+        result = self.remove_companion()
+        self.assertIn('Leaving unsafe service companion', result.stderr)
+        self.assertTrue(generation.is_symlink())
+        self.assertEqual(outside.read_bytes(), (self.bundle / 'ubs-daemon').read_bytes())
+
+    def test_uninstall_does_not_execute_nonliteral_or_ambiguous_pins(self):
+        import shlex
+        self.direct_install()
+        runner = self.destination / 'ubs'
+        original = runner.read_text()
+        payload = self.generation().read_bytes()
+        pin = 'UBS_DAEMON_SHA256="' + hashlib.sha256(payload).hexdigest() + '"'
+        marker = self.root / 'must-not-execute'
+        nonliteral = 'UBS_DAEMON_SHA256=$(touch ' + shlex.quote(str(marker)) + ')'
+        for candidate in (original.replace(pin, nonliteral), original + '\n' + pin + '\n'):
+            with self.subTest(ambiguous=candidate.endswith(pin + '\n')):
+                runner.write_text(candidate)
+                result = self.remove_companion()
+                self.assertIn('Leaving service companions', result.stderr)
+                self.assertEqual(self.generation().read_bytes(), payload)
+                self.assertFalse(marker.exists())
+
+    def test_remote_install_verifies_sidecar_against_selected_runner(self):
+        self.direct_install(remote=True)
+        self.assertTrue(self.generation().is_file())
+        self.invoke('daemon', '--help')
+        self.assertEqual([entry['name'] for entry in self.fetches()].count('ubs-daemon'), 1)
+
+    def test_bad_local_sidecar_leaves_existing_runner_and_old_generation_usable(self):
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        generation = self.generation()
+        original = generation.read_bytes()
+        (self.bundle / 'ubs-daemon').write_bytes(original + b'\n# unexpected change\n')
+        self.direct_install(expected=1)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        self.assertEqual(generation.read_bytes(), original)
+        self.invoke('daemon', '--help')
+
+    def test_missing_local_sidecar_does_not_fetch_or_replace_existing_runner(self):
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        fetches = self.fetches()
+        (self.bundle / 'ubs-daemon').rename(self.bundle / 'not-the-daemon')
+        self.direct_install(expected=1)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        self.assertEqual(self.fetches(), fetches)
+        self.invoke('daemon', '--help')
+
+    def test_bad_remote_sidecar_cannot_publish_a_runner(self):
+        (self.bundle / 'ubs-daemon').write_text('raise SystemExit(99)\n')
+        self.sign()
+        self.direct_install(remote=True, expected=1)
+        self.assertFalse((self.destination / 'ubs').exists())
+
+    def test_symlinked_local_sidecar_is_rejected(self):
+        original = self.bundle / 'saved'
+        (self.bundle / 'ubs-daemon').rename(original)
+        (self.bundle / 'ubs-daemon').symlink_to(original)
+        self.direct_install(expected=1)
+        self.assertFalse((self.destination / 'ubs').exists())
+
+    def test_generation_destination_cannot_redirect_writes(self):
+        self.destination.mkdir()
+        outside = self.root / 'preserve'
+        outside.write_text('unchanged')
+        self.generation().symlink_to(outside)
+        self.direct_install(expected=1)
+        self.assertEqual(outside.read_text(), 'unchanged')
+        self.assertFalse((self.destination / 'ubs').exists())
+
+    def test_manifest_and_runner_must_agree_on_sidecar(self):
+        (self.bundle / 'ubs-daemon').write_text('print("wrong release")\n')
+        self.sign()
+        result = self.run_verify('--verify-only', expected=1)
+        self.assertIn('does not match the authenticated runner', result.stderr)
+        self.assertFalse((self.destination / 'ubs').exists())
+
+    def test_missing_signed_daemon_entry_fails_before_installation(self):
+        manifest = (self.bundle / 'SHA256SUMS').read_text()
+        manifest = ''.join(line for line in manifest.splitlines(True) if not line.endswith('  ubs-daemon\n'))
+        self.sign(manifest=manifest)
+        self.run_verify('--', *self.flags, expected=1)
+        self.assertFalse((self.destination / 'ubs').exists())
+
+    def test_signed_install_stages_daemon_and_does_not_refetch_payload(self):
+        self.run_verify('--', *self.flags)
+        self.invoke('daemon', '--help')
+        fetched = [item['name'] for item in self.fetches()]
+        self.assertEqual(fetched.count('SHA256SUMS'), 1)
+        self.assertEqual(fetched.count('ubs-daemon'), 1)
+        self.assertTrue(self.generation().is_file())
+
+    def test_duplicate_or_nonliteral_runner_pin_is_rejected(self):
+        original = (self.bundle / 'ubs').read_text()
+        for extra in ('UBS_DAEMON_SHA256="' + '0' * 64 + '"\n',
+                      'UBS_DAEMON_SHA256=$(echo malicious)\n'):
+            with self.subTest(extra=extra):
+                (self.bundle / 'ubs').write_text(original + '\n' + extra)
+                self.direct_install(expected=1)
+                self.assertFalse((self.destination / 'ubs').exists())
+
+    def test_installer_template_matches_checkout_and_uses_canonical_client(self):
+        installer = (ROOT / 'install.sh').read_text()
+        template = installer.split("cat > \"$hook_file\" << 'HOOK_EOF'\n", 1)[1].split('\nHOOK_EOF', 1)[0] + '\n'
+        self.assertEqual(template, (ROOT / '.claude/hooks/on-file-write.sh').read_text())
+        self.assertIn('command=("$scanner" --client', template)
+        self.assertIn('NOT been verified', template)
+
+    def test_self_update_publishes_new_generation_before_switching_runner(self):
+        self.direct_install()
+        old_generation = self.generation()
+        old_payload = old_generation.read_bytes()
+        next_daemon = old_payload + b'\n# next release build\n'
+        (self.bundle / 'ubs-daemon').write_bytes(next_daemon)
+        old_hash = hashlib.sha256(old_payload).hexdigest()
+        new_hash = hashlib.sha256(next_daemon).hexdigest()
+        new_runner = (ROOT / 'ubs').read_text().replace(
+            f'UBS_VERSION="{self.version}"', 'UBS_VERSION="9999.0.0"').replace(
+            f'UBS_DAEMON_SHA256="{old_hash}"', f'UBS_DAEMON_SHA256="{new_hash}"')
+        (self.bundle / 'ubs').write_text(new_runner)
+        self.sign()
+        self.env['UBS_RELEASE_BASE'] = self.env['UBS_ARTIFACT_BASE']
+        self.invoke('--update')
+        self.assertEqual((self.destination / 'ubs').read_text(), new_runner)
+        self.assertEqual(self.generation().read_bytes(), next_daemon)
+        self.assertEqual(old_generation.read_bytes(), old_payload)
+        self.invoke('--client', '--help')
+
+    def test_failed_self_update_preserves_current_generation(self):
+        self.direct_install()
+        before = (self.destination / 'ubs').read_bytes()
+        new_runner = (ROOT / 'ubs').read_text().replace(f'UBS_VERSION="{self.version}"', 'UBS_VERSION="9999.0.0"')
+        (self.bundle / 'ubs').write_text(new_runner)
+        (self.bundle / 'ubs-daemon').write_text('print("tampered")\n')
+        self.sign()
+        self.env['UBS_RELEASE_BASE'] = self.env['UBS_ARTIFACT_BASE']
+        self.invoke('--update', expected=1)
+        self.assertEqual((self.destination / 'ubs').read_bytes(), before)
+        self.invoke('serve', '--help')
+
+    def test_updated_runner_receives_original_scan_arguments(self):
+        self.direct_install()
+        payload = (self.bundle / 'ubs-daemon').read_bytes()
+        pin = hashlib.sha256(payload).hexdigest()
+        (self.bundle / 'ubs').write_text(
+            '#!/usr/bin/env bash\nUBS_VERSION="9999.0.0"\n'
+            f'UBS_DAEMON_SHA256="{pin}"\n'
+            'exec python3 -c \'import json,sys; print(json.dumps(sys.argv[1:]))\' "$@"\n')
+        self.sign()
+        self.env.update(UBS_RELEASE_BASE=self.env['UBS_ARTIFACT_BASE'], FORCE_SELF_UPDATE='1')
+        source = self.project / 'has space.py'
+        source.write_text('value = 1\n')
+        flags = ['--ci', '--format=json', '--no-color', '--module-dir=' + str(ROOT / 'modules'), '--', str(source)]
+        result = self.invoke(*flags)
+        self.assertEqual(self.decode_json(result.stdout), flags)
+
+    def test_renamed_runner_uses_its_own_installed_generation(self):
+        self.direct_install()
+        runner = self.destination / '.ubs-wrapped'
+        generation = self.generation(runner=runner)
+        self.generation().rename(generation)
+        (self.destination / 'ubs').rename(runner)
+        self.assertFalse((self.destination / 'ubs').exists())
+        self.invoke('serve', '--help', runner=runner)
+        self.start_service(runner)
+        status = self.invoke('daemon', 'status', '--repo', str(self.project), runner=runner)
+        self.assertEqual(self.decode_json(status.stdout)['root'], str(self.project))
+        self.assertEqual(generation.read_bytes(), (self.bundle / 'ubs-daemon').read_bytes())
+
+    @unittest.skipUnless(os.environ.get('UBS_DAEMON_E2E') == '1', 'set UBS_DAEMON_E2E=1 for installed hook scanning')
+    def test_installed_hook_uses_verified_service_not_a_path_replacement(self):
+        import test_daemon as base
+        self.env['CLAUDE_PROJECT_DIR'] = str(self.project)
+        self.direct_install()
+        self.command(['git', 'init', '-q', str(self.project)])
+        self.run_verify('--artifact-dir', str(self.bundle), '--', '--setup-claude-hook',
+                        '--non-interactive', '--skip-version-check', '--no-path-modify')
+        shutil.copytree(ROOT / 'modules', self.destination / 'modules')
+        self.env.update(PATH=str(self.destination) + os.pathsep + self.env['PATH'], ENABLE_UV_TOOLS='0')
+        planted = self.bin / 'ubs-daemon'
+        marker = self.root / 'planted-executed'
+        planted.write_text('#!/usr/bin/env bash\ntouch "' + str(marker) + '"\nexit 0\n')
+        planted.chmod(0o755)
+        source = self.project / 'edited.py'
+        source.write_text('eval(input())\n')
+        self.start_service()
+        direct = self.invoke('--ci', '--no-auto-update', '--no-color', '--format=json', '--', str(source),
+                             expected=1, timeout=150)
+        expected_findings = self.decode_json(direct.stdout)['findings']
+        self.assertTrue(any(f['rule_id'] == 'python.taint.eval' and f['line'] == 1
+                            for f in expected_findings), direct.stdout + direct.stderr)
+        hook = self.project / '.claude/hooks/on-file-write.sh'
+        self.assertEqual(hook.read_bytes(), (ROOT / '.claude/hooks/on-file-write.sh').read_bytes())
+        result = self.command(['bash', str(hook)], expected=2, timeout=150,
+                              input=json.dumps({'tool_input': {'file_path': str(source)}}))
+        self.assertIn('found critical issues', result.stderr)
+        self.assertFalse(marker.exists())
+        request = {'protocol': 1, 'op': 'scan', 'root': str(self.project),
+                   'scanner': str(self.destination / 'ubs'), 'paths': [str(source)], 'format': 'text'}
+        previous = Path.cwd()
+        try:
+            os.chdir(self.project)
+            with patch.dict(os.environ, self.env, clear=True):
+                request['environment'] = base.daemon.environment_key()
+                response = base.daemon.request_service(self.project, request, 150)
+        finally:
+            os.chdir(previous)
+        self.assertTrue(response['cached'], response)
+        self.assertEqual(response['exit_code'], 1, response)
+        served = self.invoke('--client', '--repo', str(self.project), '--require-daemon',
+                             '--format=json', '--', str(source), expected=1, timeout=150)
+        self.assertEqual(self.decode_json(served.stdout)['findings'], expected_findings, served.stdout + served.stderr)
+        previous = Path.cwd()
+        try:
+            os.chdir(self.project)
+            with patch.dict(os.environ, self.env, clear=True):
+                request['format'] = 'json'
+                request['environment'] = base.daemon.environment_key()
+                cached = base.daemon.request_service(self.project, request, 150)
+        finally:
+            os.chdir(previous)
+        self.assertTrue(cached['cached'], cached)
+        self.assertEqual(self.decode_json(cached['stdout'])['findings'], expected_findings, cached)
+        self.assertFalse(marker.exists())
 
 
 if __name__ == '__main__':

@@ -13,6 +13,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -133,7 +134,12 @@ setup_claude_code_hook
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         stub = bin_dir / "ubs"
-        stub.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$1" > "$SCAN_LOG"\nexit 0\n')
+        # Preserve the exact single-path assertion after parsing scan options.
+        stub.write_text('#!/usr/bin/env bash\n'
+                        'while [[ $# -gt 0 ]]; do\n'
+                        '  case "$1" in --) shift; break;; -*) shift;; *) break;; esac\n'
+                        'done\n[[ $# -gt 0 ]] || exit 2\n'
+                        'printf "%s\\n" "$1" > "$SCAN_LOG"\nexit 0\n')
         stub.chmod(0o755)
         target = nested / "sample with spaces.py"
         target.write_text("pass\n")
@@ -285,6 +291,279 @@ setup_claude_code_hook
                 self.assertIn("Could not update", result.stdout)
 
 
+class GitHookStatus(unittest.TestCase):
+    """The actual generated hook must retain scanner failures and full scope.
+
+    The scanner here is an explicit exit/argv protocol double, not a detector.
+    UBS_INSTALLER_GATE_BASELINE enables replay of the actual original installer.
+    """
+
+    def setUp(self) -> None:
+        self.started = time.monotonic()
+        print(f"[{self.id()}] RUN", flush=True)
+        artifacts = ROOT / "test-suite/artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="git-hook-status-", dir=artifacts))
+        self.project = self.root / "project with spaces"
+        self.project.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "GIT_", "XDG_"))}
+        self.env.update(PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
+                        SCAN_ARGUMENTS=str(self.root / "arguments.json"),
+                        HOOK_INSTALL_DIR=str(self.bin))
+        result = subprocess.run(["git", "init", "-q", str(self.project)], env=self.env,
+                                text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def tearDown(self) -> None:
+        outcome = self._outcome.result
+        failed = any(test is self or getattr(test, "test_case", None) is self
+                     for test, _ in outcome.failures + outcome.errors)
+        skipped = any(test is self for test, _ in outcome.skipped)
+        state = 'FAIL' if failed else ('SKIP' if skipped else 'PASS')
+        print(f"[{self.id()}] {state} "
+              f"({time.monotonic() - self.started:.3f}s)", flush=True)
+
+    def generate(self, source: Path) -> Path:
+        text = source.read_text()
+        functions = text[text.index("setup_git_hook() {"):text.index("detect_coding_agents() {")]
+        script = """set -euo pipefail
+log(){ :; }
+warn(){ :; }
+success(){ :; }
+dry_run_enabled(){ return 1; }
+determine_install_dir(){ printf '%s\\n' "$HOOK_INSTALL_DIR"; }
+""" + functions + "\nsetup_git_hook\n"
+        generator = self.root / (source.name + "-git-hook-generator.sh")
+        generator.write_text(script)
+        result = subprocess.run(["bash", str(generator)], cwd=self.project,
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return self.project / ".git/hooks/pre-commit"
+
+    def scanner(self, *, canonical: bool) -> None:
+        source = "#!/usr/bin/env bash\n"
+        if canonical:
+            source += 'UBS_DAEMON_SHA256="' + "0" * 64 + '"\n'
+        source += """python3 - "$@" <<'PY'
+import json, os, pathlib, sys
+pathlib.Path(os.environ['SCAN_ARGUMENTS']).write_text(json.dumps(sys.argv[1:]))
+print('scanner report: configured outcome ' + os.environ['SCAN_EXIT'])
+PY
+exit "$SCAN_EXIT"
+"""
+        path = self.bin / "ubs"
+        path.write_text(source)
+        path.chmod(0o755)
+
+    def run_hook(self, hook: Path, status: int, label: str) -> subprocess.CompletedProcess[str]:
+        result = subprocess.run(["bash", str(hook)], cwd=self.project,
+                                env={**self.env, "SCAN_EXIT": str(status)},
+                                capture_output=True, text=True, timeout=20)
+        (self.root / (label + ".stdout.log")).write_text(result.stdout)
+        (self.root / (label + ".stderr.log")).write_text(result.stderr)
+        return result
+
+    def test_one_shot_findings_and_environment_errors_block_commit(self) -> None:
+        self.scanner(canonical=False)
+        baseline = os.environ.get("UBS_INSTALLER_GATE_BASELINE")
+        if baseline:
+            original = self.generate(Path(baseline))
+            for status in (1, 2):
+                result = self.run_hook(original, status, f"original-{status}")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                print(f"[original-git-hook] scanner exit {status} incorrectly accepted", flush=True)
+        hook = self.generate(INSTALLER)
+        for status in (0, 1, 2, 3):
+            result = self.run_hook(hook, status, f"current-{status}")
+            self.assertEqual(result.returncode, 0 if status == 0 else 1,
+                             result.stdout + result.stderr)
+            self.assertEqual(self.arguments(),
+                             [".", "--fail-on-warning"])
+
+    def arguments(self) -> list[str]:
+        output = Path(self.env["SCAN_ARGUMENTS"]).read_text()
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError as exc:
+            self.fail(f"Invalid scanner argv JSON: {exc}\nFull output:\n{output}")
+
+    def test_canonical_client_retains_full_root_and_warning_policy(self) -> None:
+        self.scanner(canonical=True)
+        hook = self.generate(INSTALLER)
+        for status in (0, 1, 2, 3):
+            result = self.run_hook(hook, status, f"canonical-{status}")
+            self.assertEqual(result.returncode, 0 if status == 0 else 1,
+                             result.stdout + result.stderr)
+            self.assertEqual(self.arguments(),
+                             ["--client", "--repo", str(self.project), "--format=text",
+                              "--fail-on-warning", "--", str(self.project)])
+
+    def test_windows_git_hook_keeps_one_shot_scope_and_exit_policy(self) -> None:
+        # A platform/argv double proves routing, not execution on Windows.
+        self.scanner(canonical=True)
+        uname = self.bin / "uname"
+        uname.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$TEST_SYSTEM"\n')
+        uname.chmod(0o755)
+        hook = self.generate(INSTALLER)
+        for system in ("MINGW64_NT-10.0", "MSYS_NT-10.0", "CYGWIN_NT-10.0"):
+            self.env["TEST_SYSTEM"] = system
+            for status in (0, 1, 2, 3):
+                with self.subTest(system=system, status=status):
+                    result = self.run_hook(hook, status, f"windows-git-{system}-{status}")
+                    self.assertEqual(result.returncode, 0 if status == 0 else 1,
+                                     result.stdout + result.stderr)
+                    self.assertEqual(self.arguments(), [".", "--fail-on-warning"])
+
+    def test_windows_save_hooks_scan_without_entering_the_posix_client(self) -> None:
+        # Execute both shipped hook bodies; scanner and uname are explicit
+        # protocol doubles. Native POSIX detector parity has separate tests.
+        self.scanner(canonical=True)
+        uname = self.bin / "uname"
+        uname.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$TEST_SYSTEM"\n')
+        uname.chmod(0o755)
+        client = self.bin / "ubs-daemon"
+        client.write_text('#!/usr/bin/env bash\nprintf called > "$CLIENT_CALLED"\nexit 99\n')
+        client.chmod(0o755)
+        text = INSTALLER.read_text()
+        anchor = '  cat > "$hook_file" << \'HOOK_EOF\'\n'
+        template = text.split(anchor, 1)[1].split('\nHOOK_EOF\n', 1)[0] + '\n'
+        checkout = ROOT / ".claude/hooks/on-file-write.sh"
+        self.assertEqual(template, checkout.read_text())
+        generated = self.root / "installed-save-hook.sh"
+        generated.write_text(template)
+        target = self.project / "sample with spaces.py"
+        target.write_text("pass\n")
+        marker = self.root / "client-called"
+        for hook in (checkout, generated):
+            for system in ("MINGW64_NT-10.0", "MSYS_NT-10.0", "CYGWIN_NT-10.0"):
+                for status in (0, 1, 2, 3):
+                    with self.subTest(hook=hook, system=system, status=status):
+                        result = subprocess.run(["bash", str(hook)], cwd=self.project,
+                            env={**self.env, "TEST_SYSTEM": system, "SCAN_EXIT": str(status),
+                                 "CLIENT_CALLED": str(marker)},
+                            input=json.dumps({"tool_input": {"file_path": str(target)}}),
+                            capture_output=True, text=True, timeout=20)
+                        self.assertEqual(result.returncode, 0 if status in (0, 3) else 2,
+                                         result.stdout + result.stderr)
+                        self.assertEqual(self.arguments(), ["--ci", "--no-auto-update",
+                            "--no-color", "--format=text", "--", str(target)])
+                        self.assertFalse(marker.exists())
+
+    def reference(self, destination: Path) -> subprocess.CompletedProcess[str]:
+        text = INSTALLER.read_text()
+        functions = text[text.index("\nquick_reference_block() {\n"):text.index("\nadd_to_agents_md() {\n")]
+        generator = self.root / "reference-generator.sh"
+        generator.write_text("set -euo pipefail\nlog(){ :; }\nwarn(){ printf '%s\\n' \"$*\" >&2; }\n"
+                             "success(){ :; }\ndry_run_enabled(){ return 1; }\n" + functions +
+                             '\nappend_quick_reference_block "$1" "test guardrails"\n')
+        result = subprocess.run(["bash", str(generator), str(destination)],
+                                cwd=self.project, env=self.env, capture_output=True,
+                                text=True, timeout=20)
+        (self.root / "reference.stdout.log").write_text(result.stdout)
+        (self.root / "reference.stderr.log").write_text(result.stderr)
+        return result
+
+    def test_owned_guardrail_upgrade_preserves_custom_rules_mode_and_idempotence(self) -> None:
+        start = '<!-- >>> Ultimate Bug Scanner quick reference (written by install.sh; removed by install.sh --uninstall) -->'
+        end = '<!-- <<< End Ultimate Bug Scanner quick reference -->'
+        destination = self.project / "rules"
+        original = f"House rules: keep my commands.\n{start}\n## UBS Quick Reference for AI Agents\nold commands\n{end}\nAfterword: keep this too.\n"
+        destination.write_text(original)
+        destination.chmod(0o600)
+        result = self.reference(destination)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updated = destination.read_bytes()
+        text = updated.decode()
+        self.assertTrue(text.startswith("House rules: keep my commands.\n"))
+        self.assertTrue(text.endswith("Afterword: keep this too.\n"))
+        self.assertIn("ubs --client --repo . --format=text -- file.ts file2.py", text)
+        self.assertIn("ubs --client --repo . --format=text --fail-on-warning -- .", text)
+        self.assertIn("Exit 2 means an environment, authentication, or scan failure", text)
+        self.assertNotIn("old commands", text)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+        backups = list(destination.parent.glob("rules.bak-ubs-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_text(), original)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
+        result = self.reference(destination)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(destination.read_bytes(), updated)
+        self.assertEqual(list(destination.parent.glob("rules.bak-ubs-*")), backups)
+        self.assertFalse(list(destination.parent.glob(".ubs-reference-*")))
+
+    def test_custom_ambiguous_and_symlinked_guardrails_are_preserved(self) -> None:
+        destination = self.project / "rules"
+        for text, status in (("## UBS Quick Reference for AI Agents\nMy own scanner policy.\n", 0),
+                             ("<!-- <<< End Ultimate Bug Scanner quick reference -->\n## UBS Quick Reference for AI Agents\n", 1)):
+            with self.subTest(text=text):
+                destination.write_text(text)
+                result = self.reference(destination)
+                self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+                self.assertEqual(destination.read_text(), text)
+                self.assertFalse(list(destination.parent.glob("rules.bak-ubs-*")))
+        link = self.project / "linked-rules"
+        link.symlink_to(destination)
+        original = destination.read_bytes()
+        result = self.reference(link)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(destination.read_bytes(), original)
+
+    def test_original_unmarked_installer_block_is_refreshed_in_rule_directories(self) -> None:
+        baseline = os.environ.get("UBS_INSTALLER_GATE_BASELINE")
+        if not baseline:
+            self.skipTest("set UBS_INSTALLER_GATE_BASELINE to replay the original installer guidance")
+        text = Path(baseline).read_text()
+        first = text.index("````markdown", text.index("\nquick_reference_block() {\n"))
+        last = text.index("\n````", first) + len("\n````")
+        original = "Before: custom rules.\n" + text[first:last] + "\nAfter: custom rules.\n"
+        directory = self.project / ".codex/rules"
+        directory.mkdir(parents=True)
+        destination = directory / "ubs.md"
+        destination.write_text(original)
+        result = self.reference(directory)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        current = destination.read_text()
+        self.assertTrue(current.startswith("Before: custom rules.\n"))
+        self.assertTrue(current.endswith("After: custom rules.\n"))
+        self.assertIn("ubs --client --repo . --format=text -- file.ts file2.py", current)
+        self.assertEqual(list(directory.glob("ubs.md.bak-ubs-*"))[0].read_text(), original)
+
+    def test_crlf_and_symlinked_rule_directories_preserve_user_bytes(self) -> None:
+        start = '<!-- >>> Ultimate Bug Scanner quick reference (written by install.sh; removed by install.sh --uninstall) -->'
+        end = '<!-- <<< End Ultimate Bug Scanner quick reference -->'
+        prefix = b"House rules: caf\xc3\xa9.\r\nKeep these bytes.\r\n"
+        suffix = b"\r\nAfterword: keep CRLF.\r\n"
+        original = prefix + f"{start}\r\n## UBS Quick Reference for AI Agents\r\nold\r\n{end}".encode() + suffix
+        directory = self.project / "real-rules"
+        directory.mkdir()
+        destination = directory / "ubs.md"
+        destination.write_bytes(original)
+        link = self.project / "directory-link"
+        link.symlink_to(directory, target_is_directory=True)
+        result = self.reference(link)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(destination.read_bytes(), original)
+        self.assertEqual(list(directory.iterdir()), [destination])
+        result = self.reference(directory)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        updated = destination.read_bytes()
+        self.assertTrue(updated.startswith(prefix), updated)
+        self.assertTrue(updated.endswith(suffix), updated)
+        self.assertIn(b"ubs --client --repo . --format=text -- file.ts file2.py", updated)
+        backups = list(directory.glob("ubs.md.bak-ubs-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        result = self.reference(directory)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(destination.read_bytes(), updated)
+        self.assertEqual(list(directory.glob("ubs.md.bak-ubs-*")), backups)
+
+
 class InstallerCLI(unittest.TestCase):
     def test_real_setup_action_and_easy_mode_do_not_mutate_home_hooks(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-hook-cli-") as tmp:
@@ -309,6 +588,7 @@ class InstallerCLI(unittest.TestCase):
             # The action path must never need the network. A full --local easy-mode
             # install exercises maybe_setup_hook under the same HOME reproduction.
             shutil.copy2(ROOT / "ubs", home / "ubs")
+            shutil.copy2(ROOT / "ubs-daemon", home / "ubs-daemon")
             for index, args in enumerate((
                 ["--setup-claude-hook", "--non-interactive"],
                 ["--easy-mode", "--local", "--skip-ast-grep", "--skip-ripgrep", "--skip-jq", "--skip-bun",

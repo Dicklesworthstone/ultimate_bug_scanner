@@ -222,6 +222,14 @@ def main():
 
     # Step 6: Read and update ubs script
     content = ubs_script.read_text(encoding="utf-8")
+    daemon_script = root / "ubs-daemon"
+    if not daemon_script.is_file() or daemon_script.is_symlink():
+        raise SystemExit("Error: a regular ubs-daemon release executable is required")
+    daemon_pattern = re.compile(r'^UBS_DAEMON_SHA256="[^"\n]*"$', re.MULTILINE)
+    if len(daemon_pattern.findall(content)) != 1:
+        raise SystemExit("Error: expected exactly one UBS_DAEMON_SHA256 pin")
+    content_with_daemon = daemon_pattern.sub(
+        f'UBS_DAEMON_SHA256="{compute_sha256(daemon_script)}"', content)
     
     # Regex to find the MODULE_CHECKSUMS array block
     pattern = re.compile(r"(declare -A MODULE_CHECKSUMS=\s*\()([\s\S]*?)(\))", re.MULTILINE)
@@ -235,7 +243,7 @@ def main():
                 lines.append(f"  [{lang}]='{new_checksums[lang]}'")
         return f"{prefix}\n" + "\n".join(lines) + f"\n{suffix}"
 
-    new_content = pattern.sub(replace_checksums, content)
+    new_content = pattern.sub(replace_checksums, content_with_daemon)
 
     helper_pattern = re.compile(r"(declare -A HELPER_CHECKSUMS=\s*\()([\s\S]*?)(\))", re.MULTILINE)
 
@@ -272,6 +280,7 @@ def main():
     release_entries = {
         "install.sh": compute_sha256(install_script),
         "ubs": compute_sha256(ubs_script),
+        "ubs-daemon": compute_sha256(daemon_script),
     }
     if all(release_entries.values()):
         lines = [f"{release_entries[name]}  {name}" for name in sorted(release_entries)]

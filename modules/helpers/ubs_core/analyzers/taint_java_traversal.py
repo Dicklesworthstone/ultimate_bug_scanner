@@ -1,16 +1,23 @@
-"""ubs_core.analyzers.taint_java_traversal — request path → file-sink taint (bead A2).
+"""Function-scoped Java/Kotlin request-path dataflow (D6 increment).
 
-Verbatim port of the `run_path_traversal_checks` python heredoc in
-modules/ubs-java.sh: request-derived filesystem paths reaching file
-read/write/serve sinks in Java/Kotlin sources. `main` reproduces the
-heredoc's `__COUNT__`/`__SAMPLE__` emit dialect; `run` yields the same
-detections as structured NDJSON findings over ctx.files.
+Structured branches and loops use the shared finite taint lattice/worklist.
+Local summaries carry parameter-to-return and file-sink flows. This lexical
+frontend does not model fields, tainted global captures, or cross-file/virtual
+calls. Request-derived field/global escapes and executable class initialization
+report incomplete analysis. Unknown calls conservatively propagate receiver and
+argument facts. Unsupported control flow and malformed lexical input are
+analysis errors, never clean scans.
+The legacy main() count/sample interface remains an output adapter.
 """
 from __future__ import annotations
 
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.taint_flow import (AnalysisLimit, Budget, CLEAN, Fact, Step, Trace,
+                                 advance, join, retag, solve, substitute)
+from bisect import bisect_right
+from dataclasses import dataclass, field
 import re
 import sys
 from pathlib import Path
@@ -50,13 +57,6 @@ SAFE_EXPR_RE = re.compile(
     re.IGNORECASE,
 )
 CONTAINMENT_NORMALIZE_RE = re.compile(r'\b(?:normalize|toRealPath|getCanonicalPath|getCanonicalFile)\s*\(')
-CONTAINMENT_GUARD_RE = re.compile(
-    r'\.\s*startsWith\s*\('
-    r'|\.\s*relativize\s*\('
-    r'|(?:throw|return\s+false|continue)\b'
-    r'|\b(?:insideRoot|withinRoot|isSubpath|isDescendant)\b',
-    re.IGNORECASE,
-)
 SINK_RE = re.compile(
     r'\b(?:new\s+)?(?:FileInputStream|FileOutputStream|FileReader|FileWriter|RandomAccessFile)\s*\('
     r'|\b(?:new\s+File|File|Paths\.get|Path\.of)\s*\('
@@ -65,11 +65,6 @@ SINK_RE = re.compile(
     r'newInputStream|newOutputStream|createDirectories|createFile|size|exists)\s*\('
     r'|\b(?:sendFile|send_file|serveFile|serve_file|writeFileResponse|respondFile|respondLocalFile)\s*\(',
 )
-ASSIGN_RE = re.compile(
-    r'^\s*(?:final\s+)?(?:val|var|String|Path|File|MultipartFile|Part|UploadedFile|FileUpload|Object)?\s*'
-    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)$'
-)
-PATH_LIMIT = 4
 
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
@@ -84,34 +79,6 @@ def iter_files(root: Path):
             if path.is_file() and not should_skip(path):
                 yield path
 
-def strip_line_comments(line: str) -> str:
-    out = []
-    quote = ''
-    escape = False
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            out.append(ch)
-            if escape:
-                escape = False
-            elif ch == '\\':
-                escape = True
-            elif ch == quote:
-                quote = ''
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-        if ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
-            break
-        out.append(ch)
-        i += 1
-    return ''.join(out)
-
 def has_ignore(lines, line_no):
     idx = line_no - 1
     return (
@@ -119,29 +86,6 @@ def has_ignore(lines, line_no):
     ) or (
         0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
     )
-
-def logical_statement(lines, line_no):
-    idx = line_no - 1
-    statement = strip_line_comments(lines[idx])
-    balance = statement.count('(') - statement.count(')')
-    stripped = statement.strip()
-    has_kotlin_line_end = balance <= 0 and bool(
-        re.match(r'(?:val|var|return|throw)\b', stripped) or
-        (re.match(r'[A-Za-z_][A-Za-z0-9_]*\s*=', stripped) is not None)
-    )
-    has_end = ';' in statement or '{' in statement or '}' in statement or has_kotlin_line_end
-    lookahead = idx + 1
-    while (balance > 0 or not has_end) and lookahead < len(lines) and lookahead < idx + 8:
-        next_line = strip_line_comments(lines[lookahead]).strip()
-        statement += ' ' + next_line
-        balance += next_line.count('(') - next_line.count(')')
-        has_kotlin_line_end = balance <= 0 and bool(
-            re.match(r'(?:val|var|return|throw)\b', next_line) or
-            (re.match(r'[A-Za-z_][A-Za-z0-9_]*\s*=', next_line) is not None)
-        )
-        has_end = has_end or ';' in next_line or '{' in next_line or '}' in next_line or has_kotlin_line_end
-        lookahead += 1
-    return statement
 
 def source_line(lines, line_no):
     idx = line_no - 1
@@ -155,97 +99,732 @@ def relpath(path):
     except ValueError:
         return str(path)
 
-def annotated_sources(text):
-    sources = {}
-    for match in ANNOTATED_PARAM_RE.finditer(text):
-        name = match.group(1)
-        sources[name] = {'path': [f'@request {name}']}
-    return sources
+def lexical_source(text: str, kotlin: bool, depth: int = 0) -> str:
+    """Mask inert text at original offsets; keep executable Kotlin holes."""
+    if depth > 32:
+        raise AnalysisLimit('Java/Kotlin literal nesting limit exceeded')
+    output = list(text)
 
-def is_safe_expr(expr):
-    return bool(SAFE_EXPR_RE.search(expr))
+    def blank(start, end):
+        for index in range(start, end):
+            if text[index] not in '\r\n':
+                output[index] = ' '
 
-def refs_in_expr(expr, tainted):
-    refs = []
-    for name in tainted:
-        if re.search(rf'\b{re.escape(name)}\b', expr):
-            refs.append(name)
-    return refs
+    index = 0
+    while index < len(text):
+        if text.startswith('//', index):
+            end = text.find('\n', index + 2)
+            end = len(text) if end < 0 else end
+            blank(index, end)
+            index = end
+        elif text.startswith('/*', index):
+            end, nesting = index + 2, 1
+            while end < len(text) and nesting:
+                if kotlin and text.startswith('/*', end):
+                    nesting += 1
+                    end += 2
+                elif text.startswith('*/', end):
+                    nesting -= 1
+                    end += 2
+                else:
+                    end += 1
+            if nesting:
+                raise ValueError('Unterminated Java/Kotlin comment; analysis is incomplete')
+            blank(index, end)
+            index = end
+        elif text[index] in '\"\'':
+            start = index
+            delimiter = text[index] * (3 if text.startswith(text[index] * 3, index) else 1)
+            index += len(delimiter)
+            holes = []
+            while index < len(text) and not text.startswith(delimiter, index):
+                if text[index] == '\\' and len(delimiter) == 1:
+                    index += 2
+                    continue
+                if kotlin and delimiter.startswith('\"') and text[index] == '$':
+                    name = re.match(r'\$([A-Za-z_]\w*)', text[index:])
+                    if name:
+                        holes.append((index + 1, index + name.end()))
+                        index += name.end()
+                        continue
+                    if text.startswith('${', index):
+                        opening, cursor, nesting = index + 2, index + 2, 1
+                        while cursor < len(text) and nesting:
+                            if text[cursor] in '\"\'':
+                                quote = text[cursor]
+                                cursor += 1
+                                while cursor < len(text) and text[cursor] != quote:
+                                    cursor += 2 if text[cursor] == '\\' else 1
+                            elif text[cursor] == '{':
+                                nesting += 1
+                            elif text[cursor] == '}':
+                                nesting -= 1
+                            cursor += 1
+                        if nesting:
+                            raise ValueError('Unterminated Kotlin interpolation; analysis is incomplete')
+                        holes.append((opening, cursor - 1))
+                        index = cursor
+                        continue
+                index += 1
+            if index >= len(text):
+                raise ValueError('Unterminated Java/Kotlin literal; analysis is incomplete')
+            index += len(delimiter)
+            blank(start, index)
+            output[start] = '0'
+            for low, high in holes:
+                output[low:high] = lexical_source(text[low:high], kotlin, depth + 1)
+                if (0 <= low - 1 < len(text) and 0 <= low - 1 < len(output)
+                        and 0 <= high < len(output)):
+                    if text[low - 1] == '{':
+                        output[low - 1], output[high] = '(', ')'
+                else:
+                    raise ValueError('Invalid Kotlin interpolation bounds; analysis is incomplete')
+        else:
+            index += 1
+    return ''.join(output)
 
-def taint_from_expr(expr, tainted):
-    if is_safe_expr(expr):
-        return None
-    direct = SOURCE_RE.search(expr)
-    if direct:
-        return {'path': [direct.group(0).strip('(')]}
-    refs = refs_in_expr(expr, tainted)
-    if not refs:
-        return None
-    ref = refs[0]
-    path = list(tainted.get(ref, {}).get('path', [ref]))
-    if len(path) >= PATH_LIMIT:
-        path = path[-(PATH_LIMIT - 1):]
-    path.append(ref)
-    return {'path': path}
 
-def has_containment_context(lines, line_no, refs):
-    if not refs:
-        return False
-    start = max(0, line_no - 18)
-    context = '\n'.join(strip_line_comments(line) for line in lines[start:line_no + 1])
-    if not any(re.search(rf'\b{re.escape(ref)}\b', context) for ref in refs):
-        return False
-    return bool(CONTAINMENT_NORMALIZE_RE.search(context) and CONTAINMENT_GUARD_RE.search(context))
+@dataclass(frozen=True)
+class Statement:
+    start: int
+    end: int
+    kind: str = 'simple'
+    body: tuple = ()
+    otherwise: tuple = ()
+    header: tuple = (0, 0)
+
+
+@dataclass
+class Function:
+    key: int
+    name: str
+    owner: tuple
+    start: int
+    end: int
+    parameters: tuple
+    sources: frozenset = frozenset()
+    body: tuple = ()
+    declaration: int = -1
+    captures: tuple = ()
+
+
+class Parser:
+    def __init__(self, text, kotlin):
+        self.text, self.kotlin = text, kotlin
+        self.code = lexical_source(text, kotlin)
+        self.pairs, stack = {}, []
+        for index, char in enumerate(self.code):
+            if char in '([{':
+                stack.append((char, index))
+            elif char in ')]}':
+                if not stack or stack[-1][0] != {')': '(', ']': '[', '}': '{'}[char]:
+                    raise ValueError('Unbalanced Java/Kotlin source; analysis is incomplete')
+                _, opening = stack.pop()
+                self.pairs[opening] = index
+        if stack:
+            raise ValueError('Unbalanced Java/Kotlin source; analysis is incomplete')
+        self.functions = {}
+        owners = []
+        for match in re.finditer(r'\b(?:class|interface|object|enum)\s+([A-Za-z_]\w*)[^;{}]*\{', self.code):
+            owners.append((match.start(), self.pairs[match.end() - 1], match.group(1)))
+        for match in re.finditer(r'\b([A-Za-z_]\w*)\s*\(', self.code):
+            name, opening = match.group(1), match.end() - 1
+            if name in {'if', 'while', 'for', 'switch', 'catch', 'try', 'synchronized', 'when'}:
+                continue
+            close = self.pairs[opening]
+            boundary = max(self.code.rfind(char, 0, match.start()) for char in ';{}') + 1
+            prefix = self.code[boundary:match.start()]
+            prefix = re.sub(r'@\w+(?:\s*\([^)]*\))?', ' ', prefix).strip()
+            if kotlin:
+                if not re.search(r'\bfun(?:\s+[\w.<>?]+\s*\.)?$', prefix):
+                    continue
+            elif not prefix or any(char in prefix for char in '=()!+') or prefix.split()[0] in {'return', 'throw', 'new', 'else'}:
+                continue
+            following = self.skip(close + 1, len(self.code))
+            if self.code.startswith('throws ', following):
+                following = self.code.find('{', following)
+            elif kotlin and self.code[following:following + 1] == ':':
+                tail = re.match(r':\s*[\w.<>?, \[\]]+\s*', self.code[following:])
+                if tail:
+                    following += tail.end()
+            if following < 0 or following >= len(self.code) or self.code[following] not in '{=':
+                continue
+            if self.code[following] == '=' and not kotlin:
+                continue
+            parameters, sources = [], set()
+            for low, high in self.parts(opening + 1, close, generics=True):
+                declaration = re.sub(r'@\w+(?:\s*\([^)]*\))?', ' ', self.code[low:high])
+                if '=' in declaration and (SOURCE_RE.search(declaration) or SINK_RE.search(declaration)):
+                    raise ValueError('Executable Java/Kotlin parameter default needs call binding; analysis is incomplete')
+                if kotlin:
+                    parameter = re.search(r'\b([A-Za-z_]\w*)\s*:', declaration)
+                    parameter = parameter.group(1) if parameter else None
+                else:
+                    ids = re.findall(r'\b[A-Za-z_]\w*\b', declaration.split('=', 1)[0])
+                    parameter = ids[-1] if len(ids) >= 2 else None
+                if not parameter:
+                    raise ValueError('Unsupported Java/Kotlin parameter shape; analysis is incomplete')
+                parameters.append(parameter)
+                if ANNOTATED_PARAM_RE.search(self.code[low:high]):
+                    sources.add(parameter)
+            if self.code[following] == '{':
+                start, end = following + 1, self.pairs[following]
+                body = self.block(start, end)
+            else:
+                start = following + 1
+                end = self.end_statement(start, len(self.code))
+                body = (Statement(start, end, 'return'),)
+            owner = tuple(name for low, high, name in owners if low < match.start() < high)
+            function = Function(match.start(), name, owner, start, end, tuple(parameters), frozenset(sources), body)
+            function.declaration = self.code.rfind('fun', boundary, match.start()) if kotlin else function.key
+            self.functions[function.key] = function
+        # Do not discard executable class/instance initialization while giving
+        # a clean answer about its methods. These regions need a shared field
+        # model, rather than treating their locals as unrelated method locals.
+        residual = list(self.code)
+        for function in self.functions.values():
+            for index in range(function.declaration, min(function.end + 1, len(self.code))):
+                if residual[index] not in '\r\n':
+                    residual[index] = ' '
+        outside = ''.join(residual)
+        if any(SOURCE_RE.search(outside[low:high + 1]) or SINK_RE.search(outside[low:high + 1])
+               for low, high, _ in owners):
+            raise ValueError('Executable Java/Kotlin class initialization needs field-state analysis; analysis is incomplete')
+        self.globals = ()
+        if kotlin and self.functions:
+            # Parse executable top-level statements using a declaration-only
+            # mask. The actual function/expression code keeps its offsets.
+            script = list(outside)
+            for low, high, _ in owners:
+                for index in range(low, high + 1):
+                    if script[index] not in '\r\n':
+                        script[index] = ' '
+            original = self.code
+            try:
+                self.code = ''.join(script)
+                body = self.block(0, len(self.code))
+            finally:
+                self.code = original
+            globals_ = []
+            for statement in body:
+                if statement.kind == 'simple':
+                    declaration = re.match(r'\s*(?:val|var)\s+([A-Za-z_]\w*)\b', self.code[statement.start:statement.end])
+                    if declaration:
+                        globals_.append(declaration.group(1))
+            self.globals = tuple(dict.fromkeys(globals_))
+            for function in self.functions.values():
+                function.captures = self.globals
+            self.functions[-1] = Function(-1, '<script>', (), 0, len(self.code), (), body=body)
+        elif not self.functions:
+            self.functions[-1] = Function(-1, '<script>', (), 0, len(self.code), (), body=self.block(0, len(self.code)))
+
+    def skip(self, position, end):
+        while position < end and (self.code[position].isspace() or self.code[position] == ';'):
+            position += 1
+        return position
+
+    def parts(self, start, end, separator=',', generics=False):
+        beginning, original, angles = start, start, 0
+        while start < end:
+            if self.code[start] in '([{':
+                start = self.pairs[start]
+            elif generics and self.code[start] == '<':
+                angles += 1
+            elif generics and self.code[start] == '>':
+                angles = max(0, angles - 1)
+            elif self.code[start] == separator and not angles:
+                yield beginning, start
+                beginning = start + 1
+            start += 1
+        if self.code[beginning:end].strip() or beginning != original:
+            yield beginning, end
+
+    def end_statement(self, start, end):
+        while start < end:
+            char = self.code[start]
+            if char == ';' or char == '}' or (self.kotlin and char in '\r\n'):
+                return start
+            if char in '([':
+                start = self.pairs[start]
+            elif char == '{':
+                raise ValueError('Unsupported Java/Kotlin expression block; analysis is incomplete')
+            start += 1
+        return end
+
+    def block(self, start, end):
+        statements = []
+        while (start := self.skip(start, end)) < end:
+            statement, following = self.statement(start, end)
+            if following <= start:
+                raise ValueError('Java/Kotlin parser made no progress; analysis is incomplete')
+            statements.append(statement)
+            start = following
+        return tuple(statements)
+
+    def statement(self, start, end):
+        if self.code[start] == '{':
+            finish = self.pairs[start]
+            return Statement(start, finish + 1, 'block', self.block(start + 1, finish)), finish + 1
+        control = re.match(r'(if|while|for|synchronized)\s*\(', self.code[start:end])
+        if control:
+            opening = start + control.end() - 1
+            close = self.pairs[opening]
+            body, following = self.statement(self.skip(close + 1, end), end)
+            items = body.body if body.kind == 'block' else (body,)
+            otherwise = ()
+            tail = self.skip(following, end)
+            if control.group(1) == 'if' and re.match(r'else\b', self.code[tail:end]):
+                alternate, following = self.statement(self.skip(tail + 4, end), end)
+                otherwise = alternate.body if alternate.kind == 'block' else (alternate,)
+            return Statement(start, following, control.group(1), items, otherwise, (opening + 1, close)), following
+        if re.match(r'do\b', self.code[start:end]):
+            body, following = self.statement(self.skip(start + 2, end), end)
+            tail = self.skip(following, end)
+            match = re.match(r'while\s*\(', self.code[tail:end])
+            if not match:
+                raise ValueError('Invalid Java/Kotlin do/while; analysis is incomplete')
+            opening, close = tail + match.end() - 1, self.pairs[tail + match.end() - 1]
+            return Statement(start, close + 1, 'do', body.body if body.kind == 'block' else (body,), header=(opening + 1, close)), close + 1
+        if re.match(r'try\b', self.code[start:end]):
+            position, header = self.skip(start + 3, end), (start, start)
+            if self.code[position:position + 1] == '(':
+                close = self.pairs[position]
+                header, position = (position + 1, close), self.skip(close + 1, end)
+            body, following = self.statement(position, end)
+            catches, final = [], ()
+            while True:
+                tail = self.skip(following, end)
+                match = re.match(r'(catch|finally)\b', self.code[tail:end])
+                if not match:
+                    break
+                position = self.skip(tail + match.end(), end)
+                if self.code[position:position + 1] == '(':
+                    position = self.skip(self.pairs[position] + 1, end)
+                handler, following = self.statement(position, end)
+                if match.group(1) == 'finally':
+                    final = handler.body if handler.kind == 'block' else (handler,)
+                else:
+                    catches.append(handler)
+            return Statement(start, following, 'try', (body, *catches), final, header), following
+        if re.match(r'(?:switch|when|goto|yield)\b|(?:break|continue)\s+[A-Za-z_]', self.code[start:end]):
+            raise ValueError('Unsupported Java/Kotlin control flow; analysis is incomplete')
+        if re.match(r'(?:package|import|class|interface|enum|object|@interface)\b', self.code[start:end]):
+            if self.kotlin and re.match(r'(?:package|import)\b', self.code[start:end]):
+                finish = self.end_statement(start, end)
+                return Statement(start, finish, 'definition'), min(finish + 1, end)
+            opening = self.code.find('{', start, end)
+            semi = self.code.find(';', start, end)
+            finish = self.pairs[opening] + 1 if opening >= 0 and (semi < 0 or opening < semi) else self.end_statement(start, end) + 1
+            return Statement(start, finish, 'definition'), finish
+        finish = self.end_statement(start, end)
+        abrupt = re.match(r'(return|throw|break|continue)\b', self.code[start:finish])
+        return Statement(start, finish, abrupt.group(1) if abrupt else 'simple'), min(finish + 1, end)
+
+
+@dataclass
+class Summary:
+    returned: Fact = CLEAN
+    effects: dict = field(default_factory=dict)
+    escapes: dict = field(default_factory=dict)
+    globals: dict = field(default_factory=dict)
+
+    def merged(self, other):
+        effects = dict(self.effects)
+        for key, value in other.effects.items():
+            effects[key] = join(effects.get(key, CLEAN), value)
+        escapes = dict(self.escapes)
+        for key, value in other.escapes.items():
+            escapes[key] = join(escapes.get(key, CLEAN), value)
+        globals_ = dict(self.globals)
+        for key, value in other.globals.items():
+            globals_[key] = join(globals_.get(key, CLEAN), value)
+        return Summary(join(self.returned, other.returned), effects, escapes, globals_)
+
+
+class Engine:
+    def __init__(self, path, text):
+        self.path, self.text = path, text
+        self.parser = Parser(text, path.suffix.lower() in {'.kt', '.kts'})
+        self.code = self.parser.code
+        self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
+        self.budget = Budget()
+        self.summaries = {key: Summary() for key in self.parser.functions}
+        self.graphs = {}
+
+    def step(self, offset, kind, label):
+        line = bisect_right(self.lines, offset)
+        if 0 <= line - 1 < len(self.lines):
+            return Step(str(self.path), line, offset - self.lines[line - 1] + 1, kind, label[:160])
+        raise ValueError('Invalid Java/Kotlin evidence offset; analysis is incomplete')
+
+    def source(self, offset, label):
+        return frozenset({Trace('source', (str(self.path), offset, label), evidence=(self.step(offset, 'source', label),))})
+
+    def record(self, offset, value):
+        unsafe = frozenset(trace for trace in value if 'contained-path' not in trace.tags)
+        if unsafe:
+            self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', 'file sink')))
+
+    def expression(self, start, end, state, bindings, depth=0):
+        if depth > 64:
+            raise AnalysisLimit('Java/Kotlin expression depth limit exceeded')
+        value, cursor = CLEAN, start
+        while cursor < end:
+            self.budget.spend()
+            match = re.match(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*', self.code[cursor:end])
+            if self.code[cursor] == '(':
+                close = self.parser.pairs[cursor]
+                atom = self.expression(cursor + 1, close, state, bindings, depth + 1)
+                cursor = close + 1
+                value = join(value, atom)
+                continue
+            if not match:
+                cursor += 1
+                continue
+            offset = cursor
+            name = re.sub(r'\s+', '', match.group())
+            root = name.split('.')[0]
+            atom = state.get(bindings.get(root, root), CLEAN)
+            if bindings.get(root, '').startswith('capture:') and atom:
+                escaped = retag(atom, add=frozenset({'unmodeled-global-capture'}))
+                self.escapes[offset] = join(self.escapes.get(offset, CLEAN),
+                                            advance(escaped, self.step(offset, 'capture', root)))
+            cursor += match.end()
+            cursor = self.parser.skip(cursor, end)
+            constructor = None
+            if cursor < end and self.code[cursor] == '(':
+                close = self.parser.pairs[cursor]
+                arguments = [self.expression(low, high, state, bindings, depth + 1)
+                             for low, high in self.parser.parts(cursor + 1, close)]
+                atom = join(atom, *arguments)
+                call_text = self.code[offset:close + 1]
+                # Arguments were evaluated above. Matching their text again
+                # here would resurrect a source after a known clean helper.
+                direct = SOURCE_RE.search(self.code[offset:cursor + 1])
+                if direct:
+                    atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
+                candidates = [function for function in self.parser.functions.values()
+                              if function.name == name.removeprefix('this.') and function.owner == self.function.owner
+                              and len(function.parameters) == len(arguments)] if '.' not in name or name.startswith('this.') else []
+                if SAFE_EXPR_RE.search(name):
+                    atom = CLEAN
+                elif candidates:
+                    returned = CLEAN
+                    for function in candidates:
+                        bound = {(function.key, index): fact for index, fact in enumerate(arguments)}
+                        for index, capture in enumerate(function.captures):
+                            binding = bindings.get(capture, capture) if self.function.key == -1 else 'capture:' + capture
+                            bound[(function.key, -index - 1)] = state.get(binding, CLEAN)
+                        summary, call = self.summaries[function.key], self.step(offset, 'call', function.name + '()')
+                        returned = join(returned, substitute(summary.returned, bound, call))
+                        for sink, fact in summary.effects.items():
+                            self.effects[sink] = join(self.effects.get(sink, CLEAN), substitute(fact, bound, call))
+                        for site, fact in summary.escapes.items():
+                            self.escapes[site] = join(self.escapes.get(site, CLEAN), substitute(fact, bound, call))
+                    atom = returned
+                elif SINK_RE.search(call_text[:call_text.index('(') + 1]):
+                    if name in {'File', 'Path.of', 'Paths.get'} or name.endswith('.resolve'):
+                        constructor = offset
+                    else:
+                        self.record(offset, atom)
+                cursor = close + 1
+            else:
+                direct = SOURCE_RE.search(self.code[offset:cursor + 1])
+                if direct:
+                    atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
+            while cursor < end:
+                tail = self.parser.skip(cursor, end)
+                member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
+                if self.code[tail:tail + 1] == '[':
+                    close = self.parser.pairs[tail]
+                    atom = join(atom, self.expression(tail + 1, close, state, bindings, depth + 1))
+                    cursor = close + 1
+                elif member:
+                    method = member.group(1)
+                    cursor = self.parser.skip(tail + member.end(), end)
+                    if cursor < end and self.code[cursor] == '(':
+                        close = self.parser.pairs[cursor]
+                        atom = join(atom, *(self.expression(low, high, state, bindings, depth + 1)
+                                            for low, high in self.parser.parts(cursor + 1, close)))
+                        cursor = close + 1
+                    if method in {'getFileName', 'getName', 'fileName', 'name'}:
+                        atom = CLEAN
+                    elif method in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'}:
+                        atom = retag(atom, add=frozenset({'canonical-path'}))
+                    elif method == 'resolve':
+                        constructor = tail
+                else:
+                    break
+            if name.endswith(('.normalize', '.toRealPath', '.getCanonicalPath', '.getCanonicalFile')):
+                atom = retag(atom, add=frozenset({'canonical-path'}))
+            if name.endswith(('.getFileName', '.getName', '.fileName', '.name')):
+                atom = CLEAN
+            if constructor is not None:
+                self.record(constructor, atom)
+            value = join(value, atom)
+        return value
+
+    def assignment(self, span):
+        start, end = span
+        text = self.code[start:end]
+        match = re.match(r'\s*(?:(?:final|val|var)\s+)?(?:[\w.]+(?:\s*<[^=;]+>)?(?:\[\])?\s+)?([A-Za-z_]\w*)\s*(?::\s*[\w.<>?]+\s*)?(\+?=)(?!=)', text)
+        if not match:
+            return None
+        declaration = bool(re.match(r'\s*(?:final\s+)?(?:val|var|[\w.]+(?:\s*<[^=;]+>)?(?:\[\])?)\s+[A-Za-z_]\w*', text))
+        return match.group(1), start + match.start(1), start + match.end(), end, match.group(2), declaration
+
+    def unmodeled_write(self, span):
+        """Locate a field/element write without inventing a heap binding."""
+        start, end = span
+        cursor = self.parser.skip(start, end)
+        root = re.match(r'[A-Za-z_]\w*', self.code[cursor:end])
+        if not root:
+            return None
+        lhs, cursor, indirect = cursor, cursor + root.end(), False
+        while cursor < end:
+            cursor = self.parser.skip(cursor, end)
+            member = re.match(r'\.\s*[A-Za-z_]\w*', self.code[cursor:end])
+            if member:
+                cursor += member.end()
+                indirect = True
+            elif self.code[cursor:cursor + 1] == '[':
+                cursor = self.parser.pairs[cursor] + 1
+                indirect = True
+            else:
+                break
+        operator = re.match(r'(\+?=)(?!=)', self.code[cursor:end])
+        if not indirect or not operator:
+            return None
+        return lhs, cursor, cursor + operator.end(), end, operator.group(1)
+
+    def graph(self, function):
+        actions, edges = {}, {}
+        scope = {name: 'capture:' + name for name in function.captures}
+        scope.update({name: 'param:' + str(index) for index, name in enumerate(function.parameters)})
+
+        def node(kind, span, bindings, targets=(), guard=None, reads=None):
+            self.budget.spend()
+            key = len(actions)
+            actions[key], edges[key] = (kind, span, dict(bindings), guard, dict(bindings if reads is None else reads)), tuple(targets)
+            return key
+
+        exit_node = node('exit', (function.end, function.end), scope)
+
+        def block(statements, following, bindings, break_to=None, continue_to=None, unwind=()):
+            snapshots = []
+            for statement in statements:
+                reads = dict(bindings)
+                assignment = self.assignment((statement.start, statement.end)) if statement.kind == 'simple' else None
+                if assignment and assignment[-1]:
+                    bindings[assignment[0]] = f'{assignment[0]}@{assignment[1]}'
+                snapshots.append((dict(bindings), reads))
+            entry = following
+            for statement, (local, reads) in reversed(list(zip(statements, snapshots))):
+                kind, span = statement.kind, (statement.start, statement.end)
+                targets = () if entry is None else (entry,)
+                if kind == 'definition':
+                    continue
+                if kind == 'block':
+                    entry = block(statement.body, entry, dict(local), break_to, continue_to, unwind)
+                elif kind == 'if':
+                    yes = block(statement.body, entry, dict(local), break_to, continue_to, unwind)
+                    no = block(statement.otherwise, entry, dict(local), break_to, continue_to, unwind)
+                    condition = self.code[slice(*statement.header)].strip()
+                    guard = re.fullmatch(r'(!\s*)?([A-Za-z_]\w*)(\.(?:normalize|toRealPath|getCanonicalPath|getCanonicalFile)\s*\(\s*\))?\.startsWith\s*\([^()]+\)', condition)
+                    if guard:
+                        safe = no if guard.group(1) else yes
+                        refined = node('guard', statement.header, local, () if safe is None else (safe,), (guard.group(2), bool(guard.group(3))))
+                        if guard.group(1):
+                            no = refined
+                        else:
+                            yes = refined
+                    branch_targets = (yes,) if condition == 'true' else (no,) if condition == 'false' else (yes, no)
+                    entry = node('eval', statement.header, local, tuple(target for target in branch_targets if target is not None))
+                elif kind in {'while', 'for', 'do'}:
+                    initial, update, condition, element = None, None, statement.header, None
+                    if kind == 'for':
+                        segments = list(self.parser.parts(*condition, separator=';'))
+                        if len(segments) == 3:
+                            initial, condition, update = segments
+                            assignment = self.assignment(initial)
+                            if assignment:
+                                local[assignment[0]] = f'{assignment[0]}@{assignment[1]}'
+                        else:
+                            header = self.code[slice(*condition)]
+                            match = re.match(r'\s*(?:(?:val|var|[\w.<>?]+)\s+)?([A-Za-z_]\w*)\s*(?:in\b|:)\s*', header)
+                            if not match:
+                                raise ValueError('Invalid Java/Kotlin for header; analysis is incomplete')
+                            element = match.group(1)
+                            local[element] = f'{element}@{condition[0] + match.start(1)}'
+                            condition = (condition[0] + match.end(), condition[1])
+                    test = node('eval', condition, local)
+                    step = node('simple', update, local, (test,)) if update else test
+                    body = block(statement.body, step, dict(local), (entry, len(unwind)), (step, len(unwind)), unwind)
+                    if element:
+                        body = node('element', condition, local, (body,), element)
+                    condition_text = self.code[slice(*condition)].strip()
+                    edges[test] = (body,) if condition_text in {'true', ''} and not element else targets if condition_text == 'false' else tuple(target for target in (body, entry) if target is not None)
+                    entry = body if kind == 'do' else test
+                    if initial:
+                        entry = node('simple', initial, local, (entry,))
+                elif kind == 'try':
+                    after = block(statement.otherwise, entry, dict(local), break_to, continue_to, unwind)
+                    cleanup = (*unwind, (statement.otherwise, dict(local))) if statement.otherwise else unwind
+                    before = set(actions)
+                    body = block((statement.body[0],), after, dict(local), break_to, continue_to, cleanup)
+                    body_nodes = set(actions) - before
+                    catches = tuple(target for handler in statement.body[1:]
+                                    if (target := block((handler,), after, dict(local), break_to, continue_to, cleanup)) is not None)
+                    for key in body_nodes:
+                        if actions[key][0] not in {'return', 'break', 'continue'}:
+                            edges[key] = tuple(dict.fromkeys((*edges[key], *catches)))
+                    entry = node('simple', statement.header, local, tuple(target for target in (body, *catches) if target is not None))
+                elif kind == 'synchronized':
+                    body = block(statement.body, entry, dict(local), break_to, continue_to, unwind)
+                    entry = node('eval', statement.header, local, () if body is None else (body,))
+                else:
+                    target, depth = entry, len(unwind)
+                    if kind in {'break', 'continue'}:
+                        destination = break_to if kind == 'break' else continue_to
+                        if destination is None:
+                            raise ValueError('Break/continue has no control-flow target; analysis is incomplete')
+                        target, depth = destination
+                    elif kind in {'return', 'throw'}:
+                        target, depth = exit_node if kind == 'return' else None, 0
+                    if kind in {'return', 'throw', 'break', 'continue'}:
+                        for index in range(depth, len(unwind)):
+                            final, final_scope = unwind[index]
+                            target = block(final, target, dict(final_scope), break_to, continue_to, unwind[:index])
+                    entry = node(kind, span, local, () if target is None else (target,), reads=reads)
+            return entry
+
+        entry = block(function.body, exit_node, scope)
+        if function.key == -1:
+            kind, span, _, guard, reads = actions[exit_node]
+            actions[exit_node] = kind, span, dict(scope), guard, reads
+        return entry, actions, edges
+
+    def transfer(self, action, state):
+        kind, span, bindings, guard, reads = action
+        start, end = span
+        if kind == 'exit':
+            self.returned = join(self.returned, state.get('@return', CLEAN))
+            if self.function.key == -1:
+                for name in self.parser.globals:
+                    fact = state.get(bindings.get(name, name), CLEAN)
+                    self.global_values[name] = join(self.global_values.get(name, CLEAN), fact)
+            return state
+        if kind == 'guard':
+            name, canonical = guard
+            binding = bindings.get(name, name)
+            state[binding] = join(*(retag(frozenset({trace}), add=frozenset({'contained-path'}))
+                                    if canonical or 'canonical-path' in trace.tags else frozenset({trace})
+                                    for trace in state.get(binding, CLEAN)))
+            return state
+        if kind == 'element':
+            fact = self.expression(start, end, state, bindings)
+            binding = bindings[guard]
+            if fact:
+                state[binding] = advance(fact, self.step(start, 'assign', guard))
+            else:
+                state.pop(binding, None)
+            return state
+        assignment = self.assignment(span) if kind == 'simple' else None
+        if assignment:
+            name, offset, low, high, operator, _ = assignment
+            fact = self.expression(low, high, state, reads)
+            if operator == '+=':
+                fact = join(state.get(reads.get(name, name), CLEAN), fact)
+            fact = advance(fact, self.step(offset, 'assign', name))
+            binding = bindings.get(name, name)
+            if binding.startswith('capture:') and fact:
+                escaped = retag(fact, add=frozenset({'unmodeled-global-capture'}))
+                self.escapes[offset] = join(self.escapes.get(offset, CLEAN),
+                                            advance(escaped, self.step(offset, 'capture', 'write global ' + name)))
+            if fact:
+                state[binding] = fact
+            else:
+                state.pop(binding, None)
+        else:
+            write = self.unmodeled_write(span) if kind == 'simple' else None
+            if write:
+                low, lhs_end, rhs, finish, operator = write
+                fact = self.expression(rhs, finish, state, reads)
+                if operator == '+=':
+                    fact = join(fact, self.expression(low, lhs_end, state, reads))
+                if fact:
+                    self.escapes[low] = join(self.escapes.get(low, CLEAN),
+                                             advance(fact, self.step(low, 'escape', 'unmodeled field/element write')))
+                return state
+            if kind == 'return' and self.code[start:end].lstrip().startswith('return'):
+                start += self.code[start:end].index('return') + len('return')
+            fact = self.expression(start, end, state, bindings)
+            if kind == 'return':
+                state['@return'] = advance(fact, self.step(start, 'return', self.function.name))
+        return state
+
+    def analyze(self):
+        changed = True
+        while changed:
+            changed = False
+            for key, function in self.parser.functions.items():
+                self.budget.spend()
+                self.function, self.effects, self.escapes, self.global_values, self.returned = function, {}, {}, {}, CLEAN
+                if key not in self.graphs:
+                    self.graphs[key] = self.graph(function)
+                entry, actions, edges = self.graphs[key]
+                initial = {}
+                for index, name in enumerate(function.captures):
+                    initial['capture:' + name] = frozenset({Trace('parameter', (key, -index - 1),
+                        evidence=(self.step(key, 'parameter', 'global ' + name),))})
+                for index, name in enumerate(function.parameters):
+                    fact = frozenset({Trace('parameter', (key, index), evidence=(self.step(key, 'parameter', name),))})
+                    initial['param:' + str(index)] = fact
+                if entry is not None:
+                    solve(entry, initial, edges, lambda node, state: self.transfer(actions[node], state), self.budget)
+                updated = self.summaries[key].merged(Summary(self.returned, self.effects, self.escapes, self.global_values))
+                if updated != self.summaries[key]:
+                    self.summaries[key], changed = updated, True
+        effects = {}
+        for key, summary in self.summaries.items():
+            function = self.parser.functions[key]
+            exposed = {(key, index): self.source(key, '@request ' + name)
+                       for index, name in enumerate(function.parameters) if name in function.sources}
+            script_globals = self.summaries.get(-1, Summary()).globals
+            exposed.update({(key, -index - 1): script_globals.get(name, CLEAN)
+                            for index, name in enumerate(function.captures)})
+            for offset, fact in summary.escapes.items():
+                if exposed:
+                    fact = substitute(fact, exposed, self.step(key, 'entry', function.name))
+                if any(trace.kind == 'source' for trace in fact):
+                    site = self.step(offset, 'escape', 'unmodeled field/element write')
+                    if any('unmodeled-global-capture' in trace.tags for trace in fact):
+                        raise ValueError(f'{site.path}:{site.line}: Request-derived Kotlin global capture needs capture-state analysis; analysis is incomplete')
+                    raise ValueError(f'{site.path}:{site.line}: Request-derived field/element write needs heap-state analysis; analysis is incomplete')
+            for offset, fact in summary.effects.items():
+                if exposed:
+                    fact = substitute(fact, exposed, self.step(key, 'entry', function.name))
+                concrete = frozenset(trace for trace in fact if trace.kind == 'source')
+                if concrete:
+                    line = self.step(offset, 'sink', 'file sink').line
+                    effects[line] = join(effects.get(line, CLEAN), concrete)
+        return effects
+
 
 def analyze(path, issues):
-    try:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    except OSError:
-        return
+    text = path.read_text(encoding='utf-8')
     if not ((SOURCE_RE.search(text) or ANNOTATED_PARAM_RE.search(text)) and SINK_RE.search(text)):
         return
+    engine = Engine(path, text)
     lines = text.splitlines()
-    tainted = annotated_sources(text)
-    seen = set()
-    for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
+    for line, fact in sorted(engine.analyze().items()):
+        if has_ignore(lines, line):
             continue
-        statement = logical_statement(lines, idx).strip()
-        if not statement:
-            continue
-        assign = ASSIGN_RE.match(statement)
-        if assign:
-            name = assign.group('lhs')
-            rhs = assign.group('rhs')
-            taint = taint_from_expr(rhs, tainted)
-            if taint:
-                tainted[name] = taint
-            elif name in tainted and is_safe_expr(rhs):
-                tainted.pop(name, None)
-        if not SINK_RE.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = SOURCE_RE.search(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_containment_context(lines, idx, refs):
-            continue
-        key = (relpath(path), idx)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            path_desc = f"{direct.group(0).strip('(')} -> file sink"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get('path', [ref]))
-            if len(seq) >= PATH_LIMIT:
-                seq = seq[-(PATH_LIMIT - 1):]
-            seq.append('file sink')
-            path_desc = ' -> '.join(seq)
-        issues.append((relpath(path), idx, f"{source_line(lines, idx)}  [{path_desc}]"))
+        witness = min(fact, key=lambda trace: (len(trace.evidence), trace.evidence))
+        path_desc = ' -> '.join(step.label for step in witness.evidence)
+        extras = {'taint_path': [step.record() for step in witness.evidence],
+                  'source_count': len({trace.key for trace in fact})}
+        issues.append((relpath(path), line, f'{source_line(lines, line)}  [{path_desc}]', extras))
 
 def main(argv: list[str] | None = None) -> int:
     """Reproduce the module heredoc: `python3 - <project_dir> <<PY` emit dialect."""
@@ -258,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
     for file_path in iter_files(ROOT):
         analyze(file_path, issues)
     print(f"__COUNT__\t{len(issues)}")
-    for file_name, line_no, code in issues[:25]:
+    for file_name, line_no, code, _extras in issues[:25]:
         print(f"__SAMPLE__\t{file_name}\t{line_no}\t{code}")
     return 0
 
@@ -273,9 +852,9 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if path.suffix.lower() not in {".java", ".kt", ".kts"}:
             continue
-        issues: list[tuple[str, str, int]] = []
+        issues: list[tuple[str, int, str, dict]] = []
         analyze(path, issues)
-        for rel_path, line_no, _sample in issues:
+        for rel_path, line_no, _sample, extras in issues:
             yield {
                 "rule": "java.taint.path_traversal",
                 "path": rel_path,
@@ -283,6 +862,7 @@ def run(ctx: RunContext) -> Iterable[dict]:
                 "col": 1,
                 "severity": "critical",
                 "message": _RUN_MESSAGE,
+                "extras": extras,
             }
 
 

@@ -514,6 +514,8 @@ def export_bundle(files):
     signature = 'SHA256SUMS.minisig' if signature_kind == 'minisign' else 'SHA256SUMS.sigstore.json'
     names = ['SHA256SUMS', signature, 'install.sh', 'ubs', 'git_safety_guard.py',
              'VERSION', '.claude/hooks/git_safety_guard.py']
+    if (stage / 'ubs-daemon').is_file():
+        names.append('ubs-daemon')
     names.extend('modules/' + name for name in files)
     # Build in the destination filesystem. Atomic hard-link publication refuses
     # an existing file, directory or symlink, including one created after argv
@@ -529,7 +531,7 @@ def export_bundle(files):
                             raise ValueError('cannot export a nonregular runtime asset: ' + name)
                         member = tarfile.TarInfo(name)
                         member.size = metadata.st_size
-                        member.mode = 0o755 if name == 'ubs' or name.endswith(('.sh', '.py', '.js')) else 0o644
+                        member.mode = 0o755 if name in {'ubs', 'ubs-daemon'} or name.endswith(('.sh', '.py', '.js')) else 0o644
                         member.mtime = 0
                         archive.addfile(member, payload)
         output.flush()
@@ -609,6 +611,23 @@ if [[ "$INSECURE" -eq 0 ]]; then
     "UBS_VERSION=\"${VERSION}\""|"UBS_VERSION='${VERSION}'"|"UBS_VERSION=${VERSION}") ;;
     *) die "Authenticated runner does not match requested version $VERSION" ;;
   esac
+  # Bind the companion to the authenticated manifest AND the runner's literal
+  # pin without executing the payload. A runner without a service pin has no
+  # companion requirement.
+  daemon_declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
+    END { if (count > 1) exit 1; print value }' "$VERIFY_DIR/ubs")" \
+    || die 'Authenticated runner has ambiguous daemon checksum declarations'
+  if [[ -n "$daemon_declaration" ]]; then
+    [[ "$daemon_declaration" =~ ^UBS_DAEMON_SHA256=\"([0-9a-f]{64})\"$ ]] \
+      || die 'Authenticated runner has a nonliteral daemon checksum'
+    daemon_digest="${BASH_REMATCH[1]}"
+    [[ "$(expected_digest ubs-daemon)" == "$daemon_digest" ]] \
+      || die 'Daemon manifest checksum does not match the authenticated runner'
+    fetch_asset ubs-daemon
+    verify_asset ubs-daemon
+    [[ $(wc -c < "$VERIFY_DIR/ubs-daemon") -le 524288 ]] \
+      || die 'Release daemon exceeds 512 KiB'
+  fi
   # The installer recognizes ubs + VERSION next to itself as an explicit local
   # release source. The hook is likewise taken from the authenticated copy.
   # Keep the caller's cwd so project hooks are not installed into this staging

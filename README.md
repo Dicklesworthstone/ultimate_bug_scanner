@@ -75,6 +75,13 @@ result), and pre-scan refusals are an error envelope with exit 2 (see
 "Machine-readable failures" below). The status field, the human status line and the exit code always
 agree: anything other than `ok` exits 2 unless `UBS_ALLOW_PARTIAL=1`.
 
+Checkouts also expose the optional local service through `ubs serve --repo .`,
+`ubs --client --repo . src/main.py`, and `ubs daemon status|stop|cancel --repo .`.
+The client falls back to an ordinary scan when no matching service is running.
+Installers and self-update carry its checksum-pinned companion; portable bundles
+include it too. A warmed engine for edited files remains unfinished.
+See [the service guide](docs/daemon.md).
+
 ## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
 
 You're coding faster than ever with Claude Code, Codex, Cursor, and other AI coding agents. You're shipping features in minutes that used to take days. **But here's the painful truth:**

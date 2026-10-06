@@ -109,14 +109,32 @@ jobs:
         run: |
           cp install.sh dist/
           cp ubs dist/
+          cp ubs-daemon dist/
           cp scripts/verify.sh dist/
           cp .claude/hooks/git_safety_guard.py dist/
+
+      - name: Verify assembled canonical service
+        run: |
+          set -euo pipefail
+          test -f dist/ubs-daemon
+          test ! -L dist/ubs-daemon
+          cmp ubs-daemon dist/ubs-daemon
+          dist/ubs serve --help
+          dist/ubs --client --help
+          mkdir -p "${RUNNER_TEMP}/ubs-runner-only"
+          cp dist/ubs "${RUNNER_TEMP}/ubs-runner-only/ubs"
+          if "${RUNNER_TEMP}/ubs-runner-only/ubs" serve --help; then
+            echo "Runner-only release unexpectedly loaded the service" >&2
+            exit 1
+          else
+            test "$?" -eq 2
+          fi
 
       - name: Generate checksums
         working-directory: dist
         run: |
           # Hash the assembled payload with the flat names used by its consumers.
-          sha256sum install.sh ubs verify.sh git_safety_guard.py > SHA256SUMS
+          sha256sum install.sh ubs ubs-daemon verify.sh git_safety_guard.py > SHA256SUMS
 
       - name: Sign checksums with minisign
         env:
@@ -142,7 +160,7 @@ jobs:
         #   --certificate-identity-regexp '^https://github.com/${{ github.repository }}/\.github/workflows/release\.yml@refs/tags/v'
         #   --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS`
         run: |
-          for asset in install.sh ubs SHA256SUMS git_safety_guard.py; do
+          for asset in install.sh ubs ubs-daemon SHA256SUMS git_safety_guard.py; do
             cosign sign-blob --yes --bundle "dist/${asset}.sigstore.json" "dist/${asset}"
           done
           ls -la dist/*.sigstore.json
@@ -153,6 +171,7 @@ jobs:
           subject-path: |
             dist/install.sh
             dist/ubs
+            dist/ubs-daemon
             dist/SHA256SUMS
             dist/git_safety_guard.py
 
@@ -166,7 +185,9 @@ jobs:
 
       - name: Build Homebrew formula
         run: |
-          UBS_SHA=$(sha256sum ubs | cut -d' ' -f1)
+          set -euo pipefail
+          UBS_SHA=$(sha256sum dist/ubs | cut -d' ' -f1)
+          DAEMON_SHA=$(sha256sum dist/ubs-daemon | cut -d' ' -f1)
           cat > dist/ubs.rb <<'RUBY'
           class Ubs < Formula
             desc "Ultimate Bug Scanner meta-runner"
@@ -180,13 +201,43 @@ jobs:
           cat >> dist/ubs.rb <<'RUBY'
           license "MIT"
 
+          depends_on "bash"
+          depends_on "jq"
+          depends_on "ripgrep"
+          depends_on "python@3.14"
+          RUBY
+          {
+            echo '  resource "ubs-daemon" do'
+            echo "    url \"https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/v$VERSION/ubs-daemon\""
+            echo "    sha256 \"$DAEMON_SHA\""
+            echo '  end'
+          } >> dist/ubs.rb
+          cat >> dist/ubs.rb <<'RUBY'
+
           def install
-            chmod 0555, "ubs"
-            bin.install "ubs"
+            require "digest"
+            libexec.install "ubs"
+            resource("ubs-daemon").stage { libexec.install "ubs-daemon" }
+            chmod 0555, libexec/"ubs"
+            chmod 0444, libexec/"ubs-daemon"
+            daemon_declaration = %(UBS_DAEMON_SHA256="#{Digest::SHA256.file(libexec/"ubs-daemon").hexdigest}")
+            unless (libexec/"ubs").read.lines.map(&:chomp).grep(/\AUBS_DAEMON_SHA256=/) == [daemon_declaration]
+              raise "Runner does not pin the packaged service"
+            end
+            (bin/"ubs").write <<~SH
+              #!#{Formula["bash"].opt_bin}/bash
+              #{daemon_declaration}
+              export PATH="#{Formula["bash"].opt_bin}:#{Formula["jq"].opt_bin}:#{Formula["ripgrep"].opt_bin}:#{Formula["python@3.14"].opt_libexec}/bin:#{Formula["python@3.14"].opt_bin}:$PATH"
+              export UBS_PYTHON="#{Formula["python@3.14"].opt_bin}/python3.14"
+              exec "#{Formula["bash"].opt_bin}/bash" "#{libexec}/ubs" "$@"
+            SH
+            chmod 0555, bin/"ubs"
           end
 
           test do
             system "#{bin}/ubs", "--help"
+            system "#{bin}/ubs", "serve", "--help"
+            system "#{bin}/ubs", "--client", "--help"
           end
           end
           RUBY
@@ -344,6 +395,7 @@ jobs:
           files: |
             dist/install.sh
             dist/ubs
+            dist/ubs-daemon
             dist/SHA256SUMS
             dist/SHA256SUMS.minisig
             dist/*.sigstore.json

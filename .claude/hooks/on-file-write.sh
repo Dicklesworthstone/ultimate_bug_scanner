@@ -5,8 +5,7 @@
 # {"file_path": ...}}). The hook scans just the file that was written and, when UBS
 # reports critical findings, exits 2 so the scanner output is shown to Claude as
 # feedback on the edit it just made. Clean files exit 0 silently. This checkout
-# hook uses an optional trusted ubs-daemon on PATH; standalone installer hooks
-# continue to work through the one-shot scanner without requiring that frontend.
+# hook prefers the checksum-pinned canonical client shipped in the runner.
 set -u
 
 payload="$(cat 2>/dev/null || true)"
@@ -52,7 +51,16 @@ fi
 file="$directory${file##*/}"
 command=("$scanner" --ci --no-auto-update --no-color --format=text -- "$file")
 client="$(type -P ubs-daemon || true)"
-if [[ -n "$client" ]]; then
+canonical=0
+if grep -q '^UBS_DAEMON_SHA256="[0-9a-f]\{64\}"$' "$scanner" 2>/dev/null; then
+  canonical=1
+fi
+# Windows shell environments use the ordinary scanner: the service requires
+# POSIX peer credentials and process groups. WSL reports Linux and uses it.
+case "$(uname -s 2>/dev/null)" in
+  CYGWIN*|MINGW*|MSYS*) canonical=0; client='' ;;
+esac
+if [[ "$canonical" -eq 1 || -n "$client" ]]; then
   root=''
   if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
     root="$(cd -P -- "$CLAUDE_PROJECT_DIR" && printf '%s/' "$PWD")" || exit 2
@@ -67,7 +75,11 @@ if [[ -n "$client" ]]; then
   fi
   # The client alone decides whether absence/context mismatch warrants a
   # one-shot fallback. Never hide a protocol, authentication or scanner error.
-  command=("$client" client --repo "$root" --scanner "$scanner" --format=text -- "$file")
+  if [[ "$canonical" -eq 1 ]]; then
+    command=("$scanner" --client --repo "$root" --format=text -- "$file")
+  else
+    command=("$client" client --repo "$root" --scanner "$scanner" --format=text -- "$file")
+  fi
 fi
 
 status=0

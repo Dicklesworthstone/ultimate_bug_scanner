@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # Update SHA256SUMS with current release artifact checksums.
-# Run this after modifying the ubs meta-runner or installer script.
+# Run this after modifying the runner, daemon or installer script.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$ROOT_DIR" || exit 1
 
-for file in install.sh ubs; do
+for file in install.sh ubs ubs-daemon; do
     if [[ ! -f "$file" ]]; then
         echo "Error: $file not found" >&2
         exit 1
@@ -34,6 +34,7 @@ compute_sha256() {
 {
     echo "$(compute_sha256 install.sh)  install.sh"
     echo "$(compute_sha256 ubs)  ubs"
+    echo "$(compute_sha256 ubs-daemon)  ubs-daemon"
 } > SHA256SUMS
 
 echo "Updated SHA256SUMS:"

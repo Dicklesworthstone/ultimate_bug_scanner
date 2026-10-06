@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify that SHA256SUMS matches the actual checksums of ubs and install.sh
+# Verify release checksums for the runner, daemon and installer.
 # This script is called by git hooks and CI workflows to prevent checksum drift.
 #
 # Exit codes:
@@ -35,7 +35,7 @@ compute_sha256() {
 cd "$ROOT_DIR" || exit 1
 
 # Check required files exist
-for file in ubs install.sh SHA256SUMS; do
+for file in ubs ubs-daemon install.sh SHA256SUMS; do
     if [[ ! -f "$file" ]]; then
         echo -e "${RED}Error: $file not found${NC}" >&2
         exit 2
@@ -45,10 +45,12 @@ done
 # Compute actual checksums
 ACTUAL_UBS=$(compute_sha256 ubs)
 ACTUAL_INSTALL=$(compute_sha256 install.sh)
+ACTUAL_DAEMON=$(compute_sha256 ubs-daemon)
 
 # Extract expected checksums from SHA256SUMS (2>/dev/null suppresses error if malformed)
 EXPECTED_UBS=$(grep '  ubs$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
 EXPECTED_INSTALL=$(grep '  install.sh$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
+EXPECTED_DAEMON=$(grep '  ubs-daemon$' SHA256SUMS 2>/dev/null | awk '{print $1}' || echo "")
 
 MISMATCH=0
 
@@ -70,6 +72,15 @@ if [[ "$ACTUAL_INSTALL" != "$EXPECTED_INSTALL" ]]; then
     MISMATCH=1
 else
     echo -e "${GREEN}OK: install.sh${NC}"
+fi
+
+if [[ "$ACTUAL_DAEMON" != "$EXPECTED_DAEMON" ]]; then
+    echo -e "${RED}MISMATCH: ubs-daemon${NC}"
+    echo "  Expected: $EXPECTED_DAEMON"
+    echo "  Actual:   $ACTUAL_DAEMON"
+    MISMATCH=1
+else
+    echo -e "${GREEN}OK: ubs-daemon${NC}"
 fi
 
 if [[ "$MISMATCH" -eq 1 ]]; then

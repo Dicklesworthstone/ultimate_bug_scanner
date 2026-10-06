@@ -1,10 +1,27 @@
 # Local scan service (K4)
 
-The checkout now provides `ubs-daemon serve` and `ubs-daemon client`. This is a
-standalone optional frontend to the real scanner, not a replacement detector
-engine. Serving or querying it through `ubs` itself (a serve subcommand or a
-client flag), automatic installation and in-process analysis are not
-implemented yet.
+The canonical commands are `ubs serve`, `ubs --client`, and
+`ubs daemon watch|status|stop|cancel`. They reach the same optional service as
+the standalone `ubs-daemon` command. The runner verifies its matching regular
+daemon payload against an embedded SHA-256 pin and executes those verified
+bytes with isolated Python startup. Installation and self-update carry the
+matching companion; keeping parser and analysis state warm remains unfinished.
+
+The service requires POSIX (Linux, macOS or another supported Unix). On Windows
+Git Bash, MSYS and Cygwin, installed save and Git hooks use ordinary `ubs`
+scans; use the ordinary scanner directly there. WSL uses the Linux service.
+
+```bash
+./ubs serve --repo /path/to/project --jobs=2
+./ubs --client --repo /path/to/project src/main.py
+./ubs daemon status --repo /path/to/project
+./ubs daemon stop --repo /path/to/project
+```
+
+Put the service selector first. The remaining options follow the service
+interface below. `ubs --client` defaults to JSON and retains one-shot fallback
+when no matching daemon is running. Unsupported options produce errors rather
+than silently changing the scan selection.
 
 ```bash
 ./ubs-daemon serve --repo /path/to/project
@@ -20,6 +37,22 @@ with `--profile=strict|loose` and `--fail-on-warning`. Relative source names are
 resolved against `--repo`; use `--` before names starting with a dash. Select
 explicit regular files, one directory, or a Git-scoped scan as described below.
 Custom-rule and baseline requests still use the normal `ubs` command.
+
+Installers publish a regular `ubs.daemon.<SHA256>.py` companion beside the
+runner before atomically replacing the runner. Self-update retains older
+companions so an older process still has its own matching bytes. A failed
+download, checksum, size check or publication leaves the old runner usable.
+The loader prefers its exact generation, then the pinned `ubs-daemon` adjacent
+to a checkout or portable bundle. Renamed runners retain their actual scanner
+path. Neither the project nor PATH supplies replacement daemon code.
+
+The release payload and checksum manifest include `ubs-daemon`.
+`scripts/verify.sh` binds its digest to both the authenticated manifest and
+the runner pin, then includes it in exported portable bundles. Local installs
+require the matching local companion without downloading a replacement.
+Host tools remain separate dependencies and no service starts automatically.
+An upgrade from a runner predating the service may require running the new
+installer once to provision its companion.
 
 A missing daemon or a different invocation environment/scanner falls back to an
 ordinary scan. `--require-daemon` disables that fallback. Authentication, protocol
@@ -58,8 +91,9 @@ it is never a clean result. These are input observations, not filesystem freezes
 The toolchain and other external configuration that its programs load remain
 trusted session inputs; restart the daemon after changing tool libraries or
 external tool configuration. For installed scanners without an adjacent `modules`
-directory, report reuse is disabled. Run this frontend from a trusted checkout;
-it is not included in exported portable runtimes or installed by `install.sh`.
+directory, report reuse is disabled. Installed requests still run the ordinary
+scanner with its verified module downloads and incremental cache. Portable
+runtimes include the adjacent module graph for report reuse.
 
 Misses still run the standard CLI, preserving its verified modules and existing
 Merkle cache. This does not claim sub-100 ms edited-file scans: keeping parsers
@@ -212,7 +246,7 @@ Watch mode requires a compatible running daemon with the same scanner and
 environment. It never starts a service, falls back to a second scanner, or
 silently masks service failures. Git selection and caller-assigned request ids
 are rejected for watch mode; use `client` for staged/diff scans.
-The existing save hook is unchanged.
+The save hook remains a single-edit client; watch mode runs separately.
 
 ### Recursive project observation with directory scans
 
@@ -326,9 +360,11 @@ credential path and Windows's unsupported-platform diagnostic need platform CI.
 
 ## Save-hook integration
 
-The checkout's `.claude/hooks/on-file-write.sh` uses `ubs-daemon` when that trusted
-executable is on PATH, passing the same `ubs` executable selected for one-shot
-scans. Start the service with the same environment as the agent. It resolves the
+The checkout's `.claude/hooks/on-file-write.sh` uses the verified `ubs --client`
+when the selected runner carries a daemon pin. It does not execute a separate
+PATH frontend in that case. Runners without a pin retain the existing optional
+standalone client and one-shot route. Start the service with the same environment
+as the agent. It resolves the
 served root from `CLAUDE_PROJECT_DIR`, otherwise from the edited file's Git root,
 otherwise from the file's parent directory. Paths outside an explicit project
 root are refused rather than silently scanned under a different context.
@@ -337,13 +373,19 @@ The hook requests text reports for explicit files, including Bash sources. It
 keeps clean/no-target edits silent, surfaces findings as blocking feedback, and
 reports scanner or service failures separately as **not verified**. It does not
 automatically start a daemon, change your hook registrations, or redirect Git
-staged scans to worktree contents. A missing frontend or absent/context-mismatched
-daemon still uses one-shot scanning; service/authentication errors are visible.
+staged scans to worktree contents. An absent or context-mismatched daemon uses
+one-shot scanning; a missing pinned payload or service/authentication error is
+reported as a failure.
 
-This integration is in the checkout hook. The standalone installer still embeds
-its original one-shot hook template, so existing installed hooks do not acquire
-daemon support automatically. Automatic distribution and installation of the
-frontend and updated template remain part of K4.
+The checkout and installer embed the same save hook. A runner carrying a daemon pin
+uses `ubs --client` without a standalone frontend on PATH. Re-run the installer
+to update an existing project's hook. Neither route starts a daemon automatically.
+
+The generated Git pre-commit hook also uses the canonical client when the
+runner has a pin. It preserves its full-project `--fail-on-warning` gate and
+propagates the scanner's failure through its output pipeline. It does not replace
+that gate with changed-file or staged-only selection. Installer-written agent
+quick references include canonical client and explicit service-start commands.
 
 The real native save-hook integration test explicitly sets `ENABLE_UV_TOOLS=0`
 for both peers to avoid online package auditing. Separate tests retain the

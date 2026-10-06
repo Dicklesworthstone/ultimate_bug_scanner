@@ -388,7 +388,7 @@ test_claude_hooks_registered() {
   tmpdirs+=("$ctx")
   local home="$ctx/home" proj="$ctx/proj" log="$ctx/install.log"
   mkdir -p "$home" "$proj/.claude"
-  git -C "$proj" init -q
+  git -C "$proj" init -q -b main
   # Pre-existing settings must survive the merge.
   printf '{\n  "permissions": {\n    "allow": [\n      "Bash(ls:*)"\n    ]\n  }\n}\n' >"$proj/.claude/settings.json"
   rm -rf /tmp/ubs-install.lock 2>/dev/null || true
@@ -849,11 +849,13 @@ test_flag_order_independence() {
   # --setup-claude-hook --dry-run: dry-run must apply even though it comes second.
   local proj="$ctx/proj"
   mkdir -p "$proj/.claude"
+  git -C "$proj" init -q
   rc=0
   (cd "$proj" && UBS_INSTALLER_WORKDIR="$ctx/work.${RANDOM}${RANDOM}" HOME="$home" SHELL=/bin/bash "$INSTALLER" --skip-version-check --setup-claude-hook --dry-run) >"$log" 2>&1 || rc=$?
-  if [ "$rc" -ne 0 ] || [ -e "$proj/.claude/hooks/on-file-write.sh" ] || ! grep -q "Would write" "$log"; then
+  if [ "$rc" -ne 0 ] || [ -e "$proj/.claude/hooks/on-file-write.sh" ] \
+     || [ -e "$proj/.claude/settings.json" ] || ! grep -q "Would configure project hooks" "$log"; then
     echo "[FAIL] --setup-claude-hook --dry-run wrote files or did not report a dry run (rc=$rc, log: $log)"
-    tail -n 20 "$log" || true
+    cat "$log" || true
     tests_failed=1
     return 1
   fi

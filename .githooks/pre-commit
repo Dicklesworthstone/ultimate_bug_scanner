@@ -33,9 +33,9 @@ PY
 
 # Check if any pinned checksum inputs changed.
 # - Pinned module sources: modules/ubs-*.sh, modules/helpers/*.{py,go,js}
-# - Release checksums: install.sh, ubs
+# - Release checksums: install.sh, ubs, ubs-daemon
 CHECKSUM_TRIGGER_CHANGED="$(
-  git diff --cached --name-only | grep -E '^(install\.sh|ubs|modules/(ubs-.*\.sh|helpers/[^/]+\.(py|go|js))$)' || true
+  git diff --cached --name-only | grep -E '^(install\.sh|ubs(-daemon)?|modules/(ubs-.*\.sh|helpers/[^/]+\.(py|go|js)))$' || true
 )"
 
 if [[ -n "$CHECKSUM_TRIGGER_CHANGED" ]]; then
@@ -91,6 +91,7 @@ verify_sha256sums_entry() {
 
 verify_sha256sums_entry install.sh
 verify_sha256sums_entry ubs
+verify_sha256sums_entry ubs-daemon
 
 # Beads hygiene: when .beads/ is part of the commit, surface tracker problems
 # (dangling dependencies, DB/JSONL drift) without blocking the commit. The

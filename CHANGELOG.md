@@ -8,16 +8,29 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
-## [Unreleased]
-
-_No changes yet._
-
----
-
 ## [v5.4.19] - 2026-10-05 [Tag]
+
+### Added
+
+- The main runner exposes the existing local scan service through `ubs serve`,
+  `ubs --client`, and `ubs daemon watch|status|stop|cancel`. It verifies the
+  matching service's checksum before executing its bytes with isolated Python
+  startup. The checkout save hook prefers this verified client, including when
+  an unrelated frontend appears on PATH. Installers and self-update publish its
+  verified companion before replacing the runner. Release, Docker, Nix and
+  portable-bundle payloads include the service; the installer embeds the same
+  save hook. Keeping analysis warm for edited-file latency below 100 ms remains
+  unfinished.
+- The generated Git pre-commit hook now propagates scanner failures through
+  its report pipeline and uses the canonical client while retaining the full
+  project and fail-on-warning policy.
 
 ### Fixed
 
+- Uninstall removes the installed runner's checksum-matching daemon companion. Tampered files, symlinks and other generations are preserved.
+- The Docker image includes Git so staged-file and diff selections can use the same Git-backed paths as ordinary installations.
+- Java and Kotlin request-path analysis uses finite dataflow and local helper summaries. Clean reassignments and separate function scopes no longer produce traversal findings, while branch and loop alternatives retain unsafe paths. JSON reports retain source-to-sink evidence and SARIF renders it as code flows. Kotlin top-level statements keep their original locations when local functions are present. Recognized request-derived field, array, captured-global and initializer effects that remain unsupported report incomplete analysis instead of a clean result; cross-file and virtual dispatch remain unfinished.
+- JavaScript taint joins reuse an identical immutable fact when every input is that same fact, preserving the existing shortest-path evidence for distinct inputs.
 - JavaScript taint discovers the component's actual sinks before constructing function scopes and capture relationships. Components without supported sinks avoid that work; components with sinks solve only the relevant rules and release each rule's flow state after retaining its concrete findings.
 - JavaScript closure analysis no longer builds an unused legacy table of whole block states. Captured cells and call-time heap effects continue through the current flow representation.
 - JavaScript call analysis releases recursive argument-expansion closures when expansion finishes or raises, so completed transfers do not retain their input heaps while waiting for cyclic garbage collection.

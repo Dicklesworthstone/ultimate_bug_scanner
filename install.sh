@@ -2188,6 +2188,39 @@ diagnostic_check() {
   echo ""
 }
 
+uninstall_scanner_daemon() {
+  # Only the selected runner's literal pin establishes ownership. Preserve
+  # other generations, lookalike files and symlinks rather than globbing.
+  local runner="$1" sudo_cmd="$2" declaration expected target actual
+  declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
+    END { if (count > 1) exit 1; print value }' "$runner")" || {
+    warn "Leaving service companions: ambiguous runner checksum"; return 0;
+  }
+  [[ -n "$declaration" ]] || return 0
+  if [[ ! "$declaration" =~ ^UBS_DAEMON_SHA256=\"([0-9a-f]{64})\"$ ]]; then
+    warn "Leaving service companions: invalid runner checksum"; return 0
+  fi
+  expected="${BASH_REMATCH[1]}"
+  target="${runner}.daemon.${expected}.py"
+  if [[ -L "$target" || ! -f "$target" ]]; then
+    if [[ -e "$target" || -L "$target" ]]; then
+      warn "Leaving unsafe service companion: $target"
+    fi
+    return 0
+  fi
+  actual="$(compute_sha256 "$target")" || {
+    warn "Could not verify service companion: $target"; return 0;
+  }
+  if [[ "$actual" != "$expected" || $(wc -c < "$target") -gt 524288 ]]; then
+    warn "Leaving unverified service companion: $target"; return 0
+  fi
+  if $sudo_cmd rm -f -- "$target" 2>/dev/null; then
+    success "Removed verified service companion: $target"
+  else
+    warn "Could not remove service companion: $target"
+  fi
+}
+
 uninstall_ubs() {
   log_section "Uninstall Ultimate Bug Scanner"
 
@@ -2217,6 +2250,7 @@ uninstall_ubs() {
     fi
     local sudo_cmd
     sudo_cmd="$(maybe_sudo "$candidate")"
+    uninstall_scanner_daemon "$bin" "$sudo_cmd"
     if $sudo_cmd rm -f "$bin" 2>/dev/null; then
       success "Removed binary: $bin"
       removed_binary=1
@@ -3063,6 +3097,52 @@ determine_install_dir() {
   fi
 }
 
+install_scanner_daemon() {
+  # The selected runner supplies the literal companion digest. Do not execute
+  # either payload to inspect its release metadata.
+  local runner="$1" local_source="$2" script_path="$3" use_sudo="$4"
+  local declaration expected actual source staged target temporary
+  declaration="$(awk '/^UBS_DAEMON_SHA256=/ { count++; value=$0 }
+    END { if (count > 1) exit 1; print value }' "$runner")" || {
+    error "Ambiguous daemon checksum in selected runner"; return 1;
+  }
+  [[ -n "$declaration" ]] || return 0
+  if [[ ! "$declaration" =~ ^UBS_DAEMON_SHA256=\"([0-9a-f]{64})\"$ ]]; then
+    error "Invalid daemon checksum in selected runner"; return 1
+  fi
+  expected="${BASH_REMATCH[1]}"
+  staged="$(mktemp_in_workdir 'ubs-daemon.download.XXXXXX')" || return 1
+  if [[ -n "$local_source" ]]; then
+    source="$(dirname "$local_source")/ubs-daemon"
+    if [[ ! -e "$source" && ! -L "$source" ]]; then
+      source="${local_source}.daemon.${expected}.py"
+    fi
+    if [[ ! -f "$source" || -L "$source" ]]; then
+      error "Local runner requires its matching regular ubs-daemon; no network fallback"; return 1
+    fi
+    cp -- "$source" "$staged" || return 1
+  else
+    if ! download_to_file "${ARTIFACT_BASE}/ubs-daemon" "$staged"; then
+      error "Could not fetch the matching release daemon"; return 1
+    fi
+  fi
+  actual="$(compute_sha256 "$staged")" || return 1
+  if [[ "$actual" != "$expected" || $(wc -c < "$staged") -gt 524288 ]]; then
+    error "Daemon checksum or size mismatch; installed runner remains unchanged"; return 1
+  fi
+  target="${script_path}.daemon.${expected}.py"
+  if [[ -L "$target" || ( -e "$target" && ! -f "$target" ) ]]; then
+    error "Refusing an unsafe daemon installation path: $target"; return 1
+  fi
+  temporary="$($use_sudo mktemp "${script_path}.daemon.XXXXXX")" || return 1
+  if ! $use_sudo install -m 0644 "$staged" "$temporary" \
+      || ! $use_sudo mv -f -- "$temporary" "$target"; then
+    $use_sudo rm -f -- "$temporary"
+    error "Could not publish verified daemon; installed runner remains unchanged"; return 1
+  fi
+  success "Installed checksum-pinned scan service"
+}
+
 install_scanner() {
   local install_dir
   install_dir="$(determine_install_dir)"
@@ -3105,6 +3185,10 @@ install_scanner() {
   # Download or copy the runner into WORKDIR first (cleaned up on every exit
   # path, and never subject to the install dir's permissions), then move it.
   local script_path="$install_dir/$INSTALL_NAME"
+  if [[ -L "$script_path" || ( -e "$script_path" && ! -f "$script_path" ) ]]; then
+    error "Refusing an unsafe runner installation path: $script_path"
+    return 1
+  fi
   local temp_path
   temp_path="$(mktemp_in_workdir "${INSTALL_NAME}.download.XXXXXX")"
 
@@ -3220,12 +3304,16 @@ install_scanner() {
     warn "Downloaded file does not contain expected marker; continuing (marker may have changed)"
   fi
 
-  if [ -n "$use_sudo" ]; then
-    $use_sudo install -m 0755 "$temp_path" "$script_path"
-    rm -f "$temp_path"
-  else
-    mv "$temp_path" "$script_path"
-    chmod 0755 "$script_path" 2>/dev/null || true
+  # A daemon publication failure must leave the currently installed runner
+  # usable. Stage both files beside their targets for atomic publication.
+  install_scanner_daemon "$temp_path" "$local_source" "$script_path" "$use_sudo" || return 1
+  local runner_stage
+  runner_stage="$($use_sudo mktemp "${script_path}.install.XXXXXX")" || return 1
+  if ! $use_sudo install -m 0755 "$temp_path" "$runner_stage" \
+      || ! $use_sudo mv -f -- "$runner_stage" "$script_path"; then
+    $use_sudo rm -f -- "$runner_stage"
+    error "Could not publish runner; previous installation remains unchanged"
+    return 1
   fi
 
   if [ -n "$use_sudo" ]; then
@@ -3616,7 +3704,8 @@ setup_claude_code_hook() {
 # Claude Code passes the tool call as JSON on stdin ({"tool_name": ..., "tool_input":
 # {"file_path": ...}}). The hook scans just the file that was written and, when UBS
 # reports critical findings, exits 2 so the scanner output is shown to Claude as
-# feedback on the edit it just made. Clean files exit 0 silently.
+# feedback on the edit it just made. Clean files exit 0 silently. This checkout
+# hook prefers the checksum-pinned canonical client shipped in the runner.
 set -u
 
 payload="$(cat 2>/dev/null || true)"
@@ -3640,20 +3729,68 @@ fi
 [[ -z "$file" || ! -f "$file" ]] && exit 0
 
 case "$file" in
-  *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyw|*.pyi|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.swift|*.cs|*.csx|*.ex|*.exs) ;;
+  *.js|*.jsx|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.pyw|*.pyi|*.c|*.cc|*.cpp|*.cxx|*.h|*.hh|*.hpp|*.hxx|*.rs|*.go|*.java|*.kt|*.kts|*.rb|*.swift|*.cs|*.csx|*.ex|*.exs|*.sh|*.bash) ;;
   *) exit 0 ;;
 esac
 
-if ! command -v ubs >/dev/null 2>&1; then
-  echo "ubs not found in PATH; install it (https://github.com/Dicklesworthstone/ultimate_bug_scanner) to scan edits." >&2
-  exit 0
+scanner="$(type -P ubs || true)"
+if [[ -z "$scanner" ]]; then
+  echo 'UBS could not scan this edit: ubs is not available on PATH.' >&2
+  exit 2
 fi
 
-if report="$(ubs "$file" --ci 2>&1)"; then
-  exit 0
+# Canonicalize the directory without losing embedded or trailing newlines.
+# A trailing slash protects command-substitution output from newline stripping.
+directory=.
+[[ "$file" == */* ]] && directory="${file%/*}"
+[[ -n "$directory" ]] || directory=/
+if ! directory="$(cd -P -- "$directory" && printf '%s/' "$PWD")"; then
+  echo 'UBS could not resolve the edited file directory.' >&2
+  exit 2
 fi
+file="$directory${file##*/}"
+command=("$scanner" --ci --no-auto-update --no-color --format=text -- "$file")
+client="$(type -P ubs-daemon || true)"
+canonical=0
+if grep -q '^UBS_DAEMON_SHA256="[0-9a-f]\{64\}"$' "$scanner" 2>/dev/null; then
+  canonical=1
+fi
+# Windows shell environments use the ordinary scanner: the service requires
+# POSIX peer credentials and process groups. WSL reports Linux and uses it.
+case "$(uname -s 2>/dev/null)" in
+  CYGWIN*|MINGW*|MSYS*) canonical=0; client='' ;;
+esac
+if [[ "$canonical" -eq 1 || -n "$client" ]]; then
+  root=''
+  if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+    root="$(cd -P -- "$CLAUDE_PROJECT_DIR" && printf '%s/' "$PWD")" || exit 2
+    root="${root%/}"
+    [[ -n "$root" ]] || root=/
+  elif root="$(git -C "$directory" rev-parse --show-toplevel 2>/dev/null && printf '.')"; then
+    root="${root%.}"
+    root="${root%$'\n'}"
+  else
+    root="${directory%/}"
+    [[ -n "$root" ]] || root=/
+  fi
+  # The client alone decides whether absence/context mismatch warrants a
+  # one-shot fallback. Never hide a protocol, authentication or scanner error.
+  if [[ "$canonical" -eq 1 ]]; then
+    command=("$scanner" --client --repo "$root" --format=text -- "$file")
+  else
+    command=("$client" client --repo "$root" --scanner "$scanner" --format=text -- "$file")
+  fi
+fi
+
+status=0
+report="$("${command[@]}" 2>&1)" || status=$?
+case "$status" in
+  0|3) exit 0 ;;
+  1) message="UBS found critical issues in $file — fix them before moving on:" ;;
+  *) message="UBS could not complete the scan of $file (exit $status); this edit has NOT been verified:" ;;
+esac
 {
-  echo "UBS found critical issues in $file — fix them before moving on:"
+  printf '%s\n' "$message"
   printf '%s\n' "$report" | tail -n 60
 } >&2
 exit 2
@@ -4066,6 +4203,8 @@ setup_git_hook() {
 # Ultimate Bug Scanner - Pre-commit Hook
 # Prevents commits with critical issues
 
+set -uo pipefail
+
 echo "🔬 Running bug scanner..."
 
 # Find ubs: try PATH first, then known install locations
@@ -4090,16 +4229,30 @@ UBS_CMD="\$(find_ubs)" || {
   exit 1
 }
 
-SCAN_LOG=\$(mktemp -t ubs-pre-commit.XXXXXX 2>/dev/null || echo "/tmp/ubs-pre-commit.log")
+SCAN_LOG="\$(mktemp -t ubs-pre-commit.XXXXXX)" || {
+  echo "❌ Could not create the scanner log; commit has NOT been verified." >&2
+  exit 1
+}
+trap 'rm -f -- "\$SCAN_LOG"' EXIT
 
-if ! "\$UBS_CMD" . --fail-on-warning 2>&1 | tee "\$SCAN_LOG" | tail -30; then
+# Preserve the full-project, fail-on-warning gate through either route.
+SCAN_COMMAND=("\$UBS_CMD" . --fail-on-warning)
+SERVICE_SUPPORTED=1
+case "\$(uname -s 2>/dev/null)" in
+  CYGWIN*|MINGW*|MSYS*) SERVICE_SUPPORTED=0 ;;
+esac
+if [[ "\$SERVICE_SUPPORTED" -eq 1 ]] && grep -q '^UBS_DAEMON_SHA256="[0-9a-f]\\{64\\}"\$' "\$UBS_CMD" 2>/dev/null; then
+  SCAN_ROOT="\$(git rev-parse --show-toplevel)" || exit 1
+  SCAN_COMMAND=("\$UBS_CMD" --client --repo "\$SCAN_ROOT" --format=text --fail-on-warning -- "\$SCAN_ROOT")
+fi
+
+if ! "\${SCAN_COMMAND[@]}" 2>&1 | tee "\$SCAN_LOG" | tail -30; then
   echo ""
   echo "❌ Bug scanner found issues. Fix them or use: git commit --no-verify"
   exit 1
 fi
 
 echo "✓ No critical issues found"
-rm -f "\$SCAN_LOG" 2>/dev/null || true
 HOOK_EOF
 
   chmod +x "$hook_file"
@@ -4162,17 +4315,20 @@ UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Fl
 
 **Install:** `curl -sSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh | bash`
 
-**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+**Golden Rule:** `ubs --client --repo . --format=text -- <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+
+Service commands require POSIX. On Windows Git Bash/MSYS/Cygwin, use `ubs <changed-files>` and `ubs . --fail-on-warning`; installed hooks choose ordinary scans automatically. WSL can use the Linux service.
 
 **Commands:**
 ```bash
-ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
+ubs --client --repo . --format=text -- file.ts file2.py # Specific files, with one-shot fallback
+ubs serve --repo .                      # Start the optional service explicitly
 ubs $(git diff --name-only --cached)    # Staged files — before commit
 ubs --only=js,python src/               # Language filter (3-5x faster)
-ubs --ci --fail-on-warning .            # CI mode — before PR
+ubs --client --repo . --format=text --fail-on-warning -- . # Full project — before PR
 ubs --help                              # Full command reference
 ubs sessions --entries 1                # Tail the latest install session log
-ubs .                                   # Whole project (ignores things like .venv and node_modules automatically)
+ubs --client --repo . --format=text -- . # Whole project (respects scanner exclusions)
 ```
 
 **Output Format:**
@@ -4189,10 +4345,12 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 2. Navigate `file:line:col` → view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `ubs <file>` → exit 0
+5. Re-run `ubs --client --repo . --format=text -- <file>` → exit 0
 6. Commit
 
-**Speed Critical:** Scope to changed files. `ubs src/file.ts` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
+**Per-edit feedback:** Pass the changed files. Keep the full-project warning gate before a PR. Edited-file latency is measured; the daemon does not yet meet the <100 ms goal.
+
+**Not verified:** Exit 2 means an environment, authentication, or scan failure; exit 3 means nothing was scanned. Resolve either before treating the result as a pass.
 
 **Bug Severity:**
 - **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks
@@ -4218,10 +4376,15 @@ append_quick_reference_block() {
     return 0
   fi
 
+  if [ -L "$destination" ]; then
+    warn "Refusing to replace a symlinked UBS reference: $destination"
+    return 1
+  fi
+
   # Handle directory-based rule storage (e.g., Codex CLI uses .codex/rules/ directory)
-  # For directories: check recursively if marker exists anywhere inside, then write to ubs.md
+  # Refresh our own ubs.md; a reference in another file may be custom guidance.
   if [ -d "$destination" ]; then
-    if grep -rqF "$marker" "$destination" 2>/dev/null; then
+    if [ ! -f "$destination/ubs.md" ] && grep -rqF "$marker" "$destination" 2>/dev/null; then
       [ -n "$friendly_name" ] && log "${friendly_name} already contains UBS quick reference"
       return 0
     fi
@@ -4230,9 +4393,67 @@ append_quick_reference_block() {
 
   mkdir -p "$(dirname "$destination")"
 
+  if [ -L "$destination" ]; then
+    warn "Refusing to replace a symlinked UBS reference: $destination"
+    return 1
+  fi
+
   # For file-based storage: check if marker exists in the specific target file
   if [ -f "$destination" ] && grep -qF "$marker" "$destination" 2>/dev/null; then
-    [ -n "$friendly_name" ] && log "${friendly_name} already contains UBS quick reference"
+    if ! command -v python3 >/dev/null 2>&1; then
+      warn "python3 is required to refresh existing UBS guidance in $destination"
+      return 1
+    fi
+    local reference result
+    reference="$(quick_reference_block)"
+    if ! result="$(python3 - "$destination" "$reference" <<'PY'
+import hashlib, os, re, shutil, stat, sys, tempfile
+
+path, replacement = sys.argv[1:]
+with open(path, encoding='utf-8', newline='') as source:
+    original = source.read()
+start = '<!-- >>> Ultimate Bug Scanner quick reference (written by install.sh; removed by install.sh --uninstall) -->'
+end = '<!-- <<< End Ultimate Bug Scanner quick reference -->'
+if start in original or end in original:
+    if original.count(start) != 1 or original.count(end) != 1 or original.index(start) >= original.index(end):
+        raise SystemExit('Ambiguous UBS reference markers; existing rules preserved')
+    first, last = original.index(start), original.index(end) + len(end)
+else:
+    # Only this exact legacy installer block is ours to replace. A modified
+    # reference belongs to the user and must survive an installer upgrade.
+    matches = list(re.finditer(r'````markdown\r?\n## UBS Quick Reference for AI Agents\r?\n.*?\r?\n````', original, re.S))
+    known = 'b96e61d77ed1cada4c7868192d44c237c27756f31575e616dd433037895bb650'
+    if len(matches) != 1 or hashlib.sha256(matches[0].group().replace('\r\n', '\n').encode()).hexdigest() != known:
+        print('custom')
+        raise SystemExit(0)
+    first, last = matches[0].span()
+updated = original[:first] + replacement + original[last:]
+if updated == original:
+    print('unchanged')
+    raise SystemExit(0)
+directory = os.path.dirname(path) or '.'
+mode = stat.S_IMODE(os.stat(path).st_mode)
+backup_fd, backup = tempfile.mkstemp(prefix=os.path.basename(path) + '.bak-ubs-', dir=directory)
+os.close(backup_fd)
+shutil.copy2(path, backup)
+fd, temporary = tempfile.mkstemp(prefix='.ubs-reference-', dir=directory)
+with os.fdopen(fd, 'w', encoding='utf-8', newline='') as output:
+    os.fchmod(output.fileno(), mode)
+    output.write(updated)
+    output.flush()
+    os.fsync(output.fileno())
+os.replace(temporary, path)
+print('updated')
+PY
+)"; then
+      warn "Could not refresh UBS guidance in $destination; existing rules preserved"
+      return 1
+    fi
+    case "$result" in
+      updated) [ -n "$friendly_name" ] && success "Updated UBS quick reference in ${friendly_name}" ;;
+      custom) log "Preserved custom UBS guidance in $destination" ;;
+      unchanged) [ -n "$friendly_name" ] && log "${friendly_name} already contains current UBS quick reference" ;;
+    esac
     return 0
   fi
 

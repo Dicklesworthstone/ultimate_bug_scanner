@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 20
     permissions:
       contents: read
@@ -142,7 +142,7 @@ jobs:
   publish-objects:
     needs: validate
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 10
     permissions:
       contents: write
@@ -166,8 +166,8 @@ jobs:
           executables = (shell - {'modules/lib/ubs-common.sh'}) | {'test-suite/quality/test_suppression_intervals.py'}
           allowed = shell | {'SHA256SUMS', 'modules/helpers/ubs_core/analyzers/taint_rust.py',
               'modules/helpers/ubs_core/rust_detectors/open_redirect.py',
-              'modules/helpers/ubs_core/rust_detectors/redirect_flow.py',
               'modules/helpers/ubs_core/rust_scan.py',
+              'modules/helpers/ubs_core/rust_detectors/redirect_flow.py',
               'test-suite/quality/test_rust_redirect_dataflow.py',
               'test-suite/quality/test_suppression_intervals.py'}
           published = {}

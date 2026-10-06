@@ -200,13 +200,13 @@ def code_line(source_line):
     return re.sub(r'/\*.*?\*/', '', strip_line_comments(source_line))
 
 
-def statement_from(lines, idx, max_lines=8):
+def statement_from(code_lines, idx, max_lines=8):
     parts = []
     paren_balance = 0
     brace_balance = 0
     saw_code = False
-    for line_idx in range(idx, min(len(lines), idx + max_lines)):
-        current = code_line(lines[line_idx]).strip()
+    for line_idx in range(idx, min(len(code_lines), idx + max_lines)):
+        current = code_lines[line_idx].strip()
         if not current:
             if parts:
                 break
@@ -238,7 +238,7 @@ CONTINUATION_TAIL = ('=', '(', '[', ',', '&&', '||', '?', ':', '+', '=>', '.')
 CONTINUATION_HEAD = ('.', '?', ':', ')', ']', '&&', '||', '+', '===', '!==', '==', '!=')
 
 
-def statement_start(lines, index):
+def statement_start(code_lines, index):
     # Walk upward over physical lines that belong to the same statement as
     # lines[index] (assignment/paren/operator continuations), so a suppression
     # marker placed above a MULTI-LINE statement still attaches to a finding
@@ -247,8 +247,8 @@ def statement_start(lines, index):
     for _ in range(8):
         if start <= 0:
             break
-        prev = code_line(lines[start - 1]).strip()
-        cur = code_line(lines[start]).strip()
+        prev = code_lines[start - 1].strip()
+        cur = code_lines[start].strip()
         if not prev:
             break
         if prev.endswith(CONTINUATION_TAIL) or cur.startswith(CONTINUATION_HEAD):
@@ -258,7 +258,7 @@ def statement_start(lines, index):
     return start
 
 
-def has_ignore(lines, index):
+def has_ignore(lines, code_lines, index):
     # Suppression markers live in comments, so they must be checked against the
     # RAW source line, never against comment-stripped text: code_line() removes
     # '// ubs:ignore' before it could ever match.
@@ -275,24 +275,24 @@ def has_ignore(lines, index):
         return False
     if 'ubs:ignore' in lines[index]:
         return True
-    start = statement_start(lines, index)
+    start = statement_start(code_lines, index)
     for pos in range(max(0, start - 1), index):
         if 'ubs:ignore' in lines[pos]:
             return True
-    if code_line(lines[index]).rstrip().endswith('{') and index + 1 < len(lines):
+    if code_lines[index].rstrip().endswith('{') and index + 1 < len(lines):
         relocated = lines[index + 1].strip()
         if relocated.startswith(('//', '/*', '*')) and 'ubs:ignore' in relocated:
             return True
     return False
 
 
-def collect_sensitive_vars(lines):
+def collect_sensitive_vars(lines, code_lines):
     sensitive_vars = set()
-    for idx, raw in enumerate(lines):
-        stripped = code_line(raw).strip()
-        if not stripped or has_ignore(lines, idx) or '=>' in stripped:
+    for idx, code in enumerate(code_lines):
+        stripped = code.strip()
+        if not stripped or has_ignore(lines, code_lines, idx) or '=>' in stripped:
             continue
-        statement = statement_from(lines, idx, max_lines=5)
+        statement = statement_from(code_lines, idx, max_lines=5)
         if not statement or safe_compare_re.search(statement):
             continue
         match = assignment_re.search(statement) or loose_assignment_re.search(statement)
@@ -428,21 +428,25 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
         lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
     except Exception:
         return issues
-    sensitive_vars = collect_sensitive_vars(lines)
+    # Statement lookahead and ignore placement revisit each physical line.
+    # Keep its exact lexical view only for this file; raw comments remain
+    # available for suppressions, and no source survives into the next file.
+    code_lines = [code_line(raw) for raw in lines]
+    sensitive_vars = collect_sensitive_vars(lines, code_lines)
     seen_lines = set()
-    for idx, raw in enumerate(lines):
-        stripped = code_line(raw).strip()
-        if not stripped or has_ignore(lines, idx) or ('==' not in stripped and '!=' not in stripped):
+    for idx, code in enumerate(code_lines):
+        stripped = code.strip()
+        if not stripped or has_ignore(lines, code_lines, idx) or ('==' not in stripped and '!=' not in stripped):
             continue
         prefix = ''
         if compare_re.match(stripped):
             # An operator may start a continuation line. Recover its real left
             # operand, but do not re-report comparisons from the prefix.
-            start = statement_start(lines, idx)
-            prefix = ' '.join(code_line(line).strip() for line in lines[start:idx])
+            start = statement_start(code_lines, idx)
+            prefix = ' '.join(line.strip() for line in code_lines[start:idx])
             if prefix:
                 prefix += ' '
-        statement = prefix + statement_from(lines, idx)
+        statement = prefix + statement_from(code_lines, idx)
         # Lookahead completes a multiline operand, but a comparison on a later
         # physical line must be reported there, not on this line as well.
         if not statement or not unsafe_secret_compare(
@@ -523,9 +527,9 @@ export function doneTokenCheck(doneAuthToken: string, expectedAuthToken: string)
 
 def _selftest_positive() -> None:
     statement = "return sessionNonce === expectedNonce;"
-    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement])), statement
+    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement], [code_line(statement)])), statement
     statement = "if (doneAuthToken !== expectedAuthToken) {"
-    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement])), statement
+    assert unsafe_secret_compare(statement, collect_sensitive_vars([statement], [code_line(statement)])), statement
 
 
 def _selftest_suppression() -> None:

@@ -193,6 +193,50 @@ class CredentialDetectionTests(unittest.TestCase):
                     with self.subTest(language=language, name=name, alias=alias):
                         self.assert_sensitive(language, name, alias=alias)
 
+    def test_js_comment_views_keep_multiline_suppression_local(self) -> None:
+        source = '\n'.join([
+            'const publicUrl = "https://example.org/token";',
+            'const alias = req.headers.authorization;',
+            '// ubs:ignore -- comparison below is deliberate',
+            'if (alias',
+            '    !== expectedAuthToken) {',
+            '  return false;',
+            '}',
+            'if (alias !== expectedAuthToken) {',
+            '  return false;',
+            '}',
+            'if (alias !== expectedAuthToken) {',
+            '  // ubs:ignore -- relocated block-opening marker',
+            '  return false;',
+            '}',
+            'if (alias !== expectedAuthToken) { // ubs:ignore -- trailing marker',
+            '  return false;',
+            '}',
+            'if (alias !== expectedAuthToken) {',
+            '  return false;',
+            '}',
+        ]) + '\n'
+        self.assertEqual(scan_lines('js', source), [8, 18], source)
+
+    def test_js_continued_operands_preserve_quotes_and_physical_lines(self) -> None:
+        source = '\n'.join([
+            'const password = request.password;',
+            'const value = password;',
+            'const publicUrl = "https://example.org/a//b";',
+            'if (publicUrl === "https://example.org/a//b") {',
+            '  return true;',
+            '}',
+            'if (value',
+            '    === expectedPassword) {',
+            '  return true;',
+            '}',
+            'const comment = "/* public metadata */";',
+            'if (value /* explanatory comment */ !== expectedPassword) {',
+            '  return false;',
+            '}',
+        ]) + '\n'
+        self.assertEqual(scan_lines('js', source), [8, 12], source)
+
 
 if __name__ == "__main__":
     unittest.main()

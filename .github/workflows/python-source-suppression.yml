@@ -1,0 +1,183 @@
+name: Python Source Suppression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-source-suppression.yml
+      - modules/helpers/ubs_core/py_scan.py
+      - modules/helpers/ubs_core/suppression.py
+      - modules/helpers/ubs_core/cache.py
+      - modules/helpers/ubs_core/analyzers/*_py.py
+      - test-suite/quality/test_python_suppression.py
+      - test-suite/quality/test_python_precision.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_cache.py
+  workflow_dispatch:
+
+# Candidate preparation only: this job may create content-addressed Git
+# objects, but never updates a branch, creates a PR, or commits automatically.
+# The landing commit replaces this bootstrap with the read-only regression gate.
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      UBS_NO_AUTO_UPDATE: '1'
+      ENABLE_UV_TOOLS: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare the reviewed GH-159 candidate without changing main
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/py_scan.py)" = 435a102f340ae7eba76d38ced37afbf1bb16f061
+          git apply - <<'PATCH'
+          diff --git a/modules/helpers/ubs_core/py_scan.py b/modules/helpers/ubs_core/py_scan.py
+          index 435a102..5acd9ab 100644
+          --- a/modules/helpers/ubs_core/py_scan.py
+          +++ b/modules/helpers/ubs_core/py_scan.py
+          @@ -39,6 +39,7 @@ from typing import Iterable, Sequence
+           from ubs_core.io import read_ndjson
+           from ubs_core.lexer import strip_comments_and_strings
+           from ubs_core.registry import RunContext
+          +from ubs_core.suppression import SourceSuppressions
+           
+           MARKER = "ubs:ignore"
+           _PATTERN_CACHE_KIND = "_ubs_python_pattern"
+          @@ -798,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
+                   extra=f"new_analyzers={args.enable_new_analyzers}",
+               )
+               cached_findings, files_to_scan = cache.partition_files(files)
+          +    suppressions = SourceSuppressions("python")
+           
+               capturing_sink = None
+               if files_to_scan:
+          @@ -858,7 +860,10 @@ def main(argv: list[str] | None = None) -> int:
+                   # run would hit the cache and report the findings this one could not
+                   # produce as a clean, finished scan (#111, same shape as #103).
+                   if not scan_errors:
+          -            cache.store_scanned_files(files_to_scan, capturing_sink.by_file)
+          +            cache.store_scanned_files(files_to_scan, {
+          +                path: suppressions.filter(records)
+          +                for path, records in capturing_sink.by_file.items()
+          +            })
+               else:
+                   from ubs_core.prefilter import PrefilterResult
+                   prefilter_res = PrefilterResult(
+          @@ -883,7 +888,10 @@ def main(argv: list[str] | None = None) -> int:
+                   if recs:
+                       all_recs.extend(recs)
+           
+          -    all_recs = reconcile_pattern_records(patterns, all_recs)
+          +    # Filter cold and cached records before resolving project-wide pattern
+          +    # thresholds. Suppressed source matches must not raise other sites' tiers;
+          +    # locationless pattern context and project findings remain intact.
+          +    all_recs = reconcile_pattern_records(patterns, suppressions.filter(all_recs))
+           
+               # Imported helpers can change findings in otherwise unchanged files. Keep
+               # this selected-project pass out of per-file caches and literal prefilters;
+          @@ -895,7 +903,9 @@ def main(argv: list[str] | None = None) -> int:
+                   all_recs.extend(taint_sink.get_for_file(f))
+           
+               with open(args.sink, "w", encoding="utf-8") as sink_file:
+          -        for r in all_recs:
+          +        # Include the uncached project pass in the same source-marker policy.
+          +        # All formats, counts and exit decisions consume this filtered sink.
+          +        for r in suppressions.filter(all_recs):
+                       sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
+           
+               cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
+          PATCH
+          test "$(git hash-object modules/helpers/ubs_core/py_scan.py)" = 5acd9abf8c7fe0d96f385ac2121d5f4609deccc2
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/python-suppression-tested.diff"
+      - name: Install real scanner dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
+          npm install --global @ast-grep/cli@0.45.3
+          ast-grep --version
+      - name: Verify runtime integrity and shell syntax
+        run: |
+          ./scripts/verify_checksums.sh > "$RUNNER_TEMP/python-suppression-checksums.log"
+          ./scripts/verify_sha256sums.sh
+          for source in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$source"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+      - name: Exercise source markers, real CLI, cache and existing Python gates
+        run: |
+          set -o pipefail
+          for suite in test_python_suppression.py test_python_precision.py test_suppression_intervals.py test_ubs_core.py 'test_findings*.py' test_security_precision.py; do
+            python3 -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/python-suppression-${suite//\*/all}.log"
+          done
+          python3 -m unittest discover -s test-suite/quality -p test_cache.py -k python -v 2>&1 | tee "$RUNNER_TEMP/python-suppression-cache.log"
+          python3 test-suite/run_manifest.py --case python-resource-lifecycle --case python-suppression-intervals-markers --case python-suppression-intervals-nomarkers 2>&1 | tee "$RUNNER_TEMP/python-suppression-manifest.log"
+      - name: Scan changed Python sources with UBS
+        run: |
+          set -o pipefail
+          ./ubs --ci --fail-on-warning --no-cache --only=python modules/helpers/ubs_core/py_scan.py 2>&1 | tee "$RUNNER_TEMP/python-suppression-selfscan-core.log"
+          ./ubs --ci --fail-on-warning --no-cache --only=python test-suite/quality/test_python_suppression.py 2>&1 | tee "$RUNNER_TEMP/python-suppression-selfscan-tests.log"
+      - name: Require deterministic checksum closure and unchanged tested source
+        run: |
+          git diff --check
+          python3 scripts/update_checksums.py
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/python-suppression-regenerated.diff"
+          cmp "$RUNNER_TEMP/python-suppression-tested.diff" "$RUNNER_TEMP/python-suppression-regenerated.diff"
+          test -z "$(git ls-files --others --exclude-standard)"
+      - name: Publish verified Git objects only, never a ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          def api(endpoint, payload):
+              result = subprocess.run(
+                  ['gh', 'api', '--method', 'POST', f'repos/{os.environ["GITHUB_REPOSITORY"]}/git/{endpoint}', '--input', '-'],
+                  input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=120,
+              )
+              return json.loads(result.stdout)
+
+          allowed = {'modules/helpers/ubs_core/py_scan.py', 'modules/lib/ubs-common.sh',
+                     'ubs', 'SHA256SUMS', 'scripts/new-module.sh'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          changed = set(git('diff', '--name-only').splitlines())
+          assert changed == allowed, (changed, allowed)
+          entries = []
+          for name in sorted(changed):
+              data = Path(name).read_bytes()
+              expected = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              actual = api('blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
+              assert actual == expected, (name, actual, expected)
+              entries.append({'path': name, 'mode': git('ls-files', '-s', '--', name).split()[0],
+                              'type': 'blob', 'sha': actual})
+          base = git('rev-parse', 'HEAD')
+          tree = api('trees', {'base_tree': git('rev-parse', 'HEAD^{tree}'), 'tree': entries})['sha']
+          subprocess.run(['git', 'add', '--', *sorted(changed)], check=True)
+          assert tree == git('write-tree'), 'Remote object tree differs from tested bytes'
+          manifest = {'base': base, 'tree': tree, 'files': entries}
+          target = Path(os.environ['RUNNER_TEMP']) / 'python-suppression-candidate.json'
+          target.write_text(json.dumps(manifest, indent=2) + '\n')
+          print('VERIFIED_CANDIDATE_TREE=' + tree)
+          print('VERIFIED_CANDIDATE_BASE=' + base)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: python-source-suppression-${{ github.sha }}
+          path: ${{ runner.temp }}/python-suppression-*
+          retention-days: 7

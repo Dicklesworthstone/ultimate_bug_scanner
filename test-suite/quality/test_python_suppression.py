@@ -61,6 +61,12 @@ class PythonSourceSuppressionTests(unittest.TestCase):
             "ENABLE_UV_TOOLS": "0",
         })
 
+    def decode_json(self, payload: str, context: str):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            self.fail(f"{context}: invalid scanner JSON: {exc}\n{payload[:1000]}")
+
     def scan(self, *, no_cache: bool = False, enable_new: bool = False):
         paths = self.root / "files.txt"
         paths.write_bytes(os.fsencode(self.source) + b"\0")
@@ -77,8 +83,8 @@ class PythonSourceSuppressionTests(unittest.TestCase):
             env["UBS_NO_CACHE"] = "1"
         with patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(io.StringIO()):
             code = py_scan.main(args)
-        records = [json.loads(line) for line in sink.read_text().splitlines() if line.strip()]
-        doc = json.loads(summary.read_text())
+        records = [self.decode_json(line, str(sink)) for line in sink.read_text().splitlines() if line.strip()]
+        doc = self.decode_json(summary.read_text(), str(summary))
         self.assertEqual(doc["status"], "ok", doc)
         counts = Counter(record["severity"] for record in records)
         for severity in ("critical", "warning", "info"):
@@ -95,7 +101,7 @@ class PythonSourceSuppressionTests(unittest.TestCase):
         entries = list((self.root / "cache").glob("*/files/**/*.json"))
         self.assertTrue(entries, "the test must inspect a populated real cache")
         records = [record for entry in entries
-                   for record in json.loads(entry.read_text()).get("findings", [])]
+                   for record in self.decode_json(entry.read_text(), str(entry)).get("findings", [])]
         self.assertEqual(self.sites(records, rule), expected, records)
 
     def test_all_registry_families_share_marker_semantics_and_cache_boundaries(self) -> None:
@@ -182,6 +188,24 @@ class PythonSourceSuppressionTests(unittest.TestCase):
         self.assertEqual(self.sites(self.scan()[1], NARROWING), [])
         self.assertEqual(self.sites(self.scan(enable_new=True)[1], NARROWING), [4])
 
+    def test_multiline_lifecycle_markers_follow_the_logical_statement(self) -> None:
+        for marker in ("# ubs:ignore", f"# ubs:ignore[{LIFECYCLE}]"):
+            for position in ("preceding", "argument", "closing"):
+                with self.subTest(marker=marker, position=position):
+                    lines = ["def marked(path):"]
+                    if position == "preceding":
+                        lines.append("    " + marker)
+                    lines.extend(["    handle = open(", '        path, encoding="utf-8"' +
+                                  ("  " + marker if position == "argument" else ""),
+                                  "    )" + ("  " + marker if position == "closing" else ""),
+                                  "    return handle", "", "def unmarked(path):",
+                                  '    handle = open(path, encoding="utf-8")',
+                                  "    return handle.read()"])
+                    self.source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    for result in (self.scan(), self.scan(), self.scan(no_cache=True)):
+                        self.assertEqual(self.sites(result[1], LIFECYCLE), [len(lines) - 1])
+                        self.assertEqual(result[2]["critical"], 1)
+
     def test_future_analyzers_and_project_records_use_same_pipeline(self) -> None:
         self.source.write_text("x = 1  # ubs:ignore\ny = 2\n", encoding="utf-8")
         calls = Counter()
@@ -240,11 +264,11 @@ class PythonSourceSuppressionTests(unittest.TestCase):
                     self.assertEqual(code, 0)
 
     @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
-    def test_public_ci_json_and_text_agree_with_lifecycle_sink(self) -> None:
+    def test_public_ci_json_text_and_sarif_agree_with_lifecycle_sink(self) -> None:
         for only_marked in (False, True):
             self.source.write_text(REPRO.split('\n\n')[0] + '\n' if only_marked else REPRO,
                                    encoding="utf-8")
-            for output_format in ("json", "text"):
+            for output_format in ("json", "text", "sarif"):
                 with self.subTest(only_marked=only_marked, format=output_format):
                     command = [str(REPO_ROOT / "ubs"), "--ci", "--no-cache", "--only=python",
                                f"--format={output_format}", str(self.source)]
@@ -253,7 +277,7 @@ class PythonSourceSuppressionTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, int(not only_marked), proc.stdout + proc.stderr)
                     expected = int(not only_marked)
                     if output_format == "json":
-                        doc = json.loads(proc.stdout)
+                        doc = self.decode_json(proc.stdout, "public JSON CLI")
                         self.assertEqual(doc["status"], "ok", doc)
                         self.assertEqual(doc["failed_modules"], [], doc)
                         self.assertEqual(doc["totals"]["critical"], expected, doc)
@@ -261,6 +285,13 @@ class PythonSourceSuppressionTests(unittest.TestCase):
                                     if record["rule_id"] == LIFECYCLE]
                         self.assertEqual([record["line"] for record in findings], [] if only_marked else [7])
                         self.assertTrue(all(record["suppressed"] is False for record in findings))
+                    elif output_format == "sarif":
+                        doc = self.decode_json(proc.stdout, "public SARIF CLI")
+                        findings = [record for run in doc["runs"] for record in run["results"]
+                                    if record["ruleId"] == LIFECYCLE]
+                        self.assertEqual([record["locations"][0]["physicalLocation"]["region"]["startLine"]
+                                          for record in findings], [] if only_marked else [7])
+                        self.assertTrue(all(record["level"] == "error" for record in findings))
                     else:
                         self.assertRegex(proc.stdout, rf"Critical issues:\s+{expected}\b")
                         if not only_marked:

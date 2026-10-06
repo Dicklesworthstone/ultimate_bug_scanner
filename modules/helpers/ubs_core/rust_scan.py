@@ -986,12 +986,14 @@ class Scan:
         hits: list[Hit] = []
         try:
             module = importlib.import_module(f"ubs_core.rust_detectors.{module_name}")
-        except Exception as exc:  # legacy heredoc failures degraded gracefully
+        except Exception as exc:
+            self.scan_errors.append(f"detector {module_name} could not load: {exc}")
             sys.stderr.write(f"[ubs_core.rust_scan] detector {module_name} failed: {exc}\n")
             self._detector_cache[key] = hits
             return hits
         find = getattr(module, "find", None)
-        if find is None:
+        if not callable(find):
+            self.scan_errors.append(f"detector {module_name} has no callable find entrypoint")
             self._detector_cache[key] = hits
             return hits
         detector_base = Path.cwd()
@@ -1002,13 +1004,20 @@ class Scan:
             root = Path(args[0] if args and args[0] is not None else self.project_dir).resolve()
             args = (root,)
             detector_base = root if root.is_dir() else root.parent
-        for hit in find(self.files, *args):
-            path_str, line_no, col, code = hit[0], hit[1], hit[2], hit[3]
-            path_str = str((detector_base / Path(path_str)).resolve())
-            # legacy: heredoc stdout -> count_lines (marker + test filter)
-            if self.suppressions.is_suppressed(path_str, int(line_no), None) or self._is_test_line(path_str, int(line_no), int(col)):
-                continue
-            hits.append(Hit(path_str, int(line_no), int(col), code))
+        try:
+            for hit in find(self.files, *args):
+                path_str, line_no, col, code = hit[0], hit[1], hit[2], hit[3]
+                path_str = str((detector_base / Path(path_str)).resolve())
+                # legacy: heredoc stdout -> count_lines (marker + test filter)
+                if self.suppressions.is_suppressed(path_str, int(line_no), None) or self._is_test_line(path_str, int(line_no), int(col)):
+                    continue
+                hits.append(Hit(path_str, int(line_no), int(col), code))
+        except Exception as exc:
+            # Keep earlier findings if a generator fails, continue other
+            # detectors, and mark the scan partial. main() returns 2 and never
+            # caches this result as a completed scan.
+            self.scan_errors.append(f"detector {module_name} did not complete: {exc}")
+            sys.stderr.write(f"[ubs_core.rust_scan] detector {module_name} failed: {exc}\n")
         self._detector_cache[key] = hits
         return hits
 
@@ -2265,6 +2274,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m ubs_core.rust_scan")
     parser.add_argument("--files-from", required=True, help="NUL-separated file list ('-' = stdin)")
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
+    parser.add_argument("--completion-out", help="Bounded completion receipt, written only after all outputs finish")
     parser.add_argument("--project-dir", default=".")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--fail-on-warning", action="store_true")
@@ -2498,6 +2508,14 @@ def main(argv: list[str] | None = None) -> int:
     # be reported as a finished scan, whatever it happened to find (#111).
     if scan.scan_errors:
         exit_code = 2
+    if args.completion_out:
+        # Text mode needs a completion signal without duplicating its ledger.
+        receipt = {"language": "rust", "status": "partial" if scan.scan_errors else "ok",
+                   "files": files_n,
+                   **{severity: scan.counters[severity] for severity in ("critical", "warning", "info")}}
+        if scan.scan_errors:
+            receipt["message"] = ("Rust analysis did not complete: " + "; ".join(scan.scan_errors[:5]))[:500]
+        Path(args.completion_out).write_text(json.dumps(receipt) + "\n", encoding="utf-8")
     for problem in scan.scan_errors:
         sys.stderr.write(f"ubs-rust: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps({

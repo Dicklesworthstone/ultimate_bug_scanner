@@ -1,300 +1,247 @@
-"""ubs_core.analyzers.taint_csharp_redirect — request → open-redirect taint (bead A2).
+"""C# request-to-redirect dataflow using the shared C# CFG and summaries (D6).
 
-Verbatim port of the `run_request_open_redirect_checks` python heredoc in
-modules/ubs-csharp.sh: request-derived redirect targets (returnUrl/url/next/
-callback-style keys plus Request.Host/Path*) reaching Redirect/Results.Redirect/
-Location-header sinks in C# sources. `main` reproduces the heredoc's
-`path:line:code` emit dialect over a NUL-delimited file list; `run` yields the
-same detections as structured NDJSON findings over ctx.files.
+Local-url predicates refine only the branch on which validation succeeds.
+Local helpers are analyzed by their bodies, including returns and ref/out
+effects. File-path sanitizers and promising helper names do not validate URLs.
+URI allowlists require the parsed URI, an absolute HTTPS scheme and exact,
+constant hosts in the same guard. Only the selected source file is inspected;
+heap, virtual-dispatch and cross-file summaries remain outside this frontend.
 """
 from __future__ import annotations
 
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.analyzers.taint_csharp_request import CSharpFlow, parts
+from ubs_core.suppression import SourceSuppressions
+from ubs_core.taint_flow import CLEAN, advance, join
 import re
 import sys
 from pathlib import Path
 
-PROJECT_DIR = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path.cwd().resolve()
-BASE_DIR = PROJECT_DIR if PROJECT_DIR.is_dir() else PROJECT_DIR.parent
-FILELIST = Path(sys.argv[2]) if len(sys.argv) > 2 else Path()
-
-REDIRECT_KEY = r'(?:return(?:url|uri|to)?|return_to|redirect(?:url|uri|to)?|next|continue|callback|target|destination|location|url|uri)'
-
-SOURCE_RE = re.compile(
-    rf'\b(?:HttpContext\.)?Request\.(?:Query|Form|RouteValues|Headers|Cookies)\s*\[[^\]]*{REDIRECT_KEY}[^\]]*\]'
-    rf'|\b(?:HttpContext\.)?Request\.(?:Query|Form|RouteValues|Headers|Cookies)\.(?:TryGetValue|ContainsKey)\s*\([^)]*{REDIRECT_KEY}[^)]*\)'
-    r'|\b(?:HttpContext\.)?Request\.(?:Host|Path|PathBase|RawTarget|QueryString)\b(?:\.Value\b)?'
-    r'|\b(?:ControllerContext|ActionContext)\.HttpContext\.Request\.(?:Host|Path|RawTarget|QueryString)\b',
-    re.IGNORECASE,
-)
-REQUEST_COLLECTION_RE = re.compile(
-    r'\b(?:HttpContext\.)?Request\.(?:Query|Form|RouteValues|Headers|Cookies)\s*\[[^\]]+\]'
-    r'|\b(?:HttpContext\.)?Request\.(?:Query|Form|RouteValues|Headers|Cookies)\.(?:TryGetValue|ContainsKey)\s*\(',
-    re.IGNORECASE,
-)
-URLISH_NAME_RE = re.compile(
-    r'(?:return(?:url|uri|to)?|return_to|redirect(?:url|uri|to)?|next|continue|callback|target|destination|location|url|uri)',
-    re.IGNORECASE,
-)
-SAFE_EXPR_RE = re.compile(
-    r'\b(?:LocalRedirect|SafeRedirect(?:Url|Uri|Target)?|ValidatedRedirect(?:Url|Uri|Target)?|'
-    r'Validate(?:Redirect|Return)(?:Url|Uri|Target)?|SanitizeRedirect(?:Url|Uri|Target)?|'
-    r'IsLocalUrl|IsAllowedRedirect(?:Url|Uri|Target)?|AllowedRedirect(?:Url|Uri|Target)?|'
-    r'TrustedRedirect(?:Url|Uri|Target)?|SameOriginRedirect(?:Url|Uri|Target)?|'
-    r'RequireLocalRedirect|RequireAllowedRedirectHost)\b',
-    re.IGNORECASE,
-)
-URI_PARSE_RE = re.compile(r'\b(?:Uri\.TryCreate|new\s+Uri)\s*\(')
-HOST_CHECK_RE = re.compile(
-    r'\.(?:Scheme|Host|IsLoopback)\b'
-    r'|\b(?:AllowedHosts|AllowedRedirectHosts|RedirectAllowlist|TrustedHosts|KnownRedirectOrigins|ALLOWED_HOSTS)\b'
-    r'|\.Contains\s*\('
-    r'|\bUri\.UriSchemeHttps\b'
-    r'|\bStringComparison\.OrdinalIgnoreCase\b',
-    re.IGNORECASE,
-)
-REJECT_RE = re.compile(r'\b(?:throw|return\s+(?:null|false)|BadRequest|Forbid|Unauthorized|NotFound)\b', re.IGNORECASE)
-SINK_RE = re.compile(
-    r'\b(?:Response\.)?Redirect(?:Permanent|PreserveMethod|PermanentPreserveMethod)?\s*\('
-    r'|\bResults\.Redirect\s*\('
-    r'|\bnew\s+RedirectResult\s*\('
-    r"""|\b(?:HttpContext\.)?Response\.Headers\s*\[\s*["']Location["']\s*\]\s*="""
-    r"""|\b(?:HttpContext\.)?Response\.Headers\.(?:Append|Add)\s*\(\s*["']Location["']\s*,""",
-    re.IGNORECASE,
-)
-ASSIGN_RE = re.compile(
-    r'^\s*(?:var|string|String|Uri|UriBuilder|IActionResult|IResult|RedirectResult|StringValues)?\s*'
-    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)$'
-)
-OUT_PARAM_RE = re.compile(
-    rf'\b(?:HttpContext\.)?Request\.(?:Query|Form|RouteValues|Headers|Cookies)\.TryGetValue\s*\([^)]*{REDIRECT_KEY}[^)]*,\s*out\s+'
-    r'(?:var\s+|[A-Za-z_][A-Za-z0-9_.<>, ?\[\]]*\s+)?(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)',
-    re.IGNORECASE,
-)
-PATH_LIMIT = 4
+RULE = "csharp.taint.open_redirect"
+MESSAGE = "Unvalidated redirect from request data"
+LOCAL_VALIDATORS = frozenset({"Url.IsLocalUrl", "this.Url.IsLocalUrl",
+                            "RedirectHttpResult.IsLocalUrl",
+                            "Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult.IsLocalUrl"})
 
 
-def strip_line_comments(line: str) -> str:
-    out = []
-    quote = ''
-    escape = False
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            out.append(ch)
-            if escape:
-                escape = False
-            elif ch == '\\':
-                escape = True
-            elif ch == quote:
-                quote = ''
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-        if ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
-            break
-        out.append(ch)
-        i += 1
-    return ''.join(out)
+class RedirectFlow(CSharpFlow):
+    rule = RULE
+    message = MESSAGE
+    request_members = r"\.(?:Request\.)?(?:Query|Form|RouteValues|Headers|Cookies|Host|Path|PathBase|RawTarget|QueryString)\b"
+    source_pattern = re.compile(
+        r"\b(?:Request|request|req)\s*\.\s*(?:Query|Form|RouteValues|Headers|Cookies|Host|Path|PathBase|RawTarget|QueryString)\b")
 
+    def canonical(self, name):
+        name = re.sub(r"\s|@", "", name).replace("global::", "")
+        root = name.split(".")[0]
+        if root in self.aliases:
+            name = self.aliases[root] + name[len(root):]
+        return name
 
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
+    def literal(self, start, end):
+        """Read only literal values at syntax-validated argument positions."""
+        value = self.text[start:end].strip()
+        if re.fullmatch(r'"[^"\\]*"', value):
+            return value[1:-1]
+        if re.fullmatch(r'@"(?:[^"\n]|"")*"', value):
+            return value[2:-1].replace('""', '"')
+        return None
 
+    def strip_parentheses(self, start, end):
+        while True:
+            while start < end and self.text[start].isspace():
+                start += 1
+            while end > start and self.text[end - 1].isspace():
+                end -= 1
+            if self.code[start:start + 1] == "(" and self.parser.pairs.get(start) == end - 1:
+                start, end = start + 1, end - 1
+            else:
+                return start, end
 
-def logical_statement(lines, line_no):
-    idx = line_no - 1
-    statement = strip_line_comments(lines[idx])
-    paren_balance = statement.count('(') - statement.count(')')
-    has_end = ';' in statement or '{' in statement or '}' in statement
-    lookahead = idx + 1
-    while (paren_balance > 0 or not has_end) and lookahead < len(lines) and lookahead < idx + 10:
-        next_line = strip_line_comments(lines[lookahead]).strip()
-        statement += ' ' + next_line
-        paren_balance += next_line.count('(') - next_line.count(')')
-        has_end = has_end or ';' in next_line or '{' in next_line or '}' in next_line
-        lookahead += 1
-    return statement
+    def path_guard(self, span, bindings=None):
+        bindings = bindings or {}
+        start, end = self.strip_parentheses(*span)
+        truth = True
+        if self.code[start:start + 1] == "!":
+            truth = False
+            low, high = self.strip_parentheses(start + 1, end)
+        else:
+            low, high = start, end
+        match = re.fullmatch(r"([\w.@:]+)\s*\(\s*(@?\w+)\s*\)", self.code[low:high])
+        if match:
+            name, variable = match.groups()
+            canonical = self.canonical(name)
+            if (canonical in LOCAL_VALIDATORS and name.split(".")[0] not in bindings
+                    and not self.resolve(name, 1)):
+                return variable.lstrip("@"), "local-url", truth
+        return self.uri_guard(start, end, bindings)
 
+    def uri_guard(self, start, end, bindings):
+        """A rejecting OR guard proves its negated branch's parsed URI safe.
 
-def relpath(path: Path) -> str:
-    try:
-        return str(path.resolve().relative_to(BASE_DIR))
-    except ValueError:
-        return str(path)
+        The original string is deliberately retained: parsing can normalize a
+        URI, and a check of one object must not validate another string/object.
+        """
+        segments = list(parts(self.code, start, end, separator="|"))
+        # Splitting || produces an empty middle piece. Reject |, mixed &&,
+        # expressions with side effects, and unrecognized extra disjuncts.
+        if len(segments) != 5 or self.code[slice(*segments[1])].strip() or self.code[slice(*segments[3])].strip():
+            return None
+        parsed, scheme, host = (self.strip_parentheses(*segments[index]) for index in (0, 2, 4))
+        match = re.fullmatch(
+            r"!\s*((?:System\.)?Uri)\.TryCreate\s*\(\s*(@?\w+)\s*,\s*(?:System\.)?UriKind\.Absolute\s*,\s*out\s+(?:(?:var|(?:System\.)?Uri)\s+)?(@?\w+)\s*\)",
+            self.code[slice(*parsed)])
+        if (not match or self.canonical(match.group(1)) not in {"Uri", "System.Uri"}
+                or match.group(1).split(".")[0] in bindings or self.resolve(match.group(1) + ".TryCreate", 3)):
+            return None
+        uri = match.group(3).lstrip("@")
+        expected = rf"\s*{re.escape(uri)}\s*\.\s*Scheme\s*!=\s*(?:System\.)?Uri\.UriSchemeHttps\s*"
+        if not re.fullmatch(expected, self.code[slice(*scheme)]):
+            return None
+        host_code = self.code[slice(*host)]
+        equal = re.fullmatch(rf"\s*{re.escape(uri)}\.Host\s*!=\s*(.+)\s*", host_code)
+        if equal:
+            value = self.literal(host[0] + equal.start(1), host[0] + equal.end(1))
+            if value and re.fullmatch(r"[A-Za-z0-9.-]+", value):
+                return uri, "absolute-host", False
+        membership = re.fullmatch(rf"\s*!\s*([\w.]+)\.Contains\s*\(\s*{re.escape(uri)}\.Host\s*\)\s*", host_code)
+        if membership and self.constant_hosts(membership.group(1), bindings):
+            return uri, "absolute-host", False
+        return None
 
+    def constant_hosts(self, name, bindings):
+        """Recognize a private literal host set that never escapes or mutates.
 
-def source_line(lines, line_no):
-    idx = line_no - 1
-    if 0 <= idx < len(lines):
-        return lines[idx].strip()
-    return ''
-
-
-def load_paths():
-    try:
-        data = FILELIST.read_bytes().split(b'\0')
-    except OSError:
-        return []
-    return [Path(raw.decode('utf-8', 'ignore')) for raw in data if raw]
-
-
-def is_safe_expr(expr):
-    return bool(SAFE_EXPR_RE.search(expr))
-
-
-def refs_in_expr(expr, tainted):
-    refs = []
-    for name in tainted:
-        if re.search(rf'\b{re.escape(name)}\b', expr):
-            refs.append(name)
-    return refs
-
-
-def has_source(expr, target_name=''):
-    if SOURCE_RE.search(expr):
+        A readonly reference alone is insufficient: every use in the selected
+        source must be the exact Host-membership predicate. The name of a set
+        conveys no trust, and ambiguous declarations fail conservatively.
+        """
+        if "." in name or name in bindings:
+            return False
+        for typename, builtin in (("HashSet", "System.Collections.Generic.HashSet"),
+                                  ("StringComparer", "System.StringComparer")):
+            if typename in self.aliases and self.aliases[typename] != builtin:
+                return False
+            if any(owner.rsplit(".", 1)[-1] == typename for _, _, owner in self.parser.types):
+                return False
+        escaped = re.escape(name)
+        declarations = list(re.finditer(
+            rf"\bprivate\s+static\s+readonly\s+(?:System\.Collections\.Generic\.)?HashSet\s*<\s*string\s*>\s+{escaped}\s*=\s*new\s*(?:(?:System\.Collections\.Generic\.)?HashSet\s*<\s*string\s*>)?\s*\(\s*(?:StringComparer\.OrdinalIgnoreCase\s*)?\)\s*\{{", self.code))
+        if len(declarations) != 1:
+            return False
+        declaration = declarations[0]
+        opening = declaration.end() - 1
+        closing = self.parser.pairs[opening]
+        entries = list(parts(self.code, opening + 1, closing))
+        hosts = [self.literal(low, high) for low, high in entries]
+        if not hosts or any(not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host) for host in hosts):
+            return False
+        owners = tuple(owner for low, high, owner in self.parser.types if low < declaration.start() < high)
+        if owners != self.function.owner:
+            return False
+        for use in re.finditer(rf"\b{escaped}\b", self.code):
+            if declaration.start() <= use.start() <= closing:
+                continue
+            # Includes declarations, assignment, Add/Remove/Clear, passing the
+            # reference to helpers, and aliases to a mutable set.
+            if not re.match(r"\.Contains\s*\(\s*\w+\.Host\s*\)", self.code[use.end():]):
+                return False
         return True
-    return bool(target_name and URLISH_NAME_RE.search(target_name) and REQUEST_COLLECTION_RE.search(expr))
 
+    def apply_guard(self, action, state):
+        cell = action.bindings.get(action.guard[0])
+        if cell:
+            state.pop(cell, None)
+        return state
 
-def taint_from_expr(expr, tainted, target_name=''):
-    if is_safe_expr(expr):
-        return None
-    direct = has_source(expr, target_name)
-    if direct:
-        source = SOURCE_RE.search(expr)
-        return {'path': [(source.group(0) if source else target_name or 'request redirect target').strip()]}
-    refs = refs_in_expr(expr, tainted)
-    if not refs:
-        return None
-    ref = refs[0]
-    path = list(tainted.get(ref, {}).get('path', [ref]))
-    if len(path) >= PATH_LIMIT:
-        path = path[-(PATH_LIMIT - 1):]
-    path.append(ref)
-    return {'path': path}
+    def external_value(self, name, values, receiver):
+        if name in LOCAL_VALIDATORS or name in {"Uri.TryCreate", "System.Uri.TryCreate"}:
+            return CLEAN
+        # Path.GetFileName, HTML escaping, URL encoding and arbitrary Safe*
+        # helpers do not establish a safe redirect destination.
+        return join(receiver, *values)
 
+    def sink_arguments(self, name, args):
+        name = name.removeprefix("<instance>.")
+        owner, _, method = name.rpartition(".")
+        response = owner == "Response" or owner.endswith(".Response")
+        redirect = re.fullmatch(r"Redirect(?:Permanent|PreserveMethod|PermanentPreserveMethod)?", method)
+        if redirect and (response or owner in {"", "this", "Results", "TypedResults", "Microsoft.AspNetCore.Http.Results", "Microsoft.AspNetCore.Http.TypedResults"}):
+            keywords = {"url", "location"} if response else {"url"}
+        elif method == "RedirectResult" and owner in {"", "Microsoft.AspNetCore.Mvc"}:
+            keywords = {"url"}
+        elif method in {"Add", "Append"} and (owner == "Response.Headers" or owner.endswith(".Response.Headers")):
+            headers = [index for index, (key, _, _) in enumerate(args) if (key is None and index == 0) or key == "key"]
+            key = self.literal(*args[headers[0]][1:]) if headers else None
+            if key is None or key.casefold() != "location":
+                return []
+            return [index for index, (key, _, _) in enumerate(args) if (key is None and index == 1) or key == "value"]
+        else:
+            return []
+        return [index for index, (key, _, _) in enumerate(args) if (key is None and index == 0) or key in keywords]
 
-def has_safe_context(lines, line_no, refs):
-    if not refs:
-        return False
-    start = max(0, line_no - 24)
-    context = '\n'.join(strip_line_comments(line) for line in lines[start:line_no])
-    if not any(re.search(rf'\b{re.escape(ref)}\b', context) for ref in refs):
-        return False
-    for line in context.splitlines():
-        if SAFE_EXPR_RE.search(line) and any(re.search(rf'\b{re.escape(ref)}\b', line) for ref in refs):
-            return True
-    return bool(URI_PARSE_RE.search(context) and HOST_CHECK_RE.search(context) and REJECT_RE.search(context))
+    def transfer(self, action, state):
+        start, end = action.span
+        if action.kind in {"simple", "eval"}:
+            # Location header writes are sinks, not assignments to the whole
+            # HttpContext receiver. Inspect only the RHS of the actual setter.
+            match = re.match(r"\s*((?:\w+\.)*Response\.Headers)\s*(\[|\.Location\b)", self.code[start:end])
+            if match:
+                stop = start + match.end()
+                header = match.group(2) == ".Location"
+                if match.group(2) == "[":
+                    close = self.parser.pairs[stop - 1]
+                    key = self.literal(stop, close)
+                    header = key is not None and key.casefold() == "location"
+                    stop = close + 1
+                assignment = re.match(r"\s*=(?!=|>)", self.code[stop:end])
+                if header and assignment:
+                    value = self.evaluate(stop + assignment.end(), end, state, action.bindings)
+                    if value:
+                        name = match.group(1) + ".Location"
+                        key = (start + match.start(1), name)
+                        value = advance(value, self.step(key[0], "sink", name))
+                        self.effects[key] = join(self.effects.get(key, CLEAN), value)
+                    return state
+        return super().transfer(action, state)
 
 
 def analyze(path: Path, issues):
-    try:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    except OSError:
-        return
-    if not (re.search(r'\b(?:Request|HttpContext)\b', text) and SINK_RE.search(text)):
-        return
-    lines = text.splitlines()
-    tainted = {}
-    seen = set()
-    for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
-        statement = logical_statement(lines, idx).strip()
-        if not statement:
-            continue
-        out_param = OUT_PARAM_RE.search(statement)
-        if out_param:
-            out_source = out_param.group(0).strip()
-            if not out_source.endswith(')'):
-                out_source += ')'
-            tainted[out_param.group('lhs')] = {'path': [out_source]}
-        assign = ASSIGN_RE.match(statement)
-        if assign:
-            name = assign.group('lhs')
-            rhs = assign.group('rhs')
-            taint = taint_from_expr(rhs, tainted, name)
-            if taint:
-                tainted[name] = taint
-            elif name in tainted and is_safe_expr(rhs):
-                tainted.pop(name, None)
-        if not SINK_RE.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = has_source(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_safe_context(lines, idx, refs):
-            continue
-        key = (relpath(path), idx)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            source = SOURCE_RE.search(statement)
-            path_desc = f"{(source.group(0) if source else 'request redirect target').strip()} -> redirect sink"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get('path', [ref]))
-            if len(seq) >= PATH_LIMIT:
-                seq = seq[-(PATH_LIMIT - 1):]
-            seq.append('redirect sink')
-            path_desc = ' -> '.join(seq)
-        issues.append((relpath(path), idx, f"{source_line(lines, idx)}  [{path_desc}]"))
+    lines = path.read_text(encoding="utf-8-sig").splitlines()
+    for finding in run(RunContext(lang="csharp", files=[path])):
+        trace = " -> ".join(step["label"] for step in finding["extras"]["taint_path"])
+        issues.append((str(path), finding["line"], f"{lines[finding['line'] - 1].strip()}  [{trace}]"))
 
 
 def main(argv: list[str] | None = None) -> int:
     """Reproduce the module heredoc: `python3 - <project_dir> <nul-filelist> <<PY` emit dialect."""
-    global PROJECT_DIR, BASE_DIR, FILELIST
-
     argv = sys.argv if argv is None else list(argv)
-    PROJECT_DIR = Path(argv[1]).resolve()
-    BASE_DIR = PROJECT_DIR if PROJECT_DIR.is_dir() else PROJECT_DIR.parent
-    FILELIST = Path(argv[2])
+    if len(argv) < 3:
+        raise ValueError("Expected project directory and NUL-separated file list")
+    paths = [Path(raw.decode("utf-8", "surrogateescape")) for raw in Path(argv[2]).read_bytes().split(b"\0") if raw]
     issues = []
-    for file_path in load_paths():
+    for file_path in paths:
         analyze(file_path, issues)
     for file_name, line_no, code in issues:
         print(f"{file_name}:{line_no}:{code}")
     return 0
 
 
-_RUN_MESSAGE = "Unvalidated redirect from request data"
-
-
 def run(ctx: RunContext) -> Iterable[dict]:
-    global BASE_DIR
-
-    BASE_DIR = Path.cwd()
+    if not ctx.rule_enabled(RULE):
+        return
+    suppressions = SourceSuppressions("csharp")
     for path in ctx.files:
         if path.suffix.lower() not in {".cs", ".csx"}:
             continue
-        issues: list[tuple[str, str, int]] = []
-        analyze(path, issues)
-        for rel_path, line_no, _sample in issues:
-            yield {
-                "rule": "csharp.taint.open_redirect",
-                "path": rel_path,
-                "line": line_no,
-                "col": 1,
-                "severity": "critical",
-                "message": _RUN_MESSAGE,
-            }
+        text = path.read_text(encoding="utf-8-sig")
+        if not re.search(r"\b(?:Request|request|req|HttpRequest|HttpRequestBase|HttpContext)\b", text):
+            continue
+        for finding in RedirectFlow(path, text).analyze():
+            if not suppressions.is_suppressed(path, finding["line"], RULE):
+                yield finding
 
 
 def _selftest_direct_source_to_sink() -> None:

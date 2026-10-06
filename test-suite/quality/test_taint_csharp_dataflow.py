@@ -10,15 +10,18 @@ import itertools
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
 from ubs_core.registry import RunContext
+from ubs_core.analyzers import taint_csharp_redirect as redirect
 from ubs_core.taint_flow import (AnalysisLimit, Budget, CLEAN, Step, Trace,
                                 advance, join, join_states, solve)
 
@@ -524,6 +527,271 @@ class ByReferenceTests(unittest.TestCase):
         self.bad('class C { void A(string raw, out string p) { if (done) { p=raw; return; } B(raw,out p); } void B(string raw, out string p) { A(raw,out p); } void H() { B(Request.Query["p"],out var p); File.Delete(p); } }')
 
 
+class RedirectDataflowTests(unittest.TestCase):
+    def scan(self, code):
+        with tempfile.TemporaryDirectory(prefix='ubs-csharp-redirect-') as tmp:
+            path = Path(tmp) / 'app.cs'
+            path.write_text(textwrap.dedent(code), encoding='utf-8')
+            return list(redirect.run(RunContext(lang='csharp', files=[path])))
+
+    def check(self, code, count=1):
+        findings = self.scan(code)
+        self.assertEqual(len(findings), count, findings)
+        self.assertTrue(all(f['rule'] == redirect.RULE and f['severity'] == 'critical' for f in findings), findings)
+        return findings
+
+    def test_existing_buggy_fixture_covers_every_redirect_sink(self):
+        source = ROOT / 'test-suite/csharp/security/OpenRedirectBuggy.cs'
+        findings = list(redirect.run(RunContext(lang='csharp', files=[source])))
+        self.assertEqual({f['line'] for f in findings}, {10, 16, 22, 28, 34})
+
+    def test_existing_clean_fixture_uses_real_local_and_host_validation(self):
+        source = ROOT / 'test-suite/csharp/security/OpenRedirectClean.cs'
+        self.assertEqual(list(redirect.run(RunContext(lang='csharp', files=[source]))), [])
+
+    def test_original_clean_fixture_weak_prefix_is_an_unsafe_helper(self):
+        # Retain the original predicate as positive coverage. A /\ prefix is
+        # accepted here but normalized by browsers into an external authority.
+        self.check('''
+            class C {
+                private static string SafeRedirectTarget(string raw)
+                {
+                    if (raw.StartsWith("/", StringComparison.Ordinal) && !raw.StartsWith("//", StringComparison.Ordinal))
+                    {
+                        return raw;
+                    }
+                    throw new Exception();
+                }
+                void H() { Response.Redirect(SafeRedirectTarget(Request.Query["x"])); }
+            }
+        ''')
+
+    def test_browser_url_oracle_disproves_original_local_prefix_guard(self):
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('Node URL runtime unavailable; detector regression runs independently')
+        result = subprocess.run([node, '-e', r'''
+            const raw = '/\\attacker.example/login';
+            process.stdout.write(JSON.stringify({
+                accepted: raw.startsWith('/') && !raw.startsWith('//'),
+                destination: new URL(raw, 'https://app.example.com').href
+            }));
+        '''], capture_output=True, text=True, check=True, timeout=10)
+        self.assertEqual(json.loads(result.stdout), {'accepted': True, 'destination': 'https://attacker.example/login'})
+
+    def test_helpers_propagate_only_actual_url_arguments(self):
+        findings = self.check('''
+            class C {
+                void Send(string target, string description) { Response.Redirect(target); }
+                void Bad() { Send(description: "data", target: Request.Query["x"]); }
+                void Good() { Send(description: Request.Query["x"], target: "/safe"); }
+            }
+        ''')
+        kinds = {step['kind'] for step in findings[0]['extras']['taint_path']}
+        self.assertTrue({'source', 'call', 'sink'} <= kinds)
+
+    def test_source_returns_and_ref_out_effects_reach_caller(self):
+        self.check('''
+            class C {
+                string Source() => Request.Query["x"];
+                void Copy(string input, out string target) { target = input; }
+                void H() { Copy(Source(), out var destination); Results.Redirect(destination); }
+            }
+        ''')
+
+    def test_helper_constant_return_and_ref_overwrite_are_clean(self):
+        self.check('''
+            class C {
+                string Fixed(string input) => "/safe";
+                void Clear(ref string input) { input = "/safe"; }
+                void H() {
+                    var target = Request.Query["x"];
+                    Response.Redirect(Fixed(target));
+                    Clear(ref target);
+                    Response.Redirect(target);
+                }
+            }
+        ''', 0)
+
+    def test_same_named_locals_in_other_methods_do_not_share_taint(self):
+        self.check('''
+            class C {
+                void A() { var target = Request.Query["x"]; }
+                void B(string target) { Response.Redirect(target); }
+                void Good() { B("/safe"); }
+            }
+        ''', 0)
+
+    def test_reassignment_and_branch_join_use_current_values(self):
+        for change, count in [('target = "/safe";', 0),
+                              ('if (ok) target = "/safe"; else target = "/other";', 0),
+                              ('if (ok) target = "/safe";', 1)]:
+            with self.subTest(change=change):
+                self.check('var target=Request.Query["x"]; ' + change + ' Response.Redirect(target);', count)
+
+    def test_loop_carried_flow_and_recursive_helpers_converge(self):
+        self.check('''
+            class C {
+                string A(string p) { if (done) return p; return B(p); }
+                string B(string p) => A(p);
+                void H() {
+                    var target = "/safe";
+                    while (next) { Response.Redirect(target); target = B(Request.Query["x"]); }
+                }
+            }
+        ''')
+
+    def test_guard_only_refines_its_success_branch(self):
+        for guard in ('if (!Url.IsLocalUrl(target)) { return; }',
+                      'if (!Url.IsLocalUrl(target)) { throw new Exception(); }'):
+            with self.subTest(guard=guard):
+                self.check('var target=Request.Query["x"]; ' + guard + ' Response.Redirect(target);', 0)
+        self.check('''
+            var target = Request.Query["x"];
+            if (Url.IsLocalUrl(target)) { Response.Redirect(target); }
+            else { Response.Redirect(target); }
+        ''')
+
+    def test_ignored_nondominating_or_overwritten_guards_do_not_sanitize(self):
+        cases = (
+            'Url.IsLocalUrl(target);',
+            'var valid = Url.IsLocalUrl(target);',
+            'if (!Url.IsLocalUrl(target)) { Log(target); }',
+            'if (ok) { if (!Url.IsLocalUrl(target)) return; }',
+            'if (!Url.IsLocalUrl(target)) return; target=Request.Query["other"];',
+            'var other="/safe"; if (!Url.IsLocalUrl(other)) return;',
+            'if (Url.IsLocalUrl(target)) return;',
+        )
+        for code in cases:
+            with self.subTest(code=code):
+                self.check('var target=Request.Query["x"]; ' + code + ' Response.Redirect(target);')
+
+    def test_validation_inside_real_helper_uses_summary(self):
+        self.check('''
+            class C {
+                string Validate(string target) {
+                    if (!Url.IsLocalUrl(target)) throw new Exception();
+                    return target;
+                }
+                void H() { Response.Redirect(Validate(Request.Query["x"])); }
+            }
+        ''', 0)
+
+    def test_safe_names_and_shadowed_validators_are_not_proofs(self):
+        for helper in ('SafeRedirectTarget', 'ValidatedRedirectUrl', 'SanitizeRedirect'):
+            with self.subTest(helper=helper):
+                self.check('class C { string ' + helper + '(string p) => p; void H() { Response.Redirect(' + helper + '(Request.Query["x"])); } }')
+                self.check('Response.Redirect(External.' + helper + '(Request.Query["x"]));')
+        self.check('''
+            class Url { public static bool IsLocalUrl(string p) => true; }
+            class C { void H() { var target=Request.Query["x"]; if(!Url.IsLocalUrl(target)) return; Response.Redirect(target); } }
+        ''')
+
+    def test_official_static_validator_and_import_alias(self):
+        self.check('''
+            using Redirects = Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult;
+            var target = Request.Query["x"];
+            if (!Redirects.IsLocalUrl(target)) return;
+            Response.Redirect(target);
+        ''', 0)
+
+    def test_file_path_and_encoding_sanitizers_are_not_url_validation(self):
+        for call in ('Path.GetFileName', 'Path.GetFullPath', 'HttpUtility.UrlEncode', 'WebUtility.HtmlEncode'):
+            with self.subTest(call=call):
+                self.check('Response.Redirect(' + call + '(Request.Query["x"]));')
+
+    def test_typed_request_sources_and_try_get_value_outputs(self):
+        self.check('''
+            class C { void H(HttpRequest incoming) {
+                incoming.Headers.TryGetValue("X", out var target);
+                Response.Redirect(target.ToString());
+                Response.Redirect(incoming.Host.Value);
+            } }
+        ''', 2)
+
+    def test_location_writes_and_named_arguments_track_only_header_value(self):
+        self.check('''
+            var target = Request.Query["x"];
+            Response.Headers["lOcAtIoN"] = target;
+            Response.Headers.Location = target;
+            Response.Headers.Append(value: target, key: "Location");
+            Response.Headers.Add("Location", target);
+            Response.Headers["X-Other"] = target;
+            Response.Headers.Append("X-Other", target);
+            Response.Redirect(location: "/safe", permanent: Request.Query["permanent"]);
+        ''', 4)
+
+    def test_local_redirect_is_a_safe_sink_but_does_not_clean_shared_input(self):
+        self.check('''
+            var target = Request.Query["x"];
+            LocalRedirect(target);
+            Results.LocalRedirect(target);
+            Response.Redirect(target);
+        ''')
+
+    def test_literals_and_comments_are_inert_but_interpolations_execute(self):
+        self.check(r'''
+            var documentation = "Request.Query[\"x\"]; Response.Redirect(target);";
+            /* var target=Request.Query["x"]; Response.Redirect(target); */
+            Response.Redirect("/fixed");
+        ''', 0)
+        self.check('Response.Redirect($"{Request.Query["x"]}");')
+
+    def test_rule_scoped_suppression_does_not_sanitize_source(self):
+        self.check('''
+            var target = Request.Query["x"];
+            Response.Redirect(target); // ubs:ignore[csharp.taint.open_redirect]
+            Response.Redirect(target); // ubs:ignore[csharp.taint.request_traversal]
+        ''')
+
+    def test_disabled_rule_does_not_read_source_and_invalid_source_fails(self):
+        ctx = RunContext(lang='csharp', files=[Path('/absent.cs')], profile={'disabled_rules': [redirect.RULE]})
+        self.assertEqual(list(redirect.run(ctx)), [])
+        with self.assertRaises(ValueError):
+            self.scan('var target=Request.Query["x]; Response.Redirect(target);')
+
+    def test_absolute_https_exact_host_guard_validates_only_parsed_uri(self):
+        prefix = 'var raw=Request.Query["x"]; if(!Uri.TryCreate(raw,UriKind.Absolute,out var uri)||uri.Scheme!=Uri.UriSchemeHttps||uri.Host!="app.example.com") return; '
+        self.check(prefix + 'Response.Redirect(uri.ToString());', 0)
+        self.check(prefix + 'Response.Redirect(raw);')
+        self.check(prefix + 'uri = new Uri(Request.Query["other"]); Response.Redirect(uri.ToString());')
+
+    def test_allowlist_requires_same_uri_exact_host_and_rejecting_branch(self):
+        for guard in (
+            '!Uri.TryCreate(raw,UriKind.Absolute,out var uri)||uri.Scheme!=Uri.UriSchemeHttps||uri.Host!=Request.Query["host"]',
+            '!Uri.TryCreate(raw,UriKind.Absolute,out var uri)||uri.Scheme!=Uri.UriSchemeHttps||!uri.Host.EndsWith("example.com")',
+            '!Uri.TryCreate(raw,UriKind.Absolute,out var uri)||other.Scheme!=Uri.UriSchemeHttps||uri.Host!="app.example.com"',
+            '!Uri.TryCreate(raw,UriKind.Absolute,out var uri)||uri.Scheme!=Uri.UriSchemeHttps||other.Host!="app.example.com"',
+        ):
+            with self.subTest(guard=guard):
+                self.check('var raw=Request.Query["x"]; if (' + guard + ') return; Response.Redirect(uri.ToString());')
+        self.check('var raw=Request.Query["x"]; if(!Uri.TryCreate(raw,UriKind.Absolute,out var uri)||uri.Scheme!=Uri.UriSchemeHttps||uri.Host!="app.example.com") Log(raw); Response.Redirect(uri.ToString());')
+
+    def test_private_constant_host_set_is_not_trusted_after_mutation_or_escape(self):
+        template = '''
+            class C {
+                private static readonly HashSet<string> Hosts = new(StringComparer.OrdinalIgnoreCase) { "app.example.com", "login.example.com" };
+                string Validate(string raw) {
+                    if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri) ||
+                        uri.Scheme != Uri.UriSchemeHttps || !Hosts.Contains(uri.Host)) throw new Exception();
+                    return uri.ToString();
+                }
+                void H() { MUTATE; Response.Redirect(Validate(Request.Query["x"])); }
+            }
+        '''
+        self.check(template.replace('MUTATE', 'Log("safe")'), 0)
+        for mutation in ('Hosts.Add(Request.Query["host"])', 'External.Change(Hosts)', 'var alias=Hosts'):
+            with self.subTest(mutation=mutation):
+                self.check(template.replace('MUTATE', mutation))
+        # A collection initializer does not imply BCL HashSet semantics.
+        shadow = '''class HashSet<T> : List<T> {
+            public HashSet(IEqualityComparer<T> comparer) { }
+            public new bool Contains(T item) => true;
+        }\n'''
+        self.check(shadow + template.replace('MUTATE', 'Log("safe")'))
+        self.check('using StringComparer = UnsafeComparer;\n' + template.replace('MUTATE', 'Log("safe")'))
+
+
 class AnalysisBoundaryTests(unittest.TestCase):
     def test_actual_helper_evidence_survives_combined_json_and_sarif(self):
         import io
@@ -594,6 +862,7 @@ class AnalysisBoundaryTests(unittest.TestCase):
             errors = []
             run_analyzers([path], io.StringIO(), {8}, path.parent, errors=errors)
             self.assertFalse(any('taint_csharp_request' in error for error in errors), errors)
+            self.assertFalse(any('taint_csharp_redirect' in error for error in errors), errors)
 
     def test_budget_is_not_reported_as_clean(self):
         flow = cs.CSharpFlow(Path('test.cs'), 'var p=Request.Query["p"]; File.Delete(p);')
@@ -613,6 +882,64 @@ class AnalysisBoundaryTests(unittest.TestCase):
             good.write_text('File.Delete("/fixed");')
             bad.write_text('File.Delete(Request.Query["p"]);')
             self.assertEqual(list(cs.run(RunContext(lang='csharp', files=[good]))), [])
+
+
+class RedirectPublicReportTests(unittest.TestCase):
+    def test_real_module_json_and_sarif_preserve_helper_evidence(self):
+        artifacts = ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='csharp-redirect-e2e-', dir=artifacts))
+        source = root / 'app.cs'
+        source.write_text('''class C {
+    void Send(string target) { Response.Redirect(target); }
+    void Handler() { Send(Request.Query["next"]); }
+}
+''', encoding='utf-8')
+        filelist = root / 'inputs'
+        filelist.write_bytes(os.fsencode(source) + b'\0')
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', UBS_NO_CACHE='1',
+                   UBS_NO_AUTO_UPDATE='1', NO_COLOR='1')
+        evidence = None
+        for phase in ('tainted', 'clean'):
+            for format_name in ('json', 'sarif'):
+                case = f'csharp-redirect-{phase}-{format_name}'
+                started = time.monotonic()
+                print(f'[{case}] RUN', flush=True)
+                command = [str(ROOT / 'modules/ubs-csharp.sh'), '--ci', '--only=8',
+                           '--no-dotnet', '--no-color', f'--format={format_name}',
+                           '--files-from', str(filelist), str(root)]
+                result = subprocess.run(command, cwd=root, env=env, capture_output=True,
+                                        text=True, timeout=90)
+                (root / f'{case}.stdout.json').write_text(result.stdout, encoding='utf-8')
+                (root / f'{case}.stderr.log').write_text(result.stderr, encoding='utf-8')
+                context = f'{command!r}\nexit={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}'
+                expected = int(phase == 'tainted')
+                self.assertEqual(result.returncode, expected, context)
+                doc = json.loads(result.stdout)
+                if format_name == 'json':
+                    self.assertEqual(doc['status'], 'ok', context)
+                    self.assertEqual(doc['critical'], expected, context)
+                    records = [finding for finding in doc['findings'] if finding['rule'] == redirect.RULE]
+                    self.assertEqual(len(records), expected, context)
+                    if records:
+                        self.assertEqual(records[0]['line'], 2, context)
+                        evidence = records[0]['extras']['taint_path']
+                        self.assertTrue({'source', 'call', 'sink'} <= {step['kind'] for step in evidence}, context)
+                else:
+                    records = [finding for run in doc['runs'] for finding in run.get('results', [])
+                               if finding['ruleId'] == redirect.RULE]
+                    self.assertEqual(len(records), expected, context)
+                    if records:
+                        self.assertEqual(records[0]['properties']['extras']['taint_path'], evidence, context)
+                        flow = records[0]['codeFlows'][0]['threadFlows'][0]['locations']
+                        self.assertEqual(len(flow), len(evidence), context)
+                        self.assertEqual(records[0]['locations'][0]['physicalLocation']['region']['startLine'], 2, context)
+                print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+            source.write_text('''class C {
+    void Send(string target) { if (!Url.IsLocalUrl(target)) return; Response.Redirect(target); }
+    void Handler() { Send(Request.Query["next"]); }
+}
+''', encoding='utf-8')
 
 
 if __name__ == '__main__':

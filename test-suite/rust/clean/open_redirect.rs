@@ -42,7 +42,7 @@ impl ResponseBuilder {
 }
 
 fn allowlist_redirect_url(raw: &str) -> Result<String, &'static str> {
-    if raw.starts_with('/') && !raw.starts_with("//") {
+    if raw.starts_with('/') && !raw.starts_with("//") && !raw.contains('\\') && !raw.chars().any(char::is_control) {
         return Ok(raw.to_string());
     }
 
@@ -67,7 +67,7 @@ fn redirect_with_safe_helper(Query(params): Query<HashMap<String, String>>) -> R
 
 fn redirect_with_inline_local_guard(Query(params): Query<HashMap<String, String>>) -> Result<Redirect, &'static str> {
     let target = params.get("continue").cloned().unwrap_or_default();
-    if !(target.starts_with('/') && !target.starts_with("//")) {
+    if !(target.starts_with('/') && !target.starts_with("//") && !target.contains('\\') && !target.chars().any(char::is_control)) {
         return Err("blocked redirect");
     }
     Ok(Redirect::temporary(&target))

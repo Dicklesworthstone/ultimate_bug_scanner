@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="4fe07462f7e5a085d0affecc759015eb41caf9cd6ed1832d79fe0765a7dc49f7"
+UBS_LIB_CHECKSUM="11d98edc5da7e2774abfca6eec9ebc19fdce186c0ab4cfd8095914446f265803"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -810,7 +810,11 @@ PYV2COUNT
 run_v2_summary_text(){
   echo ""
   say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
-  say "${BOLD}${CYAN}                    🎯 SCAN COMPLETE 🎯                                  ${RESET}"
+  if [[ "$ANALYZER_INCOMPLETE" -eq 1 ]]; then
+    say "${BOLD}${YELLOW}                    SCAN INCOMPLETE                                  ${RESET}"
+  else
+    say "${BOLD}${CYAN}                    🎯 SCAN COMPLETE 🎯                                  ${RESET}"
+  fi
   say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
   echo ""
   say "${WHITE}${BOLD}Summary Statistics:${RESET}"
@@ -818,6 +822,9 @@ run_v2_summary_text(){
   say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$V2_CRITICAL${RESET}"
   say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$V2_WARNING${RESET}"
   say "  ${BLUE}Info items:${RESET}       ${BLUE}$V2_INFO${RESET}"
+  if [[ "$ANALYZER_INCOMPLETE" -eq 1 ]]; then
+    say "  ${YELLOW}${BOLD}Partial:${RESET} [ANALYZER_ERROR] ${ANALYZER_INCOMPLETE_MSG}"
+  fi
   if [[ "$CARGO_UNAVAILABLE" -eq 1 ]]; then
     say "  ${YELLOW}${BOLD}Partial:${RESET} [CARGO_UNAVAILABLE] ${YELLOW}cargo could not run — compilation, tests and lints were not evaluated${RESET}"
     say "  ${DIM}${CARGO_UNAVAILABLE_MSG}${RESET}"
@@ -836,7 +843,7 @@ run_v2_summary_text(){
     say "  ${BLUE}${INFO} ${BOLD}Consider INFO suggestions${RESET}"
     say "  ${DIM}Code quality improvements and best practices${RESET}"
   fi
-  if [ "$V2_CRITICAL" -eq 0 ] && [ "$V2_WARNING" -eq 0 ]; then
+  if [ "$ANALYZER_INCOMPLETE" -eq 0 ] && [ "$V2_CRITICAL" -eq 0 ] && [ "$V2_WARNING" -eq 0 ]; then
     if [ "${#CARGO_SKIPPED_CATEGORIES[@]}" -gt 0 ]; then
       say "\n  ${GREEN}${BOLD}${SPARKLE} No critical or warning issues found by static analysis ${SPARKLE}${RESET}"
       say "  ${YELLOW}${WARN} Not evaluated (cargo phases skipped: ${CARGO_SKIP_REASON}): $(IFS='; '; echo "${CARGO_SKIPPED_CATEGORIES[*]}")${RESET}"
@@ -902,6 +909,7 @@ run_v2_legacy_parity_bridges_rust(){
 
 run_contract_v2_rust(){
   local helpers_dir="" list_file sink checks text_out="" rule_dir="" exit_code=0 v2_json_out=""
+  local completion_out=""
   local analyzer_exit=0 parity_exit=0
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-list.XXXXXX)"
@@ -967,6 +975,11 @@ generate(Path('$DUMP_RULES_DIR'))
   [[ "$QUIET" -eq 1 ]] && scan_args+=(--quiet)
   [[ "${JOBS:-0}" -gt 0 ]] && scan_args+=(--jobs "$JOBS")
 
+  # Python exits 1 on uncaught exceptions as well as ordinary findings. A
+  # bounded receipt proves completion without serializing a second ledger.
+  completion_out="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-complete.XXXXXX)"
+  TMP_FILES+=("$completion_out")
+  scan_args+=(--completion-out "$completion_out")
   case "$FORMAT" in
     json|sarif)
       v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-rustv2-json.XXXXXX)"
@@ -977,14 +990,34 @@ generate(Path('$DUMP_RULES_DIR'))
 
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.rust_scan \
     "${scan_args[@]}" --version "2.0.1" || analyzer_exit=$?
+  if [[ "$analyzer_exit" -eq 0 || "$analyzer_exit" -eq 1 ]]; then
+    if ! python3 - "$completion_out" <<'PYV2COMPLETE'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        report = json.load(stream)
+    complete = (isinstance(report, dict) and report.get("language") == "rust"
+                and report.get("status") == "ok"
+                and all(type(report.get(key)) is int and report[key] >= 0
+                        for key in ("files", "critical", "warning", "info")))
+except (OSError, ValueError, RecursionError):
+    complete = False
+if not complete:
+    sys.stderr.write("ubs-rust: analyzer has no valid complete report; scan is incomplete\n")
+    sys.exit(2)
+PYV2COMPLETE
+    then
+      analyzer_exit=2
+    fi
+  fi
   exit_code="$analyzer_exit"
   # Exit 0/1 are "no findings"/"findings"; anything else means the analyzer did
-  # not finish (#111). Its own summary document carries the precise reason when
+  # not finish (#111). Its own completion receipt carries the precise reason when
   # one was written, so prefer that over the generic fallback.
   if [[ "$analyzer_exit" -ne 0 && "$analyzer_exit" -ne 1 ]]; then
     ANALYZER_INCOMPLETE=1
-    if [[ -n "$v2_json_out" && -s "$v2_json_out" ]] && command -v jq >/dev/null 2>&1; then
-      ANALYZER_INCOMPLETE_MSG="$(jq -r '.message // empty' "$v2_json_out" 2>/dev/null || true)"
+    if [[ -s "$completion_out" ]] && command -v jq >/dev/null 2>&1; then
+      ANALYZER_INCOMPLETE_MSG="$(jq -r '.message // empty' "$completion_out" 2>/dev/null || true)"
     fi
     if [[ -z "$ANALYZER_INCOMPLETE_MSG" ]]; then
       ANALYZER_INCOMPLETE_MSG="Rust analysis did not complete (analyzer exit ${analyzer_exit}); see stderr for the failing invocation"

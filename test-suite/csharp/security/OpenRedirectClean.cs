@@ -14,7 +14,7 @@ public sealed class OpenRedirectClean : Controller
 
     private static string SafeRedirectTarget(string raw)
     {
-        if (raw.StartsWith("/", StringComparison.Ordinal) && !raw.StartsWith("//", StringComparison.Ordinal))
+        if (Microsoft.AspNetCore.Http.HttpResults.RedirectHttpResult.IsLocalUrl(raw))
         {
             return raw;
         }

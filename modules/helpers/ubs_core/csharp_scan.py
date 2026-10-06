@@ -318,7 +318,7 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
 
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
-        if analyzer.name == "taint_csharp_request" and 8 in skip:
+        if analyzer.name in {"taint_csharp_request", "taint_csharp_redirect"} and 8 in skip:
             continue
         if prefilter is not None:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)

@@ -423,6 +423,11 @@ class Summary:
 
 
 class CSharpFlow:
+    rule = RULE
+    message = MESSAGE
+    source_pattern = SOURCE
+    request_members = r"\.(?:Request\.)?(?:Query|Form|RouteValues|Headers|Cookies|Path|PathBase|RawTarget|QueryString)\b"
+
     def __init__(self, path: Path, text: str):
         self.path, self.text = path, text
         self.code = masked_source(text)
@@ -454,6 +459,9 @@ class CSharpFlow:
     def declare(self, scope, span, *, declarator=False):
         start, end = span
         code = self.code[start:end]
+        if re.fullmatch(r"\s*(?:global\s+)?using\s+@?\w+\s*=\s*[\w.:]+\s*", code):
+            # Namespace/type aliases do not allocate local runtime storage.
+            return
         declaration = re.match(r"\s*(@?\w+)\s*=", code) if declarator else re.match(r"\s*(?:(?:using|await|const)\s+)*(?:var|[\w.@]+(?:\s*<[^;=]+>)?(?:\[\])?\??)\s+(@?\w+)\s*(?:=|;|$)", code)
         if declaration:
             name = declaration.group(1).lstrip("@")
@@ -506,7 +514,7 @@ class CSharpFlow:
                 elif kind == "if":
                     yes = block(statement.body, entry, local.child(), break_to, continue_to, unwind)
                     no = block(statement.otherwise, entry, local.child(), break_to, continue_to, unwind)
-                    guard = self.path_guard(statement.header)
+                    guard = self.path_guard(statement.header, local.bindings)
                     if guard:
                         variable, base, truth = guard
                         safe = yes if truth else no
@@ -626,7 +634,7 @@ class CSharpFlow:
         self.dependencies[context].add(self.context)
         return self.summaries[context], actuals, cells
 
-    def path_guard(self, span):
+    def path_guard(self, span, bindings=None):
         """Recognize a root-bound prefix predicate, not a nearby magic name."""
         start, end = span
         condition = self.code[start:end].strip()
@@ -648,6 +656,35 @@ class CSharpFlow:
     def source_fact(self, offset, label):
         step = self.step(offset, "source", label)
         return frozenset({Trace("source", (str(self.path), offset), evidence=(step,))})
+
+    def is_source(self, name):
+        root = name.split(".")[0]
+        return bool(self.source_pattern.search(name) or (
+            root in self.function.request_parameters and re.search(self.request_members, name)))
+
+    def external_value(self, name, values, receiver):
+        """Sink-specific transformations of an unresolved external call."""
+        all_values = join(receiver, *values)
+        if name in {"Path.GetFileName", "Path.GetFileNameWithoutExtension",
+                    "System.IO.Path.GetFileName", "System.IO.Path.GetFileNameWithoutExtension"}:
+            return CLEAN
+        if name in {"Path.GetFullPath", "System.IO.Path.GetFullPath"}:
+            return retag(all_values, add=CANONICAL)
+        if name.endswith((".ToString", ".ConfigureAwait")):
+            return receiver
+        return retag(all_values, remove=CANONICAL)
+
+    def apply_guard(self, action, state):
+        variable, root = action.guard
+        cell, base = action.bindings.get(variable), action.bindings.get(root)
+        base_origins = {(trace.kind, trace.key) for trace in state.get(base, CLEAN)}
+        if cell:
+            # A user-controlled root remains unsafe; only facts confined
+            # below that root are discharged by the canonical-path guard.
+            retained = frozenset(trace for trace in state.get(cell, CLEAN)
+                                 if not CANONICAL <= trace.tags or (trace.kind, trace.key) in base_origins)
+            state[cell] = join(retained, state.get(base, CLEAN))
+        return state
 
     def arguments(self, start, end):
         result = []
@@ -786,20 +823,10 @@ class CSharpFlow:
                                 # A local named File or Path is not a proof of
                                 # System.IO type identity.
                                 canonical_name = "<instance>." + canonical_name
-                            if canonical_name in {"Path.GetFileName", "Path.GetFileNameWithoutExtension",
-                                                  "System.IO.Path.GetFileName", "System.IO.Path.GetFileNameWithoutExtension"}:
-                                value = CLEAN
-                            elif canonical_name in {"Path.GetFullPath", "System.IO.Path.GetFullPath"}:
-                                value = retag(all_values, add=CANONICAL)
-                            else:
-                                value = retag(all_values, remove=CANONICAL)
-                                if name.endswith((".ToString", ".ConfigureAwait")):
-                                    value = receiver
-                            if SOURCE.search(name) or (root_name in self.function.request_parameters and re.search(
-                                    r"\.(?:Request\.)?(?:Query|Form|RouteValues|Headers|Cookies|Path|PathBase|RawTarget|QueryString)\b", name)):
+                            value = self.external_value(canonical_name, values, receiver)
+                            if self.is_source(name):
                                 value = join(value, self.source_fact(position, name))
-                            source = SOURCE.search(self.code[position:close + 1])
-                            if name.endswith(".TryGetValue") and source:
+                            if name.endswith(".TryGetValue") and self.is_source(name):
                                 for _, low, high in args:
                                     output = re.fullmatch(r"\s*out\s+(?:(?:var|[\w.?<>\[\]]+)\s+)?(@?\w+)\s*", self.code[low:high])
                                     if output:
@@ -825,10 +852,7 @@ class CSharpFlow:
                     position = close + 1
                     continue
                 root_name = name.split(".")[0]
-                source = SOURCE.search(name)
-                typed_source = root_name in self.function.request_parameters and re.search(
-                    r"\.(?:Request\.)?(?:Query|Form|RouteValues|Headers|Cookies|Path|PathBase|RawTarget|QueryString)\b", name)
-                if source or typed_source:
+                if self.is_source(name):
                     result = join(result, self.source_fact(position, name))
                 elif root_name in bindings:
                     result = join(result, state.get(bindings[root_name], CLEAN))
@@ -862,16 +886,7 @@ class CSharpFlow:
                     self.outputs[slot] = join(self.outputs.get(slot, CLEAN), fact)
             return state
         if action.kind == "guard":
-            variable, root = action.guard
-            cell, base = action.bindings.get(variable), action.bindings.get(root)
-            base_origins = {(trace.kind, trace.key) for trace in state.get(base, CLEAN)}
-            if cell:
-                # A user-controlled root remains unsafe; only facts confined
-                # below that root are discharged by the canonical-path guard.
-                retained = frozenset(trace for trace in state.get(cell, CLEAN)
-                                     if not CANONICAL <= trace.tags or (trace.kind, trace.key) in base_origins)
-                state[cell] = join(retained, state.get(base, CLEAN))
-            return state
+            return self.apply_guard(action, state)
         if action.kind == "foreach":
             cell = action.bindings[action.guard[0]]
             state[cell] = self.evaluate(start, end, state, action.bindings)
@@ -943,8 +958,8 @@ class CSharpFlow:
         for (offset, sink), fact in sorted(effects.items()):
             location = self.step(offset, "sink", sink)
             witnesses = sorted(fact, key=lambda trace: (len(trace.evidence), trace.evidence, trace.key))
-            yield {"rule": RULE, "path": str(self.path), "line": location.line,
-                   "col": location.column, "severity": "critical", "message": MESSAGE,
+            yield {"rule": self.rule, "path": str(self.path), "line": location.line,
+                   "col": location.column, "severity": "critical", "message": self.message,
                    "extras": {"taint_path": [step.record() for step in witnesses[0].evidence],
                               "source_count": len({trace.key for trace in fact})}}
 

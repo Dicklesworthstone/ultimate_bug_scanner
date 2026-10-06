@@ -1,15 +1,10 @@
-"""ubs_core.rust_detectors.open_redirect — category 8 security (bead 0xjg.7).
+"""Request-derived Rust redirects with structured local dataflow.
 
-Port of rust_open_redirect_matches (modules/ubs-rust.sh 2371-2664): a logical
-statement tracker that taints names assigned from redirect-keyed request
-sources (params/query/form/body/json payload getters, req.query_param/header
-accessors, env QUERY_STRING/REQUEST_URI/HTTP_HOST/... values), then flags
-redirect sinks (axum/rocket/poem/warp Redirect::*, redirect/send_redirect
-calls, Location header writes) whose target is request-derived, annotating
-each hit with the taint path. Safe-redirect helpers, a local-path
-starts_with('/') && !starts_with('//') check, and Url::parse + host check +
-reject contexts within the preceding 24 lines suppress the hit. Same-line and
-previous-line `ubs:ignore` markers suppress a hit.
+The lexical front end in redirect_flow models statement order, block scope,
+branch joins, fixed-point loops and named function return/sink summaries.
+The framework source/sink vocabulary lives here. Validation requires observed
+control flow or analyzed local helper bodies; helper names confer no trust.
+Source identity and suppression use the selected file only.
 """
 from __future__ import annotations
 
@@ -230,71 +225,48 @@ def source_line(lines, line_no):
     return ""
 
 
-def analyze(path: Path, issues):
+def analyze(path: Path, issues, rule_id: str = RULE_ID):
+    """Analyze one selected file and apply suppression only to findings."""
+    from bisect import bisect_right
+    from ubs_core.suppression import build_index
+    from ubs_core.lexer import strip_comments_and_strings
+    from ubs_core.taint_flow import AnalysisLimit
+    from .redirect_flow import Source
+
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except OSError as exc:
+        raise OSError(f'Cannot read Rust redirect input {path}: {exc}') from exc
+    # Field sources (query.next, payload.return_url) require no getter call.
+    raw = strip_comments_and_strings(text, 'rust', strip_strings=False)
+    if not source_re.search(raw):
         return
-    if not (request_collection_re.search(text) and sink_re.search(text)):
-        return
+    source = Source(text, raw=raw)
+    suppressions = build_index(text, lang="rust")
     lines = text.splitlines()
-    tainted = {}
     seen = set()
-    for line_no, _ in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
+    try:
+        findings = source.solve()
+    except RecursionError as exc:
+        raise AnalysisLimit('Rust redirect recursion limit exceeded; analysis is incomplete') from exc
+    for site, origins in sorted(findings.items()):
+        line_no = bisect_right(source.lines, site)
+        if line_no in seen or suppressions.is_suppressed(line_no, rule_id):
             continue
-        raw_line = strip_line_comments(lines[line_no - 1]).strip()
-        if not raw_line:
-            continue
-        statement = logical_statement(lines, line_no).strip()
-        if not statement:
-            continue
-        assign = assign_re.match(statement)
-        if assign:
-            name = assign.group("lhs")
-            rhs = assign.group("rhs")
-            taint = taint_from_expr(rhs, tainted, name)
-            if taint:
-                tainted[name] = taint
-            else:
-                tainted.pop(name, None)
-        if not sink_re.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = source_re.search(statement) and has_request_source(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_redirect_validation_context(lines, line_no, refs):
-            continue
-        if has_ignore(lines, line_no, RULE_ID):
-            continue
-        key = (path, line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            source = source_re.search(statement)
-            path_desc = f"{(source.group(0) if source else 'request source').strip()} -> redirect"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get("path", [ref]))
-            if len(seq) >= path_limit:
-                seq = seq[-(path_limit - 1):]
-            seq.append("redirect")
-            path_desc = " -> ".join(seq)
+        seen.add(line_no)
+        origin = min(origins)
+        path_desc = f"{origin.label} -> redirect"
         issues.append((path, line_no, f"{source_line(lines, line_no)}  [{path_desc}]"))
 
 
 def find(files) -> Iterator[tuple[Path, int, int, str]]:
-    """Yield (path, line, col, code) per legacy deduped finding, in legacy
-    order. `files` is the ordered list of Path entries to scan."""
-    issues = []
+    """Yield per-file findings in selected order, preserving completed files
+    if a later selected file fails analysis."""
     for rust_file in files:
+        issues = []
         analyze(rust_file, issues)
-    for path, line_no, code in issues:
-        yield (path, line_no, 1, code)
+        for path, line_no, code in issues:
+            yield (path, line_no, 1, code)
 
 
 if __name__ == "__main__":

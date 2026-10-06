@@ -1,12 +1,10 @@
-"""ubs_core.analyzers.taint_rust — Rust open-redirect taint analysis (bead A2).
+"""Rust redirect registry and text entrypoints (beads A2, D6).
 
-Logic moved verbatim from the request-derived open-redirect heredoc in
-modules/ubs-rust.sh (rust_open_redirect_matches), which keeps its own copy
-until that module's port bead. Also exposes a structured `run(ctx)` for the
-`python3 -m ubs_core` CLI.
+Both entrypoints use the production detector's structured dataflow engine;
+the registry keeps its rule ID and its corresponding suppression namespace.
 
 Emit dialects:
-- main(argv) reproduces the heredoc byte-for-byte: one
+- main(argv) emits one
   `<path>:<line>:<source>  [<taint path>]` row per finding, with paths from
   the rglob walk or the UBS_RUST_FILE_LIST file exactly as the heredoc reads
   them.
@@ -245,62 +243,13 @@ def source_line(lines, line_no):
 
 
 def analyze(path: Path, issues):
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    if not (request_collection_re.search(text) and sink_re.search(text)):
-        return
-    lines = text.splitlines()
-    tainted = {}
-    seen = set()
-    for line_no, _ in enumerate(lines, start=1):
-        if has_ignore(lines, line_no):
-            continue
-        raw_line = strip_line_comments(lines[line_no - 1]).strip()
-        if not raw_line:
-            continue
-        statement = logical_statement(lines, line_no).strip()
-        if not statement:
-            continue
-        assign = assign_re.match(statement)
-        if assign:
-            name = assign.group("lhs")
-            rhs = assign.group("rhs")
-            taint = taint_from_expr(rhs, tainted, name)
-            if taint:
-                tainted[name] = taint
-            else:
-                tainted.pop(name, None)
-        if not sink_re.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = source_re.search(statement) and has_request_source(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_redirect_validation_context(lines, line_no, refs):
-            continue
-        key = (path, line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            source = source_re.search(statement)
-            path_desc = f"{(source.group(0) if source else 'request source').strip()} -> redirect"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get("path", [ref]))
-            if len(seq) >= path_limit:
-                seq = seq[-(path_limit - 1):]
-            seq.append("redirect")
-            path_desc = " -> ".join(seq)
-        issues.append((path, line_no, f"{source_line(lines, line_no)}  [{path_desc}]"))
+    from ubs_core.rust_detectors.open_redirect import analyze as analyze_redirect
+
+    analyze_redirect(path, issues, rule_id=_RULE)
 
 
 def main(argv=None) -> int:
-    """Byte-parity entrypoint: same behavior as the heredoc given the same argv."""
+    """Path:line:source dialect, using the production flow engine."""
     if argv is None:
         argv = sys.argv
     root = Path(argv[1])

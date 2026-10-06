@@ -7,8 +7,16 @@ on:
       - .github/workflows/python-source-suppression.yml
       - modules/helpers/ubs_core/py_scan.py
       - modules/helpers/ubs_core/suppression.py
+      - modules/helpers/ubs_core/lexer.py
       - modules/helpers/ubs_core/cache.py
+      - modules/helpers/ubs_core/py_ast.py
+      - modules/helpers/ubs_core/py_rules.py
+      - modules/helpers/ubs_core/py_patterns/**
+      - modules/helpers/ubs_core/py_detectors/**
       - modules/helpers/ubs_core/analyzers/*_py.py
+      - modules/lib/ubs-common.sh
+      - modules/ubs-python.sh
+      - ubs
       - test-suite/quality/test_python_suppression.py
       - test-suite/quality/test_python_precision.py
       - test-suite/quality/test_suppression_intervals.py
@@ -33,6 +41,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Preserve exact source for reproducibility
+        run: |
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/python-suppression-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/python-suppression-source-head.txt"
       - name: Prepare the reviewed GH-159 candidate without changing main
         run: |
           test "$(git hash-object modules/helpers/ubs_core/py_scan.py)" = 435a102f340ae7eba76d38ced37afbf1bb16f061

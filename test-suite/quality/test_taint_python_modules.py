@@ -208,6 +208,203 @@ class PythonModuleTests(unittest.TestCase):
                          'b.py': 'from a import wrap\ndef clean(x):\n    return "safe"'})
         self.assertEqual(len(got), 1, got)
 
+    def test_import_cycle_does_not_disable_downstream_selected_helpers(self):
+        sources = {'a.py': 'import b\n', 'b.py': 'import a\n',
+                   'helper.py': 'def run(value):\n    eval(value)\n',
+                   'app.py': 'import a\nfrom helper import run\nrun(input())\n'}
+        for order in (list(sources), list(reversed(sources))):
+            with self.subTest(order=order):
+                got = self.scan(sources, selected=order)
+                self.assertEqual(self.sites(got), [('helper.py', 2, 'python.taint.eval')])
+
+    def test_import_cycle_does_not_invent_taint_after_known_clean_helper(self):
+        got = self.scan({'a.py': 'import b\n', 'b.py': 'import a\n',
+                         'helper.py': 'def clean(value):\n    return "safe"\n',
+                         'app.py': 'import a\nfrom helper import clean\neval(clean(input()))\n'})
+        self.assertEqual(got, [])
+
+    def test_cycle_exports_still_carry_sources_sinks_and_mutations_to_callers(self):
+        helper = ('import peer\n'
+                  'def read():\n    return input()\n'
+                  'def run(value):\n    eval(value)\n'
+                  'def fill(box, value):\n    box.append(value)\n')
+        for body, expected in (
+                ('helper.run(input())', [('helper.py', 5, 'python.taint.eval')]),
+                ('eval(helper.read())', [('app.py', 2, 'python.taint.eval')]),
+                ('box=[]\nhelper.fill(box,input())\neval(box[0])', [('app.py', 4, 'python.taint.eval')]),
+                ('helper.run("safe")', [])):
+            with self.subTest(body=body):
+                sources = {'helper.py': helper, 'peer.py': 'import helper\n',
+                           'app.py': 'import helper\n' + body}
+                self.assertEqual(self.sites(self.scan(sources)), expected)
+
+    def test_two_cycles_do_not_disconnect_downstream_reexports(self):
+        got = self.scan({'a.py': 'import b\n', 'b.py': 'import a\n',
+                         'c.py': 'import d\n', 'd.py': 'import c\n',
+                         'sink.py': 'def run(value):\n    eval(value)\n',
+                         'bridge.py': 'import a\nfrom sink import run\n',
+                         'app.py': 'import c\nfrom bridge import run\nrun(input())\n'})
+        self.assertEqual(self.sites(got), [('sink.py', 2, 'python.taint.eval')])
+
+    def test_cycle_dependency_components_are_iterative_and_dependency_first(self):
+        # A cycle with a long tail must not consume Python's recursion stack
+        # or classify every dependent as cyclic. Test the graph independently
+        # of solving 1,200 identical scanner entry points.
+        sources = {f'm{i}.py': f'import m{i + 1}\n' for i in range(1200)}
+        sources['m1200.py'] = 'import m1199\n'
+        project = taint_py._Project(self.write(sources), self.root)
+        components = list(project.components())
+        self.assertEqual(len(components), 1200)
+        self.assertEqual({project.keys[engine].name for engine in components[0]}, {'m1199', 'm1200'})
+        done = set()
+        for component in components:
+            self.assertTrue(all(project.dependencies(engine) <= done | set(component) for engine in component))
+            done.update(component)
+        self.assertEqual(len(done), 1201)
+
+    def test_cyclic_module_functions_propagate_sink_summaries(self):
+        sources = {'a.py': 'import b\ndef forward(value):\n    b.run(value)\n',
+                   'b.py': 'import a\ndef run(value):\n    eval(value)\n',
+                   'app.py': 'import a\na.forward(input())\n'}
+        for order in (list(sources), list(reversed(sources))):
+            with self.subTest(order=order):
+                got = self.scan(sources, selected=order)
+                self.assertEqual(self.sites(got), [('b.py', 3, 'python.taint.eval')])
+
+    def test_self_imported_namespace_resolves_after_initialization(self):
+        got = self.scan({'helper.py': 'import helper as peer\ndef forward(value):\n    peer.run(value)\ndef run(value):\n    eval(value)\n',
+                         'app.py': 'from helper import forward\nforward(input())\n'})
+        self.assertEqual(self.sites(got), [('helper.py', 5, 'python.taint.eval')])
+
+    def test_typed_cyclic_helpers_keep_safe_literal_defaults(self):
+        sources = {'a.py': 'import b\ndef forward(value: str = "safe") -> str:\n    return b.read(value)\n',
+                   'b.py': 'import a\ndef read(value: str) -> str:\n    return value\n',
+                   'app.py': 'import a\neval(a.forward())\n'}
+        self.assertEqual(self.scan(sources), [])
+        sources['app.py'] = 'import a\neval(a.forward(input()))\n'
+        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
+
+    def test_cyclic_module_returns_and_sanitizer_domains(self):
+        for returned, sink, expected in (
+                ('input()', 'eval', ['python.taint.eval']),
+                ('"safe"', 'eval', []),
+                ('html.escape(value)', 'HttpResponse', []),
+                ('html.escape(value)', 'eval', ['python.taint.eval'])):
+            with self.subTest(returned=returned, sink=sink):
+                got = self.scan({'a.py': 'import b\ndef forward(value):\n    return b.read(value)\n',
+                                 'b.py': f'import a\nimport html\ndef read(value):\n    return {returned}\n',
+                                 'app.py': f'import a\n{sink}(a.forward(input()))\n'})
+                self.assertEqual([f['rule'] for f in got], expected, got)
+
+    def test_mutual_module_recursion_reaches_a_fixed_point(self):
+        sources = {'a.py': 'import b\ndef first(value, stop):\n    return b.second(value,stop)\n',
+                   'b.py': 'import a\ndef second(value,stop):\n    if stop:\n        return value\n    return a.first(value,stop)\n',
+                   'app.py': 'import a\neval(a.first(input(),flag))\n'}
+        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
+        sources['b.py'] = sources['b.py'].replace('return value', 'return "safe"')
+        self.assertEqual(self.scan(sources), [])
+
+    def test_nonreturning_module_cycle_has_no_invented_return_path(self):
+        got = self.scan({'a.py': 'import b\ndef first(value):\n    return b.second(value)\n',
+                         'b.py': 'import a\ndef second(value):\n    return a.first(value)\n',
+                         'app.py': 'import a\neval(a.first(input()))\n'})
+        self.assertEqual(got, [])
+
+    def test_cyclic_helper_mutations_and_exception_payloads(self):
+        for helper, caller, expected in (
+                ('box.append(value)', 'box=[]\na.forward(box,input())\neval(box[0])', [('app.py', 4, 'python.taint.eval')]),
+                ('raise ValueError(value)', 'try:\n    a.forward([],input())\nexcept ValueError as error:\n    eval(str(error))', [('app.py', 5, 'python.taint.eval')]),
+                ('box.append("safe")', 'box=[]\na.forward(box,input())\neval(box[0])', [])):
+            with self.subTest(helper=helper):
+                got = self.scan({'a.py': 'import b\ndef forward(box,value):\n    b.fill(box,value)\n',
+                                 'b.py': f'import a\ndef fill(box,value):\n    {helper}\n',
+                                 'app.py': 'import a\n' + caller})
+                self.assertEqual(self.sites(got), expected)
+
+    def test_function_local_import_cycle_resolves_after_initialization(self):
+        got = self.scan({'a.py': 'def forward(value):\n    from b import run\n    run(value)\n',
+                         'b.py': 'def run(value):\n    from a import forward\n    eval(value)\n',
+                         'app.py': 'from a import forward\nforward(input())\n'})
+        self.assertEqual(self.sites(got), [('b.py', 3, 'python.taint.eval')])
+
+    def test_cyclic_relative_module_aliases_and_literal_globals(self):
+        got = self.scan({'pkg/__init__.py': '',
+                         'pkg/a.py': 'from . import b as peer\nbox=[]\ndef forward(value):\n    peer.fill(box,value)\n    return box\n',
+                         'pkg/b.py': 'from . import a as peer\ndef fill(box,value):\n    box.append(value)\n',
+                         'app.py': 'from pkg.a import forward\neval(str(forward(input())))\n'})
+        self.assertEqual(self.sites(got), [('app.py', 2, 'python.taint.eval')])
+
+    def test_cyclic_higher_order_context_uses_both_defining_namespaces(self):
+        got = self.scan({'a.py': 'import b\ndef forward(callback,value):\n    b.apply(callback,value)\n',
+                         'b.py': 'import a\ndef apply(callback,value):\n    callback(value)\n',
+                         'app.py': 'import a\na.forward(eval,input())\n'})
+        self.assertEqual(self.sites(got), [('b.py', 3, 'python.taint.eval')])
+
+    def test_cyclic_initialization_expressions_are_not_certified_clean(self):
+        for definition in ('def clean(value=b.read()):\n    return "safe"\n',
+                           '@b.decorate\ndef clean(value):\n    return "safe"\n',
+                           'def clean(value: b.read()):\n    return "safe"\n'):
+            with self.subTest(definition=definition):
+                got = self.scan({'a.py': 'import b\n' + definition,
+                                 'b.py': 'import a\ndef forward(value):\n    return a.clean(value)\n',
+                                 'app.py': 'import b\neval(b.forward(input()))\n'})
+                self.assertEqual(self.sites(got), [('app.py', 2, 'python.taint.eval')])
+
+    def test_selected_class_static_helpers_keep_defining_module_and_location(self):
+        helper = ('class Service:\n    @staticmethod\n    def run(value):\n'
+                  '        eval(value)\n')
+        for call in ('from helper import Service\nService.run(input())',
+                     'import helper\nhelper.Service.run(input())',
+                     'from helper import Service as Alias\nAlias.run(input())'):
+            with self.subTest(call=call):
+                sources = {'helper.py': helper, 'app.py': call}
+                for order in (list(sources), list(reversed(sources))):
+                    self.assertEqual(self.sites(self.scan(sources, selected=order)),
+                                     [('helper.py', 4, 'python.taint.eval')])
+
+    def test_selected_static_clean_return_and_class_parameter_context(self):
+        helper = ('class Service:\n    @staticmethod\n    def clean(value):\n'
+                  '        return "safe"\n')
+        sources = {'helper.py': helper,
+                   'bridge.py': 'def apply(cls, value):\n    return cls.clean(value)\n',
+                   'app.py': 'from helper import Service\nfrom bridge import apply\n'
+                             'eval(apply(Service, input()))'}
+        self.assertEqual(self.scan(sources), [])
+        sources['helper.py'] = helper.replace('return "safe"', 'return value')
+        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 3, 'python.taint.eval')])
+
+    def test_selected_class_mutation_does_not_reuse_clean_member_summary(self):
+        sources = {'helper.py': 'class Service:\n    @staticmethod\n    def clean(value):\n'
+                               '        return "safe"\n',
+                   'app.py': 'from helper import Service\nService.clean = unknown\n'
+                             'eval(Service.clean(input()))'}
+        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 3, 'python.taint.eval')])
+
+    def test_unselected_class_is_not_resolved_from_checkout(self):
+        sources = {'helper.py': 'class Service:\n    @staticmethod\n    def clean(value):\n'
+                               '        return "safe"\n',
+                   'app.py': 'from helper import Service\neval(Service.clean(input()))'}
+        self.assertEqual(self.sites(self.scan(sources, selected=['app.py'])),
+                         [('app.py', 2, 'python.taint.eval')])
+
+    def test_class_qualified_calls_across_deferred_import_cycle(self):
+        sources = {'a.py': 'import b\nclass Service:\n    @staticmethod\n'
+                           '    def run(value):\n        return b.Service.run(value)\n',
+                   'b.py': 'import a\nclass Service:\n    @staticmethod\n'
+                           '    def run(value):\n        eval(value)\n',
+                   'app.py': 'from a import Service\nService.run(input())\n'}
+        self.assertEqual(self.sites(self.scan(sources)), [('b.py', 5, 'python.taint.eval')])
+        sources['b.py'] = sources['b.py'].replace('eval(value)', 'return "safe"')
+        sources['app.py'] = 'from a import Service\neval(Service.run(input()))\n'
+        self.assertEqual(self.scan(sources), [])
+
+    def test_cycle_with_eager_class_decorator_retains_opaque_calls(self):
+        sources = {'a.py': 'import b\nclass Service:\n    @b.decorate()\n'
+                           '    def clean(value):\n        return "safe"\n',
+                   'b.py': 'import a\ndef run(value):\n    return a.Service.clean(value)\n',
+                   'app.py': 'from b import run\neval(run(input()))\n'}
+        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
+
     def test_selection_order_does_not_move_imported_sink(self):
         sources = {'app.py': 'from helper import run\nrun(input())',
                    'helper.py': '\n\ndef run(x):\n    eval(x)'}
@@ -296,6 +493,31 @@ class PythonModuleTests(unittest.TestCase):
 class PythonModuleRunnerTests(unittest.TestCase):
     setUp = PythonModuleTests.setUp
     write = PythonModuleTests.write
+
+    def test_cyclic_helpers_json_sarif_and_warm_cache(self):
+        self.write({'a.py': 'import b\ndef forward(value):\n    b.run(value)\n',
+                    'b.py': 'import a\ndef run(value):\n    eval(value)\n',
+                    'app.py': 'import a\na.forward(input())\n'})
+        env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', PYTHONDONTWRITEBYTECODE='1',
+                   UBS_CACHE_DIR=str(self.root / 'cache'))
+        for format_ in ('json', 'json', 'sarif'):
+            with self.subTest(format=format_):
+                result = subprocess.run([str(ROOT / 'ubs'), str(self.root), '--only=python',
+                                         f'--format={format_}', '--ci'], cwd=self.root, env=env,
+                                        text=True, capture_output=True, timeout=120)
+                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                report = json.loads(result.stdout)
+                if format_ == 'json':
+                    findings = [f for f in report['findings'] if f['rule_id'] == 'python.taint.eval']
+                    sites = [(Path(f['file']).name, f['line']) for f in findings]
+                    self.assertEqual(report['status'], 'ok', report)
+                else:
+                    findings = [f for run in report['runs'] for f in run['results']
+                                if f['ruleId'] == 'python.taint.eval']
+                    locations = [f['locations'][0]['physicalLocation'] for f in findings]
+                    sites = [(Path(p['artifactLocation']['uri']).name, p['region']['startLine'])
+                             for p in locations]
+                self.assertEqual(sites, [('b.py', 3)], result.stdout)
 
     def test_helper_edits_selection_and_warm_cache(self):
         self.write({'helper.py': 'def clean(x):\n    return "safe"',

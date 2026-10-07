@@ -107,6 +107,130 @@ class CallableFlowTests(SourceTest):
                                   ('HttpResponse(run(input()))' if not expected else 'run(input())'), *expected)
 
 
+class ClassCallableFlowTests(SourceTest):
+    """Class-qualified function identity, without inventing instance dispatch."""
+
+    def test_static_helpers_propagate_sinks_sources_and_clean_returns(self):
+        for body, call, rules in (
+                ('eval(value)', 'Service.run(input())', ('eval',)),
+                ('return input()', 'eval(Service.run("safe"))', ('eval',)),
+                ('return "safe"', 'eval(Service.run(input()))', ()),
+                ('return value', 'eval(Service.run(input()))', ('eval',))):
+            with self.subTest(body=body):
+                self.assert_rules('class Service:\n    @staticmethod\n    def run(value):\n        ' +
+                                  body + '\n' + call, *rules)
+
+    def test_static_sanitizer_domains_are_not_interchangeable(self):
+        definition = ('class Service:\n    @staticmethod\n    def escape(value):\n'
+                      '        return html.escape(value)\n')
+        self.assert_rules(definition + 'HttpResponse(Service.escape(input()))')
+        self.assert_rules(definition + 'eval(Service.escape(input()))', 'eval')
+        self.assert_rules(definition + 'cursor.execute(Service.escape(input()))', 'sql')
+
+    def test_class_alias_and_captured_static_callback(self):
+        definition = 'class Service:\n    @staticmethod\n    def run(value):\n        eval(value)\n'
+        for use in ('Alias = Service\nAlias.run(input())',
+                    'run = Service.run\nrun(input())',
+                    'def apply(callback, value):\n    callback(value)\napply(Service.run, input())'):
+            with self.subTest(use=use):
+                self.assert_rules(definition + use, 'eval')
+
+    def test_staticmethod_identity_is_binding_based(self):
+        for imported, descriptor in (('', 'staticmethod'), ('import builtins\n', 'builtins.staticmethod'),
+                                     ('from builtins import staticmethod as static\n', 'static'),
+                                     ('static = staticmethod\n', 'static')):
+            with self.subTest(descriptor=descriptor):
+                self.assert_rules(imported + f'class Service:\n    @{descriptor}\n'
+                                  '    def run(value):\n        eval(value)\nService.run(input())', 'eval')
+        # A same-spelled decorator can replace its function. It cannot prove
+        # that its return is the original clean method.
+        for binding in ('staticmethod = unknown\n', 'from application import staticmethod\n'):
+            with self.subTest(binding=binding):
+                self.assert_rules(binding + 'class Service:\n    @staticmethod\n'
+                                  '    def clean(value):\n        return "safe"\n'
+                                  'eval(Service.clean(input()))', 'eval')
+
+    def test_unbound_method_uses_explicit_receiver_argument(self):
+        definition = 'class Service:\n    def run(self, value):\n        eval(value)\n'
+        self.assert_rules(definition + 'Service.run(None, input())', 'eval')
+        self.assert_rules(definition + 'Service.run(input(), "safe")')
+        self.assert_rules(definition + 'Service.run(value=input(), self=None)', 'eval')
+
+    def test_class_passed_to_or_returned_from_helper_keeps_identity(self):
+        definition = 'class Service:\n    @staticmethod\n    def run(value):\n        eval(value)\n'
+        self.assert_rules(definition + 'def apply(cls, value):\n    cls.run(value)\n'
+                          'apply(Service, input())', 'eval')
+        self.assert_rules(definition + 'def select():\n    return Service\nselect().run(input())', 'eval')
+
+    def test_class_global_namespace_is_not_its_method_closure(self):
+        # The class assignment must not shadow the module's input() binding
+        # inside the method. The reverse case protects benign module bindings.
+        self.assert_rules('class Service:\n    input = "safe"\n    @staticmethod\n'
+                          '    def run():\n        eval(input())\nService.run()', 'eval')
+        self.assert_rules('input = str\nclass Service:\n    @staticmethod\n'
+                          '    def run():\n        eval(input())\nService.run()')
+
+    def test_class_namespace_does_not_inherit_module_bindings(self):
+        self.assert_rules('clean = html.escape\nclass Service:\n    pass\n'
+                          'HttpResponse(Service.clean(input()))', 'xss')
+
+    def test_rebinding_class_name_does_not_rebind_captured_method(self):
+        definition = 'class Service:\n    @staticmethod\n    def run(value):\n        eval(value)\n'
+        self.assert_rules(definition + 'run = Service.run\nService = other\nrun(input())', 'eval')
+        self.assert_rules(definition + 'Service = other\nService.run(input())')
+
+    def test_class_mutations_revoke_known_clean_member_contract(self):
+        definition = 'class Service:\n    @staticmethod\n    def clean(value):\n        return "safe"\n'
+        for mutation in ('Service.clean = unknown', 'alias = Service\nalias.clean = unknown',
+                         'configure(Service)', 'if flag:\n    Service.clean = unknown',
+                         'def change(cls):\n    cls.clean = unknown\nchange(Service)'):
+            with self.subTest(mutation=mutation):
+                self.assert_rules(definition + mutation + '\neval(Service.clean(input()))', 'eval')
+        self.assert_rules(definition + 'clean = Service.clean\nService.clean = unknown\n'
+                          'eval(clean(input()))')
+
+    def test_mutual_class_method_recursion_reaches_fixed_point(self):
+        self.assert_rules('class Service:\n    @staticmethod\n    def first(value, stop):\n'
+                          '        return Service.second(value, stop)\n    @staticmethod\n'
+                          '    def second(value, stop):\n        if stop:\n            return value\n'
+                          '        return Service.first(value, stop)\neval(Service.first(input(), flag))', 'eval')
+
+    def test_helper_global_class_lookup_uses_invocation_time_contract(self):
+        definition = ('class Service:\n    @staticmethod\n    def clean(value):\n        return "safe"\n'
+                      'def run(value):\n    return Service.clean(value)\n')
+        self.assert_rules(definition + 'Service.clean = unknown\neval(run(input()))', 'eval')
+        # The same helper has distinct proven and revoked class contexts.
+        # Later mutation does not retroactively change its earlier return.
+        findings = self.assert_rules(definition + 'eval(run(input()))\nService.clean = unknown\n'
+                                     'eval(run(input()))', 'eval')
+        self.assertEqual(findings[0]['line'], 9)
+        self.assert_rules(definition + 'def change(cls):\n    cls.clean = unknown\n'
+                          'change(Service)\neval(run(input()))', 'eval')
+
+    def test_class_helpers_propagate_heap_effects_and_raised_payloads(self):
+        self.assert_rules('class Service:\n    @staticmethod\n    def fill(box, value):\n'
+                          '        box.append(value)\nbox=[]\nService.fill(box,input())\neval(box[0])', 'eval')
+        self.assert_rules('class Service:\n    @staticmethod\n    def raise_value(value):\n'
+                          '        raise ValueError(value)\ntry:\n    Service.raise_value(input())\n'
+                          'except ValueError as error:\n    eval(str(error))', 'eval')
+
+    def test_async_static_helpers_run_only_when_awaited(self):
+        definition = 'class Service:\n    @staticmethod\n    async def run(value):\n        eval(value)\n'
+        self.assert_rules(definition + 'Service.run(input())')
+        self.assert_rules(definition + 'async def app():\n    await Service.run(input())', 'eval')
+
+    def test_unsupported_class_construction_does_not_prove_clean(self):
+        for prefix in ('@decorate\nclass Service:', 'class Service(Base):',
+                       'class Service(metaclass=Factory):'):
+            with self.subTest(prefix=prefix):
+                self.assert_rules(prefix + '\n    @staticmethod\n    def clean(value):\n'
+                                  '        return "safe"\neval(Service.clean(input()))', 'eval')
+        for decorator in ('classmethod', 'property', 'unknown'):
+            with self.subTest(decorator=decorator):
+                self.assert_rules(f'class Service:\n    @{decorator}\n    def clean(value):\n'
+                                  '        return "safe"\neval(Service.clean(input()))', 'eval')
+
+
 class FiniteCallableTests(SourceTest):
     def scan(self, source):
         # These fixtures are parsed in a bounded subprocess, never executed.
@@ -192,6 +316,9 @@ class CallableCliTests(unittest.TestCase):
             ('alias-cleared', 'run = eval if condition else print\nrun = print\nrun(input())\n', None),
             ('recursive', 'choose = lambda value: choose(value) if condition else value\neval(choose(input()))\n', 'eval'),
             ('recursive-clean', 'clean = lambda value: clean(value) if condition else html.escape(value)\nHttpResponse(clean(input()))\n', None),
+            ('class-sink', 'class Service:\n    @staticmethod\n    def run(value):\n        eval(value)\nService.run(input())\n', 'eval'),
+            ('class-clean', 'class Service:\n    @staticmethod\n    def clean(value):\n        return "safe"\neval(Service.clean(input()))\n', None),
+            ('class-replaced', 'class Service:\n    @staticmethod\n    def clean(value):\n        return "safe"\ndef run(value):\n    return Service.clean(value)\nService.clean = other\neval(run(input()))\n', 'eval'),
         )
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-callable-effects'
         artifacts.mkdir(parents=True, exist_ok=True)

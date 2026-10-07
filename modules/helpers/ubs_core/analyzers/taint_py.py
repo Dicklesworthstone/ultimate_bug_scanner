@@ -4,9 +4,13 @@ The AST transfer functions use strong assignment updates, join control-flow
 branches, and iterate loops and recursive function summaries to a fixpoint.
 Facts retain source provenance and sink-specific sanitizers. Local helpers
 summarize both returned values and parameters reaching a sink; analyzed code
-is never imported or executed. Selected acyclic Python modules share function
-summaries; unresolved/cyclic imports and arbitrary dynamic dispatch retain
+is never imported or executed. Selected Python modules share function
+summaries, including qualified cycles with deferred peer lookups. Unresolved
+imports, eager cyclic initialization and arbitrary dynamic dispatch retain
 conservative opaque-call behavior. Known callable aliases are modeled.
+Plain class-qualified static and unbound functions retain their callable
+identity across selected modules and helper calls. Class namespace mutations
+revoke those contracts; arbitrary descriptors and instance dispatch are opaque.
 Mutable objects use a finite, field-insensitive heap: aliases share writes,
 and local call summaries propagate output-parameter and captured-object writes.
 Pending returns, raises, breaks and continues pass through cleanup before
@@ -240,7 +244,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'builtins',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'builtins', 'staticmethod',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -273,7 +277,7 @@ def _join_bindings(*bindings):
 
 
 def _without_object_contract(binding):
-    return _join_bindings(*(None if isinstance(value, (_ArgumentVector, _ProcessInput)) else value
+    return _join_bindings(*(None if isinstance(value, (_ArgumentVector, _ProcessInput, ast.ClassDef)) else value
                             for value in _binding_choices(binding)))
 
 
@@ -1714,7 +1718,7 @@ class _Flow:
             # This effect is summarized even for a symbolic helper parameter.
             for expression in (*node.args, *keyword_nodes.values()):
                 value = self.expression_bindings.get(expression)
-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue))
+                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, ast.ClassDef))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
                            'builtins.print', 'builtins.str', 'builtins.len', 'builtins.repr'}:
@@ -1756,6 +1760,12 @@ class _Flow:
                 receiver_refs = self.expression_references.get(node.value, NO_REFERENCES)
                 receiver_fact = self.expression_facts.get(node.value, CLEAN)
                 for base in _binding_choices(self.expression_bindings.get(node.value)):
+                    if isinstance(base, ast.ClassDef):
+                        members = self.engine.class_members.get(base, {})
+                        if self.engine.reads is not None:
+                            self.engine.reads[('class_members', base)] = members
+                        candidates.append(members.get(node.attr))
+                        continue
                     if isinstance(base, _ModuleBinding):
                         incoming, member, refs = base.project.member(base.key, node.attr, state)
                         fact = join_facts(fact, incoming)
@@ -2115,11 +2125,13 @@ class _Flow:
             # router identity even if a later default rebinds its name.
             route = False
             route_dependencies = []
+            descriptors = []
             for decorator in node.decorator_list:
                 is_route = isinstance(decorator, ast.Call) and _imported_name(decorator.func, state.bindings) in {
                     f'@fastapi.router.{method}' for method in _ROUTE_METHODS}
                 route = route or is_route
                 self.expr(decorator, state)
+                descriptors.append(self.expression_bindings.get(decorator))
                 if is_route:
                     markers = self.expression_bindings.get(_keyword_argument(decorator, 'dependencies'))
                     if isinstance(markers, tuple):
@@ -2143,6 +2155,8 @@ class _Flow:
             self.engine.define('default_bindings', node, {
                 name: self.expression_bindings.get(default) for name, default in defaults.items()})
             self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
+            self.engine.define('class_callables', node, not descriptors or descriptors in (
+                ['staticmethod'], ['builtins.staticmethod']))
             state[node.name] = CLEAN
             state.bindings[node.name] = node
             state.references[node.name] = NO_REFERENCES
@@ -2156,9 +2170,17 @@ class _Flow:
                 return None
             for ref, fact in completed.heap.items():
                 state.heap[ref] = join_facts(state.heap.get(ref, CLEAN), fact)
+            members = {}
+            if self.engine.plain_class(node, state):
+                for name in _local_names(node):
+                    value = completed.bindings.get(name)
+                    if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        value = value if self.engine.class_callables.get(value, False) else None
+                    members[name] = value
+            self.engine.define('class_members', node, members)
             state[node.name] = CLEAN
             state.bindings[node.name] = node
-            state.references[node.name] = NO_REFERENCES
+            state.references[node.name] = frozenset({node})
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
                 local = alias.asname or alias.name.split('.')[0]
@@ -2399,6 +2421,8 @@ class _Analysis:
         self.writes = None
         self.default_references = {}
         self.default_bindings = {}
+        self.class_members = {}
+        self.class_callables = {}
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         self.call_sites = {node: _expanded_call(node) for node in ast.walk(tree) if isinstance(node, ast.Call)}
         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
@@ -2422,6 +2446,64 @@ class _Analysis:
 
     def owner(self, function):
         return self.project.owners.get(function, self) if self.project is not None else self
+
+    @staticmethod
+    def plain_class(node, state):
+        """Prove the bounded class namespace used for class-qualified calls.
+
+        There is no instance/descriptor or inheritance simulation here. Only
+        a class using the default metaclass and straight-line declarations
+        can supply members. Executable namespace construction remains opaque.
+        Definitions still run through the ordinary transfer functions, which
+        capture actual decorator bindings and definition-time defaults.
+        """
+        if node.bases or node.keywords or node.decorator_list:
+            return False
+
+        def literal(value):
+            return value is None or all(isinstance(child, (
+                ast.Constant, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Load,
+                ast.UnaryOp, ast.UAdd, ast.USub,
+            )) for child in ast.walk(value))
+
+        def annotation(value):
+            if value is None:
+                return True
+            for child in ast.walk(value):
+                if isinstance(child, ast.Name):
+                    if child.id not in {'str', 'bytes', 'int', 'float', 'bool', 'object',
+                                         'list', 'tuple', 'dict', 'set', 'frozenset', 'type'}:
+                        return False
+                    if child.id in state.bindings:
+                        return False
+                elif not isinstance(child, (ast.Constant, ast.Load, ast.Subscript,
+                                            ast.Tuple, ast.BinOp, ast.BitOr)):
+                    return False
+            return True
+
+        for statement in node.body:
+            if isinstance(statement, ast.Pass):
+                continue
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                continue
+            if isinstance(statement, ast.Assign):
+                if all(isinstance(target, ast.Name) for target in statement.targets) and literal(statement.value):
+                    continue
+            elif isinstance(statement, ast.AnnAssign):
+                if (isinstance(statement.target, ast.Name) and literal(statement.value)
+                        and annotation(statement.annotation)):
+                    continue
+            elif isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = statement.args
+                params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                params.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
+                if (not getattr(statement, 'type_params', ())
+                        and all(literal(value) for value in (*args.defaults, *args.kw_defaults))
+                        and annotation(statement.returns)
+                        and all(annotation(arg.annotation) for arg in params)):
+                    continue
+            return False
+        return True
 
     def enclosing(self, node):
         child = node
@@ -2508,10 +2590,18 @@ class _Analysis:
         context = []
         for name, binding in sorted(values.items()):
             if name.startswith('@global:'):
-                continue
-            choices = frozenset(value if isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                # A class namespace is a mutable object. A caller may replace
+                # one of its methods after a helper's definition, so neither
+                # the helper's original nor the module's final class binding
+                # can certify this invocation. Include the finite class value
+                # (or its revoked/unknown alternative) in the summary context.
+                nominal = self.owner(function).globals.bindings.get(name[len('@global:'):])
+                if not any(isinstance(value, ast.ClassDef)
+                           for value in (*_binding_choices(binding), *_binding_choices(nominal))):
+                    continue
+            choices = frozenset(value if isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
                                 else None for value in _binding_choices(binding))
-            if any(value is not None for value in choices):
+            if name.startswith('@global:') or any(value is not None for value in choices):
                 context.append((name, _join_bindings(*choices)))
         key = (function, tuple(context)) if context else function
         summary = self.summaries.setdefault(key, FunctionSummary())
@@ -2541,8 +2631,10 @@ class _Analysis:
         # context on every pass of every later module made project scans
         # quadratic in the module count; only contexts this module requests,
         # or that belong to its own functions, are part of its fixed point.
+        solving = self.project.solving if self.project is not None else set()
         inherited = {key for key in self.summaries
-                     if isinstance(key, tuple) and self.owner(key[0]) is not self}
+                     if isinstance(key, tuple) and self.owner(key[0]) is not self
+                     and self.owner(key[0]) not in solving}
         # Worklist: a job is a deterministic function of its namespace, the
         # summaries it requested and the definition-time tables it read. When
         # none of those changed since its last solve, solving it again yields
@@ -2606,7 +2698,7 @@ class _Analysis:
                     state.bindings[name] = _SymbolicValue(f'@free:{name}')
                     state.references[name] = frozenset({f'@free:{name}'})
                 for name, binding in context:
-                    state.bindings[name.removeprefix('@free:')] = binding
+                    state.bindings[name.removeprefix('@free:').removeprefix('@global:')] = binding
                 if isinstance(function, ast.Lambda):
                     # Analyze lambda bodies once per fixed-point pass, not by
                     # recursively interpreting their call sites on our stack.
@@ -2656,8 +2748,10 @@ class _Analysis:
 class _Project:
     """Resolve only selected Python source files; never search sys.path/import code.
 
-    Module initialization is dependency ordered. Cycles (and their dependent
-    modules) keep opaque calls rather than using a guessed partial namespace.
+    Module initialization is dependency ordered. A cyclic component with only
+    literal initialization and deferred peer lookups can share a fixed point.
+    Other cycles keep opaque imports, not a guessed partial namespace; their
+    dependents still resolve selected-module summaries normally.
     A virtual line map keeps imported sink locations and suppressions attached
     to their defining file without concatenating/parsing source buffers.
     """
@@ -2668,6 +2762,7 @@ class _Project:
         self.namespaces = set()
         self.keys = {}
         self.ready = set()
+        self.solving = set()
         seen, offset = set(), 0
         for path in files:
             path = Path(path).resolve()
@@ -2702,7 +2797,8 @@ class _Project:
         self.module_references = {'@module:' + str(key) for key in self.namespaces}
         # AST-keyed metadata is safe to share. Module variable namespaces and
         # framework entrypoint bindings remain separate per defining module.
-        for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures'):
+        for name in ('summaries', 'defaults', 'default_references', 'default_bindings', 'parents', 'locals', 'closures',
+                     'class_members', 'class_callables'):
             shared = {}
             for _, _, engine, _ in self.sources:
                 shared.update(getattr(engine, name))
@@ -2745,9 +2841,154 @@ class _Project:
                     continue
                 for prefix in (key, *key.parents):
                     dependency = self.modules.get(prefix)
-                    if dependency is not None and dependency is not engine:
+                    if dependency is not None and (dependency is not engine or prefix == key):
                         dependencies.add(dependency)
         return dependencies
+
+    def components(self):
+        """Yield strongly connected import components, dependencies first.
+
+        An iterative Tarjan walk bounds stack use by the selected graph, not
+        Python's recursion limit. Only a genuine cycle needs the opaque-import
+        fallback: a module importing a cycle may also call independent helpers
+        whose source, sink and mutation summaries must remain available.
+        """
+        adjacency = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
+        order = {engine: str(path) for path, _, engine, _ in self.sources}
+        indices, lowlinks = {}, {}
+        active, stacked = set(), []
+        for root in sorted(adjacency, key=order.__getitem__):
+            if root in indices:
+                continue
+            indices[root] = lowlinks[root] = len(indices)
+            active.add(root)
+            stacked.append(root)
+            pending = [(root, iter(sorted(adjacency[root], key=order.__getitem__)))]
+            while pending:
+                engine, edges = pending[-1]
+                dependency = next(edges, None)
+                if dependency is not None:
+                    if dependency not in indices:
+                        indices[dependency] = lowlinks[dependency] = len(indices)
+                        active.add(dependency)
+                        stacked.append(dependency)
+                        pending.append((dependency, iter(sorted(adjacency[dependency], key=order.__getitem__))))
+                    elif dependency in active:
+                        lowlinks[engine] = min(lowlinks[engine], indices[dependency])
+                    continue
+                pending.pop()
+                if pending:
+                    parent = pending[-1][0]
+                    lowlinks[parent] = min(lowlinks[parent], lowlinks[engine])
+                if lowlinks[engine] == indices[engine]:
+                    component = []
+                    while True:
+                        member = stacked.pop()
+                        active.remove(member)
+                        component.append(member)
+                        if member is engine:
+                            break
+                    yield sorted(component, key=order.__getitem__)
+
+    def deferred_cycle(self, component):
+        """Can every peer namespace be initialized before peer member access?
+
+        Python permits `import peer` cycles and imports inside functions, but
+        an eager `from peer import function`, decorator or initializer call
+        may observe a partially initialized peer. Only accept explicit module
+        imports, plain function definitions and literal module state here.
+        Everything else retains the opaque fallback, never a guessed clean
+        summary. No source is imported or executed to make this decision.
+        """
+        members = set(component)
+
+        def literal(node):
+            return node is None or all(isinstance(child, (
+                ast.Constant, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Load,
+                ast.UnaryOp, ast.UAdd, ast.USub,
+            )) for child in ast.walk(node))
+
+        def annotation(node, engine):
+            if node is None:
+                return True
+            # Builtin annotations cannot inspect a peer. Reject shadowed
+            # builtin names, attribute lookups and executable annotations.
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name):
+                    if (child.id not in {'str', 'bytes', 'int', 'float', 'bool', 'object',
+                                         'list', 'tuple', 'dict', 'set', 'frozenset', 'type'}
+                            or child.id in engine.global_names):
+                        return False
+                elif not isinstance(child, (ast.Constant, ast.Load, ast.Subscript,
+                                            ast.Tuple, ast.BinOp, ast.BitOr)):
+                    return False
+            return True
+
+        for engine in component:
+            if self.modules.get(self.keys.get(engine)) is not engine:
+                return False  # An ambiguous file/package name proves no identity.
+            for node in engine.tree.body:
+                if isinstance(node, (ast.Import, ast.Pass)):
+                    continue
+                if isinstance(node, ast.ImportFrom):
+                    key = self.import_key(engine, node, node.module or '')
+                    if self.modules.get(key) in members or any(alias.name == '*' for alias in node.names):
+                        return False
+                    continue
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+                    continue
+                if isinstance(node, ast.Assign):
+                    if all(isinstance(target, ast.Name) for target in node.targets) and literal(node.value):
+                        continue
+                elif isinstance(node, ast.AnnAssign):
+                    if (isinstance(node.target, ast.Name) and literal(node.value)
+                            and annotation(node.annotation, engine)):
+                        continue
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    args = node.args
+                    params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+                    params.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
+                    if (not node.decorator_list and not getattr(node, 'type_params', ())
+                            and all(literal(value) for value in (*args.defaults, *args.kw_defaults))
+                            and annotation(node.returns, engine)
+                            and all(annotation(arg.annotation, engine) for arg in params)):
+                        continue
+                elif isinstance(node, ast.ClassDef):
+                    # Class bodies execute during import, but these bounded
+                    # namespaces contain only literal state and deferred
+                    # functions. Only an unshadowed builtin staticmethod
+                    # decorator is safe to construct while peers initialize.
+                    shadowed = engine.global_names | _local_names(node)
+                    if (engine.plain_class(node, _State(bindings={name: None for name in engine.global_names}))
+                            and all(isinstance(decorator, ast.Name) and decorator.id == 'staticmethod'
+                                    and 'staticmethod' not in shadowed
+                                    for member in node.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                    for decorator in member.decorator_list)):
+                        continue
+                return False
+        return True
+
+    def analyze_cycle(self, component):
+        # Publish all proven namespaces together. Priming does not solve any
+        # function body and cannot read a peer member under deferred_cycle's
+        # initializer contract. Qualified lookups then see complete namespaces.
+        for engine in component:
+            engine.globals = _Flow(engine, engine.tree).block(engine.tree.body, _State())
+        self.ready.update(component)
+        self.solving = set(component)
+        try:
+            while True:
+                summaries = component[0].summaries.copy()
+                effects = {}
+                for engine in component:
+                    for key, fact in engine.analyze().items():
+                        effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                if summaries == component[0].summaries:
+                    # Keep only the converged pass: an intermediate opaque
+                    # return or provisional callable is not final evidence.
+                    return effects
+        finally:
+            self.solving = set()
 
     def member(self, key, name, state):
         module_ref = '@module:' + str(key)
@@ -2787,21 +3028,23 @@ class _Project:
         return CLEAN, binding, frozenset({binding.reference})
 
     def findings(self):
-        pending = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
         effects = {}
-        while pending:
-            ready = [engine for engine, deps in pending.items() if deps <= self.ready]
-            if not ready:
+        for component in self.components():
+            cyclic = len(component) > 1 or component[0] in self.dependencies(component[0])
+            if cyclic and self.deferred_cycle(component):
+                for key, fact in self.analyze_cycle(component).items():
+                    effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                continue
+            if cyclic:
                 # Do not pretend to execute a cyclic import's partially
-                # initialized modules. Still run ordinary intrafile analysis.
-                ready = list(pending)
-                for engine in ready:
+                # initialized modules. Keep this fallback within the actual
+                # cycle, never disabling cross-file analysis in its callers.
+                for engine in component:
                     engine.project = None
-            for engine in ready:
+            for engine in component:
                 for key, fact in engine.analyze().items():
                     effects[key] = join_facts(effects.get(key, CLEAN), fact)
                 self.ready.add(engine)
-                del pending[engine]
         starts = [offset for _, _, _, offset in self.sources]
         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
         for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):

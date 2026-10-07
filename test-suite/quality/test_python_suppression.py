@@ -295,39 +295,63 @@ class PythonSourceSuppressionTests(unittest.TestCase):
                 _, records, _, _ = self.scan(no_cache=mode == "disabled")
                 self.assertEqual(self.sites(records, "py.none.equality"), [1, 2, 7])
 
+    def test_ast_rule_scope_does_not_suppress_a_distinct_pattern_rule(self) -> None:
+        rule = "py.functions.mutable-default"
+        for scope, expected in (("py.mutable-defaults", [1]),
+                                (rule, []),
+                                (f"py.mutable-defaults,{rule}", []),
+                                ("python.unrelated.rule", [1])):
+            self.source.write_text(f"def remember(bucket=[]):  # ubs:ignore[{scope}]\n"
+                                   "    bucket.append(1)\n    return bucket\n", encoding="utf-8")
+            for mode in ("cold", "warm", "disabled"):
+                with self.subTest(scope=scope, cache=mode):
+                    code, records, doc, _ = self.scan(no_cache=mode == "disabled")
+                    self.assertEqual(self.sites(records, rule), expected)
+                    self.assertEqual(doc["critical"], len(expected))
+                    self.assertEqual(code, int(bool(expected)))
+
     @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
     def test_public_ci_json_text_and_sarif_agree_with_lifecycle_sink(self) -> None:
         for only_marked in (False, True):
             self.source.write_text(REPRO.split('\n\n')[0] + '\n' if only_marked else REPRO,
                                    encoding="utf-8")
             for output_format in ("json", "text", "sarif"):
-                with self.subTest(only_marked=only_marked, format=output_format):
-                    command = [str(REPO_ROOT / "ubs"), "--ci", "--no-cache", "--only=python",
-                               f"--format={output_format}", str(self.source)]
-                    proc = subprocess.run(command, cwd=self.root, env=self.env, text=True,
-                                          capture_output=True, timeout=180)
-                    self.assertEqual(proc.returncode, int(not only_marked), proc.stdout + proc.stderr)
-                    expected = int(not only_marked)
-                    if output_format == "json":
-                        doc = self.decode_json(proc.stdout, "public JSON CLI")
-                        self.assertEqual(doc["status"], "ok", doc)
-                        self.assertEqual(doc["failed_modules"], [], doc)
-                        self.assertEqual(doc["totals"]["critical"], expected, doc)
-                        findings = [record for record in doc.get("findings", [])
-                                    if record["rule_id"] == LIFECYCLE]
-                        self.assertEqual([record["line"] for record in findings], [] if only_marked else [7])
-                        self.assertTrue(all(record["suppressed"] is False for record in findings))
-                    elif output_format == "sarif":
-                        doc = self.decode_json(proc.stdout, "public SARIF CLI")
-                        findings = [record for run in doc["runs"] for record in run["results"]
-                                    if record["ruleId"] == LIFECYCLE]
-                        self.assertEqual([record["locations"][0]["physicalLocation"]["region"]["startLine"]
-                                          for record in findings], [] if only_marked else [7])
-                        self.assertTrue(all(record["level"] == "error" for record in findings))
-                    else:
-                        self.assertRegex(proc.stdout, rf"Critical issues:\s+{expected}\b")
-                        if not only_marked:
-                            self.assertIn("(1 found) — " + LIFECYCLE, proc.stdout)
+                env = dict(self.env)
+                cache_dir = self.root / f"public-cache-{output_format}-{only_marked}"
+                env["UBS_CACHE_DIR"] = str(cache_dir)
+                for mode in ("cold", "warm", "disabled"):
+                    with self.subTest(only_marked=only_marked, format=output_format, cache=mode):
+                        command = [str(REPO_ROOT / "ubs"), "--ci", "--only=python",
+                                   f"--format={output_format}", str(self.source)]
+                        if mode == "disabled":
+                            command.insert(1, "--no-cache")
+                        proc = subprocess.run(command, cwd=self.root, env=env, text=True,
+                                              capture_output=True, timeout=180)
+                        self.assertEqual(proc.returncode, int(not only_marked), proc.stdout + proc.stderr)
+                        if mode != "disabled":
+                            self.assertTrue(list(cache_dir.glob("*/files/**/*.json")),
+                                            "cached public CLI scans must populate the real cache")
+                        expected = int(not only_marked)
+                        if output_format == "json":
+                            doc = self.decode_json(proc.stdout, "public JSON CLI")
+                            self.assertEqual(doc["status"], "ok", doc)
+                            self.assertEqual(doc["failed_modules"], [], doc)
+                            self.assertEqual(doc["totals"]["critical"], expected, doc)
+                            findings = [record for record in doc.get("findings", [])
+                                        if record["rule_id"] == LIFECYCLE]
+                            self.assertEqual([record["line"] for record in findings], [] if only_marked else [7])
+                            self.assertTrue(all(record["suppressed"] is False for record in findings))
+                        elif output_format == "sarif":
+                            doc = self.decode_json(proc.stdout, "public SARIF CLI")
+                            findings = [record for run in doc["runs"] for record in run["results"]
+                                        if record["ruleId"] == LIFECYCLE]
+                            self.assertEqual([record["locations"][0]["physicalLocation"]["region"]["startLine"]
+                                              for record in findings], [] if only_marked else [7])
+                            self.assertTrue(all(record["level"] == "error" for record in findings))
+                        else:
+                            self.assertRegex(proc.stdout, rf"Critical issues:\s+{expected}\b")
+                            if not only_marked:
+                                self.assertIn("(1 found) — " + LIFECYCLE, proc.stdout)
 
 
 if __name__ == "__main__":

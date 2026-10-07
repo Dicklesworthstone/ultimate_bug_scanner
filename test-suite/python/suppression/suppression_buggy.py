@@ -13,8 +13,8 @@ import subprocess
 import tempfile
 
 
-def remember(bucket=[]):  # ubs:ignore[py.mutable-defaults] trailing marker on the def-line finding
-    # ubs:ignore[py.mutable-defaults] formatter-relocated marker: formatters move the trailing comment onto the first body line
+def remember(bucket=[]):  # ubs:ignore[py.mutable-defaults,py.functions.mutable-default] trailing marker names both the AST and pattern rules
+    # ubs:ignore[py.mutable-defaults,py.functions.mutable-default] formatter-relocated marker: formatters move the trailing comment onto the first body line
     bucket.append("entry")
     return bucket
 

@@ -1,0 +1,434 @@
+diff --git a/test-suite/quality/test_taint_python_callables.py b/test-suite/quality/test_taint_python_callables.py
+index 16bb258..ddb315e 100644
+--- a/test-suite/quality/test_taint_python_callables.py
++++ b/test-suite/quality/test_taint_python_callables.py
+@@ -2,4 +2,5 @@
+ from __future__ import annotations
+ 
++import ast
+ import json
+ import os
+@@ -8,4 +9,5 @@ import subprocess
+ import sys
+ import tempfile
++import textwrap
+ import unittest
+ 
+@@ -309,4 +311,349 @@ class FiniteCallableTests(SourceTest):
+ 
+ 
++class BoundClassMethodFlowTests(SourceTest):
++    def scan(self, source):
++        ast.parse(textwrap.dedent(source).lstrip('\n'))
++        return super().scan(source)
++
++    def test_implicit_receiver_does_not_consume_the_source_argument(self):
++        for sink, rule in (('eval(code)', 'eval'), ('os.system(code)', 'command'),
++                           ('cursor.execute(code)', 'sql'), ('HttpResponse(code)', 'xss')):
++            with self.subTest(sink=sink):
++                self.assert_rules(f'''
++                    class Service:
++                        @classmethod
++                        def run(owner, code):
++                            {sink}
++                    Service.run(input())
++                ''', rule)
++
++    def test_sources_and_clean_returns_keep_method_identity(self):
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def read(cls):
++                    return input()
++            eval(Service.read())
++        ''', 'eval')
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def clean(cls, ignored):
++                    return 'fixed'
++            eval(Service.clean(input()))
++        ''')
++
++    def test_receiver_dispatches_to_static_and_bound_helpers(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def sink(value):
++                    eval(value)
++                @classmethod
++                def middle(cls, value):
++                    cls.sink(value)
++                @classmethod
++                def run(cls, value):
++                    cls.middle(value)
++            Service.run(input())
++        ''', 'eval')
++
++    def test_aliases_callbacks_and_returned_bound_methods(self):
++        for invocation in ('alias(input())', 'apply(alias, input())',
++                           'choose()(input())', 'apply(choose(), input())'):
++            with self.subTest(invocation=invocation):
++                self.assert_rules(textwrap.dedent('''
++                    class Service:
++                        @classmethod
++                        def run(cls, code):
++                            eval(code)
++                    def apply(callback, value):
++                        return callback(value)
++                    def choose():
++                        return Service.run
++                    alias = Service.run
++                ''') + '\n' + invocation, 'eval')
++
++    def test_positional_only_keyword_and_literal_unpacking(self):
++        for invocation, expected in (("Service.run(code=input())", ('eval',)),
++                                     ("Service.run(*[input()])", ('eval',)),
++                                     ("Service.run(**{'code': input()})", ('eval',)),
++                                     ("Service.run()", ())):
++            with self.subTest(invocation=invocation):
++                self.assert_rules(textwrap.dedent('''
++                    class Service:
++                        @classmethod
++                        def run(owner, /, code='1'):
++                            eval(code)
++                ''') + '\n' + invocation, *expected)
++
++    def test_returning_receiver_retains_class_identity(self):
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def identity(cls):
++                    return cls
++                @classmethod
++                def run(cls, value):
++                    eval(value)
++            Service.identity().run(input())
++        ''', 'eval')
++
++    def test_sanitizers_remain_sink_specific(self):
++        for sink, expected in (('HttpResponse', ()), ('eval', ('eval',))):
++            with self.subTest(sink=sink):
++                self.assert_rules(textwrap.dedent('''
++                    class Service:
++                        @classmethod
++                        def clean(cls, value):
++                            return html.escape(value)
++                ''') + f'\n{sink}(Service.clean(input()))', *expected)
++
++    def test_recursive_bound_methods_converge(self):
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def left(cls, value):
++                    return cls.right(value) if again else html.escape(value)
++                @classmethod
++                def right(cls, value):
++                    return cls.left(value)
++            HttpResponse(Service.left(input()))
++        ''')
++
++    def test_class_writes_in_bound_calls_invalidate_outer_proofs(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def replace(cls):
++                    cls.clean = other
++            Service.replace()
++            eval(Service.clean(input()))
++        ''', 'eval')
++
++    def test_callback_receiver_writes_propagate_through_helper(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def replace(cls):
++                    cls.clean = other
++            def apply(callback):
++                callback()
++            apply(Service.replace)
++            eval(Service.clean(input()))
++        ''', 'eval')
++
++    def test_captured_callable_survives_rebinding_but_receiver_proofs_do_not(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def convert(cls, value):
++                    return cls.clean(value)
++            convert = Service.convert
++            eval(convert(input()))
++            Service.clean = other
++            eval(convert(input()))
++        ''', 'eval')
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def run(cls, value):
++                    eval(value)
++            run = Service.run
++            Service = other
++            run(input())
++        ''', 'eval')
++
++    def test_awaited_calls_defer_effects_until_execution(self):
++        for invocation, expected in (('Service.run(input())', ()),
++                                     ('asyncio.run(Service.run(input()))', ('eval',))):
++            with self.subTest(invocation=invocation):
++                self.assert_rules(textwrap.dedent('''
++                    class Service:
++                        @classmethod
++                        async def run(cls, value):
++                            eval(value)
++                ''') + '\n' + invocation, *expected)
++
++    def test_mutable_arguments_and_exception_payloads(self):
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def write(cls, box, value):
++                    box['data'] = value
++            box = {}
++            Service.write(box, input())
++            eval(box['data'])
++        ''', 'eval')
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def fail(cls, value):
++                    raise ValueError(value)
++            try:
++                Service.fail(input())
++            except ValueError as error:
++                eval(str(error))
++        ''', 'eval')
++
++    def test_descriptor_identity_and_shadowing(self):
++        self.assert_rules('''
++            from builtins import classmethod as method
++            class Service:
++                @method
++                def run(cls, value):
++                    eval(value)
++            Service.run(input())
++        ''', 'eval')
++        self.assert_rules('''
++            classmethod = other
++            class Service:
++                @classmethod
++                def clean(cls, value):
++                    return 'fixed'
++            eval(Service.clean(input()))
++        ''', 'eval')
++
++    def test_opaque_callback_escape_revokes_receiver_contract(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def convert(cls, value):
++                    return cls.clean(value)
++            convert = Service.convert
++            unknown(convert)
++            eval(convert(input()))
++        ''', 'eval')
++
++    def test_coroutine_receiver_is_revalidated_when_resumed(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                async def convert(cls, value):
++                    return cls.clean(value)
++            pending = Service.convert(input())
++            Service.clean = other
++            eval(asyncio.run(pending))
++        ''', 'eval')
++
++    def test_class_parameter_receiver_writes_return_to_original_object(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def replace(cls):
++                    cls.clean = other
++            def replace(klass):
++                alias = klass.replace
++                alias()
++            replace(Service)
++            eval(Service.clean(input()))
++        ''', 'eval')
++
++    def test_returned_callback_receiver_writes_are_not_lost(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def replace(cls):
++                    cls.clean = other
++            def select(klass):
++                return klass.replace
++            def apply(callback):
++                callback()
++            apply(select(Service))
++            eval(Service.clean(input()))
++        ''', 'eval')
++
++    def test_exceptional_receiver_writes_are_observed(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def replace(cls):
++                    cls.clean = other
++                    raise ValueError('changed')
++            def apply(callback):
++                callback()
++            try:
++                apply(Service.replace)
++            except ValueError:
++                eval(Service.clean(input()))
++        ''', 'eval')
++
++    def test_argument_evaluation_keeps_callable_and_invalidates_receiver(self):
++        self.assert_rules('''
++            class Service:
++                @staticmethod
++                def clean(value):
++                    return 'fixed'
++                @classmethod
++                def convert(cls, value, ignored):
++                    return cls.clean(value)
++            def replace(klass):
++                klass.clean = other
++            eval(Service.convert(input(), replace(Service)))
++        ''', 'eval')
++
++    def test_branch_methods_and_receivers_are_not_conflated(self):
++        self.assert_rules('''
++            class Safe:
++                @classmethod
++                def clean(cls, value):
++                    return 'fixed'
++            class Unsafe:
++                @classmethod
++                def clean(cls, value):
++                    return value
++            def apply(callback, value):
++                return callback(value)
++            choice = Safe.clean if flag else Unsafe.clean
++            eval(apply(choice, input()))
++        ''', 'eval')
++
++    def test_recursive_higher_order_receiver_has_a_finite_context(self):
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def clean(cls, value):
++                    return html.escape(value)
++            def apply(callback, value):
++                return apply(callback, value) if again else callback(value)
++            HttpResponse(apply(Service.clean, input()))
++        ''')
++
++    def test_method_attribute_replacement_preserves_captured_function(self):
++        self.assert_rules('''
++            class Service:
++                @classmethod
++                def run(cls, value):
++                    eval(value)
++            captured = Service.run
++            Service.run = print
++            captured(input())
++        ''', 'eval')
++
++
+ @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'Set UBS_TAINT_E2E=1 for real CLI scans')
+ class CallableCliTests(unittest.TestCase):
+@@ -320,4 +667,8 @@ class CallableCliTests(unittest.TestCase):
+             ('class-clean', 'class Service:\n    @staticmethod\n    def clean(value):\n        return "safe"\neval(Service.clean(input()))\n', None),
+             ('class-replaced', 'class Service:\n    @staticmethod\n    def clean(value):\n        return "safe"\ndef run(value):\n    return Service.clean(value)\nService.clean = other\neval(run(input()))\n', 'eval'),
++            ('bound-sink', 'class Service:\n    @classmethod\n    def run(cls, value):\n        eval(value)\nService.run(input())\n', 'eval'),
++            ('bound-clean', 'class Service:\n    @classmethod\n    def clean(cls, value):\n        return "fixed"\neval(Service.clean(input()))\n', None),
++            ('bound-callback', 'class Service:\n    @classmethod\n    def run(cls, value):\n        eval(value)\ndef apply(callback, value): return callback(value)\napply(Service.run, input())\n', 'eval'),
++            ('bound-replaced', 'class Service:\n    @staticmethod\n    def clean(value): return "fixed"\n    @classmethod\n    def replace(cls): cls.clean = other\nService.replace()\neval(Service.clean(input()))\n', 'eval'),
+         )
+         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-callable-effects'
+diff --git a/test-suite/quality/test_taint_python_modules.py b/test-suite/quality/test_taint_python_modules.py
+index 6fb66ad..945beb4 100644
+--- a/test-suite/quality/test_taint_python_modules.py
++++ b/test-suite/quality/test_taint_python_modules.py
+@@ -44,4 +44,54 @@ class PythonModuleTests(unittest.TestCase):
+         return [(str(Path(f['path']).relative_to(self.root)), f['line'], f['rule']) for f in findings]
+ 
++    def test_bound_classmethod_retains_foreign_sink_and_selected_order(self):
++        sources = {
++            'helper.py': 'class Service:\n    @classmethod\n    def run(cls, value):\n        eval(value)\n',
++            'app.py': 'from helper import Service\nService.run(input())\n',
++        }
++        for selected in (['app.py', 'helper.py'], ['helper.py', 'app.py']):
++            with self.subTest(selected=selected):
++                self.assertEqual(self.sites(self.scan(sources, selected=selected)),
++                                 [('helper.py', 4, 'python.taint.eval')])
++
++    def test_bound_classmethod_callback_keeps_receiver_mutations_across_modules(self):
++        self.assertEqual(self.sites(self.scan({
++            'helper.py': 'def apply(callback):\n    callback()\n',
++            'app.py': 'from helper import apply\nclass Service:\n'
++                      '    @staticmethod\n    def clean(value): return "fixed"\n'
++                      '    @classmethod\n    def replace(cls): cls.clean = other\n'
++                      'apply(Service.replace)\neval(Service.clean(input()))\n',
++        })), [('app.py', 8, 'python.taint.eval')])
++
++    def test_bound_classmethod_deferred_import_cycle_uses_shared_summaries(self):
++        sources = {
++            'left.py': 'import right\nclass Service:\n    @classmethod\n'
++                       '    def clean(cls, value):\n'
++                       '        return right.Service.clean(value) if again else "fixed"\n',
++            'right.py': 'import left\nclass Service:\n    @classmethod\n'
++                        '    def clean(cls, value):\n        return left.Service.clean(value)\n',
++            'app.py': 'from left import Service\neval(Service.clean(input()))\n',
++        }
++        for selected in (['left.py', 'right.py', 'app.py'], ['app.py', 'right.py', 'left.py']):
++            with self.subTest(selected=selected):
++                self.assertEqual(self.scan(sources, selected=selected), [])
++        sources['left.py'] = sources['left.py'].replace('else "fixed"', 'else value')
++        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
++
++    def test_unselected_classmethod_module_cannot_supply_clean_proof(self):
++        self.assertEqual(self.sites(self.scan({
++            'helper.py': 'class Service:\n    @classmethod\n    def clean(cls, value): return "fixed"\n',
++            'app.py': 'from helper import Service\neval(Service.clean(input()))\n',
++        }, selected=['app.py'])), [('app.py', 2, 'python.taint.eval')])
++
++    def test_returned_bound_classmethod_preserves_foreign_receiver_identity(self):
++        self.assertEqual(self.sites(self.scan({
++            'helper.py': 'class Service:\n    @staticmethod\n    def clean(value): return "fixed"\n'
++                         '    @classmethod\n    def convert(cls, value): return cls.clean(value)\n'
++                         'def select(): return Service.convert\n'
++                         'def replace(): Service.clean = other\n',
++            'app.py': 'import helper\nconvert = helper.select()\n'
++                      'helper.replace()\neval(convert(input()))\n',
++        })), [('app.py', 4, 'python.taint.eval')])
++
+     def test_imported_sink_and_constant_actual_control(self):
+         helper = 'def run(value):\n    eval(value)\n'

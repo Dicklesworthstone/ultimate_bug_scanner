@@ -62,7 +62,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
       - name: Install real floor and selected interpreters
         env:
           PYTHON_VERSION: ${{ matrix.python }}
@@ -132,5 +132,123 @@ jobs:
           name: python-runtime-${{ matrix.os }}-${{ matrix.python }}
           path: |
             ${{ runner.temp }}/python-runtime-*
+            test-suite/artifacts/helper-python-floor/
+          retention-days: 7
+
+  doctor-candidate:
+    # Temporary immutable-object publication for the reviewed doctor fix.
+    # No branch writes; the permanent runtime matrix above remains read-only.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Preserve the exact source before candidate edits
+        run: |
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/doctor-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/doctor-source-head.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doctor-runtime-source
+          path: ${{ runner.temp }}/doctor-source*
+          retention-days: 7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+      - name: Install real interpreters and scanner dependencies
+        run: |
+          uv python install 3.9 3.10 3.14
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep shellcheck
+          npm install --global @ast-grep/cli@0.45.3
+      - name: Retrieve the immutable reviewed patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          sha = '76986cd31fbfc2b2e09ba774f605dead1b2c743a'
+          request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + '/git/blobs/' + sha,
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=90) as response:
+              value = json.load(response)
+          patch = base64.b64decode(value['content'])
+          assert hashlib.sha1(b'blob ' + str(len(patch)).encode() + b'\0' + patch).hexdigest() == sha
+          assert hashlib.sha256(patch).hexdigest() == 'bac531cd5c1b767984cb56ad69c397a4ae9a7fce2e37d2f66a800d72cd70390a'
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'doctor-runtime.patch').write_bytes(patch)
+          PY
+      - name: Prove correctly pinned broken imports fool the original doctor
+        run: |
+          git apply --check --include=test-suite/shareable/test_helper_python_floor.py "$RUNNER_TEMP/doctor-runtime.patch"
+          git apply --include=test-suite/shareable/test_helper_python_floor.py "$RUNNER_TEMP/doctor-runtime.patch"
+          set +e
+          "$(uv python find --managed-python 3.9)" -B test-suite/shareable/test_helper_python_floor.py DoctorRuntimeHealth.test_runtime_import_error_is_fatal_even_when_the_source_digest_matches -v > "$RUNNER_TEMP/doctor-baseline.log" 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 1
+          grep -q '0 != 2' "$RUNNER_TEMP/doctor-baseline.log"
+          git apply --check --include=ubs "$RUNNER_TEMP/doctor-runtime.patch"
+          git apply --include=ubs "$RUNNER_TEMP/doctor-runtime.patch"
+          ./scripts/update_sha256sums.sh
+          git diff --check
+      - name: Run real floor and newer runtime contracts
+        run: |
+          export UBS_REQUIRE_PYTHON39=1
+          export UBS_TEST_PYTHON39="$(uv python find --managed-python 3.9)"
+          for version in 3.9 3.10 3.14; do
+            UBS_TEST_EXPECT_PYTHON="$version" "$(uv python find --managed-python "$version")" -B test-suite/shareable/test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/doctor-runtime-$version.log"
+          done
+      - name: Run focused scanner and integrity gates
+        run: |
+          export UBS_PYTHON="$(uv python find --managed-python 3.14)"
+          "$UBS_PYTHON" -B -m unittest discover -s test-suite/quality -p 'test_taint_js*.py' -v 2>&1 | tee "$RUNNER_TEMP/doctor-taint-js.log"
+          "$UBS_PYTHON" -B -m unittest discover -s test-suite/quality -p test_js_scan.py -v 2>&1 | tee "$RUNNER_TEMP/doctor-js-scan.log"
+          "$UBS_PYTHON" -B test-suite/quality/test_python_command_injection_dataflow.py -v
+          "$UBS_PYTHON" -B test-suite/shareable/test_contract_checksums.py
+          shellcheck -S warning ubs
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          ./ubs --ci --fail-on-warning --only=bash,python ubs test-suite/shareable/test_helper_python_floor.py 2>&1 | tee "$RUNNER_TEMP/doctor-self-scan.log"
+      - name: Publish only the tested immutable source and checksum objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          expected = {'ubs', 'SHA256SUMS', 'test-suite/shareable/test_helper_python_floor.py'}
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert set(changed) == expected, changed
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          for name in sorted(expected):
+              data = pathlib.Path(name).read_bytes()
+              sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GH_REPO'] + '/git/blobs',
+                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  result = json.load(response)
+              assert result['sha'] == sha, name
+              print('DOCTOR_RUNTIME_OBJECT', name, sha, mode, flush=True)
+          print('DOCTOR_RUNTIME_BASE', subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: doctor-runtime-validation
+          path: |
+            ${{ runner.temp }}/doctor-*
             test-suite/artifacts/helper-python-floor/
           retention-days: 7

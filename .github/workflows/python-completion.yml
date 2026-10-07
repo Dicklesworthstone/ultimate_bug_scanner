@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: macos-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 15
     permissions:
       contents: write
@@ -20,12 +20,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Ensure the required Bash runtime for the existing integrity gates
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-        run: |
-          if ! test -x "$(brew --prefix)/bin/bash"; then brew install bash; fi
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Assemble the reviewed source and complete integrity closure
         env:
           GH_TOKEN: ${{ github.token }}

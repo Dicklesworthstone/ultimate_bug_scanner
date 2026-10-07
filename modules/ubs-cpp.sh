@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e8d7ad92938dcd7b02a0800752aede633b8c63ab2cd118c7d8760fa5b32c6fa1"
+UBS_LIB_CHECKSUM="0606a08102e74a7853e3f7c934ba880b236d1f488bf2585eedf0248723419a08"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -266,16 +266,16 @@ PYRULES
   exit 0
 fi
 
-# Redirect output early to capture everything
-if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
-
 # ── Contract-v2 path (bead 0xjg.9): ONE file list (ubs_list_files), ONE python
 #    orchestrator (ubs_core.cpp_scan), NDJSON findings sink (K2 schema).
 # ── Legacy-parity bridges for the contract-v2 path ──────────────────────────
 run_v2_legacy_parity_bridges_cpp(){
   local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}"
   local files_n bridge_rc=0
-  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  if ! files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"; then
+    echo "ERROR: cannot read the scan file list; analysis is incomplete" >&2
+    return 2
+  fi
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "${SKIP_CATEGORIES:-}" \
     "$scan_exit" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
@@ -302,8 +302,9 @@ SECTION = {
 try:
     with open(sink_path, encoding="utf-8") as fh:
         records = [json.loads(line) for line in fh if line.strip()]
-except OSError:
-    records = []
+except (OSError, ValueError) as exc:
+    print(f"ERROR: cannot read scan findings; analysis is incomplete: {exc}", file=sys.stderr)
+    sys.exit(2)
 
 def record_category(rec):
     rule = str(rec.get("rule", ""))
@@ -338,11 +339,15 @@ if as_text:
     out.append(f"Critical issues: {counts['critical']}")
     out.append(f"Warning issues: {counts['warning']}")
     out.append(f"Info items: {counts['info']}")
-    with open(text_out, "a", encoding="utf-8") as fh:
-        fh.write("\n".join(out) + "\n")
+    try:
+        with open(text_out, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as exc:
+        print(f"ERROR: cannot write text report; analysis is incomplete: {exc}", file=sys.stderr)
+        sys.exit(2)
 
-exit_code = 1 if counts["critical"] else scan_exit
-if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
+exit_code = scan_exit if scan_exit >= 2 else (1 if counts["critical"] else scan_exit)
+if exit_code < 2 and fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
     exit_code = 1
 sys.exit(exit_code)
 PYV2BRIDGE
@@ -351,14 +356,24 @@ PYV2BRIDGE
 
 run_contract_v2_cpp(){
   local list_file sink exit_code=0 text_out="" v2_json_out=""
-  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-cpp-list.XXXXXX)"
-  sink="$(mktemp 2>/dev/null || mktemp -t ubs-cpp-sink.XXXXXX)"
+  if ! list_file="$(mktemp 2>/dev/null || mktemp -t ubs-cpp-list.XXXXXX)"; then
+    echo "ERROR: cannot allocate temporary file list; analysis is incomplete" >&2
+    return 2
+  fi
+  if ! sink="$(mktemp 2>/dev/null || mktemp -t ubs-cpp-sink.XXXXXX)"; then
+    echo "ERROR: cannot allocate temporary findings sink; analysis is incomplete" >&2
+    return 2
+  fi
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
-    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
-  else
-    ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file" || true
+    if ! printf '%s\0' "$PROJECT_DIR" >"$list_file"; then
+      echo "ERROR: cannot write the scan file list; analysis is incomplete" >&2
+      return 2
+    fi
+  elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
+    echo "ERROR: contract-v2 file list failed; analysis is incomplete" >&2
+    return 2
   fi
   local v2_skip="$SKIP_CATEGORIES"
   if [[ -n "$ONLY_CATEGORIES" ]]; then
@@ -380,13 +395,22 @@ run_contract_v2_cpp(){
   [[ -n "$USER_RULE_DIR" ]] && scan_args+=(--custom-rules "$USER_RULE_DIR")
   case "$FORMAT" in
     json)
-      exec 3>&1
+      if ! exec 3>&1; then
+        echo "ERROR: cannot open scan output; analysis is incomplete" >&2
+        return 2
+      fi
       scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     sarif)
-      v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-json.XXXXXX)"
+      if ! v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-json.XXXXXX)"; then
+        echo "ERROR: cannot allocate temporary JSON report; analysis is incomplete" >&2
+        return 2
+      fi
       scan_args+=(--json-out "$v2_json_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text)
-      text_out="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-text.XXXXXX)"
+      if ! text_out="$(mktemp 2>/dev/null || mktemp -t ubs-cppv2-text.XXXXXX)"; then
+        echo "ERROR: cannot allocate temporary text report; analysis is incomplete" >&2
+        return 2
+      fi
       scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
       ;;
     *) echo "ERROR: contract-v2 cpp path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
@@ -394,23 +418,48 @@ run_contract_v2_cpp(){
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.cpp_scan \
     "${scan_args[@]}" --version "7.1" || exit_code=$?
   if [[ "$FORMAT" == "sarif" ]]; then
-    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=$?
+    if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out"; then
+      echo "ERROR: cannot deliver SARIF report; analysis is incomplete" >&2
+      exit_code=2
+    fi
     rm -f "$v2_json_out" 2>/dev/null || true
   else
     # Record-less section headers + Summary Statistics + legacy exit formula.
     run_v2_legacy_parity_bridges_cpp "$sink" "$list_file" "$exit_code" "$text_out" || exit_code=$?
     if [[ -n "$text_out" ]]; then
-      cat "$text_out" 2>/dev/null || true
+      if ! cat "$text_out"; then
+        echo "ERROR: cannot deliver text report; analysis is incomplete" >&2
+        exit_code=2
+      fi
       rm -f "$text_out" 2>/dev/null || true
     fi
   fi
   if [[ -n "$REPORT_JSON" ]]; then
-    cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
+    if ! cp "$sink" "$REPORT_JSON"; then   # K2: the sink IS the findings record stream
+      echo "ERROR: cannot deliver requested findings report; analysis is incomplete" >&2
+      exit_code=2
+    fi
   fi
   rm -f "$list_file" "$sink" 2>/dev/null || true
   return "$exit_code"
 }
 
 v2_status=0
-run_contract_v2_cpp || v2_status=$?
+if [[ -n "$OUTPUT_FILE" ]]; then
+  # Wait for delivery and inspect both stages: process substitution hides tee's
+  # exit status and can otherwise turn a failed report write into a clean scan.
+  if run_contract_v2_cpp 2>&1 | tee "$OUTPUT_FILE"; then
+    :
+  else
+    output_status=("${PIPESTATUS[@]}")
+    if [[ "${output_status[1]}" -ne 0 ]]; then
+      echo "ERROR: cannot deliver requested output file; analysis is incomplete" >&2
+      v2_status=2
+    else
+      v2_status="${output_status[0]}"
+    fi
+  fi
+else
+  run_contract_v2_cpp || v2_status=$?
+fi
 exit "$v2_status"

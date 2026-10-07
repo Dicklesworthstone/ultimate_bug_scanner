@@ -22,7 +22,7 @@ SOURCE_RE = re.compile(
     r'target|raw_url|url)\s*(?:\(|\b)'
     r'|\b(?:req|request)(?:\.|->)(?:host|target|raw_url|url)\b'
     r'|\b(?:FCGX_GetParam)\s*\('
-    r'|\bgetenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_REFERER|HTTP_REFERRER|HTTP_[A-Z0-9_]+)"\s*\)'
+    r'|\b(?:std::)?getenv\s*\(\s*"(?:QUERY_STRING|REQUEST_URI|HTTP_HOST|HTTP_REFERER|HTTP_REFERRER|HTTP_[A-Z0-9_]+)"\s*\)'
     r'|\bQUrlQuery\s*\([^;\n]*\)\.queryItemValue\s*\(',
     re.IGNORECASE,
 )

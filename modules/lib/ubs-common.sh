@@ -256,8 +256,8 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/spec_hooks.py']='04b37d261e587be7a795744746bc4a7e771305a53b2a2549bc3fdd8638860dc1'
   ['helpers/ubs_core/analyzers/spec_switch_fallthrough.py']='da5f6acc062f3ce383700dbd14cb7b80c64ada9d42f10a27975f5ae65a592e94'
   ['helpers/ubs_core/analyzers/spec_typeof.py']='caf8afb8901bec9b100c0880bbbe0dded58a08f15fcef94816b12dcec5b03293'
-  ['helpers/ubs_core/analyzers/taint_cpp_redirect.py']='3cbbd252c3783bac581a3eb958be5481b2fbee636c8b83dc9d1287e91730148e'
-  ['helpers/ubs_core/analyzers/taint_cpp_traversal.py']='4ecbfdec78591b357540543fd0010eb8dc3d49a7e6c03b4b14e2b2d4ad00ce38'
+  ['helpers/ubs_core/analyzers/taint_cpp_redirect.py']='ae3aa9adf9ab8af857f91a4237489a80876b24ef008bbdc3adf59fc1252ac2d7'
+  ['helpers/ubs_core/analyzers/taint_cpp_traversal.py']='12c1636e462d2039cc44372c0b823cbe186bd770595abe67b2a943aeb8f0a550'
   ['helpers/ubs_core/analyzers/taint_csharp_redirect.py']='4591294ab7eb34f4311d85632089309b8209669d6b24ad78440e2498322946bf'
   ['helpers/ubs_core/analyzers/taint_csharp_request.py']='8aade2b43483c37f2ef28850e1938f105ef342e3e91212fdedd785f47b4382af'
   ['helpers/ubs_core/analyzers/taint_elixir_redirect.py']='e79bcfc31754ce3485c2e3c398133eca890c3023ec135d410f72b3adfefe7da8'
@@ -763,20 +763,40 @@ ubs_list_files(){
       *) ubs_die "ubs_list_files: unknown option $1" 2 ;;
     esac
   done
-  [[ -d "$dir" ]] || return 0
-  if [[ -n "$files_from" && -f "$files_from" ]]; then
-    local f delimiter=$'\n'
+  if [[ ! -d "$dir" ]]; then
+    printf 'ubs_list_files: source directory does not exist: %s\n' "$dir" >&2
+    return 2
+  fi
+  if [[ -n "$files_from" ]]; then
+    if [[ ! -f "$files_from" ]]; then
+      printf 'ubs_list_files: requested file list is not a regular file: %s\n' "$files_from" >&2
+      return 2
+    fi
+    local f delimiter=$'\n' list_fd
+    if ! exec {list_fd}<"$files_from"; then
+      printf 'ubs_list_files: cannot open requested file list: %s\n' "$files_from" >&2
+      return 2
+    fi
     # Detect the list's delimiter before reading it. Translating all newlines
     # to NUL corrupts an already NUL-delimited filename containing a newline.
-    if IFS= read -r -d '' f < "$files_from"; then delimiter=''; fi
-    while IFS= read -r -d "$delimiter" f || [[ -n "$f" ]]; do
-      [[ -z "$f" ]] && continue
-      if [[ "$f" == /* ]]; then
-        [[ -f "$f" ]] && printf '%s\0' "$f"
-      elif [[ -f "$dir/$f" ]]; then
-        printf '%s\0' "$dir/$f"
-      fi
-    done < "$files_from"
+    if IFS= read -r -d '' f <&"$list_fd"; then delimiter=''; fi
+    if ! exec {list_fd}<&-; then
+      printf 'ubs_list_files: cannot close requested file list: %s\n' "$files_from" >&2
+      return 2
+    fi
+    if ! {
+      while IFS= read -r -d "$delimiter" f || [[ -n "$f" ]]; do
+        [[ -z "$f" ]] && continue
+        if [[ "$f" != /* ]]; then f="$dir/$f"; fi
+        if [[ -f "$f" ]] && ! printf '%s\0' "$f"; then
+          printf 'ubs_list_files: cannot write selected source paths\n' >&2
+          return 2
+        fi
+      done
+    } < "$files_from"; then
+      printf 'ubs_list_files: cannot read requested file list: %s\n' "$files_from" >&2
+      return 2
+    fi
     return 0
   fi
   local -a rg_args=(--files -0 --no-messages)
@@ -803,11 +823,32 @@ ubs_list_files(){
       prune_args+=( -path "*/${item}" -prune -o -path "*/${item}/*" -prune -o )
     done
   fi
+  local using_rg=0
+  local -a list_command list_status
   if command -v rg >/dev/null 2>&1; then
-    rg "${rg_args[@]}" -- "$dir" 2>/dev/null
+    using_rg=1
+    list_command=(rg "${rg_args[@]}" -- "$dir")
   else
-    find "$dir" -xdev "${prune_args[@]}" -type f "${find_args[@]}" -print0 2>/dev/null
+    list_command=(find "$dir" -xdev "${prune_args[@]}" -type f "${find_args[@]}" -print0)
   fi
+  # Some rg versions do not report a failed final buffered write. Let cat
+  # own the destination and check both statuses, even without pipefail or
+  # when the caller runs this function in an if/OR-list (disabling errexit).
+  if "${list_command[@]}" | cat; then
+    list_status=("${PIPESTATUS[@]}")
+  else
+    list_status=("${PIPESTATUS[@]}")
+  fi
+  if [[ "${list_status[1]:-2}" -ne 0 ]]; then
+    printf 'ubs_list_files: cannot write discovered source paths\n' >&2
+    return 2
+  fi
+  if [[ "${list_status[0]:-2}" -eq 0 ]] ||
+      [[ "$using_rg" -eq 1 && "${list_status[0]:-2}" -eq 1 ]]; then
+    return 0
+  fi
+  printf 'ubs_list_files: cannot enumerate source directory: %s\n' "$dir" >&2
+  return 2
 }
 
 # ubs_count_files DIR [options...]: number of files ubs_list_files would list.

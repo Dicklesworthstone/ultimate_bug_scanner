@@ -10,7 +10,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e8d7ad92938dcd7b02a0800752aede633b8c63ab2cd118c7d8760fa5b32c6fa1"
+UBS_LIB_CHECKSUM="0606a08102e74a7853e3f7c934ba880b236d1f488bf2585eedf0248723419a08"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -240,17 +240,17 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
 fi
 
 # File discovery
-LIST_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-list.XXXXXX)"
-SINK_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-sink.XXXXXX)"
-JSON_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-json.XXXXXX)"
-TEXT_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-text.XXXXXX)"
+LIST_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-list.XXXXXX)" || { echo "ERROR: cannot allocate temporary file list; analysis is incomplete" >&2; exit 2; }
+SINK_FILE="$(mktemp 2>/dev/null || mktemp -t ubs-kt-sink.XXXXXX)" || { echo "ERROR: cannot allocate temporary findings sink; analysis is incomplete" >&2; exit 2; }
+JSON_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-json.XXXXXX)" || { echo "ERROR: cannot allocate temporary JSON report; analysis is incomplete" >&2; exit 2; }
+TEXT_TMP="$(mktemp 2>/dev/null || mktemp -t ubs-kt-text.XXXXXX)" || { echo "ERROR: cannot allocate temporary text report; analysis is incomplete" >&2; exit 2; }
 cleanup() {
   rm -f "$LIST_FILE" "$SINK_FILE" "$JSON_TMP" "$TEXT_TMP"
 }
 trap cleanup EXIT
 
 if [[ -f "$PROJECT_DIR" ]]; then
-  printf '%s\0' "$PROJECT_DIR" > "$LIST_FILE"
+  printf '%s\0' "$PROJECT_DIR" > "$LIST_FILE" || { echo "ERROR: cannot write the scan file list; analysis is incomplete" >&2; exit 2; }
 elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} > "$LIST_FILE"; then
   echo "ERROR: contract-v2 file list failed" >&2
   exit 2

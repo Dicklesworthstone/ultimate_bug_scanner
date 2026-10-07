@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="e8d7ad92938dcd7b02a0800752aede633b8c63ab2cd118c7d8760fa5b32c6fa1"
+UBS_LIB_CHECKSUM="0606a08102e74a7853e3f7c934ba880b236d1f488bf2585eedf0248723419a08"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -441,14 +441,14 @@ PYV2BRIDGE
 
 run_contract_v2_ruby(){
   local list_file sink exit_code=0 text_out="" v2_json_out="" completion_out=""
-  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-list.XXXXXX)"
-  sink="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-sink.XXXXXX)"
+  list_file="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-list.XXXXXX)" || { echo "ERROR: cannot allocate temporary file list; analysis is incomplete" >&2; return 2; }
+  sink="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-sink.XXXXXX)" || { echo "ERROR: cannot allocate temporary findings sink; analysis is incomplete" >&2; return 2; }
   completion_out="$(mktemp 2>/dev/null || mktemp -t ubs-rbv2-complete.XXXXXX)" || return 2
   cleanup_add "$completion_out"
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ -f "$PROJECT_DIR" ]]; then
-    printf '%s\0' "$PROJECT_DIR" >"$list_file"   # single-file target: the file IS the list
+    printf '%s\0' "$PROJECT_DIR" >"$list_file" || { echo "ERROR: cannot write the scan file list; analysis is incomplete" >&2; return 2; }
   elif ! ubs_list_files "$PROJECT_DIR" --ext "$INCLUDE_EXT" ${EXTRA_EXCLUDES:+--exclude "$EXTRA_EXCLUDES"} ${FILES_FROM:+--files-from "$FILES_FROM"} >"$list_file"; then
     echo "ERROR: contract-v2 file list failed" >&2
     return 2

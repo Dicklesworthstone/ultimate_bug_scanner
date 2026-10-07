@@ -32,7 +32,7 @@ SOURCE_RE = re.compile(
     r'form_value|formValue|param|Param|url_params\.get|getPath|getPathInfo|path|target|raw_url|url)\s*(?:\(|\b)'
     r'|\b(?:req|request)(?:\.|->)(?:path|target|raw_url|url)\b'
     r'|\b(?:cgiFormString|FCGX_GetParam)\s*\('
-    r'|\bgetenv\s*\(\s*"(?:QUERY_STRING|PATH_INFO|REQUEST_URI|SCRIPT_NAME|HTTP_[A-Z0-9_]+)"\s*\)'
+    r'|\b(?:std::)?getenv\s*\(\s*"(?:QUERY_STRING|PATH_INFO|REQUEST_URI|SCRIPT_NAME|HTTP_[A-Z0-9_]+)"\s*\)'
     r'|\bQUrlQuery\s*\([^;\n]*\)\.queryItemValue\s*\('
     r'|\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)\s*(?:filename|file_name|original_filename|client_filename|getOriginalFilename)\s*(?:\(\s*\))?\b'
 )

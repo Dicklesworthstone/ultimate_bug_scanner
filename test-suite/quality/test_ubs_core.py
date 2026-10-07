@@ -4235,6 +4235,54 @@ struct Response { void set_redirect(const std::string &); };
             expected = {i for i, line in enumerate(source.splitlines(), 1) if '// SINK' in line}
             yield 'c_language_' + name, source, 'cpp.taint.' + kind, expected
 
+        environment_prelude = ('#include <cstdlib>\n#include <fstream>\n#include <string>\n'
+                               'struct Response { void set_redirect(const std::string &); };\n')
+        environment_cases = (
+            ('path_traversal', 'std_cgi_query', '''
+                void handle() {
+                  std::string path = std::getenv("QUERY_STRING");
+                  std::ifstream input(path); // SINK
+                }
+            '''),
+            ('path_traversal', 'std_cgi_path_info', '''
+                void handle() {
+                  std::string path = std::getenv("PATH_INFO");
+                  std::ifstream input(path); // SINK
+                }
+            '''),
+            ('open_redirect', 'std_http_referer', '''
+                void handle(Response &res) {
+                  std::string target = std::getenv("HTTP_REFERER");
+                  res.set_redirect(target); // SINK
+                }
+            '''),
+            ('path_traversal', 'ordinary_process_path', '''
+                void handle() {
+                  std::string path = std::getenv("PATH");
+                  std::ifstream input(path);
+                }
+            '''),
+            ('open_redirect', 'ordinary_process_language', '''
+                void handle(Response &res) {
+                  std::string target = std::getenv("LANG");
+                  res.set_redirect(target);
+                }
+            '''),
+            ('path_traversal', 'selected_namespaced_helper', '''
+                namespace application {
+                  std::string getenv(const char *) { return "/srv/public/index.html"; }
+                }
+                void handle() {
+                  std::string path = application::getenv("QUERY_STRING");
+                  std::ifstream input(path);
+                }
+            '''),
+        )
+        for kind, name, body in environment_cases:
+            source = environment_prelude + textwrap.dedent(body).strip('\n') + '\n'
+            expected = {i for i, line in enumerate(source.splitlines(), 1) if '// SINK' in line}
+            yield 'environment_' + name, source, 'cpp.taint.' + kind, expected
+
     def test_independent_cpp_selected_bindings_and_real_operands(self):
         from ubs_core.analyzers import taint_cpp_redirect, taint_cpp_traversal
         from ubs_core.registry import RunContext

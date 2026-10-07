@@ -244,5 +244,215 @@ class RubyTemporaryAllocationTest(unittest.TestCase):
         print(f"[{case_id}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
 
 
+@unittest.skipUnless(Path('/dev/full').exists(), 'requires /dev/full for bounded write-failure injection')
+class ScanPreparationFailureTest(unittest.TestCase):
+    """Actual module invocations must distinguish missing work from clean work."""
+
+    cpp_module = REPO_ROOT / 'modules/ubs-cpp.sh'
+    shared_library = REPO_ROOT / 'modules/lib/ubs-common.sh'
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / 'test-suite/artifacts/module-temp-failure'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='scan-io-', dir=artifacts))
+        self.scratch = self.root / 'scratch'
+        self.scratch.mkdir()
+        self.project = self.root / 'project'
+        self.project.mkdir()
+        self.target = self.project / 'clean name.cpp'
+        self.target.write_text('int main() { return 0; }\n', encoding='utf-8')
+        self.counter = self.root / 'allocation-count'
+        self.counter.write_text('0\n', encoding='ascii')
+        self.startup = self.root / 'fault-injection.bash'
+        # Bash loads this before the real module. Only the requested OS
+        # operation fails; selection, scanning and rendering remain real.
+        self.startup.write_text(r'''
+mktemp(){
+  local count=0
+  if [[ -f "$UBS_IO_COUNTER" ]]; then read -r count < "$UBS_IO_COUNTER"; fi
+  count=$((count + 1))
+  builtin printf '%s\n' "$count" > "$UBS_IO_COUNTER"
+  if [[ "${UBS_IO_FAIL_ALLOCATION:-0}" -gt 0 && "$count" -ge "$UBS_IO_FAIL_ALLOCATION" ]]; then
+    echo 'injected mktemp allocation failure' >&2
+    return 1
+  fi
+  command mktemp "$@"
+}
+printf(){
+  if [[ "${UBS_IO_FAULT:-}" == 'list-write' && "${1:-}" == '%s\0' ]]; then
+    builtin printf "$@" > /dev/full
+  else
+    builtin printf "$@"
+  fi
+}
+cat(){
+  if [[ "${UBS_IO_FAULT:-}" == 'text-write' && "$#" -gt 0 ]]; then
+    command cat "$@" > /dev/full
+  else
+    command cat "$@"
+  fi
+}
+''', encoding='utf-8')
+        self.env = dict(os.environ, TMPDIR=str(self.scratch), TMP=str(self.scratch),
+                        TEMP=str(self.scratch), BASH_ENV=str(self.startup),
+                        UBS_IO_COUNTER=str(self.counter), UBS_IO_SOURCE=str(self.target), UBS_IO_FAIL_ALLOCATION='0',
+                        UBS_IO_FAULT='', UBS_ALLOW_UNVERIFIED_HELPERS='1',
+                        UBS_VERIFIED_ASSET_DIR=str(REPO_ROOT / 'modules'),
+                        UBS_NO_CACHE='1', UBS_CACHE_DIR=str(self.root / 'cache'),
+                        XDG_CACHE_HOME=str(self.root / 'cache'),
+                        PYTHONDONTWRITEBYTECODE='1', NO_COLOR='1')
+
+    def invoke(self, name: str, args: list[str], *, fault: str = '', allocation: int = 0,
+               module: Path | None = None) -> subprocess.CompletedProcess:
+        started = time.monotonic()
+        print(f'[scan-io-{name}] RUN', flush=True)
+        self.counter.write_text('0\n', encoding='ascii')
+        result = subprocess.run(
+            ['bash', str(module or self.cpp_module), *args], cwd=self.root,
+            env={**self.env, 'UBS_IO_FAULT': fault, 'UBS_IO_FAIL_ALLOCATION': str(allocation)},
+            text=True, capture_output=True, check=False, timeout=45,
+        )
+        (self.root / (name + '.stdout')).write_text(result.stdout, encoding='utf-8')
+        (self.root / (name + '.stderr')).write_text(result.stderr, encoding='utf-8')
+        print(f'[scan-io-{name}] EXIT {result.returncode} ({time.monotonic() - started:.3f}s)', flush=True)
+        return result
+
+    def incomplete(self, result: subprocess.CompletedProcess) -> None:
+        context = f'exit={result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+        self.assertEqual(result.returncode, 2, context)
+        self.assertIn('incomplete', result.stderr, context)
+
+    def test_cpp_single_file_write_failure_never_becomes_empty_clean_report(self) -> None:
+        for format_name in ('json', 'sarif', 'text'):
+            with self.subTest(format=format_name):
+                result = self.invoke('list-write-' + format_name,
+                                     ['--format=' + format_name, str(self.target)], fault='list-write')
+                self.incomplete(result)
+                self.assertFalse(result.stdout.strip(), result.stdout)
+
+    def test_all_contract_runners_check_single_file_list_writes(self) -> None:
+        suffixes = {'bash': 'sh', 'csharp': 'cs', 'elixir': 'ex', 'golang': 'go',
+                    'java': 'java', 'js': 'js', 'kotlin': 'kt', 'python': 'py',
+                    'ruby': 'rb', 'rust': 'rs', 'swift': 'swift'}
+        for language, suffix in suffixes.items():
+            with self.subTest(language=language):
+                target = self.project / ('clean.' + suffix)
+                target.write_text('', encoding='utf-8')
+                result = self.invoke('list-write-' + language,
+                                     ['--format=json', str(target)], fault='list-write',
+                                     module=REPO_ROOT / ('modules/ubs-' + language + '.sh'))
+                self.incomplete(result)
+
+    def test_cpp_temporary_allocations_fail_before_scanning(self) -> None:
+        for allocation, format_name in ((1, 'json'), (2, 'json'), (3, 'text'), (3, 'sarif')):
+            with self.subTest(allocation=allocation, format=format_name):
+                result = self.invoke(f'allocation-{allocation}-{format_name}',
+                                     ['--format=' + format_name, str(self.target)], allocation=allocation)
+                self.incomplete(result)
+                self.assertFalse(result.stdout.strip(), result.stdout)
+
+    def test_cpp_empty_selection_and_real_source_remain_valid(self) -> None:
+        empty = self.root / 'empty-project'
+        empty.mkdir()
+        for name, target, count in (('empty-control', empty, 0), ('source-control', self.target, 1)):
+            with self.subTest(case=name):
+                result = self.invoke(name, ['--format=json', str(target)])
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertEqual(report['status'], 'ok', report)
+                self.assertEqual(report['files'], count, report)
+                self.assertEqual(report['critical'], 0, report)
+
+    def test_cpp_directory_and_requested_list_failures_are_not_clean(self) -> None:
+        missing_list = self.root / 'missing-selection.0'
+        missing_project = self.root / 'missing-project'
+        for name, arguments in (
+            ('missing-list', ['--files-from=' + str(missing_list), str(self.project)]),
+            ('missing-project', [str(missing_project)]),
+        ):
+            with self.subTest(case=name):
+                result = self.invoke(name, ['--format=json', *arguments])
+                self.incomplete(result)
+                self.assertFalse(result.stdout.strip(), result.stdout)
+
+    def test_cpp_report_delivery_failures_are_errors(self) -> None:
+        parent_file = self.root / 'not-a-directory'
+        parent_file.write_text('preserve me\n', encoding='utf-8')
+        destination = parent_file / 'report.json'
+        for name, args, fault in (
+            ('findings-delivery', ['--format=json', '--report-json=' + str(destination), str(self.target)], ''),
+            ('positional-delivery', ['--format=json', str(self.target), str(destination)], ''),
+            ('text-delivery', ['--format=text', str(self.target)], 'text-write'),
+        ):
+            with self.subTest(case=name):
+                result = self.invoke(name, args, fault=fault)
+                self.incomplete(result)
+        self.assertEqual(parent_file.read_text(), 'preserve me\n')
+
+    def test_cpp_successful_delivery_preserves_report_and_finding_exit(self) -> None:
+        unsafe = self.project / 'unsafe.cpp'
+        unsafe.write_text('#include <cstdlib>\n#include <fstream>\n#include <string>\n'
+                          'void load() {\n'
+                          '  std::string path = std::getenv("QUERY_STRING");\n'
+                          '  std::ifstream input(path);\n}\n', encoding='utf-8')
+        for name, target, expected_exit in (('clean-delivery-control', self.target, 0),
+                                             ('finding-delivery-control', unsafe, 1)):
+            with self.subTest(case=name):
+                output = self.root / (name + '.report')
+                findings = self.root / (name + '.ndjson')
+                result = self.invoke(name, ['--format=json', '--report-json=' + str(findings),
+                                            str(target), str(output)])
+                self.assertEqual(result.returncode, expected_exit, result.stderr)
+                self.assertEqual(output.read_text(), result.stdout)
+                report = json.loads(result.stdout.splitlines()[0])
+                self.assertEqual(report['files'], 1, report)
+                self.assertEqual(report['status'], 'ok', report)
+                records = [json.loads(line) for line in findings.read_text().splitlines()]
+                self.assertEqual(records, report['findings'])
+                if expected_exit:
+                    self.assertTrue(any(record['rule'] == 'cpp.taint.path_traversal' for record in records), records)
+
+    def test_shared_file_selection_checks_producer_and_writer_status(self) -> None:
+        listing = self.root / 'files.0'
+        listing.write_bytes(os.fsencode(self.target) + b'\0')
+        cases = (
+            ('directory-full', 'ubs_list_files "$2" --ext cpp > /dev/full', []),
+            ('selected-full', 'ubs_list_files "$2" --files-from "$3" > /dev/full', [str(listing)]),
+            ('enumerator-failure', 'rg(){ return 2; }; ubs_list_files "$2" --ext cpp', []),
+            ('partial-enumerator', 'rg(){ printf "%s\\0" "$UBS_IO_SOURCE"; return 2; }; ubs_list_files "$2" --ext cpp', []),
+        )
+        for name, command, extra in cases:
+            for pipefail in ('set +o pipefail', 'set -o pipefail'):
+                with self.subTest(case=name, pipefail=pipefail):
+                    # Deliberately invoke the helper in an OR-list, exactly
+                    # where Bash disables implicit errexit protection.
+                    script = f'source "$1"; {pipefail}; rc=0; {{ {command}; }} || rc=$?; exit "$rc"'
+                    result = subprocess.run(
+                        ['bash', '-c', script, 'listing', str(self.shared_library), str(self.project), *extra],
+                        cwd=self.root, env=self.env, capture_output=True, check=False, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 2, (name, result.stdout, result.stderr))
+
+    def test_cpp_bridge_preserves_failure_and_rejects_missing_sink(self) -> None:
+        source = self.cpp_module.read_text(encoding='utf-8')
+        begin = source.index('run_v2_legacy_parity_bridges_cpp(){')
+        finish = source.index('\nrun_contract_v2_cpp(){', begin)
+        definition = source[begin:finish]
+        listing = self.root / 'files.0'
+        listing.write_bytes(os.fsencode(self.target) + b'\0')
+        findings = self.root / 'findings.ndjson'
+        findings.write_text(json.dumps({'rule': 'cpp.taint.path_traversal', 'severity': 'critical'}) + '\n')
+        for name, sink, scan_exit, text_out in (('partial-with-critical', findings, '2', ''),
+                                               ('missing-sink', self.root / 'missing.ndjson', '0', ''),
+                                               ('text-write-failure', findings, '0', '/dev/full')):
+            with self.subTest(case=name):
+                script = definition + '\nrc=0; run_v2_legacy_parity_bridges_cpp "$1" "$2" "$3" "$4" || rc=$?; exit "$rc"\n'
+                result = subprocess.run(
+                    ['bash', '-c', script, 'bridge', str(sink), str(listing), scan_exit, text_out],
+                    cwd=self.root, env=self.env, capture_output=True, text=True, check=False, timeout=15,
+                )
+                self.assertEqual(result.returncode, 2, (name, result.stdout, result.stderr))
+
+
 if __name__ == "__main__":
     unittest.main()

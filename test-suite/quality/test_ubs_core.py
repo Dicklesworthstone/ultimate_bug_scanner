@@ -2987,6 +2987,10 @@ class JVMRedirectBindingTests(unittest.TestCase):
             '    Files.move(Path.of("/srv/source"), Path.of(request.getParameter("target"))); // unsafe')
         yield 'random-access-mode-is-not-path', program(
             '    ' + ('new ' if java else '') + 'RandomAccessFile("/srv/content.bin", request.getParameter("mode"));')
+        yield 'path-basename-normalize-tofile-keeps-leaf-proof', program(
+            '    ' + path_type + ' leaf = Path.of(request.getParameter("file")).' +
+            ('getFileName()' if java else 'fileName') + ';\n'
+            '    ' + ('new ' if java else '') + 'FileInputStream(leaf.normalize().toFile());')
         if java:
             yield 'path-equals-string-is-not-dot-rejection', program(
                 '    Path leaf = Paths.get(request.getParameter("file")).getFileName();\n'
@@ -2996,6 +3000,42 @@ class JVMRedirectBindingTests(unittest.TestCase):
                 '    Path leaf = Paths.get(request.getParameter("file")).getFileName();\n'
                 '    if (leaf.toString().equals(".") || leaf.toString().equals("..")) { ' + reject + ' }\n'
                 '    Files.walk(root.resolve(leaf));')
+        else:
+            for method in ('normalize', 'getName', 'getFileName'):
+                extension = 'fun String.' + method + '(): String = "../" + this\n'
+                yield 'string-' + method + '-extension-is-not-path-proof', extension + program(
+                    '    val leaf = File(request.getParameter("file")).name.' + method + '();\n'
+                    '    Files.readString(root.resolve(leaf)); // unsafe')
+            yield 'string-tofile-extension-is-not-path-conversion', '''fun String.toFile(): File = File("../" + this)
+''' + program(
+                '    val leaf = File(request.getParameter("file")).name.toFile();\n'
+                '    FileInputStream(leaf); // unsafe')
+            yield 'string-normalize-extension-direct-call-is-also-unsafe', '''fun String.normalize(): String = "../" + this
+''' + program(
+                '    val leaf = File(request.getParameter("file")).name;\n'
+                '    Files.readString(root.resolve(leaf.normalize())); // unsafe')
+            yield 'string-extension-does-not-replace-path-normalize', '''fun String.normalize(): String = "../" + this
+''' + program(
+                '    val leaf = Path.of(request.getParameter("file")).fileName;\n'
+                '    FileInputStream(leaf.normalize().toFile());')
+            for method, result, expression in (
+                ('getCanonicalPath', 'String', '"../" + File(this).name'),
+                ('getCanonicalFile', 'File', 'File("../" + File(this).name)'),
+                ('toFile', 'File', 'File("../" + File(this).name)'),
+            ):
+                yield 'contained-string-' + method + '-extension-invalidates-proof', (
+                    'fun String.' + method + '(): ' + result + ' = ' + expression + '\n' + '''class ConvertedPath {
+  fun choose(root: Path, raw: String): Path {
+    val target = root.resolve(raw).normalize()
+    if (!target.startsWith(root)) { throw IllegalArgumentException("outside root") }
+    return target
+  }
+  fun handle(request: Request, root: Path) {
+    val escaped = choose(root, request.getParameter("file")).toString().''' + method + '''()
+    FileInputStream(escaped) // unsafe
+  }
+}
+''')
 
     @staticmethod
     def cases(lang):

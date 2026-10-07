@@ -796,8 +796,141 @@ CASES = (
         end
         value.replace('https://api.example.com/health')
         Net::HTTP.get(URI.parse(saved))''', (12,)),
+    # Frozen independent numbered-parameter probes: _1 belongs to its block.
+    # then/yield_self and map return block results; tap returns its receiver.
+    # Sources: docs.ruby-lang.org/en/3.4/{Proc,Kernel,Array}.html.
+    Case('numbered_then_identity', URL, '''
+        target = URI.parse(params[:url]).then { _1 }
+        Net::HTTP.get(target) # unsafe''', (2,)),
+    Case('numbered_then_named_control', URL, '''
+        target = URI.parse(params[:url]).then { |value| value }
+        Net::HTTP.get(target) # unsafe''', (2,)),
+    Case('numbered_then_constant_replaces_request', URL, '''
+        target = URI.parse(params[:url]).then { URI.parse('https://api.example.com/health') }
+        Net::HTTP.get(target)''', ()),
+    Case('numbered_then_clean_numbered_receiver', URL, '''
+        ignored = params[:url]
+        target = URI.parse('https://api.example.com/health').then { _1 }
+        Net::HTTP.get(target)''', ()),
+    Case('numbered_yield_self_identity', URL, '''
+        target = URI.parse(params[:url]).yield_self { _1 }
+        Net::HTTP.get(target) # unsafe''', (2,)),
+    Case('numbered_map_identity', URL, '''
+        targets = [params[:url]].map { _1 }
+        Net::HTTP.get(URI.parse(targets.first)) # unsafe''', (2,)),
+    Case('numbered_map_named_control', URL, '''
+        targets = [params[:url]].map { |value| value }
+        Net::HTTP.get(URI.parse(targets.first)) # unsafe''', (2,)),
+    Case('numbered_map_constant_replaces_request', URL, '''
+        targets = [params[:url]].map { 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(targets.first))''', ()),
+    Case('numbered_tap_preserves_receiver', URL, '''
+        target = URI.parse(params[:url]).tap { _1 }
+        Net::HTTP.get(target) # unsafe''', (2,)),
+    Case('numbered_tap_numbered_sink', URL, '''
+        URI.parse(params[:url]).tap { Net::HTTP.get(_1) } # unsafe''', (1,)),
+    Case('numbered_tap_ignores_block_return', URL, '''
+        target = URI.parse('https://api.example.com/health').tap { params[:url] }
+        Net::HTTP.get(target)''', ()),
+    Case('numbered_then_numbered_sink', URL, '''
+        URI.parse(params[:url]).then { Net::HTTP.get(_1) } # unsafe''', (1,)),
+    Case('numbered_nested_explicit_outer_numbered_inner', URL, '''
+        target = params[:url].then do |outer|
+          inner = URI.parse(outer).then { _1 }
+          inner
+        end
+        Net::HTTP.get(target) # unsafe''', (5,)),
+    Case('numbered_nested_explicit_outer_clean_numbered_inner', URL, '''
+        target = params[:url].then do |ignored|
+          inner = URI.parse('https://api.example.com/health').then { _1 }
+          inner
+        end
+        Net::HTTP.get(target)''', ()),
+    Case('numbered_nested_numbered_outer_explicit_inner', URL, '''
+        target = URI.parse(params[:url]).then do
+          original = _1
+          fixed = 1.then { |unused| URI.parse('https://api.example.com/health') }
+          original
+        end
+        Net::HTTP.get(target) # unsafe''', (6,)),
+    Case('numbered_nested_numbered_outer_returns_clean_inner', URL, '''
+        target = URI.parse(params[:url]).then do
+          original = _1
+          fixed = 1.then { |unused| URI.parse('https://api.example.com/health') }
+          fixed
+        end
+        Net::HTTP.get(target)''', ()),
+    Case('numbered_sibling_numbered_scopes_are_independent', URL, '''
+        dangerous = URI.parse(params[:url]).then { _1 }
+        fixed = URI.parse('https://api.example.com/health').then { _1 }
+        Net::HTTP.get(fixed)
+        Net::HTTP.get(dangerous) # unsafe''', (4,)),
+    Case('numbered_next_numbered_result', URL, '''
+        target = URI.parse(params[:url]).then { next _1 }
+        Net::HTTP.get(target) # unsafe''', (2,)),
+    Case('numbered_path_map_identity', PATH, '''
+        paths = [params[:file]].map { _1 }
+        File.read(paths.first) # unsafe''', (2,)),
+    Case('numbered_path_numbered_basename_terminal_leaf', PATH, '''
+        path = params[:file].then { File.basename(_1) }
+        File.read(File.join('/srv/files', path))''', ()),
+    Case('numbered_tap_literal_receiver_mutation_reaches_result', URL, '''
+        target = 'https://api.example.com/health'.tap { _1.replace(params[:url]) }
+        Net::HTTP.get(URI.parse(target))''', (2,)),
+    Case('numbered_tap_clean_replacement_clears_result', URL, '''
+        target = params[:url].tap { _1.replace('https://api.example.com/health') }
+        Net::HTTP.get(URI.parse(target))''', ()),
+    Case('numbered_ternary_first_branch', URL, '''
+        target = params[:url].then { flag ? _1 : 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(target)) # unsafe''', (2,)),
+    Case('numbered_ternary_alternate', URL, '''
+        target = params[:url].then { flag ? 'https://api.example.com/health' : _1 }
+        Net::HTTP.get(URI.parse(target)) # unsafe''', (2,)),
+    Case('numbered_ternary_clean_receiver', URL, '''
+        ignored = params[:url]
+        target = 'https://api.example.com/health'.then { flag ? _1 : 'https://api.example.com/status' }
+        Net::HTTP.get(URI.parse(target))''', ()),
+    Case('numbered_hash_in_ternary_is_not_nested_block', URL, '''
+        target = params[:url].then do
+          metadata = flag ? {value: _1} : {}
+          _1
+        end
+        Net::HTTP.get(URI.parse(target)) # unsafe''', (5,)),
+    Case('numbered_named_hash_in_ternary_control', URL, '''
+        target = params[:url].then do |value|
+          metadata = flag ? {value: value} : {}
+          value
+        end
+        Net::HTTP.get(URI.parse(target)) # unsafe''', (5,)),
+    Case('numbered_keyword_argument_reaches_selected_helper', URL, '''
+        def fetch(target:)
+          Net::HTTP.get(URI.parse(target)) # unsafe
+        end
+        params[:url].then { fetch(target: _1) }''', (2,)),
+    Case('numbered_keyword_argument_fixed_target_is_clean', URL, '''
+        def fetch(target:)
+          Net::HTTP.get(URI.parse(target))
+        end
+        params[:url].then { fetch(target: 'https://api.example.com/health') }''', ()),
+    Case('numbered_hash_value_result_reaches_sink', URL, '''
+        target = params[:url].then { {url: _1}[:url] }
+        Net::HTTP.get(URI.parse(target)) # unsafe''', (2,)),
 )
 BY_NAME = {case.name: case for case in CASES}
+
+NUMBERED_BOUNDARIES = (
+    # Full numbered-argument destructuring may remain explicitly incomplete.
+    # If supported, this two-argument block must retain the second array value.
+    ('unsafe_or_incomplete', Case('numbered_second_parameter_needs_binding', URL, '''
+        target = ['unused', params[:url]].then { _2 }
+        Net::HTTP.get(URI.parse(target))''', (2,))),
+    ('incomplete', Case('numbered_nested_parameters_invalid', URL, '''
+        target = URI.parse(params[:url]).then { _1.then { _1 } }
+        Net::HTTP.get(target)''', ())),
+    ('incomplete', Case('numbered_explicit_and_numbered_parameters_invalid', URL, '''
+        target = URI.parse(params[:url]).then { |value| _1 }
+        Net::HTTP.get(target)''', ())),
+)
 
 
 class LoggedCase(unittest.TestCase):
@@ -860,6 +993,18 @@ class RubySemanticTests(LoggedCase):
             self.assertEqual(Path(record['path']).name, target.name, record)
             self.assertGreater(record['col'], 0, record)
             self.assertIn('params', record['message'], record)
+
+    def test_numbered_parameter_boundaries_cannot_be_silently_clean(self):
+        for contract, case in NUMBERED_BOUNDARIES:
+            with self.subTest(case=case.name):
+                if contract == 'incomplete':
+                    with self.assertRaisesRegex(ValueError, 'incomplete'):
+                        self.observe(case)
+                else:
+                    try:
+                        self.check_case(case)
+                    except ValueError as exc:
+                        self.assertIn('incomplete', str(exc).lower())
 
     def test_ruby_binding_forms_preserve_sink_flow_or_report_incomplete(self):
         supported = (
@@ -1122,6 +1267,41 @@ class RubyPublicTests(LoggedCase):
                 with self.subTest(case=case.name, format=fmt):
                     result, payload = self.scan(directory / fmt, target, fmt)
                     self.assert_findings(result, payload, case, fmt, target)
+
+    def test_numbered_parameter_flow_reaches_json_and_sarif(self):
+        for case in (case for case in CASES if case.name.startswith('numbered_')):
+            directory = self.artifact / case.name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, target, fmt)
+                    self.assert_findings(result, payload, case, fmt, target)
+
+    def test_numbered_parameter_boundaries_reach_json_and_sarif(self):
+        for contract, case in NUMBERED_BOUNDARIES:
+            directory = self.artifact / case.name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, target, fmt)
+                    if contract == 'unsafe_or_incomplete' and result.returncode != 2:
+                        self.assert_findings(result, payload, case, fmt, target)
+                        continue
+                    self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                    if fmt == 'json':
+                        self.assertEqual(payload['status'], 'partial', payload)
+                        self.assertTrue(any(row.get('language') == 'ruby' and row.get('module_error') == 'ANALYZER_ERROR'
+                                            for row in payload.get('failed_modules', [])), payload)
+                    else:
+                        invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                        self.assertTrue(invocations, payload)
+                        for invocation in invocations:
+                            self.assertIs(invocation['executionSuccessful'], False, payload)
+                            self.assertEqual(invocation['exitCode'], 2, payload)
 
     def test_malformed_source_remains_partial_on_repeated_scans(self):
         directory = self.artifact / 'malformed-public'

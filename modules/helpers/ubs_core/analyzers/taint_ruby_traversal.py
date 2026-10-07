@@ -326,6 +326,7 @@ class RubyStatement:
     names: tuple = ()
     handlers: tuple = ()
     finalizer: tuple = ()
+    explicit_parameters: bool = False
 
 
 @dataclass
@@ -349,6 +350,127 @@ class RubyParser:
         self.singleton_scope = False
         body = self.block((), ())
         self.functions[-1] = RubyFunction(-1, '<script>', (), (), body, scope=True)
+        self.bind_numbered_parameters()
+
+    def bind_numbered_parameters(self):
+        """Resolve implicit parameters in their lexical block, before CFGs.
+
+        Control/exception bodies and interpolation retain the enclosing block
+        scope. A nested iterator's receiver belongs to that scope, while its
+        body has its own parameters. Only single-argument blocks are modeled.
+        """
+        budget = Budget()
+
+        def references(tokens, depth=0):
+            if depth > 64:
+                raise AnalysisLimit('Ruby numbered-parameter nesting limit exceeded; analysis is incomplete')
+            names = set()
+            symbols, labels = set(), set()
+            frames = [[0, True]]
+            prefixes = {'return', 'next', 'break', 'raise', 'fail', 'yield', 'not', 'and', 'or'}
+            for index, token in enumerate(tokens):
+                budget.spend()
+                frame = frames[-1]
+                if token.kind != 'code':
+                    frame[1] = False
+                elif token.value in {'(', '[', '{'}:
+                    frames.append([0, True])
+                elif token.value in {')', ']', '}'}:
+                    if len(frames) > 1:
+                        frames.pop()
+                    frames[-1][1] = False
+                elif token.value == '?':
+                    frame[0] += 1
+                    frame[1] = True
+                elif token.value == ':':
+                    # A prefix colon forms a symbol. Other colons either
+                    # introduce a label's value or complete a ternary at the
+                    # same delimiter depth; nested hashes keep their labels.
+                    command_symbol = (not frame[0] and index > 0 and index + 1 < len(tokens)
+                                      and tokens[index - 1].end < token.start
+                                      and token.end == tokens[index + 1].start)
+                    if frame[1] or command_symbol:
+                        symbols.add(index)
+                    elif frame[0]:
+                        frame[0] -= 1
+                    else:
+                        labels.add(index)
+                    frame[1] = True
+                elif token.value in prefixes | {'=', '+=', '-=', '||=', '&&=', '=>', ',', ';', '\n',
+                                                 '||', '&&', '==', '!=', '<', '>', '<=', '>=',
+                                                 '+', '-', '*', '/', '!', '=~', '!~'}:
+                    frame[1] = True
+                else:
+                    frame[1] = False
+            for index, token in enumerate(tokens):
+                budget.spend()
+                previous = tokens[index - 1].value if index and tokens[index - 1].kind == 'code' else ''
+                if token.kind == 'code' and re.fullmatch(r'_[1-9]', token.value):
+                    # Property names, symbols and explicit keyword labels do
+                    # not declare an implicit parameter.
+                    if previous not in {'.', '&.', '::'} and index - 1 not in symbols:
+                        if index + 1 in labels:
+                            if index + 2 == len(tokens) or tokens[index + 2].value in {',', ')', ']', '}'}:
+                                raise ValueError('Ruby numbered keyword shorthand needs argument binding; analysis is incomplete')
+                        else:
+                            names.add(token.value)
+                for part in token.parts:
+                    names.update(references(part, depth + 1))
+            def embedded(index, token):
+                if token.kind != 'code' or token.value not in {'do', '{'} or not index:
+                    return False
+                previous = tokens[index - 1]
+                if token.value == 'do':
+                    return previous.value not in {'.', '&.', '::'} and index - 1 not in symbols
+                member = index > 1 and tokens[index - 2].value in {'.', '&.', '::'}
+                return previous.kind == 'code' and (previous.value in {')', ']', '}'} or
+                    re.fullmatch(r'[A-Za-z_]\w*[!?]?', previous.value)
+                    and (previous.value not in prefixes | {'if', 'unless', 'while', 'until', 'else', 'then'} or member))
+
+            if names and any(embedded(index, token) for index, token in enumerate(tokens)):
+                raise ValueError('Ruby embedded numbered blocks need expression-scope analysis; analysis is incomplete')
+            return names
+
+        def scope(statements, owner=None, outer_numbered=False):
+            names, nested = set(), []
+
+            def visit(body):
+                for statement in body:
+                    budget.spend()
+                    if any(re.fullmatch(r'_[1-9]', name) for name in statement.names):
+                        raise ValueError('Ruby numbered names are reserved for implicit block parameters; analysis is incomplete')
+                    parts = split_tokens(statement.tokens, {'=', '+=', '-=', '*=', '/=', '||=', '&&='})
+                    if any(len(binding) == 1 and binding[0].kind == 'code'
+                           and re.fullmatch(r'_[1-9]', binding[0].value)
+                           for lhs in parts[:-1] for binding in split_tokens(lhs, {','})):
+                        raise ValueError('Ruby numbered block parameters cannot be assigned; analysis is incomplete')
+                    names.update(references(statement.tokens))
+                    if statement.kind == 'iterate':
+                        nested.append(statement)
+                    else:
+                        visit(statement.body)
+                        visit(statement.alternate)
+                        visit(statement.handlers)
+                        visit(statement.finalizer)
+
+            visit(statements)
+            if names:
+                if owner is None:
+                    raise ValueError('Ruby numbered parameters outside a block need binding analysis; analysis is incomplete')
+                if owner.explicit_parameters:
+                    raise ValueError('Ruby explicit and numbered block parameters cannot be mixed; analysis is incomplete')
+                if outer_numbered:
+                    raise ValueError('Ruby numbered block parameters cannot be nested; analysis is incomplete')
+                if names != {'_1'}:
+                    raise ValueError('Ruby higher numbered block parameters need arity binding; analysis is incomplete')
+                owner.names = ('_1',)
+            for statement in nested:
+                scope(statement.body, statement, outer_numbered or bool(names))
+
+        for function in self.functions.values():
+            if any(re.fullmatch(r'_[1-9]', name) for name in function.parameters):
+                raise ValueError('Ruby numbered names cannot be method parameters; analysis is incomplete')
+            scope(function.body)
 
     def value(self):
         if self.position >= len(self.tokens):
@@ -551,8 +673,11 @@ class RubyParser:
                 if end != len(tokens) - 1:
                     break
                 inner, names = tokens[index + 1:end], []
-                if inner and inner[0].value == '|':
-                    closing = next((i for i in range(1, len(inner)) if inner[i].value == '|'), None)
+                explicit = bool(inner and inner[0].kind == 'code' and inner[0].value in {'|', '||'})
+                if explicit and inner[0].value == '||':
+                    inner = inner[1:]
+                elif explicit:
+                    closing = next((i for i in range(1, len(inner)) if inner[i].kind == 'code' and inner[i].value == '|'), None)
                     if closing is None:
                         raise ValueError('Unterminated Ruby block binding; analysis is incomplete')
                     names = [item.value for item in inner[1:closing] if item.value != ',']
@@ -561,11 +686,14 @@ class RubyParser:
                 self.tokens, self.position = list(inner), 0
                 body = self.block((), owner)
                 self.tokens, self.position = saved_tokens, saved_position
-                return RubyStatement('iterate', tokens[:index], body, names=tuple(names))
+                return RubyStatement('iterate', tokens[:index], body, names=tuple(names), explicit_parameters=explicit)
         if self.value() == 'do':
             self.position += 1
             names = []
-            if self.value() == '|':
+            explicit = self.value() in {'|', '||'}
+            if self.value() == '||':
+                self.position += 1
+            elif self.value() == '|':
                 self.position += 1
                 while self.value() and self.value() != '|':
                     if self.value() != ',':
@@ -576,7 +704,7 @@ class RubyParser:
                 self.position += 1
             self.separators()
             body = self.exception_body(owner)
-            return RubyStatement('iterate', tokens, body, names=tuple(names))
+            return RubyStatement('iterate', tokens, body, names=tuple(names), explicit_parameters=explicit)
         if len(split_tokens(tokens, {'rescue'})) > 1:
             raise ValueError('Ruby modifier rescue needs expression binding analysis; analysis is incomplete')
         for modifier in ('unless', 'if', 'while', 'until'):
@@ -1358,6 +1486,8 @@ class RubyEngine:
                     if names:
                         following = node('save', targets=(following,), extra=saved)
                 elif kind in {'while', 'until', 'for', 'iterate'}:
+                    if kind == 'iterate' and '_1' in statement.names:
+                        raise ValueError('Ruby numbered parameters need a selected iterator contract; analysis is incomplete')
                     loop = node('branch')
                     after = node('nil', targets=(following,))
                     break_target = following

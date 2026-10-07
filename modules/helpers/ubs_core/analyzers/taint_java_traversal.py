@@ -572,6 +572,13 @@ class Engine:
     def member_value(self, name, value, offset, arguments=None, direct_call=False, receiver=CLEAN):
         if arguments and name in {'getFileName', 'getName', 'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile', 'toString', 'toFile'}:
             return retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
+        if (name in {'getFileName', 'getName', 'fileName', 'name', 'normalize', 'toRealPath',
+                     'getCanonicalPath', 'getCanonicalFile', 'toFile'}
+                and any('jvm-path' not in trace.tags for trace in value)):
+            # A String extension can use the same name as a filesystem API.
+            # Once rendered to text, a path needs a verified conversion before
+            # those member contracts can preserve basename or containment proof.
+            return retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
         if name in {'getFileName', 'getName', 'fileName', 'name'}:
             if all('jvm-path' in trace.tags for trace in value):
                 rendered = name in {'getName', 'name'}
@@ -832,6 +839,10 @@ class Engine:
                             constructor = tail
                         cursor = close + 1
                     atom = self.member_value(method, atom, tail, arguments, receiver=receiver)
+                    if method in {'getFileName', 'getName', 'fileName', 'name'} and all('basename-path' in trace.tags for trace in atom):
+                        # This getter discharges the earlier path construction.
+                        # A later String extension must not rewrite that site.
+                        constructor = None
                     if method == 'resolve' and self.path_constructors:
                         constructor = tail
                 else:

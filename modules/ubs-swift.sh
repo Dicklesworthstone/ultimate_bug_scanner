@@ -16,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="c355a335fbfa66efdca4daeb378ab26301140851c2ad9c4e12f625fd517980ac"
+UBS_LIB_CHECKSUM="bc96f4fb94be55d5a6a0895627cee6dd61cd1223d937145955134c949491c56e"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -531,11 +531,88 @@ run_xcodebuild_analyze(){
   fi
 }
 
+validate_v2_completion_swift(){
+  local sink="$1" list_file="$2" scan_exit="$3" completion_out="$4" json_out="$5" text_out="$6"
+  local files_n
+  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  python3 - "$sink" "$files_n" "$scan_exit" "$completion_out" "$json_out" "$text_out" \
+    "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$VERSION" <<'PYCOMPLETE'
+import json
+import sys
+from pathlib import Path
+
+sink, files_raw, exit_raw, completion, json_out, text_out, project, version = sys.argv[1:]
+files_n = int(files_raw)
+incomplete = int(exit_raw) not in (0, 1)
+records = []
+counts = {"critical": 0, "warning": 0, "info": 0}
+try:
+    with open(sink, encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("invalid finding record")
+                severity = record.get("severity", "info")
+                count = int(record.get("count", 1) or 0)
+                if count < 0:
+                    raise ValueError("negative finding count")
+                records.append(record)
+                if severity in counts:
+                    counts[severity] += count
+            except (TypeError, ValueError, RecursionError):
+                incomplete = True
+except OSError:
+    incomplete = True
+receipt = {}
+try:
+    receipt = json.loads(Path(completion).read_text(encoding="utf-8"))
+    expected = {"files": files_n, **counts}
+    complete = (isinstance(receipt, dict) and receipt.get("language") == "swift"
+                and receipt.get("status") == "ok"
+                and all(type(receipt.get(key)) is int and receipt[key] == value
+                        for key, value in expected.items()))
+except (OSError, ValueError, RecursionError):
+    complete = False
+incomplete = incomplete or not complete
+if incomplete:
+    message = receipt.get("message", "") if isinstance(receipt, dict) else ""
+    if not isinstance(message, str) or not message:
+        message = f"Swift analysis did not complete (analyzer exit {exit_raw}); no valid complete report"
+    sys.stderr.write("ubs-swift: analysis incomplete: " + message + "\n")
+    if json_out:
+        try:
+            report = json.loads(Path(json_out).read_text(encoding="utf-8"))
+            if not isinstance(report, dict):
+                raise ValueError("invalid report")
+        except (OSError, ValueError, RecursionError):
+            report = {"language": "swift", "project": project, "version": version}
+        report.update(status="partial", module_error="ANALYZER_ERROR", message=message,
+                      files=files_n, findings=records, **counts)
+        Path(json_out).write_text(json.dumps(report, ensure_ascii=False) + "\n", encoding="utf-8")
+    if text_out:
+        try:
+            lines = Path(text_out).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        if not any(line.lstrip().startswith("UBS module: swift (contract v2)") for line in lines):
+            lines.insert(0, f"UBS module: swift (contract v2) — {project}")
+        lines = [line for line in lines if not line.lstrip().startswith("✓ OK")]
+        lines.append("Partial: [ANALYZER_ERROR] " + message)
+        Path(text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
+sys.exit(2 if incomplete else 0)
+PYCOMPLETE
+}
+
 run_contract_v2_swift(){
-  local list_file sink exit_code=0 text_out="" v2_json_out=""
+  local list_file sink exit_code=0 text_out="" v2_json_out="" completion_out=""
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-sink.XXXXXX)"
   cleanup_add "$list_file" "$sink"
+  completion_out="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-complete.XXXXXX)" || return 2
+  cleanup_add "$completion_out"
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   if [[ ! -e "$PROJECT_DIR" ]]; then
@@ -560,7 +637,7 @@ run_contract_v2_swift(){
     done
     v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
   fi
-  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR" --completion-out "$completion_out")
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   [[ "${UBS_SKIP_TYPE_NARROWING:-0}" -eq 1 ]] && scan_args+=(--skip-type-narrowing)
@@ -596,6 +673,11 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
       text_out="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-text.XXXXXX)"
       cleanup_add "$text_out"
       scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      if [[ -n "$SUMMARY_JSON" ]]; then
+        v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-swv2-json.XXXXXX)" || return 2
+        cleanup_add "$v2_json_out"
+        scan_args+=(--json-out "$v2_json_out")
+      fi
       ;;
     *) echo "ERROR: contract-v2 swift path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
   esac
@@ -603,11 +685,14 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.swift_scan \
     "${scan_args[@]}" --max-detailed "$MAX_DETAILED" --version "$VERSION" || exit_code=$?
 
+  validate_v2_completion_swift "$sink" "$list_file" "$exit_code" "$completion_out" \
+    "$v2_json_out" "$text_out" || exit_code=2
+
   if [[ -n "$text_out" && "$FORMAT" == "text" ]]; then
     cat "$text_out" 2>/dev/null || true
   fi
 
-  if [[ "$FORMAT" == "text" ]]; then
+  if [[ "$FORMAT" == "text" && "$exit_code" -le 1 ]]; then
     print_header "OPTIONAL ANALYZERS (if installed)"
     resolve_timeout || true
     run_swiftlint
@@ -646,7 +731,11 @@ print(counts['critical'], counts['warning'], counts['info'])
   if [[ "$FORMAT" == "text" ]]; then
     echo ""
     say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
-    say "${BOLD}${CYAN} 🎯 SCAN COMPLETE 🎯 ${RESET}"
+    if [[ "$exit_code" -le 1 ]]; then
+      say "${BOLD}${CYAN} 🎯 SCAN COMPLETE 🎯 ${RESET}"
+    else
+      say "${BOLD}${YELLOW} SCAN INCOMPLETE ${RESET}"
+    fi
     say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
     echo ""
     say "${WHITE}${BOLD}Summary Statistics:${RESET}"
@@ -674,7 +763,7 @@ print(counts['critical'], counts['warning'], counts['info'])
     fi
   elif [[ "$FORMAT" == "sarif" ]]; then
     if [[ -n "$v2_json_out" && -f "$v2_json_out" ]]; then
-      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" 2>/dev/null || true
+      PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=2
     fi
   fi
 

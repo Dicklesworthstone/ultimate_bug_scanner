@@ -330,7 +330,8 @@ def _record_category(finding: dict) -> int | None:
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  enable_new: bool = False, prefilter: Any = None) -> None:
+                  enable_new: bool = False, prefilter: Any = None,
+                  errors: list[str] | None = None) -> None:
     """Run registered elixir analyzers (the two taint heredoc ports).
 
     ``guards_elixir`` (guards_generic) and ``narrowing_elixir`` have no legacy
@@ -343,29 +344,41 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
     for analyzer in analyzers_for_lang("elixir"):
         if analyzer.layer in ("narrowing", "guards") and not enable_new:
             continue
+        if skip and 4 in skip and analyzer.layer == "taint":
+            continue
         target_files = files
         if prefilter is not None and not prefilter.is_bypass:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         if not target_files:
             continue
-        ctx = RunContext(lang="elixir", files=list(target_files))
-        for finding in analyzer.run(ctx):
-            rule = finding.get("rule", "")
-            if skip and _record_category(finding) in skip:
-                continue
-            sink.write(json.dumps({
-                "rule": rule,
-                "category_id": finding.get("category_id", "elixir.security"),
-                "path": finding.get("path", ""),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": finding.get("severity", "warning"),
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        for path in target_files:
+            ctx = RunContext(lang="elixir", files=[path])
+            try:
+                for finding in analyzer.run(ctx):
+                    rule = finding.get("rule", "")
+                    if skip and _record_category(finding) in skip:
+                        continue
+                    record = {
+                        "rule": rule,
+                        "category_id": finding.get("category_id", "elixir.security"),
+                        "path": finding.get("path", ""),
+                        "line": int(finding.get("line", 0) or 0),
+                        "col": int(finding.get("col", 1) or 1),
+                        "severity": finding.get("severity", "warning"),
+                        "message": finding.get("message", ""),
+                        "suppressed": False,
+                    }
+                    if finding.get("extras"):
+                        record["extras"] = finding["extras"]
+                    sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
 
 
-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
+def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None) -> None:
     """Run ubs_core.elixir_detectors.* modules (legacy heredoc detector ports).
 
     Protocol (single-rule modules): RULE_ID, CATEGORY, TITLE, SEVERITY,
@@ -382,6 +395,9 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
         try:
             module = importlib.import_module(f"ubs_core.elixir_detectors.{module_info.name}")
         except Exception as exc:  # legacy heredoc failures degraded gracefully too
+            if errors is None:
+                raise
+            errors.append(f"detector module {module_info.name}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.elixir_scan] detector module {module_info.name} failed: {exc}\n")
             continue
         find = getattr(module, "find", None)
@@ -397,20 +413,25 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
         }
         if skip and spec["category"] in skip:
             continue
-        for hit in find(files):
-            path, line_no, col, detail = hit[0], hit[1], hit[2], hit[3]
-            slug = slug_for_category(spec["category"])
-            title = spec["title"]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": f"elixir.{slug}",
-                "path": str(path),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": spec["severity"],
-                "message": f"{title} — {detail}"[:300] if detail else title,
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        try:
+            for hit in find(files):
+                path, line_no, col, detail = hit[0], hit[1], hit[2], hit[3]
+                slug = slug_for_category(spec["category"])
+                title = spec["title"]
+                sink.write(json.dumps({
+                    "rule": rule_id,
+                    "category_id": f"elixir.{slug}",
+                    "path": str(path),
+                    "line": int(line_no),
+                    "col": int(col),
+                    "severity": spec["severity"],
+                    "message": f"{title} — {detail}"[:300] if detail else title,
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"detector {module_info.name}: {type(exc).__name__}: {exc}")
 
 
 def _finding_title(rule: str, count: int, message: str) -> str:
@@ -458,7 +479,8 @@ def _legacy_report(records: list[dict], version: str) -> dict:
     return {"version": version, "findings": findings}
 
 
-def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
+def _render_text(args, files: Sequence[Path], counters: dict[str, int],
+                  errors: list[str] | None = None) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -500,6 +522,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int]) -> None:
         f"Info items: {counters['info']}",
         f"Report generated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
     ]
+    if errors:
+        lines.append("Partial: [ANALYZER_ERROR] Elixir analysis did not complete: " + "; ".join(errors[:5]))
     Path(args.text_out).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -511,6 +535,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m ubs_core.elixir_scan")
     parser.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
+    parser.add_argument("--completion-out", default="", help="Receipt written after all analysis and reports finish")
     parser.add_argument("--project-dir", default="", help="base dir for relative sink paths")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--text-out", default="", help="write the legacy-format text report here")
@@ -550,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
     capturing_sink = None
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
-    scan_errors: list[str] = []
+    scan_errors: list[str] = ([f"{_failures} pattern modules failed to load"] if _failures else [])
     if files_to_scan:
         elixir_analyzers = [a.name for a in analyzers_for_lang("elixir")]
         ast_rules_input = []
@@ -579,8 +604,9 @@ def main(argv: list[str] | None = None) -> int:
 
         capturing_sink = CapturingSink()
         scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
-        run_detectors(files_to_scan, capturing_sink, skip)
-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
+        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.elixir_ast import scan_all
             from ubs_core.elixir_rules import CATEGORY_MAP, SEVERITY_MAP
@@ -688,12 +714,18 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.json_out).write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
 
     if args.text_out:
-        _render_text(args, files, counters)
+        _render_text(args, files, counters, scan_errors)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-elixir: analysis incomplete: {problem}\n")
     sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
                                  "errors": scan_errors}) + "\n")
+    if args.completion_out:
+        receipt = {"language": "elixir", "status": "partial" if scan_errors else "ok",
+                   "files": len(files), **counters}
+        if scan_errors:
+            receipt["message"] = ("Elixir analysis did not complete: " + "; ".join(scan_errors[:5]))[:500]
+        Path(args.completion_out).write_text(json.dumps(receipt) + "\n", encoding="utf-8")
     return exit_code
 
 

@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="c355a335fbfa66efdca4daeb378ab26301140851c2ad9c4e12f625fd517980ac"
+UBS_LIB_CHECKSUM="bc96f4fb94be55d5a6a0895627cee6dd61cd1223d937145955134c949491c56e"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -492,19 +492,22 @@ run_v2_ex_tools(){
 # ── Legacy-parity bridges: record-less section headers + summary + exit ─────
 run_v2_legacy_parity_bridges_elixir(){
   local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}" tool_counts="${6:-}"
+  local completion_out="$7" json_out="$8"
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$scan_exit" "$tool_counts" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$scan_exit" "$tool_counts" "$completion_out" "$json_out" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import sys
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, scan_exit_raw, tool_counts) = sys.argv[1:8]
+completion_path, json_out, project = sys.argv[8:11]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
 scan_exit = int(scan_exit_raw or "0")
 as_text = bool(text_out)
+incomplete = scan_exit not in (0, 1)
 
 SLUG = {1: "pattern-matching", 2: "error-handling", 3: "process-otp",
         4: "security", 5: "phoenix", 6: "ecto", 7: "concurrency", 8: "io",
@@ -519,17 +522,69 @@ SECTION = {1: "1. PATTERN MATCHING & GUARDS", 2: "2. ERROR HANDLING & EXCEPTIONS
            13: "13. TESTING PATTERNS", 14: "14. DEPENDENCY & MIX HYGIENE",
            15: "15. STRING & BINARY SAFETY", 16: "16. MIX-POWERED EXTRA ANALYZERS"}
 
+records = []
 try:
     with open(sink_path, encoding="utf-8") as fh:
-        records = [json.loads(line) for line in fh if line.strip()]
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("invalid finding record")
+                records.append(record)
+            except (ValueError, RecursionError):
+                incomplete = True
 except OSError:
-    records = []
+    incomplete = True
 
 # Final severity recount over the whole sink, legacy exit formula inputs.
 counts = {"critical": 0, "warning": 0, "info": 0}
 for rec in records:
     sev = rec.get("severity", "info")
     counts[sev if sev in counts else "info"] += 1
+
+receipt = {}
+try:
+    with open(completion_path, encoding="utf-8") as fh:
+        receipt = json.load(fh)
+    expected = {"files": files_n, **counts}
+    complete = (isinstance(receipt, dict) and receipt.get("language") == "elixir"
+                and receipt.get("status") == "ok"
+                and all(type(receipt.get(key)) is int and receipt[key] == value
+                        for key, value in expected.items()))
+except (OSError, ValueError, RecursionError):
+    complete = False
+incomplete = incomplete or not complete
+if incomplete:
+    message = receipt.get("message", "") if isinstance(receipt, dict) else ""
+    if not isinstance(message, str) or not message:
+        message = f"Elixir analysis did not complete (analyzer exit {scan_exit}); no valid complete report"
+    sys.stderr.write("ubs-elixir: analysis incomplete: " + message + "\n")
+    if json_out:
+        try:
+            with open(json_out, encoding="utf-8") as fh:
+                report = json.load(fh)
+            if not isinstance(report, dict):
+                raise ValueError("invalid report")
+        except (OSError, ValueError, RecursionError):
+            report = {"language": "elixir", "project": project, "version": "1.0.2"}
+        report.update(status="partial", module_error="ANALYZER_ERROR", message=message,
+                      files=files_n, findings=records, **counts)
+        with open(json_out, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False)
+            fh.write("\n")
+    if text_out:
+        try:
+            with open(text_out, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            text = ""
+        with open(text_out, "w", encoding="utf-8") as fh:
+            if not any(line.lstrip().startswith("UBS module: elixir (contract v2)") for line in text.splitlines()):
+                fh.write(f"UBS module: elixir (contract v2) — {project}\n")
+            fh.write(text)
+            fh.write("Partial: [ANALYZER_ERROR] " + message + "\n")
 
 # Mix-tool counts from the module-side bridge (legacy print_finding bumps).
 for chunk in (tool_counts or "").split(","):
@@ -573,8 +628,8 @@ if as_text:
 # an abnormal scanner status with the ordinary finding exit 1 whenever
 # criticals existed, so "the scanner could not finish" and "the scanner found
 # bugs" became the same exit code. Execution failures dominate severity.
-if scan_exit not in (0, 1):
-    exit_code = scan_exit
+if incomplete:
+    exit_code = 2
 else:
     exit_code = 1 if counts["critical"] else scan_exit
     if fail_on_warning and (counts["critical"] + counts["warning"]) > 0:
@@ -585,9 +640,10 @@ PYV2BRIDGE
 }
 
 run_contract_v2_elixir(){
-  local list_file sink exit_code=0 text_out="" v2_json_out=""
+  local list_file sink exit_code=0 text_out="" v2_json_out="" completion_out=""
   list_file="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-list.XXXXXX)"
   sink="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-sink.XXXXXX)"
+  completion_out="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-complete.XXXXXX)" || return 2
   local helpers_dir=""
   ubs_resolve_helpers_dir helpers_dir || helpers_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)/helpers"
   local list_rc=0
@@ -612,19 +668,20 @@ run_contract_v2_elixir(){
     done
     v2_skip="${SKIP_CATEGORIES:+$SKIP_CATEGORIES,}$keep"
   fi
-  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR")
+  local -a scan_args=(--files-from "$list_file" --sink "$sink" --project-dir "$PROJECT_DIR" --completion-out "$completion_out")
   [[ -n "$v2_skip" ]] && scan_args+=(--skip "$v2_skip")
   [[ "${FAIL_ON_WARNING:-0}" -eq 1 ]] && scan_args+=(--fail-on-warning)
   case "$FORMAT" in
-    json)
-      exec 3>&1
-      scan_args+=(--json-out /dev/fd/3 --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
-    sarif)
+    json|sarif)
       v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-json.XXXXXX)"
       scan_args+=(--json-out "$v2_json_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}") ;;
     text)
       text_out="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-text.XXXXXX)"
       scan_args+=(--text-out "$text_out" --project "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")
+      if [[ -n "$SUMMARY_JSON" ]]; then
+        v2_json_out="$(mktemp 2>/dev/null || mktemp -t ubs-exv2-json.XXXXXX)" || return 2
+        scan_args+=(--json-out "$v2_json_out")
+      fi
       ;;
     *) echo "ERROR: contract-v2 elixir path supports text|json|sarif (got $FORMAT)" >&2; return 2 ;;
   esac
@@ -652,28 +709,40 @@ PY
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.elixir_scan \
     "${scan_args[@]}" --version "1.0.2" || exit_code=$?
   [[ -n "$ast_rule_dir" ]] && rm -rf "$ast_rule_dir" 2>/dev/null || true
-  if [[ "$FORMAT" == "sarif" ]]; then
-    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=$?
-    rm -f "$v2_json_out" 2>/dev/null || true
-  else
+  if [[ "$FORMAT" != "sarif" ]]; then
     # Category 16 parity bridge: raw mix-tool passthrough
     if [[ ",$v2_skip," != *",16,"* ]]; then
       check_mix || true
       check_phoenix || true
-      run_v2_ex_tools
+      # Validate before optional tools can print successful-check notes. The
+      # final bridge below still includes their legacy severity counts.
+      if [[ "$HAS_MIX" -eq 1 ]]; then
+        run_v2_legacy_parity_bridges_elixir "$sink" "$list_file" "$exit_code" "" \
+          "$v2_skip" "" "$completion_out" "$v2_json_out" || exit_code=$?
+      fi
+      if [[ "$exit_code" -le 1 ]]; then
+        run_v2_ex_tools
+      fi
     fi
-    # Record-less section headers + Summary Statistics + legacy exit formula.
-    run_v2_legacy_parity_bridges_elixir "$sink" "$list_file" "$exit_code" "$text_out" \
-      "$v2_skip" "$TOOL_COUNTS" || exit_code=$?
-    if [[ -n "$text_out" ]]; then
-      cat "$text_out" 2>/dev/null || true
-      rm -f "$text_out" 2>/dev/null || true
-    fi
+  fi
+  # Require completion for every format, including a child that exited 0/1.
+  run_v2_legacy_parity_bridges_elixir "$sink" "$list_file" "$exit_code" "$text_out" \
+    "$v2_skip" "$TOOL_COUNTS" "$completion_out" "$v2_json_out" || exit_code=$?
+  if [[ "$FORMAT" == "sarif" ]]; then
+    PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=2
+  elif [[ "$FORMAT" == "json" ]]; then
+    cat "$v2_json_out"
+  elif [[ -n "$text_out" ]]; then
+    cat "$text_out" 2>/dev/null || true
+    rm -f "$text_out" 2>/dev/null || true
+  fi
+  if [[ -n "$SUMMARY_JSON" && -n "$v2_json_out" ]]; then
+    cp "$v2_json_out" "$SUMMARY_JSON" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
+  rm -f "$list_file" "$sink" "$completion_out" "${v2_json_out:-}" 2>/dev/null || true
   return "$exit_code"
 }
 

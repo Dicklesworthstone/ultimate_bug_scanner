@@ -382,7 +382,7 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
             }, ensure_ascii=False) + "\n")
 
 
-def load_patterns() -> list[Pattern]:
+def load_patterns(errors: list[str] | None = None) -> list[Pattern]:
     """Aggregate PATTERNS from every ubs_core.swift_patterns.* module."""
     from ubs_core import swift_patterns
 
@@ -393,13 +393,16 @@ def load_patterns() -> list[Pattern]:
         try:
             module = importlib.import_module(f"ubs_core.swift_patterns.{module_info.name}")
         except Exception as exc:  # a broken pattern module must not kill the scan
+            if errors is None:
+                raise
+            errors.append(f"pattern module {module_info.name}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.swift_scan] pattern module {module_info.name} failed: {exc}\n")
             continue
         patterns.extend(getattr(module, "PATTERNS", []))
     return patterns
 
 
-def load_derived() -> list[Callable]:
+def load_derived(errors: list[str] | None = None) -> list[Callable]:
     """Aggregate DERIVED check callables from every swift_patterns module."""
     from ubs_core import swift_patterns
 
@@ -409,7 +412,10 @@ def load_derived() -> list[Callable]:
             continue
         try:
             module = importlib.import_module(f"ubs_core.swift_patterns.{module_info.name}")
-        except Exception:
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"derived module {module_info.name}: {type(exc).__name__}: {exc}")
             continue
         derived.extend(getattr(module, "DERIVED", []))
     return derived
@@ -420,20 +426,22 @@ def rel_for(path: Path, project_dir: Path) -> str:
     return str(path.resolve())
 
 
-def run_derived(ctx: ScanContext, sink, skip: set[int]) -> None:
+def run_derived(ctx: ScanContext, sink, skip: set[int], errors: list[str] | None = None) -> None:
     """Run the cross-count derived checks contributed by pattern modules."""
     suppressions = SourceSuppressions("swift")
-    for fn in load_derived():
+    for fn in load_derived(errors):
         try:
-            findings = list(fn(ctx))
+            for finding in fn(ctx):
+                for record in suppressions.filter([finding]):
+                    _write_record(sink, record, skip)
         except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"derived check {getattr(fn, '__name__', fn)}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.swift_scan] derived check {getattr(fn, '__name__', fn)} failed: {exc}\n")
-            continue
-        for finding in suppressions.filter(findings):
-            _write_record(sink, finding, skip)
 
 
-def run_detectors(ctx: ScanContext, sink, skip: set[int]) -> None:
+def run_detectors(ctx: ScanContext, sink, skip: set[int], errors: list[str] | None = None) -> None:
     """Run ubs_core.swift_detectors.* modules (legacy heredoc detector ports).
 
     Protocol: each module exposes ``scan(ctx) -> Iterable[dict]`` yielding
@@ -447,18 +455,24 @@ def run_detectors(ctx: ScanContext, sink, skip: set[int]) -> None:
         try:
             module = importlib.import_module(f"ubs_core.swift_detectors.{module_info.name}")
         except Exception as exc:  # legacy heredoc failures degraded gracefully too
+            if errors is None:
+                raise
+            errors.append(f"detector module {module_info.name}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.swift_scan] detector module {module_info.name} failed: {exc}\n")
             continue
         scan = getattr(module, "scan", None)
         if scan is None:
             continue
-        try:
-            findings = list(scan(ctx))
-        except Exception as exc:
-            sys.stderr.write(f"[ubs_core.swift_scan] detector {module_info.name} failed: {exc}\n")
+        if getattr(module, "CATEGORY", None) in skip:
             continue
-        for finding in findings:
-            _write_record(sink, finding, skip)
+        try:
+            for finding in scan(ctx):
+                _write_record(sink, finding, skip)
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"detector {module_info.name}: {type(exc).__name__}: {exc}")
+            sys.stderr.write(f"[ubs_core.swift_scan] detector {module_info.name} failed: {exc}\n")
 
 
 def _write_record(sink, finding: dict, skip: set[int]) -> None:
@@ -478,7 +492,7 @@ def _write_record(sink, finding: dict, skip: set[int]) -> None:
         "message": str(finding.get("message", "")),
         "suppressed": False,
     }
-    for key in ("title", "description", "samples", "scope"):
+    for key in ("title", "description", "samples", "scope", "extras"):
         if finding.get(key) is not None:
             record[key] = finding[key]
     sink.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -495,7 +509,8 @@ def _analyzer_category(rule: str) -> int | None:
     return None
 
 
-def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = False, prefilter: Any = None) -> None:
+def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = False,
+                  prefilter: Any = None, errors: list[str] | None = None) -> None:
     """Run registered swift analyzers (taint, narrowing, lifecycle).
 
     ``regex_swift`` (ReDoS deep analysis) has no legacy counter impact — the
@@ -508,6 +523,9 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
 
     for analyzer in analyzers_for_lang("swift"):
         if analyzer.layer == "regex" and not enable_new:
+            continue
+        category = {"taint": 6, "narrowing": 1, "lifecycle": 16}.get(analyzer.layer)
+        if category in skip:
             continue
         if analyzer.layer == "narrowing":
             # legacy run_swift_type_narrowing_checks degradation branches
@@ -537,29 +555,31 @@ def run_analyzers(ctx: ScanContext, sink, skip: set[int], enable_new: bool = Fal
             target_files = list(ctx.files)
         if not target_files:
             continue
-        run_ctx = RunContext(lang="swift", files=target_files)
-        try:
-            findings = list(analyzer.run(run_ctx))
-        except Exception as exc:
-            sys.stderr.write(f"[ubs_core.swift_scan] analyzer {analyzer.name} failed: {exc}\n")
-            continue
-        for finding in findings:
-            rule = str(finding.get("rule", ""))
-            category = _analyzer_category(rule)
-            if category is None or category in skip:
-                continue
-            path_raw = str(finding.get("path", "") or "")
-            rel = rel_for(Path(path_raw), ctx.project_dir) if path_raw else ""
-            _write_record(sink, {
-                "rule": rule,
-                "category": category,
-                "path": rel,
-                "line": finding.get("line", 0),
-                "col": finding.get("col", 1),
-                "severity": finding.get("severity", "warning"),
-                "count": 1,
-                "message": finding.get("message", ""),
-            }, skip)
+        for path in target_files:
+            run_ctx = RunContext(lang="swift", files=[path])
+            try:
+                for finding in analyzer.run(run_ctx):
+                    rule = str(finding.get("rule", ""))
+                    category = _analyzer_category(rule)
+                    if category is None or category in skip:
+                        continue
+                    path_raw = str(finding.get("path", "") or "")
+                    rel = rel_for(Path(path_raw), ctx.project_dir) if path_raw else ""
+                    _write_record(sink, {
+                        "rule": rule,
+                        "category": category,
+                        "path": rel,
+                        "line": finding.get("line", 0),
+                        "col": finding.get("col", 1),
+                        "severity": finding.get("severity", "warning"),
+                        "count": 1,
+                        "message": finding.get("message", ""),
+                        "extras": finding.get("extras"),
+                    }, skip)
+            except Exception as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -778,6 +798,7 @@ class _Renderer:
             f"UBS module: swift (contract v2) — {args.project or args.project_dir}"
         ]
         self.detailed = 0
+        self.complete = True
         self._line_cache: dict[str, list[str]] = {}
 
     # ── legacy print primitives (colors stripped: the meta runner captures
@@ -793,6 +814,8 @@ class _Renderer:
         self.lines += ["", f"• {text}"]
 
     def finding(self, sev: str, count: int, title: str, desc: str | None) -> None:
+        if sev == "good" and not self.complete:
+            return
         label = {"critical": "🔥 CRITICAL", "warning": "⚠ Warning", "good": "✓ OK"}.get(sev, "ℹ Info")
         if sev == "good":
             self.lines.append(f" ✓ OK {title}")
@@ -861,7 +884,8 @@ class _Renderer:
             if rec.get("path") and int(rec.get("line", 0) or 0) > 0
         ][:limit]
 
-    def render(self, skip: set[int]) -> None:
+    def render(self, skip: set[int], complete: bool = True) -> None:
+        self.complete = complete
         for cat in range(1, 24):
             if cat in skip:
                 continue
@@ -980,6 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m ubs_core.swift_scan")
     parser.add_argument("--files-from", default="-", help="NUL-separated file list ('-' = stdin)")
     parser.add_argument("--sink", required=True, help="NDJSON findings sink path")
+    parser.add_argument("--completion-out", default="", help="Receipt written after all analysis and reports finish")
     parser.add_argument("--project-dir", default="", help="scan root for rel-path parity")
     parser.add_argument("--skip", default="", help="comma-separated category numbers to skip")
     parser.add_argument("--ast-rule-dir", default="", help="consolidated ast-grep rule dir")
@@ -1009,7 +1034,10 @@ def main(argv: list[str] | None = None) -> int:
     ctx = ScanContext(files=files, project_dir=project_dir,
                       skip_narrowing=args.skip_type_narrowing,
                       ast_available=args.ast_available)
-    patterns = load_patterns()
+    # Collect failures from every contributing layer before deciding whether
+    # this invocation may publish a successful completion receipt.
+    scan_errors: list[str] = []
+    patterns = load_patterns(scan_errors)
 
     from ubs_core.cache import CapturingSink, ScanCache
 
@@ -1024,9 +1052,6 @@ def main(argv: list[str] | None = None) -> int:
     suppressions = SourceSuppressions("swift")
 
     capturing_sink = None
-    # Every analysis layer that could not complete appends here, so a scan that
-    # did not finish is never reported as a finished one (#111).
-    scan_errors: list[str] = []
     if files_to_scan:
         from ubs_core.prefilter import build_prefilter_index, run_prefilter
         from ubs_core.registry import analyzers_for_lang
@@ -1080,15 +1105,9 @@ def main(argv: list[str] | None = None) -> int:
                 "description": "Concurrency summary requires ast-grep JSON stream output",
                 "degraded": True,
             }, skip)
-        run_detectors(scan_ctx, capturing_sink, skip)
-        run_analyzers(scan_ctx, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
-        # An incomplete analysis must never become the cached answer: the next
-        # run would hit the cache and report the findings this one could not
-        # produce as a clean, finished scan (#111).
-        if not scan_errors:
-            cache.store_scanned_files(files_to_scan, {
-                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
-            })
+        run_detectors(scan_ctx, capturing_sink, skip, errors=scan_errors)
+        run_analyzers(scan_ctx, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, errors=scan_errors)
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -1111,7 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
         # here; only source-local AST/detector/analyzer records enter the cache.
         # Direct emission also preserves genuine pathless aggregate findings.
         scan_patterns(patterns, ctx, sink_file, skip)
-        run_derived(ctx, sink_file, skip)
+        run_derived(ctx, sink_file, skip, errors=scan_errors)
         for f in files:
             recs = cached_findings.get(f)
             if recs is None and capturing_sink is not None:
@@ -1120,6 +1139,12 @@ def main(argv: list[str] | None = None) -> int:
                 for r in suppressions.filter(recs):
                     sink_file.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+    # Derived checks run after the source-local passes. Wait for them too:
+    # no incomplete invocation may populate the reusable file cache.
+    if not scan_errors and files_to_scan and capturing_sink is not None:
+        cache.store_scanned_files(files_to_scan, {
+            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+        })
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
 
@@ -1183,7 +1208,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.text_out:
         records = read_ndjson(args.sink)
         renderer = _Renderer(args, records)
-        renderer.render(skip)
+        renderer.render(skip, complete=not scan_errors)
+        if scan_errors:
+            renderer.lines.append("Partial: [ANALYZER_ERROR] Swift analysis did not complete: "
+                                  + "; ".join(scan_errors[:5]))
         Path(args.text_out).write_text(renderer.text(), encoding="utf-8")
 
     for problem in scan_errors:
@@ -1191,6 +1219,12 @@ def main(argv: list[str] | None = None) -> int:
     sys.stderr.write(json.dumps({"counters": counters, "patterns": len(patterns),
                                  "prefilter": prefilter_res.to_dict(),
                                  "errors": scan_errors}) + "\n")
+    if args.completion_out:
+        receipt = {"language": "swift", "status": "partial" if scan_errors else "ok",
+                   "files": len(files), **counters}
+        if scan_errors:
+            receipt["message"] = ("Swift analysis did not complete: " + "; ".join(scan_errors[:5]))[:500]
+        Path(args.completion_out).write_text(json.dumps(receipt) + "\n", encoding="utf-8")
     return exit_code
 
 

@@ -11,9 +11,11 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
+  prepare:
+    # The source-only bootstrap needs no privileged VM or scanner downloads.
+    # Keep full semantic/platform gates in validate, not in this transport job.
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
     permissions:
       contents: write
     defaults:
@@ -102,6 +104,40 @@ jobs:
           name: interpreter-resolution-source-and-bootstrap
           path: ${{ runner.temp }}/resolution-*
           retention-days: 7
+
+  validate:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: interpreter-resolution-source-and-bootstrap
+          path: ${{ runner.temp }}/prepared
+      - name: Restore and verify the exact prepared candidate
+        run: |
+          test "$(git rev-parse HEAD)" = "$(cat "$RUNNER_TEMP/prepared/resolution-source-head.txt")"
+          tar -xzf "$RUNNER_TEMP/prepared/resolution-candidate.tar.gz"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          record = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'prepared/resolution-objects.json').read_text())
+          assert {entry['path'] for entry in record['objects']} == {'ubs', 'SHA256SUMS', 'test-suite/shareable/test_helper_python_floor.py'}
+          for entry in record['objects']:
+              data = pathlib.Path(entry['path']).read_bytes()
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == entry['sha'], entry['path']
+          PY
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
       - name: Install real runtimes and scanner tools
         run: |
@@ -148,6 +184,6 @@ jobs:
           name: interpreter-resolution-validation
           path: |
             ${{ runner.temp }}/resolution-*.log
-            ${{ runner.temp }}/resolution-objects.json
+            ${{ runner.temp }}/prepared/resolution-objects.json
             test-suite/artifacts/helper-python-floor/
           retention-days: 7

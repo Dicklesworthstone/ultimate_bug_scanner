@@ -1,0 +1,153 @@
+name: Python Interpreter Resolution
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/python-resolution.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Preserve the exact source and retrieve the reviewed patch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/resolution-source.tar.gz"
+          git rev-parse HEAD > "$RUNNER_TEMP/resolution-source-head.txt"
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          sha = '5f2f063d7c3b4a2251d7b281f1fe9f5f5c5df657'
+          request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs/' + sha,
+              headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          with urllib.request.urlopen(request, timeout=90) as response:
+              value = json.load(response)
+          data = base64.b64decode(value['content'])
+          assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+          assert hashlib.sha256(data).hexdigest() == 'ea35eeb61a1339f9c7e5e792c78ea9597ec526ff5f3c7a2cfe2fafa1510242e2'
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'resolution.patch').write_bytes(data)
+          PY
+      - name: Prove the original resolver fails the new behavioral controls
+        run: |
+          git apply --check --include=test-suite/shareable/test_helper_python_floor.py "$RUNNER_TEMP/resolution.patch"
+          git apply --include=test-suite/shareable/test_helper_python_floor.py "$RUNNER_TEMP/resolution.patch"
+          set +e
+          python3 -B test-suite/shareable/test_helper_python_floor.py PythonResolution.test_named_python3_override_does_not_reenter_its_shim PythonResolution.test_rejected_python3_falls_back_to_supported_python -v > "$RUNNER_TEMP/resolution-baseline.log" 2>&1
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/resolution-baseline.log"
+          test "$code" -eq 1
+          grep -q TimeoutExpired "$RUNNER_TEMP/resolution-baseline.log"
+          grep -q 'FAILED (failures=1, errors=1)' "$RUNNER_TEMP/resolution-baseline.log"
+      - name: Apply only the reviewed runner change and verify the bootstrap
+        run: |
+          git apply --check --include=ubs "$RUNNER_TEMP/resolution.patch"
+          git apply --include=ubs "$RUNNER_TEMP/resolution.patch"
+          ./scripts/update_sha256sums.sh
+          git diff --check
+          bash -n ubs
+          python3 -B test-suite/shareable/test_helper_python_floor.py PythonResolution HelperCurrentRuntime.test_all_helpers_compile_and_import_without_site_packages HelperCurrentRuntime.test_taint_dataclass_behavior -v 2>&1 | tee "$RUNNER_TEMP/resolution-bootstrap.log"
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+      - name: Preserve immutable bootstrap objects for independent validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          expected = {'ubs', 'SHA256SUMS', 'test-suite/shareable/test_helper_python_floor.py'}
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == expected, changed
+          before = {name: pathlib.Path(name).read_bytes() for name in expected}
+          subprocess.run(['bash', 'scripts/update_sha256sums.sh'], check=True)
+          assert all(pathlib.Path(name).read_bytes() == data for name, data in before.items())
+          objects = []
+          for name, data in sorted(before.items()):
+              sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              request = urllib.request.Request('https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/blobs',
+                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')}).encode(),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Content-Type': 'application/json', 'Accept': 'application/vnd.github+json'})
+              with urllib.request.urlopen(request, timeout=90) as response:
+                  result = json.load(response)
+              assert result['sha'] == sha, name
+              objects.append({'path': name, 'sha': sha, 'mode': mode, 'type': 'blob'})
+          record = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                    'validation': 'bootstrap only; full real-runtime and scanner gates follow', 'objects': objects}
+          print(json.dumps(record, indent=2), flush=True)
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'resolution-objects.json').write_text(json.dumps(record, indent=2) + '\n')
+          PY
+          tar -czf "$RUNNER_TEMP/resolution-candidate.tar.gz" ubs SHA256SUMS test-suite/shareable/test_helper_python_floor.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interpreter-resolution-source-and-bootstrap
+          path: ${{ runner.temp }}/resolution-*
+          retention-days: 7
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Install real runtimes and scanner tools
+        run: |
+          uv python install 3.9 3.14
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq ripgrep shellcheck
+          npm install --global @ast-grep/cli@0.45.3
+          floor="$(uv python find --managed-python 3.9)"
+          "$floor" -I -S -c 'import sys; assert sys.version_info[:2] == (3, 9); print(sys.version)'
+          tar -czf "$RUNNER_TEMP/resolution-python39.tar.gz" -C "$(dirname "$(dirname "$floor")")" .
+          tar -czf "$RUNNER_TEMP/resolution-ast-grep.tar.gz" -C "$(npm prefix -g)" lib/node_modules/@ast-grep
+          cp "$(command -v shellcheck)" "$RUNNER_TEMP/resolution-shellcheck"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: interpreter-resolution-toolchain
+          path: |
+            ${{ runner.temp }}/resolution-python39.tar.gz
+            ${{ runner.temp }}/resolution-ast-grep.tar.gz
+            ${{ runner.temp }}/resolution-shellcheck
+          retention-days: 1
+      - name: Require real floor and newer interpreter imports, doctor and scans
+        run: |
+          export UBS_REQUIRE_PYTHON39=1
+          export UBS_TEST_PYTHON39="$(uv python find --managed-python 3.9)"
+          for version in 3.9 3.14; do
+            UBS_TEST_EXPECT_PYTHON="$version" "$(uv python find --managed-python "$version")" -B test-suite/shareable/test_helper_python_floor.py -v 2>&1 | tee "$RUNNER_TEMP/resolution-runtime-$version.log"
+          done
+      - name: Retain focused semantic, self-scan and integrity gates
+        run: |
+          export UBS_PYTHON="$(uv python find --managed-python 3.14)"
+          "$UBS_PYTHON" -B -m unittest discover -s test-suite/quality -p 'test_taint_js*.py' -v 2>&1 | tee "$RUNNER_TEMP/resolution-taint-js.log"
+          "$UBS_PYTHON" -B -m unittest discover -s test-suite/quality -p test_js_scan.py -v 2>&1 | tee "$RUNNER_TEMP/resolution-js-scan.log"
+          "$UBS_PYTHON" -B test-suite/quality/test_python_command_injection_dataflow.py -v
+          "$UBS_PYTHON" -B test-suite/shareable/test_contract_checksums.py
+          shellcheck -S warning ubs
+          for file in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$file"; done
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          ./ubs --ci --fail-on-warning --only=bash,python ubs test-suite/shareable/test_helper_python_floor.py 2>&1 | tee "$RUNNER_TEMP/resolution-self-scan.log"
+          git diff --check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: interpreter-resolution-validation
+          path: |
+            ${{ runner.temp }}/resolution-*.log
+            ${{ runner.temp }}/resolution-objects.json
+            test-suite/artifacts/helper-python-floor/
+          retention-days: 7

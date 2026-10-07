@@ -1,0 +1,409 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -4,8 +4,9 @@
+ branches, and iterate loops and recursive function summaries to a fixpoint.
+ Facts retain source provenance and sink-specific sanitizers. Local helpers
+ summarize both returned values and parameters reaching a sink; analyzed code
+-is never imported or executed. Selected acyclic Python modules share function
+-summaries; unresolved/cyclic imports and arbitrary dynamic dispatch retain
++is never imported or executed. Selected Python modules share function
++summaries, including qualified cycles with deferred peer lookups. Unresolved
++imports, eager cyclic initialization and arbitrary dynamic dispatch retain
+ conservative opaque-call behavior. Known callable aliases are modeled.
+ Mutable objects use a finite, field-insensitive heap: aliases share writes,
+ and local call summaries propagate output-parameter and captured-object writes.
+@@ -2541,8 +2542,10 @@
+         # context on every pass of every later module made project scans
+         # quadratic in the module count; only contexts this module requests,
+         # or that belong to its own functions, are part of its fixed point.
++        solving = self.project.solving if self.project is not None else set()
+         inherited = {key for key in self.summaries
+-                     if isinstance(key, tuple) and self.owner(key[0]) is not self}
++                     if isinstance(key, tuple) and self.owner(key[0]) is not self
++                     and self.owner(key[0]) not in solving}
+         # Worklist: a job is a deterministic function of its namespace, the
+         # summaries it requested and the definition-time tables it read. When
+         # none of those changed since its last solve, solving it again yields
+@@ -2656,8 +2659,10 @@
+ class _Project:
+     """Resolve only selected Python source files; never search sys.path/import code.
+ 
+-    Module initialization is dependency ordered. Cycles (and their dependent
+-    modules) keep opaque calls rather than using a guessed partial namespace.
++    Module initialization is dependency ordered. A cyclic component with only
++    literal initialization and deferred peer lookups can share a fixed point.
++    Other cycles keep opaque imports, not a guessed partial namespace; their
++    dependents still resolve selected-module summaries normally.
+     A virtual line map keeps imported sink locations and suppressions attached
+     to their defining file without concatenating/parsing source buffers.
+     """
+@@ -2668,6 +2673,7 @@
+         self.namespaces = set()
+         self.keys = {}
+         self.ready = set()
++        self.solving = set()
+         seen, offset = set(), 0
+         for path in files:
+             path = Path(path).resolve()
+@@ -2745,9 +2751,142 @@
+                     continue
+                 for prefix in (key, *key.parents):
+                     dependency = self.modules.get(prefix)
+-                    if dependency is not None and dependency is not engine:
++                    if dependency is not None and (dependency is not engine or prefix == key):
+                         dependencies.add(dependency)
+         return dependencies
++
++    def components(self):
++        """Yield strongly connected import components, dependencies first.
++
++        An iterative Tarjan walk bounds stack use by the selected graph, not
++        Python's recursion limit. Only a genuine cycle needs the opaque-import
++        fallback: a module importing a cycle may also call independent helpers
++        whose source, sink and mutation summaries must remain available.
++        """
++        adjacency = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
++        order = {engine: str(path) for path, _, engine, _ in self.sources}
++        indices, lowlinks = {}, {}
++        active, stacked = set(), []
++        for root in sorted(adjacency, key=order.__getitem__):
++            if root in indices:
++                continue
++            indices[root] = lowlinks[root] = len(indices)
++            active.add(root)
++            stacked.append(root)
++            pending = [(root, iter(sorted(adjacency[root], key=order.__getitem__)))]
++            while pending:
++                engine, edges = pending[-1]
++                dependency = next(edges, None)
++                if dependency is not None:
++                    if dependency not in indices:
++                        indices[dependency] = lowlinks[dependency] = len(indices)
++                        active.add(dependency)
++                        stacked.append(dependency)
++                        pending.append((dependency, iter(sorted(adjacency[dependency], key=order.__getitem__))))
++                    elif dependency in active:
++                        lowlinks[engine] = min(lowlinks[engine], indices[dependency])
++                    continue
++                pending.pop()
++                if pending:
++                    parent = pending[-1][0]
++                    lowlinks[parent] = min(lowlinks[parent], lowlinks[engine])
++                if lowlinks[engine] == indices[engine]:
++                    component = []
++                    while True:
++                        member = stacked.pop()
++                        active.remove(member)
++                        component.append(member)
++                        if member is engine:
++                            break
++                    yield sorted(component, key=order.__getitem__)
++
++    def deferred_cycle(self, component):
++        """Can every peer namespace be initialized before peer member access?
++
++        Python permits `import peer` cycles and imports inside functions, but
++        an eager `from peer import function`, decorator or initializer call
++        may observe a partially initialized peer. Only accept explicit module
++        imports, plain function definitions and literal module state here.
++        Everything else retains the opaque fallback, never a guessed clean
++        summary. No source is imported or executed to make this decision.
++        """
++        members = set(component)
++
++        def literal(node):
++            return node is None or all(isinstance(child, (
++                ast.Constant, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Load,
++                ast.UnaryOp, ast.UAdd, ast.USub,
++            )) for child in ast.walk(node))
++
++        def annotation(node, engine):
++            if node is None:
++                return True
++            # Builtin annotations cannot inspect a peer. Reject shadowed
++            # builtin names, attribute lookups and executable annotations.
++            for child in ast.walk(node):
++                if isinstance(child, ast.Name):
++                    if (child.id not in {'str', 'bytes', 'int', 'float', 'bool', 'object',
++                                         'list', 'tuple', 'dict', 'set', 'frozenset', 'type'}
++                            or child.id in engine.global_names):
++                        return False
++                elif not isinstance(child, (ast.Constant, ast.Load, ast.Subscript,
++                                            ast.Tuple, ast.BinOp, ast.BitOr)):
++                    return False
++            return True
++
++        for engine in component:
++            if self.modules.get(self.keys.get(engine)) is not engine:
++                return False  # An ambiguous file/package name proves no identity.
++            for node in engine.tree.body:
++                if isinstance(node, (ast.Import, ast.Pass)):
++                    continue
++                if isinstance(node, ast.ImportFrom):
++                    key = self.import_key(engine, node, node.module or '')
++                    if self.modules.get(key) in members or any(alias.name == '*' for alias in node.names):
++                        return False
++                    continue
++                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
++                    continue
++                if isinstance(node, ast.Assign):
++                    if all(isinstance(target, ast.Name) for target in node.targets) and literal(node.value):
++                        continue
++                elif isinstance(node, ast.AnnAssign):
++                    if (isinstance(node.target, ast.Name) and literal(node.value)
++                            and annotation(node.annotation, engine)):
++                        continue
++                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                    args = node.args
++                    params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
++                    params.extend(arg for arg in (args.vararg, args.kwarg) if arg is not None)
++                    if (not node.decorator_list and not getattr(node, 'type_params', ())
++                            and all(literal(value) for value in (*args.defaults, *args.kw_defaults))
++                            and annotation(node.returns, engine)
++                            and all(annotation(arg.annotation, engine) for arg in params)):
++                        continue
++                return False
++        return True
++
++    def analyze_cycle(self, component):
++        # Publish all proven namespaces together. Priming does not solve any
++        # function body and cannot read a peer member under deferred_cycle's
++        # initializer contract. Qualified lookups then see complete namespaces.
++        for engine in component:
++            engine.globals = _Flow(engine, engine.tree).block(engine.tree.body, _State())
++        self.ready.update(component)
++        self.solving = set(component)
++        try:
++            while True:
++                summaries = component[0].summaries.copy()
++                effects = {}
++                for engine in component:
++                    for key, fact in engine.analyze().items():
++                        effects[key] = join_facts(effects.get(key, CLEAN), fact)
++                if summaries == component[0].summaries:
++                    # Keep only the converged pass: an intermediate opaque
++                    # return or provisional callable is not final evidence.
++                    return effects
++        finally:
++            self.solving = set()
+ 
+     def member(self, key, name, state):
+         module_ref = '@module:' + str(key)
+@@ -2787,21 +2926,23 @@
+         return CLEAN, binding, frozenset({binding.reference})
+ 
+     def findings(self):
+-        pending = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
+         effects = {}
+-        while pending:
+-            ready = [engine for engine, deps in pending.items() if deps <= self.ready]
+-            if not ready:
++        for component in self.components():
++            cyclic = len(component) > 1 or component[0] in self.dependencies(component[0])
++            if cyclic and self.deferred_cycle(component):
++                for key, fact in self.analyze_cycle(component).items():
++                    effects[key] = join_facts(effects.get(key, CLEAN), fact)
++                continue
++            if cyclic:
+                 # Do not pretend to execute a cyclic import's partially
+-                # initialized modules. Still run ordinary intrafile analysis.
+-                ready = list(pending)
+-                for engine in ready:
++                # initialized modules. Keep this fallback within the actual
++                # cycle, never disabling cross-file analysis in its callers.
++                for engine in component:
+                     engine.project = None
+-            for engine in ready:
++            for engine in component:
+                 for key, fact in engine.analyze().items():
+                     effects[key] = join_facts(effects.get(key, CLEAN), fact)
+                 self.ready.add(engine)
+-                del pending[engine]
+         starts = [offset for _, _, _, offset in self.sources]
+         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
+         for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])):
+diff --git a/test-suite/quality/test_taint_python_modules.py b/test-suite/quality/test_taint_python_modules.py
+--- a/test-suite/quality/test_taint_python_modules.py
++++ b/test-suite/quality/test_taint_python_modules.py
+@@ -207,6 +207,148 @@
+         got = self.scan({'a.py': 'from b import clean\ndef wrap(x):\n    return clean(x)\neval(wrap(input()))',
+                          'b.py': 'from a import wrap\ndef clean(x):\n    return "safe"'})
+         self.assertEqual(len(got), 1, got)
++
++    def test_import_cycle_does_not_disable_downstream_selected_helpers(self):
++        sources = {'a.py': 'import b\n', 'b.py': 'import a\n',
++                   'helper.py': 'def run(value):\n    eval(value)\n',
++                   'app.py': 'import a\nfrom helper import run\nrun(input())\n'}
++        for order in (list(sources), list(reversed(sources))):
++            with self.subTest(order=order):
++                got = self.scan(sources, selected=order)
++                self.assertEqual(self.sites(got), [('helper.py', 2, 'python.taint.eval')])
++
++    def test_import_cycle_does_not_invent_taint_after_known_clean_helper(self):
++        got = self.scan({'a.py': 'import b\n', 'b.py': 'import a\n',
++                         'helper.py': 'def clean(value):\n    return "safe"\n',
++                         'app.py': 'import a\nfrom helper import clean\neval(clean(input()))\n'})
++        self.assertEqual(got, [])
++
++    def test_cycle_exports_still_carry_sources_sinks_and_mutations_to_callers(self):
++        helper = ('import peer\n'
++                  'def read():\n    return input()\n'
++                  'def run(value):\n    eval(value)\n'
++                  'def fill(box, value):\n    box.append(value)\n')
++        for body, expected in (
++                ('helper.run(input())', [('helper.py', 5, 'python.taint.eval')]),
++                ('eval(helper.read())', [('app.py', 2, 'python.taint.eval')]),
++                ('box=[]\nhelper.fill(box,input())\neval(box[0])', [('app.py', 4, 'python.taint.eval')]),
++                ('helper.run("safe")', [])):
++            with self.subTest(body=body):
++                sources = {'helper.py': helper, 'peer.py': 'import helper\n',
++                           'app.py': 'import helper\n' + body}
++                self.assertEqual(self.sites(self.scan(sources)), expected)
++
++    def test_two_cycles_do_not_disconnect_downstream_reexports(self):
++        got = self.scan({'a.py': 'import b\n', 'b.py': 'import a\n',
++                         'c.py': 'import d\n', 'd.py': 'import c\n',
++                         'sink.py': 'def run(value):\n    eval(value)\n',
++                         'bridge.py': 'import a\nfrom sink import run\n',
++                         'app.py': 'import c\nfrom bridge import run\nrun(input())\n'})
++        self.assertEqual(self.sites(got), [('sink.py', 2, 'python.taint.eval')])
++
++    def test_cycle_dependency_components_are_iterative_and_dependency_first(self):
++        # A cycle with a long tail must not consume Python's recursion stack
++        # or classify every dependent as cyclic. Test the graph independently
++        # of solving 1,200 identical scanner entry points.
++        sources = {f'm{i}.py': f'import m{i + 1}\n' for i in range(1200)}
++        sources['m1200.py'] = 'import m1199\n'
++        project = taint_py._Project(self.write(sources), self.root)
++        components = list(project.components())
++        self.assertEqual(len(components), 1200)
++        self.assertEqual({project.keys[engine].name for engine in components[0]}, {'m1199', 'm1200'})
++        done = set()
++        for component in components:
++            self.assertTrue(all(project.dependencies(engine) <= done | set(component) for engine in component))
++            done.update(component)
++        self.assertEqual(len(done), 1201)
++
++    def test_cyclic_module_functions_propagate_sink_summaries(self):
++        sources = {'a.py': 'import b\ndef forward(value):\n    b.run(value)\n',
++                   'b.py': 'import a\ndef run(value):\n    eval(value)\n',
++                   'app.py': 'import a\na.forward(input())\n'}
++        for order in (list(sources), list(reversed(sources))):
++            with self.subTest(order=order):
++                got = self.scan(sources, selected=order)
++                self.assertEqual(self.sites(got), [('b.py', 3, 'python.taint.eval')])
++
++    def test_self_imported_namespace_resolves_after_initialization(self):
++        got = self.scan({'helper.py': 'import helper as peer\ndef forward(value):\n    peer.run(value)\ndef run(value):\n    eval(value)\n',
++                         'app.py': 'from helper import forward\nforward(input())\n'})
++        self.assertEqual(self.sites(got), [('helper.py', 5, 'python.taint.eval')])
++
++    def test_typed_cyclic_helpers_keep_safe_literal_defaults(self):
++        sources = {'a.py': 'import b\ndef forward(value: str = "safe") -> str:\n    return b.read(value)\n',
++                   'b.py': 'import a\ndef read(value: str) -> str:\n    return value\n',
++                   'app.py': 'import a\neval(a.forward())\n'}
++        self.assertEqual(self.scan(sources), [])
++        sources['app.py'] = 'import a\neval(a.forward(input()))\n'
++        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
++
++    def test_cyclic_module_returns_and_sanitizer_domains(self):
++        for returned, sink, expected in (
++                ('input()', 'eval', ['python.taint.eval']),
++                ('"safe"', 'eval', []),
++                ('html.escape(value)', 'HttpResponse', []),
++                ('html.escape(value)', 'eval', ['python.taint.eval'])):
++            with self.subTest(returned=returned, sink=sink):
++                got = self.scan({'a.py': 'import b\ndef forward(value):\n    return b.read(value)\n',
++                                 'b.py': f'import a\nimport html\ndef read(value):\n    return {returned}\n',
++                                 'app.py': f'import a\n{sink}(a.forward(input()))\n'})
++                self.assertEqual([f['rule'] for f in got], expected, got)
++
++    def test_mutual_module_recursion_reaches_a_fixed_point(self):
++        sources = {'a.py': 'import b\ndef first(value, stop):\n    return b.second(value,stop)\n',
++                   'b.py': 'import a\ndef second(value,stop):\n    if stop:\n        return value\n    return a.first(value,stop)\n',
++                   'app.py': 'import a\neval(a.first(input(),flag))\n'}
++        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
++        sources['b.py'] = sources['b.py'].replace('return value', 'return "safe"')
++        self.assertEqual(self.scan(sources), [])
++
++    def test_nonreturning_module_cycle_has_no_invented_return_path(self):
++        got = self.scan({'a.py': 'import b\ndef first(value):\n    return b.second(value)\n',
++                         'b.py': 'import a\ndef second(value):\n    return a.first(value)\n',
++                         'app.py': 'import a\neval(a.first(input()))\n'})
++        self.assertEqual(got, [])
++
++    def test_cyclic_helper_mutations_and_exception_payloads(self):
++        for helper, caller, expected in (
++                ('box.append(value)', 'box=[]\na.forward(box,input())\neval(box[0])', [('app.py', 4, 'python.taint.eval')]),
++                ('raise ValueError(value)', 'try:\n    a.forward([],input())\nexcept ValueError as error:\n    eval(str(error))', [('app.py', 5, 'python.taint.eval')]),
++                ('box.append("safe")', 'box=[]\na.forward(box,input())\neval(box[0])', [])):
++            with self.subTest(helper=helper):
++                got = self.scan({'a.py': 'import b\ndef forward(box,value):\n    b.fill(box,value)\n',
++                                 'b.py': f'import a\ndef fill(box,value):\n    {helper}\n',
++                                 'app.py': 'import a\n' + caller})
++                self.assertEqual(self.sites(got), expected)
++
++    def test_function_local_import_cycle_resolves_after_initialization(self):
++        got = self.scan({'a.py': 'def forward(value):\n    from b import run\n    run(value)\n',
++                         'b.py': 'def run(value):\n    from a import forward\n    eval(value)\n',
++                         'app.py': 'from a import forward\nforward(input())\n'})
++        self.assertEqual(self.sites(got), [('b.py', 3, 'python.taint.eval')])
++
++    def test_cyclic_relative_module_aliases_and_literal_globals(self):
++        got = self.scan({'pkg/__init__.py': '',
++                         'pkg/a.py': 'from . import b as peer\nbox=[]\ndef forward(value):\n    peer.fill(box,value)\n    return box\n',
++                         'pkg/b.py': 'from . import a as peer\ndef fill(box,value):\n    box.append(value)\n',
++                         'app.py': 'from pkg.a import forward\neval(str(forward(input())))\n'})
++        self.assertEqual(self.sites(got), [('app.py', 2, 'python.taint.eval')])
++
++    def test_cyclic_higher_order_context_uses_both_defining_namespaces(self):
++        got = self.scan({'a.py': 'import b\ndef forward(callback,value):\n    b.apply(callback,value)\n',
++                         'b.py': 'import a\ndef apply(callback,value):\n    callback(value)\n',
++                         'app.py': 'import a\na.forward(eval,input())\n'})
++        self.assertEqual(self.sites(got), [('b.py', 3, 'python.taint.eval')])
++
++    def test_cyclic_initialization_expressions_are_not_certified_clean(self):
++        for definition in ('def clean(value=b.read()):\n    return "safe"\n',
++                           '@b.decorate\ndef clean(value):\n    return "safe"\n',
++                           'def clean(value: b.read()):\n    return "safe"\n'):
++            with self.subTest(definition=definition):
++                got = self.scan({'a.py': 'import b\n' + definition,
++                                 'b.py': 'import a\ndef forward(value):\n    return a.clean(value)\n',
++                                 'app.py': 'import b\neval(b.forward(input()))\n'})
++                self.assertEqual(self.sites(got), [('app.py', 2, 'python.taint.eval')])
+ 
+     def test_selection_order_does_not_move_imported_sink(self):
+         sources = {'app.py': 'from helper import run\nrun(input())',
+@@ -296,6 +438,31 @@
+ class PythonModuleRunnerTests(unittest.TestCase):
+     setUp = PythonModuleTests.setUp
+     write = PythonModuleTests.write
++
++    def test_cyclic_helpers_json_sarif_and_warm_cache(self):
++        self.write({'a.py': 'import b\ndef forward(value):\n    b.run(value)\n',
++                    'b.py': 'import a\ndef run(value):\n    eval(value)\n',
++                    'app.py': 'import a\na.forward(input())\n'})
++        env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', PYTHONDONTWRITEBYTECODE='1',
++                   UBS_CACHE_DIR=str(self.root / 'cache'))
++        for format_ in ('json', 'json', 'sarif'):
++            with self.subTest(format=format_):
++                result = subprocess.run([str(ROOT / 'ubs'), str(self.root), '--only=python',
++                                         f'--format={format_}', '--ci'], cwd=self.root, env=env,
++                                        text=True, capture_output=True, timeout=120)
++                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
++                report = json.loads(result.stdout)
++                if format_ == 'json':
++                    findings = [f for f in report['findings'] if f['rule_id'] == 'python.taint.eval']
++                    sites = [(Path(f['file']).name, f['line']) for f in findings]
++                    self.assertEqual(report['status'], 'ok', report)
++                else:
++                    findings = [f for run in report['runs'] for f in run['results']
++                                if f['ruleId'] == 'python.taint.eval']
++                    locations = [f['locations'][0]['physicalLocation'] for f in findings]
++                    sites = [(Path(p['artifactLocation']['uri']).name, p['region']['startLine'])
++                             for p in locations]
++                self.assertEqual(sites, [('b.py', 3)], result.stdout)
+ 
+     def test_helper_edits_selection_and_warm_cache(self):
+         self.write({'helper.py': 'def clean(x):\n    return "safe"',

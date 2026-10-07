@@ -1,0 +1,126 @@
+name: Python Circular Import Dataflow
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - test-suite/patches/python-cyclic-imports.patch
+      - .github/workflows/python-cyclic-imports.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UBS_NO_AUTO_UPDATE: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Preserve exact current-tree preimage
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/cyclic-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/cyclic-source-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/cyclic-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyclic-preimage-${{ github.sha }}
+          path: ${{ runner.temp }}/cyclic-source-*
+          retention-days: 7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install native scanner tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep rsync shellcheck
+          npm install --global @ast-grep/cli
+      - name: Validate exact implementation and regression preimages
+        run: |
+          test "$(git hash-object test-suite/patches/python-cyclic-imports.patch)" = f1b3e34676625b991b9f0fc38fd03aa2f871a848
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = 1dbaef7a6a88c0fd1e46bdc9e57f65a18733525b
+          test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 91e22468c64d951db0be8405dc53cf926ed42199
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git apply --check test-suite/patches/python-cyclic-imports.patch
+          git apply --include=test-suite/quality/test_taint_python_modules.py test-suite/patches/python-cyclic-imports.patch
+          PYTHONPATH=test-suite/quality python3 - <<'PY'
+          import os, unittest
+          from pathlib import Path
+          names = [
+              'test_taint_python_modules.PythonModuleTests.test_import_cycle_does_not_disable_downstream_selected_helpers',
+              'test_taint_python_modules.PythonModuleTests.test_cyclic_module_functions_propagate_sink_summaries',
+          ]
+          with Path(os.environ['RUNNER_TEMP'], 'cyclic-before.log').open('w') as log:
+              result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
+          assert result.testsRun == 2 and result.failures and not result.errors, 'Expected source-level false-negative witnesses'
+          PY
+          git apply --include=modules/helpers/ubs_core/analyzers/taint_py.py test-suite/patches/python-cyclic-imports.patch
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+      - name: Exercise complete Python dataflow and real CLI paths
+        env:
+          UBS_TAINT_E2E: '1'
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/cyclic-python.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/cyclic-suppression.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/cyclic-findings.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean 2>&1 | tee "$RUNNER_TEMP/cyclic-manifest.log"
+      - name: Enforce syntax, lint and deterministic integrity closure
+        run: |
+          git diff --check
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
+          git diff > "$RUNNER_TEMP/cyclic-tested.diff"
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/cyclic-regenerated.diff"
+          cmp "$RUNNER_TEMP/cyclic-tested.diff" "$RUNNER_TEMP/cyclic-regenerated.diff"
+      - name: Store tested immutable blobs without moving refs or tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'modules/helpers/ubs_core/analyzers/taint_py.py',
+                     'test-suite/quality/test_taint_python_modules.py', 'modules/lib/ubs-common.sh',
+                     'scripts/new-module.sh', 'ubs', 'SHA256SUMS'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) == allowed, changed
+          records = []
+          for name in changed:
+              data = Path(name).read_bytes()
+              result = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                                      input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                                      text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(result.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              before = subprocess.check_output(['git', 'rev-parse', 'HEAD:' + name], text=True).strip()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before})
+          manifest = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': records}
+          Path(os.environ['RUNNER_TEMP'], 'cyclic-publication.json').write_text(json.dumps(manifest, indent=2))
+          print('CYCLIC_IMPORTS_TESTED', json.dumps(manifest), flush=True)
+          PY
+      - name: Preserve final source and diagnostics
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/cyclic-final.diff"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/cyclic-final-source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cyclic-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/cyclic-*
+          retention-days: 7

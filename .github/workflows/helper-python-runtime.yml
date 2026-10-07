@@ -37,7 +37,9 @@ permissions:
 
 concurrency:
   group: helper-python-runtime-${{ github.ref }}
-  cancel-in-progress: true
+  # Main receives concurrent implementation commits. Preserve its active
+  # validation instead of cancelling every job while it awaits a runner.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   runtime:
@@ -170,6 +172,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends jq ripgrep shellcheck
           npm install --global @ast-grep/cli@0.45.3
+      - name: Preserve the floor interpreter and scanner tools for offline reproduction
+        run: |
+          floor="$(uv python find --managed-python 3.9)"
+          "$floor" -I -S -c 'import sys; assert sys.version_info[:2] == (3, 9); print(sys.version)'
+          tar -czf "$RUNNER_TEMP/doctor-python39.tar.gz" -C "$(dirname "$(dirname "$floor")")" .
+          tar -czf "$RUNNER_TEMP/doctor-ast-grep.tar.gz" -C "$(npm prefix -g)" lib/node_modules/@ast-grep
+          cp "$(command -v shellcheck)" "$RUNNER_TEMP/doctor-shellcheck"
+          sha256sum "$RUNNER_TEMP/doctor-python39.tar.gz" "$RUNNER_TEMP/doctor-ast-grep.tar.gz" "$RUNNER_TEMP/doctor-shellcheck" > "$RUNNER_TEMP/doctor-toolchain.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: doctor-runtime-toolchain
+          path: |
+            ${{ runner.temp }}/doctor-python39.tar.gz
+            ${{ runner.temp }}/doctor-ast-grep.tar.gz
+            ${{ runner.temp }}/doctor-shellcheck
+            ${{ runner.temp }}/doctor-toolchain.sha256
+          retention-days: 1
       - name: Retrieve the immutable reviewed patch
         env:
           GH_TOKEN: ${{ github.token }}

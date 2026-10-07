@@ -148,7 +148,7 @@ class RedirectEngine(Engine):
                 return receiver
         return retag(self.without_proof(value), remove=frozenset({'jvm-string'}))
 
-    def member_value(self, name, value, offset, arguments=None):
+    def member_value(self, name, value, offset, arguments=None, direct_call=False):
         if arguments and name in {'toString', 'getPath', 'getRawAuthority', 'getScheme', 'getHost', 'isAbsolute'}:
             return retag(self.without_proof(value), remove=frozenset({'jvm-string'}))
         if name in {'getPath', 'path'}:
@@ -172,11 +172,13 @@ class RedirectEngine(Engine):
             value = self.without_proof(value)
         return value
 
-    def call_sink(self, name, spans, arguments, value, offset):
+    def call_sink(self, name, spans, arguments, value, offset, argument_names=()):
         method = name.rsplit('.', 1)[-1]
         target = None
         if method in {'sendRedirect', 'respondRedirect', 'redirect', 'RedirectView'}:
             target = 0
+            if method == 'respondRedirect' and 'url' in argument_names:
+                target = argument_names.index('url')
         elif method == 'ModelAndView' and spans and re.match(r'\s*"redirect:', self.text[slice(*spans[0])]):
             target = 0
         elif method in {'setHeader', 'addHeader', 'header', 'add'} and len(spans) >= 2:

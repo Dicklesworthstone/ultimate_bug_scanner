@@ -13,6 +13,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 ### Fixed
 
 - Ruby request taint follows the actual return values of `map`/`collect`, `tap`/`each`, and `then`/`yield_self` blocks into outbound URL and filesystem sinks. Block assignments, `next`, `break`, parameter shadowing, and exceptional exits retain their selected value flow; clean mapping and replacement results no longer inherit discarded inputs.
+- Java and Kotlin path analysis rejects canonical String prefix checks as containment and invalidates containment after `resolveSibling` or unmodeled chained transformations. Selected Kotlin helper calls bind named arguments to their formal parameters, redirect sinks select the named `url`, and helper selection excludes sibling scopes and respects callable parameters while retaining conservative overload handling.
 
 ---
 

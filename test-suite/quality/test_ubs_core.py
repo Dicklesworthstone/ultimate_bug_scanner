@@ -2935,6 +2935,107 @@ class JVMRedirectBindingTests(unittest.TestCase):
         yield 'branch-retains-unsafe-path', program('identity', source + '    if (request.isEnabled()) { target = "/fixed"; }\n    response.sendRedirect(target);'), 'open_redirect', {6}
         yield 'guard-overwritten', program('identity', source + '    if (!(' + guard + ')) { throw ' + reject + '; }\n    target = request.getParameter("other");\n    response.sendRedirect(target);'), 'open_redirect', {7}
         if java:
+            yield 'inline-canonical-string-prefix', '''class C {
+  File choose(String root, String raw) {
+    File target=new File(raw);
+    if (!target.getCanonicalPath().startsWith(root)) { throw new SecurityException(); }
+    return target;
+  }
+  void handle(Request request) {
+    new FileInputStream(choose("/srv/uploads", request.getParameter("file")));
+  }
+}''', 'path_traversal', {3, 8}
+            yield 'chained-path-transform-invalidates-containment', '''class C {
+  void handle(Request request) {
+    Path root=Path.of("/srv/uploads");
+    Path target=root.resolve(request.getParameter("file")).normalize();
+    if (!target.startsWith(root)) { return; }
+    Files.readString(target.normalize().resolveSibling("../../etc/passwd"));
+  }
+}''', 'path_traversal', {4, 6}
+            yield 'selected-component-containment', '''class C {
+  Path choose(Path root, String raw) {
+    Path target=root.resolve(raw).normalize();
+    if (!target.normalize().startsWith(root)) { throw new SecurityException(); }
+    return target.normalize();
+  }
+  void handle(Request request) {
+    Files.readString(choose(Path.of("/srv/uploads"), request.getParameter("file")));
+  }
+}''', 'path_traversal', set()
+        else:
+            yield 'inline-canonical-string-prefix', '''class C {
+  fun choose(root: String, raw: String): File {
+    val target=File(raw)
+    if (!target.getCanonicalPath().startsWith(root)) { throw SecurityException() }
+    return target
+  }
+  fun handle(request: Request) {
+    FileInputStream(choose("/srv/uploads", request.getParameter("file")))
+  }
+}''', 'path_traversal', {3, 8}
+            yield 'chained-path-transform-invalidates-containment', '''class C {
+  fun handle(request: Request) {
+    val root=Path.of("/srv/uploads")
+    val target=root.resolve(request.getParameter("file")).normalize()
+    if (!target.startsWith(root)) { return }
+    Files.readString(target.normalize().resolveSibling("../../etc/passwd"))
+  }
+}''', 'path_traversal', {4, 6}
+            yield 'selected-component-containment', '''class C {
+  fun choose(root: Path, raw: String): Path {
+    val target=root.resolve(raw).normalize()
+    if (!target.normalize().startsWith(root)) { throw SecurityException() }
+    return target.normalize()
+  }
+  fun handle(request: Request) {
+    Files.readString(choose(Path.of("/srv/uploads"), request.getParameter("file")))
+  }
+}''', 'path_traversal', set()
+            yield 'callable-parameter-shadows-helper', '''fun destination(value: String): String = "/fixed"
+fun handler(request: Request, response: Response, destination: (String) -> String) {
+  val target=request.getParameter("next")
+  response.sendRedirect(destination(target))
+}
+''', 'open_redirect', {4}
+            yield 'explicit-this-selects-method-despite-callable-parameter', '''class C {
+  fun destination(value: String): String = "/fixed"
+  fun handler(request: Request, response: Response, destination: (String) -> String) {
+    response.sendRedirect(this.destination(request.getParameter("next")))
+  }
+}
+''', 'open_redirect', set()
+            yield 'nested-helper-is-not-visible-in-sibling', '''open class Base {
+  fun destination(value: String): String = value
+}
+class Handler: Base() {
+  fun unrelated() {
+    fun destination(value: String): String = "/fixed"
+  }
+  fun handle(request: Request, response: Response) {
+    response.sendRedirect(destination(request.getParameter("next")))
+  }
+}
+''', 'open_redirect', {9}
+            yield 'named-argument-return-is-unsafe', '''fun destination(ignored: String, raw: String): String = raw
+fun handle(request: Request, response: Response) {
+  response.sendRedirect(destination(raw=request.getParameter("next"), ignored="/fixed"))
+}
+''', 'open_redirect', {3}
+            yield 'named-argument-ignored-is-safe', '''fun destination(ignored: String, raw: String): String = raw
+fun handle(request: Request, response: Response) {
+  response.sendRedirect(destination(raw="/fixed", ignored=request.getParameter("next")))
+}
+''', 'open_redirect', set()
+            yield 'native-named-url-is-unsafe', '''suspend fun handle(request: Request, call: ApplicationCall) {
+  call.respondRedirect(permanent=false, url=request.getParameter("next"))
+}
+''', 'open_redirect', {2}
+            yield 'native-named-permanent-does-not-taint-url', '''suspend fun handle(request: Request, call: ApplicationCall) {
+  call.respondRedirect(permanent=request.getParameter("permanent") == "true", url="/fixed")
+}
+''', 'open_redirect', set()
+        if java:
             yield 'generic-request-body-guard', ('class C { void handler(@RequestBody Box<String> target) {\n'
                   'if (!(' + guard + ')) { return; }\n'
                   'response.sendRedirect(target.toString());\n} }'), 'open_redirect', {3}
@@ -3005,6 +3106,35 @@ fun handler(request: Request, response: Response) {
                 with self.subTest(lang=lang, label=label):
                     findings = self.scan(code, lang, domain)
                     self.assertEqual({finding['line'] for finding in findings}, expected, (code, findings))
+
+    def test_path_api_semantics_independently_reject_prefix_and_transform_proofs(self):
+        if shutil.which('java') is None:
+            self.skipTest('Java runtime unavailable for the independent path API oracle')
+        oracle = self.root / 'PathGuardOracle.java'
+        oracle.write_text('''import java.io.File;
+import java.nio.file.Path;
+class PathGuardOracle { public static void main(String[] args) throws Exception {
+  Path root=Path.of("/srv/uploads");
+  File sibling=new File("/srv/uploads-evil/secret");
+  if (!sibling.getCanonicalPath().startsWith(root.toString())) throw new AssertionError();
+  if (sibling.getCanonicalFile().toPath().startsWith(root)) throw new AssertionError();
+  Path target=root.resolve("user.txt").normalize();
+  if (!target.normalize().startsWith(root)) throw new AssertionError();
+  Path escaped=target.normalize().resolveSibling("../../etc/passwd").normalize();
+  if (escaped.startsWith(root)) throw new AssertionError();
+  System.out.println("string prefix admits sibling; chained transform escapes root");
+} }''', encoding='utf-8')
+        command = ['java', str(oracle)]
+        started = time.monotonic()
+        proc = subprocess.run(command, cwd=self.root, capture_output=True, text=True, timeout=30)
+        (self.root / 'path-api-oracle.stdout.log').write_text(proc.stdout)
+        (self.root / 'path-api-oracle.stderr.log').write_text(proc.stderr)
+        (self.root / 'path-api-oracle.identity.json').write_text(json.dumps({
+            'command': command, 'source_sha256': hashlib.sha256(oracle.read_bytes()).hexdigest(),
+            'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+        }, indent=2))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), 'string prefix admits sibling; chained transform escapes root')
 
     def test_selected_helpers_recursion_loops_and_scope_isolation(self):
         code = '''class Flow {

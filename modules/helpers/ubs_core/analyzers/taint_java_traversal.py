@@ -197,6 +197,8 @@ class Function:
     declaration: int = -1
     captures: tuple = ()
     parameter_declarations: tuple = ()
+    declaration_scope: tuple = (-1, -1)
+    member: bool = False
 
 
 class Parser:
@@ -271,6 +273,12 @@ class Parser:
             function = Function(match.start(), name, owner, start, end, tuple(parameters), frozenset(sources), body)
             function.parameter_declarations = tuple(parameter_declarations)
             function.declaration = self.code.rfind('fun', boundary, match.start()) if kotlin else function.key
+            function.declaration_scope = max(
+                ((low, high) for low, high in self.pairs.items()
+                 if self.code[low] == '{' and low < function.key < high),
+                default=(-1, len(self.code)), key=lambda scope: scope[0])
+            function.member = any(self.code.find('{', low, high) == function.declaration_scope[0]
+                                  for low, high, _ in owners if low < function.key < high)
             self.functions[function.key] = function
         # Do not discard executable class/instance initialization while giving
         # a clean answer about its methods. These regions need a shared field
@@ -524,7 +532,7 @@ class Engine:
             return value
         return retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
 
-    def member_value(self, name, value, offset, arguments=None):
+    def member_value(self, name, value, offset, arguments=None, direct_call=False):
         if arguments and name in {'getFileName', 'getName', 'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile', 'toString', 'toFile'}:
             return retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
         if name in {'getFileName', 'getName', 'fileName', 'name'}:
@@ -534,11 +542,16 @@ class Engine:
         if name in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'}:
             return join(*(retag(frozenset({trace}), add=frozenset({'canonical-path'}))
                           if 'jvm-path' in trace.tags else frozenset({trace}) for trace in value))
-        if name == 'resolve':
+        if name in {'resolve', 'resolveSibling'}:
             return retag(value, remove=frozenset({'contained-path', 'canonical-path'}))
-        return value
+        if name == 'toFile':
+            return value
+        # The first qualified call was checked by external_call. A later
+        # member in a fluent chain has no such receiver/API proof: an unknown
+        # transformation must not carry containment or Path identity forward.
+        return value if direct_call else retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
 
-    def call_sink(self, name, spans, arguments, value, offset):
+    def call_sink(self, name, spans, arguments, value, offset, argument_names=()):
         if self.sink_re.search(name + '('):
             if name in {'File', 'Path.of', 'Paths.get'} or name.endswith('.resolve'):
                 return True
@@ -557,7 +570,10 @@ class Engine:
 
     def guard_facts(self, span):
         condition = self.code[slice(*span)].strip()
-        guard = re.fullmatch(r'(!\s*)?([A-Za-z_]\w*)(\.(?:normalize|toRealPath|getCanonicalPath|getCanonicalFile)\s*\(\s*\))?\.startsWith\s*\(\s*([A-Za-z_]\w*)\s*\)', condition)
+        # File.getCanonicalPath() returns String. Its startsWith() accepts
+        # sibling names such as /srv/uploads-evil and cannot prove containment.
+        # Only Path-returning normalization can qualify this component check.
+        guard = re.fullmatch(r'(!\s*)?([A-Za-z_]\w*)(\.(?:normalize|toRealPath)\s*\(\s*\))?\.startsWith\s*\(\s*([A-Za-z_]\w*)\s*\)', condition)
         if guard:
             return [(not bool(guard.group(1)), (guard.group(2), bool(guard.group(3)), guard.group(4)))]
         return []
@@ -572,6 +588,47 @@ class Engine:
                               if 'jvm-path' in trace.tags and (canonical or 'canonical-path' in trace.tags) else frozenset({trace})
                               for trace in state.get(binding, CLEAN)))
         return state
+
+    def call_arguments(self, start, end, state, bindings, depth):
+        spans, names = [], []
+        for low, high in self.parser.parts(start, end):
+            keyword = re.match(r'\s*([A-Za-z_]\w*)\s*=(?!=)', self.code[low:high]) if self.parser.kotlin else None
+            names.append(keyword.group(1) if keyword else None)
+            spans.append((low + keyword.end() if keyword else low, high))
+        arguments = [self.expression(low, high, state, bindings, depth + 1) for low, high in spans]
+        return spans, names, arguments
+
+    def selected_calls(self, name, arguments, argument_names, offset, bindings):
+        explicit_member = name.startswith('this.')
+        if ('.' in name and not explicit_member) or (
+                self.parser.kotlin and not explicit_member and name in bindings):
+            return []
+        basename = name.removeprefix('this.')
+        candidates = [function for function in self.parser.functions.values()
+                      if function.name == basename
+                      and function.owner == self.function.owner
+                      and function.declaration_scope[0] < offset < function.declaration_scope[1]
+                      and (not explicit_member or function.member)]
+        if not candidates:
+            return []
+        # Exclude sibling-local helpers, but preserve visible overloads until
+        # their argument-type applicability can be proved.
+        selected = []
+        for function in candidates:
+            if len(function.parameters) != len(arguments):
+                continue
+            bound = {}
+            for position, (keyword, fact) in enumerate(zip(argument_names, arguments)):
+                if keyword is not None and keyword not in function.parameters:
+                    break
+                index = function.parameters.index(keyword) if keyword is not None else position
+                key = (function.key, index)
+                if key in bound:
+                    break
+                bound[key] = fact
+            else:
+                selected.append((function, bound))
+        return selected
 
     def expression(self, start, end, state, bindings, depth=0):
         if depth > 64:
@@ -604,8 +661,7 @@ class Engine:
             arguments = None
             if cursor < end and self.code[cursor] == '(':
                 close = self.parser.pairs[cursor]
-                spans = list(self.parser.parts(cursor + 1, close))
-                arguments = [self.expression(low, high, state, bindings, depth + 1) for low, high in spans]
+                spans, argument_names, arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
                 atom = join(atom, *arguments)
                 call_text = self.code[offset:close + 1]
                 # Arguments were evaluated above. Matching their text again
@@ -613,14 +669,11 @@ class Engine:
                 direct = self.source_re.search(self.code[offset:cursor + 1])
                 if direct:
                     atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
-                candidates = [function for function in self.parser.functions.values()
-                              if function.name == name.removeprefix('this.') and function.owner == self.function.owner
-                              and len(function.parameters) == len(arguments)] if '.' not in name or name.startswith('this.') else []
+                candidates = self.selected_calls(name, arguments, argument_names, offset, bindings)
                 if candidates:
                     selected = True
                     returned = CLEAN
-                    for function in candidates:
-                        bound = {(function.key, index): fact for index, fact in enumerate(arguments)}
+                    for function, bound in candidates:
                         for index, capture in enumerate(function.captures):
                             binding = bindings.get(capture, capture) if self.function.key == -1 else 'capture:' + capture
                             bound[(function.key, -index - 1)] = state.get(binding, CLEAN)
@@ -632,7 +685,7 @@ class Engine:
                             self.escapes[site] = join(self.escapes.get(site, CLEAN), substitute(fact, bound, call))
                     atom = returned
                 else:
-                    if self.call_sink(name, spans, arguments, atom, offset):
+                    if self.call_sink(name, spans, arguments, atom, offset, argument_names):
                         constructor = offset
                     atom = self.external_call(name, arguments, atom, offset, bindings, state)
                 cursor = close + 1
@@ -641,7 +694,7 @@ class Engine:
                 if direct:
                     atom = join(atom, self.source(offset + direct.start(), direct.group().strip()))
             if '.' in name and not selected:
-                atom = self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments)
+                atom = self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments, direct_call=arguments is not None)
             while cursor < end:
                 tail = self.parser.skip(cursor, end)
                 member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
@@ -655,10 +708,9 @@ class Engine:
                     cursor = self.parser.skip(tail + member.end(), end)
                     if cursor < end and self.code[cursor] == '(':
                         close = self.parser.pairs[cursor]
-                        spans = list(self.parser.parts(cursor + 1, close))
-                        arguments = [self.expression(low, high, state, bindings, depth + 1) for low, high in spans]
+                        spans, argument_names, arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
                         atom = join(atom, *arguments)
-                        if self.call_sink('.' + method, spans, arguments, atom, tail):
+                        if self.call_sink('.' + method, spans, arguments, atom, tail, argument_names):
                             constructor = tail
                         cursor = close + 1
                     atom = self.member_value(method, atom, tail, arguments)

@@ -40,7 +40,8 @@ struct Response {
 let allowedRedirectHosts = Set(["app.example.com", "accounts.example.com"])
 
 func safeRedirectURL(_ raw: String) throws -> String {
-    if raw.hasPrefix("/") && !raw.hasPrefix("//") {
+    if raw.hasPrefix("/") && !raw.hasPrefix("//") && !raw.contains("\\") &&
+       !raw.contains("\t") && !raw.contains("\r") && !raw.contains("\n") {
         return raw
     }
 
@@ -73,7 +74,8 @@ func helperValidatedContent(req: Request) throws -> Response {
 
 func inlineLocalGuard(req: Request) throws -> Response {
     let target = req.parameters["next"] ?? "/"
-    guard target.hasPrefix("/") && !target.hasPrefix("//") else {
+    guard target.hasPrefix("/") && !target.hasPrefix("//") && !target.contains("\\") &&
+          !target.contains("\t") && !target.contains("\r") && !target.contains("\n") else {
         throw RedirectError.blocked
     }
     return req.redirect(to: target)
@@ -87,7 +89,7 @@ func inlineHostAllowlist(req: Request) throws -> Response {
           allowedRedirectHosts.contains(host) else {
         throw RedirectError.blocked
     }
-    return Response.redirect(to: target)
+    return Response.redirect(to: url.absoluteString)
 }
 
 func validatedLocationHeader(req: Request) throws -> Response {

@@ -5,6 +5,10 @@ defmodule CleanOpenRedirect do
   @allowed_redirect_hosts MapSet.new(["app.example.com", "accounts.example.com"])
 
   def safe_redirect_url(raw) do
+    if String.contains?(raw, ["\\", "\n", "\r", "\t"]) do
+      raise ArgumentError, "ambiguous redirect characters"
+    end
+
     if String.starts_with?(raw, "/") and not String.starts_with?(raw, "//") do
       raw
     else
@@ -41,7 +45,8 @@ defmodule CleanOpenRedirect do
   def inline_local_guard(conn) do
     target = conn.params["continue"] || "/"
 
-    unless String.starts_with?(target, "/") and not String.starts_with?(target, "//") do
+    unless String.starts_with?(target, "/") and not String.starts_with?(target, "//") and
+             not String.contains?(target, ["\\", "\n", "\r", "\t"]) do
       raise ArgumentError, "blocked redirect"
     end
 
@@ -52,7 +57,8 @@ defmodule CleanOpenRedirect do
     target = conn.params["return_url"] || "https://app.example.com/dashboard"
     uri = URI.parse(target)
 
-    unless uri.scheme == "https" and MapSet.member?(@allowed_redirect_hosts, uri.host) do
+    unless uri.scheme == "https" and MapSet.member?(@allowed_redirect_hosts, uri.host) and
+             not String.contains?(target, ["\\", "\n", "\r", "\t"]) do
       raise ArgumentError, "blocked redirect"
     end
 

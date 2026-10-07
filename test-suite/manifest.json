@@ -10307,7 +10307,13 @@
       "tags": ["elixir", "suppression", "regression"],
       "args": ["--only=elixir"],
       "expect": {
-        "exit_code": "nonzero",
+        "exit_code": 0,
+        "totals": {
+          "critical": {"max": 0},
+          "warning": {"max": 0},
+          "info": {"max": 0},
+          "files": {"min": 1, "max": 1}
+        },
         "forbid_substrings": ["suppression_buggy.ex:"]
       }
     },

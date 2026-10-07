@@ -22,6 +22,10 @@ defmodule CleanHeaderInjection do
   end
 
   def safe_redirect_url(raw) do
+    if String.contains?(raw, ["\\", "\n", "\r", "\t"]) do
+      raise ArgumentError, "ambiguous redirect characters"
+    end
+
     if String.starts_with?(raw, "/") and not String.starts_with?(raw, "//") do
       raw
     else

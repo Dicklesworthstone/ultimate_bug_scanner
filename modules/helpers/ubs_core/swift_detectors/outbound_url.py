@@ -1,14 +1,15 @@
 """swift_detectors.outbound_url — cat 6 "Request-derived outbound HTTP URLs" (SSRF).
 
-Verbatim port of the run_request_outbound_url_checks heredoc in
-modules/ubs-swift.sh. The legacy shell aggregated the heredoc's output into
-ONE critical finding. Structured records retain every selected-file occurrence.
+Port of the run_request_outbound_url_checks heredoc in modules/ubs-swift.sh.
+Structured records retain every selected-file occurrence. The shared scoped
+frontend distinguishes proven file-URL reads from outbound HTTP reads.
 """
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
+from ubs_core.analyzers.taint_swift_traversal import file_url_read_offsets
 from ubs_core.swift_detectors._common import (
     SKIP_DIRS, has_ignore, logical_statement, rel, should_skip,
     source_line, strip_line_comments,
@@ -110,6 +111,25 @@ def has_allowlist_context(lines: list[str], line_no: int, refs: list) -> bool:
     return bool(url_parse_re.search(context) and host_check_re.search(context) and reject_re.search(context))
 
 
+def outbound_sink_lines(path: Path, text: str) -> list[str]:
+    """Exclude only reader tokens whose evaluated argument is a file URL.
+
+    Retaining positions and all other tokens is essential: a physical line
+    can also contain a remote reader or a nested URLSession call. A file-only
+    argument exempts that exact String/Data call from HTTP checks; it does not
+    prove filesystem containment, which the path analyzer checks separately.
+    """
+    if not re.search(r'\b(?:Data|String)\s*\(\s*contentsOf\s*:', text):
+        return text.splitlines()
+    characters = list(text)
+    for offset in file_url_read_offsets(path, text):
+        token = re.match(r'(?:String|Data)\b', text[offset:])
+        if token is None:
+            raise ValueError('Swift file URL classification returned an invalid reader site')
+        characters[offset:offset + len(token.group())] = ' ' * len(token.group())
+    return ''.join(characters).splitlines()
+
+
 def scan(ctx):
     project = ctx.project_dir
     root = project.resolve()
@@ -121,14 +141,12 @@ def scan(ctx):
             continue
         if path != root and should_skip(path, base, SKIP_DIRS):
             continue
-        try:
-            text = path.read_text(encoding='utf-8', errors='ignore')
-        except OSError:
-            continue
+        text = path.read_text(encoding='utf-8')
         if not (re.search(r'\b(?:req|request)\b', text) and sink_re.search(text)):
             continue
 
         lines = text.splitlines()
+        sink_lines = outbound_sink_lines(path, text)
         tainted = {}
         seen = set()
         for line_no in range(1, len(lines) + 1):
@@ -147,7 +165,7 @@ def scan(ctx):
                 elif variable in tainted and is_safe_expression(rhs):
                     tainted.pop(variable, None)
 
-            if not sink_re.search(statement):
+            if not sink_re.search(logical_statement(sink_lines, line_no)):
                 continue
             if is_safe_expression(statement):
                 continue

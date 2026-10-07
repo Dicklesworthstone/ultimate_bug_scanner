@@ -67,7 +67,8 @@ func encodedFilename(_ raw: String) -> String {
 }
 
 func safeRedirectURL(_ raw: String) throws -> String {
-    if raw.hasPrefix("/") && !raw.hasPrefix("//") {
+    if raw.hasPrefix("/") && !raw.hasPrefix("//") && !raw.contains("\\") &&
+       !raw.contains("\t") && !raw.contains("\r") && !raw.contains("\n") {
         return raw
     }
 

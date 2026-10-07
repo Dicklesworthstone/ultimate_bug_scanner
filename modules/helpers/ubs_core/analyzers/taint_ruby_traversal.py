@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import sys
 from bisect import bisect_right
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -620,6 +620,16 @@ def has_shape(fact, kind):
     return any(trace.kind == 'shape' and trace.key[0] == kind for trace in fact)
 
 
+def object_ids(fact, members=False):
+    """Object identity is distinct from shared data/source provenance."""
+    kind = 'member' if members else 'object'
+    identities = frozenset(('object', trace.key) for trace in fact if trace.kind == kind)
+    if identities or members:
+        return identities
+    return frozenset((trace.kind, trace.key) for trace in fact
+                     if trace.kind in {'source', 'parameter', 'instance', 'shape'})
+
+
 class RubyEngine:
     def __init__(self, path, text, policy='path'):
         self.path, self.text, self.policy = path, text, policy
@@ -638,7 +648,36 @@ class RubyEngine:
                 parts = split_tokens(statement.tokens, {'='})
                 if statement.kind == 'simple' and len(parts) == 2 and len(parts[0]) == 1 and re.fullmatch(r'[A-Z]\w*', parts[0][0].value):
                     key = (function.owner, parts[0][0].value)
-                    self.constants[key] = CLEAN if key in self.constants else self.literal(parts[1])
+                    self.constants[key] = CLEAN if key in self.constants else self.literal_value(parts[1], shared=True)
+        self.repeated_sites = set()
+
+        def has_retry(statements):
+            return any((statement.kind == 'simple' and statement.tokens
+                        and statement.tokens[0].value == 'retry')
+                       or has_retry(statement.body) or has_retry(statement.alternate)
+                       or any(has_retry(handler.body) for handler in statement.handlers)
+                       or has_retry(statement.finalizer) for statement in statements)
+
+        def repeated(statements, inside=False):
+            def note(tokens):
+                for token in tokens:
+                    self.repeated_sites.add(token.start)
+                    for part in token.parts:
+                        note(part)
+            for statement in statements:
+                call = self.block_call(statement.tokens) if statement.kind == 'iterate' else None
+                retrying = statement.kind == 'rescue' and has_retry(statement.handlers)
+                loops = statement.kind in {'while', 'until', 'for'} or (
+                    statement.kind == 'iterate' and (not call or call[0] not in {'tap', 'then', 'yield_self'})) or retrying
+                if inside or statement.kind in {'while', 'until'}:
+                    note(statement.tokens)
+                repeated(statement.body, inside or loops)
+                repeated(statement.alternate, inside or retrying)
+                for handler in statement.handlers:
+                    repeated(handler.body, inside or retrying)
+                repeated(statement.finalizer, inside or retrying)
+        for function in self.parser.functions.values():
+            repeated(function.body)
         for function in self.parser.functions.values():
             self.context(function, tuple(CLEAN for _ in function.parameters), entry=True)
 
@@ -648,7 +687,8 @@ class RubyEngine:
         return Step(str(self.path), line_index + 1, offset - self.lines[line_index] + 1, kind, label[:160])
 
     def source(self, offset, label):
-        return frozenset({Trace('source', (str(self.path), offset, label), evidence=(self.step(offset, 'source', label),))})
+        value = frozenset({Trace('source', (str(self.path), offset, label), evidence=(self.step(offset, 'source', label),))})
+        return self.fresh(value, 'request', offset)
 
     def exception_value(self, value, kind):
         previous = frozenset(tag for trace in value for tag in trace.tags if tag.startswith('exception-type:'))
@@ -670,6 +710,56 @@ class RubyEngine:
             if all(values):
                 return join(*values, shape('literal-list', tokens[0].start))
         return CLEAN
+
+    def fresh(self, value, kind, offset, shallow=False):
+        content = frozenset(trace for trace in value if trace.kind != 'object'
+                            and (shallow or trace.kind != 'member'))
+        return join(content, frozenset({Trace('object', (kind, offset, ()))}))
+
+    def collection(self, value, offset):
+        members = frozenset(replace(trace, kind='member') if trace.kind == 'object' else trace
+                            for trace in value)
+        return join(members, frozenset({Trace('object', ('array', offset, ()))}))
+
+    def elements(self, value):
+        return frozenset(replace(trace, kind='object') if trace.kind == 'member' else trace
+                         for trace in value if trace.kind != 'object'
+                         and not (trace.kind == 'shape' and trace.key[0] in {'literal-list', 'mapped-list'}))
+
+    def literal_value(self, tokens, shared=False):
+        """Attach allocation identities without changing literal proof facts."""
+        tokens = ungroup(tokens)
+        value = self.literal(tokens)
+        if not value:
+            return CLEAN
+        if len(tokens) >= 2 and token_text(tokens[-2:]) == '.freeze':
+            tokens = tokens[:-2]
+        if len(tokens) == 1 and tokens[0].kind == 'literal':
+            value = self.fresh(value, 'string', tokens[0].start)
+        elif len(tokens) == 1 and tokens[0].kind == 'words':
+            items = join(*(self.fresh(constant(word), 'string', tokens[0].start + index)
+                           for index, word in enumerate(tokens[0].value.split())))
+            value = self.collection(join(items, value), tokens[0].start)
+        elif tokens[0].value == '[':
+            items = join(*(self.literal_value(part) for part in split_tokens(tokens[1:-1], {','}) if part))
+            value = self.collection(join(items, value), tokens[0].start)
+        if shared:
+            value = frozenset(replace(trace, tags=trace.tags | frozenset({'shared-allocation'}))
+                              if trace.kind in {'object', 'member'} else trace for trace in value)
+        return value
+
+    def returned_objects(self, value, arguments, offset):
+        """Keep borrowed references; distinguish fresh returns at call sites.
+
+        Two call sites bound the allocation context, including recursion. This
+        distinguishes repeated helper literals without an unbounded heap key.
+        """
+        borrowed = {trace.key for argument in arguments for trace in argument
+                    if trace.kind in {'object', 'member'}}
+        return frozenset(replace(trace, key=(trace.key[0], trace.key[1], (*trace.key[2], offset)[-2:]))
+                         if trace.kind in {'object', 'member'} and trace.key not in borrowed
+                         and trace.key[0] != 'request' and 'shared-allocation' not in trace.tags
+                         else trace for trace in value)
 
     def context(self, function, arguments, entry=False):
         key = function.key, arguments, entry
@@ -782,27 +872,58 @@ class RubyEngine:
             label = 'file sink' if self.policy == 'path' else 'outbound URL sink'
             self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
 
-    def mutate(self, previous, value, state, name=None):
-        """Weakly update visible aliases and selected helper argument effects."""
-        identities = {(trace.kind, trace.key) for trace in previous if trace.kind != 'constant'}
-        value = retag(join(previous, value), remove=VALUE_TAGS)
-        value = frozenset(trace for trace in value
-                          if not (trace.kind == 'shape' and trace.key[0] in {'literal-list', 'canonical-path'}))
-        if has_shape(previous, 'uri'):
-            value = retag(value, add=frozenset({'parsed-uri'}))
+    def mutate(self, previous, value, state, name=None, overwrite=False):
+        """Update object aliases; copied data does not imply shared identity.
+
+        A replacement kills the returned/direct receiver's old contents. Other
+        aliases can be updated strongly only for one definite object. Repeated
+        allocation sites and joined references need weak alias updates because
+        they may represent more than one runtime object.
+        """
+        identities = object_ids(previous)
+        roots = frozenset(trace for trace in previous if trace.kind == 'object')
+        definite = len(identities) == 1 and bool(roots) and all(
+            trace.key[1] not in self.repeated_sites
+            and not any(offset in self.repeated_sites for offset in trace.key[2])
+            and len(trace.key[2]) < 2 for trace in roots)
+        array = any(trace.key[0] == 'array' for trace in roots)
+        if array and not overwrite:
+            value = frozenset(replace(trace, kind='member') if trace.kind == 'object' else trace
+                              for trace in value)
+        else:
+            value = frozenset(trace for trace in value if trace.kind != 'object'
+                              and (array or trace.kind != 'member'))
+        changed = join(roots, value, CLEAN if overwrite else previous)
+
+        def invalidate(fact):
+            fact = retag(fact, remove=VALUE_TAGS)
+            fact = frozenset(trace for trace in fact if not (
+                trace.kind == 'shape' and trace.key[0] in {'literal-list', 'canonical-path'}))
+            if has_shape(previous, 'uri'):
+                fact = retag(join(fact, frozenset(trace for trace in previous
+                                                if trace.kind == 'shape' and trace.key[0] == 'uri')),
+                             add=frozenset({'parsed-uri'}))
+            return fact
+
+        changed = invalidate(changed)
+        content = frozenset(trace for trace in changed if trace.kind != 'object')
         for binding, fact in tuple(state.items()):
-            if binding.startswith('@block:'):
-                continue
-            if binding == name or identities & {(trace.kind, trace.key) for trace in fact if trace.kind != 'constant'}:
-                if binding and binding[0].isupper() and tainted(value):
+            aliases = object_ids(fact)
+            direct = bool(identities & aliases) or binding == name and not identities
+            contained = bool(identities & object_ids(fact, members=True))
+            if direct or contained:
+                if binding and binding[0].isupper() and tainted(changed):
                     raise ValueError('Request-derived Ruby constant mutation needs shared-state analysis; analysis is incomplete')
-                # Preserve dependencies, but an alias may no longer rely on
-                # the old canonical path or literal allowlist membership.
-                state[binding] = value
+                if direct and (definite and aliases == identities or binding == name):
+                    state[binding] = changed
+                else:
+                    # A may-alias update cannot erase another possible
+                    # object's contents, including other array elements.
+                    state[binding] = invalidate(join(fact, content))
         for index, fact in self.parameter_values.items():
-            if identities & {(trace.kind, trace.key) for trace in fact if trace.kind != 'constant'}:
-                self.mutations[index] = join(self.mutations.get(index, CLEAN), value)
-        return value
+            if identities & (object_ids(fact) | object_ids(fact, members=True)):
+                self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
+        return changed
 
     def call(self, name, receiver, arguments, token, state):
         candidates = self.candidates(name, len(arguments))
@@ -823,7 +944,8 @@ class RubyEngine:
                 call = self.step(token.start, 'call', name + '()')
                 bound = tuple(advance(value, call) for value in values)
                 summary = self.summaries[self.context(function, bound)]
-                returned = join(returned, advance(summary.returned, call))
+                result = self.returned_objects(summary.returned, (*arguments, receiver), token.start)
+                returned = join(returned, advance(result, call))
                 self.pending_raises = join(self.pending_raises, advance(summary.raised, call))
                 for site, fact in summary.effects.items():
                     self.effects[site] = join(self.effects.get(site, CLEAN), fact)
@@ -848,8 +970,25 @@ class RubyEngine:
                 elif any(tainted(argument) for argument in arguments):
                     raise ValueError('Ruby constructor arguments need visible initialization analysis; analysis is incomplete')
                 return instance
+        kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
+        if kinds and kinds <= {'string', 'request'} and method in {
+                'upcase', 'downcase', 'capitalize', 'swapcase', 'reverse', 'strip', 'lstrip', 'rstrip',
+                'chop', 'chomp', 'delete', 'delete_prefix', 'delete_suffix', 'sub', 'gsub', 'tr', 'tr_s',
+                'squeeze', 'scrub', 'encode', 'unicode_normalize', 'b', 'center', 'ljust', 'rjust',
+                'dump', 'undump', 'succ', 'next', 'inspect', 'byteslice', 'slice', 'chr', '[]'}:
+            return self.fresh(retag(value, remove=VALUE_TAGS), 'string', token.start)
         if receiver and (method.endswith('!') or method in {'push', 'append', 'prepend', 'concat', 'replace', 'clear', 'unshift', 'insert', 'update', 'delete', 'delete_at', 'delete_if'}):
-            return self.mutate(receiver, join(*arguments), state, name.split('.', 1)[0])
+            replacement = constant('', 'literal') if method == 'clear' else join(*arguments)
+            binding = name.rsplit('.', 1)[0] if '.' in name else ''
+            binding = binding if re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*', binding) else None
+            return self.mutate(receiver, replacement, state, binding,
+                               overwrite=method in {'replace', 'clear'})
+        if receiver and method in {'dup', 'clone'}:
+            kind = next(iter(kinds)) if len(kinds) == 1 else 'copy'
+            return self.fresh(receiver, 'string' if kind == 'request' else kind, token.start, shallow=True)
+        if method in {'[]', 'fetch', 'first', 'last', 'at'} and any(
+                trace.kind == 'object' and trace.key[0] == 'array' for trace in receiver):
+            return self.elements(receiver)
         if method in {'eval', 'instance_eval', 'class_eval', 'module_eval', 'send', 'public_send', '__send__', 'define_method'} and tainted(value):
             raise ValueError(f'{self.path}:{self.step(token.start, "call", name).line}: Request-derived dynamic Ruby execution needs dispatch analysis; analysis is incomplete')
         if name == 'Rack::Request.new':
@@ -857,15 +996,19 @@ class RubyEngine:
         if method in {'fetch', 'dig', '[]'} and (has_shape(receiver, 'request-params') or has_shape(receiver, 'request-headers') or has_shape(receiver, 'environment')):
             return self.source(token.start, name)
         if name in {'URI.parse', 'URI.join', 'Addressable::URI.parse', 'Addressable::URI.join', 'URI'}:
-            return join(retag(value, add=frozenset({'parsed-uri'})), shape('uri', token.start))
+            return self.fresh(join(retag(value, add=frozenset({'parsed-uri'})), shape('uri', token.start)),
+                              'uri', token.start)
         if name in {'File.expand_path', 'File.realpath', 'File.realdirpath'}:
-            return join(retag(value, add=frozenset({'canonical-path'})), shape('canonical-path', token.start))
+            return self.fresh(join(retag(value, add=frozenset({'canonical-path'})), shape('canonical-path', token.start)),
+                              'string', token.start)
         if name == 'Pathname.new':
-            return join(value, shape('pathname', token.start))
+            return self.fresh(join(value, shape('pathname', token.start)), 'pathname', token.start)
         if method in {'expand_path', 'realpath', 'realdirpath', 'cleanpath'} and has_shape(receiver, 'pathname'):
-            return join(retag(value, add=frozenset({'canonical-path'})), shape('canonical-path', token.start))
+            return self.fresh(join(retag(value, add=frozenset({'canonical-path'})), shape('canonical-path', token.start)),
+                              'pathname', token.start)
         if self.policy == 'path' and (name == 'File.basename' or (method == 'basename' and has_shape(receiver, 'pathname'))):
-            return retag(value, add=frozenset({'basename-path'}), remove=VALUE_TAGS - frozenset({'basename-path'}))
+            return self.fresh(retag(value, add=frozenset({'basename-path'}), remove=VALUE_TAGS - frozenset({'basename-path'})),
+                              'pathname' if has_shape(receiver, 'pathname') else 'string', token.start)
         if self.policy == 'path' and (name == 'File.join' or method == 'join' and has_shape(receiver, 'pathname')):
             # A final basename is a leaf only while no later path component
             # is appended. In particular basename('..') is still a directory.
@@ -873,7 +1016,8 @@ class RubyEngine:
             for index, argument in enumerate(arguments):
                 keep = frozenset({'basename-path', 'not-dot-name'}) if index == len(arguments) - 1 else frozenset()
                 result = join(result, retag(argument, remove=VALUE_TAGS - keep))
-            return join(retag(receiver, remove=VALUE_TAGS), result)
+            return self.fresh(join(retag(receiver, remove=VALUE_TAGS), result),
+                              'pathname' if has_shape(receiver, 'pathname') else 'string', token.start)
         positional = [argument for argument in arguments
                       if not any(trace.kind == 'keyword' for trace in argument)]
         if self.policy == 'url':
@@ -912,13 +1056,22 @@ class RubyEngine:
                     self.record(token.start, positional[index], name)
         if method in {'message', 'full_message', 'to_s', 'to_str'} and any(trace.kind == 'exception' for trace in receiver):
             return frozenset(trace for trace in value if trace.kind != 'exception')
-        if method in {'freeze', 'to_s', 'to_str'}:
+        if method in {'freeze', 'itself'}:
             return value
+        if method in {'to_s', 'to_str'}:
+            kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
+            if kinds and kinds <= {'string', 'request'}:
+                return value
+            converted = self.fresh(value, 'string', token.start)
+            return converted if kinds and kinds <= {'uri', 'pathname'} else join(value, converted)
         if method in {'host', 'hostname', 'scheme', 'path', 'query', 'fragment', 'port'}:
-            return retag(value, remove=PROOF_TAGS)
+            value = retag(value, remove=PROOF_TAGS)
+            return join(value, self.fresh(value, 'component', token.start))
         # Unknown calls are not validators. Preserve request dependencies while
-        # discarding proofs that their result still has the checked value.
-        return retag(value, remove=VALUE_TAGS)
+        # discarding proofs that their result still has the checked value. An
+        # unknown result may borrow an argument or be a newly allocated value.
+        value = retag(value, remove=VALUE_TAGS)
+        return join(value, self.fresh(value, 'unknown', token.start, shallow=True))
 
     def expression(self, tokens, state, depth=0):
         if depth > 64:
@@ -926,7 +1079,7 @@ class RubyEngine:
         tokens = ungroup(tokens)
         if not tokens:
             return CLEAN
-        literal = self.literal(tokens)
+        literal = self.literal_value(tokens)
         if literal:
             return literal
         shifted = split_tokens(tokens, {'<<'})
@@ -938,7 +1091,10 @@ class RubyEngine:
         for operators in ({'=>', ':'}, {'||', 'or'}, {'&&', 'and'}, {'==', '!=', '=~', '!~', '<', '>', '<=', '>='}, {'+', '-', '*', '/', '..'}):
             parts = split_tokens(tokens, operators)
             if len(parts) > 1:
-                return retag(join(*(self.expression(part, state, depth + 1) for part in parts)), remove=VALUE_TAGS)
+                combined = retag(join(*(self.expression(part, state, depth + 1) for part in parts)), remove=VALUE_TAGS)
+                if '+' in operators and all(parts):
+                    return self.fresh(combined, 'string', tokens[0].start)
+                return combined
         value, cursor = CLEAN, 0
         while cursor < len(tokens):
             self.budget.spend()
@@ -947,15 +1103,18 @@ class RubyEngine:
                 atom = retag(join(*(self.expression(part, state, depth + 1) for part in token.parts)), remove=VALUE_TAGS)
                 if token.kind == 'dynamic' and tainted(atom):
                     raise ValueError('Request-derived Ruby command interpolation needs execution analysis; analysis is incomplete')
+                atom = self.fresh(atom, 'string', token.start)
                 cursor += 1
                 name = ''
             elif token.kind in {'literal', 'number', 'words', 'regex'}:
-                atom = self.literal((token,))
+                atom = self.literal_value((token,))
                 cursor += 1
                 name = ''
             elif token.value in {'(', '[', '{'}:
                 end = closing_token(tokens, cursor)
                 atom = join(*(self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','})))
+                if token.value in {'[', '{'}:
+                    atom = self.collection(atom, token.start)
                 cursor, name = end + 1, ''
             elif re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*[!?]?', token.value):
                 name, cursor = token.value, cursor + 1
@@ -1181,7 +1340,7 @@ class RubyEngine:
                     collected = node('block-collect', targets=(loop,), extra=(slot, method, tokens[0].start)) if repeated else output
                     body = block(statement.body, collected, finish, collected,
                                  return_target, raise_target, retry_to)
-                    bound = node('block-bind', targets=(body,), extra=(slot, parameters, locals_))
+                    bound = node('block-bind', targets=(body,), extra=(slot, parameters, locals_, method))
                     if repeated:
                         edges[loop] = (bound, output)
                         # Literal nonempty arrays execute at least one block;
@@ -1397,9 +1556,13 @@ class RubyEngine:
             state[slot + ':values'] = shape('mapped-list', tokens[0].start)
             return state
         if kind == 'block-bind':
-            slot, parameters, locals_ = extra
+            slot, parameters, locals_, method = extra
+            value = state.get(slot + ':receiver', CLEAN)
+            if method in {'map', 'collect', 'each'} and any(
+                    trace.kind == 'object' and trace.key[0] == 'array' for trace in value):
+                value = self.elements(value)
             for name in parameters:
-                state[name] = state.get(slot + ':receiver', CLEAN)
+                state[name] = value
             for name in locals_:
                 state[name] = constant('nil', 'code')
             state['@result'] = constant('nil', 'code')
@@ -1413,7 +1576,7 @@ class RubyEngine:
         if kind == 'block-result':
             slot, method, offset = extra
             if method in {'map', 'collect'}:
-                value = state.get(slot + ':values', CLEAN)
+                value = self.collection(state.get(slot + ':values', CLEAN), offset)
             elif method in {'each', 'tap'}:
                 value = state.get(slot + ':receiver', CLEAN)
             else:

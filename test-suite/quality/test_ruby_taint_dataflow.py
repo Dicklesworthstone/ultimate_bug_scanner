@@ -567,6 +567,235 @@ CASES = (
         target = params[:file] # ubs:ignore[ruby.taint.path_traversal]
 
         File.read(target)''', (3,)),
+    # String#replace changes the receiver object, while dup/clone allocate
+    # independent strings. Equal literal contents are not alias identities.
+    # Sources: docs.ruby-lang.org/en/3.4/{String,Object}.html.
+    Case('alias_url_literal_replace_reaches_original', URL, '''
+        target = 'https://api.example.com/health'
+        alias_target = target
+        alias_target.replace(params[:url])
+        Net::HTTP.get(URI.parse(target))''', (4,)),
+    Case('alias_url_equal_literals_have_distinct_identity', URL, '''
+        # frozen_string_literal: false
+        first = 'https://api.example.com/health'
+        second = 'https://api.example.com/health'
+        first.replace(params[:url])
+        Net::HTTP.get(URI.parse(second))
+        Net::HTTP.get(URI.parse(first))''', (6,)),
+    Case('alias_url_variable_rebinding_preserves_original', URL, '''
+        target = 'https://api.example.com/health'
+        alias_target = target
+        alias_target = params[:url]
+        Net::HTTP.get(URI.parse(target))
+        Net::HTTP.get(URI.parse(alias_target))''', (5,)),
+    Case('alias_url_literal_replace_clears_shared_taint', URL, '''
+        target = params[:url]
+        alias_target = target
+        alias_target.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(target))
+        Net::HTTP.get(URI.parse(alias_target))''', ()),
+    Case('alias_url_transitive_alias_replace', URL, '''
+        target = 'https://api.example.com/health'
+        first = target
+        second = first
+        second.replace(params[:url])
+        Net::HTTP.get(URI.parse(target))''', (5,)),
+    Case('alias_url_literal_tap_mutates_returned_receiver', URL, '''
+        target = 'https://api.example.com/health'.tap { |value| value.replace(params[:url]) }
+        Net::HTTP.get(URI.parse(target))''', (2,)),
+    Case('alias_url_tap_clean_replace_clears_returned_receiver', URL, '''
+        target = params[:url].tap { |value| value.replace('https://api.example.com/health') }
+        Net::HTTP.get(URI.parse(target))''', ()),
+    Case('alias_url_tap_conditional_mutation_remains_possible', URL, '''
+        target = 'https://api.example.com/health'.tap do |value|
+          if healthy
+            value.replace(params[:url])
+          end
+        end
+        Net::HTTP.get(URI.parse(target))''', (6,)),
+    Case('alias_url_dup_clean_copy_preserves_original_taint', URL, '''
+        original = params[:url]
+        copy = original.dup
+        copy.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (4,)),
+    Case('alias_url_clone_clean_copy_preserves_original_taint', URL, '''
+        original = params[:url]
+        copy = original.clone
+        copy.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (4,)),
+    Case('alias_url_dup_clean_original_preserves_copy_taint', URL, '''
+        original = params[:url]
+        copy = original.dup
+        original.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (5,)),
+    Case('alias_url_clone_clean_original_preserves_copy_taint', URL, '''
+        original = params[:url]
+        copy = original.clone
+        original.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (5,)),
+    Case('alias_url_dup_literal_copy_mutation_is_independent', URL, '''
+        original = 'https://api.example.com/health'
+        copy = original.dup
+        copy.replace(params[:url])
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (5,)),
+    Case('alias_url_clone_literal_copy_mutation_is_independent', URL, '''
+        original = 'https://api.example.com/health'
+        copy = original.clone
+        copy.replace(params[:url])
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (5,)),
+    Case('alias_url_literal_helper_calls_allocate_distinct_strings', URL, '''
+        # frozen_string_literal: false
+        def fixed
+          'https://api.example.com/health'
+        end
+        first = fixed
+        second = fixed
+        first.replace(params[:url])
+        Net::HTTP.get(URI.parse(second))
+        Net::HTTP.get(URI.parse(first))''', (9,)),
+    Case('alias_url_identity_helper_preserves_alias', URL, '''
+        def identity(value)
+          value
+        end
+        original = 'https://api.example.com/health'
+        copy = identity(original)
+        copy.replace(params[:url])
+        Net::HTTP.get(URI.parse(original))''', (7,)),
+    Case('alias_path_literal_replace_reaches_original', PATH, '''
+        target = '/srv/app/files/health.txt'
+        alias_target = target
+        alias_target.replace(params[:file])
+        File.read(target)''', (4,)),
+    Case('alias_path_literal_replace_clears_shared_taint', PATH, '''
+        target = params[:file]
+        alias_target = target
+        alias_target.replace('/srv/app/files/health.txt')
+        File.read(target)
+        File.read(alias_target)''', ()),
+    Case('alias_path_literal_tap_mutates_returned_receiver', PATH, '''
+        target = '/srv/app/files/health.txt'.tap { |value| value.replace(params[:file]) }
+        File.read(target)''', (2,)),
+    Case('alias_path_dup_clean_copy_preserves_original_taint', PATH, '''
+        original = params[:file]
+        copy = original.dup
+        copy.replace('/srv/app/files/health.txt')
+        File.read(original)
+        File.read(copy)''', (4,)),
+    Case('alias_path_clone_literal_copy_mutation_is_independent', PATH, '''
+        original = '/srv/app/files/health.txt'
+        copy = original.clone
+        copy.replace(params[:file])
+        File.read(original)
+        File.read(copy)''', (5,)),
+    Case('alias_uri_dup_host_assignment_preserves_original_guard', URL, f'''
+        uri = URI.parse(params[:url])
+        raise 'blocked' unless {URL_CHECK}
+        copy = uri.dup
+        copy.host = params[:host]
+        Net::HTTP.get(uri)
+        Net::HTTP.get(copy)''', (6,)),
+    Case('alias_uri_clone_host_assignment_preserves_original_guard', URL, f'''
+        uri = URI.parse(params[:url])
+        raise 'blocked' unless {URL_CHECK}
+        copy = uri.clone
+        copy.host = params[:host]
+        Net::HTTP.get(uri)
+        Net::HTTP.get(copy)''', (6,)),
+    # A replacement kills the selected receiver's contents, but another object
+    # that merely may alias it can retain its original contents on some paths.
+    Case('alias_branch_url_may_receiver_preserves_untouched_original', URL, '''
+        original = params[:url]
+        other = 'https://api.example.com/health'
+        choice = original
+        if healthy
+          choice = other
+        end
+        choice.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(choice))''', (8,)),
+    Case('alias_branch_url_two_possible_originals_remain_tainted', URL, '''
+        first = params[:first_url]
+        second = params[:second_url]
+        choice = first
+        if healthy
+          choice = second
+        end
+        choice.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(first))
+        Net::HTTP.get(URI.parse(second))
+        Net::HTTP.get(URI.parse(choice))''', (8, 9)),
+    Case('alias_branch_path_may_receiver_preserves_untouched_original', PATH, '''
+        original = params[:file]
+        other = '/srv/app/files/health.txt'
+        choice = original
+        if healthy
+          choice = other
+        end
+        choice.replace('/srv/app/files/health.txt')
+        File.read(original)
+        File.read(choice)''', (8,)),
+    Case('alias_branch_url_conditional_clean_replace_preserves_unsafe_branch', URL, '''
+        original = params[:url]
+        if healthy
+          original.replace('https://api.example.com/health')
+        end
+        Net::HTTP.get(URI.parse(original))''', (5,)),
+    Case('alias_branch_path_conditional_clean_replace_preserves_unsafe_branch', PATH, '''
+        original = params[:file]
+        if healthy
+          original.replace('/srv/app/files/health.txt')
+        end
+        File.read(original)''', (5,)),
+    Case('alias_branch_url_both_branches_clean_replace', URL, '''
+        original = params[:url]
+        if healthy
+          original.replace('https://api.example.com/health')
+        else
+          original.replace('https://api.example.com/status')
+        end
+        Net::HTTP.get(URI.parse(original))''', ()),
+    Case('alias_branch_url_same_object_on_both_branches', URL, '''
+        original = params[:url]
+        choice = original
+        if healthy
+          choice = original
+        end
+        choice.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(choice))''', ()),
+    # String#upcase returns a copy; String#to_s returns the same String object.
+    # Source: docs.ruby-lang.org/en/3.4/String.html.
+    Case('alias_branch_url_upcase_copy_preserves_original', URL, '''
+        original = params[:url]
+        copy = original.upcase
+        copy.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(copy))''', (4,)),
+    Case('alias_branch_url_to_s_preserves_same_string_identity', URL, '''
+        original = params[:url]
+        same_string = original.to_s
+        same_string.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(original))
+        Net::HTTP.get(URI.parse(same_string))''', ()),
+    Case('alias_retry_repeated_dup_keeps_previous_instance_tainted', URL, '''
+        saved = nil
+        begin
+          value = params[:url].dup
+          if retry_needed?
+            saved = value
+            raise 'again'
+          end
+        rescue
+          retry
+        end
+        value.replace('https://api.example.com/health')
+        Net::HTTP.get(URI.parse(saved))''', (12,)),
 )
 BY_NAME = {case.name: case for case in CASES}
 
@@ -874,6 +1103,17 @@ class RubyPublicTests(LoggedCase):
 
     def test_api_argument_positions_reach_json_and_sarif(self):
         for case in (case for case in CASES if case.name.startswith('api_')):
+            directory = self.artifact / case.name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
+                    result, payload = self.scan(directory / fmt, target, fmt)
+                    self.assert_findings(result, payload, case, fmt, target)
+
+    def test_alias_mutation_and_copy_identity_reach_json_and_sarif(self):
+        for case in (case for case in CASES if case.name.startswith('alias_')):
             directory = self.artifact / case.name
             directory.mkdir(exist_ok=True)
             target = directory / 'selected source.rb'

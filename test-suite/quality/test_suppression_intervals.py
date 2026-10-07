@@ -1447,6 +1447,49 @@ mod tests {
 class StatementBoundaryTests(unittest.TestCase):
     """A marker on one statement never leaks onto the next one."""
 
+    def test_completed_literal_does_not_extend_suppression_to_next_statement(self) -> None:
+        cases = (
+            ("swift", 'let target = req.query["next"] ?? "/"', "//"),
+            ("js", 'const target = req.query.next || "/"', "//"),
+            ("python", 'target = request.GET["next"] + ""', "#"),
+            ("ruby", "target = params[:next] + ''", "#"),
+            ("elixir", 'target = params["next"] <> ""', "#"),
+            ("golang", 'target := req.URL.Query().Get("next") + ""', "//"),
+            ("kotlin", 'val target = request.getParameter("next") ?: "/"', "//"),
+        )
+        for lang, assignment, comment in cases:
+            for directive in ("ubs:ignore", "ubs:ignore[target.rule]", "noqa"):
+                with self.subTest(lang=lang, directive=directive):
+                    source = f"{assignment} {comment} {directive}\nunsafe(target)\n"
+                    index = build_index(source, lang=lang)
+                    self.assertTrue(index.is_suppressed(1, "target.rule"))
+                    self.assertFalse(index.is_suppressed(2, "target.rule"))
+                    self.assertEqual(index._interval_for(2), Interval(2, 2))
+
+    def test_literal_operand_completes_a_real_continued_statement(self) -> None:
+        for lang, first, literal, comment in (
+            ("swift", 'let target = req.query["next"] ??', '"/"', "//"),
+            ("js", 'const target = request.query.next +', '"/"', "//"),
+            ("ruby", "target = params[:next] +", "''", "#"),
+            ("python", "target = request.GET['next'] + " + "\\", '""', "#"),
+        ):
+            with self.subTest(lang=lang):
+                source = f"{first}\n    {literal} {comment} ubs:ignore[target.rule]\nunsafe(target)\n"
+                index = build_index(source, lang=lang)
+                self.assertTrue(index.is_suppressed(1, "target.rule"))
+                self.assertTrue(index.is_suppressed(2, "target.rule"))
+                self.assertFalse(index.is_suppressed(3, "target.rule"))
+                self.assertFalse(index.is_suppressed(1, "other.rule"))
+
+    def test_literal_delimiters_remain_opaque_inside_a_multiline_call(self) -> None:
+        for lang, comment in (("swift", "//"), ("js", "//"), ("python", "#")):
+            with self.subTest(lang=lang):
+                source = ('use(\n    ")]} + else do" ' + comment +
+                          ' ubs:ignore[target.rule]\n)\nnext_call()\n')
+                index = build_index(source, lang=lang)
+                self.assertEqual([line for line in range(1, 5)
+                                  if index.is_suppressed(line, "target.rule")], [1, 2, 3])
+
     def test_identifier_ending_in_keyword_does_not_continue_python(self) -> None:
         code = (
             "def f(password, provided, todo):\n"

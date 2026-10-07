@@ -366,6 +366,18 @@ def build_index(text: str, lang: str = "python") -> SuppressionIndex:
         strip_strings=True,
         strip_comments=True,
     )
+    # Literals are opaque operands, not absent operands. Erasing a completed
+    # literal in value = request ?? "/" leaves a dangling ?? and wrongly
+    # joins the next statement to an inline suppression. A second lexical view
+    # distinguishes literal bytes from comments without exposing literal
+    # parentheses, braces, keywords, or comment-like text to the interval parser.
+    literal_view = strip_comments_and_strings(
+        text, lang=lang, strip_strings=False, strip_comments=True,
+    )
+    masked = "".join(
+        "x" if char == " " and literal_char not in " \t\r\n" else char
+        for char, literal_char in zip(masked, literal_view)
+    )
     lines = masked.splitlines()
     index = SuppressionIndex()
     index.markers = parse_markers(text, lang=lang)

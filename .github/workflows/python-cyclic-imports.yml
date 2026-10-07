@@ -1,19 +1,26 @@
-name: Python Circular Import Dataflow
+name: Python Interprocedural Dataflow
 
 on:
   push:
     branches: [main]
     paths:
       - test-suite/patches/python-cyclic-imports.patch
+      - test-suite/patches/python-class-callables.patch.gz
       - .github/workflows/python-cyclic-imports.yml
   workflow_dispatch:
+    inputs:
+      runner:
+        description: Native validation runner
+        type: choice
+        options: [ubuntu-24.04-arm, ubuntu-latest]
+        default: ubuntu-24.04-arm
 
 permissions:
   contents: write
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04-arm' }}
     timeout-minutes: 30
     env:
       UBS_NO_AUTO_UPDATE: '1'
@@ -43,24 +50,34 @@ jobs:
       - name: Validate exact implementation and regression preimages
         run: |
           test "$(git hash-object test-suite/patches/python-cyclic-imports.patch)" = f1b3e34676625b991b9f0fc38fd03aa2f871a848
+          test "$(git hash-object test-suite/patches/python-class-callables.patch.gz)" = 13e5eb5736362a902e468576d0de20e84dfd1bd8
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = 1dbaef7a6a88c0fd1e46bdc9e57f65a18733525b
           test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 91e22468c64d951db0be8405dc53cf926ed42199
+          test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = 6fc3fc1d1a45aa0537a775cdc3bf8a065dff63b4
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
+          gzip -dc test-suite/patches/python-class-callables.patch.gz > "$RUNNER_TEMP/class-callables.patch"
           git apply --check test-suite/patches/python-cyclic-imports.patch
           git apply --include=test-suite/quality/test_taint_python_modules.py test-suite/patches/python-cyclic-imports.patch
+          git apply --include='test-suite/quality/*.py' "$RUNNER_TEMP/class-callables.patch"
           PYTHONPATH=test-suite/quality python3 - <<'PY'
           import os, unittest
           from pathlib import Path
           names = [
               'test_taint_python_modules.PythonModuleTests.test_import_cycle_does_not_disable_downstream_selected_helpers',
               'test_taint_python_modules.PythonModuleTests.test_cyclic_module_functions_propagate_sink_summaries',
+              'test_taint_python_modules.PythonModuleTests.test_selected_class_static_helpers_keep_defining_module_and_location',
+              'test_taint_python_callables.ClassCallableFlowTests.test_static_helpers_propagate_sinks_sources_and_clean_returns',
           ]
           with Path(os.environ['RUNNER_TEMP'], 'cyclic-before.log').open('w') as log:
               result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
-          assert result.testsRun == 2 and result.failures and not result.errors, 'Expected source-level false-negative witnesses'
+          assert result.testsRun == 4 and result.failures and not result.errors, 'Expected source-level regression witnesses'
+          failed = {test.id().split(' (', 1)[0] for test, _ in result.failures}
+          assert set(names) <= failed, (names, sorted(failed))
           PY
           git apply --include=modules/helpers/ubs_core/analyzers/taint_py.py test-suite/patches/python-cyclic-imports.patch
+          git apply --check --include=modules/helpers/ubs_core/analyzers/taint_py.py "$RUNNER_TEMP/class-callables.patch"
+          git apply --include=modules/helpers/ubs_core/analyzers/taint_py.py "$RUNNER_TEMP/class-callables.patch"
           ./scripts/update_checksums.sh
           ./scripts/update_sha256sums.sh
       - name: Exercise complete Python dataflow and real CLI paths
@@ -94,7 +111,8 @@ jobs:
           from pathlib import Path
           changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
           allowed = {'modules/helpers/ubs_core/analyzers/taint_py.py',
-                     'test-suite/quality/test_taint_python_modules.py', 'modules/lib/ubs-common.sh',
+                     'test-suite/quality/test_taint_python_modules.py',
+                     'test-suite/quality/test_taint_python_callables.py', 'modules/lib/ubs-common.sh',
                      'scripts/new-module.sh', 'ubs', 'SHA256SUMS'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert set(changed) == allowed, changed

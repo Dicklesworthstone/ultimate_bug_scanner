@@ -28,6 +28,8 @@ Python 3.9+ stdlib only.
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
 import json
 import os
 import re
@@ -277,6 +279,7 @@ def scan_patterns(
     *,
     defer_global_checks: bool = False,
     suppressions: SourceSuppressions | None = None,
+    errors: list[str] | None = None,
 ) -> dict[str, int]:
     """Run every pattern over the file list, writing sink records.
 
@@ -304,24 +307,24 @@ def scan_patterns(
     if suppressions is None:
         suppressions = SourceSuppressions("python")
 
-    def _read_text(p: Path) -> tuple[Path, str]:
+    def _read_text(p: Path) -> tuple[Path, str, OSError | None]:
         try:
-            return p, p.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            return p, ""
+            return p, p.read_text(encoding="utf-8", errors="ignore"), None
+        except OSError as exc:
+            return p, "", exc
 
     if jobs > 1 and len(files) > 1:
         from ubs_core.shards import run_work_stealing
 
         pairs = run_work_stealing(files, lambda shard: [_read_text(p) for p in shard], num_workers=jobs)
-        texts: dict[Path, str] = {p: t for p, t in pairs if t}
     else:
-        texts = {}
-        for path in files:
-            try:
-                texts[path] = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
+        pairs = (_read_text(path) for path in files)
+    texts: dict[Path, str] = {}
+    for path, text, problem in pairs:
+        if problem is not None:
+            _analysis_error(errors, f"source {path}", problem)
+        else:
+            texts[path] = text
     masked: dict[tuple[Path, bool], str] = {}
 
     def _scan_text(path: Path, text: str, code_only: bool = False) -> str:
@@ -467,7 +470,61 @@ def reconcile_pattern_records(patterns: Sequence[Pattern], records: Sequence[dic
     return result
 
 
-def load_patterns() -> list[Pattern]:
+def _analysis_error(errors: list[str] | None, stage: str, exc: BaseException) -> None:
+    """Keep failures separate from findings; direct APIs still raise by default."""
+    if errors is None:
+        raise exc
+    errors.append(f"{stage}: {type(exc).__name__}: {exc}")
+
+
+def _run_stage(problems: list[str], stage: str, run, *args, **kwargs):
+    """An unexpected producer failure must not discard sibling-layer results."""
+    try:
+        return run(*args, **kwargs)
+    except (Exception, SystemExit) as exc:
+        _analysis_error(problems, stage, exc)
+        return None
+
+
+def _source_versions(files: Sequence[Path], problems: list[str]) -> dict[Path, tuple[str, str]]:
+    """Record selected input identities without trusting cached filesystem metadata.
+
+    This is an admission/completion barrier, not a filesystem snapshot. It
+    detects observed changes across the analysis; arbitrary ABA edits between
+    reads still require immutable inputs supplied by the caller.
+    """
+    versions: dict[Path, tuple[str, str]] = {}
+    for path in files:
+        try:
+            identity = str(path.resolve(strict=True))
+            digest = hashlib.blake2b(digest_size=16)
+            with path.open("rb") as source:
+                while chunk := source.read(128 * 1024):
+                    digest.update(chunk)
+            versions[path] = (identity, digest.hexdigest())
+        except OSError as exc:
+            _analysis_error(problems, f"source {path}", exc)
+    return versions
+
+
+def _validate_source_syntax(files: Sequence[Path], problems: list[str]) -> None:
+    """Do not turn a native Python parse failure into an empty, cached result.
+
+    Some individual analyzers deliberately skip files they cannot parse. The
+    orchestrator owns completeness, including when all findings are suppressed.
+    Bytes preserve Python's encoding-cookie/BOM semantics. Cython, notebooks
+    and non-Python evidence files keep their own grammar-specific analysis.
+    """
+    for path in files:
+        if path.suffix.lower() not in _PY_SUFFIXES:
+            continue
+        try:
+            ast.parse(path.read_bytes(), filename=str(path))
+        except (OSError, SyntaxError, ValueError, RecursionError) as exc:
+            _analysis_error(problems, f"Python syntax {path}", exc)
+
+
+def load_patterns(errors: list[str] | None = None) -> list[Pattern]:
     """Aggregate PATTERNS from every ubs_core.py_patterns.* module."""
     import importlib
     import pkgutil
@@ -480,11 +537,21 @@ def load_patterns() -> list[Pattern]:
             continue
         try:
             module = importlib.import_module(f"ubs_core.py_patterns.{module_info.name}")
-        except Exception as exc:  # a broken pattern module must not kill the scan
-            sys.stderr.write(f"[ubs_core.py_scan] pattern module {module_info.name} failed: {exc}\n")
-            continue
-        patterns.extend(getattr(module, "PATTERNS", []))
+            patterns.extend(getattr(module, "PATTERNS", []))
+        except (Exception, SystemExit) as exc:
+            _analysis_error(errors, f"pattern module {module_info.name}", exc)
     return patterns
+
+
+def load_analyzers(errors: list[str] | None = None):
+    """Load the registry once, without abandoning independent scanner layers."""
+    try:
+        from ubs_core import analyzers  # noqa: F401 (populate registry)
+        from ubs_core.registry import analyzers_for_lang
+        return analyzers_for_lang("python")
+    except (Exception, SystemExit) as exc:
+        _analysis_error(errors, "analyzer registry", exc)
+        return []
 
 
 def _record_category(finding: dict) -> int | None:
@@ -522,19 +589,26 @@ def run_analyzers(
     prefilter: Any = None,
     taint: bool | None = None,
     project_dir: str | None = None,
+    errors: list[str] | None = None,
+    registered=None,
 ) -> None:
     """Run registered python analyzers (taint, lifecycle, guards, ctcompare).
 
     ``python.narrowing.*`` (bead D4) has no legacy python counterpart — it
     stays off unless ``enable_new`` is set, so v2 totals match legacy.
     """
-    from ubs_core import analyzers  # noqa: F401  (populate registry)
-    from ubs_core.registry import analyzers_for_lang
-
-    for analyzer in analyzers_for_lang("python"):
+    if registered is None:
+        registered = load_analyzers(errors)
+    # These built-ins are file-local. Never split taint_py or an unknown
+    # extension's selected-project context just to recover from a failure.
+    file_local = {"lifecycle_py", "guards_py", "narrowing_py", "ctcompare_py"}
+    categories = {"taint_py": 7, "ctcompare_py": 7, "lifecycle_py": 19, "guards_py": 1}
+    for analyzer in registered:
         if taint is not None and (analyzer.name == "taint_py") != taint:
             continue
         if analyzer.layer == "narrowing" and not enable_new:
+            continue
+        if skip and categories.get(analyzer.name) in skip:
             continue
         if prefilter is not None and analyzer.name != "taint_py":
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
@@ -542,24 +616,34 @@ def run_analyzers(
             target_files = list(files)
         if not target_files:
             continue
-        ctx = RunContext(lang="python", files=target_files,
-                         profile={"project_dir": project_dir} if project_dir else {})
-        for finding in analyzer.run(ctx):
-            if skip and _record_category(finding) in skip:
-                continue
-            sink.write(json.dumps({
-                "rule": finding.get("rule", ""),
-                "category_id": finding.get("category_id", "python.security"),
-                "path": finding.get("path", ""),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": finding.get("severity", "warning"),
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        groups = ([path] for path in target_files) if analyzer.name in file_local else (target_files,)
+        for group in groups:
+            ctx = RunContext(lang="python", files=group,
+                             profile={"project_dir": project_dir} if project_dir else {})
+            try:
+                for finding in analyzer.run(ctx):
+                    if skip and _record_category(finding) in skip:
+                        continue
+                    record = {
+                        "rule": finding.get("rule", ""),
+                        "category_id": finding.get("category_id", "python.security"),
+                        "path": finding.get("path", ""),
+                        "line": int(finding.get("line", 0) or 0),
+                        "col": int(finding.get("col", 1) or 1),
+                        "severity": finding.get("severity", "warning"),
+                        "message": finding.get("message", ""),
+                        "suppressed": False,
+                    }
+                    if finding.get("extras"):
+                        record["extras"] = finding["extras"]
+                    sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except (Exception, SystemExit) as exc:
+                scope = str(group[0]) if len(group) == 1 else "selected project"
+                _analysis_error(errors, f"{analyzer.name} ({scope})", exc)
 
 
-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
+def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None) -> None:
     """Run ubs_core.py_detectors.* modules (legacy heredoc detector ports).
 
     Protocol (single-rule modules): RULE_ID, CATEGORY, TITLE, SEVERITY,
@@ -578,8 +662,8 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
             continue
         try:
             module = importlib.import_module(f"ubs_core.py_detectors.{module_info.name}")
-        except Exception as exc:  # legacy heredoc failures degraded gracefully too
-            sys.stderr.write(f"[ubs_core.py_scan] detector module {module_info.name} failed: {exc}\n")
+        except (Exception, SystemExit) as exc:
+            _analysis_error(errors, f"detector module {module_info.name}", exc)
             continue
         find = getattr(module, "find", None)
         if find is None:
@@ -604,27 +688,30 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
                      if spec["category"] not in skip}
             if not specs:
                 continue
-        for hit in find(files):
-            if len(hit) == 5:
-                rule_id, path, line_no, col, detail = hit
-            else:
-                path, line_no, col, detail = hit  # single-rule convenience
-                rule_id = next(iter(specs))
-            spec = specs.get(rule_id)
-            if spec is None:
-                continue
-            slug = slug_for_category(spec["category"])
-            title = spec["title"]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": f"python.{slug}",
-                "path": str(path),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": spec["severity"],
-                "message": f"{title} — {detail}"[:300] if detail else title,
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        try:
+            for hit in find(files):
+                if len(hit) == 5:
+                    rule_id, path, line_no, col, detail = hit
+                else:
+                    path, line_no, col, detail = hit  # single-rule convenience
+                    rule_id = next(iter(specs))
+                spec = specs.get(rule_id)
+                if spec is None:
+                    continue
+                slug = slug_for_category(spec["category"])
+                title = spec["title"]
+                sink.write(json.dumps({
+                    "rule": rule_id,
+                    "category_id": f"python.{slug}",
+                    "path": str(path),
+                    "line": int(line_no),
+                    "col": int(col),
+                    "severity": spec["severity"],
+                    "message": f"{title} — {detail}"[:300] if detail else title,
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
+        except (Exception, SystemExit) as exc:
+            _analysis_error(errors, f"detector {module_info.name}", exc)
 
 
 def _finding_title(rec: dict) -> str:
@@ -791,8 +878,10 @@ def main(argv: list[str] | None = None) -> int:
     # is not a clean result, and findings from a run that partly failed are
     # still worth reporting — as a partial result.
     scan_errors: list[str] = []
+    source_versions = _source_versions(files, scan_errors)
 
-    patterns = load_patterns()
+    patterns = _run_stage(scan_errors, "pattern registry", load_patterns, scan_errors) or []
+    registered = load_analyzers(scan_errors)
     from ubs_core.cache import CapturingSink, ScanCache
 
     suppressions = SourceSuppressions("python")
@@ -807,12 +896,10 @@ def main(argv: list[str] | None = None) -> int:
 
     capturing_sink = None
     if files_to_scan:
+        _validate_source_syntax(files_to_scan, scan_errors)
         from ubs_core.py_rules import _RULES
         from ubs_core.prefilter import build_prefilter_index, run_prefilter
-        from ubs_core.registry import analyzers_for_lang
-        from ubs_core import analyzers  # noqa: F401
-
-        py_analyzers = [a.name for a in analyzers_for_lang("python")]
+        py_analyzers = [a.name for a in registered]
         ast_rules_input = list(_RULES)
         if args.ast_rule_dir:
             rules_dir = Path(args.ast_rule_dir) / "rules"
@@ -835,12 +922,15 @@ def main(argv: list[str] | None = None) -> int:
         prefilter_res = run_prefilter(files_to_scan, prefilter_index)
 
         capturing_sink = CapturingSink()
-        scan_patterns(patterns, files_to_scan, capturing_sink, skip,
+        _run_stage(scan_errors, "pattern scan", scan_patterns,
+                      patterns, files_to_scan, capturing_sink, skip,
                       prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True,
-                      suppressions=suppressions)
-        run_detectors(files_to_scan, capturing_sink, skip)
-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
-                      prefilter=prefilter_res, taint=False)
+                      suppressions=suppressions, errors=scan_errors)
+        _run_stage(scan_errors, "detector scan", run_detectors,
+                      files_to_scan, capturing_sink, skip, errors=scan_errors)
+        _run_stage(scan_errors, "analyzer scan", run_analyzers,
+                      files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, taint=False, errors=scan_errors, registered=registered)
         if args.ast_rule_dir:
             from ubs_core.py_ast import scan_all
             from ubs_core.py_rules import CATEGORY_MAP, SEVERITY_MAP
@@ -856,18 +946,11 @@ def main(argv: list[str] | None = None) -> int:
                 except (ValueError, OSError):
                     pass
             ast_files = prefilter_res.ast_files if not prefilter_res.is_bypass else files_to_scan
-            scan_all(
+            _run_stage(scan_errors, "AST scan", scan_all,
                 Path(args.ast_rule_dir), ast_files, capturing_sink, overrides,
                 count_only=None, skip_categories=None, category_map=CATEGORY_MAP,
                 skip=skip, errors=scan_errors,
             )
-        # An incomplete analysis must never become the cached answer: the next
-        # run would hit the cache and report the findings this one could not
-        # produce as a clean, finished scan (#111, same shape as #103).
-        if not scan_errors:
-            cache.store_scanned_files(files_to_scan, {
-                path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
-            })
     else:
         from ubs_core.prefilter import PrefilterResult
         prefilter_res = PrefilterResult(
@@ -891,20 +974,33 @@ def main(argv: list[str] | None = None) -> int:
             recs = capturing_sink.get_for_file(f)
         if recs:
             all_recs.extend(recs)
+    if capturing_sink is not None:
+        all_recs.extend(capturing_sink.unscoped)
 
     # Imported helpers can change findings in otherwise unchanged files. Keep
     # this selected-project pass out of per-file caches and literal prefilters;
     # all other analyzer layers retain their existing incremental behavior.
     taint_sink = CapturingSink()
-    run_analyzers(files, taint_sink, skip, taint=True,
-                  project_dir=args.project_dir or args.project or ".")
+    _run_stage(scan_errors, "project analyzer scan", run_analyzers,
+                  files, taint_sink, skip, taint=True,
+                  project_dir=args.project_dir or args.project or ".",
+                  errors=scan_errors, registered=registered)
     for f in files:
         all_recs.extend(taint_sink.get_for_file(f))
+    all_recs.extend(taint_sink.unscoped)
 
     # Suppress only emitted findings, preserving source facts and helper flow.
     # Recheck cached records too, before project-wide severity thresholds and
     # the common sink determine every report, total and exit status.
     all_recs = reconcile_pattern_records(patterns, suppressions.filter(all_recs))
+
+    # Include cached files and suppression reads in the completion barrier.
+    # A changed input cannot be certified clean merely because its old version
+    # had no findings. Keep available findings, but reject fresh cache writes.
+    final_versions = _source_versions(files, scan_errors)
+    for path in files:
+        if source_versions.get(path) != final_versions.get(path):
+            scan_errors.append(f"source changed during analysis: {path}")
 
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for r in all_recs:
@@ -975,6 +1071,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.text_out:
         _render_text(args, files, counters, complete=not scan_errors)
+
+    # Admit fresh cache entries only after every producer and requested report
+    # completed. A failed project pass must not publish a reusable partial scan.
+    # Unscoped file-pass findings depend on the selected project, not on one
+    # source. Recompute that pass instead of caching away its project findings.
+    # Taint's project findings are safe: that pass runs even on all-cache hits.
+    if capturing_sink is not None and not scan_errors and not capturing_sink.unscoped:
+        cache.store_scanned_files(files_to_scan, {
+            path: suppressions.filter(records) for path, records in capturing_sink.by_file.items()
+        })
 
     if scan_errors:
         for problem in scan_errors:

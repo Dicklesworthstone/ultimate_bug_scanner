@@ -199,6 +199,9 @@ class CapturingSink:
     def __init__(self, target_sink: Any = None) -> None:
         self._sink = target_sink
         self.by_file: dict[str, list[dict]] = {}
+        # Project findings have no source identity. Keep them available to
+        # reporting, but never assign them to an arbitrary per-file cache key.
+        self.unscoped: list[dict] = []
 
     def write(self, s: str) -> int:
         n = self._sink.write(s) if self._sink is not None else len(s)
@@ -206,10 +209,12 @@ class CapturingSink:
         if line:
             try:
                 rec = json.loads(line)
-                if isinstance(rec, dict) and "path" in rec and "rule" in rec:
-                    p = str(rec.get("path", ""))
+                if isinstance(rec, dict) and "rule" in rec:
+                    p = str(rec.get("path") or "")
                     if p:
                         self.by_file.setdefault(str(Path(p).resolve()), []).append(rec)
+                    else:
+                        self.unscoped.append(rec)
             except ValueError:
                 pass
         return n
@@ -284,6 +289,10 @@ class ScanCache:
         self.files_dir = self.cache_root / "files"
         self.dirs_dir = self.cache_root / "dirs"
         self.stat_cache: dict[str, tuple[int, int, str]] = {}  # path -> (mtime_ns, size, hash)
+        # A paired partition/store operation may only admit findings under
+        # the source versions selected for that scan, never a later edit.
+        # None retains the standalone store API for externally produced data.
+        self._partition_hashes: dict[str, str | None] | None = None
         # Optional per-file analysis context (resolved path -> digest). A file
         # whose findings depend on which other files are selected (a linked
         # module component) is cached under its content hash plus that
@@ -458,6 +467,10 @@ class ScanCache:
 
         Returns (cached_findings_map, files_to_scan).
         """
+        # The memo is local to one operation. Equal size and mtime do not
+        # prove unchanged bytes when this cache object is reused for a scan.
+        self.stat_cache.clear()
+        self._partition_hashes = {}
         total = len(files)
         self.stats["total"] = total
         if not self.enabled or total == 0:
@@ -472,6 +485,9 @@ class ScanCache:
             fh = self._entry_hash(f, git_blobs)
             if fh:
                 file_hashes[f] = fh
+        self._partition_hashes = {
+            str(f.resolve()): file_hashes.get(f) for f in files
+        }
 
         # 2. Group files by parent directory to evaluate directory Merkle nodes
         by_dir: dict[Path, list[Path]] = {}
@@ -505,7 +521,8 @@ class ScanCache:
                 saved_findings = dir_data.get("findings", {})
                 directory_inputs = dir_data.get("inputs", {})
                 if (
-                    isinstance(saved_findings, dict)
+                    all(f in file_hashes for f in dir_files)
+                    and isinstance(saved_findings, dict)
                     and isinstance(directory_inputs, dict)
                     and all(
                         self._inputs_valid(inputs, git_blobs)
@@ -572,12 +589,21 @@ class ScanCache:
                     seen.add(id(record))
                     grouped.append(record)
 
+        # Revalidate independently of partition's stat memo: a producer may
+        # have run long enough for an editor to replace or rewrite the source.
+        self.stat_cache.clear()
         git_blobs = get_clean_git_blobs(self.project_dir)
         file_hashes: dict[Path, str] = {}
         for f in files:
+            expected = (self._partition_hashes.get(str(f.resolve()))
+                        if self._partition_hashes is not None else None)
+            if self._partition_hashes is not None and expected is None:
+                continue  # unselected or unreadable when the scan began
             fh = self._entry_hash(f, git_blobs)
-            if fh:
+            if fh and (self._partition_hashes is None or fh == expected):
                 file_hashes[f] = fh
+        if not file_hashes:
+            return
 
         # 1. Write per-file entries
         for f in files:

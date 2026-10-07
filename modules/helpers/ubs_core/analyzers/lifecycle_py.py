@@ -658,7 +658,9 @@ def collect_files(root: Path) -> list[Path]:
 def scan_file(path: Path, root: Path) -> list[tuple[Path, ResourceRecord]]:
     """Return (display_path, unreleased record) findings for one file."""
     try:
-        text = path.read_text(encoding="utf-8")
+        # Let Python's parser honor encoding cookies and UTF-8 BOMs. Decoding
+        # as UTF-8 first rejects valid Python before lifecycle analysis starts.
+        text = path.read_bytes()
     except OSError as e:
         print(f"WARN: Could not read {path}: {e}", file=sys.stderr)
         return []

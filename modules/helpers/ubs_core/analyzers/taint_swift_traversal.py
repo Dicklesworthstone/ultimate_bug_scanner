@@ -499,7 +499,7 @@ class SwiftSummary:
 
 class SwiftEngine:
     def __init__(self, path, text, policy='path', parser=None):
-        self.path, self.text, self.policy = path, text, policy
+        self.path, self.text, self.policy = Path(path).resolve(), text, policy
         self.parser = SwiftParser(text) if parser is None else parser
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}

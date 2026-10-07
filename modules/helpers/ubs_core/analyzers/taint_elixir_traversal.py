@@ -585,7 +585,9 @@ class ElixirEngine:
                                     tuple(self.imports[owner].items()))
                 self.functions.setdefault((owner, name, len(parameters)), []).append(function)
                 required = len(parameters)
-                while required and parameters[required - 1].kind == 'binary' and parameters[required - 1].value == '\\\\':
+                for parameter in reversed(parameters):
+                    if parameter.kind != 'binary' or parameter.value != '\\\\':
+                        break
                     required -= 1
                     self.functions.setdefault((owner, name, required), []).append(function)
             elif expr.kind == 'set_attribute':
@@ -684,9 +686,9 @@ class ElixirEngine:
         sources = {'params', 'conn', '_conn', '_params', 'socket', 'upload', 'filename', 'Conn'}
         sinks = {'redirect', 'put_resp_header', 'send_file', 'send_download', 'File', 'apply', 'Code', 'defmacro'}
         dynamic = any(token.kind == 'id' and token.text[:1].islower() and
-                      executable_tokens[index + 1].text == '.' and
-                      (executable_tokens[index + 2].text == '(' or executable_tokens[index + 3].text == '(')
-                      for index, token in enumerate(executable_tokens[:-3]))
+                      dot.text == '.' and (next_token.text == '(' or following.text == '(')
+                      for token, dot, next_token, following in
+                      zip(executable_tokens, executable_tokens[1:], executable_tokens[2:], executable_tokens[3:]))
         request_sinks = {'redirect', 'put_resp_header', 'send_file', 'send_download'}
         if (not names & sources and not names & request_sinks) or (not names & sinks and not dynamic):
             return {}

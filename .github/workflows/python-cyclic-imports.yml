@@ -12,15 +12,15 @@ on:
       runner:
         description: Native validation runner
         type: choice
-        options: [ubuntu-24.04-arm, ubuntu-latest]
-        default: ubuntu-24.04-arm
+        options: [ubuntu-26.04-arm, ubuntu-latest]
+        default: ubuntu-26.04-arm
 
 permissions:
   contents: write
 
 jobs:
   validate:
-    runs-on: ${{ inputs.runner || 'ubuntu-24.04-arm' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-26.04-arm' }}
     timeout-minutes: 30
     env:
       UBS_NO_AUTO_UPDATE: '1'
@@ -119,7 +119,7 @@ jobs:
           records = []
           for name in changed:
               data = Path(name).read_bytes()
-              result = subprocess.run(['gh', 'api', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+              result = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
                                       input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
                                       text=True, capture_output=True, check=True, timeout=90)
               sha = json.loads(result.stdout)['sha']

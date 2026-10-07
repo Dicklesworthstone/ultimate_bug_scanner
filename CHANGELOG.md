@@ -8,6 +8,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Ruby request taint follows the actual return values of `map`/`collect`, `tap`/`each`, and `then`/`yield_self` blocks into outbound URL and filesystem sinks. Block assignments, `next`, `break`, parameter shadowing, and exceptional exits retain their selected value flow; clean mapping and replacement results no longer inherit discarded inputs.
+
+---
+
 ## [v5.4.19] - 2026-10-05 [Tag]
 
 ### Added

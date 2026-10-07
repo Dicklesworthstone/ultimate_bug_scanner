@@ -367,6 +367,9 @@ class RubyParser:
             value = token.value if token.kind == 'code' else ''
             if not depth and value in {'\n', ';', 'then', 'end', 'else', 'elsif', *stops}:
                 previous = self.tokens[self.position - 1].value if self.position > start else ''
+                if previous in {'.', '&.'} and value not in {'\n', ';'}:
+                    self.position += 1
+                    continue
                 if value == '\n' and previous in {'.', '&.', '&&', '||', '+', ',', '=', '\\'}:
                     self.position += 1
                     continue
@@ -1033,6 +1036,21 @@ class RubyEngine:
                 return {match.group(1): frozenset({'not-dot-name'})}
         return {}
 
+    def block_call(self, tokens):
+        """Identify bounded receiver/block return contracts in a statement."""
+        expression = ungroup(split_tokens(tokens, {'=', '+=', '-=', '||=', '&&='})[-1])
+        members = split_tokens(expression, {'.', '&.'})
+        if len(members) < 2 or not members[-1]:
+            return None
+        member = members[-1]
+        method = member[0].value
+        if method not in {'map', 'collect', 'each', 'tap', 'then', 'yield_self'}:
+            return None
+        if len(member) != 1 and token_text(member[1:]) != '()':
+            raise ValueError('Ruby block-call arguments need selected iterator binding; analysis is incomplete')
+        receiver = expression[:len(expression) - len(member) - 1]
+        return method, receiver, expression
+
     def graph(self, function):
         actions, edges = {}, {}
 
@@ -1109,6 +1127,47 @@ class RubyEngine:
                     false_guard = node('guard', tokens, (no if kind == 'if' else yes,), False)
                     targets = (true_guard,) if token_text(tokens) == 'true' else (false_guard,) if token_text(tokens) in {'false', 'nil'} else (true_guard, false_guard)
                     following = evaluate('condition', tokens, targets, exception_to)
+                elif kind == 'iterate' and self.block_call(tokens):
+                    method, receiver, expression = self.block_call(tokens)
+                    slot = '@iteration:' + str(tokens[0].start)
+                    names = statement.names
+                    separator = names.index(';') if ';' in names else len(names)
+                    parameters, locals_ = names[:separator], names[separator + 1:]
+                    names = (*parameters, *locals_)
+                    if any(not re.fullmatch(r'[a-z_]\w*', name) for name in names):
+                        raise ValueError('Ruby destructured block parameters need binding analysis; analysis is incomplete')
+                    saved = (slot, names)
+                    assign = node('block-assign', tokens, (following,), slot)
+                    finish = node('restore', targets=(assign,), extra=saved) if names else assign
+
+                    def leave(target):
+                        discarded = node('block-discard', targets=(target,), extra=slot)
+                        return node('restore', targets=(discarded,), extra=saved) if names else discarded
+
+                    return_target, raise_target = leave(return_to), leave(exception_to)
+                    output = node('block-result', targets=(finish,), extra=(slot, method, tokens[0].start))
+                    repeated = method in {'map', 'collect', 'each'}
+                    loop = node('branch') if repeated else output
+                    collected = node('block-collect', targets=(loop,), extra=(slot, method, tokens[0].start)) if repeated else output
+                    body = block(statement.body, collected, finish, collected,
+                                 return_target, raise_target, retry_to)
+                    bound = node('block-bind', targets=(body,), extra=(slot, parameters, locals_))
+                    if repeated:
+                        edges[loop] = (bound, output)
+                        # Literal nonempty arrays execute at least one block;
+                        # an empty array never evaluates the block body.
+                        plain = ungroup(receiver)
+                        if plain and plain[0].value == '[' and closing_token(plain, 0) == len(plain) - 1:
+                            entered = bound if plain[1:-1] else output
+                        else:
+                            entered = loop
+                    else:
+                        entered = bound
+                    start = node('block-enter', receiver, (entered,), (slot, method))
+                    possible_raise = node('exception', expression, (exception_to,))
+                    following = node('branch', targets=(start, possible_raise))
+                    if names:
+                        following = node('save', targets=(following,), extra=saved)
                 elif kind in {'while', 'until', 'for', 'iterate'}:
                     loop = node('branch')
                     after = node('nil', targets=(following,))
@@ -1148,6 +1207,37 @@ class RubyEngine:
             return following
 
         return block(function.body, exit_node), actions, edges
+
+    def assign(self, tokens, values, state):
+        """Commit ordinary and completed block-call results to local bindings."""
+        parts = split_tokens(tokens, {'=', '+=', '-=', '||=', '&&='})
+        offset = sum(len(part) + 1 for part in parts[:-1]) - 1
+        for lhs_group in reversed(parts[:-1]):
+            operator = tokens[offset].value
+            bindings = split_tokens(lhs_group, {','})
+            for index, lhs in enumerate(bindings):
+                if not lhs:
+                    continue
+                value = values[index] if index < len(values) else CLEAN
+                if len(bindings) == 1:
+                    value = join(*values)
+                elif len(values) == 1 and tainted(values[0]):
+                    # An unknown tuple/array can carry a request in any
+                    # destructured position; literal packs bind exactly.
+                    value = values[0]
+                if len(lhs) == 1 and re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*', lhs[0].value):
+                    name = lhs[0].value
+                    if operator != '=':
+                        value = retag(join(state.get(name, CLEAN), value), remove=VALUE_TAGS)
+                    if (name.startswith(('@', '$')) or name[0].isupper()) and tainted(value):
+                        raise ValueError('Request-derived Ruby instance/global state needs heap analysis; analysis is incomplete')
+                    state[name] = advance(value, self.step(lhs[0].start, 'assign', name))
+                else:
+                    name = lhs[0].value
+                    self.mutate(state.get(name, CLEAN), value, state, name)
+            offset -= len(lhs_group) + 1
+        state['@result'] = join(*values)
+        return state
 
     def transfer(self, action, state):
         kind, tokens, extra = action
@@ -1265,6 +1355,47 @@ class RubyEngine:
         if kind == 'condition':
             self.expression(tokens, state)
             return state
+        if kind == 'block-enter':
+            slot, method = extra
+            value = self.expression(tokens, state)
+            instances = {trace.key[0] for trace in value if trace.kind == 'instance'}
+            if self.candidates(token_text(tokens) + '.' + method, 0) or any(
+                    not function.scope and not function.singleton and function.name == method
+                    and function.owner in instances for function in self.parser.functions.values()):
+                raise ValueError('Overridden Ruby block methods need callback dispatch analysis; analysis is incomplete')
+            state[slot + ':receiver'] = advance(value, self.step(tokens[0].start, 'call', method + '()'))
+            state[slot + ':values'] = shape('mapped-list', tokens[0].start)
+            return state
+        if kind == 'block-bind':
+            slot, parameters, locals_ = extra
+            for name in parameters:
+                state[name] = state.get(slot + ':receiver', CLEAN)
+            for name in locals_:
+                state[name] = constant('nil', 'code')
+            state['@result'] = constant('nil', 'code')
+            return state
+        if kind == 'block-collect':
+            slot, method, offset = extra
+            if method in {'map', 'collect'}:
+                value = advance(state.get('@result', CLEAN), self.step(offset, 'return', method + ' block result'))
+                state[slot + ':values'] = join(state.get(slot + ':values', CLEAN), value)
+            return state
+        if kind == 'block-result':
+            slot, method, offset = extra
+            if method in {'map', 'collect'}:
+                value = state.get(slot + ':values', CLEAN)
+            elif method in {'each', 'tap'}:
+                value = state.get(slot + ':receiver', CLEAN)
+            else:
+                value = state.get('@result', CLEAN)
+            state['@result'] = advance(value, self.step(offset, 'return', method + ' block result'))
+            return state
+        if kind in {'block-assign', 'block-discard'}:
+            state.pop(extra + ':receiver', None)
+            state.pop(extra + ':values', None)
+            if kind == 'block-assign':
+                return self.assign(tokens, [state.get('@result', CLEAN)], state)
+            return state
         parts = split_tokens(tokens, {'=', '+=', '-=', '||=', '&&='})
         if len(parts) > 1 and parts[0]:
             rhs = ungroup(parts[-1])
@@ -1272,32 +1403,7 @@ class RubyEngine:
             if multiple and rhs and rhs[0].value == '[' and closing_token(rhs, 0) == len(rhs) - 1:
                 rhs = rhs[1:-1]
             values = [self.expression(part, state) for part in split_tokens(rhs, {','})]
-            offset = sum(len(part) + 1 for part in parts[:-1]) - 1
-            for lhs_group in reversed(parts[:-1]):
-                operator = tokens[offset].value
-                bindings = split_tokens(lhs_group, {','})
-                for index, lhs in enumerate(bindings):
-                    if not lhs:
-                        continue
-                    value = values[index] if index < len(values) else CLEAN
-                    if len(bindings) == 1:
-                        value = join(*values)
-                    elif len(values) == 1 and tainted(values[0]):
-                        # An unknown tuple/array can carry a request in any
-                        # destructured position; literal packs bind exactly.
-                        value = values[0]
-                    if len(lhs) == 1 and re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*', lhs[0].value):
-                        name = lhs[0].value
-                        if operator != '=':
-                            value = retag(join(state.get(name, CLEAN), value), remove=VALUE_TAGS)
-                        if (name.startswith(('@', '$')) or name[0].isupper()) and tainted(value):
-                            raise ValueError('Request-derived Ruby instance/global state needs heap analysis; analysis is incomplete')
-                        state[name] = advance(value, self.step(lhs[0].start, 'assign', name))
-                    else:
-                        name = lhs[0].value
-                        value = self.mutate(state.get(name, CLEAN), value, state, name)
-                offset -= len(lhs_group) + 1
-            state['@result'] = join(*values)
+            return self.assign(tokens, values, state)
         else:
             state['@result'] = self.expression(tokens, state)
         return state

@@ -312,6 +312,91 @@ CASES = (
         target = params[:url] # ubs:ignore
 
         Net::HTTP.get(URI.parse(target))''', (3,)),
+    # Ruby's return contracts are independent of the block's last expression:
+    # tap/each return their receiver, map/collect return the mapped values,
+    # and then/yield_self return the single block result.
+    Case('url_map_result_reaches_sink', URL, '''
+        targets = [params[:url]].map { |value| value }
+        Net::HTTP.get(URI.parse(targets.first))''', (2,)),
+    Case('url_collect_result_reaches_sink', URL, '''
+        targets = [params[:url]].collect { |value| value }
+        Net::HTTP.get(URI.parse(targets.first))''', (2,)),
+    Case('url_map_constant_result_is_clean', URL, '''
+        targets = [params[:url]].map { |value| 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(targets.first))''', ()),
+    Case('url_map_body_source_reaches_sink', URL, '''
+        targets = [1].map do |value|
+          params[:url]
+        end
+        Net::HTTP.get(URI.parse(targets.first))''', (4,)),
+    Case('url_map_next_value_reaches_sink', URL, '''
+        targets = [params[:url]].map do |value|
+          next value
+          'https://api.example.com/health'
+        end
+        Net::HTTP.get(URI.parse(targets.first))''', (5,)),
+    Case('url_map_next_constant_is_clean', URL, '''
+        targets = [params[:url]].map do |value|
+          next 'https://api.example.com/health'
+          value
+        end
+        Net::HTTP.get(URI.parse(targets.first))''', ()),
+    Case('url_map_branch_keeps_unsafe_result', URL, '''
+        targets = [params[:url]].map do |value|
+          if healthy
+            'https://api.example.com/health'
+          else
+            value
+          end
+        end
+        Net::HTTP.get(URI.parse(targets.first))''', (8,)),
+    Case('url_tap_returns_receiver', URL, '''
+        target = params[:url].tap { |value| puts value }
+        Net::HTTP.get(URI.parse(target))''', (2,)),
+    Case('url_tap_ignores_clean_block_result', URL, '''
+        target = params[:url].tap { |value| 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(target))''', (2,)),
+    Case('url_tap_ignores_tainted_block_result', URL, '''
+        target = 'https://api.example.com/health'.tap { |value| params[:url] }
+        Net::HTTP.get(URI.parse(target))''', ()),
+    Case('url_tap_rebind_does_not_replace_receiver', URL, '''
+        target = params[:url].tap do |value|
+          value = 'https://api.example.com/health'
+        end
+        Net::HTTP.get(URI.parse(target))''', (4,)),
+    Case('url_each_returns_original_values', URL, '''
+        targets = [params[:url]].each { |value| 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(targets.first))''', (2,)),
+    Case('url_each_ignores_tainted_block_result', URL, '''
+        targets = ['https://api.example.com/health'].each { |value| params[:url] }
+        Net::HTTP.get(URI.parse(targets.first))''', ()),
+    Case('url_then_returns_block_value', URL, '''
+        target = 1.then { |value| params[:url] }
+        Net::HTTP.get(URI.parse(target))''', (2,)),
+    Case('url_then_constant_result_is_clean', URL, '''
+        target = params[:url].then { |value| 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(target))''', ()),
+    Case('url_yield_self_returns_block_value', URL, '''
+        target = 1.yield_self { |value| params[:url] }
+        Net::HTTP.get(URI.parse(target))''', (2,)),
+    Case('url_block_result_overwrites_previous_value', URL, '''
+        target = params[:url]
+        target = 1.then { |value| 'https://api.example.com/health' }
+        Net::HTTP.get(URI.parse(target))''', ()),
+    Case('url_block_parameter_preserves_outer_binding', URL, '''
+        value = 'https://api.example.com/health'
+        targets = [params[:url]].map { |value| value }
+        Net::HTTP.get(URI.parse(value))
+        Net::HTTP.get(URI.parse(targets.first))''', (4,)),
+    Case('path_map_result_reaches_sink', PATH, '''
+        targets = [params[:file]].map { |value| value }
+        File.read(targets.first)''', (2,)),
+    Case('path_tap_returns_receiver', PATH, '''
+        target = params[:file].tap { |value| puts value }
+        File.read(target)''', (2,)),
+    Case('path_then_constant_result_is_clean', PATH, '''
+        target = params[:file].then { |value| '/srv/app/files/health.txt' }
+        File.read(target)''', ()),
     Case('path_direct', PATH, 'File.read(params[:file])', (1,)),
     Case('path_safe_named_identity', PATH, '''
         def safe_path(value)
@@ -715,6 +800,23 @@ class RubyPublicTests(LoggedCase):
             self.assert_findings(result, payload, case, 'json', target)
             profile = payload['scanners'][0]['extras']['profile']
             self.assertEqual(profile['cache_hits'], int(index in (1, 3)), payload)
+
+    def test_block_return_contracts_reach_json_and_sarif(self):
+        names = ('url_map_result_reaches_sink', 'url_map_constant_result_is_clean',
+                 'url_map_next_value_reaches_sink', 'url_tap_returns_receiver',
+                 'url_tap_ignores_tainted_block_result', 'url_each_returns_original_values',
+                 'url_then_returns_block_value', 'url_then_constant_result_is_clean',
+                 'path_map_result_reaches_sink', 'path_tap_returns_receiver')
+        for name in names:
+            case = BY_NAME[name]
+            directory = self.artifact / name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=name, format=fmt):
+                    result, payload = self.scan(directory / fmt, target, fmt)
+                    self.assert_findings(result, payload, case, fmt, target)
 
     def test_malformed_source_remains_partial_on_repeated_scans(self):
         directory = self.artifact / 'malformed-public'

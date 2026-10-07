@@ -100,20 +100,26 @@ jobs:
           diff --git a/ubs b/ubs
           --- a/ubs
           +++ b/ubs
-          @@ -28,4 +28,4 @@
+          @@ -28,7 +28,7 @@
            shopt -s lastpipe || true
            trap '' SIGPIPE 2>/dev/null || true
            
           -UBS_VERSION="5.4.28"
           +UBS_VERSION="5.4.29"
+           # The optional service is a release executable, not a command trusted via PATH.
+           # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
+           UBS_DAEMON_SHA256="5016469099336eb215179a04d432643e00fdde653a01481c55d4e2861c2e0ad7"
           diff --git a/README.md b/README.md
           --- a/README.md
           +++ b/README.md
-          @@ -10,3 +10,3 @@
+          @@ -10,6 +10,6 @@
            [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
            [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
           -[![Version](https://img.shields.io/badge/version-5.4.28-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
           +[![Version](https://img.shields.io/badge/version-5.4.29-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+           
+           <div align="center">
+           
           '''
           subprocess.run(['git', 'apply', '--check', '-'], input=version_patch, text=True, check=True)
           subprocess.run(['git', 'apply', '-'], input=version_patch, text=True, check=True)
@@ -170,7 +176,7 @@ jobs:
         run: |
           tar -xzf "$RUNNER_TEMP/candidate/completion-candidate.tar.gz" -C "$GITHUB_WORKSPACE"
           git init -b main
-          git add .
+          git add -f .
           git -c user.name=Validation -c user.email=validation@localhost commit -m 'Local validation snapshot, not published'
           python3 - <<'PY'
           import json, os, subprocess
@@ -188,6 +194,7 @@ jobs:
           for suite in test_python_completion.py test_python_suppression.py test_python_precision.py test_cache.py test_python_command_injection_dataflow.py test_lifecycle_py_bindings.py; do
             python3 -B -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/completion-$suite.log"
           done
+          PYTHONPATH=modules/helpers:test-suite/quality python3 -B -m unittest test_ubs_core.PythonTaintDataflowTests test_ubs_core.AstIngestionTests -v 2>&1 | tee "$RUNNER_TEMP/completion-core.log"
           python3 test-suite/run_manifest.py --case python-resource-lifecycle --case python-suppression-intervals-markers --case python-suppression-intervals-nomarkers 2>&1 | tee "$RUNNER_TEMP/completion-manifest.log"
       - name: Verify integrity and scan changed production sources
         run: |

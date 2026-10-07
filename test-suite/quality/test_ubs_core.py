@@ -2915,6 +2915,89 @@ class JVMRedirectBindingTests(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix='jvm-bindings-', dir=artifacts))
 
     @staticmethod
+    def path_operand_cases(lang):
+        java = lang == 'java'
+
+        def program(body):
+            header = ('void handle(Request request, Path root)' if java else
+                      'fun handle(request: Request, root: Path)')
+            return 'class PathOperands {\n  ' + header + ' {\n' + body + '\n  }\n}\n'
+
+        string = 'String' if java else 'var'
+        path_type = 'Path' if java else 'val'
+        getters = (
+            ('path', 'Paths.get(request.getParameter("file")).getFileName().toString()' if java else
+             'Path.of(request.getParameter("file")).fileName.toString()'),
+            ('file', 'new File(request.getParameter("file")).getName()' if java else
+             'File(request.getParameter("file")).name'),
+        )
+        reject = 'throw ' + ('new ' if java else '') + 'IllegalArgumentException("dot directory");'
+        for getter, expression in getters:
+            source = '    ' + string + ' leaf = ' + expression + ';\n'
+            checks = 'leaf.equals(".") || leaf.equals("..")' if java else 'leaf == "." || leaf == ".."'
+            guard = '    if (' + checks + ') { ' + reject + ' }\n'
+            yield 'basename-' + getter + '-terminal-files', program(source +
+                '    Files.readString(root.resolve(leaf));\n'
+                '    Files.writeString(root.resolve(leaf), request.getParameter("body"));\n'
+                '    Files.copy(Path.of("/srv/source.txt"), root.resolve(leaf));')
+            yield 'basename-' + getter + '-child-component', program(source +
+                '    Files.readString(root.resolve(leaf).resolve("secret.txt")); // unsafe')
+            yield 'basename-' + getter + '-directory-walk', program(source +
+                '    Files.walk(root.resolve(leaf)); // unsafe\n'
+                '    Files.list(root.resolve(leaf)); // unsafe\n'
+                '    Files.newDirectoryStream(root.resolve(leaf)); // unsafe')
+            yield 'basename-' + getter + '-checked-directory', program(source + guard +
+                '    Files.walk(root.resolve(leaf));\n'
+                '    Files.newDirectoryStream(root.resolve(leaf));')
+            yield 'basename-' + getter + '-partial-rejection', program(source +
+                '    if (' + ('leaf.equals(".")' if java else 'leaf == "."') + ') { ' + reject + ' }\n'
+                '    Files.walk(root.resolve(leaf)); // unsafe')
+            yield 'basename-' + getter + '-unknown-transform', program(source +
+                '    Files.readString(root.resolve(change(leaf))); // unsafe')
+            yield 'basename-' + getter + '-real-path-is-absolute', program(source +
+                '    Files.readString(root.resolve(Path.of(leaf).toRealPath())); // unsafe')
+            yield 'basename-' + getter + '-canonical-path-is-absolute', program(source +
+                '    Files.readString(root.resolve(' + ('new ' if java else '') +
+                'File(leaf).getCanonicalPath())); // unsafe')
+            yield 'basename-' + getter + '-changed-after-guard', program(source + guard +
+                '    leaf = request.getParameter("other");\n'
+                '    Files.readString(root.resolve(leaf)); // unsafe')
+            yield 'basename-' + getter + '-directory-concatenation', program(source +
+                '    Files.readString(Path.of("/srv/uploads/" + leaf + "/secret.txt")); // unsafe')
+
+        yield 'write-string-content-is-not-path', program(
+            '    Files.writeString(Path.of("/srv/content.txt"), request.getParameter("body"));')
+        yield 'unknown-resolve-cannot-create-path-type', program(
+            '    Files.readString(Path.of(change(request.getParameter("file")).resolve("fixed").getFileName())); // unsafe')
+        yield 'actual-path-resolve-retains-path-type', program(
+            '    Files.readString(Path.of(request.getParameter("file")).resolve("fixed").getFileName());')
+        yield 'write-bytes-content-is-not-path', program(
+            '    Files.write(Path.of("/srv/content.bin"), request.getParameter("body").' +
+            ('getBytes()' if java else 'toByteArray()') + ');')
+        yield 'write-result-preserves-only-path', program(
+            '    ' + path_type + ' written = Files.writeString(Path.of("/srv/content.txt"), request.getParameter("body"));\n'
+            '    Files.readString(written);')
+        yield 'write-unsafe-path-and-return', program(
+            '    ' + path_type + ' written = Files.writeString(Path.of(request.getParameter("file")), "fixed"); // unsafe\n'
+            '    Files.readString(written); // unsafe')
+        yield 'copy-and-move-both-path-operands', program(
+            '    Files.copy(Path.of(request.getParameter("source")), Path.of("/srv/target")); // unsafe\n'
+            '    Files.copy(Path.of("/srv/source"), Path.of(request.getParameter("target"))); // unsafe\n'
+            '    Files.move(Path.of(request.getParameter("source")), Path.of("/srv/target")); // unsafe\n'
+            '    Files.move(Path.of("/srv/source"), Path.of(request.getParameter("target"))); // unsafe')
+        yield 'random-access-mode-is-not-path', program(
+            '    ' + ('new ' if java else '') + 'RandomAccessFile("/srv/content.bin", request.getParameter("mode"));')
+        if java:
+            yield 'path-equals-string-is-not-dot-rejection', program(
+                '    Path leaf = Paths.get(request.getParameter("file")).getFileName();\n'
+                '    if (leaf.equals(".") || leaf.equals("..")) { ' + reject + ' }\n'
+                '    Files.walk(root.resolve(leaf)); // unsafe')
+            yield 'path-rendered-dot-rejection', program(
+                '    Path leaf = Paths.get(request.getParameter("file")).getFileName();\n'
+                '    if (leaf.toString().equals(".") || leaf.toString().equals("..")) { ' + reject + ' }\n'
+                '    Files.walk(root.resolve(leaf));')
+
+    @staticmethod
     def cases(lang):
         java = lang == 'java'
         def program(helper, body):
@@ -3080,6 +3163,9 @@ fun handler(request: Request, response: Response) {
   response.sendRedirect(target)
 }
 ''', 'open_redirect', {9}
+        for label, code in JVMRedirectBindingTests.path_operand_cases(lang):
+            expected = {line for line, text in enumerate(code.splitlines(), 1) if '// unsafe' in text}
+            yield label, code, 'path_traversal', expected
 
     def scan(self, code, lang='java', domain='open_redirect'):
         from ubs_core.registry import RunContext
@@ -3135,6 +3221,62 @@ class PathGuardOracle { public static void main(String[] args) throws Exception 
         }, indent=2))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.strip(), 'string prefix admits sibling; chained transform escapes root')
+
+    def test_basename_leaf_and_directory_semantics_with_real_java(self):
+        if shutil.which('java') is None:
+            self.skipTest('Java runtime unavailable for the independent basename API oracle')
+        oracle = self.root / 'BasenameOperandOracle.java'
+        oracle.write_text('''import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+class BasenameOperandOracle {
+  public static void main(String[] args) throws Exception {
+    Path sandbox = Path.of(args[0]).toAbsolutePath();
+    Path root = Files.createDirectories(sandbox.resolve("uploads"));
+    Path secret = sandbox.resolve("secret.txt");
+    Files.writeString(secret, "outside the upload root");
+    for (String dot : new String[]{".", ".."}) {
+      if (!Path.of(dot).getFileName().toString().equals(dot)) throw new AssertionError();
+      if (!new File(dot).getName().equals(dot)) throw new AssertionError();
+      Path leaf = root.resolve(Path.of(dot).getFileName());
+      try { Files.readString(leaf); throw new AssertionError("directory read as file"); }
+      catch (IOException expected) { }
+      try { Files.writeString(leaf, "must not write a directory"); throw new AssertionError("directory written as file"); }
+      catch (IOException expected) { }
+    }
+    Path parent = root.resolve(Path.of("..").getFileName());
+    if (!Files.readString(parent.resolve("secret.txt")).equals("outside the upload root")) throw new AssertionError();
+    try (var paths = Files.walk(parent)) {
+      if (!paths.anyMatch(path -> path.toAbsolutePath().normalize().equals(secret))) throw new AssertionError();
+    }
+    Path fixed = root.resolve("content.txt");
+    Path returned = Files.writeString(fixed, "../this-is-content");
+    if (!returned.equals(fixed) || !Files.readString(returned).equals("../this-is-content")) throw new AssertionError();
+    Path localSecret = Files.writeString(Path.of("basename-secret.txt"), "absolute path escapes");
+    String name = localSecret.getFileName().toString();
+    for (Path absolute : new Path[]{Path.of(name).toRealPath(), new File(name).getCanonicalFile().toPath()}) {
+      Path escaped = root.resolve(absolute);
+      if (!absolute.isAbsolute() || escaped.startsWith(root)) throw new AssertionError();
+      if (!Files.readString(escaped).equals("absolute path escapes")) throw new AssertionError();
+    }
+    if (root.resolve(new File(name).getCanonicalPath()).startsWith(root)) throw new AssertionError();
+    if (!root.resolve(Path.of(name).normalize()).startsWith(root)) throw new AssertionError();
+    System.out.println("dot leaves are directories; child and walk escape; write content does not select path");
+  }
+}''', encoding='utf-8')
+        command = ['java', str(oracle), str(self.root / 'java-basename-oracle')]
+        started = time.monotonic()
+        proc = subprocess.run(command, cwd=self.root, capture_output=True, text=True, timeout=30)
+        (self.root / 'basename-api.stdout.log').write_text(proc.stdout)
+        (self.root / 'basename-api.stderr.log').write_text(proc.stderr)
+        (self.root / 'basename-api.identity.json').write_text(json.dumps({
+            'command': command, 'source_sha256': hashlib.sha256(oracle.read_bytes()).hexdigest(),
+            'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+        }, indent=2))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(),
+                         'dot leaves are directories; child and walk escape; write content does not select path')
 
     def test_selected_helpers_recursion_loops_and_scope_isolation(self):
         code = '''class Flow {

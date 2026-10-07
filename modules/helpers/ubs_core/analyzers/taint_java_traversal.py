@@ -52,9 +52,16 @@ SINK_RE = re.compile(
     r'|\b(?:new\s+File|File|Paths\.get|Path\.of)\s*\('
     r'|\.\s*resolve\s*\('
     r'|\bFiles\.(?:readAllBytes|readString|readAllLines|write|writeString|copy|move|delete|deleteIfExists|'
-    r'newInputStream|newOutputStream|createDirectories|createFile|size|exists)\s*\('
+    r'newInputStream|newOutputStream|createDirectories|createFile|size|exists|walk|walkFileTree|'
+    r'list|newDirectoryStream|find)\s*\('
     r'|\b(?:sendFile|send_file|serveFile|serve_file|writeFileResponse|respondFile|respondLocalFile)\s*\(',
 )
+
+BASENAME_TAGS = frozenset({'basename-path', 'basename-not-dot', 'basename-not-dotdot'})
+PATH_PROOF_TAGS = frozenset({'contained-path', 'canonical-path'}) | BASENAME_TAGS
+FILE_LEAF_METHODS = frozenset({'readAllBytes', 'readString', 'readAllLines', 'write', 'writeString',
+                               'newInputStream', 'newOutputStream', 'createFile'})
+FILE_CONSTRUCTORS = frozenset({'FileInputStream', 'FileOutputStream', 'FileReader', 'FileWriter', 'RandomAccessFile'})
 
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
@@ -478,8 +485,16 @@ class Engine:
     def source(self, offset, label):
         return frozenset({Trace('source', (str(self.path), offset, label), evidence=(self.step(offset, 'source', label),))})
 
-    def record(self, offset, value):
-        unsafe = frozenset(trace for trace in value if 'contained-path' not in trace.tags)
+    def safe_sink_trace(self, trace):
+        tags = trace.tags
+        return 'contained-path' in tags or ('basename-path' in tags and (
+            {'basename-not-dot', 'basename-not-dotdot'} <= tags or
+            'file-leaf-sink' in tags or 'path-construction' in tags))
+
+    def record(self, offset, value, file_leaf=False):
+        if file_leaf:
+            value = retag(value, add=frozenset({'file-leaf-sink'}))
+        unsafe = frozenset(trace for trace in value if not self.safe_sink_trace(trace))
         if unsafe:
             self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', self.sink_label)))
 
@@ -516,42 +531,97 @@ class Engine:
         inferred = bool(re.match(re.escape(root) + r'\s*=\s*(?:Paths\.get|Path\.of|File)\s*\(', tail))
         return (declared or inferred) and all(self.builtin_type(name) for name in ('Path', 'Paths', 'File'))
 
+    def files_call(self, name, bindings):
+        owner = name.rpartition('.')[0]
+        return ((owner == 'java.nio.file.Files' and 'java' not in bindings) or
+                (owner == 'Files' and 'Files' not in bindings and self.builtin_type('Files')))
+
+    def joined_path(self, receiver, arguments):
+        # A basename is a leaf only in the final component. Moving it into a
+        # directory position must retain the dependency without the leaf proof:
+        # getFileName("..") followed by a child can escape the intended root.
+        result = retag(receiver, remove=PATH_PROOF_TAGS)
+        for index, argument in enumerate(arguments):
+            remove = PATH_PROOF_TAGS - BASENAME_TAGS if index == len(arguments) - 1 else PATH_PROOF_TAGS
+            result = join(result, retag(argument, remove=remove))
+        return retag(result, add=frozenset({'jvm-path'}), remove=frozenset({'jvm-string'}))
+
     def external_call(self, name, arguments, value, offset, bindings, state):
         root, _, method = name.rpartition('.')
         if name in {'File', 'Path.of', 'Paths.get'} and self.builtin_type(name.split('.')[0]) and name.split('.')[0] not in bindings:
-            return retag(value, add=frozenset({'jvm-path'}))
-        if method == 'resolve':
+            if len(arguments) > 1:
+                return self.joined_path(CLEAN, arguments)
+            return retag(value, add=frozenset({'jvm-path'}), remove=frozenset({'jvm-string'}))
+        if self.files_call(name, bindings) and method in {'write', 'writeString'} and arguments:
+            # Both APIs return the path operand, never the bytes/characters
+            # written to it. Content taint must not become a later path flow.
+            return retag(arguments[0], add=frozenset({'jvm-path'}))
+        if method in {'resolve', 'resolveSibling'}:
             if self.path_receiver(root, bindings, state):
-                return retag(value, add=frozenset({'jvm-path'}), remove=frozenset({'contained-path', 'canonical-path'}))
+                receiver = state.get(bindings.get(root, root), CLEAN)
+                return self.joined_path(receiver, arguments)
         if method in {'getFileName', 'getName'} and not arguments:
             if self.path_receiver(root, bindings, state):
-                return CLEAN
+                return retag(value, add=frozenset({'jvm-path'}))
         if method in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'} and not arguments and self.path_receiver(root, bindings, state):
             return retag(value, add=frozenset({'jvm-path'}))
         if method in {'toString', 'toFile'} and not arguments:
             return value
-        return retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
+        return retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
 
-    def member_value(self, name, value, offset, arguments=None, direct_call=False):
+    def member_value(self, name, value, offset, arguments=None, direct_call=False, receiver=CLEAN):
         if arguments and name in {'getFileName', 'getName', 'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile', 'toString', 'toFile'}:
-            return retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
+            return retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
         if name in {'getFileName', 'getName', 'fileName', 'name'}:
-            return CLEAN if all('jvm-path' in trace.tags for trace in value) else value
+            if all('jvm-path' in trace.tags for trace in value):
+                rendered = name in {'getName', 'name'}
+                return retag(value, add=frozenset({'basename-path', 'jvm-string' if rendered else 'jvm-path'}),
+                             remove=PATH_PROOF_TAGS | frozenset({'jvm-path' if rendered else 'jvm-string'}))
+            return value
         if name in {'toString', 'getCanonicalPath'}:
-            return retag(value, remove=frozenset({'jvm-path', 'canonical-path'}))
-        if name in {'normalize', 'toRealPath', 'getCanonicalPath', 'getCanonicalFile'}:
+            remove = frozenset({'jvm-path', 'canonical-path'})
+            if name == 'getCanonicalPath':
+                remove |= BASENAME_TAGS
+            return retag(value, add=frozenset({'jvm-string'}), remove=remove)
+        if name in {'normalize', 'toRealPath', 'getCanonicalFile'}:
+            if name != 'normalize':
+                # These APIs return absolute paths. A formerly relative leaf
+                # can then override a root passed to Path.resolve().
+                value = retag(value, remove=BASENAME_TAGS)
             return join(*(retag(frozenset({trace}), add=frozenset({'canonical-path'}))
                           if 'jvm-path' in trace.tags else frozenset({trace}) for trace in value))
         if name in {'resolve', 'resolveSibling'}:
-            return retag(value, remove=frozenset({'contained-path', 'canonical-path'}))
+            if direct_call:
+                return value
+            if arguments is not None and receiver and all('jvm-path' in trace.tags for trace in receiver):
+                return self.joined_path(receiver, arguments)
+            return retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
         if name == 'toFile':
             return value
         # The first qualified call was checked by external_call. A later
         # member in a fluent chain has no such receiver/API proof: an unknown
         # transformation must not carry containment or Path identity forward.
-        return value if direct_call else retag(value, remove=frozenset({'contained-path', 'canonical-path', 'jvm-path'}))
+        return value if direct_call else retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
 
-    def call_sink(self, name, spans, arguments, value, offset, argument_names=()):
+    def call_sink(self, name, spans, arguments, value, offset, argument_names=(), bindings=None):
+        bindings = {} if bindings is None else bindings
+        if self.files_call(name, bindings) and self.sink_re.search(name + '('):
+            method = name.rsplit('.', 1)[-1]
+            indexes = (0, 1) if method in {'copy', 'move'} else (0,)
+            for index in indexes:
+                if index < len(arguments):
+                    # A two-argument copy cannot replace an existing directory
+                    # target. Its source remains potentially directory-capable.
+                    leaf = method in FILE_LEAF_METHODS or (method == 'copy' and index == 1 and len(arguments) == 2)
+                    self.record(offset, arguments[index], file_leaf=leaf)
+            return False
+        owner, _, constructor = name.rpartition('.')
+        constructor = constructor or name
+        if (constructor in FILE_CONSTRUCTORS and arguments and
+                ((owner == 'java.io' and 'java' not in bindings) or
+                 (not owner and constructor not in bindings and self.builtin_type(constructor)))):
+            self.record(offset, arguments[0], file_leaf=True)
+            return False
         if self.sink_re.search(name + '('):
             if name in {'File', 'Path.of', 'Paths.get'} or name.endswith('.resolve'):
                 return True
@@ -561,14 +631,54 @@ class Engine:
     def summary_effect(self, summary, fact):
         # Construction diagnostics are retained unless this selected helper
         # proves containment for every return of the same symbolic value.
-        return frozenset(trace for trace in fact if 'path-construction' not in trace.tags or not (
+        return frozenset(trace for trace in fact if not self.safe_sink_trace(trace)
+            and ('path-construction' not in trace.tags or not (
             (matches := [item for item in summary.returned if item.kind == trace.kind and item.key == trace.key])
-            and all('contained-path' in item.tags for item in matches)))
+            and all('contained-path' in item.tags for item in matches))))
 
     def summary_return(self, fact, offset):
         return fact
 
     def guard_facts(self, span):
+        start, end = span
+        while start < end and self.text[start].isspace():
+            start += 1
+        while end > start and self.text[end - 1].isspace():
+            end -= 1
+        if self.code[start:start + 1] == '(' and self.parser.pairs.get(start) == end - 1:
+            return self.guard_facts((start + 1, end - 1))
+        for operator, truth in (('||', False), ('&&', True)):
+            cursor, beginning, parts = start, start, []
+            while cursor < end:
+                if cursor in self.parser.pairs:
+                    cursor = self.parser.pairs[cursor] + 1
+                elif self.code.startswith(operator, cursor):
+                    parts.append((beginning, cursor))
+                    cursor += 2
+                    beginning = cursor
+                else:
+                    cursor += 1
+            if parts:
+                parts.append((beginning, end))
+                return [(truth, guard) for part in parts for positive, guard in self.guard_facts(part) if positive == truth]
+        if self.code[start:start + 1] == '!':
+            return [(not truth, guard) for truth, guard in self.guard_facts((start + 1, end))]
+        raw = self.text[start:end].strip()
+        dot = re.fullmatch(r'([A-Za-z_]\w*)(\.toString\(\))?\.equals\(\s*"(\.\.?)"\s*\)', raw)
+        constant_dot = re.fullmatch(r'"(\.\.?)"\.equals\(\s*([A-Za-z_]\w*)(\.toString\(\))?\s*\)', raw)
+        kotlin_dot = re.fullmatch(r'([A-Za-z_]\w*)(\.toString\(\))?\s*(==|!=)\s*"(\.\.?)"', raw) if self.parser.kotlin else None
+        if dot or constant_dot or kotlin_dot:
+            if dot:
+                name, rendered, literal = dot.groups()
+                truth = False
+            elif constant_dot:
+                literal, name, rendered = constant_dot.groups()
+                truth = False
+            else:
+                name, rendered, operator, literal = kotlin_dot.groups()
+                truth = operator == '!='
+            tag = 'basename-not-dot' if literal == '.' else 'basename-not-dotdot'
+            return [(truth, ('basename', name, tag, bool(rendered)))]
         condition = self.code[slice(*span)].strip()
         # File.getCanonicalPath() returns String. Its startsWith() accepts
         # sibling names such as /srv/uploads-evil and cannot prove containment.
@@ -579,6 +689,13 @@ class Engine:
         return []
 
     def apply_guard(self, guard, state, bindings):
+        if len(guard) == 4 and guard[0] == 'basename':
+            _, name, tag, rendered = guard
+            binding = bindings.get(name, name)
+            state[binding] = join(*(retag(frozenset({trace}), add=frozenset({tag}))
+                if 'basename-path' in trace.tags and ('jvm-string' in trace.tags or rendered and 'jvm-path' in trace.tags)
+                else frozenset({trace}) for trace in state.get(binding, CLEAN)))
+            return state
         name, canonical, root = guard
         binding = bindings.get(name, name)
         root_fact = state.get(bindings.get(root, root), CLEAN)
@@ -685,7 +802,7 @@ class Engine:
                             self.escapes[site] = join(self.escapes.get(site, CLEAN), substitute(fact, bound, call))
                     atom = returned
                 else:
-                    if self.call_sink(name, spans, arguments, atom, offset, argument_names):
+                    if self.call_sink(name, spans, arguments, atom, offset, argument_names, bindings):
                         constructor = offset
                     atom = self.external_call(name, arguments, atom, offset, bindings, state)
                 cursor = close + 1
@@ -705,15 +822,16 @@ class Engine:
                 elif member:
                     method = member.group(1)
                     arguments = None
+                    receiver = atom
                     cursor = self.parser.skip(tail + member.end(), end)
                     if cursor < end and self.code[cursor] == '(':
                         close = self.parser.pairs[cursor]
                         spans, argument_names, arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
                         atom = join(atom, *arguments)
-                        if self.call_sink('.' + method, spans, arguments, atom, tail, argument_names):
+                        if self.call_sink('.' + method, spans, arguments, atom, tail, argument_names, bindings):
                             constructor = tail
                         cursor = close + 1
-                    atom = self.member_value(method, atom, tail, arguments)
+                    atom = self.member_value(method, atom, tail, arguments, receiver=receiver)
                     if method == 'resolve' and self.path_constructors:
                         constructor = tail
                 else:
@@ -722,7 +840,7 @@ class Engine:
                 self.record(constructor, retag(atom, add=frozenset({'path-construction'})))
             value = join(value, atom)
         if '+' in self.code[start:end]:
-            value = retag(value, remove=frozenset({'contained-path', 'canonical-path'}))
+            value = retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
         return value
 
     def assignment(self, span):
@@ -898,7 +1016,7 @@ class Engine:
             fact = self.expression(low, high, state, reads)
             if operator == '+=':
                 fact = join(state.get(reads.get(name, name), CLEAN), fact)
-                fact = retag(fact, remove=frozenset({'contained-path', 'canonical-path'}))
+                fact = retag(fact, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
             fact = advance(fact, self.step(offset, 'assign', name))
             binding = bindings.get(name, name)
             if binding.startswith('capture:') and fact:

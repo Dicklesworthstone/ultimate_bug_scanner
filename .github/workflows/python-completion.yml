@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-slim
+    runs-on: macos-latest
     timeout-minutes: 15
     permissions:
       contents: write
@@ -20,6 +20,12 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Ensure the required Bash runtime for the existing integrity gates
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: |
+          if ! test -x "$(brew --prefix)/bin/bash"; then brew install bash; fi
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: Assemble the reviewed source and complete integrity closure
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,30 +56,67 @@ jobs:
           def blob_id(data):
               return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
 
+          def apply_transport(name, hashes, digest):
+              chunks = []
+              for sha in hashes:
+                  data = base64.b64decode(api('blobs/' + sha)['content'])
+                  assert blob_id(data) == sha
+                  chunks.append(data)
+              compressed = b''.join(chunks)
+              assert hashlib.sha256(compressed).hexdigest() == digest
+              target = root / name
+              target.write_bytes(gzip.decompress(compressed))
+              subprocess.run(['git', 'apply', '--check', str(target)], check=True)
+              subprocess.run(['git', 'apply', str(target)], check=True)
+
           root = Path(os.environ['RUNNER_TEMP'])
           subprocess.run(['git', 'archive', '--format=tar.gz', '-o', str(root / 'completion-base.tar.gz'), 'HEAD'], check=True)
           expected = {'modules/helpers/ubs_core/py_scan.py': 'e7d90749780d8d446d57d1e6bbb66dce20b4a33e',
-                      'modules/helpers/ubs_core/cache.py': '713a272b291a0cc17cdd649a1ade7b10b1811389'}
+                      'modules/helpers/ubs_core/cache.py': '713a272b291a0cc17cdd649a1ade7b10b1811389',
+                      'modules/helpers/ubs_core/analyzers/lifecycle_py.py': '4a6e2d60b2caa63e16cb6b1494ed83443df400ba'}
           for path, sha in expected.items():
               assert git('hash-object', path) == sha, 'Concurrent source change: ' + path
-          chunks = []
-          for sha in ('8a49724196fc02e4f4224adadea7ead6623fc931',
-                      '89dcbcf2bb2ad3278530500dd9eb66ad2cadc215',
-                      '6f5680cdf410290fb8a43cbf105adc822d1f6639',
-                      '3c5711c26b5d8029a20930c35b589da8329c8f43'):
-              data = base64.b64decode(api('blobs/' + sha)['content'])
-              assert blob_id(data) == sha
-              chunks.append(data)
-          compressed = b''.join(chunks)
-          assert hashlib.sha256(compressed).hexdigest() == '495e9be30ccbc1a8c1055635780bab52b0550a6eca3aea8a9d2e4228c864a373'
-          patch = root / 'completion.patch'
-          patch.write_bytes(gzip.decompress(compressed))
-          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
-          subprocess.run(['git', 'apply', str(patch)], check=True)
-          for path, sha in {'modules/helpers/ubs_core/py_scan.py': 'd8e7de03d6229d25d1e467201c650d39706422bf',
+          apply_transport('completion.patch', (
+              '8a49724196fc02e4f4224adadea7ead6623fc931',
+              '89dcbcf2bb2ad3278530500dd9eb66ad2cadc215',
+              '6f5680cdf410290fb8a43cbf105adc822d1f6639',
+              '3c5711c26b5d8029a20930c35b589da8329c8f43'),
+              '495e9be30ccbc1a8c1055635780bab52b0550a6eca3aea8a9d2e4228c864a373')
+          apply_transport('completion-inputs.patch', (
+              '736c6be978d8c90ec0bed70bc160a47a2081cbbb',
+              '9ee43d435f5bb85935fc8280439f1790140efe6a'),
+              '94510f362c8cc4ec190848e41bced9896d44ad72908f17298f2d683e06a3cd5c')
+          for path, sha in {'modules/helpers/ubs_core/py_scan.py': '7875d81c31d8ff0bed7f4361478a961c2e0fa13d',
                             'modules/helpers/ubs_core/cache.py': '62fc798795c19a8958815e550ede6c73b2ffb6e1',
-                            'test-suite/quality/test_python_completion.py': '4319c309f3c86bdacc09ede9cde4b6bbdfe57c2c'}.items():
+                            'modules/helpers/ubs_core/analyzers/lifecycle_py.py': '9ab9e74aede243d24bac4ceeadd57d8c64a07d8d',
+                            'test-suite/quality/test_python_completion.py': '0f8c206e60013cfcb13f6fe2f85445c537630b37'}.items():
               assert git('hash-object', path) == sha, path
+          version_patch = '''diff --git a/VERSION b/VERSION
+          --- a/VERSION
+          +++ b/VERSION
+          @@ -1 +1 @@
+          -5.4.28
+          +5.4.29
+          diff --git a/ubs b/ubs
+          --- a/ubs
+          +++ b/ubs
+          @@ -28,4 +28,4 @@
+           shopt -s lastpipe || true
+           trap '' SIGPIPE 2>/dev/null || true
+           
+          -UBS_VERSION="5.4.28"
+          +UBS_VERSION="5.4.29"
+          diff --git a/README.md b/README.md
+          --- a/README.md
+          +++ b/README.md
+          @@ -10,3 +10,3 @@
+           [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
+           [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+          -[![Version](https://img.shields.io/badge/version-5.4.28-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+          +[![Version](https://img.shields.io/badge/version-5.4.29-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+          '''
+          subprocess.run(['git', 'apply', '--check', '-'], input=version_patch, text=True, check=True)
+          subprocess.run(['git', 'apply', '-'], input=version_patch, text=True, check=True)
           subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
           subprocess.run(['bash', 'scripts/update_sha256sums.sh'], check=True)
           subprocess.run(['bash', 'scripts/verify_checksums.sh'], check=True)
@@ -81,13 +124,16 @@ jobs:
           subprocess.run(['git', 'diff', '--check'], check=True)
           changed = set(git('diff', '--name-only').splitlines())
           changed.add('test-suite/quality/test_python_completion.py')
-          allowed = set(expected) | {'test-suite/quality/test_python_completion.py',
+          allowed = set(expected) | {'test-suite/quality/test_python_completion.py', 'VERSION', 'README.md',
                     'modules/lib/ubs-common.sh', 'ubs', 'SHA256SUMS', 'scripts/new-module.sh'}
           allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
           assert changed == allowed, (changed, allowed)
+          before = {path: Path(path).read_bytes() for path in changed}
+          subprocess.run(['python3', 'scripts/update_checksums.py'], check=True)
+          subprocess.run(['bash', 'scripts/update_sha256sums.sh'], check=True)
+          assert all(Path(path).read_bytes() == data for path, data in before.items())
           entries = []
-          for path in sorted(changed):
-              data = Path(path).read_bytes()
+          for path, data in sorted(before.items()):
               sha = api('blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})['sha']
               assert sha == blob_id(data), path
               mode = git('ls-files', '-s', '--', path).split()
@@ -109,7 +155,7 @@ jobs:
           retention-days: 7
   validate:
     needs: prepare
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       PYTHONDONTWRITEBYTECODE: '1'
@@ -126,13 +172,20 @@ jobs:
           git init -b main
           git add .
           git -c user.name=Validation -c user.email=validation@localhost commit -m 'Local validation snapshot, not published'
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          record = json.loads((Path(os.environ['RUNNER_TEMP']) / 'candidate/completion-objects.json').read_text())
+          tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          assert tree == record['tree'], (tree, record['tree'])
+          PY
           sudo apt-get update -qq
           sudo apt-get install -y -qq jq ripgrep rsync shellcheck python3-yaml
           npm install --global @ast-grep/cli@0.45.3
       - name: Run failure recovery, source edits and existing focused gates
         run: |
           set -o pipefail
-          for suite in test_python_completion.py test_python_suppression.py test_python_precision.py test_cache.py test_python_command_injection_dataflow.py; do
+          for suite in test_python_completion.py test_python_suppression.py test_python_precision.py test_cache.py test_python_command_injection_dataflow.py test_lifecycle_py_bindings.py; do
             python3 -B -m unittest discover -s test-suite/quality -p "$suite" -v 2>&1 | tee "$RUNNER_TEMP/completion-$suite.log"
           done
           python3 test-suite/run_manifest.py --case python-resource-lifecycle --case python-suppression-intervals-markers --case python-suppression-intervals-nomarkers 2>&1 | tee "$RUNNER_TEMP/completion-manifest.log"
@@ -141,7 +194,7 @@ jobs:
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           for source in ubs modules/ubs-*.sh modules/lib/ubs-common.sh scripts/new-module.sh; do bash -n "$source"; done
-          ./ubs --ci --fail-on-warning --no-cache --only=python modules/helpers/ubs_core/py_scan.py modules/helpers/ubs_core/cache.py test-suite/quality/test_python_completion.py
+          ./ubs --ci --fail-on-warning --no-cache --only=python modules/helpers/ubs_core/py_scan.py modules/helpers/ubs_core/cache.py modules/helpers/ubs_core/analyzers/lifecycle_py.py test-suite/quality/test_python_completion.py
           git diff --exit-code
       - uses: actions/upload-artifact@v4
         if: always()
@@ -150,4 +203,5 @@ jobs:
           path: |
             ${{ runner.temp }}/completion-*.log
             test-suite/artifacts/python-completion-*/public-*
+            test-suite/artifacts/python-completion-*/syntax-*
           retention-days: 7

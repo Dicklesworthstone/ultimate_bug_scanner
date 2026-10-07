@@ -3728,5 +3728,630 @@ String inert="response.sendRedirect(request.getParameter(x))";
                         print(f'[{case}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
 
+class CppSelectedRequestFlowTests(unittest.TestCase):
+    """Independent C++ binding oracles frozen before the October rewrite.
+
+    The initial 30 source programs compiled under C++20; 18 failed the old
+    analyzers while 12 independent safe/unsafe controls passed. A second
+    independent tranche covers references, namespaces and expression flow.
+    Public module JSON/SARIF companions run with UBS_CPP_TAINT_E2E=1.
+    """
+
+    def setUp(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='cpp-selected-flow-', dir=artifacts))
+
+    @staticmethod
+    def cases():
+        prelude = '''\
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+struct Request { std::string get_param_value(const char *) const; };
+struct Response {
+  void set_header(const std::string &, const std::string &);
+  void set_redirect(const std::string &);
+};
+'''
+        cases = (
+            ('redirect', 'direct_header_control', '''
+                void handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  res.set_header("Location", url); // SINK
+                }
+            '''),
+            ('redirect', 'literal_header_control', '''
+                void handle(const Request &req, Response &res) {
+                  std::string ignored = req.get_param_value("next");
+                  res.set_header("Location", "/home");
+                }
+            '''),
+            ('redirect', 'actual_httplib_set_redirect', '''
+                void handle(const Request &req, Response &res) {
+                  res.set_redirect(req.get_param_value("next")); // SINK
+                }
+            '''),
+            ('redirect', 'literal_set_redirect_control', '''
+                void handle(const Request &req, Response &res) {
+                  std::string ignored = req.get_param_value("next");
+                  res.set_redirect("/home");
+                }
+            '''),
+            ('redirect', 'safe_named_identity', '''
+                std::string safe_redirect_target(std::string value) { return value; }
+                void handle(const Request &req, Response &res) {
+                  std::string url = safe_redirect_target(req.get_param_value("next"));
+                  res.set_header("Location", url); // SINK
+                }
+            '''),
+            ('redirect', 'alpha_renamed_identity_control', '''
+                std::string identity(std::string value) { return value; }
+                void handle(const Request &req, Response &res) {
+                  std::string url = identity(req.get_param_value("next"));
+                  res.set_header("Location", url); // SINK
+                }
+            '''),
+            ('redirect', 'selected_constant_helper', '''
+                std::string destination(std::string value) { return "/home"; }
+                void handle(const Request &req, Response &res) {
+                  std::string url = destination(req.get_param_value("next"));
+                  res.set_header("Location", url);
+                }
+            '''),
+            ('redirect', 'inverted_rejection_guard', '''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  if (url.starts_with("/") && !url.starts_with("//")) return false;
+                  res.set_header("Location", url); // SINK
+                  return true;
+                }
+            '''),
+            ('redirect', 'unrelated_guard', '''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  std::string other = "/home";
+                  if (!(other.starts_with("/") && !other.starts_with("//"))) return false;
+                  res.set_header("Location", url); // SINK
+                  return true;
+                }
+            '''),
+            ('redirect', 'conditional_literal_overwrite', '''
+                void handle(const Request &req, Response &res, bool flag) {
+                  std::string url = req.get_param_value("next");
+                  if (flag) {
+                    url = "/home";
+                  }
+                  res.set_header("Location", url); // SINK
+                }
+            '''),
+            ('redirect', 'unconditional_literal_overwrite_control', '''
+                void handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  url = "/home";
+                  res.set_header("Location", url);
+                }
+            '''),
+            ('redirect', 'complete_local_guard_control', r'''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  if (!(url.starts_with("/") && !url.starts_with("//") &&
+                        url.find_first_of("\\\r\n\t") == std::string::npos)) return false;
+                  res.set_header("Location", url);
+                  return true;
+                }
+            '''),
+            ('redirect', 'weak_local_guard_allows_backslash', '''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  if (!(url.starts_with("/") && !url.starts_with("//"))) return false;
+                  res.set_header("Location", url); // SINK
+                  return true;
+                }
+            '''),
+            ('redirect', 'guard_rebinding_retains_unsafe', r'''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  if (!(url.starts_with("/") && !url.starts_with("//") &&
+                        url.find_first_of("\\\r\n\t") == std::string::npos)) return false;
+                  url = req.get_param_value("next");
+                  res.set_header("Location", url); // SINK
+                  return true;
+                }
+            '''),
+            ('redirect', 'selected_literal_allowlist_control', '''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  if (url != "/home" && url != "/account") return false;
+                  res.set_header("Location", url);
+                  return true;
+                }
+            '''),
+            ('redirect', 'allowlist_for_different_value', '''
+                bool handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  std::string other = req.get_param_value("other");
+                  if (other != "/home" && other != "/account") return false;
+                  res.set_header("Location", url); // SINK
+                  return true;
+                }
+            '''),
+            ('redirect', 'selected_validating_helper_control', r'''
+                std::string destination(std::string value) {
+                  if (value.starts_with("/") && !value.starts_with("//") &&
+                      value.find_first_of("\\\r\n\t") == std::string::npos) return value;
+                  return "/home";
+                }
+                void handle(const Request &req, Response &res) {
+                  std::string url = destination(req.get_param_value("next"));
+                  res.set_header("Location", url);
+                }
+            '''),
+            ('redirect', 'source_key_is_not_destination_name', '''
+                void handle(const Request &req, Response &res) {
+                  auto value = req.get_param_value("q");
+                  res.set_header("Location", value); // SINK
+                }
+            '''),
+            ('redirect', 'direct_unknown_key', '''
+                void handle(const Request &req, Response &res) {
+                  res.set_header("Location", req.get_param_value("q")); // SINK
+                }
+            '''),
+            ('redirect', 'literal_string_is_not_sanitizer', '''
+                void handle(const Request &req, Response &res) {
+                  auto url = req.get_param_value("next") + "safe_redirect_target";
+                  res.set_header("Location", url); // SINK
+                }
+            '''),
+            ('path', 'direct_path_control', '''
+                void handle(const Request &req) {
+                  std::string file = req.get_param_value("file");
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+            ('path', 'literal_path_control', '''
+                void handle(const Request &req) {
+                  std::string ignored = req.get_param_value("file");
+                  std::ifstream input("/srv/data/help.txt");
+                }
+            '''),
+            ('path', 'safe_path_identity', '''
+                std::string safe_path(std::string value) { return value; }
+                void handle(const Request &req) {
+                  std::string file = safe_path(req.get_param_value("file"));
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+            ('path', 'path_literal_overwrite', '''
+                void handle(const Request &req) {
+                  std::string file = req.get_param_value("file");
+                  file = "/srv/data/help.txt";
+                  std::ifstream input(file);
+                }
+            '''),
+            ('path', 'same_spelling_unrelated_scope', '''
+                void remember(const Request &req) {
+                  std::string file = req.get_param_value("file");
+                }
+                void fixed() {
+                  std::string file = "/srv/data/help.txt";
+                  std::ifstream input(file);
+                }
+            '''),
+            ('path', 'unrelated_filename_is_not_proof', '''
+                void handle(const Request &req) {
+                  std::string file = req.get_param_value("file");
+                  auto harmless = std::filesystem::path("help.txt").filename();
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+            ('path', 'basename_reused_as_directory_prefix', '''
+                void handle(const Request &req) {
+                  auto leaf = std::filesystem::path(req.get_param_value("file")).filename();
+                  auto file = std::filesystem::path("/srv/data") / leaf / "secret.txt";
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+            ('path', 'terminal_basename_regular_file_control', '''
+                void handle(const Request &req) {
+                  auto leaf = std::filesystem::path(req.get_param_value("file")).filename();
+                  auto file = std::filesystem::path("/srv/data") / leaf;
+                  std::ifstream input(file);
+                }
+            '''),
+            ('path', 'selected_canonical_root_control', '''
+                void handle(const Request &req) {
+                  auto root = std::filesystem::canonical("/srv/data");
+                  auto file = std::filesystem::canonical(root / req.get_param_value("file"));
+                  auto relative = file.lexically_relative(root);
+                  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..")
+                    throw std::runtime_error("outside root");
+                  std::ifstream input(file);
+                }
+            '''),
+            ('path', 'canonical_guard_for_unrelated_file', '''
+                void handle(const Request &req) {
+                  auto root = std::filesystem::canonical("/srv/data");
+                  auto checked = std::filesystem::canonical(root / "help.txt");
+                  auto relative = checked.lexically_relative(root);
+                  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..")
+                    throw std::runtime_error("outside root");
+                  auto file = req.get_param_value("file");
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+        )
+        for domain, name, body in cases:
+            source = prelude + textwrap.dedent(body).strip('\n') + '\n'
+            expected = {i for i, line in enumerate(source.splitlines(), 1) if '// SINK' in line}
+            rule = 'cpp.taint.' + ('open_redirect' if domain == 'redirect' else 'path_traversal')
+            yield name, source, rule, expected
+        yield from CppSelectedRequestFlowTests.heldout_cases()
+        yield from CppSelectedRequestFlowTests.conditional_assignment_cases()
+
+    @staticmethod
+    def heldout_cases():
+        prelude = '''\
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+struct Request { std::string get_param_value(const char *) const; };
+struct Response {
+  void set_header(const std::string &, const std::string &);
+  void set_redirect(const std::string &, int = 302);
+};
+'''
+        cases = (
+            ('redirect', 'mutable_reference_helper_introduces_source', '''
+                void fill(std::string &value, const Request &req) {
+                  value = req.get_param_value("next");
+                }
+                void handle(const Request &req, Response &res) {
+                  std::string url = "/home";
+                  fill(url, req);
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'by_value_helper_does_not_mutate_caller', '''
+                void fill(std::string value, const Request &req) {
+                  value = req.get_param_value("next");
+                }
+                void handle(const Request &req, Response &res) {
+                  std::string url = "/home";
+                  fill(url, req);
+                  res.set_redirect(url);
+                }
+            '''),
+            ('redirect', 'mutable_reference_helper_clears_source', '''
+                void replace(std::string &value) { value = "/home"; }
+                void handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  replace(url);
+                  res.set_redirect(url);
+                }
+            '''),
+            ('redirect', 'reference_alias_reassignment_updates_original', '''
+                void handle(const Request &req, Response &res) {
+                  std::string url = "/home";
+                  std::string &alias = url;
+                  alias = req.get_param_value("next");
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'copy_reassignment_does_not_update_original', '''
+                void handle(const Request &req, Response &res) {
+                  std::string url = "/home";
+                  std::string copy = url;
+                  copy = req.get_param_value("next");
+                  res.set_redirect(url);
+                }
+            '''),
+            ('redirect', 'qualified_unsafe_helper_selected', '''
+                namespace Unsafe { std::string safe_redirect_target(std::string x) { return x; } }
+                namespace Safe { std::string safe_redirect_target(std::string x) { return "/home"; } }
+                void handle(const Request &req, Response &res) {
+                  auto url = Unsafe::safe_redirect_target(req.get_param_value("next"));
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'qualified_constant_helper_selected', '''
+                namespace Unsafe { std::string safe_redirect_target(std::string x) { return x; } }
+                namespace Safe { std::string safe_redirect_target(std::string x) { return "/home"; } }
+                void handle(const Request &req, Response &res) {
+                  auto url = Safe::safe_redirect_target(req.get_param_value("next"));
+                  res.set_redirect(url);
+                }
+            '''),
+            ('redirect', 'block_shadow_does_not_taint_outer', '''
+                void handle(const Request &req, Response &res) {
+                  std::string url = "/home";
+                  {
+                    std::string url = req.get_param_value("next");
+                  }
+                  res.set_redirect(url);
+                }
+            '''),
+            ('redirect', 'block_shadow_does_not_clear_outer', '''
+                void handle(const Request &req, Response &res) {
+                  std::string url = req.get_param_value("next");
+                  {
+                    std::string url = "/home";
+                  }
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'short_circuit_assignment_preserves_false_path', '''
+                void handle(const Request &req, Response &res, bool flag) {
+                  std::string url = req.get_param_value("next");
+                  flag && ((url = "/home") == "/home");
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'ternary_assignment_preserves_false_path', '''
+                void handle(const Request &req, Response &res, bool flag) {
+                  std::string url = req.get_param_value("next");
+                  flag ? (url = "/home") : (url = url);
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'status_argument_is_not_redirect_target', '''
+                void handle(const Request &req, Response &res) {
+                  int status = std::stoi(req.get_param_value("next"));
+                  res.set_redirect("/home", status);
+                }
+            '''),
+            ('redirect', 'unknown_sanitizer_declaration_is_not_proof', '''
+                std::string validate_redirect_target(const std::string &);
+                void handle(const Request &req, Response &res) {
+                  auto url = validate_redirect_target(req.get_param_value("next"));
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('redirect', 'raw_string_decoy_is_not_request_flow', '''
+                void handle(const Request &req, Response &res) {
+                  std::string text = R"example(req.get_param_value("next"); res.set_redirect(text);)example";
+                  res.set_redirect("/home");
+                }
+            '''),
+            ('redirect', 'identity_macro_retains_request_value', '''
+                #define AS_DESTINATION(value) (value)
+                void handle(const Request &req, Response &res) {
+                  auto url = AS_DESTINATION(req.get_param_value("next"));
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('path', 'fopen_mode_argument_is_not_path', '''
+                void handle(const Request &req) {
+                  auto mode = req.get_param_value("file");
+                  FILE *input = fopen("/srv/data/help.txt", mode.c_str());
+                  if (input) fclose(input);
+                }
+            '''),
+            ('path', 'rename_destination_is_a_path', '''
+                void handle(const Request &req) {
+                  auto destination = req.get_param_value("file");
+                  std::filesystem::rename("/srv/data/upload.tmp", destination); // SINK
+                }
+            '''),
+            ('path', 'canonical_containment_cannot_trust_request_root', '''
+                void handle(const Request &req) {
+                  auto root = std::filesystem::canonical(req.get_param_value("root"));
+                  auto file = std::filesystem::canonical(root / "secret.txt");
+                  auto relative = file.lexically_relative(root);
+                  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..")
+                    throw std::runtime_error("outside root");
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+            ('path', 'canonical_containment_invalidated_by_rebinding', '''
+                void handle(const Request &req) {
+                  auto root = std::filesystem::canonical("/srv/data");
+                  auto file = std::filesystem::canonical(root / req.get_param_value("file"));
+                  auto relative = file.lexically_relative(root);
+                  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..")
+                    throw std::runtime_error("outside root");
+                  file = req.get_param_value("other");
+                  std::ifstream input(file); // SINK
+                }
+            '''),
+        )
+        for domain, name, body in cases:
+            source = prelude + textwrap.dedent(body).strip('\n') + '\n'
+            expected = {i for i, line in enumerate(source.splitlines(), 1) if '// SINK' in line}
+            rule = 'cpp.taint.' + ('open_redirect' if domain == 'redirect' else 'path_traversal')
+            yield name, source, rule, expected
+
+    @staticmethod
+    def conditional_assignment_cases():
+        prelude = '''\
+#include <string>
+struct Request { std::string get_param_value(const char *) const; };
+struct Response { void set_redirect(const std::string &); };
+'''
+        cases = (
+            ('short_circuit_assignment_introduces_source', '''
+                void handle(const Request &req, Response &res, bool flag) {
+                  std::string url = "/home";
+                  flag && ((url = req.get_param_value("next")) == "/home");
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+            ('ternary_assignment_introduces_source', '''
+                void handle(const Request &req, Response &res, bool flag) {
+                  std::string url = "/home";
+                  flag ? (url = req.get_param_value("next")) : (url = url);
+                  res.set_redirect(url); // SINK
+                }
+            '''),
+        )
+        for name, body in cases:
+            source = prelude + textwrap.dedent(body).strip('\n') + '\n'
+            expected = {i for i, line in enumerate(source.splitlines(), 1) if '// SINK' in line}
+            yield name, source, 'cpp.taint.open_redirect', expected
+
+        c_prelude = '#include <stdio.h>\n#include <stdlib.h>\nvoid set_header(const char *, const char *);\n'
+        c_cases = (
+            ('path_traversal', 'direct_file_operand', '''
+                void handle(void) {
+                  const char *path = getenv("QUERY_STRING");
+                  FILE *file = fopen(path, "r"); // SINK
+                }
+            '''),
+            ('path_traversal', 'literal_file_overwrite', '''
+                void handle(void) {
+                  const char *path = getenv("QUERY_STRING");
+                  path = "/srv/public/index.html";
+                  FILE *file = fopen(path, "r");
+                }
+            '''),
+            ('open_redirect', 'selected_identity_helper', '''
+                const char *safe_redirect(const char *value) { return value; }
+                void handle(void) {
+                  const char *target = safe_redirect(getenv("QUERY_STRING"));
+                  set_header("Location", target); // SINK
+                }
+            '''),
+            ('open_redirect', 'selected_constant_helper', '''
+                const char *destination(const char *value) { return "/home"; }
+                void handle(void) {
+                  const char *target = destination(getenv("QUERY_STRING"));
+                  set_header("Location", target);
+                }
+            '''),
+            ('open_redirect', 'conditional_overwrite', '''
+                void handle(int fallback) {
+                  const char *target = getenv("QUERY_STRING");
+                  if (fallback) { target = "/home"; }
+                  set_header("Location", target); // SINK
+                }
+            '''),
+        )
+        for kind, name, body in c_cases:
+            source = c_prelude + textwrap.dedent(body).strip('\n') + '\n'
+            expected = {i for i, line in enumerate(source.splitlines(), 1) if '// SINK' in line}
+            yield 'c_language_' + name, source, 'cpp.taint.' + kind, expected
+
+    def test_independent_cpp_selected_bindings_and_real_operands(self):
+        from ubs_core.analyzers import taint_cpp_redirect, taint_cpp_traversal
+        from ubs_core.registry import RunContext
+        for name, source, rule, expected in self.cases():
+            with self.subTest(case=name):
+                path = self.root / (name + ('.c' if name.startswith('c_language_') else '.cpp'))
+                path.write_text(source, encoding='utf-8')
+                analyzer = taint_cpp_redirect if rule.endswith('open_redirect') else taint_cpp_traversal
+                started = time.monotonic()
+                print(f'[cpp-{name}] RUN', flush=True)
+                findings = list(analyzer.run(RunContext(lang='cpp', files=[path])))
+                actual = {int(f['line']) for f in findings if f['rule'] == rule}
+                context = json.dumps({'source': source, 'findings': findings}, indent=2)
+                self.assertEqual(actual, expected, context)
+                self.assertEqual(len(findings), len(expected), context)
+                self.assertTrue(all(f['rule'] == rule and Path(f['path']) == path for f in findings), context)
+                print(f'[cpp-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_cpp_clean_redirect_fixture_rejects_browser_authority_bypasses(self):
+        compiler = shutil.which('g++') or shutil.which('clang++')
+        node = shutil.which('node')
+        if not compiler or not node:
+            self.skipTest('C++ compiler and Node are required for the independent URL API oracle')
+        fixture = REPO_ROOT / 'test-suite/cpp/security/open_redirect_clean.cpp'
+        source = self.root / 'redirect-fixture-oracle.cpp'
+        program = self.root / 'redirect-fixture-oracle'
+        source.write_text('#include <iostream>\n#include ' + json.dumps(str(fixture)) + '\n' + r'''
+void Response::redirect(const std::string&) {}
+void Response::set_header(const std::string&, const std::string&) {}
+int main() {
+  const std::string denied[] = {
+    "/\\evil.example/path", "/\t/evil.example/path", "/\n/evil.example/path", "/\r/evil.example/path",
+    "//evil.example/path", "https://app.example.com@evil.example/profile",
+    "https://app.example.com.evil.example/profile", "https://app.example.com\\@evil.example/profile",
+    "https://app.example.com\t.evil.example/path", "http://app.example.com/path"
+  };
+  for (const auto& raw : denied) {
+    try {
+      safe_redirect_url(raw);
+      std::cerr << "unsafe redirect accepted\n";
+      return 1;
+    } catch (const std::invalid_argument&) {}
+  }
+  for (const std::string raw : {"/dashboard", "https://app.example.com/profile", "https://accounts.example.com"}) {
+    if (safe_redirect_url(raw) != raw) return 2;
+    std::cout << raw << '\n';
+  }
+}
+''', encoding='utf-8')
+        browser_script = r'''
+const fs = require("fs");
+const rows = JSON.parse(fs.readFileSync(0, "utf8"));
+const origins = rows.map(value => new URL(value, "https://trusted.example/start").origin);
+if (origins.some(origin => origin !== "https://evil.example")) throw new Error(JSON.stringify(origins));
+console.log(JSON.stringify(origins));
+'''
+        commands = (
+            ('compile', [compiler, '-std=c++20', str(source), '-o', str(program)], None),
+            ('fixture', [str(program)], None),
+            ('browser', [node, '-e', browser_script],
+             json.dumps(['/\\evil.example/path', '/\t/evil.example/path', '/\n/evil.example/path', '/\r/evil.example/path'])),
+        )
+        for name, command, stdin in commands:
+            started = time.monotonic()
+            print(f'[cpp-redirect-fixture-{name}] RUN', flush=True)
+            proc = subprocess.run(command, input=stdin, cwd=self.root, text=True,
+                                  capture_output=True, timeout=60)
+            (self.root / (name + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
+            (self.root / (name + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
+            (self.root / (name + '.identity.json')).write_text(json.dumps({
+                'command': command, 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(),
+                'python': sys.version, 'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+            }, indent=2) + '\n', encoding='utf-8')
+            self.assertEqual(proc.returncode, 0, f'{command!r}\n{proc.stdout}\n{proc.stderr}')
+            if name == 'fixture':
+                self.assertEqual(proc.stdout.splitlines(), ['/dashboard', 'https://app.example.com/profile',
+                                                           'https://accounts.example.com'])
+            print(f'[cpp-redirect-fixture-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    @unittest.skipUnless(os.environ.get('UBS_CPP_TAINT_E2E') == '1', 'set UBS_CPP_TAINT_E2E=1 for native C++ JSON/SARIF')
+    def test_independent_cpp_cases_through_public_json_and_sarif(self):
+        for name, source, rule, expected in self.cases():
+            path = self.root / (name + ('.c' if name.startswith('c_language_') else '.cpp'))
+            path.write_text(source, encoding='utf-8')
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=name, format=fmt):
+                    label = 'cpp-' + name + '-' + fmt
+                    print(f'[{label}] RUN', flush=True)
+                    command = [str(REPO_ROOT / 'modules/ubs-cpp.sh'), '--ci', '--only=7',
+                               '--no-color', '--format=' + fmt, str(path)]
+                    env = dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1',
+                               PYTHONDONTWRITEBYTECODE='1', ENABLE_UV_TOOLS='0')
+                    started = time.monotonic()
+                    proc = subprocess.run(command, cwd=self.root, env=env, capture_output=True,
+                                          text=True, timeout=120)
+                    (self.root / (label + '.stdout.log')).write_text(proc.stdout, encoding='utf-8')
+                    (self.root / (label + '.stderr.log')).write_text(proc.stderr, encoding='utf-8')
+                    (self.root / (label + '.identity.json')).write_text(json.dumps({
+                        'command': command, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                        'python': sys.version, 'exit': proc.returncode, 'elapsed': time.monotonic() - started,
+                    }, indent=2) + '\n', encoding='utf-8')
+                    context = f'{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
+                    self.assertEqual(proc.returncode, int(bool(expected)), context)
+                    report = json.loads(proc.stdout)
+                    if fmt == 'json':
+                        self.assertEqual(report['status'], 'ok', context)
+                        self.assertEqual(report['critical'], len(expected), context)
+                        findings = [f for f in report['findings'] if f['rule'] == rule]
+                        actual = {int(f['line']) for f in findings}
+                    else:
+                        findings = [f for run in report['runs'] for f in run.get('results', []) if f['ruleId'] == rule]
+                        actual = {int(f['locations'][0]['physicalLocation']['region']['startLine']) for f in findings}
+                    self.assertEqual(actual, expected, context)
+                    self.assertEqual(len(findings), len(expected), context)
+                    print(f'[{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+
 if __name__ == "__main__":
     unittest.main()

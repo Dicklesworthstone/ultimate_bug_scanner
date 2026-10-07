@@ -404,13 +404,16 @@ class RubyParser:
                     frame[1] = False
             for index, token in enumerate(tokens):
                 budget.spend()
-                previous = tokens[index - 1].value if index and tokens[index - 1].kind == 'code' else ''
+                previous = tokens[index - 1].value if index > 0 and tokens[index - 1].kind == 'code' else ''
                 if token.kind == 'code' and re.fullmatch(r'_[1-9]', token.value):
                     # Property names, symbols and explicit keyword labels do
                     # not declare an implicit parameter.
                     if previous not in {'.', '&.', '::'} and index - 1 not in symbols:
                         if index + 1 in labels:
-                            if index + 2 == len(tokens) or tokens[index + 2].value in {',', ')', ']', '}'}:
+                            following = None
+                            if index + 2 < len(tokens):
+                                following = tokens[index + 2].value
+                            if following is None or following in {',', ')', ']', '}'}:
                                 raise ValueError('Ruby numbered keyword shorthand needs argument binding; analysis is incomplete')
                         else:
                             names.add(token.value)

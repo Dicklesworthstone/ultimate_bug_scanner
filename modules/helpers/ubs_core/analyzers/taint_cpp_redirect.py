@@ -1,10 +1,4 @@
-"""ubs_core.analyzers.taint_cpp_redirect — C++ open-redirect taint (bead A2).
-
-Logic moved verbatim from the open-redirect heredoc in modules/ubs-cpp.sh
-(run_open_redirect_checks); the shell keeps its copy until that module's port
-bead. `main()` reproduces the heredoc's __COUNT__/__SAMPLE__ output exactly for
-the same argv; run(ctx) exposes the same detections as structured findings.
-"""
+"""C/C++ redirect dataflow with value-bound, branch-specific URL proof."""
 from __future__ import annotations
 
 import re
@@ -13,13 +7,14 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.analyzers.taint_cpp_traversal import Engine
+from ubs_core.taint_flow import CLEAN, Trace, join, retag
 
 ROOT: Path = Path()
 BASE_DIR: Path = Path()
 SKIP_DIRS = {'.git', '.hg', '.svn', 'vendor', 'node_modules', '.cache', 'build', 'cmake-build-debug', 'cmake-build-release', 'dist', 'out'}
 EXTS = {'.c', '.cc', '.cpp', '.cxx', '.c++', '.h', '.hh', '.hpp', '.hxx', '.ipp', '.tpp', '.ixx', '.cppm', '.mpp'}
 
-REDIRECT_KEY = r'(?:return[_-]?to|return[_-]?url|redirect(?:[_-]?url)?|next|continue|callback|target|destination|location|uri|url)'
 SOURCE_RE = re.compile(
     r'\b(?:req|request|http_request|httpRequest|ctx|context)(?:\.|->)'
     r'(?:get_param_value|getParam|getParameter|getQueryParam|getQueryParameter|query_param|queryParam|'
@@ -40,69 +35,15 @@ REQUEST_COLLECTION_RE = re.compile(
     r'|\bQUrlQuery\s*\([^;\n]*\)\.queryItemValue\s*\(',
     re.IGNORECASE,
 )
-CGI_FORM_OUT_RE = re.compile(
-    rf'\bcgiFormString\s*\(\s*["\'][^"\']*{REDIRECT_KEY}[^"\']*["\']\s*,\s*(?:&\s*)?(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*,',
-    re.IGNORECASE,
-)
-REDIRECTISH_NAME_RE = re.compile(
-    r'(redirect|return|callback|next|continue|target|destination|location|uri|url)',
-    re.IGNORECASE,
-)
-HOST_SOURCE_RE = re.compile(
-    r'\b(?:req|request)(?:\.|->)host\b|\bgetenv\s*\(\s*"HTTP_HOST"\s*\)|\b(?:getHost|get_host|host)\s*\(',
-    re.IGNORECASE,
-)
-SAFE_EXPR_RE = re.compile(
-    r'\b(?:safe(?:RedirectURL|RedirectUrl|RedirectURI|RedirectUri|RedirectTarget)|'
-    r'safe_(?:redirect_url|redirect_uri|redirect_target)|'
-    r'validate(?:RedirectURL|RedirectUrl|RedirectURI|RedirectUri|RedirectTarget)|'
-    r'validate_(?:redirect_url|redirect_uri|redirect_target)|'
-    r'validated(?:RedirectURL|RedirectUrl|RedirectURI|RedirectUri|RedirectTarget)|'
-    r'validated_(?:redirect_url|redirect_uri|redirect_target)|'
-    r'sanitize(?:RedirectURL|RedirectUrl|RedirectURI|RedirectUri|RedirectTarget)|'
-    r'sanitize_(?:redirect_url|redirect_uri|redirect_target)|'
-    r'allowed(?:RedirectURL|RedirectUrl|RedirectURI|RedirectUri|RedirectHost|RedirectTarget)|'
-    r'allowed_(?:redirect_url|redirect_uri|redirect_host|redirect_target)|'
-    r'local(?:RedirectURL|RedirectUrl|RedirectURI|RedirectUri|RedirectTarget)|'
-    r'local_(?:redirect_url|redirect_uri|redirect_target)|'
-    r'sameOriginRedirect|same_origin_redirect|isLocalRedirect|is_local_redirect|'
-    r'isAllowedRedirectHost|is_allowed_redirect_host)\b',
-    re.IGNORECASE,
-)
-URL_PARSE_RE = re.compile(r'\b(?:Poco::URI|QUrl|ada::parse|boost::urls::parse_uri|boost::urls::url_view|curl_url)\s*\(')
-HOST_CHECK_RE = re.compile(
-    r'\b(?:allowedRedirectHosts|allowed_redirect_hosts|allowedHosts|allowed_hosts|redirectHostAllowlist|'
-    r'redirect_host_allowlist|trustedRedirectHosts|trusted_redirect_hosts|isAllowedRedirectHost|is_allowed_redirect_host)\b'
-    r'|\.\s*(?:host|scheme|getHost|getScheme|isValid)\s*\('
-    r'|\b(?:starts_with|rfind|compare)\s*\([^;\n]*https://',
-    re.IGNORECASE,
-)
-LOCAL_PATH_RE = re.compile(
-    r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?:starts_with|rfind)\s*\(\s*["\']/["\'](?:\s*,\s*0)?\s*\)\s*(?:==\s*0)?'
-    r'(?:(?!;).)*(?:&&|\band\b)(?:(?!;).)*(?:!\s*)?\1\s*\.\s*(?:starts_with|rfind)\s*\(\s*["\']//["\'](?:\s*,\s*0)?\s*\)\s*(?:!=\s*0|==\s*(?:false|std::string::npos))?'
-    r'|(?:!\s*)?\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?:starts_with|rfind)\s*\(\s*["\']//["\'](?:\s*,\s*0)?\s*\)\s*(?:!=\s*0|==\s*(?:false|std::string::npos))?'
-    r'(?:(?!;).)*(?:&&|\band\b)(?:(?!;).)*\2\s*\.\s*(?:starts_with|rfind)\s*\(\s*["\']/["\'](?:\s*,\s*0)?\s*\)\s*(?:==\s*0)?',
-    re.IGNORECASE | re.DOTALL,
-)
-REJECT_RE = re.compile(
-    r'\b(?:throw|return\s+false|return\s+\{\}|abort|forbid|deny|invalid_argument|runtime_error|domain_error)\b',
-    re.IGNORECASE,
-)
 SINK_RE = re.compile(
     r'\b(?:res|resp|response|reply|http_response|httpResponse|ctx|context)(?:\.|->)\s*'
-    r'(?:redirect|Redirect|sendRedirect|setRedirect)\s*\('
+    r'(?:redirect|Redirect|sendRedirect|setRedirect|set_redirect)\s*\('
     r'|\b(?:redirect|send_redirect|sendRedirect|http_redirect|httpRedirect)\s*\('
     r'|\b(?:set_header|setHeader|add_header|addHeader|header|set)\s*\([^;\n]*(?:"Location"|\'Location\')\s*,'
     r'|\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)\s*(?:set_header|setHeader|add_header|addHeader|header|set)\s*\([^;\n]*(?:"Location"|\'Location\')\s*,'
     r'|\b(?:headers|response_headers|resp_headers)\s*\[\s*(?:"Location"|\'Location\')\s*\]\s*='
     r'|\b[A-Za-z_][A-Za-z0-9_]*(?:\.|->)\s*(?:headers|response_headers|resp_headers)\s*\[\s*(?:"Location"|\'Location\')\s*\]\s*=',
 )
-ASSIGN_RE = re.compile(
-    r'^\s*(?:const\s+)?(?:auto|std::string(?:_view)?|string(?:_view)?|'
-    r'QUrl|Poco::URI|boost::urls::url(?:_view)?|char\s*(?:const\s*)?\*|const\s+char\s*\*)?\s*'
-    r'(?P<lhs>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?P<rhs>.+)$'
-)
-PATH_LIMIT = 4
 
 def should_skip(path: Path) -> bool:
     try:
@@ -120,56 +61,6 @@ def iter_files(root: Path):
         if path.is_file() and path.suffix.lower() in EXTS and not should_skip(path):
             yield path
 
-def strip_line_comments(line: str) -> str:
-    out = []
-    quote = ''
-    escape = False
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            out.append(ch)
-            if escape:
-                escape = False
-            elif ch == '\\':
-                escape = True
-            elif ch == quote:
-                quote = ''
-            i += 1
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-            out.append(ch)
-            i += 1
-            continue
-        if ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
-            break
-        out.append(ch)
-        i += 1
-    return ''.join(out)
-
-def has_ignore(lines, line_no):
-    idx = line_no - 1
-    return (
-        0 <= idx < len(lines) and 'ubs:ignore' in lines[idx]
-    ) or (
-        0 <= idx - 1 < len(lines) and 'ubs:ignore' in lines[idx - 1]
-    )
-
-def logical_statement(lines, line_no):
-    idx = line_no - 1
-    statement = strip_line_comments(lines[idx])
-    balance = statement.count('(') - statement.count(')')
-    has_end = ';' in statement or '{' in statement or '}' in statement
-    lookahead = idx + 1
-    while (balance > 0 or not has_end) and lookahead < len(lines) and lookahead < idx + 8:
-        next_line = strip_line_comments(lines[lookahead]).strip()
-        statement += ' ' + next_line
-        balance += next_line.count('(') - next_line.count(')')
-        has_end = has_end or ';' in next_line or '{' in next_line or '}' in next_line
-        lookahead += 1
-    return statement
-
 def source_line(lines, line_no):
     idx = line_no - 1
     if 0 <= idx < len(lines):
@@ -182,106 +73,168 @@ def relpath(path):
     except ValueError:
         return str(path)
 
-def is_safe_expr(expr):
-    return bool(SAFE_EXPR_RE.search(expr))
+LOCAL_TAGS = frozenset({'url-slash', 'url-not-network', 'url-no-backslash',
+                       'url-no-cr', 'url-no-lf', 'url-no-tab'})
 
-def has_request_source(expr, target_name=''):
-    if SOURCE_RE.search(expr):
-        return bool(REDIRECTISH_NAME_RE.search(expr) or HOST_SOURCE_RE.search(expr))
-    return bool(target_name and REDIRECTISH_NAME_RE.search(target_name) and REQUEST_COLLECTION_RE.search(expr))
 
-def refs_in_expr(expr, tainted):
-    refs = []
-    for name in tainted:
-        if re.search(rf'\b{re.escape(name)}\b', expr):
-            refs.append(name)
-    return refs
+class RedirectEngine(Engine):
+    source_re, sink_re = SOURCE_RE, SINK_RE
+    sink_label = 'redirect'
+    rule = 'cpp.taint.open_redirect'
 
-def taint_from_expr(expr, tainted, target_name=''):
-    if is_safe_expr(expr):
-        return None
-    direct = SOURCE_RE.search(expr)
-    if direct and has_request_source(expr, target_name):
-        return {'path': [direct.group(0).strip('(')]}
-    refs = refs_in_expr(expr, tainted)
-    if not refs:
-        return None
-    ref = refs[0]
-    path = list(tainted.get(ref, {}).get('path', [ref]))
-    if len(path) >= PATH_LIMIT:
-        path = path[-(PATH_LIMIT - 1):]
-    path.append(ref)
-    return {'path': path}
+    def safe(self, trace):
+        return ('url-constant' in trace.tags or LOCAL_TAGS <= trace.tags or
+            (LOCAL_TAGS - {'url-slash', 'url-not-network'} | {'url-https', 'url-host'}) <= trace.tags)
 
-def has_redirect_validation_context(lines, line_no, refs):
-    if not refs:
-        return False
-    start = max(0, line_no - 24)
-    context = '\n'.join(strip_line_comments(line) for line in lines[start:line_no])
-    if not any(re.search(rf'\b{re.escape(ref)}\b', context) for ref in refs):
-        return False
-    for line in context.splitlines():
-        if SAFE_EXPR_RE.search(line) and any(re.search(rf'\b{re.escape(ref)}\b', line) for ref in refs):
-            return True
-    return bool(
-        (URL_PARSE_RE.search(context) and HOST_CHECK_RE.search(context) and REJECT_RE.search(context))
-        or (LOCAL_PATH_RE.search(context) and REJECT_RE.search(context))
-    )
+    def constant_string(self, name, state, bindings):
+        value = state.get(bindings.get(name, name), CLEAN)
+        literals = {trace.key[0] for trace in value if trace.kind == 'constant'}
+        return next(iter(literals)) if len(literals) == 1 and all(trace.kind == 'constant' for trace in value) else None
+
+    def assigned_value(self, start, offset, low, high, value, state, bindings):
+        declaration = self.parser.compact(start, offset)
+        if (declaration.startswith('conststd::unordered_set<std::string>') or
+                declaration.startswith('conststd::set<std::string>')):
+            if self.parser.value(low) == '{' and self.parser.pairs.get(low) == high - 1:
+                hosts = tuple(self.literal(a, b) for a, b in self.parser.parts(low + 1, high - 1))
+                if hosts and all(host is not None and re.fullmatch(r'[A-Za-z0-9.-]+', host) for host in hosts):
+                    return frozenset({Trace('allowlist', (offset, hosts), frozenset({'literal-hosts'}))})
+        return value
+
+    def external_call(self, name, spans, arguments, receiver, offset, state, bindings):
+        member = re.fullmatch(r'([A-Za-z_]\w*)\.(find|substr)', name)
+        if member and len(spans) == 2:
+            root, method = member.groups()
+            binding = bindings.get(root, root)
+            original = state.get(binding, CLEAN)
+            if method == 'find' and self.literal(*spans[0]) == '/':
+                prefix = re.fullmatch(r'([A-Za-z_]\w*)\.size\(\)', self.parser.compact(*spans[1]))
+                if prefix and self.constant_string(prefix.group(1), state, bindings) == 'https://':
+                    relation = Trace('host-end', (binding, self.fingerprint(original), prefix.group(1)))
+                    return join(self.without_proof(original), frozenset({relation}))
+            if method == 'substr':
+                prefix = re.fullmatch(r'([A-Za-z_]\w*)\.size\(\)', self.parser.compact(*spans[0]))
+                length = re.fullmatch(r'([A-Za-z_]\w*)-([A-Za-z_]\w*)\.size\(\)', self.parser.compact(*spans[1]))
+                if (prefix and length and prefix.group(1) == length.group(2)
+                        and self.constant_string(prefix.group(1), state, bindings) == 'https://'):
+                    end_value = state.get(bindings.get(length.group(1), length.group(1)), CLEAN)
+                    identity = (binding, self.fingerprint(original), prefix.group(1))
+                    if any(trace.kind == 'host-end' and trace.key == identity for trace in end_value):
+                        relation = Trace('host', identity)
+                        return join(self.without_proof(original), frozenset({relation}))
+        return super().external_call(name, spans, arguments, receiver, offset, state, bindings)
+
+    def call_sink(self, name, spans, arguments, offset, receiver=CLEAN):
+        method = re.split(r'::|\.|->', name)[-1]
+        targets = []
+        if method in {'redirect', 'Redirect', 'sendRedirect', 'setRedirect', 'set_redirect',
+                      'http_redirect', 'httpRedirect'}:
+            targets = [0]
+        elif method == 'send_redirect':
+            targets = [len(arguments) - 1]
+        elif method in {'set_header', 'setHeader', 'add_header', 'addHeader', 'header', 'set'}:
+            if len(spans) >= 2 and self.literal(*spans[0]) == 'Location':
+                targets = [1]
+        for index in targets:
+            if 0 <= index < len(arguments):
+                self.record(offset, arguments[index])
+
+    def atomic_guard(self, start, end):
+        import json
+
+        raw = self.parser.compact(start, end)
+        result = []
+        check = re.fullmatch(r'([A-Za-z_]\w*)\.(starts_with|rfind)\(("(?:[^"\\]|\\.)*")(?:,0)?\)(?:(==|!=)(0|false|true|std::string::npos))?', raw)
+        if check:
+            name, method, quoted, operator, compared = check.groups()
+            try:
+                literal = json.loads(quoted)
+            except ValueError:
+                literal = None
+            truth = True if method == 'starts_with' and operator is None else None
+            if method == 'rfind' and compared == '0':
+                truth = operator == '=='
+            elif method == 'starts_with' and compared in {'true', 'false', '0'}:
+                truth = (compared == 'true') == (operator == '==')
+            if truth is not None and literal in {'/', '//', 'https://'}:
+                result.append((not truth if literal == '//' else truth,
+                    (name, {'/': 'url-slash', '//': 'url-not-network', 'https://': 'url-https'}[literal])))
+        check = re.fullmatch(r'([A-Za-z_]\w*)\.rfind\(([A-Za-z_]\w*),0\)(==|!=)0', raw)
+        if check:
+            result.append((check.group(3) == '==', ('https-prefix', check.group(1), check.group(2))))
+        check = re.fullmatch(r'([A-Za-z_]\w*)\.find\(([A-Za-z_]\w*)\)(==|!=)\1\.end\(\)', raw)
+        if check:
+            result.append((check.group(3) == '!=', ('host-allowlist', check.group(1), check.group(2))))
+        check = re.fullmatch(r'([A-Za-z_]\w*)\.(find|find_first_of)\(("(?:[^"\\]|\\.)*")\)(==|!=)std::string::npos', raw)
+        if check:
+            name, method, quoted, operator = check.groups()
+            try:
+                characters = json.loads(quoted)
+            except ValueError:
+                characters = ''
+            if method == 'find_first_of' or len(characters) == 1:
+                for char, tag in (('\\', 'url-no-backslash'), ('\r', 'url-no-cr'), ('\n', 'url-no-lf'), ('\t', 'url-no-tab')):
+                    if char in characters:
+                        result.append((operator == '==', (name, tag)))
+        check = re.fullmatch(r'([A-Za-z_]\w*)(==|!=)("(?:[^"\\]|\\.)*")', raw)
+        if check:
+            try:
+                literal = json.loads(check.group(3))
+            except ValueError:
+                literal = ''
+            if (literal.startswith('/') and not literal.startswith('//')
+                    and not any(char in literal for char in '\\\r\n\t')):
+                result.append((check.group(2) == '==', (check.group(1), 'url-constant')))
+        return result
+
+    def apply_guard(self, guard, state, bindings):
+        if guard[0] == 'https-prefix':
+            _, name, prefix = guard
+            if self.constant_string(prefix, state, bindings) != 'https://':
+                return state
+            guard = name, 'url-https'
+        if guard[0] == 'host-allowlist':
+            _, allowlist, host = guard
+            hosts = state.get(bindings.get(allowlist, allowlist), CLEAN)
+            if not hosts or not all(trace.kind == 'allowlist' and 'literal-hosts' in trace.tags for trace in hosts):
+                return state
+            value = state.get(bindings.get(host, host), CLEAN)
+            for trace in value:
+                if trace.kind != 'host':
+                    continue
+                target, identity, prefix = trace.key
+                original = state.get(target, CLEAN)
+                if (self.fingerprint(original) == identity and
+                        self.constant_string(prefix, state, bindings) == 'https://'):
+                    state[target] = retag(original, add=frozenset({'url-host'}))
+            return state
+        name, tag = guard
+        binding = bindings.get(name, name)
+        state[binding] = retag(state.get(binding, CLEAN), add=frozenset({tag}))
+        return state
+
+    def transfer(self, action, state):
+        kind, span, bindings, guard, reads = action
+        if kind == 'simple':
+            start, end = span
+            raw = self.parser.raw(start, end)
+            location = re.match(r'(?:[A-Za-z_]\w*(?:\.|->))?(?:headers|response_headers|resp_headers)\s*\[\s*"Location"\s*\]\s*=', raw)
+            if location:
+                equals = next(i for i in self.top_tokens(start, end) if self.parser.value(i) == '=')
+                self.record(start, self.expression(equals + 1, end, state, reads))
+                return state
+        return super().transfer(action, state)
+
 
 def analyze(path, issues):
-    try:
-        text = path.read_text(encoding='utf-8', errors='ignore')
-    except OSError:
-        return
+    text = path.read_text(encoding='utf-8')
     if not (REQUEST_COLLECTION_RE.search(text) and SINK_RE.search(text)):
         return
     lines = text.splitlines()
-    tainted = {}
-    seen = set()
-    for idx, _ in enumerate(lines, start=1):
-        if has_ignore(lines, idx):
-            continue
-        statement = logical_statement(lines, idx).strip()
-        if not statement:
-            continue
-        cgi_out = CGI_FORM_OUT_RE.search(statement)
-        if cgi_out:
-            name = cgi_out.group('lhs')
-            tainted[name] = {'path': [f"cgiFormString(..., {name}, ...)"]}
-        assign = ASSIGN_RE.match(statement)
-        if assign:
-            name = assign.group('lhs')
-            rhs = assign.group('rhs')
-            taint = taint_from_expr(rhs, tainted, name)
-            if taint:
-                tainted[name] = taint
-            else:
-                tainted.pop(name, None)
-        if not SINK_RE.search(statement):
-            continue
-        if is_safe_expr(statement):
-            continue
-        direct = SOURCE_RE.search(statement) and has_request_source(statement)
-        refs = refs_in_expr(statement, tainted)
-        if not direct and not refs:
-            continue
-        if has_redirect_validation_context(lines, idx, refs):
-            continue
-        key = (relpath(path), idx)
-        if key in seen:
-            continue
-        seen.add(key)
-        if direct:
-            source = SOURCE_RE.search(statement)
-            path_desc = f"{(source.group(0) if source else 'request source').strip('(')} -> redirect"
-        else:
-            ref = refs[0]
-            seq = list(tainted.get(ref, {}).get('path', [ref]))
-            if len(seq) >= PATH_LIMIT:
-                seq = seq[-(PATH_LIMIT - 1):]
-            seq.append('redirect')
-            path_desc = ' -> '.join(seq)
-        issues.append((relpath(path), idx, f"{source_line(lines, idx)}  [{path_desc}]"))
+    for line, fact in sorted(RedirectEngine(path, text).analyze().items()):
+        witness = min(fact, key=lambda trace: (len(trace.evidence), trace.evidence))
+        source = witness.evidence[0].label if witness.evidence else 'request source'
+        issues.append((relpath(path), line, f"{source_line(lines, line)}  [{source} -> redirect]"))
 
 
 def main(argv=None) -> int:
@@ -319,6 +272,8 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if path.suffix.lower() not in EXTS:
             continue
+        if not ctx.rule_enabled('cpp.taint.open_redirect'):
+            continue
         rel = path.resolve()
         issues = []
         analyze(path, issues)
@@ -352,7 +307,7 @@ def _selftest_direct_redirect(tmp_prefix: str = "ubs_core_taint_cpp_redir_") -> 
     assert "req.getParam -> redirect" in findings[0]["message"], findings
 
 
-def _selftest_validation_context_suppression(tmp_prefix: str = "ubs_core_taint_cpp_redir_val_") -> None:
+def _selftest_inverted_guard_is_unsafe(tmp_prefix: str = "ubs_core_taint_cpp_redir_val_") -> None:
     import tempfile
 
     code = (
@@ -364,15 +319,34 @@ def _selftest_validation_context_suppression(tmp_prefix: str = "ubs_core_taint_c
         target = Path(tmp) / "main.cpp"
         target.write_text(code, encoding="utf-8")
         findings = list(run(RunContext(lang="cpp", files=[target])))
-    assert findings == [], findings
+    assert [(finding['rule'], finding['line']) for finding in findings] == [
+        ('cpp.taint.open_redirect', 3)], findings
 
 
-def _selftest_sanitizer_suppression(tmp_prefix: str = "ubs_core_taint_cpp_redir_san_") -> None:
+def _selftest_unknown_sanitizer_is_unsafe(tmp_prefix: str = "ubs_core_taint_cpp_redir_san_") -> None:
     import tempfile
 
     code = (
         "std::string url = validate_redirect_target(req.getParam(\"next\"));\n"
         "res.redirect(url);\n"
+    )
+    with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
+        target = Path(tmp) / "main.cpp"
+        target.write_text(code, encoding="utf-8")
+        findings = list(run(RunContext(lang="cpp", files=[target])))
+    assert [(finding['rule'], finding['line']) for finding in findings] == [
+        ('cpp.taint.open_redirect', 2)], findings
+
+
+def _selftest_selected_literal_helper(tmp_prefix: str = "ubs_core_taint_cpp_redir_fixed_") -> None:
+    import tempfile
+
+    code = (
+        'std::string destination(std::string input) { return "/home"; }\n'
+        'void handle(Request& req, Response& res) {\n'
+        '  auto url = destination(req.getParam("next"));\n'
+        '  res.redirect(url);\n'
+        '}\n'
     )
     with tempfile.TemporaryDirectory(prefix=tmp_prefix) as tmp:
         target = Path(tmp) / "main.cpp"
@@ -406,8 +380,9 @@ def _selftest_main_emit_dialect(tmp_prefix: str = "ubs_core_taint_cpp_redir_main
 
 SELF_TESTS: tuple[tuple[str, callable], ...] = (
     ("direct_redirect", _selftest_direct_redirect),
-    ("validation_context_suppression", _selftest_validation_context_suppression),
-    ("sanitizer_suppression", _selftest_sanitizer_suppression),
+    ("inverted_guard_is_unsafe", _selftest_inverted_guard_is_unsafe),
+    ("unknown_sanitizer_is_unsafe", _selftest_unknown_sanitizer_is_unsafe),
+    ("selected_literal_helper", _selftest_selected_literal_helper),
     ("main_emit_dialect", _selftest_main_emit_dialect),
 )
 

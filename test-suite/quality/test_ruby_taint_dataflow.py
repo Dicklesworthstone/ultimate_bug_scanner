@@ -489,6 +489,60 @@ CASES = (
         name = File.basename(params[:file]) + '/secrets.txt'
         File.read(File.join('/srv/app/files', name))''', (2,)),
     Case('path_chmod_path_is_second_argument', PATH, 'File.chmod(0600, params[:file])', (1,)),
+    # Independent API contracts: File uses variadic paths after any mode/owner
+    # arguments; FileUtils uses a fixed list argument followed by keywords.
+    # Sources: docs.ruby-lang.org/en/3.4/{File,FileUtils}.html.
+    # These snippets are scanner input only; no filesystem mutation executes.
+    Case('api_path_delete_later_argument', PATH,
+         "File.delete('/srv/app/files/fixed.txt', params[:file])", (1,)),
+    Case('api_path_delete_middle_argument', PATH,
+         "File.delete('/srv/app/files/fixed.txt', params[:file], '/srv/app/files/other.txt')", (1,)),
+    Case('api_path_delete_splat_argument', PATH,
+         "File.delete('/srv/app/files/fixed.txt', *[params[:file], '/srv/app/files/other.txt'])", (1,)),
+    Case('api_path_delete_literal_arguments', PATH,
+         "File.delete('/srv/app/files/fixed.txt', '/srv/app/files/other.txt')", ()),
+    Case('api_path_unlink_later_argument', PATH,
+         "File.unlink('/srv/app/files/fixed.txt', params[:file])", (1,)),
+    Case('api_path_chmod_first_variadic_argument', PATH,
+         "File.chmod(0600, params[:file], '/srv/app/files/fixed.txt')", (1,)),
+    Case('api_path_chmod_middle_variadic_argument', PATH,
+         "File.chmod(0600, '/srv/app/files/fixed.txt', params[:file], '/srv/app/files/other.txt')", (1,)),
+    Case('api_path_chmod_mode_is_not_path', PATH,
+         "File.chmod(params[:mode].to_i, '/srv/app/files/fixed.txt', '/srv/app/files/other.txt')", ()),
+    Case('api_path_chown_first_variadic_argument', PATH,
+         "File.chown(nil, nil, params[:file], '/srv/app/files/fixed.txt')", (1,)),
+    Case('api_path_chown_ids_are_not_paths', PATH,
+         "File.chown(params[:uid].to_i, params[:gid].to_i, '/srv/app/files/fixed.txt')", ()),
+    Case('api_path_fileutils_chmod_before_keyword', PATH,
+         "FileUtils.chmod(0600, params[:file], verbose: true)", (1,)),
+    Case('api_path_fileutils_chmod_list_before_keywords', PATH,
+         "FileUtils.chmod(0600, ['/srv/app/files/fixed.txt', params[:file]], verbose: true, noop: false)", (1,)),
+    Case('api_path_fileutils_chmod_mode_and_options_are_not_paths', PATH,
+         "FileUtils.chmod(params[:mode], '/srv/app/files/fixed.txt', verbose: params[:verbose])", ()),
+    Case('api_path_fileutils_chown_before_keyword', PATH,
+         "FileUtils.chown(nil, nil, params[:file], verbose: true)", (1,)),
+    Case('api_path_fileutils_chown_ids_and_options_are_not_paths', PATH,
+         "FileUtils.chown(params[:owner], params[:group], '/srv/app/files/fixed.txt', verbose: params[:verbose])", ()),
+    Case('api_path_write_content_and_options_are_not_paths', PATH,
+         "File.write('/srv/app/files/fixed.txt', params[:content], mode: params[:mode])", ()),
+    # HTTP.rb request(verb, uri, **options) differs from get(uri, **options).
+    # Source: github.com/httprb/http/blob/main/lib/http/client.rb.
+    Case('api_url_http_request_second_argument', URL,
+         'HTTP.request(:get, params[:url])', (1,)),
+    Case('api_url_http_request_before_keywords', URL,
+         'HTTP.request(:post, params[:url], body: "health")', (1,)),
+    Case('api_url_http_request_method_is_not_url', URL,
+         "HTTP.request(params[:verb].to_sym, 'https://api.example.com/health')", ()),
+    Case('api_url_http_request_body_is_not_url', URL,
+         "HTTP.request(:post, 'https://api.example.com/health', body: params[:body])", ()),
+    Case('api_url_http_get_first_argument', URL,
+         'HTTP.get(params[:url], headers: {"Accept" => "application/json"})', (1,)),
+    Case('api_url_http_get_options_are_not_url', URL,
+         "HTTP.get('https://api.example.com/health', headers: {\"X-Request\" => params[:header]})", ()),
+    Case('api_url_net_http_uri_first_argument', URL,
+         'Net::HTTP.get(URI.parse(params[:url]))', (1,)),
+    Case('api_url_net_http_headers_are_not_url', URL,
+         "Net::HTTP.get(URI.parse('https://api.example.com/health'), {\"X-Request\" => params[:header]})", ()),
     Case('path_local_sink_summary', PATH, '''
         def read_document(target)
           File.read(target)
@@ -815,6 +869,17 @@ class RubyPublicTests(LoggedCase):
             target.write_text(case.source)
             for fmt in ('json', 'sarif'):
                 with self.subTest(case=name, format=fmt):
+                    result, payload = self.scan(directory / fmt, target, fmt)
+                    self.assert_findings(result, payload, case, fmt, target)
+
+    def test_api_argument_positions_reach_json_and_sarif(self):
+        for case in (case for case in CASES if case.name.startswith('api_')):
+            directory = self.artifact / case.name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            for fmt in ('json', 'sarif'):
+                with self.subTest(case=case.name, format=fmt):
                     result, payload = self.scan(directory / fmt, target, fmt)
                     self.assert_findings(result, payload, case, fmt, target)
 

@@ -717,6 +717,25 @@ class RubyEngine:
             raise ValueError('Ruby expanded call arguments need argument binding analysis; analysis is incomplete')
         return self.expression(tokens, state, depth)
 
+    def call_arguments(self, tokens, state, depth):
+        if depth > 64:
+            raise AnalysisLimit('Ruby argument expansion depth limit exceeded; analysis is incomplete')
+        arguments = []
+        for part in split_tokens(tokens, {','}):
+            if not part:
+                continue
+            self.budget.spend()
+            if part[0].value == '*':
+                expanded = ungroup(part[1:])
+                if expanded and expanded[0].value == '[' and closing_token(expanded, 0) == len(expanded) - 1:
+                    # Literal array splats have a known order and arity. Keep
+                    # each element in its actual parameter position instead
+                    # of collapsing the collection into a single argument.
+                    arguments.extend(self.call_arguments(expanded[1:-1], state, depth + 1))
+                    continue
+            arguments.append(self.argument(part, state, depth))
+        return arguments
+
     def bind_arguments(self, function, arguments, state):
         if 'rest' in function.parameter_kinds:
             raise ValueError('Ruby rest/block parameters need argument binding analysis; analysis is incomplete')
@@ -855,13 +874,18 @@ class RubyEngine:
                 keep = frozenset({'basename-path', 'not-dot-name'}) if index == len(arguments) - 1 else frozenset()
                 result = join(result, retag(argument, remove=VALUE_TAGS - keep))
             return join(retag(receiver, remove=VALUE_TAGS), result)
+        positional = [argument for argument in arguments
+                      if not any(trace.kind == 'keyword' for trace in argument)]
         if self.policy == 'url':
             is_sink = (name in {'URI.open', 'OpenURI.open', 'open'}
                        or re.fullmatch(r'Net::HTTP\.(?:get|get_response|post|post_form|start|new)', name)
                        or re.fullmatch(r'(?:Faraday|HTTParty|RestClient|Excon|HTTP|Typhoeus|Curl)\.(?:get|post|put|patch|delete|head|request)', name)
                        or method in {'get', 'request'})
-            if is_sink and arguments:
-                self.record(token.start, join(receiver, arguments[0]))
+            # HTTP.rb request takes (verb, uri, **options); its convenience
+            # verbs and the other supported clients put the URL first.
+            target = 1 if name == 'HTTP.request' else 0
+            if is_sink and target < len(positional):
+                self.record(token.start, join(receiver, positional[target]))
         else:
             sink = re.fullmatch(r'(File|IO|FileUtils|Dir)\.(\w+[!?]?)', name)
             indexes = ()
@@ -869,17 +893,23 @@ class RubyEngine:
                 group, operation = sink.groups()
                 if operation in {'rename', 'cp', 'copy', 'mv', 'move'}:
                     indexes = (0, 1)
+                elif group == 'File' and operation in {'delete', 'unlink'}:
+                    indexes = range(len(positional))
                 elif operation in {'chmod', 'chown'}:
-                    indexes = (len(arguments) - 1,)
+                    first_path = 1 if operation == 'chmod' else 2
+                    # File accepts any number of paths. FileUtils accepts
+                    # one path/list before its non-path keyword options.
+                    indexes = range(first_path, len(positional)) if group == 'File' else (first_path,)
                 elif operation in {'read', 'binread', 'write', 'binwrite', 'open', 'delete', 'unlink', 'truncate', 'size', 'exist?', 'directory?', 'file?', 'rm', 'remove', 'rm_f', 'rm_rf', 'remove_entry', 'mkdir', 'mkdir_p', 'touch', 'foreach', 'entries', 'children', 'rmdir'}:
                     indexes = (0,)
             elif name in {'send_file', 'serve_file', 'download_file', 'write_file_response'}:
                 indexes = (0,)
             elif name == 'render':
-                indexes = tuple(range(len(arguments)))
+                positional = arguments
+                indexes = range(len(arguments))
             for index in indexes:
-                if 0 <= index < len(arguments):
-                    self.record(token.start, arguments[index], name)
+                if 0 <= index < len(positional):
+                    self.record(token.start, positional[index], name)
         if method in {'message', 'full_message', 'to_s', 'to_str'} and any(trace.kind == 'exception' for trace in receiver):
             return frozenset(trace for trace in value if trace.kind != 'exception')
         if method in {'freeze', 'to_s', 'to_str'}:
@@ -935,11 +965,11 @@ class RubyEngine:
                 atom = state.get(name, CLEAN)
                 if cursor < len(tokens) and tokens[cursor].value == '(':
                     end = closing_token(tokens, cursor)
-                    arguments = [self.argument(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','}) if part]
+                    arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
                     atom = self.call(name, CLEAN, arguments, token, state)
                     cursor = end + 1
                 elif cursor < len(tokens) and tokens[cursor].value not in {'.', '&.', '[', '::', ',', ')', ']', '}'}:
-                    arguments = [self.argument(part, state, depth + 1) for part in split_tokens(tokens[cursor:], {','}) if part]
+                    arguments = self.call_arguments(tokens[cursor:], state, depth + 1)
                     atom = self.call(name, CLEAN, arguments, token, state)
                     cursor = len(tokens)
                 elif name not in state and self.candidates(name, 0):
@@ -960,10 +990,10 @@ class RubyEngine:
                     arguments = []
                     if cursor < len(tokens) and tokens[cursor].value == '(':
                         end = closing_token(tokens, cursor)
-                        arguments = [self.argument(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','}) if part]
+                        arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
                         cursor = end + 1
                     elif cursor < len(tokens) and tokens[cursor].value not in {'.', '&.', '[', ',', ')', ']', '}'}:
-                        arguments = [self.argument(part, state, depth + 1) for part in split_tokens(tokens[cursor:], {','}) if part]
+                        arguments = self.call_arguments(tokens[cursor:], state, depth + 1)
                         cursor = len(tokens)
                     if has_shape(atom, 'request') and member.value in {'params', 'query', 'get', 'post', 'GET', 'POST'}:
                         atom = shape('request-params', member.start)

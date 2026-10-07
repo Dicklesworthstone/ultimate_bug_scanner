@@ -6000,6 +6000,43 @@
       }
     },
     {
+      "id": "rust-exclude-tests-meta-runner-default",
+      "description": "The meta-runner scans the --exclude-tests fixture with test code counted: both panics and the tests_support.rs findings.",
+      "path": "test-suite/rust/exclude_tests_mod",
+      "language": "rust",
+      "tags": ["rust", "exclude-tests", "meta-runner", "regression"],
+      "args": ["--only=rust", "--no-cargo"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 2,
+            "max": 2
+          }
+        },
+        "require_substrings": ["tests_support.rs"]
+      }
+    },
+    {
+      "id": "rust-exclude-tests-meta-runner-excluded",
+      "description": "The meta-runner forwards --exclude-tests to the Rust module (it was rejected as an unknown option): test-only findings drop, the production panic still fails the scan.",
+      "path": "test-suite/rust/exclude_tests_mod",
+      "language": "rust",
+      "tags": ["rust", "exclude-tests", "meta-runner", "regression"],
+      "args": ["--only=rust", "--no-cargo", "--exclude-tests"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "critical": {
+            "min": 1,
+            "max": 1
+          }
+        },
+        "require_substrings": ["panic! macro(s) present"],
+        "forbid_substrings": ["tests_support.rs", "unknown option"]
+      }
+    },
+    {
       "id": "rust-unsafe-memory-buggy",
       "description": "Rust unsafe memory APIs should be caught as code, not just text inventory.",
       "path": "test-suite/rust/buggy/unsafe_memory.rs",

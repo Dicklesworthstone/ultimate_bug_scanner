@@ -1527,6 +1527,9 @@ Options:
                           skipped categories report "Not evaluated" instead of "clean".
                           UBS_SKIP_RUST_BUILD=1 is the env equivalent. Cargo phases also skip
                           themselves (loudly) on targeted scans, whose shadow workspace has no Cargo.toml.
+  --exclude-tests         Pass through to the Rust module: drop matches inside test functions/modules
+                          and files reachable only through cfg(test)-gated mod declarations;
+                          production findings still count.
   --no-auto-update        Disable auto-update (even if UBS_ENABLE_AUTO_UPDATE=1)
   --no-cache              Disable reading and writing the Merkle-keyed scan cache
   --cache-dir=DIR         Directory for scan cache (default: \$XDG_CACHE_HOME/ubs or ~/.cache/ubs)
@@ -1647,6 +1650,7 @@ cat <<'JSON'
       {"name": "--skip-size-check", "args": null, "example": "--skip-size-check", "description": "Skip the directory size guard (default limit 1000 MB after ignores)."},
       {"name": "--skip-type-narrowing", "args": null, "example": "--skip-type-narrowing", "description": "Skip the JS/Rust/Kotlin/Swift/C# type-narrowing helpers."},
       {"name": "--no-cargo", "args": null, "example": "--no-cargo", "description": "Rust static-only mode: skip every cargo phase (fmt/clippy, check/test --no-run, audit/deny/udeps/outdated). Skipped categories report a 'Not evaluated' finding and the Rust JSON carries meta.cargo_execution.status=skipped. Env equivalent: UBS_SKIP_RUST_BUILD=1."},
+      {"name": "--exclude-tests", "args": null, "example": "--exclude-tests", "description": "Rust module only: drop matches inside test functions/modules and files reachable only through cfg(test)-gated mod declarations; production findings still count."},
       {"name": "--go-tools", "args": null, "example": "--go-tools", "description": "Run optional read-only gofmt, go vet and govulncheck; fresh findings and coverage status reach all formats."},
       {"name": "--test-pkgs", "args": "PKGS", "example": "--test-pkgs=./...", "description": "Go package patterns per selected module, parsed as arguments without shell evaluation."},
       {"name": "--go-timeout", "args": "SECONDS", "example": "--go-timeout=120", "description": "Execution timeout for each optional Go analyzer invocation."},
@@ -2272,6 +2276,12 @@ else
         shift;;
       --no-cargo)
         # Rust static-only mode: forwarded to the Rust module only (issue #99).
+        RUST_MODULE_ARGS+=("$1")
+        shift;;
+      --exclude-tests)
+        # Rust module only (GH #80 boundary): drop matches inside test
+        # functions/modules and cfg(test)-only files. Rejected as an unknown
+        # option before, so a meta-runner gate could not reach it.
         RUST_MODULE_ARGS+=("$1")
         shift;;
       --go-tools|--test-pkgs=*|--go-timeout=*)

@@ -14,6 +14,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 - Ruby request taint follows the actual return values of `map`/`collect`, `tap`/`each`, and `then`/`yield_self` blocks into outbound URL and filesystem sinks. Block assignments, `next`, `break`, parameter shadowing, and exceptional exits retain their selected value flow; clean mapping and replacement results no longer inherit discarded inputs.
 - Java and Kotlin path analysis rejects canonical String prefix checks as containment and invalidates containment after `resolveSibling` or unmodeled chained transformations. Selected Kotlin helper calls bind named arguments to their formal parameters, redirect sinks select the named `url`, and helper selection excludes sibling scopes and respects callable parameters while retaining conservative overload handling.
+- The runner forwards `--exclude-tests` to the Rust module. The module has
+  supported it since v5.1.0 (drop matches inside test functions/modules and
+  files reachable only through `cfg(test)`-gated `mod` declarations), but the
+  runner rejected it as an unknown option (exit 2), so a gate that runs `ubs`
+  could not separate test code from production code. Production findings
+  still count: on the `exclude_tests_mod` fixture, the scan drops from 2
+  critical / 8 warning to 1 critical / 3 warning and still exits 1 on the
+  production `panic!`. Manifest cases `rust-exclude-tests-meta-runner-*` cover
+  both runs through the runner.
 
 ---
 

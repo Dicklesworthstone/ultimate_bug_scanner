@@ -356,6 +356,10 @@ def run_analyzers(
         # request-flow syntax it deliberately does not support.
         if skip and 6 in skip and analyzer.layer == "taint":
             continue
+        # The ownership frontend has explicit unsupported/budget failures.
+        # A disabled resource category must not parse or fail those inputs.
+        if skip and 8 in skip and analyzer.layer == "lifecycle":
+            continue
         if prefilter is not None:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
         else:

@@ -39,6 +39,28 @@ FACTORIES = {"File.open": "file_handle", "Net::HTTP.start": "http_session",
              "Thread.new": "thread_join", "Thread.start": "thread_join",
              "Thread.fork": "thread_join"}
 ACQUISITION = re.compile(r"\b(?:File\s*\.\s*open|Net\s*::\s*HTTP\s*\.\s*start|Thread\s*\.\s*(?:new|start|fork))\b")
+CONSTANT = re.compile(r"[A-Z]\w*(?:::[A-Z]\w*)*")
+CONSTANT_ALIAS = re.compile(r"\b([A-Z]\w*)\s*=\s*([A-Z]\w*(?:\s*::\s*[A-Z]\w*)*)\b")
+
+
+def may_acquire(code):
+    """Lexical admission includes transitive factory aliases, never literals."""
+    if ACQUISITION.search(code):
+        return True
+    aliases = {"File": {"open"}, "Thread": {"new", "start", "fork"}, "Net::HTTP": {"start"}}
+    definitions = [(name, re.sub(r"\s+", "", target)) for name, target in CONSTANT_ALIAS.findall(code)]
+    for _ in range(len(definitions)):
+        changed = False
+        for name, target in definitions:
+            methods = aliases.get(target, set())
+            previous = aliases.get(name, set())
+            if methods - previous:
+                aliases[name] = previous | methods
+                changed = True
+        if not changed:
+            break
+    return any(re.search(r"\b" + re.escape(name) + r"\s*\.\s*(?:" + "|".join(sorted(methods)) + r")\b", code)
+               for name, methods in aliases.items())
 
 
 def is_ignored(path: Path, root: Path) -> bool:
@@ -78,6 +100,19 @@ class Value:
 UNKNOWN = Value()
 
 
+class ExpressionSplit(Exception):
+    """Request another bounded evaluation of an expression's next choice."""
+
+    def __init__(self, count):
+        self.count = count
+
+
+@dataclass
+class ExpressionChoices:
+    path: tuple[int, ...]
+    used: int = 0
+
+
 @dataclass
 class State:
     bindings: dict[str, Value] = field(default_factory=dict)
@@ -112,6 +147,204 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         self.resources: dict[int, tuple[int, str, str]] = {}
         self.issues: dict[tuple[int, str], str] = {}
         self.serial = 0
+        self.function = self.parser.functions[-1]
+        self.calls = ()
+        self.choices = None
+        self.constants = {}
+        definitions = {}
+        for function in self.parser.functions.values():
+            if not function.scope:
+                continue
+            for statement in function.body:
+                groups = self.split(statement.tokens, {"="})
+                if (statement.kind == "simple" and len(groups) == 2 and len(groups[0]) == 1
+                        and CONSTANT.fullmatch(groups[0][0].value)):
+                    key = function.owner, groups[0][0].value
+                    target = self.text(groups[1])
+                    definitions[key] = target if key not in definitions and CONSTANT.fullmatch(target) else None
+        pending = dict(definitions)
+        while pending:
+            changed = False
+            for key, target in tuple(pending.items()):
+                owner, _ = key
+                visible = self.constant_bindings(owner)
+                unresolved = any((owner[:length], target) in pending for length in range(len(owner) + 1))
+                if target in visible:
+                    value = visible[target]
+                elif unresolved:
+                    continue
+                else:
+                    value = Value("constant", target) if target else UNKNOWN
+                self.constants[key] = value
+                pending.pop(key)
+                changed = True
+            if not changed:
+                for key in pending:
+                    self.constants[key] = Value("ambiguous_constant", key[1])
+                break
+
+    def constant_bindings(self, owner):
+        bindings = {}
+        for length in range(len(owner) + 1):
+            bindings.update({name: value for (scope, name), value in self.constants.items()
+                             if scope == owner[:length]})
+        return bindings
+
+    def lookup(self, name, state):
+        if name in state.bindings:
+            return state.bindings[name]
+        if CONSTANT.fullmatch(name):
+            parts = name.split("::")
+            if any("::".join(parts[:index]) in state.bindings for index in range(1, len(parts))):
+                return UNKNOWN
+            return Value("constant", name)
+        return UNKNOWN
+
+    def choose(self, values):
+        if len(values) == 1:
+            return values[0]
+        if not values:
+            raise ValueError("Ruby lifecycle expression has no selected outcome; analysis is incomplete")
+        frame = self.choices
+        if frame is None:
+            raise ValueError("Ruby lifecycle expression needs an outcome context; analysis is incomplete")
+        index = frame.used
+        frame.used += 1
+        if index == len(frame.path):
+            raise ExpressionSplit(len(values))
+        return values[frame.path[index]]
+
+    def evaluate(self, tokens, state, **kwargs):
+        """Keep each expression outcome separate from its caller's bindings.
+
+        Calls and short-circuit operators introduce finite alternatives. Replay
+        only this expression from its entry state for each choice path, so the
+        existing mutating evaluator never joins mutually exclusive handles.
+        Nested helper statements have their own choice frame. The shared work
+        budget and the same 256-state bound include all replayed work.
+        """
+        previous, pending, outputs = self.choices, [()], []
+        try:
+            while pending:
+                self.budget.spend()
+                path = pending.pop()
+                self.choices = ExpressionChoices(path)
+                current = state.copy()
+                try:
+                    current.result = self.expression(tokens, current, **kwargs)
+                except ExpressionSplit as split:
+                    pending.extend((*path, index) for index in range(split.count))
+                    if len(pending) + len(outputs) > 256:
+                        raise AnalysisLimit("Ruby lifecycle expression path limit exceeded; analysis is incomplete")
+                else:
+                    outputs.append(current)
+        finally:
+            self.choices = previous
+        return self.bounded(outputs)
+
+    @staticmethod
+    def adopt(state, output):
+        state.bindings, state.members = output.bindings, output.members
+        state.live, state.closed = output.live, output.closed
+        state.flow, state.result = output.flow, output.result
+        return output.result
+
+    @staticmethod
+    def truth(value):
+        if value.kind == "keyword":
+            return value.key not in {"nil", "false"}
+        if value.kind in {"literal", "number", "resource", "array", "symbol", "constant"}:
+            return True
+        return None
+
+    def negate(self, value):
+        truth = self.truth(value)
+        if truth is None:
+            truth = self.choose((False, True))
+        return Value("keyword", "false" if truth else "true")
+
+    def selected_call(self, name, receiver, arguments, state):
+        owner = self.function.owner
+        singleton = self.function.singleton or (self.function.scope and bool(owner))
+        method = name
+        if name.startswith("self."):
+            method = name[5:]
+        elif "." in name:
+            target, method = name.rsplit(".", 1)
+            if receiver.kind == "constant":
+                target = str(receiver.key)
+            elif receiver != UNKNOWN or not re.fullmatch(r"[A-Z]\w*(?:::[A-Z]\w*)*", target):
+                return None
+            if target in state.bindings and receiver.kind != "constant":
+                return None
+            owner, singleton = tuple(target.split("::")), True
+        names, pending = {method}, [method]
+        while pending:
+            for alias in self.parser.aliases.get((owner, singleton, pending.pop()), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending.append(alias)
+        candidates = [function for function in self.parser.functions.values()
+                      if not function.scope and function.owner == owner
+                      and function.singleton == singleton and function.name in names]
+        if not candidates and "." not in name and owner:
+            candidates = [function for function in self.parser.functions.values()
+                          if not function.scope and not function.owner
+                          and not function.singleton and function.name == method]
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise ValueError("Ruby lifecycle helper dispatch is ambiguous; analysis is incomplete")
+        function = candidates[0]
+        if function.key in self.calls or len(self.calls) >= 12:
+            raise AnalysisLimit("Ruby lifecycle helper recursion limit exceeded; analysis is incomplete")
+        kinds = function.parameter_kinds or tuple("positional" for _ in function.parameters)
+        if any(kind != "positional" for kind in kinds):
+            raise ValueError("Ruby lifecycle helper keyword/rest/block binding is unsupported; analysis is incomplete")
+        defaults = function.defaults or tuple(() for _ in function.parameters)
+        required = sum(not default for default in defaults)
+        if not required <= len(arguments) <= len(function.parameters):
+            raise ValueError("Ruby lifecycle helper arguments cannot bind; analysis is incomplete")
+        optional = [index for index, default in enumerate(defaults) if default]
+        first_optional = optional[0] if optional else len(defaults)
+        after_optional = optional[-1] + 1 if optional else len(defaults)
+        if any(not default for default in defaults[first_optional:after_optional]):
+            raise ValueError("Ruby lifecycle optional arguments must be grouped; analysis is incomplete")
+        supplied_optional = len(arguments) - required
+        caller, stack, bindings = self.function, self.calls, dict(state.bindings)
+        child = state.copy()
+        child.bindings, child.result = self.constant_bindings(function.owner), UNKNOWN
+        self.function, self.calls = function, (*self.calls, function.key)
+        try:
+            inputs = [child]
+            for index, parameter in enumerate(function.parameters):
+                # Required arguments after the optional group consume values
+                # from the end. Missing defaults still execute left to right.
+                argument_index = index
+                if index >= after_optional:
+                    argument_index = len(arguments) - len(function.parameters) + index
+                elif index >= first_optional and index - first_optional >= supplied_optional:
+                    argument_index = None
+                following = []
+                for current in inputs:
+                    if argument_index is not None:
+                        current.bindings[parameter] = arguments[argument_index]
+                        following.append(current)
+                    else:
+                        for output in self.evaluate(defaults[index], current):
+                            output.bindings[parameter] = output.result
+                            following.append(output)
+                inputs = self.bounded(following)
+            outputs = self.sequence(function.body, inputs)
+        finally:
+            self.function, self.calls = caller, stack
+        for output in outputs:
+            output.bindings = dict(bindings)
+            if output.flow == "return":
+                output.flow = "normal"
+            elif output.flow in {"break", "next"}:
+                raise ValueError("Ruby lifecycle helper has a non-local block exit; analysis is incomplete")
+        return self.adopt(state, self.choose(outputs))
 
     def identity(self):
         self.budget.spend()
@@ -245,15 +478,28 @@ is an explicit incomplete-analysis error, never a truncated clean result.
     def call(self, name, receiver, arguments, token, state, label="", position=None):
         if state.flow != "normal":
             return UNKNOWN
-        root = name.split(".", 1)[0]
-        constants = root.split("::")
-        shadowed = any("::".join(constants[:index]) in state.bindings for index in range(1, len(constants) + 1))
-        if name in FACTORIES and not shadowed:
-            return self.acquire(name, token, state, label, position)
+        selected = self.selected_call(name, receiver, arguments, state)
+        if selected is not None:
+            return selected
         method = name.rsplit(".", 1)[-1]
+        factory = str(receiver.key) + "." + method if receiver.kind == "constant" else ""
+        if receiver.kind == "ambiguous_constant" and method in {"open", "new", "start", "fork"}:
+            raise ValueError("Ruby resource factory constant is unresolved; analysis is incomplete")
+        if factory in FACTORIES:
+            if FACTORIES[factory] == "thread_join" and any(self.references(value, state) for value in arguments):
+                raise ValueError("Ruby resource passed into a Thread needs cross-thread ownership; analysis is incomplete")
+            return self.acquire(factory, token, state, label, position)
         self.release(receiver, state, method, arguments, token.start)
         if receiver.kind == "resource":
             kind = self.resources[receiver.key][1]
+            if kind == "thread_join" and method == "join" and len(arguments) == 1 and receiver.key in state.live:
+                # A finite join can time out with nil, or return the completed
+                # Thread. Only the latter path observes this exact handle.
+                completed = self.choose((False, True))
+                if not completed:
+                    return Value("keyword", "nil")
+                self.release(receiver, state, "join")
+                return receiver
             if kind == "file_handle" and method == "closed?" and not arguments:
                 return Value("keyword", "true" if receiver.key in state.closed else "false")
             if kind == "http_session" and method == "started?" and not arguments:
@@ -312,6 +558,62 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         tokens = self.ungroup(tokens)
         if not tokens:
             return UNKNOWN
+        # Ruby's word-form operators bind below assignment; && and || bind
+        # above it. Each returns the selected operand, not a Boolean merge.
+        for operators in ({"or"}, {"and"}):
+            parts = self.split(tokens, operators)
+            if len(parts) > 1:
+                result = self.expression(parts[0], state, depth + 1)
+                for part in parts[1:]:
+                    truth = self.truth(result)
+                    if truth is None:
+                        truth = self.choose((False, True))
+                    if state.flow != "normal" or truth == ("or" in operators):
+                        break
+                    result = self.expression(part, state, depth + 1)
+                return result
+        if tokens[0].value == "not":
+            return self.negate(self.expression(tokens[1:], state, depth + 1))
+        if tokens[0].value in {"return", "raise", "fail", "break", "next"}:
+            result = self.expression(tokens[1:], state, depth + 1)
+            if state.flow == "normal":
+                state.flow = "raise" if tokens[0].value in {"raise", "fail"} else tokens[0].value
+            return result
+        groups = self.split(tokens, {"="})
+        if len(groups) > 1:
+            target = groups[0]
+            name = target[0].value if len(target) == 1 else ""
+            result = self.expression(groups[-1], state, depth + 1, label=name,
+                                     position=target[0].start if target else None)
+            if state.flow == "normal":
+                self.assign(groups[:-1], result, state)
+            return result
+        ternary = self.split(tokens, {"?"})
+        if len(ternary) > 1:
+            if len(ternary) != 2:
+                raise ValueError("Ruby nested ternary lifecycle binding is unsupported; analysis is incomplete")
+            arms = self.split(ternary[1], {":"})
+            if len(arms) != 2 or not all(arms):
+                raise ValueError("Ruby ternary lifecycle arms are ambiguous; analysis is incomplete")
+            condition = self.expression(ternary[0], state, depth + 1)
+            if state.flow != "normal":
+                return condition
+            truth = self.truth(condition)
+            if truth is None:
+                truth = self.choose((False, True))
+            return self.expression(arms[0 if truth else 1], state, depth + 1)
+        for operators in ({"||"}, {"&&"}):
+            parts = self.split(tokens, operators)
+            if len(parts) > 1:
+                result = self.expression(parts[0], state, depth + 1)
+                for part in parts[1:]:
+                    truth = self.truth(result)
+                    if truth is None:
+                        truth = self.choose((False, True))
+                    if state.flow != "normal" or truth == ("||" in operators):
+                        break
+                    result = self.expression(part, state, depth + 1)
+                return result
         if len(tokens) == 2 and tokens[0].value == "-" and tokens[1].kind == "number":
             return Value("number", "-" + tokens[1].value)
         shifted = self.split(tokens, {"<<"})
@@ -322,14 +624,14 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                 if value.kind == "array":
                     state.members[value.key] = (*state.members.get(value.key, ()), item)
             return value
-        for operators in ({"||", "&&", "or", "and", "?"}, {"==", "!=", "<", ">", "<=", ">="}, {"+", "-", "*", "/", ".."}):
+        for operators in ({"==", "!=", "<", ">", "<=", ">="}, {"+", "-", "*", "/", ".."}):
             parts = self.split(tokens, operators)
             if len(parts) > 1:
-                if operators & {"||", "&&", "or", "and", "?"} and self.relevant(tokens, state):
-                    raise ValueError("Ruby lifecycle short-circuit expression needs branch binding; analysis is incomplete")
                 for part in parts:
                     self.expression(part, state, depth + 1)
                 return UNKNOWN
+        if tokens[0].value == "!":
+            return self.negate(self.expression(tokens[1:], state, depth + 1))
         result, cursor = UNKNOWN, 0
         while cursor < len(tokens):
             self.budget.spend()
@@ -354,7 +656,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                 while cursor + 1 < len(tokens) and tokens[cursor].value == "::":
                     name += "::" + tokens[cursor + 1].value
                     cursor += 2
-                result = state.bindings.get(name, UNKNOWN)
+                result = self.lookup(name, state)
                 if cursor < len(tokens) and tokens[cursor].value == "(":
                     end = self.closing(tokens, cursor)
                     args = self.arguments(tokens[cursor + 1:end], state, depth + 1)
@@ -364,6 +666,9 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                     args = self.arguments(tokens[cursor:], state, depth + 1)
                     result = self.call(name, UNKNOWN, args, token, state, label, position)
                     cursor = len(tokens)
+                elif (name not in state.bindings and name[0].islower()
+                      and (cursor == len(tokens) or tokens[cursor].value in {".", "&."})):
+                    result = self.call(name, UNKNOWN, (), token, state, label, position)
             else:
                 cursor += 1
                 continue
@@ -405,27 +710,53 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         for group in reversed(groups):
             if len(group) == 1 and group[0].kind == "code" and IDENT.fullmatch(group[0].value):
                 state.bindings[group[0].value] = value
+            elif (len(group) >= 4 and group[1].value == "[" and self.closing(group, 1) == len(group) - 1
+                    and IDENT.fullmatch(group[0].value)):
+                container = self.lookup(group[0].value, state)
+                index_tokens = self.ungroup(group[2:-1])
+                index = None
+                if len(index_tokens) == 1 and index_tokens[0].kind == "number" and index_tokens[0].value.isdigit():
+                    index = int(index_tokens[0].value)
+                elif (len(index_tokens) == 2 and index_tokens[0].value == "-"
+                      and index_tokens[1].kind == "number" and index_tokens[1].value.isdigit()):
+                    index = -int(index_tokens[1].value)
+                if container.kind != "array" or index is None:
+                    raise ValueError("Ruby lifecycle collection assignment needs an exact index; analysis is incomplete")
+                members = list(state.members.get(container.key, ()))
+                if index < 0:
+                    index += len(members)
+                if index < 0:
+                    state.flow = "raise"
+                    return
+                if index >= 256:
+                    raise AnalysisLimit("Ruby lifecycle collection index limit exceeded; analysis is incomplete")
+                members.extend(Value("keyword", "nil") for _ in range(index + 1 - len(members)))
+                members[index] = value
+                state.members[container.key] = tuple(members)
             elif group and (value.kind in {"resource", "array"} or self.relevant(group, state)):
                 raise ValueError("Ruby lifecycle assignment target needs binding analysis; analysis is incomplete")
         state.result = value
 
+    def references(self, value, state, seen=None):
+        if value.kind == "resource":
+            return {value.key}
+        if value.kind != "array":
+            return set()
+        seen = set() if seen is None else set(seen)
+        if value.key in seen:
+            raise ValueError("Ruby cyclic resource collection needs heap analysis; analysis is incomplete")
+        seen.add(value.key)
+        return {identity for member in state.members.get(value.key, ())
+                for identity in self.references(member, state, seen)}
+
     def simple(self, tokens, state):
         if not tokens:
-            return state
-        if tokens[0].value in {"return", "raise", "fail", "break", "next"}:
-            state.result = self.expression(tokens[1:], state)
-            state.flow = "raise" if tokens[0].value in {"raise", "fail"} else tokens[0].value
-            return state
-        groups = self.split(tokens, {"="})
+            return [state]
         if len(self.split(tokens, {"||=", "&&=", "+=", "-="})) > 1:
             if self.relevant(tokens, state):
                 raise ValueError("Ruby lifecycle compound assignment needs binding analysis; analysis is incomplete")
-            return state
-        target = groups[0] if len(groups) > 1 else ()
-        label = target[0].value if len(target) == 1 else ""
-        value = self.expression(groups[-1], state, label=label, position=target[0].start if target else None)
-        self.assign(groups[:-1], value, state)
-        return state
+            return [state]
+        return self.evaluate(tokens, state)
 
     def scoped_block(self, statement, state, values):
         names = statement.names
@@ -451,28 +782,48 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         expression = groups[-1]
         call_expression = self.ungroup(self.split(expression, {"<<"})[-1])
         factory_parts = self.split(call_expression, {".", "&."})
-        factory = (self.text(factory_parts[0]) + "." + factory_parts[1][0].value
-                   if len(factory_parts) == 2 and factory_parts[1] else "")
+        factory = ""
+        if len(factory_parts) == 2 and factory_parts[1]:
+            receiver = self.lookup(self.text(factory_parts[0]), state)
+            if receiver.kind == "constant":
+                factory = str(receiver.key) + "." + factory_parts[1][0].value
         if factory in {"Thread.new", "Thread.start", "Thread.fork"}:
-            self.simple(statement.tokens, state)
-            child = state.copy()
-            child.live.clear()
-            child.result = UNKNOWN
-            self.finish(self.scoped_block(statement, child, ()))
-            return [state]
+            outputs = self.simple(statement.tokens, state)
+            for output in outputs:
+                if output.flow != "normal":
+                    continue
+                child = output.copy()
+                child.live.clear()
+                child.result = UNKNOWN
+                self.finish(self.scoped_block(statement, child, ()))
+            return outputs
         if factory in {"File.open", "Net::HTTP.start"}:
-            value = self.expression(expression, state)
-            if value.kind == "resource" and self.resources[value.key][1] == FACTORIES[factory]:
-                outputs = self.scoped_block(statement, state, (value,))
-                for output in outputs:
-                    self.release(value, output, "close" if factory.startswith("File.") else "finish")
-                    if output.flow == "normal":
-                        self.assign(groups[:-1], output.result, output)
-                return outputs
+            outputs = []
+            for current in self.evaluate(expression, state):
+                value = current.result
+                if current.flow != "normal":
+                    outputs.append(current)
+                elif value.kind == "resource" and self.resources[value.key][1] == FACTORIES[factory]:
+                    for output in self.scoped_block(statement, current, (value,)):
+                        self.release(value, output, "close" if factory.startswith("File.") else "finish")
+                        if output.flow == "normal":
+                            self.assign(groups[:-1], output.result, output)
+                        outputs.append(output)
+                else:
+                    outputs.extend(self.loop(statement, current))
+            return self.bounded(outputs)
         parts = self.split(expression, {".", "&."})
         method = parts[-1][0].value if len(parts) > 1 and parts[-1] else ""
         receiver_tokens = expression[:len(expression) - len(parts[-1]) - 1] if method else ()
-        receiver = self.expression(receiver_tokens, state) if receiver_tokens else UNKNOWN
+        outputs = []
+        for current in self.evaluate(receiver_tokens, state):
+            if current.flow != "normal":
+                outputs.append(current)
+            else:
+                outputs.extend(self.iterate_receiver(statement, current, current.result, method, groups))
+        return self.bounded(outputs)
+
+    def iterate_receiver(self, statement, state, receiver, method, groups):
         if method in {"each", "map", "collect"} and receiver.kind == "array":
             members = state.members.get(receiver.key, ())
             mapped = self.array((), state) if method != "each" else UNKNOWN
@@ -483,7 +834,14 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                     if output.flow != "normal":
                         following.append(output)
                         continue
-                    for current in self.scoped_block(statement, output, (member,)):
+                    if statement.kind == "for":
+                        if len(statement.names) != 1 or not IDENT.fullmatch(statement.names[0]):
+                            raise ValueError("Ruby lifecycle for destructuring is unsupported; analysis is incomplete")
+                        output.bindings[statement.names[0]] = member
+                        iterations = self.sequence(statement.body, [output])
+                    else:
+                        iterations = self.scoped_block(statement, output, (member,))
+                    for current in iterations:
                         if current.members.get(receiver.key, ()) != members:
                             raise ValueError("Ruby collection mutation during iteration needs loop analysis; analysis is incomplete")
                         if current.flow == "next":
@@ -574,34 +932,40 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                     depth += 1
                 elif token.value in {")", "]", "}"}:
                     depth -= 1
-            return [self.simple(statement.tokens, state)]
+            return self.simple(statement.tokens, state)
         if kind == "block":
             return self.sequence(statement.body, [state])
         if kind in {"if", "unless"}:
-            condition = self.expression(statement.tokens, state)
-            truth = None
-            if condition.kind == "keyword":
-                truth = condition.key not in {"nil", "false"}
-            elif condition.kind in {"literal", "number", "resource", "array", "symbol"}:
-                truth = True
-            if kind == "unless" and truth is not None:
-                truth = not truth
             outputs = []
-            if truth is not False:
-                outputs.extend(self.sequence(statement.body, [state.copy()]))
-            if truth is not True:
-                alternate = state.copy()
-                alternate.result = UNKNOWN
-                outputs.extend(self.sequence(statement.alternate, [alternate]))
+            for current in self.evaluate(statement.tokens, state):
+                if current.flow != "normal":
+                    outputs.append(current)
+                    continue
+                truth = self.truth(current.result)
+                if kind == "unless" and truth is not None:
+                    truth = not truth
+                if truth is not False:
+                    outputs.extend(self.sequence(statement.body, [current.copy()]))
+                if truth is not True:
+                    alternate = current.copy()
+                    alternate.result = UNKNOWN
+                    outputs.extend(self.sequence(statement.alternate, [alternate]))
             return outputs
         if kind in {"while", "until", "for"}:
-            condition = self.expression(statement.tokens, state)
-            if kind != "for" and condition.kind == "keyword":
-                truth = condition.key not in {"nil", "false"}
-                if (kind == "while" and not truth) or (kind == "until" and truth):
-                    state.result = UNKNOWN
-                    return [state]
-            return self.loop(statement, state)
+            outputs = []
+            for current in self.evaluate(statement.tokens, state):
+                if current.flow != "normal":
+                    outputs.append(current)
+                    continue
+                truth = self.truth(current.result)
+                if (kind == "while" and truth is False) or (kind == "until" and truth is True):
+                    current.result = UNKNOWN
+                    outputs.append(current)
+                elif kind == "for" and current.result.kind == "array":
+                    outputs.extend(self.iterate_receiver(statement, current, current.result, "each", ((),)))
+                else:
+                    outputs.extend(self.loop(statement, current))
+            return outputs
         if kind == "iterate":
             return self.iterate(statement, state)
         if kind == "rescue":
@@ -644,24 +1008,33 @@ is an explicit incomplete-analysis error, never a truncated clean result.
 
     def run(self):
         for function in self.parser.functions.values():
+            self.function, self.calls = function, (function.key,)
             state = State()
+            if not function.scope:
+                state.bindings.update(self.constant_bindings(function.owner))
+            inputs = [state]
             for index, name in enumerate(function.parameters):
                 default = function.defaults[index] if index < len(function.defaults) else ()
-                state.bindings[name] = self.expression(default, state) if default else UNKNOWN
-            self.finish(self.sequence(function.body, [state]), returns=not function.scope)
+                following = []
+                for current in inputs:
+                    for output in self.evaluate(default, current):
+                        output.bindings[name] = output.result
+                        following.append(output)
+                inputs = self.bounded(following)
+            self.finish(self.sequence(function.body, inputs), returns=not function.scope)
         return [(position, kind, message) for (position, kind), message in sorted(self.issues.items())]
 
 
 def scan_file(path: Path, text: str) -> list[tuple[int, str, str]]:
     """Return acquisition-site findings, or fail explicitly when incomplete."""
-    if not ACQUISITION.search(text):
+    if not may_acquire(text):
         return []
     from ubs_core.analyzers.taint_ruby_traversal import RubyLexer
     pending = [RubyLexer(text).scan()]
     relevant = False
     while pending:
         tokens = pending.pop()
-        relevant |= bool(ACQUISITION.search(" ".join(token.value if token.kind == "code" else " " for token in tokens)))
+        relevant |= may_acquire(" ".join(token.value if token.kind == "code" else " " for token in tokens))
         pending.extend(part for token in tokens for part in token.parts)
     if not relevant:
         return []
@@ -701,6 +1074,9 @@ def main() -> int:
 
 
 def run(ctx: RunContext) -> Iterable[dict]:
+    enabled = {kind for kind in FACTORIES.values() if ctx.rule_enabled(f"ruby.lifecycle.{kind}")}
+    if not enabled:
+        return
     cwd = Path.cwd()
     for path in ctx.files:
         if path.suffix.lower() not in RUBY_SUFFIXES:
@@ -711,6 +1087,8 @@ def run(ctx: RunContext) -> Iterable[dict]:
             continue
         rel = str(path.relative_to(cwd)) if path.is_relative_to(cwd) else str(path)
         for pos, kind, message in scan_file(path, text):
+            if kind not in enabled:
+                continue
             line, col = line_col(text, pos)
             yield {
                 "rule": f"ruby.lifecycle.{kind}",

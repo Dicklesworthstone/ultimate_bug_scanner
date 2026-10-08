@@ -4,6 +4,8 @@ The expected obligations follow the Ruby APIs, before choosing an analysis:
 https://docs.ruby-lang.org/en/3.4/Thread.html
 https://docs.ruby-lang.org/en/3.4/IO.html#method-c-open
 https://docs.ruby-lang.org/en/3.4/syntax/exceptions_rdoc.html
+https://docs.ruby-lang.org/en/3.4/syntax/methods_rdoc.html
+https://docs.ruby-lang.org/en/3.4/syntax/control_expressions_rdoc.html
 
 Thread#join without a deadline and Thread#value observe that receiver. Array
 iteration invokes a block for each member; Array#join merely formats strings.
@@ -164,6 +166,47 @@ CASES = (
     Case("string_marker_does_not_suppress_code", "worker = Thread.new { work }; note = '# ubs:ignore'", ((THREAD, 1),)),
     Case("marker_does_not_suppress_another_acquisition", "worker = Thread.new { first } # ubs:ignore[ruby.lifecycle.thread_join]\nsecond = Thread.new { second }", ((THREAD, 2),)),
     Case("acquisition_marker_does_not_suppress_double_finish", "session = Net::HTTP.start('example.com') # ubs:ignore[ruby.lifecycle.http_session]\nsession.finish\nsession.finish", ((HTTP, 3),)),
+    # Source-visible calls must preserve the actual argument and return object.
+    # A safe returned-handle case alone cannot expose an ignored call: pair it
+    # with a caller that drops the same returned obligation.
+    Case("helper_returned_file_closed_by_caller", "def acquire\n  File.open('data')\nend\nhandle = acquire\nhandle.close", ()),
+    Case("helper_returned_file_leaks_in_caller", "def acquire\n  File.open('data')\nend\nhandle = acquire\nputs 'done'", ((FILE, 2),)),
+    Case("helper_ignored_return_keeps_obligation", "def acquire\n  File.open('data')\nend\nacquire\nputs 'done'", ((FILE, 2),)),
+    Case("helper_returned_thread_joined_by_caller", "def start_work\n  Thread.new { work }\nend\nworker = start_work\nworker.join", ()),
+    Case("helper_returned_thread_remains_unobserved", "def start_work\n  Thread.new { work }\nend\nworker = start_work\nputs 'done'", ((THREAD, 2),)),
+    Case("helper_closes_selected_argument", "def release(handle)\n  handle.close\nend\nhandle = File.open('data')\nrelease(handle)", ()),
+    Case("helper_argument_position_preserves_other_owner", "def release(first, second)\n  second.close\nend\nfirst = File.open('first')\nsecond = File.open('second')\nrelease(first, second)", ((FILE, 4),)),
+    Case("helper_returned_argument_keeps_identity", "def same_handle(handle)\n  handle\nend\nhandle = File.open('data')\ncopy = same_handle(handle)\ncopy.close", ()),
+    Case("helper_conditional_close_leaves_obligation", "def release(handle, ready)\n  handle.close if ready\nend\nhandle = File.open('data')\nrelease(handle, condition)", ((FILE, 4),)),
+    Case("helper_both_branches_close", "def release(handle, ready)\n  if ready\n    handle.close\n  else\n    handle.close\n  end\nend\nhandle = File.open('data')\nrelease(handle, condition)", ()),
+    Case("helper_named_release_without_close_leaks", "def release(handle)\n  nil\nend\nhandle = File.open('data')\nrelease(handle)", ((FILE, 4),)),
+    Case("helper_raise_skips_caller_cleanup", "def stop_work(handle)\n  raise 'failed'\nend\nhandle = File.open('data')\nstop_work(handle)\nhandle.close", ((FILE, 4),)),
+    Case("helper_ensure_closes_on_return", "def release(handle)\n  begin\n    return nil\n  ensure\n    handle.close\n  end\nend\nhandle = File.open('data')\nrelease(handle)", ()),
+    Case("helper_http_double_finish_skips_file_close", "def finish_session(session)\n  session.finish\nend\nhandle = File.open('data')\nsession = Net::HTTP.start('example.com')\nfinish_session(session)\nfinish_session(session)\nhandle.close", ((FILE, 4), (HTTP, 2))),
+    Case("helper_branch_return_preserves_selected_object", "def acquire(ready)\n  if ready\n    File.open('first')\n  else\n    File.open('second')\n  end\nend\nhandle = acquire(condition)\nhandle.close", ()),
+    Case("helper_branch_return_does_not_erase_dropped_objects", "def acquire(ready)\n  if ready\n    File.open('first')\n  else\n    File.open('second')\n  end\nend\nhandle = acquire(condition)\nputs 'done'", ((FILE, 3), (FILE, 5))),
+    # Conditions execute only the selected operand; a timed join can return
+    # nil, whereas an unlimited join guarantees completion on its return path.
+    Case("ternary_both_arms_close", "handle = File.open('data')\nready ? handle.close : handle.close", ()),
+    Case("ternary_one_arm_keeps_obligation", "handle = File.open('data')\nready ? handle.close : nil", ((FILE, 1),)),
+    Case("unknown_short_circuit_keeps_thread_obligation", "worker = Thread.new { work }\nready && worker.join", ((THREAD, 1),)),
+    Case("false_short_circuit_never_closes_file", "handle = File.open('data')\nfalse && handle.close", ((FILE, 1),)),
+    Case("nil_short_circuit_executes_close", "handle = File.open('data')\nnil || handle.close", ()),
+    Case("timed_join_fallback_waits_for_completion", "worker = Thread.new { work }\nworker.join(0) || worker.join", ()),
+    Case("timed_join_and_can_skip_completion", "worker = Thread.new { work }\nworker.join(0) && worker.join", ((THREAD, 1),)),
+    Case("for_binding_replaces_outer_file", "handle = File.open('first')\nhandles = [File.open('second')]\nfor handle in handles\n  handle.close\nend\nhandle.close", ((FILE, 1),)),
+    Case("for_binding_survives_loop", "handles = [File.open('data')]\nfor handle in handles\n  nil\nend\nhandle.close", ()),
+    Case("factory_constant_visible_in_method", "Files = File\ndef consume\n  handle = Files.open('data')\n  nil\nend", ((FILE, 3),)),
+    Case("factory_constant_visible_in_module_method", "module Storage\n  Files = File\n  def self.consume\n    handle = Files.open('data')\n    nil\n  end\nend", ((FILE, 4),)),
+    Case("indexed_replacement_keeps_removed_thread_obligation", "workers = []\nworkers << Thread.new { first }\nworkers << Thread.new { second }\nworkers[0] = nil\nworkers.each(&:join)", ((THREAD, 2),)),
+    Case("bare_helper_receiver_keeps_unclosed_return", "def acquire\n  File.open('data')\nend\nacquire.read", ((FILE, 2),)),
+    Case("bare_helper_receiver_closes_return", "def acquire\n  File.open('data')\nend\nacquire.close", ()),
+    Case("negated_timeout_else_join_can_skip_wait", "worker = Thread.new { work }\nif !worker.join(0)\n  nil\nelse\n  worker.join\nend", ((THREAD, 1),)),
+    Case("negated_timeout_true_arm_waits", "worker = Thread.new { work }\nif !worker.join(0)\n  worker.join\nelse\n  nil\nend", ()),
+    Case("negated_true_must_not_close", "handle = File.open('data')\nif !true\n  handle.close\nend", ((FILE, 1),)),
+    Case("negated_false_executes_close", "handle = File.open('data')\nif !false\n  handle.close\nend", ()),
+    Case("optional_before_required_preserves_argument_position", "def release(ignored=nil, handle)\n  ignored.close if ignored\nend\nhandle = File.open('data')\nrelease(handle)", ((FILE, 4),)),
+    Case("optional_before_required_closes_required_owner", "def release(ignored=nil, handle)\n  handle.close\nend\nhandle = File.open('data')\nrelease(handle)", ()),
 )
 
 BY_NAME = {case.name: case for case in CASES}
@@ -200,11 +243,38 @@ class RubyLifecycleBindings(unittest.TestCase):
         findings = lifecycle_ruby.scan_file(target, source)
         self.assertEqual([], findings)
 
+    def test_rule_profile_selects_exact_owners_before_unsupported_parsing(self):
+        from ubs_core.registry import RunContext
+
+        target = self.artifact / "profile.rb"
+        target.write_text("handle = File.open('data')\nworker = Thread.new { work }\n", encoding="utf-8")
+        for disabled, expected in (
+            ((), [(FILE, 1, 1), (THREAD, 2, 1)]),
+            ((THREAD,), [(FILE, 1, 1)]),
+            ((FILE,), [(THREAD, 2, 1)]),
+            ((FILE, THREAD), []),
+        ):
+            with self.subTest(disabled=disabled):
+                rows = list(lifecycle_ruby.run(RunContext(
+                    lang="ruby", files=[target], profile={"disabled_rules": list(disabled)})))
+                actual = [(row["rule"], row["line"], row["col"]) for row in rows]
+                label = "-".join(rule.rsplit(".", 1)[-1] for rule in disabled) or "enabled"
+                (self.artifact / (label + ".json")).write_text(json.dumps({
+                    "disabled": disabled, "expected": expected, "actual": actual,
+                    "findings": rows, "python": sys.version,
+                    "source_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
+                    "analyzer_sha256": hashlib.sha256(Path(lifecycle_ruby.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(actual, expected, rows)
+        target.write_text("worker = Thread.new { work }\ncallback = -> { worker.join }\n", encoding="utf-8")
+        self.assertEqual([], list(lifecycle_ruby.run(RunContext(
+            lang="ruby", files=[target], profile={"disabled_rules": [FILE, THREAD, HTTP]}))))
+
     def test_analysis_limits_and_unsupported_shapes_are_explicit(self):
         cases = {
             "malformed": "worker = Thread.new do\n  work\n",
             "unsupported_closure": "worker = Thread.new { work }\ncallback = -> { worker.join }\n",
-            "unknown_short_circuit": "worker = Thread.new { work }\nready && worker.join\n",
+            "cross_thread_resource_argument": "handle = File.open('data')\nworker = Thread.new(handle) { |file| file.close }\nworker.join\n",
             "mutated_iterator": "workers = [Thread.new { work }]\nworkers.each { |worker| workers << Thread.new { work }; worker.join }\n",
             "path_budget": "\n".join(f"if ready{i}\n  worker{i} = Thread.new {{ work }}\nend" for i in range(9)),
             "unknown_loop_multiplicity": "workers = []\ncount.times { workers << Thread.new { work } }\nworkers[0].join\nworkers[1].join\n",
@@ -314,11 +384,7 @@ class RubyLifecycleBindings(unittest.TestCase):
             self.assertIn("lifecycle_ruby", report["scanners"][0]["message"])
 
     def test_public_json_and_sarif(self):
-        names = ("collection_joined_with_symbol", "unrelated_join_does_not_observe_anonymous_thread",
-                 "uncalled_method_does_not_join_outer_thread", "collection_alias_retains_members",
-                 "new_binding_does_not_discharge_old_thread", "conditional_join_leaves_obligation",
-                 "file_alias_closes_original", "file_reassignment_keeps_old_obligation",
-                 "ensure_closes_on_raise", "explicit_raise_skips_later_close")
+        names = tuple(case.name for case in CASES)
         selected = self.artifact / "selected"
         selected.mkdir()
         expected = []

@@ -134,5 +134,51 @@ class LocaleTests(unittest.TestCase):
         self.assertEqual(proc.stdout.decode(), "1")
 
 
+def comma_decimal_locale() -> str | None:
+    """A locale whose EPOCHREALTIME uses "," (ru_RU, de_DE...), or None if none is installed."""
+    listed = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout.split()
+    for name in ("ru_RU.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "ru_RU.utf8", "de_DE.utf8", "fr_FR.utf8"):
+        if name in listed:
+            probe = subprocess.run(["bash", "-c", 'printf %s "$EPOCHREALTIME"'], capture_output=True, text=True,
+                                   env={**os.environ, "LC_ALL": "", "LC_NUMERIC": name})
+            if "," in probe.stdout:
+                return name
+    return None
+
+
+class EpochMillisecondsTests(unittest.TestCase):
+    """GH #160: EPOCHREALTIME carries the LC_NUMERIC decimal separator, so splitting at a literal
+    "." read the microsecond field as the epoch under ru_RU/de_DE (garbage or negative durations,
+    and "value too great for base" when the fraction started with 0)."""
+
+    def test_dot_and_comma_separators_give_the_same_milliseconds(self) -> None:
+        for raw, expected in (("1791357093.406751", "1791357093406"), ("1791357093,406751", "1791357093406"),
+                              ("1791357099,083236", "1791357099083"), ("1791357099.000999", "1791357099000")):
+            proc = bash('ubs_epoch_ms "$1"', raw)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.decode().strip(), expected, raw)
+
+    def test_runner_copy_matches(self) -> None:
+        # The meta-runner keeps its own copy (it runs before any module library is sourced).
+        runner = REPO_ROOT / "ubs"
+        for raw, expected in (("1791357093,406751", "1791357093406"), ("1791357099.083236", "1791357099083")):
+            proc = subprocess.run(
+                ["bash", "-c", 'source <(sed -n "/^epoch_ms(){/,/^}/p" "$1"); epoch_ms "$2"', "bash", str(runner), raw],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), expected, raw)
+
+    def test_now_ms_under_a_comma_decimal_locale(self) -> None:
+        name = comma_decimal_locale()
+        if name is None:
+            self.skipTest("no comma-decimal locale installed")
+        proc = bash('ubs_now_ms; date +%s', env={"LC_NUMERIC": name})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, b"")
+        now_ms, epoch_s = (int(line) for line in proc.stdout.decode().split())
+        self.assertLess(abs(now_ms - epoch_s * 1000), 5000)
+
+
 if __name__ == "__main__":
     unittest.main()

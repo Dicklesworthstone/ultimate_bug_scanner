@@ -33,10 +33,19 @@ ubs_export_locale(){
 }
 
 # ── Time / failure ──────────────────────────────────────────────────────────
+# Milliseconds since the epoch from an EPOCHREALTIME value. Bash prints EPOCHREALTIME with the
+# LC_NUMERIC decimal separator ("1791357093,406751" under ru_RU or de_DE), so split at the first
+# and last non-digit rather than at a literal "." (#160).
+ubs_epoch_ms(){
+  local t="$1" s us
+  s="${t%%[!0-9]*}"
+  us="${t##*[!0-9]}"
+  printf '%s\n' $(( 10#$s * 1000 + 10#${us:0:3} ))
+}
+
 ubs_now_ms(){
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    local s="${EPOCHREALTIME%.*}" us="${EPOCHREALTIME#*.}"
-    printf '%s\n' $(( s * 1000 + 10#${us:0:3} ))
+    ubs_epoch_ms "$EPOCHREALTIME"
   else
     local ns; ns="$(date +%s%N 2>/dev/null || echo 0)"
     printf '%s\n' $(( ns / 1000000 ))

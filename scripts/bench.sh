@@ -183,7 +183,8 @@ fi
 # Text mode, because that is what the hooks run (json mode adds the module's
 # own report-json pass). Timed with $EPOCHREALTIME (bash 5): no extra process.
 SINGLE_FILE_TARGET_REL="test-suite/python/clean/clean_async_security.py"
-now_ms(){ local t="${EPOCHREALTIME/./}"; echo $(( t / 1000 )); }
+# Drop the separator whatever LC_NUMERIC makes it ("." or ","; #160), leaving microseconds.
+now_ms(){ local t="${EPOCHREALTIME//[!0-9]/}"; echo $(( 10#$t / 1000 )); }
 bench_single_file(){
   local target="$ROOT_DIR/$SINGLE_FILE_TARGET_REL" samples="$WORK/single-file.samples"
   local i t0 t1 t2 meta module

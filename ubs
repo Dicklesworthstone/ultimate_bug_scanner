@@ -106,18 +106,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='667c647f7268b089bf82635013cda9080d31f37169dc0dabb60832d943c44faa'
-  [cpp]='e10c812c4ca784d76b95d3fa586060bbe14f913ff4525c8ebf562d6f42c5bc54'
-  [csharp]='0eb47837a24273c5d4bc76382a2536c20e6790d110315250c5db29c5b085c14f'
-  [elixir]='4844ff4307b3009af68c46cb40b428d04aab099b77e8f207ea37f69af4ba9c90'
-  [golang]='6e29183106ab4f071ed9093d45b459943969cd9ebcad308585b237ac82d670c1'
-  [java]='d330493d5626efbb15ed7190bb92c4af5e7493864278737cf24cd35cb2879ecd'
-  [js]='f4c157a38ed2c50faa0703f922a450260feee3a7572d16407c39451758790bee'
-  [kotlin]='b4bbffc6ae4a03350731e833540bdcf182e6cc8b7171310a1a65492cc8443c21'
-  [python]='cce7130dd6a065d788f2269db444b7290fbec1a3ae5305d9abe33fe40c165a68'
-  [ruby]='d952f813a6a4c62efa36a81f29cb9d357b3bd3da17e020eb6d552d386b998162'
-  [rust]='93b2a8c2f118bf7043ea4eb3ad4ec6000355820ef8bfebc0168650372eaf650b'
-  [swift]='8c8c7c9939bd273b69adf91bad38a0eff99270be4f3c78de6c1907e66c4a1bf3'
+  [bash]='90e7a549ce4ea1eca704c6a2319545784352144215f24fcfdb10204e6ef8ed6f'
+  [cpp]='65ccd6e36ec088c23ce1d1ec46f267b98a588717b483fbecc2f36949b026e13d'
+  [csharp]='ab4847abc59e234e25158fe824fa221fc70451e97b14e35b79dd1c64948c0ea1'
+  [elixir]='151b558e8bc7215c1f6980b4870543ca6f369b2e452be4c78f465dd86fc012d8'
+  [golang]='cbc02122f1c5dbb98181f9f524fa1a48c8c1085e5f203043a4d5e3a132141e91'
+  [java]='c49e32600688a0b71f3f19a69b146fa509f1fc2074853c2fae006e8e1a8138f2'
+  [js]='689115dad999adabdb62440b69dab348c7a5b8fa7c0ccb0e94b958f959695ac4'
+  [kotlin]='0f22bca0f61713f6094ae021d646465e66f4c60f8d35ede36115fe2137c08ebc'
+  [python]='16afbd2733e9cba5f80fe0cc5901ef770147187afe85e0bb81e3fe561b3c86e9'
+  [ruby]='22cd7268c5982b7a2c29ebf2b3a8cf73c55fceec6ccd35b7bae9343d175e85be'
+  [rust]='c2df19ad11ad11bbf86cc57ca5bd9ee7a3c15376dafcf92d4b2d24160bb8fcd2'
+  [swift]='f9415e6bbac175a71d0bdc295e9f852b1fdace9aad515d57f55b735b0bb8c898'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -475,7 +475,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='b506f2f01c92fba09f5a684a24cdc124097b4760719f928e22f64fdf3bdcb246'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='c9ac19785f95afcda3cad7c3a9c9c3d97a71456d7a1379f21e4dcf06c4eef342'
+  ['lib/ubs-common.sh']='f24e186666b67eaedba6fa45bbe3fad771269a10bdee1416821d9bf4c47cb999'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -563,11 +563,20 @@ resolve_python3(){
 resolve_python3 || true
 date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then TZ=UTC printf '%(%Y-%m-%dT%H:%M:%SZ)T\n' -1; else printf '%(%Y-%m-%d %H:%M:%S)T\n' -1; fi; }
 
+# Milliseconds since the epoch from an EPOCHREALTIME value. Bash prints it with the LC_NUMERIC
+# decimal separator ("1791357093,406751" under ru_RU or de_DE), so split at the first and last
+# non-digit rather than at a literal "." (#160).
+epoch_ms(){
+  local t="$1" s us
+  s="${t%%[!0-9]*}"
+  us="${t##*[!0-9]}"
+  printf '%s\n' $(( 10#$s * 1000 + 10#${us:0:3} ))
+}
+
 # Milliseconds since the epoch (bash 5 EPOCHREALTIME, else date +%s%N).
 now_ms(){
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    local s="${EPOCHREALTIME%.*}" us="${EPOCHREALTIME#*.}"
-    printf '%s\n' $(( s * 1000 + 10#${us:0:3} ))
+    epoch_ms "$EPOCHREALTIME"
   else
     local ns; ns="$(date +%s%N 2>/dev/null || echo 0)"
     printf '%s\n' $(( ns / 1000000 ))

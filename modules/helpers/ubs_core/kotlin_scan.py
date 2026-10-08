@@ -2,7 +2,7 @@
 
 Executes static analysis on Kotlin (.kt, .kts) files across:
 1. Pattern layer: ProcessBuilder shell execution
-2. Analyzer layer: Kotlin null-guard type narrowing, taint path traversal, taint open redirect
+2. Analyzer layer: Kotlin null flow, coroutine context/ownership, taint paths and redirects
 3. Detector layer: archive extraction (zip slip), response header injection,
    SSRF outbound URL, insecure randomness in tokens/secrets
 4. ast-grep layer: consolidated rule pack via ubs_core.kotlin_rules
@@ -63,6 +63,9 @@ _SUBHEADERS = {
     1: {
         "kotlin.narrowing.": "Kotlin guard clauses without exit",
     },
+    3: {
+        "kotlin.coroutine.": "Coroutine cancellation, blocking work and Job ownership",
+    },
     4: {
         "kotlin.security.insecure-randomness": "Security-sensitive non-crypto randomness",
         "kotlin.taint.path_traversal": "Request-derived filesystem paths",
@@ -87,6 +90,10 @@ _SUMMARY_TITLES: dict[str, str] = {
     "kotlin.narrowing.positive_guard": "Kotlin guard without exit before '!!'",
     "kotlin.narrowing.smart_cast": "Kotlin guard without exit before '!!'",
     "kotlin.narrowing.elvis_force": "Kotlin guard without exit before '!!'",
+    "kotlin.narrowing.nullable_value": "Null assertion may dereference an explicitly nullable value",
+    "kotlin.coroutine.swallowed-cancellation": "Selected cancellation exception is not propagated on every path",
+    "kotlin.coroutine.blocking-call": "Blocking Thread.sleep in a coroutine context",
+    "kotlin.coroutine.unowned-job": "Detached coroutine Job has no local completion or ownership transfer",
 }
 
 _GOOD_LINES: tuple[tuple[str, str, int], ...] = (
@@ -146,6 +153,8 @@ def _record_category(rec: dict) -> int | None:
     rule = rec.get("rule", "")
     if rule.startswith("kotlin.narrowing."):
         return 1
+    if rule.startswith("kotlin.coroutine."):
+        return 3
     if rule.startswith("kotlin.security.") or rule.startswith("kotlin.taint."):
         return 4
     cat_id = rec.get("category_id", "")
@@ -192,26 +201,39 @@ def scan_patterns(patterns: list[Pattern], files: Sequence[Path], sink, skip: se
                     }, ensure_ascii=False) + "\n")
 
 
-def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Path | None = None, prefilter: Any = None) -> None:
+def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Path | None = None,
+                   prefilter: Any = None, errors: list[str] | None = None) -> None:
+    import importlib
     from ubs_core.registry import RunContext
 
     def _source_path(path: str) -> str:
         return str(Path(path).resolve()) if path else path
 
-    # 1. Type narrowing (category 1)
-    if 1 not in skip:
-        from ubs_core.analyzers import narrowing_kotlin
-        aname = getattr(narrowing_kotlin, "name", "narrowing_kotlin")
+    # Native analyses share selection, suppression and the incomplete-scan
+    # envelope. A malformed/exhausted file must not become a clean cache entry.
+    for category, aname, category_id in (
+        (1, "narrowing_kotlin", "kotlin.type-narrowing"),
+        (3, "coroutines_kotlin", "kotlin.concurrency"),
+    ):
+        if category in skip:
+            continue
+        analyzer = importlib.import_module("ubs_core.analyzers." + aname)
         target_files = files
         if prefilter is not None and not prefilter.is_bypass:
             target_files = prefilter.filter_files_for_analyzer(aname, files)
-        if target_files:
-            ctx = RunContext(lang="kotlin", files=list(target_files))
-            for finding in narrowing_kotlin.run(ctx):
+        for path in target_files:
+            try:
+                findings = list(analyzer.run(RunContext(lang="kotlin", files=[path])))
+            except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: {aname}: {exc}")
+                continue
+            for finding in findings:
                 rule_id = finding.get("rule", "")
                 sink.write(json.dumps({
                     "rule": rule_id,
-                    "category_id": "kotlin.type-narrowing",
+                    "category_id": category_id,
                     "path": _source_path(str(finding.get("path", ""))),
                     "line": int(finding.get("line", 0) or 0),
                     "col": int(finding.get("col", 1) or 1),
@@ -435,6 +457,8 @@ def main(argv: list[str] | None = None) -> int:
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
         extra=(f"new_analyzers={args.enable_new_analyzers};"
+               f"kotlin_tokens={os.environ.get('UBS_KOTLIN_MAX_TOKENS', '')};"
+               f"kotlin_nesting={os.environ.get('UBS_KOTLIN_MAX_NESTING', '')};"
                f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
@@ -454,7 +478,8 @@ def main(argv: list[str] | None = None) -> int:
 
         capturing_sink = CapturingSink()
         scan_patterns(_PATTERNS, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
-        scan_analyzers(files_to_scan, capturing_sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None, prefilter=prefilter_res)
+        scan_analyzers(files_to_scan, capturing_sink, skip, project_dir=Path(args.project_dir) if args.project_dir else None,
+                       prefilter=prefilter_res, errors=scan_errors)
         scan_detectors(files_to_scan, capturing_sink, skip)
         if args.custom_rules:
             from ubs_core.external_tools import scan_custom_rules

@@ -38,10 +38,10 @@ fun maybeAvatar(url: String?) {
 
 fun smartCast(adminCandidate: Any?) {
     val admin = adminCandidate as? MutableMap<String, String>
-    println("admin level ${admin!!.getValue(\"level\")}")
+    println("admin level ${admin!!.getValue("level")}")
 }
 
 fun elvisForce(profile: UserProfile?) {
-    val alias = profile?.email ?: println("no alias yet")
+    val alias = profile?.email ?: run { println("no alias yet"); null }
     println("alias length ${alias!!.length}")
 }

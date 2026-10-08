@@ -10,8 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+### Added
+
+- Native Kotlin coroutine analysis reports selected cancellation handlers that do not propagate cancellation, JVM `Thread.sleep` in established coroutine contexts, and unowned `GlobalScope` jobs. Imported aliases and lexical shadowing select the actual APIs; structured parent ownership, explicit IO dispatch, joins/cancellation, and deliberate transfers stay distinct from discarded jobs. Printing a job or checking it for null does not transfer ownership.
+
 ### Fixed
 
+- Kotlin null analysis follows lexical bindings, aliases, assignments, branch exits, short circuits, loops, and exception/finally paths before reporting a selected unsafe `!!`. Non-null Elvis fallbacks, including `println`'s Unit result, and genuine exit guards remain clean. Executable string interpolation retains its source locations. Unmodeled captured mutation and exhausted native analysis produce explicit incomplete results that are not cached as successful scans.
 - Ruby resource analysis tracks individual file handles, HTTP sessions, threads, and collection members through aliases, branches, loops, returns, and `ensure`. Unrelated cleanup no longer hides a leak, collection-wide joins satisfy the actual member obligations, and a timed join cannot prove thread completion. Repeated `Net::HTTP#finish` reports its invalid lifetime and exception path; valid repeated file closes and thread joins remain clean. Disabled lifecycle categories skip analysis before parsing, and inline suppression applies to the selected statement and rule without hiding analysis errors.
 - Scans, `--update-modules`, and `doctor --fix` preserve helper source files in a checkout, including tracked helpers selected by an installed runner through `--module-dir`. A checksum mismatch reports an integrity error with remediation instead of downloading over local edits. Verified repair remains available for ordinary installed caches.
 - Reported durations are correct in locales whose decimal separator is a comma (#160). Bash prints `EPOCHREALTIME` with the `LC_NUMERIC` separator (`1791357093,406751` under `ru_RU`/`de_DE`), and the runner, the shared module library and `scripts/bench.sh` all split it at a literal `.`, so they read the microsecond field as the epoch: `Finished js (-506488s)`, and roughly one run in ten printed `value too great for base` when the fraction started with `0`. The split now happens at whatever separator is present. Findings and exit codes were never affected.

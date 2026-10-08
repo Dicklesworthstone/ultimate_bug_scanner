@@ -43,6 +43,56 @@ class PythonModuleTests(unittest.TestCase):
     def sites(self, findings):
         return [(str(Path(f['path']).relative_to(self.root)), f['line'], f['rule']) for f in findings]
 
+    def test_bound_classmethod_retains_foreign_sink_and_selected_order(self):
+        sources = {
+            'helper.py': 'class Service:\n    @classmethod\n    def run(cls, value):\n        eval(value)\n',
+            'app.py': 'from helper import Service\nService.run(input())\n',
+        }
+        for selected in (['app.py', 'helper.py'], ['helper.py', 'app.py']):
+            with self.subTest(selected=selected):
+                self.assertEqual(self.sites(self.scan(sources, selected=selected)),
+                                 [('helper.py', 4, 'python.taint.eval')])
+
+    def test_bound_classmethod_callback_keeps_receiver_mutations_across_modules(self):
+        self.assertEqual(self.sites(self.scan({
+            'helper.py': 'def apply(callback):\n    callback()\n',
+            'app.py': 'from helper import apply\nclass Service:\n'
+                      '    @staticmethod\n    def clean(value): return "fixed"\n'
+                      '    @classmethod\n    def replace(cls): cls.clean = other\n'
+                      'apply(Service.replace)\neval(Service.clean(input()))\n',
+        })), [('app.py', 8, 'python.taint.eval')])
+
+    def test_bound_classmethod_deferred_import_cycle_uses_shared_summaries(self):
+        sources = {
+            'left.py': 'import right\nclass Service:\n    @classmethod\n'
+                       '    def clean(cls, value):\n'
+                       '        return right.Service.clean(value) if again else "fixed"\n',
+            'right.py': 'import left\nclass Service:\n    @classmethod\n'
+                        '    def clean(cls, value):\n        return left.Service.clean(value)\n',
+            'app.py': 'from left import Service\neval(Service.clean(input()))\n',
+        }
+        for selected in (['left.py', 'right.py', 'app.py'], ['app.py', 'right.py', 'left.py']):
+            with self.subTest(selected=selected):
+                self.assertEqual(self.scan(sources, selected=selected), [])
+        sources['left.py'] = sources['left.py'].replace('else "fixed"', 'else value')
+        self.assertEqual(self.sites(self.scan(sources)), [('app.py', 2, 'python.taint.eval')])
+
+    def test_unselected_classmethod_module_cannot_supply_clean_proof(self):
+        self.assertEqual(self.sites(self.scan({
+            'helper.py': 'class Service:\n    @classmethod\n    def clean(cls, value): return "fixed"\n',
+            'app.py': 'from helper import Service\neval(Service.clean(input()))\n',
+        }, selected=['app.py'])), [('app.py', 2, 'python.taint.eval')])
+
+    def test_returned_bound_classmethod_preserves_foreign_receiver_identity(self):
+        self.assertEqual(self.sites(self.scan({
+            'helper.py': 'class Service:\n    @staticmethod\n    def clean(value): return "fixed"\n'
+                         '    @classmethod\n    def convert(cls, value): return cls.clean(value)\n'
+                         'def select(): return Service.convert\n'
+                         'def replace(): Service.clean = other\n',
+            'app.py': 'import helper\nconvert = helper.select()\n'
+                      'helper.replace()\neval(convert(input()))\n',
+        })), [('app.py', 4, 'python.taint.eval')])
+
     def test_imported_sink_and_constant_actual_control(self):
         helper = 'def run(value):\n    eval(value)\n'
         for value, count in [('input()', 1), ('"safe"', 0)]:

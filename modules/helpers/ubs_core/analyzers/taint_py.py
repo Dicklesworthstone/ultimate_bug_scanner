@@ -7,7 +7,8 @@ summarize both returned values and parameters reaching a sink; analyzed code
 is never imported or executed. Selected Python modules share function
 summaries, including qualified cycles with deferred peer lookups. Unresolved
 imports, eager cyclic initialization and arbitrary dynamic dispatch retain
-conservative opaque-call behavior. Known callable aliases are modeled.
+conservative opaque-call behavior. Known callable aliases and builtin
+classmethod descriptors retain captured receivers through local summaries.
 Plain class-qualified static and unbound functions retain their callable
 identity across selected modules and helper calls. Class namespace mutations
 revoke those contracts; arbitrary descriptors and instance dispatch are opaque.
@@ -199,6 +200,25 @@ class _BoundCallable:
 
 
 @dataclass(frozen=True)
+class _ClassMethodDescriptor:
+    function: ast.FunctionDef | ast.AsyncFunctionDef
+
+
+@dataclass(frozen=True)
+class _BoundClassMethod:
+    """A descriptor lookup captures its function, class and receiver identity.
+
+    Replacing a class member does not replace an already captured callable.
+    It can, however, invalidate proofs about members read through its receiver.
+    """
+    function: ast.FunctionDef | ast.AsyncFunctionDef
+    owner: ast.ClassDef
+    references: References
+    receiver: Fact = CLEAN
+    valid: bool = True
+
+
+@dataclass(frozen=True)
 class _LiteralString:
     """A value is not an import/callable identity just because it is text."""
     value: str
@@ -244,7 +264,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'builtins', 'staticmethod',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'builtins', 'staticmethod', 'classmethod',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -1255,6 +1275,32 @@ class _Flow:
             bound[key] = value
         return bound
 
+    @staticmethod
+    def bind_method_receivers(bound, references, values, state):
+        """Bind callback receivers separately from the callable object itself.
+
+        A helper taking a bound method may mutate its class even though it
+        never receives that class as a positional argument. Symbolic receiver
+        slots carry those effects through the ordinary summary substitution.
+        Concrete heaps and evidence never become callable context keys.
+        """
+        for name, binding in tuple(values.items()):
+            choices = []
+            receivers, refs = [], []
+            for value in _binding_choices(binding):
+                if isinstance(value, _BoundClassMethod):
+                    receivers.append(join_facts(value.receiver, *(state.heap.get(ref, CLEAN)
+                                                                  for ref in value.references)))
+                    refs.append(value.references)
+                    value = _BoundClassMethod(value.function, value.owner, value.references, value.receiver,
+                                              value.valid and not bool(value.references & state.mutated))
+                choices.append(value)
+            if refs:
+                slot = '@method:' + name
+                bound[slot] = join_facts(*receivers)
+                references[slot] = frozenset().union(*refs)
+                values[name] = _join_bindings(*choices)
+
     def resume_environment(self, function, bound, references, values, state):
         """Arguments are captured at creation; globals and cells are read later.
 
@@ -1310,6 +1356,13 @@ class _Flow:
                 actual = frozenset().union(*(references.get(ref, NO_REFERENCES) if isinstance(ref, str)
                                              else frozenset({node}) for ref in target.references))
                 choices.append(_BoundCallable(target.name, actual, self.substitute(target.receiver, bound, call_name)))
+            elif isinstance(target, _BoundClassMethod):
+                actual = frozenset().union(*(
+                    references.get(ref, NO_REFERENCES) if isinstance(ref, str)
+                    else frozenset({ref if isinstance(ref, ast.ClassDef) else node})
+                    for ref in target.references))
+                choices.append(_BoundClassMethod(target.function, target.owner, actual,
+                                                 self.substitute(target.receiver, bound, call_name), target.valid))
             elif isinstance(target, _DeferredCall):
                 arguments = tuple((name, self.substitute(fact, bound, call_name))
                                   for name, fact in target.arguments)
@@ -1471,6 +1524,56 @@ class _Flow:
 
     def invoke(self, node, state, target, fallback_name, receiver, receiver_refs,
                arguments, keywords, keyword_nodes, *, resumed=None):
+        if isinstance(target, _BoundClassMethod):
+            signature = target.function.args
+            positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
+            count = len(node.args) + 1
+            expanded = any(isinstance(arg, ast.Starred) for arg in node.args)
+            named = set(keyword_nodes) - {None}
+            accepted = {arg.arg for arg in (*signature.args, *signature.kwonlyargs)}
+            definite_mismatch = (
+                not expanded and signature.vararg is None and count > len(positional)
+                or signature.kwarg is None and bool(named - accepted)
+                or not expanded and bool(named & set(positional[len(signature.posonlyargs):count]))
+            )
+            if not expanded and None not in keyword_nodes:
+                required = positional[:len(positional) - len(signature.defaults)]
+                definite_mismatch |= count < min(len(signature.posonlyargs), len(required))
+                definite_mismatch |= any(name not in named for name in required[max(count, len(signature.posonlyargs)):])
+                definite_mismatch |= any(arg.arg not in named for arg, default
+                                         in zip(signature.kwonlyargs, signature.kw_defaults) if default is None)
+            if definite_mismatch:
+                # An unbindable invocation does not establish the callee's
+                # clean-return contract. Retain the ordinary opaque-call
+                # provenance rather than binding arguments to wrong slots.
+                return self.invoke(node, state, None, '', target.receiver, target.references,
+                                   arguments, keywords, keyword_nodes)
+            # This is a call view, not a second evaluation of the receiver or
+            # its arguments. Keep its AST identity fixed across worklist passes
+            # and recursive/coroutine summaries just like literal * expansion.
+            key = (node, target.function, target.owner)
+            call = self.engine.method_calls.get(key)
+            if call is None:
+                implicit = ast.copy_location(ast.Name(id='@receiver', ctx=ast.Load()), node)
+                call = ast.copy_location(ast.Call(func=node.func, args=[implicit, *node.args],
+                                                  keywords=node.keywords), node)
+                self.engine.method_calls[key] = call
+            implicit = call.args[0]
+            refs = target.references
+            value = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in refs))
+            self.expression_facts[implicit] = value
+            self.expression_references[implicit] = refs
+            self.expression_bindings[implicit] = (target.owner if target.valid and not refs & state.mutated else None)
+            result = self.invoke(call, state, target.function, '', CLEAN, NO_REFERENCES,
+                                 [value, *arguments], keywords, keyword_nodes)
+            for table in (self.expression_bindings, self.expression_references,
+                          self.generator_returns, self.generator_return_references,
+                          self.generator_return_bindings):
+                if call in table:
+                    table[node] = table[call]
+                else:
+                    table.pop(node, None)
+            return result
         name = target if isinstance(target, str) else fallback_name if target is None else ''
         if isinstance(target, _BoundCallable):
             name = target.name
@@ -1490,6 +1593,13 @@ class _Flow:
                                               for ref in references.get(name, NO_REFERENCES)))
                          for name, fact in resumed.arguments}
                 self.resume_environment(function, bound, references, values, state)
+            # A default or suspended coroutine keeps the object, not an
+            # immutable proof of that object's members/shape. Invalidation
+            # applies even to clean writes between creation and execution.
+            for name, refs in references.items():
+                if refs & state.mutated:
+                    values[name] = _without_object_contract(values.get(name))
+            self.bind_method_receivers(bound, references, values, state)
             if (isinstance(function, ast.AsyncFunctionDef)
                     and function not in self.engine.generators and resumed is None):
                 self.expression_bindings[node] = _DeferredCall(
@@ -1718,11 +1828,14 @@ class _Flow:
             # This effect is summarized even for a symbolic helper parameter.
             for expression in (*node.args, *keyword_nodes.values()):
                 value = self.expression_bindings.get(expression)
-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, ast.ClassDef))
+                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, ast.ClassDef, _BoundClassMethod))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
                            'builtins.print', 'builtins.str', 'builtins.len', 'builtins.repr'}:
                     self.mutate(self.expression_references.get(expression, NO_REFERENCES), CLEAN, state)
+                    for choice in _binding_choices(value):
+                        if isinstance(choice, _BoundClassMethod):
+                            self.mutate(choice.references, CLEAN, state)
         configurable_html = name == 'bleach.clean' and (
             len(node.args) > 1 or any(keyword.arg not in {'text', 'strip', 'strip_comments'} for keyword in node.keywords)
         )
@@ -1764,7 +1877,10 @@ class _Flow:
                         members = self.engine.class_members.get(base, {})
                         if self.engine.reads is not None:
                             self.engine.reads[('class_members', base)] = members
-                        candidates.append(members.get(node.attr))
+                        member = members.get(node.attr)
+                        if isinstance(member, _ClassMethodDescriptor):
+                            member = _BoundClassMethod(member.function, base, receiver_refs, receiver_fact)
+                        candidates.append(member)
                         continue
                     if isinstance(base, _ModuleBinding):
                         incoming, member, refs = base.project.member(base.key, node.attr, state)
@@ -2155,8 +2271,9 @@ class _Flow:
             self.engine.define('default_bindings', node, {
                 name: self.expression_bindings.get(default) for name, default in defaults.items()})
             self.engine.describe_framework(node, default_inputs, state.bindings, route, route_dependencies)
-            self.engine.define('class_callables', node, not descriptors or descriptors in (
-                ['staticmethod'], ['builtins.staticmethod']))
+            descriptor = ('class' if descriptors in (['classmethod'], ['builtins.classmethod'])
+                          else not descriptors or descriptors in (['staticmethod'], ['builtins.staticmethod']))
+            self.engine.define('class_callables', node, descriptor)
             state[node.name] = CLEAN
             state.bindings[node.name] = node
             state.references[node.name] = NO_REFERENCES
@@ -2175,7 +2292,9 @@ class _Flow:
                 for name in _local_names(node):
                     value = completed.bindings.get(name)
                     if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        value = value if self.engine.class_callables.get(value, False) else None
+                        descriptor = self.engine.class_callables.get(value, False)
+                        value = (_ClassMethodDescriptor(value) if descriptor == 'class'
+                                 else value if descriptor else None)
                     members[name] = value
             self.engine.define('class_members', node, members)
             state[node.name] = CLEAN
@@ -2425,6 +2544,7 @@ class _Analysis:
         self.class_callables = {}
         self.parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         self.call_sites = {node: _expanded_call(node) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+        self.method_calls = {}
         self.functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = {function for function in self.functions
                            if any(isinstance(node, (ast.Yield, ast.YieldFrom)) for node in _scope_nodes(function))}
@@ -2451,7 +2571,7 @@ class _Analysis:
     def plain_class(node, state):
         """Prove the bounded class namespace used for class-qualified calls.
 
-        There is no instance/descriptor or inheritance simulation here. Only
+        There is no instance, arbitrary-descriptor or inheritance simulation. Only
         a class using the default metaclass and straight-line declarations
         can supply members. Executable namespace construction remains opaque.
         Definitions still run through the ordinary transfer functions, which
@@ -2596,11 +2716,18 @@ class _Analysis:
                 # can certify this invocation. Include the finite class value
                 # (or its revoked/unknown alternative) in the summary context.
                 nominal = self.owner(function).globals.bindings.get(name[len('@global:'):])
-                if not any(isinstance(value, ast.ClassDef)
+                if not any(isinstance(value, (ast.ClassDef, _BoundClassMethod))
                            for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
-            choices = frozenset(value if isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
-                                else None for value in _binding_choices(binding))
+            choices = []
+            for value in _binding_choices(binding):
+                if isinstance(value, _BoundClassMethod):
+                    slot = '@method:' + name
+                    symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
+                    value = _BoundClassMethod(value.function, value.owner, frozenset({slot}), symbolic, value.valid)
+                elif not isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    value = None
+                choices.append(value)
             if name.startswith('@global:') or any(value is not None for value in choices):
                 context.append((name, _join_bindings(*choices)))
         key = (function, tuple(context)) if context else function
@@ -2956,12 +3083,12 @@ class _Project:
                 elif isinstance(node, ast.ClassDef):
                     # Class bodies execute during import, but these bounded
                     # namespaces contain only literal state and deferred
-                    # functions. Only an unshadowed builtin staticmethod
-                    # decorator is safe to construct while peers initialize.
+                    # functions. Only the unshadowed builtin staticmethod and
+                    # classmethod descriptors are safe while peers initialize.
                     shadowed = engine.global_names | _local_names(node)
                     if (engine.plain_class(node, _State(bindings={name: None for name in engine.global_names}))
-                            and all(isinstance(decorator, ast.Name) and decorator.id == 'staticmethod'
-                                    and 'staticmethod' not in shadowed
+                            and all(isinstance(decorator, ast.Name) and decorator.id in {'staticmethod', 'classmethod'}
+                                    and decorator.id not in shadowed
                                     for member in node.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
                                     for decorator in member.decorator_list)):
                         continue

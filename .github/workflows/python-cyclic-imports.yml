@@ -4,30 +4,55 @@ on:
   push:
     branches: [main]
     paths:
-      - test-suite/patches/python-bound-classmethods.patch
-      - test-suite/patches/python-bound-classmethods-tests.patch
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/registry.py
+      - modules/helpers/ubs_core/suppression.py
+      - modules/helpers/ubs_core/py_scan.py
+      - modules/lib/ubs-common.sh
+      - modules/ubs-python.sh
+      - test-suite/quality/test_taint_python_*.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_findings*.py
+      - test-suite/manifest.json
+      - ubs
+      - SHA256SUMS
+      - .github/workflows/python-cyclic-imports.yml
+  pull_request:
+    paths:
+      - modules/helpers/ubs_core/analyzers/taint_py.py
+      - modules/helpers/ubs_core/registry.py
+      - modules/helpers/ubs_core/suppression.py
+      - modules/helpers/ubs_core/py_scan.py
+      - modules/lib/ubs-common.sh
+      - modules/ubs-python.sh
+      - test-suite/quality/test_taint_python_*.py
+      - test-suite/quality/test_suppression_intervals.py
+      - test-suite/quality/test_findings*.py
+      - test-suite/manifest.json
+      - ubs
+      - SHA256SUMS
       - .github/workflows/python-cyclic-imports.yml
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: python-interprocedural-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  validate:
+  regression:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     env:
       UBS_NO_AUTO_UPDATE: '1'
       PYTHONDONTWRITEBYTECODE: '1'
+      UBS_TAINT_E2E: '1'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Preserve exact current-tree preimage
-        run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/bound-source-head.txt"
-          git ls-files -s > "$RUNNER_TEMP/bound-source-index.txt"
-          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/bound-source.tar.gz"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -36,98 +61,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Validate exact implementation and failing-before witnesses
+      - name: Verify committed runtime before execution
         run: |
-          test "$(git hash-object test-suite/patches/python-bound-classmethods.patch)" = 07f59424bf2358b3b213514d48ca86a8184c9d22
-          test "$(git hash-object test-suite/patches/python-bound-classmethods-tests.patch)" = 8f9d016d342c2dbca6b1e14be5d145698f7e7ec4
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = 6e7ac4533d0fc8951e930c1c32083a8023e062b8
-          test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 6fb66ad66423acd642c42cf97c1571c48fcf8ddd
-          test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = 16bb258e6d4de1832d1d0246882dce75e5d8bea1
+          git rev-parse HEAD > "$RUNNER_TEMP/python-dataflow-head.txt"
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-          git apply --check test-suite/patches/python-bound-classmethods-tests.patch
-          git apply test-suite/patches/python-bound-classmethods-tests.patch
-          PYTHONPATH=test-suite/quality python3 - <<'PY'
-          import os, unittest
-          from pathlib import Path
-          names = [
-              'test_taint_python_callables.BoundClassMethodFlowTests.test_implicit_receiver_does_not_consume_the_source_argument',
-              'test_taint_python_callables.BoundClassMethodFlowTests.test_callback_receiver_writes_propagate_through_helper',
-              'test_taint_python_modules.PythonModuleTests.test_bound_classmethod_retains_foreign_sink_and_selected_order',
-              'test_taint_python_modules.PythonModuleTests.test_bound_classmethod_deferred_import_cycle_uses_shared_summaries',
-          ]
-          with Path(os.environ['RUNNER_TEMP'], 'bound-before.log').open('w') as log:
-              result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
-          assert result.testsRun == 4 and not result.errors, 'Expected source-level regression witnesses'
-          failed = {test.id().split(' (', 1)[0] for test, _ in result.failures}
-          assert set(names) <= failed, (names, sorted(failed))
-          PY
-          git apply --check test-suite/patches/python-bound-classmethods.patch
-          git apply test-suite/patches/python-bound-classmethods.patch
-          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ae9af0a47c1a3250203da4d2620b3b294369e9d2
-          test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = ddb315e1e0270396f2a697517b6b15144e6ef57d
-          test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 945beb4d276ccf068adcaa20a9301012011ed04c
-          ./scripts/update_checksums.sh
-          ./scripts/update_sha256sums.sh
-      - name: Exercise complete Python dataflow and real CLI paths
-        env:
-          UBS_TAINT_E2E: '1'
+      - name: Exercise committed Python dataflow and real CLI paths
         run: |
           set -o pipefail
-          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/bound-python.log"
-          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/bound-suppression.log"
-          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/bound-findings.log"
-          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean 2>&1 | tee "$RUNNER_TEMP/bound-manifest.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/python-dataflow-tests.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/python-dataflow-suppression.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/python-dataflow-findings.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean 2>&1 | tee "$RUNNER_TEMP/python-dataflow-manifest.log"
       - name: Enforce syntax, lint and deterministic integrity closure
         run: |
-          git diff --check
           for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
           shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
-          ./scripts/verify_checksums.sh
-          ./scripts/verify_sha256sums.sh
-          git diff > "$RUNNER_TEMP/bound-tested.diff"
           ./scripts/update_checksums.sh
           ./scripts/update_sha256sums.sh
-          git diff > "$RUNNER_TEMP/bound-regenerated.diff"
-          cmp "$RUNNER_TEMP/bound-tested.diff" "$RUNNER_TEMP/bound-regenerated.diff"
-      - name: Store tested immutable blobs without moving refs or tags
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess
-          from pathlib import Path
-          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
-          allowed = {'modules/helpers/ubs_core/analyzers/taint_py.py',
-                     'test-suite/quality/test_taint_python_modules.py',
-                     'test-suite/quality/test_taint_python_callables.py', 'modules/lib/ubs-common.sh',
-                     'scripts/new-module.sh', 'ubs', 'SHA256SUMS'}
-          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
-          assert set(changed) == allowed, changed
-          records = []
-          for name in changed:
-              data = Path(name).read_bytes()
-              result = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0', '--method', 'POST', f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
-                                      input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
-                                      text=True, capture_output=True, check=True, timeout=90)
-              sha = json.loads(result.stdout)['sha']
-              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
-              before = subprocess.check_output(['git', 'rev-parse', 'HEAD:' + name], text=True).strip()
-              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
-              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before})
-          manifest = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': records}
-          Path(os.environ['RUNNER_TEMP'], 'bound-publication.json').write_text(json.dumps(manifest, indent=2))
-          print('BOUND_METHODS_TESTED', json.dumps(manifest), flush=True)
-          PY
-      - name: Preserve final source and diagnostics
-        if: always()
-        run: |
-          git diff > "$RUNNER_TEMP/bound-final.diff"
-          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/bound-final-source.tar.gz"
+          git diff --exit-code
+          git diff --check
+          ./scripts/verify_checksums.sh
+          ./scripts/verify_sha256sums.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bound-validation-${{ github.sha }}
-          path: ${{ runner.temp }}/bound-*
+          name: python-dataflow-${{ github.sha }}
+          path: ${{ runner.temp }}/python-dataflow-*
           retention-days: 7

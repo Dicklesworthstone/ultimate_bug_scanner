@@ -1,0 +1,156 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+index acb09fb..71baeb0 100644
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -1030,6 +1030,23 @@ class _Flow:
+             choices.append(value)
+         return _join_bindings(*choices)
+ 
++    @staticmethod
++    def live_fact(binding, fact, references, state):
++        """Read both object and type storage before revoking a nominal proof.
++
++        Capturing a method freezes its function, not its receiver's fields.
++        A suspended method or callback must also observe later class writes;
++        invalidating the instance identity must not erase that provenance.
++        """
++        storage = set(references)
++        for value in _binding_choices(binding):
++            if isinstance(value, _Instance):
++                storage.update(value.class_references)
++                storage.add(value.owner)
++            elif isinstance(value, ast.ClassDef):
++                storage.add(value)
++        return join_facts(fact, *(state.heap.get(ref, CLEAN) for ref in storage))
++
+     def apply_mutations(self, mutations, writes, bound, references, state, call_name):
+         attributes = dict(writes)
+         for parameter, written in mutations:
+@@ -1345,11 +1362,11 @@ class _Flow:
+                 if isinstance(instance, _Instance):
+                     slot = '@type:' + name
+                     bound[slot] = join_facts(bound.get(slot, CLEAN),
+-                                            *(state.heap.get(ref, CLEAN) for ref in instance.class_references))
++                                            *(state.heap.get(ref, CLEAN)
++                                              for ref in instance.class_references | {instance.owner}))
+                     references[slot] = references.get(slot, NO_REFERENCES) | instance.class_references
+                 if isinstance(value, _BoundMethod):
+-                    receivers.append(join_facts(value.receiver, *(state.heap.get(ref, CLEAN)
+-                                                                  for ref in value.references)))
++                    receivers.append(self.live_fact(value.owner, value.receiver, value.references, state))
+                     refs.append(value.references)
+                     live = self.live_binding(value.owner, value.references, state)
+                     value = _BoundMethod(value.function, value.owner, value.references, value.receiver,
+@@ -1657,7 +1674,7 @@ class _Flow:
+                 self.engine.method_calls[key] = call
+             implicit = call.args[0]
+             refs = target.references
+-            value = join_facts(target.receiver, *(state.heap.get(ref, CLEAN) for ref in refs))
++            value = self.live_fact(target.owner, target.receiver, refs, state)
+             self.expression_facts[implicit] = value
+             self.expression_references[implicit] = refs
+             self.expression_bindings[implicit] = (self.live_binding(target.owner, refs, state)
+@@ -1695,6 +1712,7 @@ class _Flow:
+             # immutable proof of that object's members/shape. Invalidation
+             # applies even to clean writes between creation and execution.
+             for name, refs in references.items():
++                bound[name] = self.live_fact(values.get(name), bound.get(name, CLEAN), refs, state)
+                 values[name] = self.live_binding(values.get(name), refs, state)
+             self.bind_method_receivers(bound, references, values, state)
+             if (isinstance(function, ast.AsyncFunctionDef)
+diff --git a/test-suite/quality/test_taint_python_callables.py b/test-suite/quality/test_taint_python_callables.py
+index 0cd075b..c5143ca 100644
+--- a/test-suite/quality/test_taint_python_callables.py
++++ b/test-suite/quality/test_taint_python_callables.py
+@@ -674,6 +674,8 @@ class CallableCliTests(unittest.TestCase):
+             ('instance-clean', 'class Service:\n    def __init__(self, value): self.value = "fixed"\n    def read(self): return self.value\neval(Service(input()).read())\n', None),
+             ('instance-setter', 'class Service:\n    def set(self, value): self.value = value\n    def run(self): eval(self.value)\nservice = Service()\nservice.set(input())\nservice.run()\n', 'eval'),
+             ('instance-callback', 'class Service:\n    def run(self, value): eval(value)\ndef apply(callback, value): callback(value)\napply(Service().run, input())\n', 'eval'),
++            ('captured-class-storage', 'class Box:\n    value = "fixed"\n    def read(self): return self.value\nsaved = Box().read\nBox.value = input()\neval(saved())\n', 'eval'),
++            ('async-class-storage', 'class Box:\n    value = "fixed"\n    async def read(self): return self.value\nasync def route():\n    pending = Box().read()\n    Box.value = input()\n    eval(await pending)\n', 'eval'),
+         )
+         artifacts = ROOT / 'test-suite' / 'artifacts' / 'python-callable-effects'
+         artifacts.mkdir(parents=True, exist_ok=True)
+@@ -710,6 +712,82 @@ class CallableCliTests(unittest.TestCase):
+ 
+ 
+ class InstanceMethodFlowTests(SourceTest):
++    def test_captured_method_reads_class_storage_at_invocation(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                def read(self): return self.value
++            box = Box()
++            saved = box.read
++            Box.value = input()
++            eval(saved())
++        ''', 'eval')
++
++    def test_returned_method_reads_class_storage_at_invocation(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                def read(self): return self.value
++            def make(): return Box().read
++            saved = make()
++            Box.value = input()
++            eval(saved())
++        ''', 'eval')
++
++    def test_callback_reads_class_storage_changed_inside_helper(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                def read(self): return self.value
++            saved = Box().read
++            def invoke(callback):
++                Box.value = input()
++                return callback()
++            eval(invoke(saved))
++        ''', 'eval')
++
++    def test_suspended_instance_method_reads_later_type_writes(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                async def read(self): return self.value
++            async def route():
++                pending = Box().read()
++                Box.value = input()
++                eval(await pending)
++        ''', 'eval')
++
++    def test_default_instance_reads_current_class_storage(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                def read(self): return self.value
++            def invoke(box=Box()): return box.read()
++            Box.value = input()
++            eval(invoke())
++        ''', 'eval')
++
++    def test_current_class_storage_does_not_contaminate_literal_returns(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                def read(self): return 'constant'
++            saved = Box().read
++            Box.value = input()
++            eval(saved())
++        ''')
++
++    def test_captured_class_storage_retains_sink_specific_sanitizers(self):
++        self.assert_rules('''
++            class Box:
++                value = 'fixed'
++                def read(self): return html.escape(self.value)
++            saved = Box().read
++            Box.value = input()
++            HttpResponse(saved())
++            eval(saved())
++        ''', 'eval')
++
+     def test_callable_factory_keeps_captured_fields(self):
+         self.assert_rules('''
+             class Service:

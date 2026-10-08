@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - test-suite/patches/python-instance-storage.patch
       - .github/workflows/python-cyclic-imports.yml
   workflow_dispatch:
 
@@ -12,7 +13,11 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-26.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
       UBS_NO_AUTO_UPDATE: '1'
@@ -65,11 +70,12 @@ jobs:
           Path(os.environ['RUNNER_TEMP'], 'instance-patch.gz').write_bytes(compressed)
           Path(os.environ['RUNNER_TEMP'], 'instance.patch').write_bytes(patch)
           PY
-      - name: Verify preimages and reproduce failures before the implementation
+      - name: Verify preimages and reproduce missing instance analysis
         run: |
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ae9af0a47c1a3250203da4d2620b3b294369e9d2
           test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 945beb4d276ccf068adcaa20a9301012011ed04c
           test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = ddb315e1e0270396f2a697517b6b15144e6ef57d
+          test "$(git hash-object test-suite/patches/python-instance-storage.patch)" = 029ec37251db5e493bc664793e82ffef1311a804
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
           git apply --check "$RUNNER_TEMP/instance.patch"
@@ -93,6 +99,33 @@ jobs:
           test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = acb09fb47bdc7c749a5c78b608e027a69bdcaf91
           test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = 0cd075b832c010d9d61d547d22a6ca1460a4a950
           test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 659532e41debcece83c32b4ae19d6fc2ebf7c142
+      - name: Reproduce and correct late class-storage reads
+        run: |
+          git apply --check test-suite/patches/python-instance-storage.patch
+          git apply --include='test-suite/quality/*.py' test-suite/patches/python-instance-storage.patch
+          PYTHONPATH=test-suite/quality python3 - <<'PY'
+          import os, unittest
+          from pathlib import Path
+          prefix = 'test_taint_python_callables.InstanceMethodFlowTests.'
+          failures = [
+              'test_captured_method_reads_class_storage_at_invocation',
+              'test_returned_method_reads_class_storage_at_invocation',
+              'test_callback_reads_class_storage_changed_inside_helper',
+              'test_suspended_instance_method_reads_later_type_writes',
+              'test_default_instance_reads_current_class_storage',
+              'test_captured_class_storage_retains_sink_specific_sanitizers',
+          ]
+          names = [prefix + name for name in failures]
+          names.append(prefix + 'test_current_class_storage_does_not_contaminate_literal_returns')
+          with Path(os.environ['RUNNER_TEMP'], 'instance-storage-before.log').open('w') as log:
+              result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
+          assert result.testsRun == len(names) and not result.errors
+          failed = {test.id().split(' (', 1)[0] for test, _ in result.failures}
+          assert failed == {prefix + name for name in failures}, sorted(failed)
+          PY
+          git apply --include=modules/helpers/ubs_core/analyzers/taint_py.py test-suite/patches/python-instance-storage.patch
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = 71baeb0ffc18b8c240b45724cbe40e348d3982f1
+          test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = c5143caa3ba70c7d145dd439bda6359d5e17e3a5
           ./scripts/update_checksums.sh
           ./scripts/update_sha256sums.sh
       - name: Exercise complete Python dataflow and real CLI paths
@@ -156,6 +189,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: instance-validation-${{ github.sha }}
+          name: instance-validation-${{ matrix.runner }}-${{ github.sha }}
           path: ${{ runner.temp }}/instance-*
           retention-days: 7

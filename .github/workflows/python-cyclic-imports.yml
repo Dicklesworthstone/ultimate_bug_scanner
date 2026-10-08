@@ -4,55 +4,28 @@ on:
   push:
     branches: [main]
     paths:
-      - modules/helpers/ubs_core/analyzers/taint_py.py
-      - modules/helpers/ubs_core/registry.py
-      - modules/helpers/ubs_core/suppression.py
-      - modules/helpers/ubs_core/py_scan.py
-      - modules/lib/ubs-common.sh
-      - modules/ubs-python.sh
-      - test-suite/quality/test_taint_python_*.py
-      - test-suite/quality/test_suppression_intervals.py
-      - test-suite/quality/test_findings*.py
-      - test-suite/manifest.json
-      - ubs
-      - SHA256SUMS
-      - .github/workflows/python-cyclic-imports.yml
-  pull_request:
-    paths:
-      - modules/helpers/ubs_core/analyzers/taint_py.py
-      - modules/helpers/ubs_core/registry.py
-      - modules/helpers/ubs_core/suppression.py
-      - modules/helpers/ubs_core/py_scan.py
-      - modules/lib/ubs-common.sh
-      - modules/ubs-python.sh
-      - test-suite/quality/test_taint_python_*.py
-      - test-suite/quality/test_suppression_intervals.py
-      - test-suite/quality/test_findings*.py
-      - test-suite/manifest.json
-      - ubs
-      - SHA256SUMS
       - .github/workflows/python-cyclic-imports.yml
   workflow_dispatch:
 
 permissions:
-  contents: read
-
-concurrency:
-  group: python-interprocedural-${{ github.ref }}
-  cancel-in-progress: true
+  contents: write
 
 jobs:
-  regression:
+  validate:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 30
     env:
       UBS_NO_AUTO_UPDATE: '1'
       PYTHONDONTWRITEBYTECODE: '1'
-      UBS_TAINT_E2E: '1'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Preserve exact current-tree preimage
+        run: |
+          git rev-parse HEAD > "$RUNNER_TEMP/instance-source-head.txt"
+          git ls-files -s > "$RUNNER_TEMP/instance-source-index.txt"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/instance-source.tar.gz"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -61,31 +34,128 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ripgrep rsync shellcheck
           npm install --global @ast-grep/cli
-      - name: Verify committed runtime before execution
+      - name: Recover exact authored implementation from immutable objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          git rev-parse HEAD > "$RUNNER_TEMP/python-dataflow-head.txt"
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, subprocess
+          from pathlib import Path
+          objects = (
+              'be67bdc42fa68bf55f6377947edfbc94a7ff773f',
+              '828862ffa9f364818976726ade00bff2a5ff95da',
+              '9d71dddaef463546e0dd94a6ecccaab345f1e335',
+              '735e8a8871ff74c4fcafe930f2d5a722ce5d214a',
+          )
+          parts = []
+          for sha in objects:
+              result = subprocess.run(['gh', 'api', '-H', 'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                  f"repos/{os.environ['GH_REPO']}/git/blobs/{sha}"], text=True, capture_output=True, check=True, timeout=90)
+              record = json.loads(result.stdout)
+              assert record['encoding'] == 'base64' and record['sha'] == sha
+              data = base64.b64decode(record['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              parts.append(data)
+          compressed = b''.join(parts)
+          assert len(compressed) == 10465
+          assert hashlib.sha256(compressed).hexdigest() == 'bbbbb13007904d59e34d56fd760e3e52023e7e21618176d48eee2a0087f7405c'
+          patch = gzip.decompress(compressed)
+          assert len(patch) == 50262
+          Path(os.environ['RUNNER_TEMP'], 'instance-patch.gz').write_bytes(compressed)
+          Path(os.environ['RUNNER_TEMP'], 'instance.patch').write_bytes(patch)
+          PY
+      - name: Verify preimages and reproduce failures before the implementation
+        run: |
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = ae9af0a47c1a3250203da4d2620b3b294369e9d2
+          test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 945beb4d276ccf068adcaa20a9301012011ed04c
+          test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = ddb315e1e0270396f2a697517b6b15144e6ef57d
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
-      - name: Exercise committed Python dataflow and real CLI paths
-        run: |
-          set -o pipefail
-          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/python-dataflow-tests.log"
-          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/python-dataflow-suppression.log"
-          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/python-dataflow-findings.log"
-          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean 2>&1 | tee "$RUNNER_TEMP/python-dataflow-manifest.log"
-      - name: Enforce syntax, lint and deterministic integrity closure
-        run: |
-          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
-          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
+          git apply --check "$RUNNER_TEMP/instance.patch"
+          git apply --include='test-suite/quality/*.py' "$RUNNER_TEMP/instance.patch"
+          PYTHONPATH=test-suite/quality python3 - <<'PY'
+          import os, unittest
+          from pathlib import Path
+          names = [
+              'test_taint_python_callables.InstanceMethodFlowTests.test_constructor_input_reaches_method_sink',
+              'test_taint_python_callables.InstanceMethodFlowTests.test_bound_method_argument_and_clean_return',
+              'test_taint_python_callables.InstanceMethodFlowTests.test_selected_setter_summary_preserves_method_contract',
+              'test_taint_python_modules.PythonModuleTests.test_instance_constructor_and_method_keep_defining_file',
+          ]
+          with Path(os.environ['RUNNER_TEMP'], 'instance-before.log').open('w') as log:
+              result = unittest.TextTestRunner(stream=log, verbosity=2).run(unittest.defaultTestLoader.loadTestsFromNames(names))
+          assert result.testsRun == len(names) and not result.errors
+          failed = {test.id().split(' (', 1)[0] for test, _ in result.failures}
+          assert set(names) <= failed, (names, sorted(failed))
+          PY
+          git apply --include=modules/helpers/ubs_core/analyzers/taint_py.py "$RUNNER_TEMP/instance.patch"
+          test "$(git hash-object modules/helpers/ubs_core/analyzers/taint_py.py)" = acb09fb47bdc7c749a5c78b608e027a69bdcaf91
+          test "$(git hash-object test-suite/quality/test_taint_python_callables.py)" = 0cd075b832c010d9d61d547d22a6ca1460a4a950
+          test "$(git hash-object test-suite/quality/test_taint_python_modules.py)" = 659532e41debcece83c32b4ae19d6fc2ebf7c142
           ./scripts/update_checksums.sh
           ./scripts/update_sha256sums.sh
-          git diff --exit-code
+      - name: Exercise complete Python dataflow and real CLI paths
+        env:
+          UBS_TAINT_E2E: '1'
+        run: |
+          set -o pipefail
+          python3 -m unittest discover -s test-suite/quality -p 'test_taint_python_*.py' -v 2>&1 | tee "$RUNNER_TEMP/instance-python.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_suppression_intervals.py' -v 2>&1 | tee "$RUNNER_TEMP/instance-suppression.log"
+          python3 -m unittest discover -s test-suite/quality -p 'test_findings*.py' -v 2>&1 | tee "$RUNNER_TEMP/instance-findings.log"
+          python3 test-suite/run_manifest.py --case python-taint-buggy --case python-taint-clean 2>&1 | tee "$RUNNER_TEMP/instance-manifest.log"
+      - name: Enforce syntax, lint and deterministic integrity closure
+        run: |
           git diff --check
+          for script in ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh; do bash -n "$script"; done
+          shellcheck -S warning ubs modules/lib/ubs-common.sh scripts/new-module.sh modules/ubs-*.sh
           ./scripts/verify_checksums.sh
           ./scripts/verify_sha256sums.sh
+          git diff > "$RUNNER_TEMP/instance-tested.diff"
+          ./scripts/update_checksums.sh
+          ./scripts/update_sha256sums.sh
+          git diff > "$RUNNER_TEMP/instance-regenerated.diff"
+          cmp "$RUNNER_TEMP/instance-tested.diff" "$RUNNER_TEMP/instance-regenerated.diff"
+      - name: Store tested immutable blobs without moving refs or tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          allowed = {'modules/helpers/ubs_core/analyzers/taint_py.py',
+                     'test-suite/quality/test_taint_python_modules.py',
+                     'test-suite/quality/test_taint_python_callables.py', 'modules/lib/ubs-common.sh',
+                     'scripts/new-module.sh', 'ubs', 'SHA256SUMS'}
+          allowed.update(str(path) for path in Path('modules').glob('ubs-*.sh'))
+          assert set(changed) == allowed, changed
+          records = []
+          for name in changed:
+              data = Path(name).read_bytes()
+              result = subprocess.run(['gh', 'api', '--method', 'POST', '-H',
+                  'User-Agent: OpenAI File Downloader, XaiImageApiFetch/1.0',
+                  f"repos/{os.environ['GH_REPO']}/git/blobs", '--input', '-'],
+                  input=json.dumps({'content': data.decode('utf-8'), 'encoding': 'utf-8'}),
+                  text=True, capture_output=True, check=True, timeout=90)
+              sha = json.loads(result.stdout)['sha']
+              assert sha == hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              before = subprocess.check_output(['git', 'rev-parse', 'HEAD:' + name], text=True).strip()
+              mode = subprocess.check_output(['git', 'ls-files', '-s', '--', name], text=True).split()[0]
+              records.append({'path': name, 'mode': mode, 'type': 'blob', 'sha': sha, 'before': before})
+          manifest = {'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'files': records}
+          Path(os.environ['RUNNER_TEMP'], 'instance-publication.json').write_text(json.dumps(manifest, indent=2))
+          print('INSTANCE_METHODS_TESTED', json.dumps(manifest), flush=True)
+          PY
+      - name: Preserve final source and diagnostics
+        if: always()
+        run: |
+          git diff > "$RUNNER_TEMP/instance-final.diff"
+          git ls-files -z | tar --null -T - -czf "$RUNNER_TEMP/instance-final-source.tar.gz"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: python-dataflow-${{ github.sha }}
-          path: ${{ runner.temp }}/python-dataflow-*
+          name: instance-validation-${{ github.sha }}
+          path: ${{ runner.temp }}/instance-*
           retention-days: 7

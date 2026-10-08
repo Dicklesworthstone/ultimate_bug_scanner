@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -139,6 +140,171 @@ class Sandbox:
         env.update(dict(extra_env))
         cmd = [str(self.bin_dir / "ubs"), f"--module-dir={self.module_dir}", "--only=python", "--ci", "--format=json", str(PY_FIXTURE)]
         return subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)  # ubs:ignore[python.taint.command] - trusted test-runner env; copied UBS argv scans the fixed Python fixture using a local raw tree.
+
+
+class CheckoutSandbox(Sandbox):
+    """Retained source checkout plus a separate installed runner and file:// mirror.
+
+    Unlike the ordinary cache controls, source-owned bytes must never be
+    repaired by downloading over them. All mutation targets belong to this
+    test fixture; the actual repository's executable is only copied, never run.
+    """
+
+    targets = (TAMPERED_HELPER, CORE_ASSET, LIB_ASSET)
+
+    def __init__(self, name: str, *, tracked: bool = False):
+        artifacts = REPO_ROOT / "test-suite/artifacts/supply-chain-checkout"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        temporary = Path(tempfile.mkdtemp(prefix=name + "-", dir=artifacts))
+        super().__init__(temporary)
+        self.checkout = temporary / "checkout"
+        self.checkout.mkdir()
+        shutil.copy2(self.bin_dir / "ubs", self.checkout / "ubs")
+        shutil.copytree(self.module_dir, self.checkout / "modules")
+        self.module_dir = self.checkout / "modules"
+        # Include the manifest and all modules: doctor must inspect this
+        # complete source fixture without trying to install missing modules.
+        for source in [MODULES / "contract.json", *MODULES.glob("ubs-*.sh")]:
+            shutil.copy2(source, self.module_dir / source.name)
+            for ref in (f"v{ubs_version()}", "main"):
+                shutil.copy2(source, self.raw_base / ref / "modules" / source.name)
+        self.fixture = temporary / "input.py"
+        self.fixture.write_text("value = 1\n", encoding="utf-8")
+        self.download_log = temporary / "downloads.log"
+        self.download_log.write_text("", encoding="utf-8")
+        self.tools = temporary / "fixture-tools"
+        self.tools.mkdir()
+        real_curl = shutil.which("curl")
+        if real_curl is None:
+            raise RuntimeError("curl is required by the source-checkout integrity fixture")
+        curl = self.tools / "curl"
+        curl.write_text(
+            "#!/usr/bin/env bash\n"
+            'for argument in "$@"; do\n'
+            '  case "$argument" in\n'
+            '    file://*) printf "%s\\n" "$argument" >> "$UBS_TEST_SOURCE_DOWNLOAD_LOG" ;;\n'
+            '    http://*|https://*) echo "external URLs are unavailable in this fixture" >&2; exit 22 ;;\n'
+            '  esac\n'
+            'done\n'
+            "exec " + shlex.quote(real_curl) + ' --user-agent "OpenAI File Downloader, XaiImageApiFetch/1.0" "$@"\n',
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        if tracked:
+            subprocess.run(["git", "init", "-q", "-b", "main", str(self.checkout)], check=True, capture_output=True, text=True, timeout=60)
+            subprocess.run(["git", "-C", str(self.checkout), "add", "ubs", "modules"], check=True, capture_output=True, text=True, timeout=60)
+
+    def edit(self, targets: tuple[str, ...] = targets) -> None:
+        for relative in targets:
+            path = self.module_dir / relative
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(TAMPER_SUFFIX)
+
+    def snapshot(self):
+        return {relative: {
+            "sha256": hashlib.sha256((self.module_dir / relative).read_bytes()).hexdigest(),
+            "inode": (self.module_dir / relative).stat().st_ino,
+            "mtime_ns": (self.module_dir / relative).stat().st_mtime_ns,
+        } for relative in self.targets}
+
+    def requested_source_helpers(self):
+        requests = self.download_log.read_text(encoding="utf-8").splitlines()
+        return [url for url in requests if any(url.endswith("/modules/" + relative) for relative in self.targets)]
+
+    def run_checkout(self, *, mode="scan", update=False, installed=False):
+        runner = self.bin_dir / "ubs" if installed else self.checkout / "ubs"
+        arguments = (["doctor", "--fix", "--format=json"] if mode == "doctor" else
+                     ["--only=python", "--ci", "--format=json"])
+        arguments.append("--module-dir=" + str(self.module_dir))
+        if update:
+            arguments.append("--update-modules")
+        if mode != "doctor":
+            arguments.append(str(self.fixture))
+        env = dict(os.environ, NO_COLOR="1", UBS_NO_AUTO_UPDATE="1", UBS_NO_CACHE="1", UBS_SKIP_SIZE_CHECK="1",
+                   UBS_ALLOW_UNVERIFIED_HELPERS="0", PYTHONDONTWRITEBYTECODE="1",
+                   UBS_REPO_RAW_BASE="file://" + str(self.raw_base),
+                   UBS_TEST_SOURCE_DOWNLOAD_LOG=str(self.download_log),
+                   XDG_CACHE_HOME=str(self.tmp / "user-cache"), XDG_CONFIG_HOME=str(self.tmp / "user-config"),
+                   PATH=str(self.tools) + os.pathsep + os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"))
+        env.pop("UBS_VERIFIED_ASSET_DIR", None)
+        command = [str(runner), *arguments]
+        before = self.snapshot()
+        started = time.monotonic()
+        proc = subprocess.run(command, cwd=self.tmp, env=env, capture_output=True, text=True, timeout=300)
+        (self.tmp / "stdout.log").write_text(proc.stdout, encoding="utf-8")
+        (self.tmp / "stderr.log").write_text(proc.stderr, encoding="utf-8")
+        (self.tmp / "result.json").write_text(json.dumps({
+            "command": command, "cwd": str(self.tmp), "returncode": proc.returncode,
+            "elapsed": time.monotonic() - started, "before": before, "after": self.snapshot(),
+            "download_requests": self.requested_source_helpers(),
+        }, indent=2) + "\n", encoding="utf-8")
+        return proc
+
+
+def check_checkout_helper_scan_preserves_edits() -> None:
+    for relative in CheckoutSandbox.targets:
+        name = "checkout_scan_preserves_" + relative.replace("/", "_")
+        print(f"[supply-chain:{name}] RUN", flush=True)
+        sb = CheckoutSandbox(name)
+        sb.edit((relative,))
+        before = sb.snapshot()
+        proc = sb.run_checkout()
+        combined = proc.stdout + proc.stderr
+        ok = (proc.returncode == 2 and sb.snapshot() == before and not sb.requested_source_helpers()
+              and "checkout" in combined.lower() and relative in combined)
+        report(name, ok, f"exit={proc.returncode} source_preserved={sb.snapshot() == before} artifacts={sb.tmp}", proc)
+
+
+def check_checkout_update_preserves_source_helpers() -> None:
+    for edited in (False, True):
+        name = "checkout_update_preserves_" + ("edited" if edited else "healthy") + "_helpers"
+        print(f"[supply-chain:{name}] RUN", flush=True)
+        sb = CheckoutSandbox(name)
+        if edited:
+            sb.edit()
+        before = sb.snapshot()
+        proc = sb.run_checkout(update=True)
+        expected_exit = proc.returncode == 2 if edited else proc.returncode in (0, 1)
+        ok = expected_exit and sb.snapshot() == before and not sb.requested_source_helpers()
+        if not edited:
+            try:
+                payload = json.loads(proc.stdout)
+                ok = ok and payload.get("status") == "ok" and payload.get("totals", {}).get("files") == 1
+            except ValueError:
+                ok = False
+        report(name, ok, f"exit={proc.returncode} source_preserved={sb.snapshot() == before} artifacts={sb.tmp}", proc)
+
+
+def check_checkout_doctor_fix_preserves_source_helpers() -> None:
+    name = "checkout_doctor_fix_preserves_edited_helpers"
+    print(f"[supply-chain:{name}] RUN", flush=True)
+    sb = CheckoutSandbox(name)
+    sb.edit()
+    before = sb.snapshot()
+    proc = sb.run_checkout(mode="doctor")
+    try:
+        payload = json.loads(proc.stdout)
+        checks = {check["id"]: check for check in payload.get("checks", [])}
+    except (ValueError, KeyError):
+        checks = {}
+    targets_reported = all(checks.get("helper:" + relative, {}).get("status") == "err" and
+                           "checkout" in checks.get("helper:" + relative, {}).get("detail", "").lower()
+                           for relative in sb.targets)
+    ok = proc.returncode == 2 and sb.snapshot() == before and not sb.requested_source_helpers() and targets_reported
+    report(name, ok, f"exit={proc.returncode} source_preserved={sb.snapshot() == before} artifacts={sb.tmp}", proc)
+
+
+def check_installed_runner_preserves_tracked_module_dir_helpers() -> None:
+    name = "installed_runner_preserves_tracked_module_dir_helpers"
+    print(f"[supply-chain:{name}] RUN", flush=True)
+    sb = CheckoutSandbox(name, tracked=True)
+    sb.edit()
+    before = sb.snapshot()
+    proc = sb.run_checkout(installed=True)
+    combined = proc.stdout + proc.stderr
+    ok = (proc.returncode == 2 and sb.snapshot() == before and not sb.requested_source_helpers()
+          and all(relative in combined for relative in sb.targets) and "checkout" in combined.lower())
+    report(name, ok, f"exit={proc.returncode} source_preserved={sb.snapshot() == before} artifacts={sb.tmp}", proc)
 
 
 def check_healthy_cache_scans() -> None:
@@ -723,6 +889,10 @@ def test_sha256sums_coverage() -> None:
 
 def main() -> int:
     for check in (
+        check_checkout_helper_scan_preserves_edits,
+        check_checkout_update_preserves_source_helpers,
+        check_checkout_doctor_fix_preserves_source_helpers,
+        check_installed_runner_preserves_tracked_module_dir_helpers,
         check_healthy_cache_scans,
         check_tampered_helper_refreshed_from_clean_source,
         check_tampered_helper_refused,

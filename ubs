@@ -5395,8 +5395,22 @@ download_module(){
   return 1
 }
 
+is_checkout_helper(){
+  local path="$1"
+  # Bundled source assets are not cache entries, including an exported tree
+  # without .git. An explicit --module-dir can also point at tracked source
+  # belonging to a different checkout than this runner.
+  [[ "$path" == "$(script_dir)/modules/"* ]] && return 0
+  need_cmd git && git -C "$(dirname "$path")" ls-files --error-unmatch -- "$(basename "$path")" >/dev/null 2>&1
+}
+
 download_helper_asset(){
   local rel="$1" path="$2"
+  if is_checkout_helper "$path"; then
+    VERIFY_HELPER_ERR="checkout helper $rel is source, not a cache entry; refusing to overwrite it (run ./scripts/update_checksums.sh after editing helpers)"
+    say_err "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
+    return 2
+  fi
   ensure_dir "$(dirname "$path")"
   local release_url="${REPO_RAW}/modules/${rel}"
   local latest_url="${REPO_RAW_LATEST}/modules/${rel}"
@@ -5492,7 +5506,18 @@ download_helper_asset(){
 ensure_helper_asset(){
   local rel="$1"
   local path="$MODULE_DIR/$rel"
+  local checkout_helper=0
+  # Check ownership only on mutation paths. Healthy scans should not spawn a
+  # Git process for every pinned helper in an ordinary installed cache.
   if [ "$UPDATE_MODULES" -eq 1 ] || [ ! -f "$path" ]; then
+    is_checkout_helper "$path" && checkout_helper=1
+  fi
+  if [[ "$checkout_helper" -eq 1 && ! -f "$path" ]]; then
+    VERIFY_HELPER_ERR="checkout helper $rel is missing; restore source before scanning (never downloading over a checkout)"
+    say_err "${RED}$X ${VERIFY_HELPER_ERR}${RESET}"
+    return 2
+  fi
+  if { [ "$UPDATE_MODULES" -eq 1 ] && [ "$checkout_helper" -eq 0 ]; } || [ ! -f "$path" ]; then
     VERIFY_HELPER_ERR=""
     if ! download_helper_asset "$rel" "$path"; then
       [[ "${VERIFY_HELPER_ERR:-}" == *"checksum mismatch"* ]] && return 2
@@ -5513,6 +5538,10 @@ ensure_helper_asset(){
       return 2
     fi
     if [[ $verify_code -ne 0 ]]; then
+      if is_checkout_helper "$path"; then
+        say_err "${RED}$X helper $rel in this checkout failed verification (${VERIFY_HELPER_ERR:-mismatch}); run ./scripts/update_checksums.sh after editing helpers (never downloading over a checkout)${RESET}"
+        return 2
+      fi
       say "${YELLOW}${WARN}${RESET} cached helper $rel failed verification (${VERIFY_HELPER_ERR:-corrupt}); refreshing..."
       VERIFY_HELPER_ERR=""
       if ! download_helper_asset "$rel" "$path"; then

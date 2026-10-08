@@ -333,6 +333,30 @@ def scan_files_native(
     return counters
 
 
+def _shellcheck_batches(files: Sequence[Path]) -> Iterable[list[str]]:
+    """Bound source volume as well as argv count without dropping any input."""
+    byte_limit = 128 * 1024
+    batch: list[str] = []
+    source_bytes = 0
+    for path in files:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            # Unknown sizes run alone. ShellCheck must still see the path and
+            # report any missing/unreadable-file error through its usual JSON.
+            size = byte_limit + 1
+        if batch and (len(batch) >= 50 or source_bytes + size > byte_limit):
+            yield batch
+            batch, source_bytes = [], 0
+        batch.append(str(path))
+        source_bytes += size
+        if size > byte_limit:
+            yield batch
+            batch, source_bytes = [], 0
+    if batch:
+        yield batch
+
+
 def scan_shellcheck(
     files: Sequence[Path],
     sink,
@@ -368,11 +392,9 @@ def scan_shellcheck(
     if 6 in skip or not shutil.which("shellcheck"):
         return counters
 
-    # Run shellcheck on batches of files
-    batch_size = 50
-    file_strs = [str(p) for p in files]
-    for i in range(0, len(file_strs), batch_size):
-        batch = file_strs[i:i + batch_size]
+    # Sending many large scripts to one ShellCheck process can exhaust memory.
+    # Bound their combined size; oversized individual files still run alone.
+    for batch in _shellcheck_batches(files):
         try:
             proc = subprocess.run(
                 ["shellcheck", "-f", "json", *batch],

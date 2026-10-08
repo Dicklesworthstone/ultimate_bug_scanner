@@ -120,7 +120,12 @@ class ShellCheckResults(unittest.TestCase):
                 self.assertIn("malformed diagnostic", errors[0])
 
     def test_failure_does_not_prevent_later_batches(self):
-        files = [Path(f"sample-{i}.sh") for i in range(51)]
+        artifacts = ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix="shellcheck-small-batches-", dir=artifacts))
+        files = [scratch / f"sample-{i}.sh" for i in range(51)]
+        for path in files:
+            path.write_text("#!/bin/sh\ntrue\n", encoding="utf-8")
         sink, errors = io.StringIO(), []
         with patch.object(bash_scan.shutil, "which", return_value="/bin/shellcheck"), \
              patch.object(bash_scan.subprocess, "run", side_effect=[OSError("failed batch"), self.result(1, [diagnostic()])]) as run:

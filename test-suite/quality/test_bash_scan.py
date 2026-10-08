@@ -271,6 +271,179 @@ class BashFindingCoverageTest(unittest.TestCase):
         cache.store_scanned_files.assert_not_called()
 
 
+class BashShellcheckBatchTest(unittest.TestCase):
+    """Large source sets must retain coverage without overloading one process."""
+
+    def setUp(self) -> None:
+        artifacts = ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="bash-shellcheck-batches-", dir=artifacts))
+
+    def script(self, name: str, size: int) -> Path:
+        path = self.root / name
+        header = b"#!/usr/bin/env bash\n#"
+        path.write_bytes(header + b"x" * (size - len(header)) if size else b"")
+        return path
+
+    @staticmethod
+    def diagnostic(path, *, code=2086, level="warning"):
+        return {"file": str(path), "line": 2, "column": 4, "code": code,
+                "level": level, "message": "Selected ShellCheck diagnostic"}
+
+    def records(self, sink):
+        try:
+            return [json.loads(line) for line in sink.getvalue().splitlines()]
+        except json.JSONDecodeError as exc:
+            self.fail(f"ShellCheck sink contains invalid diagnostic JSON: {exc}")
+
+    def test_source_volume_and_file_caps_preserve_order_and_every_finding(self) -> None:
+        files = [
+            self.script("first.sh", 64 * 1024),
+            self.script("second.sh", 64 * 1024),
+            self.script("empty.sh", 0),
+            self.script("exact-limit.sh", 128 * 1024),
+            self.script("oversized.sh", 426 * 1024),
+            self.script("after-large with spaces.sh", 70 * 1024),
+            self.script("another-large.sh", 70 * 1024),
+        ]
+        files += [self.script(f"small-{i}.sh", 64) for i in range(55)]
+        files.append(files[0])  # Preserve input occurrences, including duplicates.
+        sizes = {str(path): path.stat().st_size for path in files}
+        batches = []
+
+        def shellcheck(command, **kwargs):
+            self.assertEqual(command[:3], ["shellcheck", "-f", "json"])
+            self.assertEqual(kwargs["timeout"], 120)
+            batches.append(command[3:])
+            return subprocess.CompletedProcess(
+                command, 1, json.dumps([self.diagnostic(p) for p in command[3:]]), "",
+            )
+
+        sink, errors = io.StringIO(), []
+        with patch.object(bash_scan.shutil, "which", return_value="/tools/shellcheck"), \
+                patch.object(bash_scan.subprocess, "run", side_effect=shellcheck):
+            counts = bash_scan.scan_shellcheck(files, sink, set(), set(), errors=errors)
+        self.assertEqual([p for batch in batches for p in batch], list(map(str, files)))
+        self.assertEqual([record["path"] for record in self.records(sink)], list(map(str, files)))
+        self.assertEqual(counts, {"critical": 0, "warning": len(files), "info": 0})
+        self.assertFalse(errors, "exit 1 with diagnostic JSON is a complete scan")
+        for batch in batches:
+            with self.subTest(batch=batch):
+                self.assertGreater(len(batch), 0)
+                self.assertLessEqual(len(batch), 50)
+                if sum(sizes[p] for p in batch) > 128 * 1024:
+                    self.assertEqual(len(batch), 1, "oversized files must run alone")
+
+    def test_missing_and_unstatable_paths_still_reach_shellcheck(self) -> None:
+        readable = self.script("readable.sh", 70 * 1024)
+        missing = self.root / "missing.sh"
+        denied_stat = self.script("stat-denied.sh", 70 * 1024)
+        final = self.script("final.sh", 70 * 1024)
+        files = [readable, missing, denied_stat, final]
+        batches = []
+        original_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == denied_stat:
+                raise PermissionError("cannot stat selected source")
+            return original_stat(path, *args, **kwargs)
+
+        def shellcheck(command, **kwargs):
+            batch = command[3:]
+            batches.append(batch)
+            records = [self.diagnostic(p) for p in batch if p != str(missing)]
+            unreadable = str(missing) in batch
+            return subprocess.CompletedProcess(
+                command, 2 if unreadable else 1, json.dumps(records),
+                "missing.sh: openBinaryFile: does not exist" if unreadable else "",
+            )
+
+        sink, errors = io.StringIO(), []
+        with patch.object(Path, "stat", stat), \
+                patch.object(bash_scan.shutil, "which", return_value="/tools/shellcheck"), \
+                patch.object(bash_scan.subprocess, "run", side_effect=shellcheck):
+            counts = bash_scan.scan_shellcheck(files, sink, set(), set(), errors=errors)
+        self.assertEqual([p for batch in batches for p in batch], list(map(str, files)))
+        self.assertEqual([record["path"] for record in self.records(sink)],
+                         list(map(str, (readable, denied_stat, final))))
+        self.assertEqual(counts["warning"], 3)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("shellcheck exited 2", errors[0])
+        self.assertIn("missing.sh", errors[0])
+
+    def test_failed_batches_preserve_findings_and_partial_summary(self) -> None:
+        files = [self.script(name, 128 * 1024 + 1) for name in
+                 ("partial.sh", "timeout.sh", "killed.sh", "later.sh")]
+        partial, timed_out, killed, later = map(str, files)
+        batches = []
+
+        def shellcheck(command, **kwargs):
+            batch = command[3:]
+            batches.append(batch)
+            if timed_out in batch:
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            if killed in batch:
+                return subprocess.CompletedProcess(command, -9, '[{"file":', "killed")
+            records = [self.diagnostic(path) for path in batch]
+            if later in batch:
+                records += [self.diagnostic(later, code=1072, level="error"),
+                            self.diagnostic(later, code=2034, level="info")]
+            return subprocess.CompletedProcess(
+                command, 2 if partial in batch else 1, json.dumps(records),
+                "source could not be opened" if partial in batch else "",
+            )
+
+        native = {"rule": "bash.robustness.cd_without_exit", "path": later,
+                  "line": 2, "col": 1, "category_id": "bash.robustness",
+                  "severity": "warning", "message": "cd without exit"}
+        cache = Mock()
+        cache.partition_files.return_value = (
+            {path: [native] if path == files[-1] else [] for path in files}, [],
+        )
+        cache.stats = {"hits": len(files), "misses": 0, "hit_rate": 1}
+        file_list, summary = self.root / "files", self.root / "summary.json"
+        file_list.write_bytes(b"".join(os.fsencode(path) + b"\0" for path in files))
+        env = {"UBS_PREFILTER_FILE": "", "UBS_CACHE_FILE": "", "UBS_PROFILE": "0"}
+        with patch("ubs_core.cache.ScanCache", return_value=cache), \
+                patch.dict(os.environ, env), \
+                patch.object(bash_scan.shutil, "which", return_value="/tools/shellcheck"), \
+                patch.object(bash_scan.subprocess, "run", side_effect=shellcheck), \
+                redirect_stderr(io.StringIO()):
+            code = bash_scan.main([
+                "--files-from", str(file_list), "--sink", str(self.root / "findings"),
+                "--json-out", str(summary), "--project-dir", str(self.root),
+            ])
+        try:
+            result = json.loads(summary.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            self.fail(f"Bash partial summary contains invalid JSON ({summary}): {exc}")
+        self.assertEqual([p for batch in batches for p in batch], list(map(str, files)))
+        self.assertEqual(code, 2)
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["module_error"], "ANALYZER_ERROR")
+        self.assertEqual((result["critical"], result["warning"], result["info"]), (1, 3, 0))
+        self.assertEqual([(r["path"], r["rule"]) for r in result["findings"]], [
+            (later, native["rule"]), (partial, "bash.shellcheck.SC2086"),
+            (later, "bash.shellcheck.SC2086"), (later, "bash.shellcheck.SC1072"),
+        ])
+        for reason in ("exited 2", "timed out", "exited -9", "not JSON"):
+            self.assertIn(reason, result["message"])
+
+    def test_optional_or_empty_scan_does_not_launch_shellcheck(self) -> None:
+        missing = self.root / "absent.sh"
+        for files, skip, installed in (([missing], {6}, "/tools/shellcheck"),
+                                       ([missing], set(), None),
+                                       ([], set(), "/tools/shellcheck")):
+            with self.subTest(files=files, skip=skip, installed=installed), \
+                    patch.object(bash_scan.shutil, "which", return_value=installed), \
+                    patch.object(bash_scan.subprocess, "run") as run:
+                errors = []
+                counts = bash_scan.scan_shellcheck(files, io.StringIO(), skip, set(), errors=errors)
+                self.assertEqual(sum(counts.values()), 0)
+                self.assertFalse(errors)
+                run.assert_not_called()
+
+
 class BashRulePackTest(unittest.TestCase):
     """Exercise the real generator and wrapper; stub only scan/bootstrap IO."""
 

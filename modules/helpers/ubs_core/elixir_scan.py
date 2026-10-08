@@ -24,8 +24,7 @@ Elixir-specific pattern semantics the shared engine expresses declaratively:
                       rescue = ``rescue\s*$`` + ``rescue\s+_\s*->``, weak
                       crypto, SQL injection). One record per (component,
                       path, line) so the sink recount equals the legacy sum.
-  diff_regexes        legacy NET counts (Task.async minus Task.await, File.open
-                      minus close/stream, binary_to_term minus [:safe], unpinned
+  diff_regexes        remaining legacy NET counts (binary_to_term minus [:safe], unpinned
                       deps, fixed-vs-shell command execution). The record count
                       equals the NET number: the first N main-pattern hits.
   suppress_if         legacy conjunctions (`count > 50 AND guarded < 5`,
@@ -227,7 +226,9 @@ def scan_patterns(patterns: Sequence[Pattern], files: Sequence[Path], sink,
     the legacy shell did.
     """
     counters = {"critical": 0, "warning": 0, "info": 0}
-    active = [p for p in patterns if p.category not in skip]
+    from ubs_core.analyzers.lifecycle_elixir import REPLACED_RULES
+
+    active = [p for p in patterns if p.category not in skip and p.rule_id not in REPLACED_RULES]
     if not active:
         return counters
     texts: dict[Path, str] = {}
@@ -375,6 +376,28 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                 if errors is None:
                     raise
                 errors.append(f"{path}: {analyzer.name}: {type(exc).__name__}: {exc}")
+
+
+def run_lifecycle(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None) -> None:
+    """Replace aggregate File/Port/Task counts with scoped object obligations."""
+    families = set()
+    if not skip or 8 not in skip:
+        families.update(('file', 'port'))
+    if not skip or 3 not in skip:
+        families.add('task')
+    if not families:
+        return
+    from ubs_core.analyzers.lifecycle_elixir import scan_file_findings
+
+    for path in files:
+        try:
+            for finding in scan_file_findings(path, families=frozenset(families)):
+                sink.write(json.dumps(finding, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"{path}: lifecycle_elixir: {type(exc).__name__}: {exc}")
 
 
 def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
@@ -604,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
 
         capturing_sink = CapturingSink()
         scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
+        run_lifecycle(files_to_scan, capturing_sink, skip, errors=scan_errors)
         run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
         run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res, errors=scan_errors)

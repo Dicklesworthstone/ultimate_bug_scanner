@@ -22,6 +22,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Python taint analysis incrementally joins changed exception-path state instead of rebuilding the entire collector at every potentially raising expression. Mutable heap updates, callable rebinding and deletion, comprehension exits, and shortest evidence paths retain the same findings as complete fresh joins; scan coverage and deadlines are unchanged.
 - Python security detectors reuse a bounded UTF-8 source-line index for AST expression lookups instead of splitting the whole file for every lookup. The shared lookup preserves missing-location behavior, Unicode byte offsets, multiline spans, CR/LF line endings and form feeds; detector rules, findings and scan deadlines remain unchanged.
 - JavaScript secret-comparison analysis distinguishes JSX attribute names from assignments to local variables. Public `id` and `className` values no longer acquire file-wide secret taint from nearby documentation prose, while actual alias assignments inside JSX expressions, plain statements, arguments and conditional bodies remain checked.
 - Interpreter selection resolves named and relative executables before creating the per-run `python3` wrapper, preventing `UBS_PYTHON=python3` from recursively executing its own wrapper and hanging scans. Relative PATH entries remain bound to the original directory, virtualenv symlinks preserve their environment, and unusable `python3` candidates fall through to a verified `python` or `py -3` interpreter.

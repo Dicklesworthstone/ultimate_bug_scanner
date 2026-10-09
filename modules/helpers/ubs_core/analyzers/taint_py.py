@@ -807,15 +807,52 @@ class _Flow:
             return
         # Most expressions leave the state untouched, and joining the same
         # state twice is idempotent: skip the join when this collector's last
-        # joined state holds exactly the same objects. The collector is only
-        # ever replaced, never mutated in place, so the snapshot recorded on
-        # it stays true for as long as it is the collector.
+        # joined input holds exactly the same objects. The snapshot retains
+        # those objects, including their evidence, independently of mutation
+        # of the live input state.
         accumulated = self.exception_states[-1]
         snapshot = _identity_snapshot(state)
         previous = getattr(accumulated, 'last_joined', None)
         if previous is not None and _same_snapshot(previous, snapshot):
             return
-        joined = _join_states(accumulated, state)
+        if previous is None:
+            joined = _join_states(accumulated, state)
+        else:
+            # This collector is owned exclusively by its active capture; it
+            # is exposed as a completion only after being popped. Its state
+            # already includes every entry in the previous input, so unchanged
+            # entries add nothing. Merge the delta in place instead of copying
+            # and re-joining the complete namespace at every raising expression.
+            joined = accumulated
+            for target, source, index in ((joined, state, 0), (joined.heap, state.heap, 6)):
+                if (previous[index] == snapshot[index]
+                        and all(map(operator.is_, previous[index + 1], snapshot[index + 1]))):
+                    continue
+                before = dict(zip(previous[index], previous[index + 1]))
+                for name, fact in source.items():
+                    if before.get(name, _MISSING) is fact:
+                        continue
+                    joined_fact = target.get(name, _MISSING)
+                    target[name] = fact if joined_fact is _MISSING else join_facts(joined_fact, fact)
+            if not (previous[4] == snapshot[4]
+                    and all(map(operator.is_, previous[5], snapshot[5]))):
+                before = dict(zip(previous[4], previous[5]))
+                for name, refs in state.references.items():
+                    if before.get(name, _MISSING) is not refs:
+                        joined.references[name] = joined.references.get(name, NO_REFERENCES) | refs
+            if not (previous[2] == snapshot[2]
+                    and all(map(operator.is_, previous[3], snapshot[3]))):
+                before = dict(zip(previous[2], previous[3]))
+                for name, binding in state.bindings.items():
+                    if before.get(name, _MISSING) is not binding:
+                        joined.bindings[name] = _join_bindings(
+                            joined.bindings.get(name, _implicit_identity(name)), binding)
+                # Unlike a missing fact/reference, a missing callable binding
+                # contributes the implicit builtin identity. Deletions must
+                # join it even though absent keys do not appear in the input.
+                for name in before.keys() - state.bindings.keys():
+                    joined.bindings[name] = _join_bindings(joined.bindings[name], _implicit_identity(name))
+            joined.mutated.update(state.mutated)
         joined.last_joined = snapshot
         self.exception_states[-1] = joined
 

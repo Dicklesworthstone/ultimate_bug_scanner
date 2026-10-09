@@ -1,6 +1,6 @@
 """ubs_core.java_patterns.security_rg — category 4 rg-pipeline subset (bead 0xjg.8).
 
-The regex halves of the legacy security checks: SSL verification, weak hashes,
+The regex halves of the legacy security checks: weak hashes,
 plain HTTP URLs, Java deserialization and the ProcessBuilder shell-interpreter
 pattern (the kotlin-security-command manifest cases). The taint heredocs run
 as analyzers/detectors (java.taint.*, java_detectors.*).
@@ -22,13 +22,6 @@ _PB_SHELL = (
 )
 
 PATTERNS: list[Pattern] = [
-    Pattern(
-        category=4,
-        rule_id="java.security.ssl-insecure",
-        title="SSL/TLS validation disabled",
-        regex=re.compile(r"HostnameVerifier\W*\(\W*.*->\W*true\W*\)"),
-        thresholds=((0, "critical"),),
-    ),
     Pattern(
         category=4,
         rule_id="java.security.weak-hash",

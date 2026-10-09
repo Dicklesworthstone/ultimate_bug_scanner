@@ -64,6 +64,7 @@ def scan_config(
     counters = {"critical": 0, "warning": 0, "info": 0}
     path_list = [Path(p) for p in paths]
     suppressions = SourceSuppressions("kotlin" if lang == "kotlin" else "java")
+    tls_sites: dict[Path, set[tuple[int, int]]] = {}
     for match in scan_ast_config(config, path_list, errors,
                                  ast_grep_bin=ast_grep_bin, batch_size=_BATCH):
         rule_id, file_str = match["ruleId"], match["file"]
@@ -77,6 +78,22 @@ def scan_config(
         rng = match["range"]["start"]
         path = Path(file_str)
         line_no = rng["line"] + 1
+        if rule_id == "java.insecure-ssl":
+            # A setter alone says nothing about the callback's policy. Apply
+            # the same receiver/return proof used by the native detector so
+            # safe delegates cannot leak into optional AST/SARIF evidence.
+            from ubs_core.java_detectors.tls_verification import analyze_source
+            if path not in tls_sites:
+                try:
+                    tls_sites[path] = {(line, col) for line, col, _ in
+                                       analyze_source(path.read_text(encoding="utf-8"))}
+                except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+                    if errors is None:
+                        raise
+                    errors.append(f"{path}: TLS AST qualification: {exc}")
+                    tls_sites[path] = set()
+            if (line_no, rng["column"] + 1) not in tls_sites[path]:
+                continue
         raw_severity = match["severity"]
         if raw_severity == "off":
             continue
@@ -94,6 +111,8 @@ def scan_config(
             category_id = category_for_rule(rule_id)
         else:
             category_id = rule_id.rsplit(".", 1)[0] if "." in rule_id else rule_id
+        if rule_id == "java.insecure-ssl":
+            category_id = "java.security"
         sink.write(json.dumps({
             "rule": rule_id,
             "category_id": category_id,

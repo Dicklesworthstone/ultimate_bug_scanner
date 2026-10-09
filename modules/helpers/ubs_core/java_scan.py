@@ -258,6 +258,8 @@ def _record_category(finding: dict) -> int | None:
     category_id = str(finding.get("category_id", ""))
     if rule.startswith("java.taint."):
         return 4
+    if rule == "java.insecure-ssl":
+        return 4
     if rule.startswith("java.resource."):
         return 19
     if rule.startswith("java.async."):
@@ -333,7 +335,8 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                 }, ensure_ascii=False) + "\n")
 
 
-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> None:
+def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None) -> None:
     """Run ubs_core.java_detectors.* modules (legacy heredoc detector ports).
 
     Protocol (single-rule modules): RULE_ID, CATEGORY, TITLE, SEVERITY,
@@ -341,6 +344,8 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
     Multi-rule modules expose ``RULES`` — a tuple of
     (rule_id, category, title, severity, description) tuples — and
     ``find(files)`` yielding (rule_id, path, line, col, detail).
+    FILE_SCOPED detectors run per file so an incomplete input preserves
+    findings from the remaining selected files.
     """
     import importlib
     import pkgutil
@@ -352,7 +357,10 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
             continue
         try:
             module = importlib.import_module(f"ubs_core.java_detectors.{module_info.name}")
-        except Exception as exc:  # legacy heredoc failures degraded gracefully too
+        except Exception as exc:
+            if errors is None:
+                raise
+            errors.append(f"detector module {module_info.name}: {type(exc).__name__}: {exc}")
             sys.stderr.write(f"[ubs_core.java_scan] detector module {module_info.name} failed: {exc}\n")
             continue
         find = getattr(module, "find", None)
@@ -378,27 +386,35 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None) -> 
                      if spec["category"] not in skip}
             if not specs:
                 continue
-        for hit in find(files):
-            if len(hit) == 5:
-                rule_id, path, line_no, col, detail = hit
-            else:
-                path, line_no, col, detail = hit  # single-rule convenience
-                rule_id = next(iter(specs))
-            spec = specs.get(rule_id)
-            if spec is None:
-                continue
-            slug = slug_for_category(spec["category"])
-            title = spec["title"]
-            sink.write(json.dumps({
-                "rule": rule_id,
-                "category_id": f"java.{slug}",
-                "path": str(path),
-                "line": int(line_no),
-                "col": int(col),
-                "severity": spec["severity"],
-                "message": f"{title} — {detail}"[:300] if detail else title,
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        batches = ([path] for path in files) if getattr(module, "FILE_SCOPED", False) else (files,)
+        for batch in batches:
+            try:
+                for hit in find(batch):
+                    if len(hit) == 5:
+                        rule_id, path, line_no, col, detail = hit
+                    else:
+                        path, line_no, col, detail = hit  # single-rule convenience
+                        rule_id = next(iter(specs))
+                    spec = specs.get(rule_id)
+                    if spec is None:
+                        continue
+                    slug = slug_for_category(spec["category"])
+                    title = spec["title"]
+                    sink.write(json.dumps({
+                        "rule": rule_id,
+                        "category_id": f"java.{slug}",
+                        "path": str(path),
+                        "line": int(line_no),
+                        "col": int(col),
+                        "severity": spec["severity"],
+                        "message": f"{title} — {detail}"[:300] if detail else title,
+                        "suppressed": False,
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                if errors is None:
+                    raise
+                source = str(batch[0]) if len(batch) == 1 else "selected files"
+                errors.append(f"{source}: detector {module_info.name}: {type(exc).__name__}: {exc}")
 
 
 def _finding_title(rec: dict) -> str:
@@ -555,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
                 pass
 
     from ubs_core.cache import CapturingSink, ScanCache, hash_rules_dir
+    from ubs_core.java_detectors.tls_verification import LIMIT_DEFAULTS as TLS_LIMITS
 
     cache = ScanCache(
         lang="java",
@@ -562,7 +579,9 @@ def main(argv: list[str] | None = None) -> int:
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
         extra=(f"new_analyzers={args.enable_new_analyzers};"
-               f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
+               f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''};"
+               "tls_policy=" + repr([(name, os.environ.get(name, str(value)))
+                                      for name, value in sorted(TLS_LIMITS.items())])),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
     suppressions = SourceSuppressions("java")
@@ -587,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                       project_dir=Path(args.project_dir) if args.project_dir else None,
                       enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res)
-        run_detectors(files_to_scan, capturing_sink, skip)
+        run_detectors(files_to_scan, capturing_sink, skip, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.java_ast import scan_all
             from ubs_core.java_rules import SEVERITY_MAP
@@ -629,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     ast_records: list[dict] = []
+    tls_counted_sites: set[tuple[str, int, int]] = set()
     with open(args.sink, "w", encoding="utf-8") as sink_file:
         for f in files:
             recs = cached_findings.get(f)
@@ -642,6 +662,11 @@ def main(argv: list[str] | None = None) -> int:
                     if is_ast:
                         ast_records.append(record)
                     if not report_only:
+                        if record.get("rule") == "java.insecure-ssl":
+                            site = (str(Path(record["path"]).resolve()), record["line"], record["col"])
+                            if site in tls_counted_sites:
+                                continue
+                            tls_counted_sites.add(site)
                         sink_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")

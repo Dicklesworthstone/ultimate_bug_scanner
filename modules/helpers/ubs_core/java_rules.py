@@ -7,12 +7,10 @@ every rule, one sgconfig-java.yml, one sgbase-java.yml and a manifest.json into
 the rule dir so `ubs_core.java_ast.scan_all` can run the whole pack with a
 single `ast-grep scan -c` invocation.
 
-Counting calibration (legacy): the pack is staged for --sarif-out/--json-out
-passthrough and category-15 staging notes only — the ONLY counted ids are the
-five resource-lifecycle rules (emit_ast_rule_group RESOURCE_LIFECYCLE_RULE_IDS,
-ubs-java.sh 286-313), the two async rules (ASYNC_ERROR_RULE_IDS, 148-160) and
-the cat-1 isPresent()+get() probe (ast_search, 3439). SEVERITY_MAP pins their
-legacy severities; everything else stays an informational dump.
+SEVERITY_MAP identifies the qualified, counted rules. Other pack records remain
+advisory evidence. TLS setter matches are candidates: java_ast qualifies them
+against the native callback and receiver analysis before counting or emitting
+them, and java_scan merges the native/AST finding at the same source site.
 """
 from __future__ import annotations
 
@@ -39,6 +37,7 @@ SEVERITY_MAP: dict[str, str] = {
     "java.async.then-no-exceptionally": "warning",
     "java.optional-isPresent-then-get": "info",
     "java.secrets.string-decl": "warning",
+    "java.insecure-ssl": "critical",
 }
 
 # Counted ids -> legacy print_finding titles (SUMMARY/REMEDIATION maps).
@@ -52,6 +51,7 @@ SUMMARY_MAP: dict[str, str] = {
     "java.async.then-no-exceptionally": "CompletableFuture chains missing exceptionally()/handle()",
     "java.optional-isPresent-then-get": "isPresent()+get() pattern",
     "java.secrets.string-decl": "Potential hard-coded secrets found",
+    "java.insecure-ssl": "HTTPS hostname verifier accepts every hostname",
 }
 
 REMEDIATION_MAP: dict[str, str] = {
@@ -62,6 +62,7 @@ REMEDIATION_MAP: dict[str, str] = {
     "java.resource.statement-no-close": "Close Statement/PreparedStatement handles or wrap them in try-with-resources",
     "java.async.future-get-no-try": "Handle ExecutionException from get() or CompletionException from join() with try/catch or a recovery stage",
     "java.async.then-no-exceptionally": "Attach .exceptionally(...) or .handle(...) to promise chains to surface errors",
+    "java.insecure-ssl": "Keep the default hostname verifier or authenticate the requested host with a validating delegate",
 }
 
 # Rule ids whose matches are marker-suppressed at count time:
@@ -310,7 +311,7 @@ rule:
     - pattern: javax.net.ssl.HttpsURLConnection.setDefaultHostnameVerifier($VERIFIER)
     - pattern: $X.setHostnameVerifier($VERIFIER)
 severity: error
-message: "SSL/TLS verification disabled; enables MITM"
+message: "HTTPS hostname verifier accepts every hostname; enables server impersonation"
 """),
     ("weak-hash", """id: java.weak-hash
 language: java

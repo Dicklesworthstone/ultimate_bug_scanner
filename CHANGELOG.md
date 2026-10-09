@@ -12,6 +12,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- Ordinary Java scans report `java.insecure-ssl` for proven always-accepting HTTPS hostname verifiers, including multiline and block lambdas, anonymous verifiers, and stable local aliases. Actual API imports, receiver types, and method/lambda scopes keep secure delegates, rejecting callbacks, unrelated setters, and lexical examples clean. Native and optional AST evidence agree without duplicate counted findings; incomplete inputs retain valid neighboring findings and cannot become successful cache entries.
 - Native Kotlin coroutine analysis reports selected cancellation handlers that do not propagate cancellation, JVM `Thread.sleep` in established coroutine contexts, and unowned `GlobalScope` jobs. Imported aliases and lexical shadowing select the actual APIs; structured parent ownership, explicit IO dispatch, joins/cancellation, and deliberate transfers stay distinct from discarded jobs. Printing a job or checking it for null does not transfer ownership.
 
 ### Fixed

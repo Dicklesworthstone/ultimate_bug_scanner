@@ -139,6 +139,21 @@ def main():
     os.system(apply(ident, input()))
 ''',
     },
+    'call_global_refresh': {'app.py': '''
+import asyncio
+import os
+shared = ["safe"]
+def read():
+    return shared[0]
+async def later():
+    os.system(shared[0])
+def handler():
+    os.system(read())
+    pending = later()
+    shared[0] = input()
+    os.system(read())
+    asyncio.run(pending)
+'''},
 }
 
 EXPECTED = {
@@ -149,6 +164,7 @@ EXPECTED = {
     'late_default': {('app.py', 4)},
     'cross_module_callbacks': {('a_app.py', 5), ('m_callbacks.py', 8)},
     'inherited_context': {('c.py', 5), ('c.py', 6), ('c.py', 7)},
+    'call_global_refresh': {('app.py', 7), ('app.py', 12)},
 }
 
 
@@ -173,6 +189,30 @@ class WorklistReuseTests(unittest.TestCase):
                     fresh = self.scan(sources)
                 self.assertEqual(reused, fresh)
                 self.assertEqual({(path, line) for path, _, line, _, _ in reused}, EXPECTED[name], reused)
+
+    def test_interned_formals_match_fresh_global_traces(self):
+        class FreshGlobals(dict):
+            def __getitem__(self, name):
+                # The original solver allocated these immutable formal
+                # inputs for every job/read. Concrete call/heap evidence
+                # must match when the lexical templates are shared instead.
+                key = f'@global:{name}'
+                return (frozenset({taint_py.TaintTrace(name, parameter=key, path=(name,))}),
+                        frozenset({key}), taint_py._SymbolicValue(key))
+
+        initialize = taint_py._Analysis.__init__
+
+        def fresh_globals(engine, *args, **kwargs):
+            initialize(engine, *args, **kwargs)
+            engine.global_symbols = FreshGlobals(engine.global_symbols)
+
+        for name, sources in SHAPES.items():
+            with self.subTest(shape=name):
+                interned = self.scan(sources)
+                with patch.object(taint_py._Analysis, '__init__', fresh_globals):
+                    fresh = self.scan(sources)
+                self.assertEqual(interned, fresh)
+                self.assertEqual({(path, line) for path, _, line, _, _ in interned}, EXPECTED[name], interned)
 
 
 if __name__ == '__main__':

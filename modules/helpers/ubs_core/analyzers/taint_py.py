@@ -1183,7 +1183,8 @@ class _Flow:
             if (owner is self.engine and not isinstance(self.scope, ast.Module)
                     and (name in self.engine.locals.get(self.scope, set())
                          or name in self.engine.closures.get(self.scope, set()))):
-                yield key, frozenset({TaintTrace(name, parameter=key, path=(name,))}), frozenset({key}), _SymbolicValue(key)
+                fact, refs, value = owner.global_symbols[name]
+                yield key, fact, refs, value
             else:
                 refs = namespace.references.get(name, NO_REFERENCES)
                 fact = join_facts(namespace.value(name), state.heap.get(module_ref, CLEAN),
@@ -2555,6 +2556,14 @@ class _Analysis:
                                     for child in ast.walk(generator.target)
                                     if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
         self.global_names = self.locals[tree]
+        # Formal globals are lexical constants, not concrete heap facts.
+        # Reusing their immutable traces preserves paths and lets state joins
+        # recognize unchanged globals by identity across fixed-point passes.
+        self.global_symbols = {
+            name: (frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))}),
+                   frozenset({f'@global:{name}'}), _SymbolicValue(f'@global:{name}'))
+            for name in self.global_names
+        }
         self.closures = {}
         for function in self.functions:
             available = set()
@@ -2803,10 +2812,11 @@ class _Analysis:
                 namespace = globals_ if owner is self else owner.globals
                 local = owner.locals[function]
                 flow = _Flow(owner, function)
-                state = _State({name: frozenset({TaintTrace(name, parameter=f'@global:{name}', path=(name,))})
+                state = _State({name: owner.global_symbols[name][0]
                                 for name in owner.global_names if name not in local},
                                {name: target for name, target in namespace.bindings.items() if name not in local})
-                state.references.update({name: frozenset({f'@global:{name}'}) for name in owner.global_names if name not in local})
+                state.references.update({name: owner.global_symbols[name][1]
+                                         for name in owner.global_names if name not in local})
                 for name in local:
                     state.bindings[name] = None
                 arguments = function.args

@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="bfeefc3b9258e4782b2659effa7d55f08c6c8715ec92861ff197d6083d92b3c0"
+UBS_LIB_CHECKSUM="18648f0c2e874ac2f70e998b9efbdd72b4aae050250a020ed6b56479989088e6"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -54,7 +54,7 @@ if [[ ! -f "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh" ]]; then
   echo "✗ ${BASH_SOURCE[0]}: missing ${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh (run 'ubs doctor --fix' or reinstall)" >&2
   exit 2
 fi
-# shellcheck source=lib/ubs-common.sh
+# shellcheck source-path=SCRIPTDIR source=lib/ubs-common.sh
 source "${UBS_MODULE_LIB_DIR}/lib/ubs-common.sh"
 umask 022
 shopt -s lastpipe
@@ -74,6 +74,8 @@ TEMP_PATHS=()
 
 cleanup_add() { [[ -n "${1:-}" ]] && TEMP_PATHS+=("$1"); }
 
+# Called indirectly by Bash's EXIT trap.
+# shellcheck disable=SC2329
 cleanup() {
   IFS=${ORIG_IFS}
   [[ "${KEEP_TEMP}" -eq 1 ]] && return 0
@@ -87,6 +89,8 @@ trap cleanup EXIT
 # ────────────────────────────────────────────────────────────────────────────
 # Error trapping
 # ────────────────────────────────────────────────────────────────────────────
+# Called indirectly by Bash's ERR trap.
+# shellcheck disable=SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED:-}; local _BOLD=${BOLD:-}; local _RESET=${RESET:-}; local _DIM=${DIM:-}; local _WHITE=${WHITE:-}
@@ -104,19 +108,16 @@ USE_COLOR=1
 if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
 
 if [[ "$USE_COLOR" -eq 1 ]]; then
-  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+  RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'
   MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'
   BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''
+  RED=''; GREEN=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''
   BOLD=''; DIM=''; RESET=''
 fi
 
 CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; BULLET="•"; FIRE="🔥"
 : "$CHECK" "$CROSS" "$WARN" "$INFO" "$BULLET" "$FIRE" "$RED" "$GREEN" "$BLUE" "$MAGENTA" "$CYAN" "$WHITE"
-
-say() { echo -e "$*"; }
-print_subheader() { say "\n${YELLOW}${BOLD}• $1${RESET}"; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # CLI Parsing & Configuration
@@ -317,7 +318,7 @@ run_v2_legacy_parity_bridges_ruby(){
   local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}"
   local completion_out="$6" json_out="$7"
   local files_n bridge_rc=0
-  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  files_n="$(safe_count_files <"$list_file" 2>/dev/null)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
     "$scan_exit" "$completion_out" "$json_out" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" <<'PYV2BRIDGE' || bridge_rc=$?
 import json

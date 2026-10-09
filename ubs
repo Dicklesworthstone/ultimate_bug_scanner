@@ -106,18 +106,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='c1c8e16b0e67ef4fde5a71403a99acff072f7ac7cf05c7c4938eb0b75ec56d3c'
-  [cpp]='68ed932b3affd170b9e5bdc634f1f01357e3d22a8bfa679d94551fcf71233088'
-  [csharp]='133c2f243cbcbb447169b04eafe74f0c930bdc53044d18cf9ef87444ed240b46'
-  [elixir]='ec6b0e37c7e4d88f7936066337357c0d3fedecf8196c0510125e04fae6578295'
-  [golang]='ebeace12568b382d7f975e13871320a24d7daa578142f39a0fc052362eba6fa9'
-  [java]='eff83792bf185ea2a066c26ec936b6c2667628d8b4f51a4bdc8ad2c391d73161'
-  [js]='78ce87f4e176daa3984c4e9645f2925ac26a153682b2bdd5ca8e88318c612168'
-  [kotlin]='d71d97938527033866f6c8fe92e764b79f1d336dc226a58df9cb83659d159a86'
-  [python]='4d83445a012240a338f6fef14e380d7dca2f1a2c2e57c093b2011c5083d50fbc'
-  [ruby]='2ebd5517fbf098a55d0297ef07903ca32853921aa7fe135f05c1e205437efbb3'
-  [rust]='c5e2111e9a678d8c7ad2ef40c74988b7e73bf5f7e700f865f62e105237ae1f24'
-  [swift]='44eb9e7047080d8ec0b937d3e424590f47c12e5ba7b42d5a9cbb981d8dd5ebae'
+  [bash]='01bea850208d15465072fedbea1df53ce1ede2772162ed5691a0f73fed40e5d9'
+  [cpp]='9e9ee885a590160e8a0d2fa4ae381ca8a46eab0e708a5e90b621d592c7c362be'
+  [csharp]='704d56795cc7612648321bb448e691fd0a8fc0e9f6f321b891c704ec62889958'
+  [elixir]='796f9937ef5fd130bf649c3a537f5ba4fdb2916886b505b4b0865428db5ff57b'
+  [golang]='2d5d78b16457ec4465e28c9bdc9934e6aa6790d63c7bde5b83300ba8eca01cbc'
+  [java]='521ec543fa601ed429b6780882b648c1f87523c3b12eb4e947c654f660137138'
+  [js]='e3dc232a03157dd7938de8c56182ba813fbc50c9cd407c2a937dd8f7d69fdfdb'
+  [kotlin]='b89e626a61fdb34adf3ce02f07323b01ec882ece8400cf310a14228eefdc97d4'
+  [python]='d406c5887067a3579f6919ac09936b545c6245bd274bf4332862e3f1a9d3869b'
+  [ruby]='b186874c5e4be85767e0154c9deb10a4d647fb7e7a538f944a99d5e9f345e064'
+  [rust]='4792db0912e99d00b0cf2e439bdd8cdb842b7813891caebb15998c41f368be8b'
+  [swift]='ceca3ee9c7ad3bc5f554a228638a6493fac7229c598eb7d123a25445c8c8c32e'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -482,7 +482,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='b506f2f01c92fba09f5a684a24cdc124097b4760719f928e22f64fdf3bdcb246'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='bfeefc3b9258e4782b2659effa7d55f08c6c8715ec92861ff197d6083d92b3c0'
+  ['lib/ubs-common.sh']='18648f0c2e874ac2f70e998b9efbdd72b4aae050250a020ed6b56479989088e6'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -512,6 +512,8 @@ ensure_tmpdir_run(){
     EARLY_TMP_PATHS+=("$TMPDIR_RUN")
   fi
 }
+# Invoked by the EXIT trap below and the later cleanup callback.
+# shellcheck disable=SC2329
 early_cleanup(){
   local p
   for p in "${EARLY_TMP_PATHS[@]}"; do
@@ -1323,7 +1325,9 @@ with input_path.open('r', encoding='utf-8', errors='ignore') as fh:
 PY
 }
 
-on_err(){ local ec=$? ln=${BASH_LINENO[0]:-?} cmd=${BASH_COMMAND:-?}; say "${RED}${BOLD}Error${RESET}${DIM} (exit $ec)${RESET} ${WHITE}line $ln:${RESET} $cmd"; exit $ec; }
+# Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
+on_err(){ local ec=$? ln="${BASH_LINENO[0]:-?}" cmd="${BASH_COMMAND:-?}"; say "${RED}${BOLD}Error${RESET}${DIM} (exit $ec)${RESET} ${WHITE}line $ln:${RESET} $cmd"; exit "$ec"; }
 trap on_err ERR
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4464,10 +4468,14 @@ verify_ast_grep_bin(){
   tmpfile="$tmpdir/verify.js"
   printf 'const x = 1; x = 2;\n' >"$tmpfile" 2>/dev/null || true
 
+  # ast-grep metavariables must reach the pattern parser as literal dollar signs.
+  # shellcheck disable=SC2016
   if "$bin" run -p '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
     [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
     return 0
   fi
+  # The legacy form uses the same literal ast-grep metavariables.
+  # shellcheck disable=SC2016
   if "$bin" --pattern '$X = $Y' "$tmpfile" --json=stream >/dev/null 2>&1; then
     [[ -n "$tmpdir" && "$tmpdir" != "/" ]] && rm -rf "$tmpdir" 2>/dev/null || true
     return 0
@@ -6104,7 +6112,7 @@ fi
 MODULE_PGID_FILE="$TMPDIR_RUN/module_pgids"
 : > "$MODULE_PGID_FILE" 2>/dev/null || true
 
-# shellcheck disable=SC2317  # invoked indirectly via the INT/TERM trap
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via the INT/TERM trap
 kill_module_pgroups(){
   local f="${MODULE_PGID_FILE:-}"
   [[ -n "$f" && -f "$f" ]] || return 0
@@ -6123,7 +6131,7 @@ kill_module_pgroups(){
   done <<< "$pgs"
 }
 
-# shellcheck disable=SC2317  # invoked via the EXIT trap and from on_interrupt
+# shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap and from on_interrupt
 cleanup(){
   # Flush the OUTPUT_FILE tee (if any) before tearing anything down: close our
   # copy of the pipe so tee sees EOF, then wait for it to finish writing.
@@ -6140,7 +6148,7 @@ cleanup(){
 # On interrupt/termination, tear down any in-flight module process groups first
 # (so their cargo/ast-grep grandchildren don't reparent and survive), clean up,
 # then re-raise the signal with the default disposition.
-# shellcheck disable=SC2317  # invoked indirectly via the INT/TERM trap
+# shellcheck disable=SC2317,SC2329  # invoked indirectly via the INT/TERM trap
 on_interrupt(){
   local sig="$1"
   kill_module_pgroups
@@ -7719,26 +7727,6 @@ PY
   fi
 }
 
-parse_sarif_to_json(){
-  local lang="$1" sarif="$2" json="$3"
-  [[ -f "$sarif" ]] || return 1
-  if ! need_cmd jq; then
-    say "${YELLOW}${WARN}${RESET} jq not available; cannot parse SARIF"
-    return 1
-  fi
-  local critical warning info files
-  critical=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "error")] | length' "$sarif" 2>/dev/null || echo 0)
-  warning=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "warning")] | length' "$sarif" 2>/dev/null || echo 0)
-  info=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "note")] | length' "$sarif" 2>/dev/null || echo 0)
-  files=$(jq '[.runs[]?.results[]?.locations[]?.physicalLocation?.artifactLocation?.uri?] | unique | length' "$sarif" 2>/dev/null || echo 0)
-  critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
-  local proj_display
-  proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
-  cat >"$json" <<JSON
-{"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
-JSON
-}
-
 merge_json_scanners(){
   # This directory also holds internal metadata and combined exports. Only
   # selected modules own scanner summaries: globbing *.json can leak metadata
@@ -8416,7 +8404,7 @@ for L in "${langs[@]}"; do
     if [[ -n "$finished_pid" && -n "${PID_SLOT[$finished_pid]:-}" ]]; then
       s="${PID_SLOT[$finished_pid]}"
       dur=$(( $(now_ms) - PID_START[$finished_pid] ))
-      SLOT_BUSY_MS[$s]=$(( ${SLOT_BUSY_MS[$s]} + dur ))
+      SLOT_BUSY_MS[s]=$(( SLOT_BUSY_MS[s] + dur ))
       FREE_SLOTS+=("$s")
       unset "PID_SLOT[$finished_pid]"
       finished_count=$(( finished_count + 1 ))
@@ -8460,7 +8448,7 @@ while [[ "$finished_count" -lt "$total_jobs" ]]; do
   if [[ -n "$finished_pid" && -n "${PID_SLOT[$finished_pid]:-}" ]]; then
     s="${PID_SLOT[$finished_pid]}"
     dur=$(( $(now_ms) - PID_START[$finished_pid] ))
-    SLOT_BUSY_MS[$s]=$(( ${SLOT_BUSY_MS[$s]} + dur ))
+    SLOT_BUSY_MS[s]=$(( SLOT_BUSY_MS[s] + dur ))
     FREE_SLOTS+=("$s")
     unset "PID_SLOT[$finished_pid]"
     finished_count=$(( finished_count + 1 ))

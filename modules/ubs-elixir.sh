@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # ═══════════════════════════════════════════════════════════════════════════
 # ELIXIR ULTIMATE BUG SCANNER v1.0.2 (Bash) - Industrial-Grade Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
@@ -15,7 +16,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="bfeefc3b9258e4782b2659effa7d55f08c6c8715ec92861ff197d6083d92b3c0"
+UBS_LIB_CHECKSUM="18648f0c2e874ac2f70e998b9efbdd72b4aae050250a020ed6b56479989088e6"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -111,6 +112,8 @@ fi
 # Error handling
 # ────────────────────────────────────────────────────────────────────────────
 
+# Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "sarif" ]]; then
@@ -326,7 +329,7 @@ check_phoenix() {
 run_mix_tool() {
   local tool_cmd="$1"; shift || true
   if [[ "$ENABLE_MIX_TOOLS" -eq 1 && "$HAS_MIX" -eq 1 ]]; then
-    ( cd "$PROJECT_DIR" && with_timeout "$EX_TIMEOUT" mix $tool_cmd "$@" ) || true
+    ( cd "$PROJECT_DIR" && with_timeout "$EX_TIMEOUT" mix "$tool_cmd" "$@" ) || true
   else
     say "  ${GRAY}${INFO} mix not available or tools disabled; skipping${RESET}"
   fi
@@ -494,7 +497,7 @@ run_v2_legacy_parity_bridges_elixir(){
   local sink="$1" list_file="$2" scan_exit="$3" text_out="${4:-}" skip_csv="${5:-}" tool_counts="${6:-}"
   local completion_out="$7" json_out="$8"
   local files_n bridge_rc=0
-  files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
+  files_n="$(safe_count_files <"$list_file" 2>/dev/null)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
     "$scan_exit" "$tool_counts" "$completion_out" "$json_out" "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" <<'PYV2BRIDGE' || bridge_rc=$?
 import json

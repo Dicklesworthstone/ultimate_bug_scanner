@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # shellcheck disable=SC2002,SC2015,SC2034,SC2317
 # ═══════════════════════════════════════════════════════════════════════════
 # RUST ULTIMATE BUG SCANNER v3.0.1 - Industrial-Grade Rust Code Analysis
@@ -16,7 +17,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="bfeefc3b9258e4782b2659effa7d55f08c6c8715ec92861ff197d6083d92b3c0"
+UBS_LIB_CHECKSUM="18648f0c2e874ac2f70e998b9efbdd72b4aae050250a020ed6b56479989088e6"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -58,6 +59,8 @@ shopt -s lastpipe 2>/dev/null || true
 
 # Centralized cleanup & robust error handler
 TMP_FILES=()
+# Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 cleanup() {
   local ec=$?
   if [[ ${#TMP_FILES[@]} -gt 0 ]]; then
@@ -69,6 +72,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Invoked by the ERR traps below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED-}; local _BOLD=${BOLD-}; local _RESET=${RESET-}; local _DIM=${DIM-}; local _WHITE=${WHITE-}

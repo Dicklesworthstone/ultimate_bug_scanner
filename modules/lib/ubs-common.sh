@@ -15,6 +15,8 @@
 # fallback for --format=toon/jsonl) are fixed once, here.
 
 if [[ -n "${UBS_COMMON_LOADED:-}" ]]; then
+  # Executing this file directly makes return fail, so the exit fallback is live.
+  # shellcheck disable=SC2317
   return 0 2>/dev/null || exit 0
 fi
 UBS_COMMON_LOADED=1

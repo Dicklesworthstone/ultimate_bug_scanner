@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # shellcheck disable=SC2002,SC2015,SC2034,SC2317
 # ═══════════════════════════════════════════════════════════════════════════
 # SWIFT ULTIMATE BUG SCANNER v3.0.1 - Industrial-Grade Swift Code Analysis
@@ -16,7 +17,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="bfeefc3b9258e4782b2659effa7d55f08c6c8715ec92861ff197d6083d92b3c0"
+UBS_LIB_CHECKSUM="18648f0c2e874ac2f70e998b9efbdd72b4aae050250a020ed6b56479989088e6"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -61,6 +62,8 @@ KEEP_TEMP=${UBS_KEEP_TEMP:-0}
 TEMP_PATHS=()
 cleanup_add() { [[ -n "${1:-}" ]] && TEMP_PATHS+=("$1"); }
 
+# Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 cleanup() {
   local ec=$?
   if [[ "${KEEP_TEMP}" -eq 1 ]]; then exit "$ec"; fi
@@ -72,6 +75,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Invoked by the ERR trap below; ShellCheck does not count trap callbacks.
+# shellcheck disable=SC2329
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
   local _RED=${RED-}; local _BOLD=${BOLD-}; local _RESET=${RESET-}; local _DIM=${DIM-}; local _WHITE=${WHITE-}
@@ -115,7 +120,6 @@ print_header() {
   say "${WHITE}${BOLD}$1${RESET}"
   say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 }
-print_category() { say "\n${MAGENTA}${BOLD}▓▓▓ $1${RESET}\n${DIM}$2${RESET}"; }
 print_subheader() { say "\n${YELLOW}${BOLD}$BULLET $1${RESET}"; }
 
 # CLI Parsing & Configuration
@@ -487,12 +491,13 @@ run_xcodebuild_analyze(){
   local xcw xcp SCHEME=""
   xcw=$(find "$PROJECT_DIR" -maxdepth 6 -name "*.xcworkspace" 2>/dev/null | head -n1 || true)
   xcp=$(find "$PROJECT_DIR" -maxdepth 6 -name "*.xcodeproj" 2>/dev/null | head -n1 || true)
-  local sdkflag=""
+  # Guard empty-array expansion below for Bash 4.0-4.3 under set -u.
+  local -a sdk_args=()
   case "$SDK_KIND" in
-    ios) sdkflag="-sdk iphonesimulator" ;;
-    macos) sdkflag="-sdk macosx" ;;
-    tvos) sdkflag="-sdk appletvsimulator" ;;
-    watchos) sdkflag="-sdk watchsimulator" ;;
+    ios) sdk_args=(-sdk iphonesimulator) ;;
+    macos) sdk_args=(-sdk macosx) ;;
+    tvos) sdk_args=(-sdk appletvsimulator) ;;
+    watchos) sdk_args=(-sdk watchsimulator) ;;
   esac
   if command -v xcodebuild >/dev/null 2>&1; then
     if [[ -n "$xcw" ]]; then
@@ -502,7 +507,7 @@ run_xcodebuild_analyze(){
       [[ -z "$SCHEME" ]] && SCHEME="$(basename "$xcw" .xcworkspace)"
       local tmp; tmp="$(mktemp 2>/dev/null || mktemp -t ubs_xc_analyze.XXXXXX)"
       cleanup_add "$tmp"
-      with_timeout xcodebuild -workspace "$xcw" -scheme "$SCHEME" analyze $sdkflag >"$tmp" 2>&1 || true
+      with_timeout xcodebuild -workspace "$xcw" -scheme "$SCHEME" analyze ${sdk_args[@]+"${sdk_args[@]}"} >"$tmp" 2>&1 || true
       local w e; w=$(grep -c "warning:" "$tmp" 2>/dev/null || true); e=$(grep -c "error:" "$tmp" 2>/dev/null || true)
       if [[ "$w" -gt 0 || "$e" -gt 0 ]]; then
         say " ${YELLOW}${WARN} Analyzer:${RESET} ${WHITE}${w}${RESET} warnings, ${RED}${e}${RESET} errors"
@@ -517,7 +522,7 @@ run_xcodebuild_analyze(){
       [[ -z "$SCHEME" ]] && SCHEME="$(basename "$xcp" .xcodeproj)"
       local tmp; tmp="$(mktemp 2>/dev/null || mktemp -t ubs_xc_analyze.XXXXXX)"
       cleanup_add "$tmp"
-      with_timeout xcodebuild -project "$xcp" -scheme "$SCHEME" analyze $sdkflag >"$tmp" 2>&1 || true
+      with_timeout xcodebuild -project "$xcp" -scheme "$SCHEME" analyze ${sdk_args[@]+"${sdk_args[@]}"} >"$tmp" 2>&1 || true
       local w e; w=$(grep -c "warning:" "$tmp" 2>/dev/null || true); e=$(grep -c "error:" "$tmp" 2>/dev/null || true)
       if [[ "$w" -gt 0 || "$e" -gt 0 ]]; then
         say " ${YELLOW}${WARN} Analyzer:${RESET} ${WHITE}${w}${RESET} warnings, ${RED}${e}${RESET} errors"

@@ -522,35 +522,49 @@ early_cleanup(){
 }
 trap early_cleanup EXIT
 
-# python3 resolution (bead G7). Git for Windows and some Windows installs only
-# have `python` (or the `py` launcher); the modules and the 14 helpers call
-# `python3` by name. When python3 is missing but `python`/`py -3` is Python
-# >= 3.9, a shim directory holding a `python3` wrapper is prepended to PATH for
-# the whole run, so nothing else changes. UBS_PYTHON=/path/to/interpreter
-# overrides detection (a shim is made even when a python3 is on PATH). doctor
-# reports what was used.
+# python3 resolution (bead G7). Modules and helpers call `python3` by name.
+# Validate every candidate, including an existing python3, and freeze its
+# executable path before a shim changes PATH or a module changes directory.
+# Preserve the final symlink so virtualenv interpreters keep their identity.
+# UBS_PYTHON overrides detection; python and py -3 remain fallback candidates.
+# doctor reports the selected interpreter.
 PYTHON_RESOLVED=""   # interpreter python3 resolves to (for doctor); empty = none
 PYTHON_SOURCE=""     # path | UBS_PYTHON | python | py
 PYTHON_SHIM_DIR=""
 python_is_3(){ "$@" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; }
+python_executable_path(){
+  local located directory
+  located="$(type -P -- "$1" 2>/dev/null)" || return 1
+  [[ -n "$located" && -x "$located" ]] || return 1
+  if [[ "$located" == /* ]]; then
+    printf '%s\n' "$located"
+  else
+    directory="$(CDPATH='' cd -P -- "$(dirname -- "$located")" && pwd -P)" || return 1
+    printf '%s/%s\n' "$directory" "${located##*/}"
+  fi
+}
 resolve_python3(){
   local -a cand=()
+  local executable
   if [[ -n "${UBS_PYTHON:-}" ]]; then
-    if python_is_3 "$UBS_PYTHON"; then
-      cand=("$UBS_PYTHON"); PYTHON_SOURCE="UBS_PYTHON"
+    if executable="$(python_executable_path "$UBS_PYTHON")" && python_is_3 "$executable"; then
+      cand=("$executable"); PYTHON_SOURCE="UBS_PYTHON"
     else
       echo "⚠ UBS_PYTHON=$UBS_PYTHON is not a usable Python >= 3.9; ignoring it" >&2
     fi
   fi
   if [[ ${#cand[@]} -eq 0 ]]; then
-    if command -v python3 >/dev/null 2>&1; then
-      PYTHON_RESOLVED="$(command -v python3)"; PYTHON_SOURCE="path"
-      return 0
-    fi
-    if command -v python >/dev/null 2>&1 && python_is_3 python; then
-      cand=("$(command -v python)"); PYTHON_SOURCE="python"
-    elif command -v py >/dev/null 2>&1 && python_is_3 py -3; then
-      cand=(py -3); PYTHON_SOURCE="py"
+    if executable="$(python_executable_path python3)" && python_is_3 "$executable"; then
+      PYTHON_SOURCE="path"
+      if [[ "$(type -P -- python3)" == /* ]]; then
+        PYTHON_RESOLVED="$executable"
+        return 0
+      fi
+      cand=("$executable")
+    elif executable="$(python_executable_path python)" && python_is_3 "$executable"; then
+      cand=("$executable"); PYTHON_SOURCE="python"
+    elif executable="$(python_executable_path py)" && python_is_3 "$executable" -3; then
+      cand=("$executable" -3); PYTHON_SOURCE="py"
     fi
   fi
   [[ ${#cand[@]} -gt 0 ]] || return 1

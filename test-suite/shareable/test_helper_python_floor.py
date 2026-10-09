@@ -12,6 +12,7 @@ import ast
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -217,6 +218,218 @@ class HelperPythonFloor(unittest.TestCase):
         self.assertGreater(report["totals"]["critical"], 0, report)
 
 
+class PythonResolution(unittest.TestCase):
+    """Execute the real resolver with a hermetic PATH, not a reimplementation."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        source = UBS.read_text(encoding="utf-8")
+        start = source.index('PYTHON_RESOLVED=""')
+        end = source.index("\nresolve_python3 || true", start)
+        cls.resolver = source[start:end]
+        cls.bash = shutil.which("bash")
+        if cls.bash is None:
+            raise RuntimeError("the runtime resolver tests require Bash")
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "python-resolution"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix=self._testMethodName + "-", dir=artifacts)).resolve()
+        self.bin = self.root / "tools"
+        self.work = self.root / "project"
+        self.other = self.root / "elsewhere"
+        self.temp = self.root / "tmp"
+        for path in (self.bin, self.work, self.other, self.temp):
+            path.mkdir()
+        for tool in ("bash", "mktemp", "chmod", "dirname"):
+            found = shutil.which(tool)
+            self.assertIsNotNone(found, tool)
+            (self.bin / tool).symlink_to(found)
+        self.env = {key: value for key, value in clean_env(self.root).items()
+                    if not key.startswith("BASH_FUNC_") and key not in ("BASH_ENV", "ENV", "CDPATH")}
+        self.env.update(PATH=str(self.bin), TMPDIR=str(self.temp))
+
+    def interpreter(self, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(sys.executable)
+        return path
+
+    def executable(self, path: Path, script: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n" + script, encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def shell(self, tail: str, *args: str) -> subprocess.CompletedProcess:
+        # Only repository source and fixed test code are executed. All paths
+        # and probe text travel as argv; no scanned source reaches this shell.
+        script = "set -Eeuo pipefail\nEARLY_TMP_PATHS=()\n" + self.resolver + "\n" + tail
+        command = [self.bash, "-c", script, "ubs-resolution-test", *args]
+        (self.root / "resolver.sh").write_text(script, encoding="utf-8")
+        started = time.perf_counter()
+        proc = None
+        failure = None
+        try:
+            proc = subprocess.run(  # ubs:ignore[python.taint.command,py.security.command-injection] trusted resolver harness
+                command, cwd=self.work, env=self.env, text=True, capture_output=True,
+                timeout=15, check=False,
+            )
+            return proc
+        except subprocess.TimeoutExpired as exc:
+            failure = exc
+            raise
+        finally:
+            for name in ("stdout", "stderr"):
+                output = getattr(proc if proc is not None else failure, name, "") or ""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                (self.root / (name + ".log")).write_text(output, encoding="utf-8")
+            (self.root / "result.json").write_text(json.dumps({
+                "case": self.id(), "command": command, "cwd": str(self.work),
+                "python": sys.version, "executable": sys.executable,
+                "runner_sha256": hashlib.sha256(UBS.read_bytes()).hexdigest(),
+                "resolver_sha256": hashlib.sha256(self.resolver.encode()).hexdigest(),
+                "duration_sec": time.perf_counter() - started,
+                "exit_code": proc.returncode if proc is not None else None,
+                "error": type(failure).__name__ if failure is not None else None,
+                "environment": {key: self.env[key] for key in ("PATH", "UBS_PYTHON", "CDPATH")
+                                if key in self.env},
+            }, indent=2) + "\n", encoding="utf-8")
+
+    def probe(self, expected_source: str, selected: Path, *, prefix: Path | None = None) -> tuple:
+        code = ("import json, sys; print(json.dumps([sys.executable, "
+                "list(sys.version_info[:2]), sys.prefix, sys.argv[1:]]))")
+        proc = self.shell(r'''
+if ! resolve_python3; then exit 2; fi
+printf '%s\n' "$PYTHON_SOURCE" "$PYTHON_RESOLVED" "$PYTHON_SHIM_DIR"
+cd -- "$1"
+exec python3 -c "$2" 'argument with spaces' '' '$literal;not-code'
+''', str(self.other), code)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        source, description, shim, body = proc.stdout.splitlines()
+        self.assertEqual(source, expected_source)
+        self.assertTrue(description.startswith(str(selected)), description)
+        try:
+            actual, version, actual_prefix, args = json.loads(body)
+        except (ValueError, TypeError) as exc:
+            self.fail(f"interpreter probe returned malformed JSON: {exc}: {proc.stdout}{proc.stderr}")
+        self.assertEqual(Path(actual), selected)
+        self.assertEqual(version, list(sys.version_info[:2]))
+        self.assertEqual(args, ["argument with spaces", "", "$literal;not-code"])
+        if prefix is not None:
+            self.assertEqual(Path(actual_prefix), prefix)
+        return description, shim, proc
+
+    def test_absolute_path_keeps_working_without_a_shim(self) -> None:
+        selected = self.interpreter(self.bin / "python3")
+        _, shim, _ = self.probe("path", selected)
+        self.assertEqual(shim, "")
+
+    def test_absolute_override_beats_broken_python3(self) -> None:
+        selected = self.interpreter(self.bin / "selected-python")
+        self.executable(self.bin / "python3", "exit 99\n")
+        self.env["UBS_PYTHON"] = str(selected)
+        _, shim, _ = self.probe("UBS_PYTHON", selected)
+        self.assertTrue(shim)
+
+    def test_named_python3_override_does_not_reenter_its_shim(self) -> None:
+        selected = self.interpreter(self.bin / "python3")
+        self.env["UBS_PYTHON"] = "python3"
+        self.probe("UBS_PYTHON", selected)
+
+    def test_other_named_override_is_pinned(self) -> None:
+        selected = self.interpreter(self.bin / "chosen-python")
+        self.env["UBS_PYTHON"] = "chosen-python"
+        self.probe("UBS_PYTHON", selected)
+
+    def test_relative_override_survives_a_directory_change(self) -> None:
+        selected = self.interpreter(self.work / "venv with spaces" / "bin" / "python3")
+        self.env["UBS_PYTHON"] = "venv with spaces/bin/python3"
+        self.probe("UBS_PYTHON", selected)
+
+    def test_relative_path_interpreter_survives_a_directory_change(self) -> None:
+        selected = self.interpreter(self.work / ".venv" / "bin" / "python3")
+        self.env["PATH"] = ".venv/bin" + os.pathsep + self.env["PATH"]
+        self.probe("path", selected)
+
+    def test_cdpath_cannot_redirect_a_relative_interpreter(self) -> None:
+        selected = self.interpreter(self.work / ".venv" / "bin" / "python3")
+        self.interpreter(self.other / ".venv" / "bin" / "python3")
+        self.env["UBS_PYTHON"] = ".venv/bin/python3"
+        self.env["CDPATH"] = str(self.other)
+        self.probe("UBS_PYTHON", selected)
+
+    def test_empty_path_entry_is_pinned_to_original_directory(self) -> None:
+        selected = self.interpreter(self.work / "python3")
+        self.env["PATH"] = os.pathsep + self.env["PATH"]
+        self.probe("path", selected)
+
+    def test_rejected_python3_falls_back_to_supported_python(self) -> None:
+        self.executable(self.bin / "python3", "exit 1\n")
+        self.probe("python", self.interpreter(self.bin / "python"))
+
+    def test_crashing_python3_falls_back_to_supported_python(self) -> None:
+        self.executable(self.bin / "python3", "exit 99\n")
+        self.probe("python", self.interpreter(self.bin / "python"))
+
+    def test_missing_python3_falls_back_to_supported_python(self) -> None:
+        self.probe("python", self.interpreter(self.bin / "python"))
+
+    def test_relative_fallback_python_is_pinned(self) -> None:
+        self.executable(self.bin / "python3", "exit 1\n")
+        selected = self.interpreter(self.work / ".venv" / "bin" / "python")
+        self.env["PATH"] = ".venv/bin" + os.pathsep + self.env["PATH"]
+        self.probe("python", selected)
+
+    def test_py_launcher_keeps_its_version_argument(self) -> None:
+        self.executable(self.bin / "python3", "exit 1\n")
+        self.executable(self.bin / "python", "exit 1\n")
+        selected = self.interpreter(self.root / "selected" / "python3")
+        launcher = self.executable(self.bin / "py", '[ "$1" = -3 ] || exit 97\nshift\nexec '
+                                   + shlex.quote(str(selected)) + ' "$@"\n')
+        proc = self.shell(r'''
+resolve_python3
+[[ "$PYTHON_SOURCE" == py ]]
+[[ "$PYTHON_RESOLVED" == "$1 -3 (via a per-run python3 shim)" ]]
+cd -- "$2"
+exec python3 -c 'import sys; print(sys.executable)'
+''', str(launcher), str(self.other))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), str(selected))
+
+    def test_invalid_override_retains_documented_fallback(self) -> None:
+        selected = self.interpreter(self.bin / "python3")
+        self.env["UBS_PYTHON"] = str(self.root / "missing")
+        _, _, proc = self.probe("path", selected)
+        self.assertIn("ignoring it", proc.stderr)
+
+    def test_shell_metacharacters_in_interpreter_path_are_not_executed(self) -> None:
+        selected = self.interpreter(self.work / "venv ' $(touch OWNED)" / "python3")
+        self.env["UBS_PYTHON"] = str(selected)
+        self.probe("UBS_PYTHON", selected)
+        self.assertFalse((self.work / "OWNED").exists())
+        self.assertFalse((self.other / "OWNED").exists())
+
+    def test_virtualenv_symlink_is_not_resolved_to_system_python(self) -> None:
+        venv = self.work / ".venv"
+        selected = self.interpreter(venv / "bin" / "python3")
+        (venv / "pyvenv.cfg").write_text("home = " + str(Path(sys.executable).resolve().parent)
+                                       + "\ninclude-system-site-packages = false\n", encoding="utf-8")
+        self.env["UBS_PYTHON"] = ".venv/bin/python3"
+        self.probe("UBS_PYTHON", selected, prefix=venv)
+
+    def test_no_supported_interpreter_returns_failure_without_a_shim(self) -> None:
+        for name in ("python3", "python", "py"):
+            self.executable(self.bin / name, "exit 1\n")
+        proc = self.shell(r'''
+if resolve_python3; then exit 93; fi
+[[ -z "$PYTHON_RESOLVED" && -z "$PYTHON_SHIM_DIR" ]]
+[[ ${#EARLY_TMP_PATHS[@]} -eq 0 ]]
+''')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(list(self.temp.iterdir()), [])
+
+
 class HelperCurrentRuntime(unittest.TestCase):
     def test_expected_interpreter_is_really_running(self) -> None:
         self.assertGreaterEqual(sys.version_info[:2], FLOOR)
@@ -301,6 +514,58 @@ class HelperCurrentRuntime(unittest.TestCase):
 
     def test_explicit_interpreter_doctor_and_real_scans_agree(self) -> None:
         self.check_doctor_and_scans(override=True)
+
+    def test_named_relative_and_fallback_interpreters_drive_public_scans(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "python-resolution"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        for mode in ("named-override", "relative-override", "relative-path", "fallback"):
+            with self.subTest(mode=mode):
+                scratch = Path(tempfile.mkdtemp(prefix=mode + "-", dir=artifacts)).resolve()
+                binaries = scratch / "bin with spaces"
+                binaries.mkdir()
+                name = "python" if mode == "fallback" else "selected-python" if mode == "relative-override" else "python3"
+                selected = binaries / name
+                selected.symlink_to(sys.executable)
+                env = clean_env(scratch)
+                path_entry = binaries.name if mode == "relative-path" else str(binaries)
+                env["PATH"] = path_entry + os.pathsep + env.get("PATH", "")
+                if mode == "named-override":
+                    env["UBS_PYTHON"] = "python3"
+                elif mode == "relative-override":
+                    env["UBS_PYTHON"] = str(selected.relative_to(scratch))
+                if mode in ("relative-override", "fallback"):
+                    rejected = binaries / "python3"
+                    rejected.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+                    rejected.chmod(0o755)
+                source = scratch / "sample.py"
+                source.write_text("VALUE = 42\n", encoding="utf-8")
+                doctor = public_probe(mode + "-doctor", ["doctor"], scratch, env, source)
+                detail = doctor.stdout + doctor.stderr
+                self.assertEqual(doctor.returncode, 0, detail)
+                self.assertIn(f"python: ready {selected} (via a per-run python3 shim) Python {sys.version.split()[0]}", detail)
+                for dirty, contents in ((False, "VALUE = 42\n"), (True, "value = input()\neval(value)\n")):
+                    source.write_text(contents, encoding="utf-8")
+                    # Category 20 provisions optional uv tools. Selected-runtime
+                    # proof here exercises the native helper without downloads.
+                    proc = public_probe(mode + ("-buggy" if dirty else "-clean"),
+                                        ["--only=python", "--skip=20", "--ci", "--format=json", str(source)],
+                                        scratch, env, source)
+                    detail = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, int(dirty), detail)
+                    self.assertNotIn("Traceback (most recent call last)", detail)
+                    try:
+                        report = json.loads(proc.stdout)
+                    except ValueError as exc:
+                        self.fail(f"scanner did not emit JSON: {exc}: {detail}")
+                    self.assertEqual(report.get("status"), "ok", report)
+                    self.assertEqual(report.get("failed_modules"), [], report)
+                    self.assertEqual(report["totals"]["files"], 1, report)
+                    sites = [(Path(finding["file"]).name, finding["line"])
+                             for finding in report.get("findings", []) if finding["rule_id"] == "python.taint.eval"]
+                    self.assertEqual(sites, [("sample.py", 2)] if dirty else [], report)
+                    if not dirty:
+                        self.assertEqual(report["totals"]["critical"], 0, report)
+                        self.assertEqual(report["totals"]["warning"], 0, report)
 
     def test_public_json_and_sarif_preserve_rule_sites_across_languages(self) -> None:
         cases = (

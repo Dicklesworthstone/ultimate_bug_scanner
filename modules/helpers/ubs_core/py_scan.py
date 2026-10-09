@@ -1,8 +1,9 @@
 """ubs_core.py_scan — contract-v2 orchestrator for the Python module (bead 0xjg.5).
 
-ONE ``python3 -m ubs_core.py_scan`` process replaces the legacy module's
+One ``python3 -m ubs_core.py_scan`` orchestrator replaces the legacy module's
 ~250-400 process spawns (57 rg pipelines, 37 python heredocs, ~156 ast-grep
-invocations). Layers, in legacy-equivalent order:
+invocations). Larger projects use bounded Python detector subprocesses;
+each receives the complete selected project. Layers, in legacy-equivalent order:
 
 1. ``ubs_core.py_patterns.*``  Pattern tables — faithful ports of the legacy
    rg pipelines (category-scoped regex + threshold-descending severity
@@ -642,76 +643,152 @@ def run_analyzers(
                 _analysis_error(errors, f"{analyzer.name} ({scope})", exc)
 
 
-def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  errors: list[str] | None = None) -> None:
-    """Run ubs_core.py_detectors.* modules (legacy heredoc detector ports).
-
-    Protocol (single-rule modules): RULE_ID, CATEGORY, TITLE, SEVERITY,
-    DESCRIPTION and ``find(files)`` yielding (path, line, col, detail).
-    Multi-rule modules (e.g. the SQL two-tier detector) expose ``RULES`` —
-    a tuple of (rule_id, category, title, severity, description) tuples —
-    and ``find(files)`` yielding (rule_id, path, line, col, detail).
-    """
+def _run_detector(module_name: str, files: Sequence[Path], sink,
+                  skip: set[int] | None, errors: list[str] | None) -> None:
+    """Run one detector over the complete selected project."""
     import importlib
+
+    try:
+        module = importlib.import_module(f"ubs_core.py_detectors.{module_name}")
+    except (Exception, SystemExit) as exc:
+        _analysis_error(errors, f"detector module {module_name}", exc)
+        return
+    find = getattr(module, "find", None)
+    if find is None:
+        return
+    if hasattr(module, "RULES"):
+        specs = {
+            spec[0]: {"category": int(spec[1]), "title": str(spec[2]),
+                      "severity": str(spec[3]), "description": str(spec[4])}
+            for spec in module.RULES
+        }
+    else:
+        category = int(getattr(module, "CATEGORY", 7))
+        rule_id = str(getattr(module, "RULE_ID", f"py.cat{category}.{module_name}"))
+        specs = {rule_id: {
+            "category": category,
+            "title": str(getattr(module, "TITLE", rule_id)),
+            "severity": str(getattr(module, "SEVERITY", "warning")),
+            "description": str(getattr(module, "DESCRIPTION", "")),
+        }}
+    if skip:
+        specs = {rid: spec for rid, spec in specs.items()
+                 if spec["category"] not in skip}
+        if not specs:
+            return
+    try:
+        for hit in find(files):
+            if len(hit) == 5:
+                rule_id, path, line_no, col, detail = hit
+            else:
+                path, line_no, col, detail = hit  # single-rule convenience
+                rule_id = next(iter(specs))
+            spec = specs.get(rule_id)
+            if spec is None:
+                continue
+            slug = slug_for_category(spec["category"])
+            title = spec["title"]
+            sink.write(json.dumps({
+                "rule": rule_id,
+                "category_id": f"python.{slug}",
+                "path": str(path),
+                "line": int(line_no),
+                "col": int(col),
+                "severity": spec["severity"],
+                "message": f"{title} — {detail}"[:300] if detail else title,
+                "suppressed": False,
+            }, ensure_ascii=False) + "\n")
+    except (Exception, SystemExit) as exc:
+        _analysis_error(errors, f"detector {module_name}", exc)
+
+
+def _detector_job(module_name: str, files: Sequence[Path], skip: set[int] | None):
+    """Return both records and failures, including hits emitted before a failure."""
+    import io
+
+    sink = io.StringIO()
+    errors: list[str] = []
+    _run_detector(module_name, files, sink, skip, errors)
+    return sink.getvalue(), errors
+
+
+def _detector_worker() -> None:
+    """Private subprocess protocol; source paths are data, never Python code."""
+    try:
+        name, paths, skip = json.load(sys.stdin)
+    except (ValueError, TypeError) as exc:
+        raise ValueError('Invalid detector worker request') from exc
+    result = _detector_job(name, [Path(path) for path in paths],
+                           set(skip) if skip is not None else None)
+    sys.stdout.write(json.dumps(result))
+
+
+def _detector_process(module_name: str, files: Sequence[Path], skip: set[int] | None):
+    import subprocess
+
+    env = dict(os.environ)
+    helpers = str(Path(__file__).resolve().parent.parent)
+    env['PYTHONPATH'] = os.pathsep.join(part for part in (helpers, env.get('PYTHONPATH', '')) if part)
+    limit = env.get('UBS_MODULE_TIMEOUT', '300')
+    timeout = int(limit) if limit.isdecimal() else 300
+    result = subprocess.run(
+        [sys.executable, '-c', 'from ubs_core.py_scan import _detector_worker; _detector_worker()'],
+        input=json.dumps([module_name, [str(path) for path in files],
+                          sorted(skip) if skip is not None else None]).encode('utf-8'),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        timeout=timeout or None,  # An explicit zero retains the unlimited policy.
+    )
+    if result.returncode:
+        raise RuntimeError(f'worker exited {result.returncode}: '
+                           f'{result.stderr.decode("utf-8", "replace")[-2000:]}')
+    try:
+        records, problems = json.loads(result.stdout)
+        if (not isinstance(records, str) or not isinstance(problems, list)
+                or any(not isinstance(problem, str) for problem in problems)):
+            raise ValueError('Expected records and a list of diagnostic strings')
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f'Invalid detector worker response from {module_name}') from exc
+    if result.stderr:
+        sys.stderr.write(result.stderr.decode('utf-8', 'replace'))
+    return records, problems
+
+
+def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
+                  errors: list[str] | None = None, jobs: int = 1) -> None:
+    """Run detectors, retaining project-wide thresholds and module ordering.
+
+    Processes parallelize independent detector modules, never file shards:
+    every ``find(files)`` sees the full project. Small projects and direct
+    APIs without an error collector keep streaming on the calling process.
+    """
     import pkgutil
 
     from ubs_core import py_detectors
 
-    for module_info in pkgutil.iter_modules(py_detectors.__path__):
-        if module_info.name.startswith("_"):
-            continue
-        try:
-            module = importlib.import_module(f"ubs_core.py_detectors.{module_info.name}")
-        except (Exception, SystemExit) as exc:
-            _analysis_error(errors, f"detector module {module_info.name}", exc)
-            continue
-        find = getattr(module, "find", None)
-        if find is None:
-            continue
-        if hasattr(module, "RULES"):
-            specs = {
-                spec[0]: {"category": int(spec[1]), "title": str(spec[2]),
-                          "severity": str(spec[3]), "description": str(spec[4])}
-                for spec in module.RULES
-            }
-        else:
-            category = int(getattr(module, "CATEGORY", 7))
-            rule_id = str(getattr(module, "RULE_ID", f"py.cat{category}.{module_info.name}"))
-            specs = {rule_id: {
-                "category": category,
-                "title": str(getattr(module, "TITLE", rule_id)),
-                "severity": str(getattr(module, "SEVERITY", "warning")),
-                "description": str(getattr(module, "DESCRIPTION", "")),
-            }}
-        if skip:
-            specs = {rid: spec for rid, spec in specs.items()
-                     if spec["category"] not in skip}
-            if not specs:
+    names = [info.name for info in pkgutil.iter_modules(py_detectors.__path__)
+             if not info.name.startswith("_")]
+    if not names or jobs <= 1 or len(files) < 8 or errors is None:
+        for name in names:
+            _run_detector(name, files, sink, skip, errors)
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Threads only supervise ordinary Python subprocesses. Multiprocessing's
+    # named semaphores need /dev/shm capacity that disposable hosts may lack.
+    with ThreadPoolExecutor(max_workers=min(jobs, len(names))) as pool:
+        pending = [(name, pool.submit(_detector_process, name, files, skip)) for name in names]
+        # Join in registry order, so scheduling cannot alter records or samples.
+        for name, future in pending:
+            try:
+                records, problems = future.result()
+            except (Exception, SystemExit) as exc:
+                _analysis_error(errors, f"detector {name}", exc)
                 continue
-        try:
-            for hit in find(files):
-                if len(hit) == 5:
-                    rule_id, path, line_no, col, detail = hit
-                else:
-                    path, line_no, col, detail = hit  # single-rule convenience
-                    rule_id = next(iter(specs))
-                spec = specs.get(rule_id)
-                if spec is None:
-                    continue
-                slug = slug_for_category(spec["category"])
-                title = spec["title"]
-                sink.write(json.dumps({
-                    "rule": rule_id,
-                    "category_id": f"python.{slug}",
-                    "path": str(path),
-                    "line": int(line_no),
-                    "col": int(col),
-                    "severity": spec["severity"],
-                    "message": f"{title} — {detail}"[:300] if detail else title,
-                    "suppressed": False,
-                }, ensure_ascii=False) + "\n")
-        except (Exception, SystemExit) as exc:
-            _analysis_error(errors, f"detector {module_info.name}", exc)
+            # CapturingSink consumes one JSON record per write, not a batch.
+            for record in records.splitlines(keepends=True):
+                sink.write(record)
+            errors.extend(problems)
 
 
 def _finding_title(rec: dict) -> str:
@@ -860,7 +937,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="", help="project path recorded in the json summary")
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
-    parser.add_argument("--jobs", type=int, default=1, help="parallel worker count for work-stealing file shards")
+    parser.add_argument("--jobs", type=int, default=min(4, os.cpu_count() or 1),
+                        help="parallel workers (default: auto, up to 4); 1 runs serially")
     parser.add_argument("--enable-new-analyzers", action="store_true",
                         help="run analyzers with no legacy counterpart (python.narrowing)")
     args = parser.parse_args(argv)
@@ -927,7 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
                       prefilter=prefilter_res, jobs=args.jobs, defer_global_checks=True,
                       suppressions=suppressions, errors=scan_errors)
         _run_stage(scan_errors, "detector scan", run_detectors,
-                      files_to_scan, capturing_sink, skip, errors=scan_errors)
+                      files_to_scan, capturing_sink, skip, errors=scan_errors, jobs=args.jobs)
         _run_stage(scan_errors, "analyzer scan", run_analyzers,
                       files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
                       prefilter=prefilter_res, taint=False, errors=scan_errors, registered=registered)

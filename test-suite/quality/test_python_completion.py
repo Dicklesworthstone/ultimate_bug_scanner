@@ -213,6 +213,97 @@ class PythonCompletionTests(unittest.TestCase):
                 self.assertIn("py.security.sql-injection", {row["rule"] for row in result[2]})
                 self.assertIn("python.lifecycle.file_handle", {row["rule"] for row in result[2]})
 
+    def test_parallel_detectors_preserve_full_project_thresholds_and_capture(self):
+        files = []
+        for index in range(8):
+            path = self.root / f"divisions{index}.py"
+            path.write_text('import os\nos.system(input())\n' +
+                            ''.join(f'value{line} = numerator / divisor\n' for line in range(4)))
+            files.append(path)
+        outputs = []
+        for jobs in (1, 3):
+            target = io.StringIO()
+            sink = CapturingSink(target)
+            errors = []
+            py_scan.run_detectors(files, sink, errors=errors, jobs=jobs)
+            self.assertEqual(errors, [])
+            records = [self.decode_json(line, 'detector JSON record')
+                       for line in target.getvalue().splitlines()]
+            self.assertTrue(any(row['severity'] == 'critical' for row in records), records)
+            divisions = [row for row in records if row['rule'].startswith('py.numeric.division')]
+            self.assertEqual(len(divisions), 32)
+            self.assertEqual({(row['rule'], row['severity']) for row in divisions},
+                             {('py.numeric.division-heavy', 'warning')})
+            for path in files:
+                self.assertEqual(sink.get_for_file(path),
+                                 [row for row in records if row['path'] == str(path)])
+            outputs.append(records)
+        self.assertEqual(*outputs)
+        sink = io.StringIO()
+        errors = []
+        py_scan.run_detectors(files, sink, skip={2}, errors=errors, jobs=3)
+        self.assertEqual(errors, [])
+        records = [self.decode_json(line, 'detector JSON record')
+                   for line in sink.getvalue().splitlines()]
+        self.assertFalse(any(row['rule'].startswith('py.numeric.division') for row in records))
+        self.assertTrue(any(row['severity'] == 'critical' for row in records), records)
+
+    def test_detector_worker_protocol_retains_hits_before_failure(self):
+        module = importlib.import_module("ubs_core.py_detectors.sql_injection")
+
+        def broken(files):
+            yield "py.security.sql-injection", files[0], 1, 1, "before worker failure"
+            raise RuntimeError("worker detector failed")
+
+        with patch.object(module, "find", side_effect=broken):
+            payload, errors = py_scan._detector_job("sql_injection", [self.source], None)
+        self.assertEqual(self.decode_json(payload, 'worker payload')['rule'], 'py.security.sql-injection')
+        self.assertEqual(errors, ['detector sql_injection: RuntimeError: worker detector failed'])
+
+    def test_detector_worker_deadline_terminates_a_stalled_child(self):
+        stalled = self.root / 'stalled-python'
+        stalled.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(30)\n')
+        stalled.chmod(0o755)
+        with patch.object(sys, 'executable', str(stalled)), \
+                patch.dict(os.environ, {'UBS_MODULE_TIMEOUT': '1'}):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                py_scan._detector_process('division', [self.source], None)
+
+    def test_malformed_detector_protocol_fails_loudly(self):
+        for request in ('not JSON', 'null', '[]'):
+            with self.subTest(request=request), patch.object(sys, 'stdin', io.StringIO(request)):
+                with self.assertRaisesRegex(ValueError, 'Invalid detector worker request'):
+                    py_scan._detector_worker()
+        for index, reply in enumerate(('not JSON', '[null, []]', '["", [null]]')):
+            invalid = self.root / f'invalid-worker{index}'
+            invalid.write_text(f'#!{sys.executable}\nprint({reply!r})\n')
+            invalid.chmod(0o755)
+            with self.subTest(reply=reply), patch.object(sys, 'executable', str(invalid)):
+                with self.assertRaisesRegex(ValueError, 'Invalid detector worker response'):
+                    py_scan._detector_process('division', [self.source], None)
+
+    def test_parallel_detector_failure_is_partial_and_keeps_sibling_records(self):
+        from types import SimpleNamespace
+
+        files = []
+        for index in range(8):
+            path = self.root / f"sibling{index}.py"
+            path.write_text('handle = open("data", encoding="utf-8")\n' +
+                            ''.join(f'value{line} = numerator / divisor\n' for line in range(4)))
+            files.append(path)
+        original = py_scan.run_detectors
+
+        def selected_detectors(*args, **kwargs):
+            with patch('pkgutil.iter_modules', return_value=[
+                    SimpleNamespace(name='division'), SimpleNamespace(name='missing_detector_probe')]):
+                return original(*args, **kwargs)
+
+        with patch.object(py_scan, 'run_detectors', side_effect=selected_detectors):
+            result = self.scan(files=files, jobs=3)
+        self.assert_partial(result, 'missing_detector_probe')
+        self.assertEqual(sum(row['rule'] == 'py.numeric.division-heavy' for row in result[2]), 32)
+        self.assertIn('python.lifecycle.file_handle', {row['rule'] for row in result[2]})
+
     def test_unreadable_input_is_not_an_empty_successful_source(self):
         missing = self.root / "missing.py"
         for jobs in (1, 2):

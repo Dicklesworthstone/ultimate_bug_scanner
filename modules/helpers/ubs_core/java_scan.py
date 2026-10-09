@@ -584,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     from ubs_core.cache import CapturingSink, ScanCache, hash_rules_dir
     from ubs_core.java_detectors.tls_verification import LIMIT_DEFAULTS as TLS_LIMITS
     from ubs_core.analyzers.taint_java_sql import LIMIT_DEFAULTS as SQL_LIMITS
+    from ubs_core.java_detectors.jwt_verification import LIMIT_DEFAULTS as JWT_LIMITS
 
     cache = ScanCache(
         lang="java",
@@ -594,7 +595,9 @@ def main(argv: list[str] | None = None) -> int:
                f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''};"
                "tls_policy=" + repr([(name, os.environ.get(name, str(value)))
                                       for name, value in sorted(TLS_LIMITS.items())]) + ";sql_policy=" +
-               repr([(name, os.environ.get(name, str(value))) for name, value in sorted(SQL_LIMITS.items())])),
+               repr([(name, os.environ.get(name, str(value))) for name, value in sorted(SQL_LIMITS.items())]) +
+               ";jwt_policy=" + repr([(name, os.environ.get(name, str(value)))
+                                        for name, value in sorted(JWT_LIMITS.items())])),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
     suppressions = SourceSuppressions("java")

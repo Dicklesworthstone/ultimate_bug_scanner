@@ -119,7 +119,7 @@ class JdbcSource(VerifierSource):
         while cursor > 0:
             while cursor > 0 and self.code[cursor - 1].isspace():
                 cursor -= 1
-            if self.code[cursor - 1:cursor] in {")", "]"}:
+            if cursor > 0 and self.code[cursor - 1:cursor] in {")", "]"}:
                 cursor = self.reverse_pairs[cursor - 1]
                 preceding = cursor
                 while preceding > 0 and self.code[preceding - 1].isspace():

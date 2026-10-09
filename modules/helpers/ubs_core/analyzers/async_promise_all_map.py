@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
@@ -73,7 +74,7 @@ def scan_lines(lines: list[str]) -> list[tuple[int, int]]:
             if RETURN_RE.search(callback_body):
                 continue
             sample_line = idx + expression[:match.start()].count('\n') + 1
-            col_match = MAP_DOT_RE.search(lines[sample_line - 1])
+            col_match = MAP_DOT_RE.search(source_line(lines, sample_line))
             col = col_match.start() + 1 if col_match else 1
             issues.append((sample_line, col))
     return issues
@@ -114,7 +115,7 @@ def collect_issues(root: Path) -> list[tuple[str, int, str]]:
                 rel = path.relative_to(sample_root)
             except ValueError:
                 rel = path
-            issues.append((str(rel), sample_line, lines[sample_line - 1].strip().replace('\t', ' ')))
+            issues.append((str(rel), sample_line, source_line(lines, sample_line).strip().replace('\t', ' ')))
     return issues
 
 

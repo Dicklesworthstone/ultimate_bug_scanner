@@ -12,7 +12,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Sequence
 
 
 @lru_cache(maxsize=1)
@@ -53,6 +53,18 @@ def line_col(text: str, pos: int) -> tuple[int, int]:
     last_newline = text.rfind("\n", 0, pos)
     col = pos + 1 if last_newline == -1 else pos - last_newline
     return line, col
+
+
+def source_line(lines: Sequence[str], line: int) -> str:
+    """Return a one-based source line, rejecting invalid diagnostic anchors.
+
+    In particular, zero must not wrap to the last line as Python's negative
+    indexing would. A bad generated coordinate means analysis is incomplete,
+    rather than a finding whose evidence silently points at another line.
+    """
+    if type(line) is not int or not 0 < line <= len(lines):
+        raise ValueError(f"Invalid source line {line!r} for {len(lines)} lines; analysis is incomplete")
+    return lines[line - 1]
 
 
 def format_location(base: Path | str, path: Path | str, pos: int, text: str) -> str:

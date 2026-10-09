@@ -10,6 +10,9 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Validate one-based diagnostic source-line lookups in the shared location utility, rejecting invalid anchors rather than allowing negative indices to wrap. JavaScript async and block-function checks, Rust secret comparisons and Swift shell findings retain the original source evidence for valid lines.
+- Recognize bounds guards that record a diagnostic before an unconditional exit. Rebinding the index invalidates an earlier guard, and comprehension filters only protect expressions evaluated after them; the index warning threshold is unchanged.
+
 ### Added
 
 - Java SQL provenance recognizes actual Jakarta and javax Servlet request APIs, including parameters, headers, and selected URL components. Request aliases, helper returns, and casts retain their identity through JDBC execution; exact helper overloads use declared API or scoped local-class types so fixed-value overloads stay distinct from request-producing ones. Bound parameters, genuine numeric validation, local API shadows, and application-owned request attributes retain their separate semantics.

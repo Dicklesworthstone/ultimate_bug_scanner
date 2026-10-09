@@ -60,6 +60,7 @@ mirroring ``ruby.collections.index-arithmetic-info``.
 from __future__ import annotations
 
 import ast
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -194,6 +195,63 @@ _NAMED_PATTERNS = tuple(getattr(ast, n) for n in ("MatchAs", "MatchStar") if has
 _MAPPING_PATTERNS = tuple(getattr(ast, n) for n in ("MatchMapping",) if hasattr(ast, n))
 
 
+@lru_cache(maxsize=2048)
+def _rebinds(node: ast.AST, name: str) -> bool:
+    return any(
+        isinstance(part, ast.Name) and part.id == name and isinstance(part.ctx, (ast.Store, ast.Del))
+        or _string_binding(part, name)
+        for part in ast.walk(node)
+    )
+
+
+@lru_cache(maxsize=2048)
+def _fallthrough_rebinds(node: ast.AST, name: str) -> bool:
+    if isinstance(node, ast.If):
+        if _rebinds(node.test, name):
+            return True
+        for block in (node.body, node.orelse):
+            if block and isinstance(block[-1], _TERMINATORS):
+                continue
+            if any(_fallthrough_rebinds(stmt, name) for stmt in block):
+                return True
+        return False
+    return _rebinds(node, name)
+
+
+def _rebound_before(node: ast.AST, ancestor: ast.AST, name: str, parents, *, fresh_header=False) -> bool:
+    """Conservatively reject stores between a guard and the selected lookup."""
+    child = node
+    while child is not ancestor:
+        parent = parents.get(child)
+        if parent is None:
+            return True
+        for field, value in ast.iter_fields(parent):
+            if (isinstance(parent, (ast.Assign, ast.AnnAssign)) and field in ('targets', 'target')
+                    or isinstance(parent, ast.AugAssign) and field == 'target' and isinstance(value, ast.Name)):
+                continue  # The assigned name changes after its RHS is evaluated.
+            # An ancestor's header supplies the fresh guard/loop binding.
+            # Only statements inside its selected branch can invalidate it.
+            if fresh_header and parent is ancestor and field not in ('body', 'orelse', 'finalbody'):
+                continue
+            if value is child:
+                break
+            if isinstance(value, list):
+                if isinstance(parent, ast.If) and field in ('body', 'orelse') \
+                        and not any(entry is child for entry in value):
+                    continue  # The other branch did not execute on this path.
+                for entry in value:
+                    if entry is child:
+                        break
+                    if isinstance(entry, ast.AST) and _fallthrough_rebinds(entry, name):
+                        return True
+                if any(entry is child for entry in value):
+                    break
+            elif isinstance(value, ast.AST) and _rebinds(value, name):
+                return True
+        child = parent
+    return False
+
+
 def _early_exit_bounds(block: list[ast.stmt], upto: ast.AST,
                        name: str, want_upper: bool, offset: int) -> bool:
     """A preceding statement in this block establishes the bound.
@@ -202,22 +260,33 @@ def _early_exit_bounds(block: list[ast.stmt], upto: ast.AST,
     surviving path knows the negation, and `assert <in range>`, which states
     the bound directly.
     """
+    bounded = False
     for stmt in block:
         if stmt is upto:
-            return False
+            return bounded
+        changes_index = _rebinds(stmt, name)
         if isinstance(stmt, ast.Assert):
-            if (_compare_bounds(stmt.test, name, want_upper, offset=offset)
+            if changes_index:
+                bounded = False
+            elif (_compare_bounds(stmt.test, name, want_upper, offset=offset)
                     or (not want_upper and offset == 1 and _implies_nonzero(stmt.test, name))):
-                return True
+                bounded = True
             continue
-        if not isinstance(stmt, ast.If) or stmt.orelse:
-            continue
-        if not all(isinstance(inner, _TERMINATORS) for inner in stmt.body):
-            continue
-        if (_compare_bounds(stmt.test, name, want_upper, negate=True, offset=offset)
+        if (isinstance(stmt, ast.If) and not stmt.orelse and stmt.body
+                and isinstance(stmt.body[-1], _TERMINATORS)):
+            # Recording a diagnostic before `continue` does not leave a
+            # fall-through path. Stores inside that exiting body cannot
+            # change the surviving index, but stores in the test can.
+            test_changes_index = _rebinds(stmt.test, name)
+            if test_changes_index:
+                bounded = False
+            elif (_compare_bounds(stmt.test, name, want_upper, negate=True, offset=offset)
                 or (not want_upper and offset == 1
                     and _implies_nonzero(stmt.test, name, when_false=True))):
-            return True
+                bounded = True
+            continue
+        if changes_index:
+            bounded = False
     return False
 
 
@@ -286,15 +355,20 @@ def _guarded(
         if isinstance(parent, ast.BoolOp):
             # Short-circuit: only operands evaluated before this one can guard.
             when_false = isinstance(parent.op, ast.Or)
+            bounded = False
             for value in parent.values:
                 if value is child:
                     break
+                if _rebinds(value, name):
+                    bounded = False
                 if (_compare_bounds(value, name, want_upper, negate=when_false, offset=offset)
                         or (not want_upper and offset == 1
                             and _implies_nonzero(value, name, when_false=when_false))):
-                    return True
+                    bounded = True
+            if bounded and not _rebound_before(node, child, name, parents):
+                return True
         elif isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
-            if child is not parent.test:
+            if child is not parent.test and not _rebound_before(node, parent, name, parents, fresh_header=True):
                 when_false = not _in_true_branch(parent, child)
                 if _compare_bounds(parent.test, name, want_upper, negate=when_false, offset=offset):
                     return True
@@ -302,16 +376,51 @@ def _guarded(
                         and _implies_nonzero(parent.test, name, when_false=when_false)):
                     return True
         elif isinstance(parent, ast.comprehension):
-            if any(_compare_bounds(cond, name, want_upper, offset=offset) for cond in parent.ifs):
-                return True
+            # The iterable is evaluated before binding the target or testing
+            # any filters. A filter can use only filters evaluated before it.
+            if child is not parent.iter and child is not parent.target:
+                bounded = _loop_guards(parent.target, parent.iter, name, want_upper, offset)
+                for cond in parent.ifs:
+                    if _rebinds(cond, name):
+                        bounded = False
+                    if cond is child:
+                        break
+                    if not _rebinds(cond, name) and _compare_bounds(cond, name, want_upper, offset=offset):
+                        bounded = True
+                if bounded:
+                    return True
         elif isinstance(parent, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            bounded = False
             for gen in parent.generators:
-                if any(_compare_bounds(cond, name, want_upper, offset=offset) for cond in gen.ifs):
-                    return True
-                if _loop_guards(gen.target, gen.iter, name, want_upper, offset):
-                    return True
+                if gen is child:
+                    # For a filter, this generator has already rebound its
+                    # target; for its iterable, the old binding still applies.
+                    ancestor = node
+                    while ancestor in parents and parents[ancestor] is not gen:
+                        ancestor = parents[ancestor]
+                    if ancestor is not gen.iter:
+                        if _rebinds(gen.target, name):
+                            bounded = False
+                        for cond in gen.ifs:
+                            if _rebinds(cond, name):
+                                bounded = False
+                            if cond is ancestor:
+                                break
+                            if not _rebinds(cond, name) and _compare_bounds(cond, name, want_upper, offset=offset):
+                                bounded = True
+                    break  # Later generators/filters have not run yet.
+                if _rebinds(gen.target, name):
+                    bounded = _loop_guards(gen.target, gen.iter, name, want_upper, offset)
+                for cond in gen.ifs:
+                    if _rebinds(cond, name):
+                        bounded = False
+                    elif _compare_bounds(cond, name, want_upper, offset=offset):
+                        bounded = True
+            if bounded:
+                return True
         elif isinstance(parent, (ast.For, ast.AsyncFor)):
-            if _loop_guards(parent.target, parent.iter, name, want_upper, offset):
+            if (_loop_guards(parent.target, parent.iter, name, want_upper, offset)
+                    and not _rebound_before(node, parent, name, parents, fresh_header=True)):
                 return True
             if _collected_enumerate_guarded(parent, name, want_upper, offset, parents):
                 return True
@@ -321,7 +430,8 @@ def _guarded(
         for block_name in ("body", "orelse", "finalbody"):
             block = getattr(parent, block_name, None)
             if isinstance(block, list) and any(stmt is child for stmt in block):
-                if _early_exit_bounds(block, child, name, want_upper, offset):
+                if (_early_exit_bounds(block, child, name, want_upper, offset)
+                        and not _rebound_before(node, child, name, parents)):
                     return True
         if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module,
                                ast.ClassDef, ast.Lambda)):
@@ -611,6 +721,10 @@ def _bisect_predecessor_guarded(node: ast.Subscript, name: str, delta: int, pare
 def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
     hits: list[tuple[Path, int, int, str]] = []
     for path in files:
+        # Parsed ASTs are immutable within this pass. Cache repeated binding
+        # queries without retaining a previous file's tree or source state.
+        _rebinds.cache_clear()
+        _fallthrough_rebinds.cache_clear()
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
         try:
@@ -646,6 +760,8 @@ def find(files: Sequence[Path]) -> Iterable[tuple[str, Path, int, int, str]]:
             seen.add(line_no)
             code = lines[idx].strip()[:240] if 0 <= idx < len(lines) else ''
             hits.append((path, line_no, node.col_offset + 1, code))
+    _rebinds.cache_clear()
+    _fallthrough_rebinds.cache_clear()
     if not hits:
         return
     rule = ("py.collections.index-arithmetic" if len(hits) > WARNING_ABOVE

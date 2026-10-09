@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
+from ubs_core.io import source_line
 from ubs_core.registry import Analyzer, RunContext, register
 
 EXTS = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
@@ -96,7 +97,7 @@ def collect_issues(root: Path) -> list[tuple[str, int, str, str]]:
                 rel = path.relative_to(sample_root)
             except ValueError:
                 rel = path
-            issues.append((str(rel), issue_line, method, lines[issue_line - 1].strip().replace('\t', ' ')))
+            issues.append((str(rel), issue_line, method, source_line(lines, issue_line).strip().replace('\t', ' ')))
     return issues
 
 

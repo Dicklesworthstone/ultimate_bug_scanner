@@ -866,7 +866,7 @@ class Flow:
             pos, _ = src.trim(pos, close)
             if pos == close:
                 break
-            if src.code.startswith('#[', pos):
+            if pos + 1 < close and src.code.startswith('#[', pos):
                 pos = src.pairs[pos + 1] + 1
                 continue
             arrow = pos

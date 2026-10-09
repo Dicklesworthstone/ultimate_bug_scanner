@@ -401,7 +401,8 @@ class SqlEngine(Engine):
                            if tag.startswith(_TYPE_PREFIX) and tag[len(_TYPE_PREFIX):] in _OBJECTS)
         return retag(selected, add=frozenset({_PREPARED_SQL}), remove=remove)
 
-    def call_sink(self, name, spans, arguments, value, offset, argument_names=(), bindings=None):
+    def call_sink(self, name, call, value, offset, bindings):
+        arguments = call.values
         method = name.rsplit(".", 1)[-1]
         if method not in _EXECUTE:
             return False
@@ -414,7 +415,7 @@ class SqlEngine(Engine):
         else:
             root = name.rpartition(".")[0]
             state = self.contexts[-1][3]
-            receiver, types = self._receiver(root, offset, bindings or {}, state)
+            receiver, types = self._receiver(root, offset, bindings, state)
             start = offset
         if types & _PREPARED and not arguments:
             self.record(start, self._prepared_query(receiver))
@@ -506,9 +507,10 @@ class SqlEngine(Engine):
             receiver = self.expression(opening + 1, closing, state, bindings, depth + 1)
             declared = self.jdbc.receiver_type(opening, closing + 1)
             for dot, method, low, high in members:
-                spans, names, arguments = self.call_arguments(low, high, state, bindings, depth)
+                call_arguments = self.call_arguments(low, high, state, bindings, depth)
+                arguments = call_arguments.values
                 joined = join(receiver, *arguments)
-                self.call_sink("." + method, spans, arguments, joined, dot, names, bindings)
+                self.call_sink("." + method, call_arguments, joined, dot, bindings)
                 types = _types(receiver) & _OBJECTS
                 if declared in _HTTP | _SERVLET | _SERVLET_HTTP:
                     types = frozenset({declared})

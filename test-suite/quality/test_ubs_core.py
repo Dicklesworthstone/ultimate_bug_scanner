@@ -2719,8 +2719,15 @@ class Second {
         context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, 2, context)
         report = self.decode_report(proc)
-        self.assertEqual(report['status'], 'error', context)
-        self.assertTrue(report['failed_modules'], context)
+        # The other Java layers ran, but traversal could not model this heap
+        # write. Contract v2 preserves their results as partial, still exit 2.
+        self.assertEqual(report['status'], 'partial', context)
+        self.assertEqual(report['exit_code'], 2, context)
+        self.assertEqual(len(report['failed_modules']), 1, context)
+        failed = report['failed_modules'][0]
+        self.assertEqual(failed['language'], 'java', context)
+        self.assertEqual(failed['status'], 'partial', context)
+        self.assertEqual(failed['module_error'], 'ANALYZER_ERROR', context)
         self.assertIn('heap-state', proc.stdout + proc.stderr, context)
 
     def test_kotlin_top_level_parameter_helpers_execute_with_original_offsets(self):
@@ -2906,8 +2913,13 @@ fun handler(request: jakarta.servlet.http.HttpServletRequest, again: Boolean) {
         context = f'exit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}'
         self.assertEqual(proc.returncode, 2, context)
         report = self.decode_report(proc)
-        self.assertEqual(report['status'], 'error', context)
-        self.assertTrue(report['failed_modules'], context)
+        self.assertEqual(report['status'], 'partial', context)
+        self.assertEqual(report['exit_code'], 2, context)
+        self.assertEqual(len(report['failed_modules']), 1, context)
+        failed = report['failed_modules'][0]
+        self.assertEqual(failed['language'], 'java', context)
+        self.assertEqual(failed['status'], 'partial', context)
+        self.assertEqual(failed['module_error'], 'ANALYZER_ERROR', context)
         self.assertIn('field-state', proc.stdout + proc.stderr, context)
 
     def test_existing_fixture_pairs_preserve_bytes_and_findings(self):

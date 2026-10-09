@@ -1053,7 +1053,8 @@ def _function_scopes(text, code):
                 type_ranges.append((closing + 1, arrow))
                 arrow_parameters[arrow] = (opening, closing)
 
-    def add(start, params_start, params_end, body, name='', declaration=False, concise=False):
+    def add(start, parameter_span, body, name='', declaration=False, concise=False):
+        params_start, params_end = parameter_span
         if body in body_starts:
             return
         if concise:
@@ -1104,7 +1105,7 @@ def _function_scopes(text, code):
         declaration = not prefix or prefix[-1] in ';{}' or bool(re.search(r'\b(?:export|default|async)\s*$', prefix))
         if '\n' in code[max(prefix.rfind(';'), prefix.rfind('}')) + 1:match.start()] and not re.search(r'=\s*$', prefix):
             declaration = True
-        add(match.start(), opening + 1, closing, body, match.group(1) or '', declaration)
+        add(match.start(), (opening + 1, closing), body, match.group(1) or '', declaration)
 
     for match in re.finditer(r'=>', code):
         if any(left <= match.start() < right for left, right in type_ranges):
@@ -1138,7 +1139,7 @@ def _function_scopes(text, code):
         while body < len(code) and code[body].isspace():
             body += 1
         name_match = re.search(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)(?:\s*:[^=;\n]+)?\s*=\s*(?:async\s+)?$', code[:start])
-        add(start, params_start, params_end, body, name_match.group(1) if name_match else '',
+        add(start, (params_start, params_end), body, name_match.group(1) if name_match else '',
             concise=code[body:body + 1] != '{')
 
     # Methods are analyzed as isolated scopes even when dynamic receiver
@@ -1151,7 +1152,7 @@ def _function_scopes(text, code):
             continue
         body = _signature_body(code, pairs, closing)
         if body is not None and body not in body_starts:
-            add(match.start(), match.end(), closing, body)
+            add(match.start(), (match.end(), closing), body)
 
     root = _Scope(0, len(text), 0, len(text), '<module>')
     for scope in sorted(scopes, key=lambda item: (item.start, -item.end)):

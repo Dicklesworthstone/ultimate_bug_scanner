@@ -193,6 +193,23 @@ _MISSING = object()  # absent-key sentinel for the state join
 
 
 @dataclass(frozen=True)
+class _CallTarget:
+    """Callable and receiver identities captured before argument evaluation."""
+    binding: object
+    fallback_name: str = ''
+    receiver: Fact = CLEAN
+    references: References = NO_REFERENCES
+
+
+@dataclass(frozen=True)
+class _CallInputs:
+    """Already evaluated arguments; keep keyword facts with their AST nodes."""
+    arguments: list[Fact]
+    keywords: dict[str | None, Fact]
+    keyword_nodes: dict[str | None, ast.AST]
+
+
+@dataclass(frozen=True)
 class _BoundCallable:
     name: str
     references: References
@@ -1538,8 +1555,8 @@ class _Flow:
             branch = state.copy()
             self.expression_bindings.pop(node, None)
             self.expression_references.pop(node, None)
-            result = self.invoke(node, branch, target, fallback_name, receiver,
-                                 receiver_refs, arguments, keywords, keyword_nodes)
+            result = self.invoke(node, branch, _CallTarget(target, fallback_name, receiver, receiver_refs),
+                                 _CallInputs(arguments, keywords, keyword_nodes))
             if branch.reachable:
                 results.append(result)
                 references.append(self.expression_references.get(node, frozenset({node})))
@@ -1560,8 +1577,10 @@ class _Flow:
                     values.pop(original, None)
         return join_facts(*results)
 
-    def invoke(self, node, state, target, fallback_name, receiver, receiver_refs,
-               arguments, keywords, keyword_nodes, *, resumed=None):
+    def invoke(self, node, state, callee, inputs, *, resumed=None):
+        target, fallback_name = callee.binding, callee.fallback_name
+        receiver, receiver_refs = callee.receiver, callee.references
+        arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
         if isinstance(target, _BoundClassMethod):
             signature = target.function.args
             positional = [arg.arg for arg in (*signature.posonlyargs, *signature.args)]
@@ -1584,8 +1603,8 @@ class _Flow:
                 # An unbindable invocation does not establish the callee's
                 # clean-return contract. Retain the ordinary opaque-call
                 # provenance rather than binding arguments to wrong slots.
-                return self.invoke(node, state, None, '', target.receiver, target.references,
-                                   arguments, keywords, keyword_nodes)
+                return self.invoke(node, state, _CallTarget(None, receiver=target.receiver, references=target.references),
+                                   inputs)
             # This is a call view, not a second evaluation of the receiver or
             # its arguments. Keep its AST identity fixed across worklist passes
             # and recursive/coroutine summaries just like literal * expansion.
@@ -1602,8 +1621,8 @@ class _Flow:
             self.expression_facts[implicit] = value
             self.expression_references[implicit] = refs
             self.expression_bindings[implicit] = (target.owner if target.valid and not refs & state.mutated else None)
-            result = self.invoke(call, state, target.function, '', CLEAN, NO_REFERENCES,
-                                 [value, *arguments], keywords, keyword_nodes)
+            result = self.invoke(call, state, _CallTarget(target.function),
+                                 _CallInputs([value, *arguments], keywords, keyword_nodes))
             for table in (self.expression_bindings, self.expression_references,
                           self.generator_returns, self.generator_return_references,
                           self.generator_return_bindings):
@@ -1696,8 +1715,8 @@ class _Flow:
             for coroutine in alternatives:
                 branch = state.copy()
                 if isinstance(coroutine, _DeferredCall):
-                    value = self.invoke(node, branch, coroutine.function, '', CLEAN, NO_REFERENCES,
-                                        [], {}, {}, resumed=coroutine)
+                    value = self.invoke(node, branch, _CallTarget(coroutine.function),
+                                        _CallInputs([], {}, {}), resumed=coroutine)
                     binding = self.expression_bindings.get(node)
                     refs = self.expression_references.get(node, NO_REFERENCES)
                 else:
@@ -1723,8 +1742,8 @@ class _Flow:
                 outer = self.pending
                 self.pending = []
                 try:
-                    self.invoke(node, branch, coroutine.function, '', CLEAN, NO_REFERENCES,
-                                [], {}, {}, resumed=coroutine)
+                    self.invoke(node, branch, _CallTarget(coroutine.function),
+                                _CallInputs([], {}, {}), resumed=coroutine)
                     ends = [branch, *(item.state for item in self.pending)]
                 finally:
                     self.pending = outer
@@ -2005,8 +2024,8 @@ class _Flow:
             for target in _binding_choices(self.expression_bindings.get(node.value)):
                 branch = state.copy()
                 if isinstance(target, _DeferredCall):
-                    fact = self.invoke(node, branch, target.function, '', CLEAN, NO_REFERENCES,
-                                       [], {}, {}, resumed=target)
+                    fact = self.invoke(node, branch, _CallTarget(target.function),
+                                       _CallInputs([], {}, {}), resumed=target)
                     binding = self.expression_bindings.get(node)
                     refs = self.expression_references.get(node, NO_REFERENCES)
                 else:

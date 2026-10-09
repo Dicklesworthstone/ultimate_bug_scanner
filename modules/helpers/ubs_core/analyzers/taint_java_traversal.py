@@ -63,6 +63,14 @@ FILE_LEAF_METHODS = frozenset({'readAllBytes', 'readString', 'readAllLines', 'wr
                                'newInputStream', 'newOutputStream', 'createFile'})
 FILE_CONSTRUCTORS = frozenset({'FileInputStream', 'FileOutputStream', 'FileReader', 'FileWriter', 'RandomAccessFile'})
 
+
+@dataclass(frozen=True)
+class CallArguments:
+    """Argument order, Kotlin labels and source spans for one evaluation."""
+    spans: list[tuple[int, int]]
+    names: list[str | None]
+    values: list[Fact]
+
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
 
@@ -610,8 +618,8 @@ class Engine:
         # transformation must not carry containment or Path identity forward.
         return value if direct_call else retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
 
-    def call_sink(self, name, spans, arguments, value, offset, argument_names=(), bindings=None):
-        bindings = {} if bindings is None else bindings
+    def call_sink(self, name, call, value, offset, bindings):
+        arguments = call.values
         if self.files_call(name, bindings) and self.sink_re.search(name + '('):
             method = name.rsplit('.', 1)[-1]
             indexes = (0, 1) if method in {'copy', 'move'} else (0,)
@@ -720,7 +728,7 @@ class Engine:
             names.append(keyword.group(1) if keyword else None)
             spans.append((low + keyword.end() if keyword else low, high))
         arguments = [self.expression(low, high, state, bindings, depth + 1) for low, high in spans]
-        return spans, names, arguments
+        return CallArguments(spans, names, arguments)
 
     def selected_calls(self, name, arguments, argument_names, offset, bindings):
         explicit_member = name.startswith('this.')
@@ -785,7 +793,8 @@ class Engine:
             arguments = None
             if cursor < end and self.code[cursor] == '(':
                 close = self.parser.pairs[cursor]
-                spans, argument_names, arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
+                call_arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
+                spans, argument_names, arguments = call_arguments.spans, call_arguments.names, call_arguments.values
                 atom = join(atom, *arguments)
                 call_text = self.code[offset:close + 1]
                 # Arguments were evaluated above. Matching their text again
@@ -809,7 +818,7 @@ class Engine:
                             self.escapes[site] = join(self.escapes.get(site, CLEAN), substitute(fact, bound, call))
                     atom = returned
                 else:
-                    if self.call_sink(name, spans, arguments, atom, offset, argument_names, bindings):
+                    if self.call_sink(name, call_arguments, atom, offset, bindings):
                         constructor = offset
                     atom = self.external_call(name, arguments, atom, offset, bindings, state)
                 cursor = close + 1
@@ -833,9 +842,10 @@ class Engine:
                     cursor = self.parser.skip(tail + member.end(), end)
                     if cursor < end and self.code[cursor] == '(':
                         close = self.parser.pairs[cursor]
-                        spans, argument_names, arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
+                        call_arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
+                        arguments = call_arguments.values
                         atom = join(atom, *arguments)
-                        if self.call_sink('.' + method, spans, arguments, atom, tail, argument_names, bindings):
+                        if self.call_sink('.' + method, call_arguments, atom, tail, bindings):
                             constructor = tail
                         cursor = close + 1
                     atom = self.member_value(method, atom, tail, arguments, receiver=receiver)

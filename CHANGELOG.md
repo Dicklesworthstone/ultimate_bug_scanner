@@ -10,6 +10,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Simplify analyzer call contracts: preserve source spans with evaluated arguments and named labels, capture Python callable/receiver identity separately from argument inputs, and keep fluent Swift call locations distinct. Remove unused C++ callback inputs; resource acquisition labels and Go decoder expression coordinates remain paired with their source locations.
 - Validate one-based diagnostic source-line lookups in the shared location utility, rejecting invalid anchors rather than allowing negative indices to wrap. JavaScript async and block-function checks, Rust secret comparisons and Swift shell findings retain the original source evidence for valid lines.
 - Recognize bounds guards that record a diagnostic before an unconditional exit. Rebinding the index invalidates an earlier guard, and comprehension filters only protect expressions evaluated after them; the index warning threshold is unchanged.
 

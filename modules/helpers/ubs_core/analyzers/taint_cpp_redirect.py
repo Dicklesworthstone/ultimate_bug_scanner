@@ -91,7 +91,7 @@ class RedirectEngine(Engine):
         literals = {trace.key[0] for trace in value if trace.kind == 'constant'}
         return next(iter(literals)) if len(literals) == 1 and all(trace.kind == 'constant' for trace in value) else None
 
-    def assigned_value(self, start, offset, low, high, value, state, bindings):
+    def assigned_value(self, start, offset, low, high, value):
         declaration = self.parser.compact(start, offset)
         if (declaration.startswith('conststd::unordered_set<std::string>') or
                 declaration.startswith('conststd::set<std::string>')):
@@ -101,7 +101,8 @@ class RedirectEngine(Engine):
                     return frozenset({Trace('allowlist', (offset, hosts), frozenset({'literal-hosts'}))})
         return value
 
-    def external_call(self, name, spans, arguments, receiver, offset, state, bindings):
+    def external_call(self, name, call, receiver, offset, state, bindings):
+        spans, arguments = call.spans, call.values
         member = re.fullmatch(r'([A-Za-z_]\w*)\.(find|substr)', name)
         if member and len(spans) == 2:
             root, method = member.groups()
@@ -122,7 +123,7 @@ class RedirectEngine(Engine):
                     if any(trace.kind == 'host-end' and trace.key == identity for trace in end_value):
                         relation = Trace('host', identity)
                         return join(self.without_proof(original), frozenset({relation}))
-        return super().external_call(name, spans, arguments, receiver, offset, state, bindings)
+        return super().external_call(name, call, receiver, offset, state, bindings)
 
     def call_sink(self, name, spans, arguments, offset, receiver=CLEAN):
         method = re.split(r'::|\.|->', name)[-1]

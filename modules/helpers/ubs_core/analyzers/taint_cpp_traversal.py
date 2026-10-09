@@ -80,6 +80,13 @@ class Token:
 
 
 @dataclass(frozen=True)
+class CallArguments:
+    """Keep evaluated arguments paired with their original token spans."""
+    spans: list[tuple[int, int]]
+    values: list[Fact]
+
+
+@dataclass(frozen=True)
 class Statement:
     start: int
     end: int
@@ -469,7 +476,8 @@ class Engine:
             if index < len(arguments):
                 self.record(offset, arguments[index], file_leaf)
 
-    def external_call(self, name, spans, arguments, receiver, offset, state, bindings):
+    def external_call(self, name, call, receiver, offset, state, bindings):
+        spans, arguments = call.spans, call.values
         method = re.split(r'::|\.|->', name)[-1]
         macro = self.parser.macro_at(method, offset)
         if macro is not None:
@@ -505,7 +513,7 @@ class Engine:
         if method == 'lexically_normal' and not arguments and any('path' in trace.tags for trace in receiver):
             return self.path_value(self.without_proof(receiver), offset)
         if method in {'relative', 'lexically_relative'}:
-            relation = self.relative_relation(name, spans, arguments, receiver, offset, state, bindings)
+            relation = self.relative_relation(name, spans, state, bindings)
             if relation:
                 return join(self.without_proof(value), frozenset({relation}))
         if method in {'assign', 'append', 'clear', 'replace', 'push_back', 'operator='} and receiver:
@@ -517,7 +525,7 @@ class Engine:
                 self.note_mutation(bindings[root])
         return self.without_proof(value)
 
-    def relative_relation(self, name, spans, arguments, receiver, offset, state, bindings):
+    def relative_relation(self, name, spans, state, bindings):
         if name.endswith('.lexically_relative') and len(spans) == 1:
             target_name = name.split('.', 1)[0]
             base_name = self.parser.compact(*spans[0])
@@ -652,7 +660,7 @@ class Engine:
                     atom = returned
                 else:
                     self.call_sink(name, spans, arguments, offset, atom)
-                    atom = self.external_call(name, spans, arguments, atom, offset, state, bindings)
+                    atom = self.external_call(name, CallArguments(spans, arguments), atom, offset, state, bindings)
                 cursor = close + 1
             elif self.source_re.search(name):
                 source = self.source_re.search(name)
@@ -672,7 +680,7 @@ class Engine:
                 if name == 'QUrlQuery' and method == 'queryItemValue':
                     atom = self.source(offset, 'QUrlQuery.queryItemValue')
                 else:
-                    atom = self.external_call('.' + method, spans, arguments, atom, method_offset, state, bindings)
+                    atom = self.external_call('.' + method, CallArguments(spans, arguments), atom, method_offset, state, bindings)
                 cursor = close + 1
             value = join(value, atom)
         return value
@@ -739,7 +747,7 @@ class Engine:
             if '&' in declaration and not re.search(r'\bconst\b', declaration):
                 self.mutated.add(index)
 
-    def assigned_value(self, start, offset, low, high, value, state, bindings):
+    def assigned_value(self, start, offset, low, high, value):
         return value
 
     def graph(self, function):
@@ -851,7 +859,7 @@ class Engine:
             value = self.expression(low, high, state, reads)
             if operator != '=':
                 value = self.without_proof(join(state.get(reads.get(name, name), CLEAN), value))
-            value = self.assigned_value(start, offset, low, high, value, state, reads)
+            value = self.assigned_value(start, offset, low, high, value)
             if declaration and any(self.parser.value(i) in {'&', '*'} for i in range(start, offset)):
                 declared = self.parser.raw(start, offset)
                 if '&' in declared and value:

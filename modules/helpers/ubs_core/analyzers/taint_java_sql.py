@@ -2,7 +2,7 @@
 
 Reuse the finite JVM CFG and local call summaries. JDBC objects and captured
 prepared SQL are distinct facts: setters bind values, never rewrite SQL text.
-Only genuine java.sql receivers and JDK HTTP exchange sources qualify. Static
+Only genuine java.sql receivers and selected JDK/Servlet request APIs qualify. Static
 strings have explicit identities, while unknown values remain unknown; absence
 of request taint is not proof that a legacy concatenation warning is redundant.
 
@@ -37,14 +37,22 @@ _EXECUTE = frozenset({"execute", "executeQuery", "executeUpdate", "executeLargeU
 _PREPARED = frozenset({"java.sql.PreparedStatement", "java.sql.CallableStatement"})
 _STATEMENTS = _PREPARED | {"java.sql.Statement"}
 _HTTP = frozenset({"com.sun.net.httpserver.HttpExchange", "com.sun.net.httpserver.HttpsExchange"})
+_SERVLET = frozenset({"jakarta.servlet.ServletRequest", "javax.servlet.ServletRequest"})
+_SERVLET_HTTP = frozenset({"jakarta.servlet.http.HttpServletRequest", "javax.servlet.http.HttpServletRequest"})
+_SERVLET_HTTP_ARITY = {
+    "getHeader": 1, "getQueryString": 0, "getRequestURI": 0,
+    "getPathInfo": 0, "getServletPath": 0,
+}
 _EXECUTORS = frozenset({"java.util.concurrent.Executor", "java.util.concurrent.ExecutorService",
                         "java.util.concurrent.ScheduledExecutorService"})
-_OBJECTS = _STATEMENTS | _HTTP | {"java.sql.Connection"}
+_OBJECTS = _STATEMENTS | _HTTP | _SERVLET | _SERVLET_HTTP | {"java.sql.Connection"}
 _APIS = _OBJECTS | _EXECUTORS | {"java.lang.String", "java.net.URI", "java.lang.Integer", "java.lang.Long"}
 _TYPE_PREFIX = "sql:type:"
 _PREPARED_SQL = "sql:prepared-query"
 _SINK_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|execute)\s*\(")
-_SOURCE_RE = re.compile(r"\b[A-Za-z_$][\w$]*\s*\.\s*(?:getRequestURI|getRequestHeaders)\s*\(")
+_SOURCE_RE = re.compile(
+    r"\b[A-Za-z_$][\w$]*\s*\.\s*(?P<method>getRequestURI|getRequestHeaders|getParameter|"
+    r"getHeader|getQueryString|getPathInfo|getServletPath)\s*\(")
 _LITERAL = re.compile(r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _NAME = re.compile(r"[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*")
 
@@ -60,6 +68,25 @@ def policy_limits() -> tuple[int, int, int]:
             raise AnalysisLimit(f"{name} must be a positive integer")
         values.append(value)
     return tuple(values)
+
+
+def _request_result_type(types: frozenset[str], method: str, arity: int) -> str | None:
+    """Selected request getters, qualified by actual API type and signature.
+
+    Servlet attributes may be set by application code, so getAttribute does
+    not establish request provenance. Value binding remains a JDBC operation
+    and never inherits source semantics from a getter's spelling alone.
+    """
+    if types & _HTTP and arity == 0:
+        if method == "getRequestURI":
+            return "java.net.URI"
+        if method == "getRequestHeaders":
+            return "com.sun.net.httpserver.Headers"
+    if method == "getParameter" and arity == 1 and types & (_SERVLET | _SERVLET_HTTP):
+        return "java.lang.String"
+    if types & _SERVLET_HTTP and _SERVLET_HTTP_ARITY.get(method) == arity:
+        return "java.lang.String"
+    return None
 
 
 class JdbcSource(VerifierSource):
@@ -144,6 +171,38 @@ class JdbcSource(VerifierSource):
                 if method and self.receiver_type(low, low + method.start(), depth=depth + 1) == "java.sql.Connection":
                     return {"createStatement": "java.sql.Statement", "prepareStatement": "java.sql.PreparedStatement",
                             "prepareCall": "java.sql.CallableStatement"}[method.group(1)]
+        return None
+
+    def nominal_type(self, spelling: str, position: int) -> tuple | None:
+        """Identity for exact overload selection, including local class scope.
+
+        Unknown hierarchies remain unresolved. A matching local class or real
+        API declaration can select an exact overload without borrowing a
+        source-producing summary from an unrelated same-arity helper.
+        """
+        actual = self.resolve_type(spelling, position)
+        if actual is not None:
+            return ("api", actual)
+        local = [(low, high, name) for name, low, high in self.classes
+                 if name == spelling and low < position < high]
+        if local:
+            return ("local", *min(local, key=lambda item: item[1] - item[0]))
+        return None
+
+    def argument_type(self, low: int, high: int) -> tuple | None:
+        low, high = self.trim(low, high)
+        name = re.sub(r"\s+", "", self.code[low:high])
+        field = name.startswith("this.")
+        if field:
+            name = name[5:]
+        if re.fullmatch(r"[A-Za-z_$][\w$]*", name):
+            binding = self.binding(name, low, field=field)
+            if binding is not None:
+                return self.nominal_type(binding.type_name, binding.declaration)
+        if self.code[low:low + 1] == "(":
+            closing = self.pairs[low]
+            if closing < high - 1:
+                return self.nominal_type(self.code[low + 1:closing].strip(), low)
         return None
 
     def execution_sites(self) -> dict[int, tuple[int, str, str]]:
@@ -272,9 +331,12 @@ class SqlEngine(Engine):
             return CLEAN
         root = match.group().split(".", 1)[0].strip()
         _, types = self._receiver(root, offset, bindings, state)
-        if not types & _HTTP:
+        opening = match.end() - 1
+        arity = sum(1 for _ in self.parser.parts(opening + 1, self.parser.pairs[opening]))
+        actual = _request_result_type(types, match.group("method"), arity)
+        if actual is None:
             return CLEAN
-        return retag(super().source(offset, label), add=_type_tags("java.net.URI"))
+        return retag(super().source(offset, label), add=_type_tags(actual))
 
     def safe_sink_trace(self, trace):
         return False
@@ -305,6 +367,21 @@ class SqlEngine(Engine):
 
     def selected_calls(self, name, arguments, argument_names, offset, bindings):
         selected = super().selected_calls(name, arguments, argument_names, offset, bindings)
+        if len(selected) > 1:
+            opening = self.code.find("(", offset)
+            actual_types = [self.jdbc.argument_type(low, high)
+                            for low, high in self.parser.parts(opening + 1, self.parser.pairs[opening])]
+            exact = []
+            for function, actuals in selected:
+                formal_types = []
+                for declaration in function.parameter_declarations:
+                    match = re.fullmatch(r"\s*(?:final\s+)?([\w.$]+)\s+[A-Za-z_$][\w$]*\s*", declaration)
+                    formal_types.append(self.jdbc.nominal_type(match.group(1), function.key) if match else None)
+                if (len(formal_types) == len(actual_types) and all(actual_types)
+                        and formal_types == actual_types):
+                    exact.append((function, actuals))
+            if exact:
+                selected = exact
         for function, actuals in selected:
             self.selected_arguments[id(self.summaries[function.key])] = actuals
         return selected
@@ -351,9 +428,10 @@ class SqlEngine(Engine):
         return frozenset({Trace("jdbc-object", (str(self.path), offset, actual), tags=_type_tags(actual))})
 
     def _known_call(self, method, arguments, value, offset, types):
-        if types & _HTTP and method in {"getRequestURI", "getRequestHeaders"} and not arguments:
+        request_type = _request_result_type(types, method, len(arguments))
+        if request_type is not None:
             actual = Engine.source(self, offset, self.text[offset:self.text.find("(", offset) + 1].strip())
-            return join(_data(value), actual)
+            return join(_data(value), retag(actual, add=_type_tags(request_type)))
         if "java.sql.Connection" in types:
             if method == "createStatement":
                 return self._object("java.sql.Statement", offset)
@@ -380,6 +458,10 @@ class SqlEngine(Engine):
     def member_value(self, name, value, offset, arguments=None, direct_call=False, receiver=CLEAN):
         if direct_call:
             return value
+        if arguments is not None:
+            known = self._known_call(name, arguments, value, offset, _types(receiver) & _OBJECTS)
+            if known is not None:
+                return known
         if name in _EXECUTE and arguments is not None:
             return CLEAN
         if name in {"getQuery", "getRawQuery", "toString", "getFirst", "get"}:
@@ -422,11 +504,16 @@ class SqlEngine(Engine):
         for opening, closing, finish, members in chains:
             value = join(value, super().expression(beginning, opening, state, bindings, depth))
             receiver = self.expression(opening + 1, closing, state, bindings, depth + 1)
+            declared = self.jdbc.receiver_type(opening, closing + 1)
             for dot, method, low, high in members:
                 spans, names, arguments = self.call_arguments(low, high, state, bindings, depth)
                 joined = join(receiver, *arguments)
                 self.call_sink("." + method, spans, arguments, joined, dot, names, bindings)
-                known = self._known_call(method, arguments, joined, opening, _types(receiver) & _OBJECTS)
+                types = _types(receiver) & _OBJECTS
+                if declared in _HTTP | _SERVLET | _SERVLET_HTTP:
+                    types = frozenset({declared})
+                known = self._known_call(method, arguments, joined, opening, types)
+                declared = None
                 if known is not None:
                     receiver = known
                 elif method in {"getQuery", "getRawQuery", "toString", "getFirst", "get"}:

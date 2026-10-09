@@ -21,8 +21,8 @@ exts = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs'}
 skip_dirs = {'.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', '.turbo'}
 
 compare_re = re.compile(r'(?<![=!<>])(?:===|!==|==|!=)(?!=)')
-assignment_re = re.compile(r'\b(?:const|let|var)\s+(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?P<expr>.+)')
-loose_assignment_re = re.compile(r'\b(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?!=)(?P<expr>.+)')
+assignment_head_re = re.compile(r'(?<![\w$])(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?!=)')
+open_jsx_tag_re = re.compile(r'<[A-Za-z_$][\w.$:-]*(?=[\s/>]|$)[^<>]*$')
 identifier_re = re.compile(r'[A-Za-z_$][A-Za-z0-9_$]*')
 safe_compare_re = re.compile(
     r'\b(?:crypto\.)?(?:timingSafeEqual|safeEqual|safeCompare|constantTimeEqual|compareDigest|verifyWebhookSignature)\s*\('
@@ -286,8 +286,26 @@ def has_ignore(lines, code_lines, index):
     return False
 
 
+def open_jsx_tag(prefix):
+    """Recognize an unfinished JSX tag, excluding ordinary less-than operands."""
+    match = open_jsx_tag_re.search(prefix)
+    if not match:
+        return ''
+    before = prefix[:match.start()].rstrip()
+    if before and before[-1] not in '=([{,:?;>&|' and not re.search(r'\b(?:return|yield)\s*$', before):
+        return ''
+    return match.group()
+
+
 def collect_sensitive_vars(lines, code_lines):
     sensitive_vars = set()
+    # Carry unfinished tags over physical lines. Attribute names are DOM
+    # properties, not assignments to JavaScript locals. Keep assignments inside
+    # their {...} expressions eligible, including nested assignment expressions.
+    tag_prefixes, tag = [], ''
+    for code in code_lines:
+        tag_prefixes.append(tag)
+        tag = open_jsx_tag(tag + ' ' + strip_string_literals(code))
     for idx, code in enumerate(code_lines):
         stripped = code.strip()
         if not stripped or has_ignore(lines, code_lines, idx) or '=>' in stripped:
@@ -295,17 +313,18 @@ def collect_sensitive_vars(lines, code_lines):
         statement = statement_from(code_lines, idx, max_lines=5)
         if not statement or safe_compare_re.search(statement):
             continue
-        match = assignment_re.search(statement) or loose_assignment_re.search(statement)
-        if not match:
-            continue
-        name = match.group('name')
-        expr = match.group('expr')
-        # Taint the variable name only if its own name, or its assigned
-        # expression's *code* (string-literal contents stripped), names a
-        # secret.  A sensitive word appearing only inside a string literal on
-        # the RHS no longer taints the name (issue #61 / #54 parity).
-        if sensitive_families(name) or sensitive_families(expr):
-            sensitive_vars.add(name)
+        statement = strip_string_literals(statement)
+        for match in assignment_head_re.finditer(statement):
+            prefix = tag_prefixes[idx] + ' ' + statement[:match.start()]
+            tag = open_jsx_tag(prefix)
+            if tag and tag.count('{') == tag.count('}'):
+                continue
+            name = match.group('name')
+            expr = statement[match.end():].split(';', 1)[0]
+            # String contents and JSX attribute names cannot taint locals;
+            # real assignment expressions still propagate secret material.
+            if sensitive_families(name) or sensitive_families(expr):
+                sensitive_vars.add(name)
     return sensitive_vars
 
 

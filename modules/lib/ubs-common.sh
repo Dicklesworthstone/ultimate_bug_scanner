@@ -391,6 +391,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/java_detectors/streams_concat.py']='4c76d552db8a001b8647f42c6ec20e90e8128e854bf0bcf030eac993b106db4d'
   ['helpers/ubs_core/java_detectors/tech_debt.py']='6fa5702a073d08656b72f9673ba5299770f8f56277d0f942ab7cbc99bcabc873'
   ['helpers/ubs_core/java_detectors/tls_verification.py']='4513b4a82b82969dd399fe9403e9cb8b7c2f873ce491f9f2ced5c1bb6ec4a928'
+  ['helpers/ubs_core/java_detectors/trust_manager.py']='4ba1ee1961e0f059aebfcec32c44bea10cb4f34afc1b00e571376735951ab7c8'
   ['helpers/ubs_core/java_patterns/__init__.py']='8b7de6cca7d1b61a2884216d2756adabf3ad7d2a08bea8defe3e8d305452e9c2'
   ['helpers/ubs_core/java_patterns/concurrency_io.py']='9bee9f2911a23993806d3e367339b99af70eaf4946cc979b21d18bc8a35e383d'
   ['helpers/ubs_core/java_patterns/foundations.py']='64b5f87535eaadf3be0ba10e3f7ac8b05e8c114f17ac1bf25596d71c1078b1b5'

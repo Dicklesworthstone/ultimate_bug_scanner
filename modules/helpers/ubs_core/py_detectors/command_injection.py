@@ -18,6 +18,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.io import python_source_segment
+
 RULE_ID = "py.security.command-injection"
 CATEGORY = 7
 TITLE = "User-controlled command reaches shell or executable selection"
@@ -586,7 +588,7 @@ class CommandInjectionAnalyzer(ast.NodeVisitor):
         self.mark_assignment(target_names(node.target), value)
 
     def segment(self, node):
-        return ast.get_source_segment(self.text, node) or ''
+        return python_source_segment(self.text, node) or ''
 
     def remember_issue(self, line_no):
         if has_ignore(self.lines, line_no) or line_no in self.seen_lines:

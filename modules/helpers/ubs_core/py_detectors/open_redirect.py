@@ -19,6 +19,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.io import python_source_segment
+
 RULE_ID = "py.security.open-redirect"
 CATEGORY = 7
 TITLE = "Unvalidated redirect from request data"
@@ -86,7 +88,7 @@ class _RedirectAnalyzer(ast.NodeVisitor):
         self.issues = []
 
     def segment(self, node):
-        return ast.get_source_segment(self.text, node) or ''
+        return python_source_segment(self.text, node) or ''
 
     def is_request_source(self, node):
         return bool(REQUEST_SOURCE_RE.search(self.segment(node)))

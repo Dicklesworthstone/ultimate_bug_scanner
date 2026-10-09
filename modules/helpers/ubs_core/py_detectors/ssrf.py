@@ -21,6 +21,8 @@ import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.io import python_source_segment
+
 RULE_ID = "py.security.ssrf"
 CATEGORY = 7
 TITLE = "Request-derived URL reaches outbound HTTP client"
@@ -90,7 +92,7 @@ class _SSRFAnalyzer(ast.NodeVisitor):
         self.issues = []
 
     def segment(self, node):
-        return ast.get_source_segment(self.text, node) or ''
+        return python_source_segment(self.text, node) or ''
 
     def is_request_source(self, node):
         return bool(REQUEST_SOURCE_RE.search(self.segment(node)))

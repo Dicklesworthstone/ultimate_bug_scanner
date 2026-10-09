@@ -2,7 +2,7 @@
 
 Executes static analysis on Kotlin (.kt, .kts) files across:
 1. Pattern layer: ProcessBuilder shell execution
-2. Analyzer layer: Kotlin null flow, coroutine context/ownership, taint paths and redirects
+2. Analyzer layer: Kotlin null flow, coroutine/resource ownership, taint paths and redirects
 3. Detector layer: archive extraction (zip slip), response header injection,
    SSRF outbound URL, insecure randomness in tokens/secrets
 4. ast-grep layer: consolidated rule pack via ubs_core.kotlin_rules
@@ -75,6 +75,9 @@ _SUBHEADERS = {
         "kotlin.security.archive-extraction": "Archive extraction path traversal",
         "kotlin.security.processbuilder-shell": "Command execution via ProcessBuilder",
     },
+    19: {
+        "kotlin.resource.": "Selected file, stream and socket ownership",
+    },
 }
 
 _SUMMARY_TITLES: dict[str, str] = {
@@ -94,6 +97,9 @@ _SUMMARY_TITLES: dict[str, str] = {
     "kotlin.coroutine.swallowed-cancellation": "Selected cancellation exception is not propagated on every path",
     "kotlin.coroutine.blocking-call": "Blocking Thread.sleep in a coroutine context",
     "kotlin.coroutine.unowned-job": "Detached coroutine Job has no local completion or ownership transfer",
+    "kotlin.resource.unclosed": "Selected resource is not closed or returned on every exit path",
+    "kotlin.resource.use-after-close": "Operation uses a selected resource after close",
+    "kotlin.resource.escape-from-use": "Selected resource escapes use after its receiver is closed",
 }
 
 _GOOD_LINES: tuple[tuple[str, str, int], ...] = (
@@ -155,6 +161,8 @@ def _record_category(rec: dict) -> int | None:
         return 1
     if rule.startswith("kotlin.coroutine."):
         return 3
+    if rule.startswith("kotlin.resource."):
+        return 19
     if rule.startswith("kotlin.security.") or rule.startswith("kotlin.taint."):
         return 4
     cat_id = rec.get("category_id", "")
@@ -214,6 +222,7 @@ def scan_analyzers(files: Sequence[Path], sink, skip: set[int], project_dir: Pat
     for category, aname, category_id in (
         (1, "narrowing_kotlin", "kotlin.type-narrowing"),
         (3, "coroutines_kotlin", "kotlin.concurrency"),
+        (19, "lifecycle_kotlin", "kotlin.resource-lifecycle"),
     ):
         if category in skip:
             continue

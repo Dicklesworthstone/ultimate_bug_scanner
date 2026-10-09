@@ -282,6 +282,25 @@ class PythonCompletionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'Invalid detector worker response'):
                     py_scan._detector_process('division', [self.source], None)
 
+    def test_parallel_worker_capture_preserves_unicode_line_separators(self):
+        from types import SimpleNamespace
+
+        record = self.finding(SimpleNamespace(files=[self.source]))
+        record['message'] = 'first\u0085second\u2028third\u2029fourth'
+        payload = json.dumps(record, ensure_ascii=False) + '\n'
+        worker = self.root / 'unicode-worker'
+        worker.write_text(f'#!{sys.executable}\nprint({json.dumps([payload, []])!r})\n')
+        worker.chmod(0o755)
+        target = io.StringIO()
+        sink = CapturingSink(target)
+        errors = []
+        with patch.object(sys, 'executable', str(worker)), \
+                patch('pkgutil.iter_modules', return_value=[SimpleNamespace(name='unicode_probe')]):
+            py_scan.run_detectors([self.source] * 8, sink, errors=errors, jobs=2)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.decode_json(target.getvalue(), 'worker Unicode record'), record)
+        self.assertEqual(sink.get_for_file(self.source), [record])
+
     def test_parallel_detector_failure_is_partial_and_keeps_sibling_records(self):
         from types import SimpleNamespace
 

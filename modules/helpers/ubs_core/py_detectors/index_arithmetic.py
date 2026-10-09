@@ -19,8 +19,10 @@ when any of these hold:
 
 1. **A bounding comparison is in scope.** Every enclosing ``if`` / ``while`` /
    ``assert`` test, conditional expression, comprehension filter, and every
-   earlier operand of the enclosing boolean expression is searched for a
-   comparison that bounds the index on the side the offset moves toward.
+   earlier operand of the enclosing boolean expression is checked using its
+   guaranteed outcome (true for ``and``, false for ``or``). A comparison in
+   an arbitrary call argument or only one possible true ``or`` branch does
+   not establish a bound.
    ``i + 1 < len(line)`` and ``0 <= idx - 1`` guard a forward and a backward
    offset respectively; ``idx == 0 or …`` and a bare ``if idx:`` are the
    equality and truthiness forms of a lower bound.
@@ -132,43 +134,56 @@ def _in_true_branch(parent: ast.AST, child: ast.AST) -> bool:
 
 
 def _compare_bounds(
-    node: ast.AST, name: str, want_upper: bool, *, negate: bool = False
+    node: ast.AST, name: str, want_upper: bool, *, negate: bool = False, offset: int = 1
 ) -> bool:
-    """True when `node` contains a comparison bounding `name` on the wanted side.
+    """Does this test's known outcome imply a bound on the wanted side?
 
     ``negate`` flips the sense of every comparison, for the early-exit idiom:
     after ``if start <= 0: break`` the surviving path knows ``start > 0``.
     """
-    for cmp_node in ast.walk(node):
-        if not isinstance(cmp_node, ast.Compare):
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _compare_bounds(node.operand, name, want_upper, negate=not negate, offset=offset)
+    if isinstance(node, ast.BoolOp):
+        bounds = [_compare_bounds(value, name, want_upper, negate=negate, offset=offset)
+                  for value in node.values]
+        # A true AND or false OR proves every operand's outcome. A true OR
+        # or false AND can be explained by any operand, so every alternative
+        # must imply the bound before the compound test can prove it.
+        every_outcome = isinstance(node.op, ast.And) != negate
+        return bool(bounds) and (any(bounds) if every_outcome else all(bounds))
+    if not isinstance(node, ast.Compare):
+        return False
+    operands = [node.left] + list(node.comparators)
+    bounds = []
+    for i, op in enumerate(node.ops):
+        # `operands` is built one longer than `ops` — ubs:ignore[py.collections.index-arithmetic]
+        left, right = operands[i], operands[i + 1]
+        left_has, right_has = _mentions(left, name), _mentions(right, name)
+        if left_has == right_has:
+            bounds.append(False)
             continue
-        operands = [cmp_node.left] + list(cmp_node.comparators)
-        for i, op in enumerate(cmp_node.ops):
-            # `operands` is built one longer than `ops` — ubs:ignore[py.collections.index-arithmetic]
-            left, right = operands[i], operands[i + 1]
-            left_has, right_has = _mentions(left, name), _mentions(right, name)
-            if not (left_has or right_has):
-                continue
-            if isinstance(op, _EQ_OPS):
-                # `idx == 0 or …` / `if i != 0:` — an explicit case split on the
-                # boundary. Only against an integer literal: `i == j` says
-                # nothing about the range.
-                other = right if left_has else left
-                if isinstance(other, ast.Constant) and isinstance(other.value, int) \
-                        and not isinstance(other.value, bool):
-                    return True
-                continue
-            upper_op = isinstance(op, _UPPER_OPS)
-            if not upper_op and not isinstance(op, _LOWER_OPS):
-                continue
-            if negate:
-                upper_op = not upper_op
-            # left < right bounds `left` from above and `right` from below.
-            if (left_has and upper_op == want_upper) or (
-                right_has and upper_op != want_upper
-            ):
-                return True
-    return False
+        if isinstance(op, _EQ_OPS):
+            # Only excluding zero gives the existing predecessor bound.
+            # Equality to an arbitrary integer does not bound a sequence.
+            other = right if left_has else left
+            indexed = left if left_has else right
+            bounds.append(not want_upper and offset == 1 and isinstance(indexed, ast.Name)
+                          and isinstance(other, ast.Constant)
+                          and type(other.value) is int and other.value == 0
+                          and isinstance(op, ast.NotEq) != negate)
+            continue
+        upper_op = isinstance(op, _UPPER_OPS)
+        if not upper_op and not isinstance(op, _LOWER_OPS):
+            bounds.append(False)
+            continue
+        if negate:
+            upper_op = not upper_op
+        # left < right bounds `left` from above and `right` from below.
+        bounds.append((left_has and upper_op == want_upper) or (
+            right_has and upper_op != want_upper
+        ))
+    # A false chained comparison does not identify which comparison failed.
+    return bool(bounds) and (all(bounds) if negate else any(bounds))
 
 
 _TERMINATORS = (ast.Break, ast.Continue, ast.Return, ast.Raise)
@@ -180,7 +195,7 @@ _MAPPING_PATTERNS = tuple(getattr(ast, n) for n in ("MatchMapping",) if hasattr(
 
 
 def _early_exit_bounds(block: list[ast.stmt], upto: ast.AST,
-                       name: str, want_upper: bool) -> bool:
+                       name: str, want_upper: bool, offset: int) -> bool:
     """A preceding statement in this block establishes the bound.
 
     Two shapes: `if <out of range>: break` (or continue/return/raise), whose
@@ -191,16 +206,17 @@ def _early_exit_bounds(block: list[ast.stmt], upto: ast.AST,
         if stmt is upto:
             return False
         if isinstance(stmt, ast.Assert):
-            if (_compare_bounds(stmt.test, name, want_upper)
-                    or _implies_nonzero(stmt.test, name)):
+            if (_compare_bounds(stmt.test, name, want_upper, offset=offset)
+                    or (not want_upper and offset == 1 and _implies_nonzero(stmt.test, name))):
                 return True
             continue
         if not isinstance(stmt, ast.If) or stmt.orelse:
             continue
         if not all(isinstance(inner, _TERMINATORS) for inner in stmt.body):
             continue
-        if (_compare_bounds(stmt.test, name, want_upper, negate=True)
-                or _implies_nonzero(stmt.test, name, when_false=True)):
+        if (_compare_bounds(stmt.test, name, want_upper, negate=True, offset=offset)
+                or (not want_upper and offset == 1
+                    and _implies_nonzero(stmt.test, name, when_false=True))):
             return True
     return False
 
@@ -269,24 +285,28 @@ def _guarded(
     while parent is not None:
         if isinstance(parent, ast.BoolOp):
             # Short-circuit: only operands evaluated before this one can guard.
+            when_false = isinstance(parent.op, ast.Or)
             for value in parent.values:
                 if value is child:
                     break
-                if _compare_bounds(value, name, want_upper):
+                if (_compare_bounds(value, name, want_upper, negate=when_false, offset=offset)
+                        or (not want_upper and offset == 1
+                            and _implies_nonzero(value, name, when_false=when_false))):
                     return True
         elif isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
             if child is not parent.test:
-                if _compare_bounds(parent.test, name, want_upper):
+                when_false = not _in_true_branch(parent, child)
+                if _compare_bounds(parent.test, name, want_upper, negate=when_false, offset=offset):
                     return True
-                # A truthiness split only holds on the true branch.
-                if _in_true_branch(parent, child) and _implies_nonzero(parent.test, name):
+                if (not want_upper and offset == 1
+                        and _implies_nonzero(parent.test, name, when_false=when_false)):
                     return True
         elif isinstance(parent, ast.comprehension):
-            if any(_compare_bounds(cond, name, want_upper) for cond in parent.ifs):
+            if any(_compare_bounds(cond, name, want_upper, offset=offset) for cond in parent.ifs):
                 return True
         elif isinstance(parent, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
             for gen in parent.generators:
-                if any(_compare_bounds(cond, name, want_upper) for cond in gen.ifs):
+                if any(_compare_bounds(cond, name, want_upper, offset=offset) for cond in gen.ifs):
                     return True
                 if _loop_guards(gen.target, gen.iter, name, want_upper, offset):
                     return True
@@ -301,7 +321,7 @@ def _guarded(
         for block_name in ("body", "orelse", "finalbody"):
             block = getattr(parent, block_name, None)
             if isinstance(block, list) and any(stmt is child for stmt in block):
-                if _early_exit_bounds(block, child, name, want_upper):
+                if _early_exit_bounds(block, child, name, want_upper, offset):
                     return True
         if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module,
                                ast.ClassDef, ast.Lambda)):

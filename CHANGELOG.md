@@ -22,6 +22,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Parallel Python detector results use newline-delimited JSON boundaries, preserving findings whose messages contain Unicode line-separator characters in the capture and cache pipeline.
+- Python index guards follow the actual short-circuit and branch outcomes: an unsafe `or` alternative or false branch can no longer borrow a bound from an unrelated true case, while bounded `or`, negated comparisons and truthy predecessor loops avoid false findings. Equality-to-zero splits only protect a one-step predecessor; severity thresholds are unchanged.
 - Python detector passes now honor parallel jobs using bounded worker processes (auto uses up to four workers). Each detector still sees the entire selected project, preserving project-wide severity thresholds, deterministic record ordering, partial-failure diagnostics, and cache admission; small scans and explicit single-worker runs stay serial.
 - Python taint analysis incrementally joins changed exception-path state instead of rebuilding the entire collector at every potentially raising expression. Mutable heap updates, callable rebinding and deletion, comprehension exits, and shortest evidence paths retain the same findings as complete fresh joins; scan coverage and deadlines are unchanged.
 - Python security detectors reuse a bounded UTF-8 source-line index for AST expression lookups instead of splitting the whole file for every lookup. The shared lookup preserves missing-location behavior, Unicode byte offsets, multiline spans, CR/LF line endings and form feeds; detector rules, findings and scan deadlines remain unchanged.

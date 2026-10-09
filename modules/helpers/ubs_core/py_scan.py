@@ -786,8 +786,11 @@ def run_detectors(files: Sequence[Path], sink, skip: set[int] | None = None,
                 _analysis_error(errors, f"detector {name}", exc)
                 continue
             # CapturingSink consumes one JSON record per write, not a batch.
-            for record in records.splitlines(keepends=True):
-                sink.write(record)
+            # NDJSON is delimited by LF, not Unicode line separators that
+            # may occur literally inside a JSON string.
+            for record in records.split('\n'):
+                if record:
+                    sink.write(record + '\n')
             errors.extend(problems)
 
 

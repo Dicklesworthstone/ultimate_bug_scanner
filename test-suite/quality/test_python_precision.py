@@ -318,6 +318,53 @@ class IndexArithmeticGuardTests(unittest.TestCase):
         """})
         self.assertEqual(len(hits), 1, hits)
 
+    def test_boolean_guards_follow_short_circuit_outcomes(self) -> None:
+        cases = (
+            ('safe-and', 'i + 1 < len(x) and x[i + 1]', 0),
+            ('unsafe-or', 'i + 1 < len(x) or x[i + 1]', 1),
+            ('safe-or', 'i + 1 >= len(x) or x[i + 1]', 0),
+            ('unsafe-and', 'i + 1 >= len(x) and x[i + 1]', 1),
+            ('safe-not', 'not (i + 1 >= len(x)) and x[i + 1]', 0),
+            ('unsafe-negated-or', 'not (i + 1 >= len(x)) or x[i + 1]', 1),
+            ('safe-predecessor', 'i and x[i - 1]', 0),
+            ('unsafe-zero', 'not i and x[i - 1]', 1),
+            ('safe-zero-split', 'i == 0 or x[i - 1]', 0),
+            ('unsafe-zero-split', 'i == 0 and x[i - 1]', 1),
+            ('unsafe-forward-truthiness', 'i and x[i + 1]', 1),
+            ('unsafe-large-predecessor', 'i and x[i - 2]', 1),
+            ('unsafe-large-zero-split', 'i == 0 or x[i - 2]', 1),
+            ('unsafe-nested-or', '(ready or i + 1 < len(x)) and x[i + 1]', 1),
+            ('safe-nested-and', '(ready and i + 1 < len(x)) and x[i + 1]', 0),
+            ('unsafe-false-chain', '0 <= i + 1 < len(x) or x[i + 1]', 1),
+        )
+        for label, expression, expected in cases:
+            with self.subTest(case=label):
+                hits = run_detector(index_arithmetic, {
+                    'boolean.py': f'def probe(x, i, ready):\n    return {expression}\n',
+                })
+                self.assertEqual(len(hits), expected, (expression, hits))
+
+    def test_enclosing_guards_use_the_selected_branch(self) -> None:
+        cases = (
+            ('unsafe-or-body', 'if ready or i + 1 < len(x):\n        return x[i + 1]', 1),
+            ('safe-and-body', 'if ready and i + 1 < len(x):\n        return x[i + 1]', 0),
+            ('unsafe-else', 'if i + 1 < len(x):\n        return None\n    else:\n        return x[i + 1]', 1),
+            ('safe-else', 'if i + 1 >= len(x):\n        return None\n    else:\n        return x[i + 1]', 0),
+            ('safe-ternary', 'return None if i + 1 >= len(x) else x[i + 1]', 0),
+            ('unsafe-ternary', 'return None if i + 1 < len(x) else x[i + 1]', 1),
+            ('unsafe-equality', 'if i == 0:\n        return x[i + 1]', 1),
+            ('unsafe-call-argument', 'if check(i + 1 < len(x)):\n        return x[i + 1]', 1),
+            ('unsafe-early-and', 'if ready and i + 1 >= len(x):\n        return None\n    return x[i + 1]', 1),
+            ('safe-early-or', 'if ready or i + 1 >= len(x):\n        return None\n    return x[i + 1]', 0),
+            ('safe-while', 'while i and x[i - 1]:\n        i -= 1', 0),
+        )
+        for label, body, expected in cases:
+            with self.subTest(case=label):
+                hits = run_detector(index_arithmetic, {
+                    'branch.py': f'def probe(x, i, ready):\n    {body}\n',
+                })
+                self.assertEqual(len(hits), expected, (body, hits))
+
     def test_unguarded_offsets_are_reported(self) -> None:
         hits = run_detector(index_arithmetic, {"unguarded.py": self.UNGUARDED})
         self.assertEqual(len(hits), 5, hits)
@@ -1059,7 +1106,11 @@ class FloatEqualityPrecisionTests(unittest.TestCase):
                 (artifacts / f"{label}-result.json").write_text(result.stdout)
                 (artifacts / f"{label}-stderr.log").write_text(result.stderr)
                 self.assertEqual(result.returncode, 1 if expected else 0, (result.stdout, result.stderr))
-                doc = json.loads(result.stdout)
+                try:
+                    doc = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"Notebook CLI returned invalid JSON: {exc}; "
+                              f"stdout={result.stdout!r}; stderr={result.stderr!r}")
                 self.assertEqual(doc["status"], "ok", (result.stdout, result.stderr))
                 self.assertEqual(doc["failed_modules"], [], (result.stdout, result.stderr))
                 hits = [finding for finding in doc.get("findings", [])

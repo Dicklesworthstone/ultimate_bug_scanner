@@ -201,6 +201,7 @@ class Function:
     parent: int | None = None
     request_parameters: frozenset[str] = frozenset()
     parameter_modes: tuple[str, ...] = ()
+    parameter_types: tuple[str, ...] = ()
     body: tuple = ()
 
 
@@ -246,7 +247,7 @@ class Parser:
             if (not words or words[-1] in MODIFIERS or any(char in prefix for char in "=()!+\"'")
                     or words[0] in {"return", "throw", "new", "else", "case"}):
                 continue
-            parameters, request_parameters, parameter_modes, defaults = [], set(), [], 0
+            parameters, request_parameters, parameter_modes, parameter_types, defaults = [], set(), [], [], 0
             for start, end in parts(self.code, opening + 1, close, generics=True):
                 declaration = self.code[start:end].split("=", 1)
                 ids = re.findall(r"@?[A-Za-z_]\w*", declaration[0])
@@ -257,6 +258,11 @@ class Parser:
                 mode = "out" if "out" in ids[:-1] else "in" if "in" in ids[:-1] or (
                     "ref" in ids[:-1] and "readonly" in ids[:-1]) else "ref" if "ref" in ids[:-1] else "value"
                 parameter_modes.append(mode)
+                variable = list(re.finditer(r"@?[A-Za-z_]\w*", declaration[0]))[-1]
+                spelling = declaration[0][:variable.start()]
+                spelling = re.sub(r"\[[^\]]*\]", " ", spelling)
+                spelling = re.sub(r"\b(?:this|ref|out|in|readonly|params)\b", " ", spelling)
+                parameter_types.append(re.sub(r"\s+", "", spelling))
                 if any(word in {"HttpRequest", "HttpRequestBase", "HttpContext"} for word in ids[:-1]):
                     request_parameters.add(parameter)
                 defaults += len(declaration) == 2
@@ -273,7 +279,8 @@ class Parser:
                 function = Function(match.start(), name, owner, beginning, start, end,
                                     tuple(parameters), defaults, expression,
                                     request_parameters=frozenset(request_parameters),
-                                    parameter_modes=tuple(parameter_modes))
+                                    parameter_modes=tuple(parameter_modes),
+                                    parameter_types=tuple(parameter_types))
                 self.functions[function.key] = function
                 self.declarations[beginning] = function
         for function in self.functions.values():
@@ -366,7 +373,8 @@ class Parser:
                 else:
                     catches.append(handler)
             return Statement(start, following, "try", (body, *catches), final), following
-        if re.match(r"(?:class|struct|namespace|record)\b", self.code[start:end]):
+        if re.match(r"(?:(?:public|private|protected|internal|static|abstract|sealed|partial|readonly|ref|file|unsafe)\s+)*"
+                    r"(?:class|struct|namespace|record|interface)\b", self.code[start:end]):
             opening = self.code.find("{", start, end)
             semi = self.code.find(";", start, end)
             if semi >= 0 and (opening < 0 or semi < opening):
@@ -746,6 +754,30 @@ class CSharpFlow:
         return [index for index, (keyword, _, _) in enumerate(args)
                 if (keyword is None and index < len(names)) or keyword in names]
 
+    def parameter_fact(self, function, index):
+        return frozenset({Trace("parameter", (function.key, index), evidence=(
+            self.step(function.key, "parameter", function.parameters[index]),))})
+
+    def name_value(self, name, position, state, bindings):
+        if self.is_source(name):
+            return self.source_fact(position, name)
+        return state.get(bindings.get(name.split(".")[0], ""), CLEAN)
+
+    def call_candidates(self, name, args, values, state, bindings, position):
+        root = name.split(".")[0]
+        return self.resolve(name, len(args)) if root not in bindings or root == "this" else []
+
+    def intrinsic_value(self, name, args, state, bindings, position):
+        return CLEAN
+
+    def call_value(self, name, canonical_name, args, values, receiver, state,
+                   bindings, position, opening, name_end):
+        return self.external_value(canonical_name, values, receiver)
+
+    def call_sink_facts(self, name, canonical_name, args, values, receiver, state,
+                        bindings, position, opening, name_end):
+        return [(index, values[index]) for index in self.sink_arguments(canonical_name, args)]
+
     def evaluate(self, start, end, state, bindings, depth=0):
         self.budget.spend()
         if depth > 96:
@@ -788,11 +820,11 @@ class CSharpFlow:
                     close = self.parser.pairs[following]
                     args = self.arguments(following + 1, close)
                     if name in {"nameof", "typeof", "sizeof"}:
-                        value = CLEAN
+                        value = self.intrinsic_value(name, args, state, bindings, position)
                     else:
                         values = [self.evaluate(low, high, state, bindings, depth + 1) for _, low, high in args]
                         root_name = name.split(".")[0]
-                        candidates = self.resolve(name, len(args)) if root_name not in bindings or root_name == "this" else []
+                        candidates = self.call_candidates(name, args, values, state, bindings, position)
                         value = CLEAN
                         if candidates:
                             outputs = {}
@@ -823,7 +855,8 @@ class CSharpFlow:
                                 # A local named File or Path is not a proof of
                                 # System.IO type identity.
                                 canonical_name = "<instance>." + canonical_name
-                            value = self.external_value(canonical_name, values, receiver)
+                            value = self.call_value(name, canonical_name, args, values, receiver,
+                                                    state, bindings, position, following, stop)
                             if self.is_source(name):
                                 value = join(value, self.source_fact(position, name))
                             if name.endswith(".TryGetValue") and self.is_source(name):
@@ -843,8 +876,10 @@ class CSharpFlow:
                                     cell = bindings.get(output.group(1).lstrip("@")) if output else None
                                     if cell:
                                         state[cell] = join(state.get(cell, CLEAN), retag(all_values, remove=CANONICAL))
-                            for index in self.sink_arguments(canonical_name, args):
-                                fact = advance(values[index], self.step(position, "sink", canonical_name))
+                            for index, source in self.call_sink_facts(name, canonical_name, args, values,
+                                                                      receiver, state, bindings, position,
+                                                                      following, stop):
+                                fact = advance(source, self.step(position, "sink", canonical_name))
                                 if fact:
                                     key = (position, canonical_name)
                                     self.effects[key] = join(self.effects.get(key, CLEAN), fact)
@@ -852,10 +887,7 @@ class CSharpFlow:
                     position = close + 1
                     continue
                 root_name = name.split(".")[0]
-                if self.is_source(name):
-                    result = join(result, self.source_fact(position, name))
-                elif root_name in bindings:
-                    result = join(result, state.get(bindings[root_name], CLEAN))
+                result = join(result, self.name_value(name, position, state, bindings))
                 position = stop
                 continue
             if self.code[position] in "([{":
@@ -929,8 +961,7 @@ class CSharpFlow:
                 if function.parameter_modes[index] == "out":
                     continue
                 cell = f"param:{aliases[index]}"
-                fact = frozenset({Trace("parameter", (function.key, index), evidence=(
-                    self.step(function.key, "parameter", name),))})
+                fact = self.parameter_fact(function, index)
                 initial[cell] = join(initial.get(cell, CLEAN), fact)
             solve(entry, initial, edges, lambda key, state: self.transfer(actions[key], state), self.budget)
         return Summary(self.returned, dict(self.effects), dict(self.outputs))

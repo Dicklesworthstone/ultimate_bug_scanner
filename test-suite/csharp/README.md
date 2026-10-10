@@ -7,6 +7,7 @@
 - `security/HeaderInjectionBuggy.cs` and `security/HeaderInjectionClean.cs` cover ASP.NET request/query/header/form and annotated action values flowing into response headers.
 - `security/RequestPathTraversalBuggy.cs` and `security/RequestPathTraversalClean.cs` cover ASP.NET request/header/upload values flowing into file read/write/serve/delete sinks.
 - `security/SsrfBuggy.cs` and `security/SsrfClean.cs` cover ASP.NET request/header values flowing into outbound HTTP clients.
+- `security/DapperSqlBuggy.cs` and `security/DapperSqlClean.cs` distinguish request-derived Dapper SQL text from request values passed through real bound parameters, including asynchronous execution and local helper calls.
 - `tests/test_helper_scanners.py` covers the helper-backed type narrowing, resource lifecycle, and async task-handle analyzers directly.
 - `manifest.json` now also includes a shimmed ast-grep regression case so the AST rule pack stays testable even when `ast-grep` is not installed globally.
 - Manifest cases run with `--no-dotnet` so scanner regressions stay stable even when the .NET SDK is absent.

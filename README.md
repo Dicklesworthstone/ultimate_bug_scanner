@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.4.37-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.4.38-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -165,6 +165,37 @@ repository declarations or model lazy SQL stream consumption. Unresolved tainted
 calls and exhausted analysis budgets produce an explicit incomplete result while
 preserving findings already established. The separate legacy fragment heuristic
 remains; it is not evidence of complete Ecto query-macro support.
+
+#### C# Dapper SQL request flow
+
+C# security category 8 includes `cs.security.sql-injection` in ordinary scans.
+It follows selected ASP.NET Core request inputs through aliases, branches and
+same-file helpers into Dapper's `Execute`, `ExecuteScalar`, `Query`, `QueryFirst`,
+`QueryFirstOrDefault`, `QuerySingle` and `QuerySingleOrDefault` families, including
+their asynchronous and supported Type-leading overloads. The scanner resolves
+ADO.NET connection types, Dapper imports and `SqlMapper` aliases before identifying
+an execution. Application methods with the same names are not automatically SQL
+sinks, and an arbitrary parameter named `request` is not an ASP.NET source.
+
+SQL text and the separate parameter object retain distinct provenance. A fixed SQL
+template with request values bound to placeholders remains clean; supplying a
+parameter object cannot sanitize SQL text that already contains request data.
+Named arguments bind to their actual signature slots. JSON and SARIF findings
+point to the execution call and retain the source-to-sink trace.
+
+Run `ubs --only=csharp --format=json .` or inspect the rule with
+`ubs explain cs.security.sql-injection`. No .NET compiler is required by the
+native rule. Category skipping, file selection, suppression and incremental cache
+policy apply normally. Its confidence remains `unknown` pending independent
+corpus calibration.
+
+The bounded model covers selected text-SQL execution. `CommandDefinition`,
+deferred enumeration, multimapping, non-text command modes and unresolved
+request-bearing execution effects produce an explicit partial result. Known
+findings and independent files remain in the report, and partial scans are not
+cached as complete. The per-source limits are 100,000 tokens, 96 nesting levels
+and 500,000 steps, configurable through `UBS_CSHARP_SQL_MAX_TOKENS`,
+`UBS_CSHARP_SQL_MAX_NESTING` and `UBS_CSHARP_SQL_MAX_STEPS`.
 
 #### PHP request flow and template output
 

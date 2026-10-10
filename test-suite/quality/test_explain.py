@@ -184,6 +184,26 @@ class ExplainRuleTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("unknown (uncalibrated)", proc.stdout)
 
+    def test_native_dapper_rule_explains_its_own_fixtures(self) -> None:
+        rule_id = "cs.security.sql-injection"
+        proc = run_ubs(["explain", rule_id, "--format=json"])
+        record_artifact("explain-csharp-dapper-json", proc)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        document = json.loads(proc.stdout)
+        self.assertEqual(document["rule_id"], rule_id)
+        self.assertEqual(document["language"], "csharp")
+        self.assertEqual(document["category_id"], "csharp.security")
+        self.assertEqual(document["severity"], "critical")
+        self.assertEqual(document["confidence"], "unknown")
+        self.assertTrue(document["message"])
+        self.assertTrue(document["remediation"])
+        for kind, filename in (("buggy_fixture", "DapperSqlBuggy.cs"),
+                               ("clean_fixture", "DapperSqlClean.cs")):
+            fixture = document[kind]
+            self.assertEqual(Path(fixture["path"]).name, filename)
+            self.assertTrue((REPO_ROOT / fixture["path"]).is_file())
+            self.assertTrue(fixture["excerpt"])
+
     def test_unknown_rule_text_suggests_nearest_matches(self) -> None:
         case_id = "explain-unknown-rule-text"
 

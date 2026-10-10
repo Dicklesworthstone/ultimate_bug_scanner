@@ -10520,6 +10520,39 @@
       }
     },
     {
+      "id": "csharp-dapper-buggy",
+      "description": "Resolved ASP.NET request values reach Dapper query text through sync, async and local-helper execution; separate bound values do not sanitize SQL text.",
+      "path": "test-suite/csharp/security/DapperSqlBuggy.cs",
+      "language": "csharp",
+      "tags": ["csharp", "dapper", "security", "taint", "buggy"],
+      "args": ["--only=csharp", "--format=json", "--no-dotnet"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "files": {"min": 1, "max": 1},
+          "critical": {"min": 3, "max": 3},
+          "warning": {"max": 0}
+        },
+        "rule_ids": {"min": {"cs.security.sql-injection": 3}}
+      }
+    },
+    {
+      "id": "csharp-dapper-clean",
+      "description": "Dapper sync, async and helper calls keep SQL text fixed and pass request values only as real parameters.",
+      "path": "test-suite/csharp/security/DapperSqlClean.cs",
+      "language": "csharp",
+      "tags": ["csharp", "dapper", "security", "taint", "clean"],
+      "args": ["--only=csharp", "--format=json", "--no-dotnet"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "files": {"min": 1, "max": 1},
+          "critical": {"max": 0},
+          "warning": {"max": 0}
+        }
+      }
+    },
+    {
       "id": "php-buggy",
       "description": "Request data reaches all six PHP security sinks; PHTML exercises three additional output contexts.",
       "path": "test-suite/php/buggy",

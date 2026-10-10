@@ -6,7 +6,7 @@ ONE `python3 -m ubs_core.csharp_scan` process (js/py/go/java/ruby semantics):
    line-anchored, marker-dropped, severity faithful;
 2. detector ports (ubs_core.csharp_detectors.*) — the four cat-8 heredocs
    (archive extraction, header injection, outbound URL, security randomness);
-3. registered analyzers (taint_csharp_request / taint_csharp_redirect /
+3. registered analyzers (taint_csharp_request / taint_csharp_redirect / taint_csharp_sql /
    lifecycle_csharp / narrowing_csharp / async_handles_csharp) — the A2
    verbatim heredoc ports, run through RunContext; bead-D3 analyzers with no
    legacy counterpart (guards_csharp) stay off unless --enable-new-analyzers;
@@ -85,6 +85,7 @@ _RULE_CHECKS = {
     "csharp.async.unobserved_task_handle": (3, 175, "Task handles created but never observed ({n})", "tsv"),
     "csharp.taint.request_traversal": (8, 371, "Request-derived path reaches file read/write/serve sink ({n}) - validate with Path.GetFullPath containment or Path.GetFileName before file access", "report"),
     "csharp.taint.open_redirect": (8, 372, "Unvalidated redirect from request data ({n}) - validate with Url.IsLocalUrl/LocalRedirect or explicit redirect host allow-list checks", "report"),
+    "cs.security.sql-injection": (8, 351, "Request-derived SQL reaches Dapper execution ({n}) - keep SQL text static and pass request values through parameters", "report"),
     "csharp.lifecycle": (19, 710, "Potential resource lifecycle leaks (helper): {n}", "tsv"),
     # detector ports (cat-8 heredocs)
     "csharp.security.archive-extraction": (8, 370, "Archive extraction path traversal risk ({n}) - validate archive entry paths stay under destination", "report"),
@@ -304,12 +305,11 @@ def run_detectors(files: Sequence, sink, skip: set, base_dir: Path) -> None:
 def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
                   enable_new: bool = False, prefilter: Any = None,
                   errors: list[str] | None = None) -> None:
-    """Run the registered csharp analyzers (taint x2, lifecycle, narrowing, async).
+    """Run the registered csharp analyzers (taint, lifecycle, narrowing, async).
 
-    Every one replaces a legacy check that ran inside its category, so skip
-    filtering applies through _RULE_CHECKS. Analyzers with NO legacy csharp
-    counterpart (bead-D3 guards_csharp deep-chain engine) stay off for
-    parity unless --enable-new-analyzers — the python.narrowing /
+    Security taint checks run in ordinary scans, with category filtering
+    through _RULE_CHECKS. The bead-D3 guards_csharp deep-chain engine stays
+    off for parity unless --enable-new-analyzers — the python.narrowing /
     java.guards precedent. Record paths are relativized to the project base
     (the legacy TSV display form).
     """
@@ -318,7 +318,7 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
 
     skip_narrowing = os.environ.get("UBS_SKIP_TYPE_NARROWING", "0") == "1"
     for analyzer in analyzers_for_lang("csharp"):
-        if analyzer.name in {"taint_csharp_request", "taint_csharp_redirect"} and 8 in skip:
+        if analyzer.name in {"taint_csharp_request", "taint_csharp_redirect", "taint_csharp_sql"} and 8 in skip:
             continue
         if prefilter is not None:
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
@@ -326,14 +326,21 @@ def run_analyzers(files: Sequence, sink, skip: set, base_dir: Path,
             target_files = list(files)
         if not target_files:
             continue
-        ctx = RunContext(lang="csharp", files=target_files)
         def checked_findings():
-            try:
-                yield from analyzer.run(ctx)
-            except (OSError, ValueError, RecursionError) as exc:
-                if errors is None:
-                    raise
-                errors.append(f"{analyzer.name}: {exc}")
+            # SQL analysis is bounded within each selected file. Stream known
+            # findings before recording incompleteness, then continue with the
+            # next file so an unsupported input cannot hide a neighbor's sink.
+            per_file = analyzer.name == "taint_csharp_sql"
+            batches = ([path] for path in target_files) if per_file else (target_files,)
+            for batch in batches:
+                ctx = RunContext(lang="csharp", files=batch)
+                try:
+                    yield from analyzer.run(ctx)
+                except (OSError, ValueError, RecursionError) as exc:
+                    if errors is None:
+                        raise
+                    location = f"{batch[0]}: " if per_file else ""
+                    errors.append(f"{location}{analyzer.name}: {exc}")
         for finding in checked_findings():
             rule = _ASYNC_RULE_REMAP.get(str(finding.get("rule", "")), str(finding.get("rule", "")))
             if skip_narrowing and rule.startswith("csharp.narrowing."):
@@ -556,13 +563,16 @@ def main(argv: list | None = None) -> int:
     patterns = load_patterns()
 
     from ubs_core.cache import CapturingSink, ScanCache
+    from ubs_core.analyzers.taint_csharp_sql import LIMIT_DEFAULTS as SQL_LIMITS
 
     cache = ScanCache(
         lang="csharp",
         project_dir=base_dir,
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
-        extra=f"new_analyzers={args.enable_new_analyzers}",
+        extra=(f"new_analyzers={args.enable_new_analyzers};sql_policy=" +
+               repr([(name, os.environ.get(name, str(value)))
+                     for name, value in sorted(SQL_LIMITS.items())])),
     )
     cached_findings, files_to_scan = cache.partition_files(files)
     suppressions = SourceSuppressions("csharp")

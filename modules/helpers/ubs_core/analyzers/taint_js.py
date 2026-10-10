@@ -27,6 +27,7 @@ from os.path import commonpath
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.taint_flow import AnalysisLimit, Budget
 
 ROOT: Path = Path()
 BASE_DIR: Path = Path()
@@ -606,17 +607,28 @@ def _refs(fact):
     return getattr(fact, 'refs', frozenset())
 
 
-def _materialize(fact, heap, seen=frozenset()):
+def _materialize(fact, heap, seen=frozenset(), *, budget=None):
     """Snapshot reachable taint at a consumption point; cycles are finite."""
     result = frozenset()
     pending, visited = [fact], set(seen)
     while pending:
         current = pending.pop()
+        if budget is not None:
+            budget.spend(1 + len(current) + len(_refs(current)))
         result = _join(result, frozenset(current))
         for ref in _refs(current) - visited:
             visited.add(ref)
-            pending.extend(heap.get(ref, {}).values())
+            slots = heap.get(ref, {})
+            if budget is not None:
+                budget.spend(1 + len(slots))
+            pending.extend(slots.values())
     return result
+
+
+def _heap_work(heap):
+    """Charge reachable fields and facts, not just the number of call sites."""
+    return sum(1 + sum(1 + len(value) + len(_refs(value)) for value in slots.values())
+               for slots in heap.values())
 
 
 def _join(*facts):
@@ -648,7 +660,11 @@ def _step(fact, name):
 
 
 class _State(dict):
-    def __init__(self, values=(), bindings=None):
+    def __init__(self, values=(), bindings=None, *, budget=None):
+        self.budget = budget if budget is not None else getattr(values, 'budget', None)
+        if self.budget is not None:
+            self.budget.spend(1 + len(values) + len(getattr(values, 'cells', {}))
+                              + _heap_work(getattr(values, 'heap', {})))
         super().__init__(values)
         self.bindings = dict(bindings if bindings is not None else getattr(values, 'bindings', {}))
         # Visible names and captured cells are separate: a caller's shadowing
@@ -685,12 +701,17 @@ def _join_states(*states):
     states = [state for state in states if state is not None]
     if not states:
         return None
+    budget = states[0].budget
+    if budget is not None:
+        budget.spend(sum(1 + len(state) + len(state.cells) + _heap_work(state.heap)
+                         for state in states))
     names = set().union(*(state.keys() for state in states))
     bindings = {}
     for name in set().union(*(state.bindings.keys() for state in states)):
         candidates = [state.bindings.get(name) for state in states]
         bindings[name] = candidates[0] if all(value is candidates[0] for value in candidates) else None
-    result = _State({name: _join(*(state.get(name, frozenset()) for state in states)) for name in names}, bindings)
+    result = _State({name: _join(*(state.get(name, frozenset()) for state in states)) for name in names},
+                    bindings, budget=budget)
     for state in states:
         result.owners.update(state.owners)
     for name, key in result.owners.items():
@@ -1312,7 +1333,7 @@ class _Flow:
 
     def effect(self, start, label, fact, state=None):
         if state is not None:
-            fact = _materialize(fact, state.heap)
+            fact = _materialize(fact, state.heap, budget=self.engine.budget)
         if fact:
             key = (start, label)
             self.effects[key] = _join(self.effects.get(key, frozenset()), fact)
@@ -1572,13 +1593,15 @@ class _Flow:
                 spread = self.value(begin, right, state)
                 if array:
                     unknown_offset = True
-                    slots[None] = _join(slots.get(None, frozenset()), _materialize(spread, state.heap))
+                    slots[None] = _join(slots.get(None, frozenset()),
+                                        _materialize(spread, state.heap, budget=self.engine.budget))
                 else:
                     refs = _refs(spread)
                     if len(refs) == 1 and not frozenset(spread):
                         slots.update(state.heap.get(next(iter(refs)), {}))
                     else:
-                        slots[None] = _join(slots.get(None, frozenset()), _materialize(spread, state.heap))
+                        slots[None] = _join(slots.get(None, frozenset()),
+                                            _materialize(spread, state.heap, budget=self.engine.budget))
                 continue
             if array:
                 key, begin = (None if unknown_offset else str(index)), left
@@ -1699,7 +1722,7 @@ class _Flow:
             if parsed:
                 facts.append(self.read_access(parsed, state, evaluate_keys=False))
                 consumed = parsed[2] - start
-        return _materialize(_join(*facts), state.heap)
+        return _materialize(_join(*facts), state.heap, budget=self.engine.budget)
 
     def apply_writes(self, writes, callee, bound, state, incoming):
         # Substitute against one pre-call snapshot. Reading a preceding update
@@ -1808,7 +1831,7 @@ class _Flow:
                 if default_flow is None:
                     default_flow = _Flow(self.engine, callee, self.rule)
                     default_flow.parameter_context = True
-                    default_state = _State()
+                    default_state = _State(budget=self.engine.budget)
                     default_state.cells = dict(state.cells)
                     default_state.heap = {ref: dict(slots) for ref, slots in state.heap.items()}
                     default_state.weak_refs = set(state.weak_refs)
@@ -1853,6 +1876,7 @@ class _Flow:
         return result
 
     def value(self, start, end, state):
+        self.engine.budget.spend()
         text, code = self.engine.text, self.scope.code
         while start < end and code[start].isspace():
             start += 1
@@ -1878,7 +1902,7 @@ class _Flow:
                     self.value(*computed, state)
             old = (self.property(receiver, key, state) if receiver is not None
                    else self.reference(target, state)) if assignment.group(1) != '=' else frozenset()
-            old = _materialize(old, state.heap)
+            old = _materialize(old, state.heap, budget=self.engine.budget)
             fact = self.value(rhs, end, state)
             if assignment.group(1) != '=':
                 fact = _join(old, fact)
@@ -2075,13 +2099,14 @@ class _Flow:
                     call_fact = frozenset()
                 # Unknown calls may transform or serialize their arguments;
                 # their return is not proof of object identity.
-                call_fact = _materialize(call_fact, state.heap)
+                call_fact = _materialize(call_fact, state.heap, budget=self.engine.budget)
                 if mutation is not None:
                     call_fact = mutation
                     sole_local_call = (code[start:match_start].strip() in {'', 'await'} and closing + 1 == end)
                 # Unknown code may throw. Record the invocation-time store,
                 # not every unrelated statement prefix in a try block.
-                self.throws.append((_materialize(_join(*argument_facts), state.heap), state.copy()))
+                self.throws.append((_materialize(_join(*argument_facts), state.heap,
+                                                 budget=self.engine.budget), state.copy()))
             selectors, call_end = self.selectors(closing + 1, end, stop_at_call=True)
             for key, computed in selectors:
                 selected = self.value(*computed, state) if computed is not None else frozenset()
@@ -2118,7 +2143,7 @@ class _Flow:
         for location, expr_start, rule, label in self.engine.write_sinks:
             if rule == self.rule and start <= location < end:
                 self.effect(location, label, self.value(expr_start, end, state), state)
-        return result if sole_local_call else _materialize(result, state.heap)
+        return result if sole_local_call else _materialize(result, state.heap, budget=self.engine.budget)
 
     def expression(self, start, end, state):
         text = self.engine.text
@@ -2139,7 +2164,7 @@ class _Flow:
         compound = re.match(r'([A-Za-z_$][\w$]*)\s*(\+=|\|\|=|&&=|\?\?=)\s*(.+)', raw, re.S)
         if compound:
             name = compound.group(1)
-            old = _materialize(self.reference(name, state), state.heap)
+            old = _materialize(self.reference(name, state), state.heap, budget=self.engine.budget)
             fact = self.value(offset + compound.start(3), end, state)
             self.assign(name, _join(old, fact), state, start)
             return state
@@ -2193,6 +2218,7 @@ class _Flow:
         return state
 
     def statement(self, node, state):
+        self.engine.budget.spend()
         try:
             return self.transfer(node, state)
         except _NoNormalCompletion:
@@ -2424,6 +2450,12 @@ class _Engine:
                 offset = module.end + 3
             text, code = ''.join(chunks), ''.join(masks)
         self.text, self.code = text, code
+        # Allocation-site contexts are finite but their heap shapes can grow
+        # exponentially through a small chain of binary factories. Count the
+        # actual copied/traversed facts as well as transfers. Larger selected
+        # components receive proportional work; exhaustion is an explicit
+        # incomplete analysis, never an empty successful finding stream.
+        self.work_limit = max(500_000, 128 * len(code))
         sinks = []
         for left, right in ([(m.start, m.end) for m in modules] if modules else [(0, len(text))]):
             aliases, functions = child_process_bindings(text[left:right].splitlines())
@@ -2713,7 +2745,7 @@ class _Engine:
                 or any(_refs(fact) for fact in state.cells.values()))
 
     def heap_input(self, callee, bound, incoming, recursive):
-        state = _State()
+        state = _State(budget=self.budget)
         ancestors, parent = set(), callee.parent
         while parent is not None:
             ancestors.add(parent)
@@ -2730,6 +2762,7 @@ class _Engine:
             ref = pending.pop()
             if ref in state.heap:
                 continue
+            self.budget.spend(_heap_work({ref: incoming.heap.get(ref, {})}))
             state.heap[ref] = dict(incoming.heap.get(ref, {}))
             for fact in state.heap[ref].values():
                 pending.extend(_refs(fact) - state.heap.keys())
@@ -2775,6 +2808,7 @@ class _Engine:
                 output is not None, _step(thrown_value, label), thrown_state)
 
     def apply_heap_output(self, incoming, state, output, writes, returned, location):
+        self.budget.spend(1 + _heap_work(output.heap))
         renamed = {ref: ref if ref in incoming.heap else
                    (*ref[:2], (ref[2] if len(ref) > 2 else frozenset()) | {location})
                    for ref in output.heap}
@@ -2861,6 +2895,7 @@ class _Engine:
                 if ref in heap or ref not in store.heap:
                     continue
                 slots = heap[ref] = store.heap[ref]
+                self.budget.spend(_heap_work({ref: slots}))
                 for fact in slots.values():
                     pending.extend(_refs(fact) - heap.keys())
             return _HeapOutput(heap, store.weak_refs & heap.keys(),
@@ -2973,7 +3008,7 @@ class _Engine:
 
     def analyze(self, scope, rule):
         statements = self.scope_statements(scope)
-        state = _State()
+        state = _State(budget=self.budget)
         for name in self.declarations(statements):
             state[name], state.bindings[name] = frozenset(), None
             state.owners[name] = self.binding(scope, name)
@@ -3001,12 +3036,15 @@ class _Engine:
         heap = (joined if joined is not None else state).heap
         thrown = _join_states(*(exit_state for _, exit_state in flow.throws))
         throw_value = (None if thrown is None else
-                       _join(*(_materialize(value, store.heap) for value, store in flow.throws)))
+                       _join(*(_materialize(value, store.heap, budget=self.budget)
+                               for value, store in flow.throws)))
         throw_writes = ({} if thrown is None else
-                        {key: _materialize(value, thrown.heap) for key, value in thrown.cells.items()
+                        {key: _materialize(value, thrown.heap, budget=self.budget)
+                         for key, value in thrown.cells.items()
                          if key[0] is not scope})
-        return (_join(*(_materialize(value, store.heap) for value, store in flow.returns)), flow.effects,
-                {key: _materialize(value, heap) for key, value in writes.items()},
+        return (_join(*(_materialize(value, store.heap, budget=self.budget)
+                       for value, store in flow.returns)), flow.effects,
+                {key: _materialize(value, heap, budget=self.budget) for key, value in writes.items()},
                 joined is not None, throw_value, throw_writes)
 
     def concrete(self, fact, rule, visited=frozenset()):
@@ -3019,7 +3057,7 @@ class _Engine:
                 owner = key[0]
                 state = self.final_states.get((owner, rule))
                 if state is not None:
-                    captured = _materialize(_cell_value(key, state), state.heap)
+                    captured = _materialize(_cell_value(key, state), state.heap, budget=self.budget)
                     result = _join(result, self.concrete(captured, rule, visited | {trace.origin}))
             elif trace.origin[0] == 'parameter':
                 _, scope, name = trace.origin
@@ -3041,8 +3079,10 @@ class _Engine:
         for rule in KIND_BY_RULE:
             if rule not in active_rules:
                 continue
+            self.budget = Budget(self.work_limit)
             self.pending, self.queued = deque(reversed(self.scopes)), set(self.scopes)
             while self.pending:
+                self.budget.spend()
                 task = self.pending.popleft()
                 self.queued.discard(task)
                 self.current_task = task
@@ -3157,6 +3197,11 @@ def scan_project_findings(files):
                 line = bisect_right(lines, offset)
                 # line_starts lists begin with offset 0 <= offset, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
                 yield module.path, rule, line, offset - lines[line - 1] + 1, path_desc
+        except AnalysisLimit as exc:
+            selected = ', '.join(str(module.path) for module in modules[:3])
+            if len(modules) > 3:
+                selected += f', and {len(modules) - 3} more files'
+            raise AnalysisLimit(f'JavaScript taint in {selected[:240]}: {exc}') from exc
         finally:
             # No import edge crosses a component boundary. Retaining these
             # roots on the project graph kept every completed component's

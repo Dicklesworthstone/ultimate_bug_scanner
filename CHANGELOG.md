@@ -27,6 +27,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Bound JavaScript taint heap work per sink domain and selected import component, including copies, state joins, allocation translation, and materialization. Pathological expansion produces explicit incomplete analysis with retained findings instead of consuming unbounded time and memory; ordinary field-sensitive and sink-free analyses retain their behavior.
+
 - JavaScript analyzer exceptions preserve findings already emitted, continue the remaining registered analyzers, and produce explicit partial results with accurate file counts. Incomplete scans are never saved as successful cache entries; direct callers without an error collector still receive the exception.
 
 - Parallel Python detector results use newline-delimited JSON boundaries, preserving findings whose messages contain Unicode line-separator characters in the capture and cache pipeline.

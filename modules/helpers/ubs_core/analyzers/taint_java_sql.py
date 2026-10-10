@@ -12,9 +12,11 @@ try-with-resources, branches and selected local helper calls. Batch queues are
 attached to the actual statement allocation or parameter, not its variable
 name. addBatch captures query text; clearBatch and successful batch execution
 empty only a definitely selected object's queue. Bound parameter values never
-become query text. Cross-call batch mutation/escape, repeated allocation sites,
-mutable SQL builders, callbacks and SQL-bearing heap state retain an explicit
-incomplete-analysis result until their object effects can be proved.
+become query text. Selected StringBuilder/StringBuffer constructors, append,
+toString and setLength(0) track mutable contents separately from aliases and
+immutable query snapshots. Cross-call mutable object effects, repeated
+allocation sites, other builder mutations, callbacks and SQL-bearing heap
+state retain an explicit incomplete-analysis result.
 """
 from __future__ import annotations
 
@@ -51,14 +53,18 @@ _SERVLET_HTTP_ARITY = {
 }
 _EXECUTORS = frozenset({"java.util.concurrent.Executor", "java.util.concurrent.ExecutorService",
                         "java.util.concurrent.ScheduledExecutorService"})
-_OBJECTS = _STATEMENTS | _HTTP | _SERVLET | _SERVLET_HTTP | {"java.sql.Connection"}
-_APIS = _OBJECTS | _EXECUTORS | {"java.lang.String", "java.net.URI", "java.lang.Integer", "java.lang.Long"}
+_BUILDERS = frozenset({"java.lang.StringBuilder", "java.lang.StringBuffer"})
+_OBJECTS = _STATEMENTS | _HTTP | _SERVLET | _SERVLET_HTTP | _BUILDERS | {"java.sql.Connection"}
+_APIS = _OBJECTS | _EXECUTORS | {"java.lang.String", "java.lang.CharSequence", "java.lang.Object",
+                               "java.net.URI", "com.sun.net.httpserver.Headers",
+                               "java.lang.Integer", "java.lang.Long"}
 _TYPE_PREFIX = "sql:type:"
 _PREPARED_SQL = "sql:prepared-query"
 _ARGUMENT_OBJECT = "sql:argument-object"
 _SINK_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute)\s*\(")
 _BATCH_RE = re.compile(r"\.\s*(?:addBatch|clearBatch|executeBatch|executeLargeBatch)\s*\(")
 _SQL_OPERATION_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLargeUpdate|executeBatch|executeLargeBatch|execute|addBatch|clearBatch)\s*\(")
+_MEMBER_CALL_RE = re.compile(r"\.\s*[A-Za-z_$][\w$]*\s*\(")
 _SOURCE_RE = re.compile(
     r"\b[A-Za-z_$][\w$]*\s*\.\s*(?P<method>getRequestURI|getRequestHeaders|getParameter|"
     r"getHeader|getQueryString|getPathInfo|getServletPath)\s*\(")
@@ -176,6 +182,11 @@ class JdbcSource(VerifierSource):
         if self.code[high - 1:high] == ")":
             opening = self.reverse_pairs.get(high - 1)
             if opening is not None:
+                constructor = re.fullmatch(r"new\s+([\w.$]+)\s*", self.code[low:opening])
+                if constructor:
+                    actual = self.resolve_type(constructor.group(1), low)
+                    if actual in _BUILDERS:
+                        return actual
                 method = re.search(r"\.\s*(createStatement|prepareStatement|prepareCall)\s*$", self.code[low:opening])
                 if method and self.receiver_type(low, low + method.start(), depth=depth + 1) == "java.sql.Connection":
                     return {"createStatement": "java.sql.Statement", "prepareStatement": "java.sql.PreparedStatement",
@@ -236,6 +247,10 @@ class JdbcSource(VerifierSource):
         return frozenset(match.start() for match in _BATCH_RE.finditer(self.code)
                          if self.receiver_type(self.receiver_start(match.start()), match.start()) in _STATEMENTS)
 
+    def builder_sites(self) -> frozenset[int]:
+        return frozenset(match.start() for match in _MEMBER_CALL_RE.finditer(self.code)
+                         if self.receiver_type(self.receiver_start(match.start()), match.start()) in _BUILDERS)
+
 
 def jdbc_execution_sites(text: str) -> dict[int, tuple[int, str, str]]:
     """API classification only, independent of enabling the SQL taint rule."""
@@ -280,7 +295,7 @@ def _types(value) -> frozenset[str]:
 
 def _data(value):
     """Object receiver identity is not query data; preserve unknown provenance."""
-    return frozenset(trace for trace in value if trace.kind != "jdbc-object" and not (
+    return frozenset(trace for trace in value if trace.kind not in {"jdbc-object", "sql-builder"} and not (
         trace.kind == "parameter" and _types((trace,)) & _OBJECTS))
 
 
@@ -296,12 +311,15 @@ class SqlEngine(Engine):
         self.selected_arguments = {}
         selected = source.execution_sites()
         self.batch_sites = source.batch_sites()
+        self.builder_sites = source.builder_sites()
         self.repeated_allocations = []
         for arrow in re.finditer(r"->", source.code):
             low = source.skip(arrow.end())
             high = source.pairs[low] if source.code[low:low + 1] == "{" else source.expression_end(low, len(source.code))
             if any(low <= offset < high for offset in set(selected) | self.batch_sites):
                 raise ValueError("JDBC execution in a callback needs callback-state analysis; analysis is incomplete")
+            if any(low <= offset < high for offset in self.builder_sites):
+                raise ValueError("SQL builder operation in a callback needs callback-state analysis; analysis is incomplete")
         super().__init__(path, text)
         self.budget = Budget(limits[2])
         for function in self.parser.functions.values():
@@ -318,6 +336,9 @@ class SqlEngine(Engine):
                 # A clear/execute operation that throws cannot establish the
                 # successful-return queue state on a catch continuation.
                 raise ValueError("JDBC batch operations with catch/finally continuations need exceptional object-state analysis; analysis is incomplete")
+            if statement.kind == "try" and (len(statement.body) > 1 or statement.otherwise) and any(
+                    statement.start <= offset < statement.end for offset in self.builder_sites):
+                raise ValueError("SQL builder operations with catch/finally continuations need exceptional object-state analysis; analysis is incomplete")
             self._batch_boundaries(statement.body)
             self._batch_boundaries(statement.otherwise)
 
@@ -350,9 +371,12 @@ class SqlEngine(Engine):
                 inferred = _types(value) & _STATEMENTS
                 if actual == "java.sql.Statement" and inferred:
                     return value, inferred
+                builders = _types(value) & _BUILDERS
+                if builders and actual in _BUILDERS | {"java.lang.CharSequence", "java.lang.Object"}:
+                    return value, builders
                 if binding.type_name != "var":
                     return value, frozenset({actual}) if actual else frozenset()
-        return value, _types(value) & _OBJECTS
+        return value, _types(value) & _APIS
 
     def source(self, offset, label):
         if label.startswith("@request") or not self.contexts:
@@ -421,6 +445,8 @@ class SqlEngine(Engine):
             if exact:
                 selected = exact
         for function, actuals in selected:
+            if any(_types(value) & _BUILDERS for value in actuals.values()):
+                raise ValueError("SQL builder passed to a helper needs mutable object-effect summaries; analysis is incomplete")
             if any(function.start <= site < function.end for site in self.batch_sites) and any(
                     _types(value) & _STATEMENTS for value in actuals.values()):
                 raise ValueError("JDBC batch state across a statement helper argument needs object-effect summaries; analysis is incomplete")
@@ -521,13 +547,116 @@ class SqlEngine(Engine):
         return False
 
     def _object(self, actual, offset):
-        return frozenset({Trace("jdbc-object", (str(self.path), offset, actual), tags=_type_tags(actual))})
+        kind = "sql-builder" if actual in _BUILDERS else "jdbc-object"
+        return frozenset({Trace(kind, (str(self.path), offset, actual), tags=_type_tags(actual))})
 
-    def _known_call(self, method, arguments, value, offset, types):
+    def _builder_keys(self, receiver):
+        objects = [trace for trace in receiver if trace.kind == "sql-builder"]
+        if any(trace.kind == "parameter" and _types((trace,)) & _BUILDERS for trace in receiver):
+            raise ValueError("SQL builder parameter needs caller object-state analysis; analysis is incomplete")
+        if not objects:
+            raise ValueError("SQL builder receiver needs resolved object identity; analysis is incomplete")
+        if any(low <= trace.key[1] < high for trace in objects for low, high in self.repeated_allocations):
+            raise ValueError("SQL builder from a repeated allocation site needs allocation-state analysis; analysis is incomplete")
+        return frozenset("@sql-builder:" + repr(trace.key) for trace in objects)
+
+    def _builder_contents(self, receiver, state, offset):
+        keys = self._builder_keys(receiver)
+        if any(key not in state for key in keys):
+            raise ValueError("SQL builder contents need resolved object-state analysis; analysis is incomplete")
+        contents = join(*(state[key] for key in keys))
+        return advance(contents, self.step(offset, "builder-read", "builder contents"))
+
+    def _string_value(self, value, state, offset):
+        builders = frozenset(trace for trace in value if _types((trace,)) & _BUILDERS)
+        contents = self._builder_contents(builders, state, offset) if builders else CLEAN
+        data = join(_data(value), contents)
+        remove = frozenset(tag for trace in data for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+        return retag(data, add=_type_tags("java.lang.String"), remove=remove)
+
+    def _constant_value(self, offset, label):
+        return frozenset({Trace("literal", (str(self.path), offset),
+                               evidence=(self.step(offset, "value", label),))})
+
+    def _builder_constructor(self, name, arguments, offset, state):
+        actual = self.jdbc.resolve_type(name, offset)
+        if actual not in _BUILDERS or not re.search(r"\bnew\s*$", self.code[:offset]):
+            return None
+        if len(arguments) > 1:
+            raise ValueError("Unsupported SQL builder constructor; analysis is incomplete")
+        contents = self._constant_value(offset, "empty SQL builder")
+        if arguments:
+            opening = self.code.find("(", offset)
+            low, high = next(self.parser.parts(opening + 1, self.parser.pairs[opening]))
+            raw = self.text[low:high].strip()
+            binding = self.jdbc.binding(raw, low) if re.fullmatch(r"[A-Za-z_$][\w$]*", raw) else None
+            capacity = bool(re.fullmatch(r"[+\-]?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|[0-9][0-9_]*)", raw))
+            capacity = capacity or (binding is not None and binding.type_name in {"byte", "short", "char", "int"})
+            capacity = capacity or bool(arguments[0]) and all("sql:integer" in trace.tags for trace in arguments[0])
+            if not capacity:
+                declared = self.jdbc.resolve_type(binding.type_name, binding.declaration) if binding else None
+                string_types = _BUILDERS | {"java.lang.String", "java.lang.CharSequence"}
+                if (any(trace.kind in {"source", "parameter"} for trace in arguments[0])
+                        and not _types(arguments[0]) & string_types and declared not in string_types):
+                    raise ValueError("SQL builder constructor overload needs a resolved string or capacity; analysis is incomplete")
+                contents = self._string_value(arguments[0], state, offset) or contents
+        receiver = self._object(actual, offset)
+        for key in self._builder_keys(receiver):
+            state[key] = advance(contents, self.step(offset, "builder-create", name))
+        return receiver
+
+    def _builder_call(self, method, arguments, receiver, offset, state):
+        keys = self._builder_keys(receiver)
+        if method == "append" and len(arguments) == 1:
+            contents = self._string_value(arguments[0], state, offset)
+            contents = advance(contents, self.step(offset, "builder-append", "append captures SQL text"))
+            for key in keys:
+                if key not in state:
+                    raise ValueError("SQL builder append needs resolved contents; analysis is incomplete")
+                state[key] = join(state[key], contents)
+            return receiver
+        if method == "toString" and not arguments:
+            return self._string_value(receiver, state, offset)
+        if method == "setLength" and len(arguments) == 1:
+            opening = self.code.find("(", offset)
+            low, high = next(self.parser.parts(opening + 1, self.parser.pairs[opening]))
+            if self.text[low:high].strip() != "0":
+                raise ValueError("SQL builder truncation needs character-range analysis; analysis is incomplete")
+            # Clearing a may-alias receiver must not erase every candidate's
+            # contents. Proving the selected object's later read needs a
+            # correlation that the per-object finite state does not retain.
+            if len(keys) != 1:
+                raise ValueError("SQL builder reset through a may-alias receiver needs correlated object state; analysis is incomplete")
+            state[next(iter(keys))] = self._constant_value(offset, "SQL builder reset to empty")
+            return CLEAN
+        if method in {"length", "capacity"} and not arguments:
+            return retag(self._constant_value(offset, "SQL builder integer result"), add=frozenset({"sql:integer"}))
+        if (method == "ensureCapacity" and len(arguments) == 1) or (method == "trimToSize" and not arguments):
+            return CLEAN
+        raise ValueError(f"SQL builder {method} needs character/object-effect analysis; analysis is incomplete")
+
+    def _known_call(self, method, arguments, value, offset, types, receiver=CLEAN):
+        if types & _BUILDERS:
+            return self._builder_call(method, arguments, receiver, offset, self.contexts[-1][3])
         request_type = _request_result_type(types, method, len(arguments))
         if request_type is not None:
             actual = Engine.source(self, offset, self.text[offset:self.text.find("(", offset) + 1].strip())
             return join(_data(value), retag(actual, add=_type_tags(request_type)))
+        if "java.net.URI" in types and method in {"getQuery", "getRawQuery", "toString"} and not arguments:
+            return retag(_data(value), add=_type_tags("java.lang.String"), remove=_type_tags("java.net.URI"))
+        if "com.sun.net.httpserver.Headers" in types and method == "getFirst" and len(arguments) == 1:
+            return retag(_data(value), add=_type_tags("java.lang.String"),
+                         remove=_type_tags("com.sun.net.httpserver.Headers"))
+        if "java.lang.String" in types:
+            integer_methods = {"length": {0}, "hashCode": {0}, "indexOf": {1, 2},
+                               "lastIndexOf": {1, 2}, "compareTo": {1}, "compareToIgnoreCase": {1}}
+            if len(arguments) in integer_methods.get(method, set()):
+                return retag(self._constant_value(offset, "String integer result"), add=frozenset({"sql:integer"}))
+            string_methods = {"toString": {0}, "concat": {1}, "substring": {1, 2}, "trim": {0},
+                              "strip": {0}, "stripLeading": {0}, "stripTrailing": {0}, "replace": {2},
+                              "replaceAll": {2}, "replaceFirst": {2}, "toLowerCase": {0, 1}, "toUpperCase": {0, 1}}
+            if len(arguments) in string_methods.get(method, set()):
+                return retag(_data(value), add=_type_tags("java.lang.String"))
         if "java.sql.Connection" in types:
             if method == "createStatement":
                 return self._object("java.sql.Statement", offset)
@@ -541,29 +670,40 @@ class SqlEngine(Engine):
         return None
 
     def external_call(self, name, arguments, value, offset, bindings, state):
+        constructed = self._builder_constructor(name, arguments, offset, state)
+        if constructed is not None:
+            return constructed
         root, _, method = name.rpartition(".")
         receiver, types = self._receiver(root, offset, bindings, state)
-        known = self._known_call(method, arguments, value, offset, types)
+        known = self._known_call(method, arguments, value, offset, types, receiver)
         if known is not None:
             return known
+        if (method == "valueOf" and len(arguments) == 1 and self.jdbc.resolve_type(root, offset) == "java.lang.String"
+                and self.jdbc.binding(root.split(".", 1)[0], offset) is None):
+            return self._string_value(arguments[0], state, offset)
+        if any(_types(argument) & _BUILDERS for argument in arguments):
+            raise ValueError("SQL builder passed to an unresolved call may mutate or escape; analysis is incomplete")
         if self.batch_sites and any(_types(argument) & _STATEMENTS for argument in arguments):
             raise ValueError("JDBC statement passed to an unresolved call may mutate its batch; analysis is incomplete")
         if method in {"parseInt", "parseLong"} and arguments and self.jdbc.resolve_type(root, offset) in {
                 "java.lang.Integer", "java.lang.Long"} and self.jdbc.binding(root.split(".", 1)[0], offset) is None:
             return frozenset({Trace("literal", (str(self.path), offset), evidence=(self.step(offset, "value", "validated integer"),))})
-        return join(_data(value), frozenset({Trace("unknown", (str(self.path), offset, name))}))
+        remove = frozenset(tag for trace in value for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+        return join(retag(_data(value), remove=remove), frozenset({Trace("unknown", (str(self.path), offset, name))}))
 
     def member_value(self, name, value, offset, arguments=None, direct_call=False, receiver=CLEAN):
         if direct_call:
             return value
         if arguments is not None:
-            known = self._known_call(name, arguments, value, offset, _types(receiver) & _OBJECTS)
+            known = self._known_call(name, arguments, value, offset, _types(receiver) & _APIS, receiver)
             if known is not None:
                 return known
         if name in _EXECUTE and arguments is not None:
             return CLEAN
-        if name in {"getQuery", "getRawQuery", "toString", "getFirst", "get"}:
-            return _data(value)
+        if arguments is not None:
+            remove = frozenset(tag for trace in value for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+            return join(retag(_data(value), remove=remove),
+                        frozenset({Trace("unknown", (str(self.path), offset, name))}))
         return _data(value)
 
     def _grouped_chains(self, start, end):
@@ -608,10 +748,10 @@ class SqlEngine(Engine):
                 arguments = call_arguments.values
                 joined = join(receiver, *arguments)
                 self.call_sink("." + method, call_arguments, joined, dot, bindings)
-                types = _types(receiver) & _OBJECTS
+                types = _types(receiver) & _APIS
                 if declared in _HTTP | _SERVLET | _SERVLET_HTTP:
                     types = frozenset({declared})
-                known = self._known_call(method, arguments, joined, opening, types)
+                known = self._known_call(method, arguments, joined, dot, types, receiver)
                 declared = None
                 if known is not None:
                     receiver = known
@@ -626,6 +766,8 @@ class SqlEngine(Engine):
         self.contexts.append((start, end, bindings, state))
         try:
             value = self._expression_value(start, end, state, bindings, depth)
+            if _types(value) & _BUILDERS and sum(1 for _ in self.parser.parts(start, end, separator="+")) > 1:
+                value = self._string_value(value, state, start)
         finally:
             self.contexts.pop()
         # Inert literal text is distinct from missing/unknown dataflow facts.
@@ -653,10 +795,23 @@ class SqlEngine(Engine):
 
     def transfer(self, action, state):
         output = super().transfer(action, state)
+        if any(_types(value) & _BUILDERS for value in self.escapes.values()):
+            raise ValueError("SQL builder field/element escape needs heap-state analysis; analysis is incomplete")
+        if action[0] == "return" and _types(output.get("@return", CLEAN)) & _BUILDERS:
+            raise ValueError("Returning a SQL builder needs mutable object-state summaries; analysis is incomplete")
         if action[0] == "return" and self.batch_sites:
             returned = output.get("@return", CLEAN)
             if any(output.get(key) for key in self._batch_keys(returned)):
                 raise ValueError("Returning a queued JDBC statement needs batch object-state summaries; analysis is incomplete")
+        # Discard contents only after the final local reference is replaced.
+        # Otherwise a dead object from the opposite branch would contaminate
+        # a still-live object that was definitely reset on this branch.
+        live_builders = {"@sql-builder:" + repr(trace.key) for binding, value in output.items()
+                         if not binding.startswith("@sql-builder:") for trace in value
+                         if trace.kind == "sql-builder"}
+        for binding in tuple(output):
+            if binding.startswith("@sql-builder:") and binding not in live_builders:
+                output.pop(binding)
         return output
 
 

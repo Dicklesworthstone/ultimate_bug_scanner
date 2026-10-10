@@ -10,6 +10,8 @@ Every valid fixture compiles against the real JDK JDBC and HttpExchange APIs.
 https://docs.oracle.com/en/java/javase/17/docs/api/java.sql/java/sql/Statement.html
 https://docs.oracle.com/en/java/javase/17/docs/api/java.sql/java/sql/PreparedStatement.html
 https://docs.oracle.com/en/java/javase/17/docs/api/java.sql/java/sql/Connection.html
+https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/StringBuilder.html
+https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/lang/StringBuffer.html
 """
 from __future__ import annotations
 
@@ -615,10 +617,363 @@ BATCH_CASES = (
     """, "HttpExchange exchange, Connection connection")),
 )
 
-ALL_CASES = CASES + REVIEW_CASES + BATCH_CASES
+BUILDER_CASES = (
+    Case("builder_append", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name='");
+        query.append({SOURCE});
+        query.append("'");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """)),
+    Case("builder_buffer_alias", handle(f"""
+        StringBuffer query = new StringBuffer("select * from users where name='");
+        StringBuffer alias = query;
+        alias.append({SOURCE});
+        query.append("'");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """)),
+    Case("builder_fluent", handle(f"""
+        String query = new StringBuilder("select * from users where name='").append({SOURCE}).append("'").toString();
+        statement.executeQuery(query); // SQL_EXEC
+    """)),
+    Case("builder_constructor", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        query.append(" -- query suffix");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """)),
+    Case("builder_copy_constructor", handle(f"""
+        StringBuilder original = new StringBuilder("select * from users where name='");
+        original.append({SOURCE});
+        StringBuilder query = new StringBuilder(original);
+        original.setLength(0);
+        query.append("'");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """)),
+    Case("builder_append_copies_contents", handle(f"""
+        StringBuffer fragment = new StringBuffer();
+        fragment.append({SOURCE});
+        StringBuilder query = new StringBuilder("select * from users where name='");
+        query.append(fragment);
+        fragment.setLength(0);
+        query.append("'");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """)),
+    Case("builder_distinct_objects", handle(f"""
+        StringBuilder dirty = new StringBuilder("select * from users where name='");
+        StringBuilder clean = new StringBuilder("select * from users where enabled=1");
+        dirty.append({SOURCE});
+        clean.append(" order by name");
+        statement.executeQuery(clean.toString());
+        statement.executeQuery(dirty.toString()); // SQL_EXEC
+    """)),
+    Case("builder_alias_survives_reassignment", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        StringBuilder alias = query;
+        query = new StringBuilder("select * from users where enabled=1");
+        query.setLength(0);
+        statement.executeQuery(alias.toString()); // SQL_EXEC
+    """)),
+    Case("builder_snapshot_survives_reset", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        String snapshot = query.toString();
+        query.setLength(0);
+        query.append("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+        statement.executeQuery(snapshot); // SQL_EXEC
+    """)),
+    Case("builder_later_mutation_keeps_old_snapshot_clean", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where enabled=1");
+        String snapshot = query.toString();
+        query.append({SOURCE});
+        statement.executeQuery(snapshot);
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """)),
+    Case("builder_string_conversion_snapshot", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        String snapshot = String.valueOf(query);
+        query.setLength(0);
+        statement.executeQuery(snapshot); // SQL_EXEC
+    """)),
+    Case("builder_string_concat_snapshot", handle(f"""
+        StringBuilder fragment = new StringBuilder();
+        fragment.append({SOURCE});
+        String snapshot = "select * from users where name='" + fragment + "'";
+        fragment.setLength(0);
+        statement.executeQuery(snapshot); // SQL_EXEC
+    """)),
+    Case("builder_prepared_dynamic_template", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where tenant=? and name='");
+        query.append({SOURCE});
+        query.append("'");
+        try (PreparedStatement prepared = connection.prepareStatement(query.toString())) {{
+            query.setLength(0);
+            prepared.setString(1, "tenant");
+            prepared.executeQuery(); // SQL_EXEC
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("builder_batch_snapshot", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        statement.addBatch(query.toString());
+        query.setLength(0);
+        statement.executeLargeBatch(); // SQL_EXEC
+    """)),
+    Case("builder_conditional_append", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name='");
+        if (selected) {{ query.append({SOURCE}); }} else {{ query.append("fixed"); }}
+        query.append("'");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, boolean selected")),
+    Case("builder_conditional_reset", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        if (selected) {{ query.setLength(0); }}
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, boolean selected")),
+    Case("builder_loop_append", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name='");
+        while (more) {{ query.append({SOURCE}); more = false; }}
+        query.append("'");
+        statement.executeQuery(query.toString()); // SQL_EXEC
+    """, "HttpExchange exchange, Statement statement, boolean more")),
+    Case("builder_grouped_receiver", handle(f"""
+        java.lang.StringBuilder query = new java.lang.StringBuilder();
+        (query).append({SOURCE});
+        statement.executeQuery((query).toString()); // SQL_EXEC
+    """)),
+    Case("builder_upcast_alias", handle(f"""
+        StringBuilder query = new StringBuilder();
+        CharSequence alias = query;
+        query.append({SOURCE});
+        statement.executeQuery(alias.toString()); // SQL_EXEC
+    """)),
+    Case("builder_helper_returns_string", '''
+        String queryFor(String value) {
+            StringBuilder query = new StringBuilder("select * from users where name='");
+            query.append(value);
+            query.append("'");
+            return query.toString();
+        }
+    ''' + handle(f"""
+        String query = queryFor({SOURCE});
+        statement.executeQuery(query); // SQL_EXEC
+        statement.executeQuery(queryFor("fixed"));
+    """)),
+    Case("builder_static", handle('''
+        StringBuilder query = new StringBuilder("select * from users");
+        query.append(" where enabled=1");
+        statement.executeQuery(query.toString());
+    ''')),
+    Case("builder_actual_binding", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name=");
+        query.append("?");
+        try (PreparedStatement prepared = connection.prepareStatement(query.toString())) {{
+            prepared.setString(1, {SOURCE});
+            prepared.executeQuery();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("builder_prepared_keeps_old_template", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name=?");
+        try (PreparedStatement prepared = connection.prepareStatement(query.toString())) {{
+            query.append({SOURCE});
+            prepared.setString(1, {SOURCE});
+            prepared.executeQuery();
+        }}
+    """, "HttpExchange exchange, Connection connection")),
+    Case("builder_reassigned", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        query = new StringBuilder("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_reset", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        query.setLength(0);
+        query.append("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_reset_alias", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        StringBuilder alias = query;
+        alias.setLength(0);
+        query.append("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_branch_reset_or_rebind", handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        if (selected) {{ query.setLength(0); }} else {{ query = new StringBuilder(); }}
+        query.append("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+    """, "HttpExchange exchange, Statement statement, boolean selected")),
+    Case("builder_loop_reset_afterwards", handle(f"""
+        StringBuilder query = new StringBuilder();
+        while (more) {{ query.append({SOURCE}); more = false; }}
+        query.setLength(0);
+        query.append("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+    """, "HttpExchange exchange, Statement statement, boolean more")),
+    Case("builder_capacity_is_not_sql", handle(f"""
+        String input = {SOURCE};
+        int capacity = input.length();
+        StringBuilder query = new StringBuilder(capacity);
+        query.ensureCapacity(input.length());
+        query.append("select * from users where enabled=1");
+        query.trimToSize();
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_direct_capacity_expression", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE}.length());
+        query.append("select * from users where enabled=1");
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_validated_integer", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where id=");
+        query.append(Integer.parseInt({SOURCE}));
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_helper_fixed_string", '''
+        String queryFor(String ignored) {
+            StringBuilder query = new StringBuilder("select * from users");
+            query.append(" where enabled=1");
+            return query.toString();
+        }
+    ''' + handle(f"statement.executeQuery(queryFor({SOURCE}));")),
+    Case("builder_shadowed_class", '''
+        static class StringBuilder {
+            StringBuilder(String initial) {}
+            StringBuilder append(String value) { return this; }
+            public String toString() { return "select * from users where enabled=1"; }
+        }
+    ''' + handle(f"""
+        StringBuilder query = new StringBuilder("fixed");
+        query.append({SOURCE});
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_shadowed_sibling_scope", '''
+        static class FakeScope {
+            static class StringBuilder {
+                StringBuilder(String initial) {}
+                StringBuilder append(String value) { return this; }
+                public String toString() { return "select * from users where enabled=1"; }
+            }
+            void handle(HttpExchange exchange, Statement statement) throws SQLException {
+                StringBuilder query = new StringBuilder("fixed");
+                query.append(exchange.getRequestURI().getQuery());
+                statement.executeQuery(query.toString());
+            }
+        }
+        static class ActualScope {
+            void handle(HttpExchange exchange, Statement statement) throws SQLException {
+                java.lang.StringBuilder query = new java.lang.StringBuilder();
+                query.append(exchange.getRequestURI().getQuery());
+                statement.executeQuery(query.toString()); // SQL_EXEC
+            }
+        }
+    '''),
+    Case("builder_lexical_decoys", handle('''
+        StringBuilder query = new StringBuilder("select * from users where enabled=1");
+        // query.append(exchange.getRequestURI().getQuery());
+        String documentation = "query.append(exchange.getRequestURI().getQuery())";
+        statement.executeQuery(query.toString());
+    ''')),
+)
+
+ALL_CASES = CASES + REVIEW_CASES + BATCH_CASES + BUILDER_CASES
 BY_NAME = {case.name: case for case in ALL_CASES}
 
 INCOMPLETE_CASES = (
+    Case("builder_insert", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name='");
+        query.insert(0, {SOURCE});
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_partial_delete", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        query.delete(0, 1);
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_partial_replace", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        query.replace(0, 1, "fixed");
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_set_character", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        query.setCharAt(0, 'x');
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_partial_set_length", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        query.setLength(1);
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_subsequence_append", handle(f"""
+        StringBuilder query = new StringBuilder("select * from users where name='");
+        query.append({SOURCE}, 0, 1);
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_helper_mutation", '''
+        void appendQuery(StringBuilder query, String value) { query.append(value); }
+    ''' + handle(f"""
+        StringBuilder query = new StringBuilder();
+        appendQuery(query, {SOURCE});
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_helper_object_return", '''
+        StringBuilder queryFor(String value) {
+            StringBuilder query = new StringBuilder();
+            query.append(value);
+            return query;
+        }
+    ''' + handle(f"""
+        StringBuilder query = queryFor({SOURCE});
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_field_escape", 'Object saved;\n' + handle(f"""
+        StringBuilder query = new StringBuilder();
+        query.append({SOURCE});
+        this.saved = query;
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_callback_reset", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        executor.execute(() -> query.setLength(0));
+        statement.executeQuery(query.toString());
+    """, "HttpExchange exchange, Statement statement, java.util.concurrent.Executor executor")),
+    Case("builder_catch_reset", handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        try {{ query.setLength(0); }} catch (RuntimeException failure) {{
+            java.util.logging.Logger.getLogger("query").warning(failure.toString());
+        }}
+        statement.executeQuery(query.toString());
+    """)),
+    Case("builder_repeated_allocation", handle(f"""
+        for (int i = 0; i < 2; i++) {{
+            StringBuilder query = new StringBuilder();
+            query.append({SOURCE});
+            statement.executeQuery(query.toString());
+        }}
+    """)),
+    Case("builder_unresolved_consumer", '''
+        interface Owner { void inspect(StringBuilder query); }
+    ''' + handle(f"""
+        StringBuilder query = new StringBuilder({SOURCE});
+        owner.inspect(query);
+        statement.executeQuery(query.toString());
+    """, "HttpExchange exchange, Statement statement, Owner owner")),
+    Case("builder_may_alias_reset", handle(f"""
+        StringBuilder dirty = new StringBuilder({SOURCE});
+        StringBuilder clean = new StringBuilder("select * from users where enabled=1");
+        StringBuilder query = dirty;
+        if (selected) {{ query = clean; }}
+        query.setLength(0);
+        statement.executeQuery(dirty.toString());
+    """, "HttpExchange exchange, Statement statement, boolean selected")),
     Case("async_callback", handle(f"""
         String input = {SOURCE};
         String query = {QUERY};
@@ -779,6 +1134,12 @@ class JavaSqlDirectTests(unittest.TestCase):
                     self.assertEqual(Path(row["path"]), path)
                     trace = row.get("extras", {}).get("taint_path", [])
                     self.assertTrue(trace, row)
+                    if case.name.startswith("builder_"):
+                        self.assertEqual(row["extras"]["source_count"], 1, row)
+                        self.assertEqual((trace[-1]["line"], trace[-1]["col"], trace[-1]["kind"]),
+                                         (row["line"], row["col"], "sink"), row)
+                        self.assertIn("source", {step["kind"] for step in trace}, row)
+                        self.assertIn("builder-read", {step["kind"] for step in trace}, row)
         (artifact / "receipt.json").write_text(json.dumps({"command": sys.argv, "python": sys.version,
             "tools": identities(), "cases": records}, indent=2) + "\n", encoding="utf-8")
         print(f"[java-sql-direct] {artifact}", flush=True)
@@ -926,6 +1287,55 @@ class JavaSqlPublicTests(unittest.TestCase):
         result, payload = self.scan("batch-module-sarif", project, fmt="sarif")
         self.assert_sarif(result, payload, expected)
 
+    def test_builder_formats_cache_and_source_repair(self):
+        project, expected = self.fixture(BUILDER_CASES)
+        result, payload = self.scan("builder-cold", project)
+        self.assert_json(result, payload, expected, files=len(BUILDER_CASES))
+        self.assert_cache("builder-cold", 0, len(BUILDER_CASES))
+        result, payload = self.scan("builder-warm-sarif", project, fmt="sarif")
+        self.assert_sarif(result, payload, expected)
+        self.assert_cache("builder-warm-sarif", len(BUILDER_CASES), 0)
+        result, stream = self.scan("builder-meta-jsonl", project, meta=True, fmt="jsonl")
+        summaries = [row for row in stream if row["type"] == "totals"]
+        self.assertEqual(len(summaries), 1, stream)
+        summary = summaries[0]
+        self.assert_json(result, {"status": summary["status"], "failed_modules": summary["failed_modules"],
+                                 "totals": summary, "findings": [row for row in stream if row["type"] == "finding"]},
+                         expected, meta=True, files=len(BUILDER_CASES))
+        repaired = project / "Case_builder_append.java"
+        repaired.write_text(BY_NAME["builder_append"].source.replace(SOURCE, '"fixed"'), encoding="utf-8")
+        result, payload = self.scan("builder-source-repair", project)
+        self.assert_json(result, payload, [row for row in expected if row[0] != repaired.name], files=len(BUILDER_CASES))
+        self.assert_cache("builder-source-repair", len(BUILDER_CASES) - 1, 1)
+
+    def test_builder_selection_and_scoped_suppression(self):
+        selected = tuple(BY_NAME[name] for name in ("builder_append", "builder_snapshot_survives_reset", "builder_actual_binding"))
+        project, _ = self.fixture(selected)
+        result, payload = self.scan("builder-category-skip", project, meta=True, extra=("--skip-java=4",))
+        self.assert_json(result, payload, [], meta=True, files=3)
+        selection = self.artifact / "builder-selected-files"
+        selection.write_bytes(os.fsencode(project / "Case_builder_actual_binding.java") + b"\0")
+        result, payload = self.scan("builder-selected-clean", project, extra=("--files-from", str(selection)))
+        self.assert_json(result, payload, [], files=1)
+        result, payload = self.scan("builder-ignored-unsafe", project, meta=True,
+            extra=("--exclude=Case_builder_append.java,Case_builder_snapshot_survives_reset.java",))
+        self.assert_json(result, payload, [], meta=True, files=1)
+        suppression = Case("builder_suppression", handle(f"""
+            StringBuilder query = new StringBuilder();
+            query.append({SOURCE});
+            statement.executeQuery(query.toString()); // ubs:ignore[{RULE}]
+            // ubs:ignore[{RULE}]
+            statement.executeQuery(query.toString());
+            statement.executeQuery(query.toString()); // SQL_EXEC // ubs:ignore[java.insecure-ssl]
+        """))
+        path = self.artifact / "Case_builder_suppression.java"
+        path.write_text(suppression.source, encoding="utf-8")
+        expected = [(path.name, RULE, line, col, "critical") for line, col in suppression.sites]
+        result, payload = self.scan("builder-scoped-suppression", path)
+        self.assert_json(result, payload, expected, files=1)
+        result, payload = self.scan("builder-scoped-suppression-sarif", path, fmt="sarif")
+        self.assert_sarif(result, payload, expected)
+
     def test_selection_category_and_scoped_suppression(self):
         selected = tuple(BY_NAME[name] for name in ("execute_query", "mixed_placeholder_still_unsafe", "bound_parameters"))
         project, _ = self.fixture(selected)
@@ -981,7 +1391,7 @@ class JavaSqlPublicTests(unittest.TestCase):
         self.assert_json(result, payload, [], meta=True, files=2)
 
     def test_unsupported_neighbor_retains_proven_findings(self):
-        project, expected = self.fixture((BY_NAME["execute_query"],) + INCOMPLETE_CASES)
+        project, expected = self.fixture((BY_NAME["execute_query"], BY_NAME["builder_append"]) + INCOMPLETE_CASES)
         result, payload = self.scan("unsupported", project, meta=True, no_ast=True)
         context = result.stdout + "\n" + result.stderr
         self.assertEqual(result.returncode, 2, context)
@@ -992,7 +1402,7 @@ class JavaSqlPublicTests(unittest.TestCase):
         self.assertEqual(sorted(actual), expected, context)
         self.assertEqual((payload["totals"]["files"], payload["totals"]["critical"],
                           payload["totals"]["warning"], payload["totals"]["info"]),
-                         (1 + len(INCOMPLETE_CASES), 1, 0, 0), context)
+                         (2 + len(INCOMPLETE_CASES), 2, 0, 0), context)
 
 
 if __name__ == "__main__":

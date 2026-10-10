@@ -17,6 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- JDBC SQL provenance tracks request-derived queries assembled through real `StringBuilder` and `StringBuffer` objects. Separate `append` calls and aliases update the selected builder, while `toString`, prepared statements and queued batches retain the SQL snapshot they captured. Reassignment, resets, branches and loops preserve object identity; bound parameters and scoped application APIs remain distinct. Unsupported builder mutation or escape produces an explicit incomplete result.
 - Export JSON, JSONL, SARIF, and TOON sidecars from one scan with repeatable `--also=FORMAT:FILE` options. Every format uses the same findings, baseline filter, coverage status, timestamps, and profile snapshot. Destination aliases are rejected before opening the primary output, and failed rendering or delivery preserves existing sidecars and reports an explicit error.
 - JDBC SQL provenance follows commands queued by `Statement.addBatch` into `executeBatch` and `executeLargeBatch`. Captured SQL follows statement identity through aliases, reassignment, branches, and loops; clearing or successfully executing a batch discharges only the selected queue. Prepared-statement parameters remain separate from SQL construction, and unsupported queue effects remain explicit incomplete analysis.
 

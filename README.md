@@ -140,6 +140,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - `--comparison=<baseline.json>` diff the latest combined summary against a stored run. Deltas feed into console output, JSON, HTML, and SARIF automation metadata so CI can detect regressions.
 - `--report-json=<file>` writes an enriched summary (project, totals, git metadata, optional comparison block) that you can archive or share with teammates/CI.
 - `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
+- `--also=FORMAT:FILE` writes another rendering of the same scan, including the full findings ledger. Repeat it for JSON, JSONL, SARIF, or TOON; each selected module runs once. The primary `--format` still controls stdout. Relative destinations use the invocation directory, and two reports cannot target the same file. TOON requires the same verified encoder as `--format=toon`.
 - All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output annotates `path:line` references, stdout JSON gains `git.*` metadata plus a `permalink` on every finding sample, and merged SARIF runs carry `properties.permalink` on each result location together with `versionControlProvenance` and `automationDetails` keyed by the comparison id. Permalinks are relative to the repository root even when you scan a subdirectory.
 
 #### Resource lifecycle heuristics in each language
@@ -162,6 +163,15 @@ ubs --ci --only=python --category=resource-lifecycle \
 ```
 
 `latest.json` now contains the git metadata (repo URL, commit, blob_base) plus a `comparison.delta` block, and `latest.html` renders a lightweight dashboard summarising the deltas. SARIF uploads also pick up the comparison id so repeating runs in CI stay grouped by automation id.
+
+To publish SARIF and keep the complete JSON and JSONL findings from one scan:
+
+```bash
+ubs . --ci --format=sarif --output=report.sarif \
+    --also=json:report.json --also=jsonl:findings.jsonl
+```
+
+Every rendering shares the same findings, baseline filtering, and scan-completion state. Partial scans still export the available evidence and retain exit 2; an empty scan exports its explicit no-coverage result and retains exit 3. A failed additional export exits 2, names the failed path, preserves its previous report, and still attempts the other requested exports.
 
 ---
 
@@ -1026,6 +1036,8 @@ File Selection:
   --exclude-langs=CSV      Exclude LANGUAGES from the scan (e.g. --exclude-langs=js,ruby)
   --output=FILE, -o FILE   Also write the report to FILE (same as the positional
                            OUTPUT_FILE form); stdout still receives it
+  --also=FMT:FILE          Also render this scan as json|jsonl|sarif|toon to FILE;
+                           repeatable, without rescanning any module
   --skip-size-check        Skip directory size guard (use with care)
 
 Performance:

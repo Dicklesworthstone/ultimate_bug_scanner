@@ -1395,6 +1395,9 @@ USER_RULES_DIR=""          # forwarded to modules as --rules= (custom ast-grep r
 USER_RULES_SOURCES=()      # every --rules DIR (repeatable), else the UBS_RULES entries
 USER_RULES_REQUESTED=0     # distinguish an absent option from --rules=
 OUTPUT_FILE=""             # tee the rendered report to this file (--output / PROJECT_DIR OUTPUT_FILE)
+ALSO_REPORTS=()            # repeatable FORMAT:FILE exports from the same scan
+ALSO_FORMATS=()
+ALSO_PATHS=()
 LIST_CATEGORIES=0
 TEE_PID=""
 CSHARP_MODULE_ARGS=()
@@ -1508,6 +1511,7 @@ Usage: ubs [options] [PROJECT_DIR]
 
 Options:
   --format=FMT            text|json|jsonl|sarif|toon (default: text)
+  --also=FMT:FILE         Also render this scan as json|jsonl|sarif|toon to FILE (repeatable)
   --output=FILE, -o FILE  Also write the report to FILE (same as the positional form
                           ubs PROJECT_DIR OUTPUT_FILE); stdout still receives it
   --no-color              Disable ANSI colors (same as NO_COLOR=1)
@@ -1702,6 +1706,7 @@ cat <<'JSON'
       {"name": "--save-baseline", "args": "FILE", "example": "--save-baseline=baseline.json", "description": "Save the current scan findings and totals to FILE as a baseline."},
       {"name": "--new-only", "args": null, "example": "--new-only", "description": "Report only findings not present in the baseline (diff mode)."},
       {"name": "--report-json", "args": "FILE", "example": "--report-json=summary.json", "description": "Write the combined summary JSON to FILE."},
+      {"name": "--also", "args": "FMT:FILE", "example": "--also=sarif:report.sarif", "description": "Render the same scan to an additional JSON, JSONL, SARIF or TOON file. Repeatable; no module is scanned again. Distinct report destinations are required; delivery failures exit 2."},
       {"name": "--html-report", "args": "FILE", "example": "--html-report=report.html", "description": "Write a shareable HTML report."},
       {"name": "--beads-jsonl", "args": "FILE", "example": "--beads-jsonl=findings.jsonl", "description": "Write findings as JSONL for Beads/strung."},
       {"name": "--jsonl-summary-only", "args": null, "example": "--jsonl-summary-only", "description": "JSONL: emit only scanner/totals lines, no per-finding lines."},
@@ -2261,6 +2266,10 @@ else
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --format=*) FORMAT="${1#*=}"; shift;;
+      --also=*) ALSO_REPORTS+=("${1#*=}"); shift;;
+      --also)
+        if [[ $# -lt 2 ]]; then say_err "ERROR: --also requires FORMAT:FILE"; exit 2; fi
+        ALSO_REPORTS+=("$2"); shift 2;;
       --version|-V) SHOW_VERSION=1; shift;;
       --ci) CI_MODE=1; shift;;
       --fail-on-warning) FAIL_ON_WARNING=1; shift;;
@@ -2419,7 +2428,24 @@ else
       say_err "${RED}$X unknown --format value${RESET}: $FORMAT (expected text|json|jsonl|sarif|toon)"
       exit 2;;
   esac
-  if [[ "$FORMAT" == "toon" ]]; then
+  _also_needs_toon=0
+  for _also_report in "${ALSO_REPORTS[@]}"; do
+    _also_format="${_also_report%%:*}"
+    _also_path="${_also_report#*:}"
+    if [[ "$_also_report" != *:* || -z "$_also_path" || "$_also_path" == "-" ]]; then
+      say_err "ERROR: --also requires FORMAT:FILE with a nonempty file path: $_also_report"
+      exit 2
+    fi
+    case "$_also_format" in
+      json|jsonl|sarif) ;;
+      toon) _also_needs_toon=1;;
+      *) say_err "ERROR: unknown --also format: $_also_format (expected json|jsonl|sarif|toon)"; exit 2;;
+    esac
+    ALSO_FORMATS+=("$_also_format")
+    ALSO_PATHS+=("$_also_path")
+  done
+  unset _also_report _also_format _also_path
+  if [[ "$FORMAT" == "toon" || "$_also_needs_toon" -eq 1 ]]; then
     _toon_problem="$(toon_encoder_problem)"
     if [[ -n "$_toon_problem" ]]; then
       refuse_toon_without_encoder "$_toon_problem"
@@ -2441,6 +2467,33 @@ else
     PROJECT_DIR="${POSITIONAL_TARGETS[0]}"
   elif [[ ${#POSITIONAL_TARGETS[@]} -gt 0 ]]; then
     SCAN_FILES+=("${POSITIONAL_TARGETS[@]}")
+  fi
+  if [[ ${#ALSO_PATHS[@]} -gt 0 ]]; then
+    # Reject aliases before --output can truncate a file or any scan starts.
+    # A destination cannot represent two different reports at once.
+    if ! python3 - "$OUTPUT_FILE" "$SAVE_BASELINE_FILE" "$REPORT_JSON_PATH" \
+        "$HTML_REPORT_PATH" "$BEADS_JSONL_PATH" "${ALSO_PATHS[@]}" <<'PYALSO'
+import os
+from pathlib import Path
+import sys
+
+seen = []
+try:
+    for raw in sys.argv[1:]:
+        if not raw:
+            continue
+        path = Path(raw).resolve()
+        for previous in seen:
+            if path == previous or (path.exists() and previous.exists() and os.path.samefile(path, previous)):
+                raise ValueError(f"report destinations refer to the same file: {raw}")
+        seen.append(path)
+except (OSError, RuntimeError, ValueError) as exc:
+    print(f"ubs: invalid --also output: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PYALSO
+    then
+      exit 2
+    fi
   fi
   if [[ -n "$OUTPUT_FILE" && "$LIST_CATEGORIES" -eq 0 ]]; then
     if ! : >"$OUTPUT_FILE" 2>/dev/null; then
@@ -7621,7 +7674,7 @@ JSON
     text|*)
       prepare_metrics_dir "$metrics_dir"
       local -a text_report_args=()
-      if [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || -n "$BEADS_JSONL_PATH" || "$NEW_ONLY" -eq 1 ]]; then
+      if [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || -n "$BEADS_JSONL_PATH" || "$NEW_ONLY" -eq 1 || ${#ALSO_PATHS[@]} -gt 0 ]]; then
         # A baseline/export needs the same uncapped ledger as machine output.
         # Without requesting it here, the default text --save-baseline path
         # saved only summary counts and could never recognize existing bugs.
@@ -7955,7 +8008,7 @@ generate_combined_json(){
     local need_findings_merge=0
     if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ]]; then
       need_findings_merge=1
-    elif [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || -n "$BEADS_JSONL_PATH" || "$NEW_ONLY" -eq 1 ]]; then
+    elif [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$SAVE_BASELINE_FILE" || -n "$BEADS_JSONL_PATH" || "$NEW_ONLY" -eq 1 || ${#ALSO_PATHS[@]} -gt 0 ]]; then
       need_findings_merge=1
     fi
     if [[ "$need_findings_merge" -eq 1 ]]; then
@@ -7992,11 +8045,19 @@ generate_combined_json(){
 
 # Print the combined JSON, with the profile block when UBS_PROFILE=1.
 emit_combined_json(){
-  if [[ "$UBS_PROFILE" == "1" ]] && need_cmd jq; then
-    jq --argjson profile "$(profile_json)" '. + {profile: $profile, extras: ((.extras // {}) + {profile: $profile})}' "$COMBINED_JSON_FILE"
-  else
-    cat "$COMBINED_JSON_FILE"
+  local rendered="$TMPDIR_RUN/rendered-combined.json"
+  local pending="$TMPDIR_RUN/rendered-combined.pending"
+  if [[ ! -s "$rendered" ]]; then
+    # Freeze timing metadata too: repeated renderings describe one snapshot.
+    # A failed renderer must not leave a partial snapshot for later reports.
+    if [[ "$UBS_PROFILE" == "1" ]] && need_cmd jq; then
+      jq --argjson profile "$(profile_json)" '. + {profile: $profile, extras: ((.extras // {}) + {profile: $profile})}' "$COMBINED_JSON_FILE" >"$pending" || return 1
+    else
+      cat "$COMBINED_JSON_FILE" >"$pending" || return 1
+    fi
+    mv -f "$pending" "$rendered" || return 1
   fi
+  cat "$rendered"
 }
 
 emit_combined_sarif(){
@@ -8112,8 +8173,9 @@ write_jsonl_summary(){
   if ! generate_combined_json; then return 1; fi
   local tmp="$TMPDIR_RUN/combined.jsonl"
   local ts
-  ts="$(date_iso)"
   if ! need_cmd jq; then return 1; fi
+  ts="$(jq -r '.timestamp // empty' "$COMBINED_JSON_FILE")" || return 1
+  [[ -n "$ts" ]] || ts="$(date_iso)"
 
   if [[ "${JSONL_DETAIL:-1}" -eq 1 ]]; then
     # Detailed mode: emit each finding as its own JSONL line.
@@ -8128,24 +8190,24 @@ write_jsonl_summary(){
          message:.message, remediation:.remediation, fix:.fix,
          fingerprint:.fingerprint, suppressed:.suppressed,
          title:(.message // .rule_id), count:1}
-      ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
+      ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || return 1
     else
       jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
         .scanners[] as $s |
         (($s.findings // [])[]) |
         {type:"finding", project:$project, language:$s.language} + .
-      ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || true
+      ' "$COMBINED_JSON_FILE" >"$tmp" 2>/dev/null || return 1
     fi
 
     # Also emit scanner summaries
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
       .scanners[] | {type:"scanner", project:$project, language, status:(.status // "ok"), files, critical, warning, info, timestamp:(.timestamp // $ts)}
-    ' "$COMBINED_JSON_FILE" >>"$tmp"
+    ' "$COMBINED_JSON_FILE" >>"$tmp" || return 1
   else
     # Summary-only mode (legacy behavior)
     jq -c --arg project "$SOURCE_PROJECT_DIR" --arg ts "$ts" '
       .scanners[] | {type:"scanner", project:$project, language, files, critical, warning, info, timestamp:(.timestamp // $ts)}
-    ' "$COMBINED_JSON_FILE" >"$tmp"
+    ' "$COMBINED_JSON_FILE" >"$tmp" || return 1
   fi
 
   # Always emit totals
@@ -8153,7 +8215,7 @@ write_jsonl_summary(){
     {type:"totals", project:$project, status:(.status // "ok"), failed_modules:(.failed_modules // []),
      files:(.totals.files//0), critical:(.totals.critical//0),
      warning:(.totals.warning//0), info:(.totals.info//0), timestamp:(.timestamp // $ts)}
-  ' "$COMBINED_JSON_FILE" >>"$tmp"
+  ' "$COMBINED_JSON_FILE" >>"$tmp" || return 1
 
   if [[ -n "$dest" ]]; then
     deliver_file "$tmp" "$dest" "Beads JSONL" || return 1
@@ -8162,7 +8224,79 @@ write_jsonl_summary(){
   fi
 }
 
-# Emit a structured "no supported languages" result and exit.
+# Deliver a requested artifact atomically; a failed write preserves the old
+# report. Defined before language detection so empty scans can export too.
+deliver_file(){
+  local src="$1" dest="$2" label="$3" dir tmp
+  dir="$(dirname "$dest")"
+  if [[ ! -d "$dir" ]] && ! mkdir -p "$dir" 2>/dev/null; then
+    say_err "${RED}${X}${RESET} Cannot create the directory for the requested ${label}: $dir"
+    return 1
+  fi
+  if [[ ! -d "$dir" ]]; then
+    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dir is not a directory"
+    return 1
+  fi
+  tmp="$(mktemp "$dest.ubs-XXXXXX" 2>/dev/null)" || {
+    say_err "${RED}${X}${RESET} Cannot stage the requested ${label} in $dir (not writable?)"
+    return 1
+  }
+  if ! cat "$src" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dest"
+    return 1
+  fi
+  if [[ -d "$dest" ]] || ! mv -f "$tmp" "$dest" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest"
+    return 1
+  fi
+  return 0
+}
+
+render_additional_format(){
+  local fmt="$1" no_scan="$2" problem
+  if [[ "$fmt" == "toon" ]]; then
+    problem="$(toon_encoder_problem)"
+    if [[ -n "$problem" ]]; then
+      say_err "ERROR: Cannot render requested TOON report: $problem"
+      return 1
+    fi
+  fi
+  if [[ "$no_scan" -eq 1 ]]; then
+    emit_no_langs_document "$fmt"
+    return $?
+  fi
+  case "$fmt" in
+    json) emit_combined_json;;
+    jsonl) write_jsonl_summary "";;
+    sarif) emit_combined_sarif;;
+    toon) emit_combined_json | "$TOON_BIN" --encode;;
+  esac
+}
+
+write_additional_reports(){
+  local no_scan="${1:-0}" index staged failed=0
+  [[ ${#ALSO_PATHS[@]} -gt 0 ]] || return 0
+  if [[ "$no_scan" -eq 0 ]] && ! generate_combined_json; then
+    say_err "ERROR: Could not build the combined result for the requested --also reports"
+    return 1
+  fi
+  for index in "${!ALSO_PATHS[@]}"; do
+    staged="$TMPDIR_RUN/additional-$index.${ALSO_FORMATS[$index]}"
+    if render_additional_format "${ALSO_FORMATS[$index]}" "$no_scan" >"$staged"; then
+      if ! deliver_file "$staged" "${ALSO_PATHS[$index]}" "--also ${ALSO_FORMATS[$index]} report"; then
+        failed=1
+      fi
+    else
+      say_err "ERROR: Could not render requested --also ${ALSO_FORMATS[$index]} report: ${ALSO_PATHS[$index]}"
+      failed=1
+    fi
+  done
+  return "$failed"
+}
+
+# Emit a structured "no supported languages" result.
 #
 # When none of UBS's supported languages are detected (e.g. a Dart-only repo, or
 # a --files list with only unsupported extensions) no scanner runs. Previously
@@ -8178,7 +8312,8 @@ write_jsonl_summary(){
 # files. We exit 3 here: a NEW code so it cannot be confused with 1 (findings)
 # or 2 (environment error). Set UBS_ALLOW_NO_SCAN=1 to restore the legacy
 # exit-0 behaviour for callers that intentionally point UBS at mixed trees.
-emit_no_langs_result(){
+emit_no_langs_document(){
+  local FORMAT="$1"
   local proj="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
   local supported="${ALL_LANGS[*]}"
   local rc=3
@@ -8194,7 +8329,7 @@ emit_no_langs_result(){
       local payload
       payload=$(printf '{"result":"no-supported-languages","exit_code":%d,"project":"%s","detected_languages":[],"supported_languages":[%s],"totals":{"critical":0,"warning":0,"info":0,"files":0},"scanners":[]}\n' "$rc" "$proj_e" "$supported_json")
       if [[ "$FORMAT" == "toon" ]] && command -v "$TOON_BIN" >/dev/null 2>&1 && looks_like_toon_rust_encoder "$TOON_BIN"; then
-        printf '%s' "$payload" | "$TOON_BIN" --encode || printf '%s' "$payload"
+        printf '%s' "$payload" | "$TOON_BIN" --encode
       else
         printf '%s' "$payload"
       fi
@@ -8217,6 +8352,13 @@ emit_no_langs_result(){
       fi
       ;;
   esac
+}
+
+emit_no_langs_result(){
+  local rc=3
+  if [[ "${UBS_ALLOW_NO_SCAN:-0}" == "1" ]]; then rc=0; fi
+  emit_no_langs_document "$FORMAT" || rc=2
+  write_additional_reports 1 || rc=2
   exit "$rc"
 }
 
@@ -8546,40 +8688,6 @@ emit_env_error_report(){
   done
 }
 
-# Deliver a requested artifact, or fail loudly. Issue #106: `mkdir -p … || true`
-# plus `cp … 2>/dev/null || true` meant a requested report or baseline could be
-# silently absent while the command reported success, so a consumer waiting on
-# exit 0 archived nothing (or kept reusing a stale file). Staging beside the
-# destination and renaming into place also means a failed write never truncates
-# the artifact that was already there.
-deliver_file(){
-  local src="$1" dest="$2" label="$3" dir tmp
-  dir="$(dirname "$dest")"
-  if [[ ! -d "$dir" ]] && ! mkdir -p "$dir" 2>/dev/null; then
-    say_err "${RED}${X}${RESET} Cannot create the directory for the requested ${label}: $dir"
-    return 1
-  fi
-  if [[ ! -d "$dir" ]]; then
-    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dir is not a directory"
-    return 1
-  fi
-  tmp="$(mktemp "$dest.ubs-XXXXXX" 2>/dev/null)" || {
-    say_err "${RED}${X}${RESET} Cannot stage the requested ${label} in $dir (not writable?)"
-    return 1
-  }
-  if ! cat "$src" >"$tmp" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
-    say_err "${RED}${X}${RESET} Cannot write the requested ${label}: $dest"
-    return 1
-  fi
-  if ! mv -f "$tmp" "$dest" 2>/dev/null; then
-    rm -f "$tmp" 2>/dev/null || true
-    say_err "${RED}${X}${RESET} Cannot replace the requested ${label}: $dest"
-    return 1
-  fi
-  return 0
-}
-
 env_error_langs_json(){
   local lang out="" first=1
   for lang in "${ENV_ERROR_LANGS[@]:-}"; do
@@ -8803,6 +8911,8 @@ case "$FORMAT" in
 	    status=2
 	  fi
 	fi
+
+write_additional_reports || status=2
 
 if [[ -n "$BEADS_JSONL_PATH" ]]; then
   if ! write_jsonl_summary "$BEADS_JSONL_PATH"; then

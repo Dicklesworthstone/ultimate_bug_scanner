@@ -17,6 +17,7 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Added
 
+- Export JSON, JSONL, SARIF, and TOON sidecars from one scan with repeatable `--also=FORMAT:FILE` options. Every format uses the same findings, baseline filter, coverage status, timestamps, and profile snapshot. Destination aliases are rejected before opening the primary output, and failed rendering or delivery preserves existing sidecars and reports an explicit error.
 - JDBC SQL provenance follows commands queued by `Statement.addBatch` into `executeBatch` and `executeLargeBatch`. Captured SQL follows statement identity through aliases, reassignment, branches, and loops; clearing or successfully executing a batch discharges only the selected queue. Prepared-statement parameters remain separate from SQL construction, and unsupported queue effects remain explicit incomplete analysis.
 
 - Java SQL provenance recognizes actual Jakarta and javax Servlet request APIs, including parameters, headers, and selected URL components. Request aliases, helper returns, and casts retain their identity through JDBC execution; exact helper overloads use declared API or scoped local-class types so fixed-value overloads stay distinct from request-producing ones. Bound parameters, genuine numeric validation, local API shadows, and application-owned request attributes retain their separate semantics.

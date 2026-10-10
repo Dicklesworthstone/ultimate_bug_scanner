@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.4.38-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.4.39-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -165,6 +165,21 @@ repository declarations or model lazy SQL stream consumption. Unresolved tainted
 calls and exhausted analysis budgets produce an explicit incomplete result while
 preserving findings already established. The separate legacy fragment heuristic
 remains; it is not evidence of complete Ecto query-macro support.
+
+Selected anonymous functions participate in the same request-flow analysis.
+Direct `callback.(...)` invocation and synchronous `Enum.each`/`Enum.map` over
+finite lists carry arguments, captured values and local helper effects into
+the actual sink. A callback retains the value captured when it was created;
+later rebinding does not change that capture. Creating an unused callback does
+not execute its body. The shared callback semantics also let the resource
+analyzer recognize a handle closed through a stored local callback.
+
+Unknown callback targets, deferred execution and external code evaluation remain
+explicit boundaries. Static Erlang module calls are distinguished from dynamic
+module dispatch. Only a bounded, pure arithmetic subset of literal
+`Code.eval_string` payloads is modeled; arbitrary dynamic or call-bearing payloads
+and `Code.eval_file` do not become trusted merely because their arguments are
+literal strings.
 
 #### C# Dapper SQL request flow
 

@@ -380,6 +380,21 @@ class ElixirScopedFlowTests(LoggedCase):
                 self.assertEqual(sorted((row['rule'], row['line']) for row in findings),
                                  [(case.rule, line) for line in case.lines], findings)
 
+    def test_direct_identity_callback_preserves_request_source(self):
+        """This unchanged former boundary is now supported callback coverage."""
+        from ubs_core.analyzers.taint_elixir_redirect import run
+        from ubs_core.registry import RunContext
+        source = 'def handle(conn, params) do\nf = fn value -> value end\nredirect(conn, external: f.(params["next"]))\nend'
+        path = self.artifact / 'direct_identity_callback.ex'
+        path.write_text(source, encoding='utf-8')
+        findings = list(run(RunContext(lang='elixir', files=[path])))
+        self.assertEqual([(row['rule'], row['line'], row['col']) for row in findings],
+                         [('elixir.taint.open_redirect', 3, 1)], findings)
+        self.assertEqual(findings[0]['severity'], 'critical')
+        trace = findings[0]['extras']['taint_path']
+        self.assertEqual((trace[0]['kind'], trace[-1]['kind']), ('source', 'sink'))
+        self.assertEqual((trace[0]['line'], trace[-1]['line'], trace[-1]['col']), (3, 3, 1))
+
     def test_explicit_boundaries_and_budget(self):
         sources = (
             'def handle(conn, params) do\nredirect(conn, external: params["next"])',
@@ -387,7 +402,6 @@ class ElixirScopedFlowTests(LoggedCase):
             'def handle(conn, params) do\nredirect(conn, external: apply(Safe, :validate, [params["next"]]))\nend',
             'defmodule Handler do\nuse CustomMacros\ndef handle(conn, params), do: redirect(conn, external: params["next"])\nend',
             'def handle(conn, params) do\nredirect(conn, external: Unknown.validate(params["next"]))\nend',
-            'def handle(conn, params) do\nf = fn value -> value end\nredirect(conn, external: f.(params["next"]))\nend',
             'defmodule Handler do\nimport Fake, only: [raise: 1]\ndef handle(conn, params) do\nraise(params["next"])\nredirect(conn, external: params["next"])\nend\nend',
             'def handle(conn, params) do\nput_resp_header(conn, params["header"], params["next"])\nend',
         )
@@ -973,6 +987,12 @@ ELIXIR_LIFECYCLE_CASES = (
           finish = fn -> Task.await(task) end
           :ok
         end'''),
+    ElixirLifecycleCase('saved_callback_execution', '''
+        def run do
+          io = File.open!("one.txt")
+          finish = fn -> File.close(io) end
+          finish.()
+        end'''),
 )
 
 
@@ -993,12 +1013,6 @@ ELIXIR_LIFECYCLE_INCOMPLETE = (
         def run do
           io = File.open!("one.txt")
           apply(File, :close, [io])
-        end'''),
-    ElixirLifecycleCase('saved_callback_execution', '''
-        def run do
-          io = File.open!("one.txt")
-          finish = fn -> File.close(io) end
-          finish.()
         end'''),
     ElixirLifecycleCase('unmodeled_collection_callback_ownership', '''
         def run(paths) do

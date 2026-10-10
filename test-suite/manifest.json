@@ -10520,6 +10520,39 @@
       }
     },
     {
+      "id": "elixir-callback-sql-buggy",
+      "description": "Request SQL reaches Ecto execution through direct anonymous calls, immutable captures and finite-list Enum.each callbacks.",
+      "path": "test-suite/elixir/callbacks/sql_buggy.ex",
+      "language": "elixir",
+      "tags": ["elixir", "ecto", "callback", "security", "taint", "buggy"],
+      "args": ["--only=elixir", "--format=json"],
+      "expect": {
+        "exit_code": 1,
+        "totals": {
+          "files": {"min": 1, "max": 1},
+          "critical": {"min": 3, "max": 3},
+          "warning": {"max": 0}
+        },
+        "rule_ids": {"min": {"ex.security.sql-interpolation": 3}}
+      }
+    },
+    {
+      "id": "elixir-callback-sql-clean",
+      "description": "Anonymous Ecto callbacks keep SQL templates fixed and pass request values only as bound parameters.",
+      "path": "test-suite/elixir/callbacks/sql_clean.ex",
+      "language": "elixir",
+      "tags": ["elixir", "ecto", "callback", "security", "taint", "clean"],
+      "args": ["--only=elixir", "--format=json"],
+      "expect": {
+        "exit_code": 0,
+        "totals": {
+          "files": {"min": 1, "max": 1},
+          "critical": {"max": 0},
+          "warning": {"max": 0}
+        }
+      }
+    },
+    {
       "id": "csharp-dapper-buggy",
       "description": "Resolved ASP.NET request values reach Dapper query text through sync, async and local-helper execution; separate bound values do not sanitize SQL text.",
       "path": "test-suite/csharp/security/DapperSqlBuggy.cs",

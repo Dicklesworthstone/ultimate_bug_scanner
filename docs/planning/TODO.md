@@ -56,6 +56,7 @@ The user requested implementation of the reality-check plan and all remaining Be
 
 - [ ] `mj1j.7/.8`: Swift helper/guard proof for exact redirect/path values, literal kills, optional bindings and unrelated guards; actual CLI regressions.
 - [ ] `mj1j.9/.10`: Elixir selected clauses, rebinding, pipelines, case/cond joins and sink-specific validation; explicit unsupported/budget states.
+  - 2026-10-10: selected anonymous functions now preserve lexical captures and argument flow through direct invocation and synchronous finite-list Enum callbacks. Request SQL/path/redirect effects and local resource cleanup share the callback frontend; unused closures do not execute. Dynamic/deferred callbacks and external code evaluation remain explicit incomplete boundaries, so the broader language/framework work stays open.
 - [ ] `mj1j.11/.12`: bounded C/C++ binding/guard proof with macro, overload and preprocessing uncertainty; preserve lifecycle checks and avoid mandatory compiler dependencies.
 - [ ] `mj1j.13/.14`: native Kotlin coroutine/cancellation/job and null-safety rules; structured ownership, dispatcher and shadowing controls; no blanket launch/!! warnings.
 - [ ] `mj1j.17/.18`: Ruby handle/thread and Kotlin resource ownership; normal/exception exits, transfer and double release; joined Ruby collections and Kotlin use{} clean controls.

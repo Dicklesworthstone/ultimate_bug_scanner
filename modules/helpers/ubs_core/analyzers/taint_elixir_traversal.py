@@ -324,6 +324,36 @@ class Parser:
         self.require('end')
         return tuple(clauses)
 
+    def callback(self, token):
+        """Keep anonymous clauses as syntax; creation does not execute them."""
+        clauses = []
+        self.newlines()
+        while self.current.text != 'end':
+            parameters = []
+            if self.current.text != '->':
+                parameters.append(self.expression())
+                while self.accept(','):
+                    parameters.append(self.expression())
+            self.require('->')
+            body = []
+            self.newlines()
+            while self.current.text != 'end' and self.current.kind != 'eof':
+                checkpoint = self.index
+                item = self.expression()
+                if self.current.text in {'->', ','}:
+                    self.index = checkpoint
+                    break
+                body.append(item)
+                if self.current.text == 'end':
+                    break
+                if self.current.kind != 'nl' and self.current.text != ';':
+                    raise ElixirSyntaxError(
+                        f'Unsupported Elixir callback at line {self.current.line}; analysis is incomplete')
+                self.newlines()
+            clauses.append((tuple(parameters), Expr('block', token, args=tuple(body))))
+        self.require('end')
+        return Expr('callback', token, args=tuple(clauses))
+
     def expression(self, minimum=0, bare=True):
         self.depth += 1
         if self.depth > 120:
@@ -333,7 +363,7 @@ class Parser:
         if token.kind in {'string', 'atom', 'number'}:
             interpolations = []
             for embedded in token.interpolations:
-                parser = Parser(embedded, self.budget)
+                parser = type(self)(embedded, self.budget)
                 interpolations.append(parser.block())
             left = Expr(token.kind, token, token.text, tuple(interpolations))
         elif token.text in {'true', 'false', 'nil'}:
@@ -370,7 +400,9 @@ class Parser:
                 self.require('end')
                 clauses = ()
             left = Expr('with', token, args=(tuple(generators), body, clauses))
-        elif token.text in {'defmacro', 'defmacrop', 'quote', 'unquote', 'for', 'receive', 'try', 'fn'}:
+        elif token.text == 'fn':
+            left = self.callback(token)
+        elif token.text in {'defmacro', 'defmacrop', 'quote', 'unquote', 'for', 'receive', 'try'}:
             raise ElixirSyntaxError(f'Elixir {token.text} needs additional flow semantics at line {token.line}; analysis is incomplete')
         elif token.text == '(':
             left = self.expression()
@@ -458,6 +490,8 @@ class Parser:
 
     @staticmethod
     def name(expr):
+        if expr.kind == 'atom':
+            return ':' + expr.value
         if expr.kind == 'name':
             return expr.value
         if expr.kind == 'member':
@@ -518,6 +552,9 @@ class ElixirEngine:
         self.sql_imports: dict[str, dict[tuple[str, int], str]] = {}
         self.sql_repositories: set[str] = set()
         self.effects: dict[tuple[int, int], Fact] = {}
+        self.closures: dict[tuple, tuple] = {}
+        self.closure_keys: dict[tuple, tuple] = {}
+        self.callback_depth = 0
         self.owner, self.context, self.call_stack = '', (), []
         self.function_scope: Function | None = None
 
@@ -619,7 +656,7 @@ class ElixirEngine:
                         raise ElixirSyntaxError(f'Elixir use macro expansion at line {expr.token.line}; analysis is incomplete')
                 elif directive == 'import' and len(expr.args) >= 2:
                     imported = Parser.name(expr.args[1])
-                    if self.policy == 'sql' and self.module_in_scope(imported, owner) == 'Ecto.Adapters.SQL':
+                    if self.module_in_scope(imported, owner) == 'Ecto.Adapters.SQL':
                         self.register_sql_import(expr, owner)
                         continue
                     if imported not in {'Plug.Conn', 'Phoenix.Controller', 'Kernel'}:
@@ -651,7 +688,7 @@ class ElixirEngine:
         return '.'.join((self.aliases.get(owner, {}).get(first, first), *rest))
 
     def register_sql_repository(self, expr, owner):
-        if self.policy != 'sql' or len(expr.args) < 2:
+        if len(expr.args) < 2:
             return False
         if self.module_in_scope(Parser.name(expr.args[1]), owner) != 'Ecto.Repo':
             return False
@@ -727,6 +764,136 @@ class ElixirEngine:
                 args[1] = replace(args[1], kind='request_map')
         return tuple(args)
 
+    @staticmethod
+    def pattern_names(pattern):
+        if pattern.kind == 'name':
+            return {pattern.value} if pattern.value != '_' and not pattern.value[:1].isupper() else set()
+        if pattern.kind == 'unary' and pattern.value == '^':
+            return set()
+        if pattern.kind == 'binary' and pattern.value == 'when':
+            return ElixirEngine.pattern_names(pattern.args[0])
+        return set().union(*(ElixirEngine.pattern_names(item)
+                             for item in pattern.args if isinstance(item, Expr)))
+
+    def capture_reads(self, expr, bound=frozenset()):
+        """Free reads respect assignment order and nested callback/clause scopes."""
+        self.budget.spend()
+        if expr.kind == 'name':
+            return ({expr.value} - set(bound), bound)
+        if expr.kind == 'block':
+            reads, local = set(), set(bound)
+            for item in expr.args:
+                used, local = self.capture_reads(item, local)
+                reads.update(used)
+            return reads, local
+        if expr.kind == 'binary' and expr.value in {'=', '<-'}:
+            reads, local = self.capture_reads(expr.args[1], bound)
+            names = self.pattern_names(expr.args[0])
+            pattern_reads, _ = self.capture_reads(expr.args[0], set(local) | names)
+            return reads | pattern_reads, set(local) | names
+        if expr.kind == 'callback':
+            reads = set()
+            for parameters, body in expr.args:
+                local = set(bound).union(*(self.pattern_names(pattern) for pattern in parameters))
+                for pattern in parameters:
+                    reads.update(self.capture_reads(pattern, local)[0])
+                reads.update(self.capture_reads(body, local)[0])
+            return reads, bound
+        if expr.kind in {'case', 'cond'}:
+            reads = set()
+            if expr.kind == 'case':
+                reads.update(self.capture_reads(expr.args[0], bound)[0])
+                clauses = expr.args[1]
+            else:
+                clauses = expr.args
+            for pattern, body in clauses:
+                local = set(bound) | self.pattern_names(pattern) if expr.kind == 'case' else bound
+                reads.update(self.capture_reads(pattern, local)[0])
+                reads.update(self.capture_reads(body, local)[0])
+            return reads, bound
+        if expr.kind == 'with':
+            generators, body, clauses = expr.args
+            reads, local = set(), bound
+            for generator in generators:
+                used, local = self.capture_reads(generator, local)
+                reads.update(used)
+            reads.update(self.capture_reads(body, local)[0])
+            for pattern, fallback in clauses:
+                selected = set(bound) | self.pattern_names(pattern)
+                reads.update(self.capture_reads(pattern, selected)[0])
+                reads.update(self.capture_reads(fallback, selected)[0])
+            return reads, bound
+        if expr.kind in {'if', 'try'}:
+            reads = set().union(*(self.capture_reads(item, bound)[0] for item in expr.args))
+            return reads, bound
+        reads, local = set(), bound
+        for item in expr.args:
+            if isinstance(item, Expr):
+                used, local = self.capture_reads(item, local)
+                reads.update(used)
+        return reads, local
+
+    def capture_callback(self, expr, state):
+        used, _ = self.capture_reads(expr)
+        captured = tuple(sorted((name, value) for name, value in state.bindings.items() if name in used))
+        key = (self.identity(expr), captured)
+        identity = self.closure_keys.get(key)
+        if identity is None:
+            # Different immutable snapshots at one syntax site must not replace
+            # each other when branches or finite enumeration revisit that site.
+            identity = (*self.identity(expr), 'closure', len(self.closures))
+            self.closure_keys[key] = identity
+            self.closures[identity] = (expr.args, captured, self.owner, self.function_scope, self.context)
+        return Value('callback', identity=identity)
+
+    def callback_unmatched(self, state):
+        """An unmatched anonymous clause raises and has no normal continuation."""
+        return []
+
+    def invoke_callback(self, expr, callback, args, state):
+        if callback.kind != 'callback' or callback.identity not in self.closures:
+            raise ElixirSyntaxError(f'Unknown Elixir callback dispatch at line {expr.token.line}; analysis is incomplete')
+        if self.callback_depth >= 24:
+            raise AnalysisLimit('Elixir callback limit exceeded; analysis is incomplete')
+        clauses, captured, owner, scope, context = self.closures[callback.identity]
+        previous = self.owner, self.function_scope, self.context
+        self.owner, self.function_scope, self.context = owner, scope, (*context, 'callback', expr.token.offset)
+        self.callback_depth += 1
+        pending, outputs = [state], []
+        try:
+            for parameters, body in clauses:
+                if len(parameters) != len(args):
+                    raise ElixirSyntaxError(f'Elixir callback arity mismatch at line {expr.token.line}; analysis is incomplete')
+                following = []
+                for candidate in pending:
+                    selections = [FlowState(dict(captured), dict(candidate.checks))]
+                    possible_failure, bound = False, {}
+                    for pattern, value in zip(parameters, args):
+                        matches = []
+                        for selection in selections:
+                            selected, failed = self.match(pattern, value, selection, bound)
+                            matches.extend(selected)
+                            possible_failure |= failed
+                        selections = matches
+                    if possible_failure or not selections:
+                        following.append(candidate)
+                    for selection in selections:
+                        for after, value in self.sequence(body, selection):
+                            value = replace(value, fact=advance(value.fact, self.step(expr.token, 'call', 'anonymous callback')))
+                            outputs.append((FlowState(dict(state.bindings), after.checks), value))
+                pending = following
+            outputs.extend(outcome for candidate in pending for outcome in self.callback_unmatched(candidate))
+            return self.outcomes(outputs)
+        finally:
+            self.callback_depth -= 1
+            self.owner, self.function_scope, self.context = previous
+
+    def dynamic_call(self, expr, state, prepend=()):
+        results = []
+        for after, values in self.values(expr.args, state):
+            results.extend(self.invoke_callback(expr, values[0], (*prepend, *values[1:]), after))
+        return self.outcomes(results)
+
     def analyze(self):
         # Tokens establish executable vocabulary: strings/comments cannot opt a
         # file into, or out of, the semantic parser.
@@ -769,6 +936,8 @@ class ElixirEngine:
             return self.sequence(expr, state)
         if kind in {'noop', 'function', 'module'}:
             return [(state, Value('nil'))]
+        if kind == 'callback':
+            return [(state, self.capture_callback(expr, state))]
         if kind in {'string', 'atom', 'number', 'literal'}:
             if expr.args:
                 results = []
@@ -851,7 +1020,7 @@ class ElixirEngine:
             return self.binary(expr, state)
         if kind in {'call', 'dynamic_call'}:
             if kind == 'dynamic_call':
-                raise ElixirSyntaxError(f'Dynamic Elixir function dispatch at line {expr.token.line}; analysis is incomplete')
+                return self.dynamic_call(expr, state)
             return self.call(expr, state)
         if kind == 'if':
             condition, positive, negative = expr.args
@@ -909,6 +1078,9 @@ class ElixirEngine:
         if expr.value == '|>':
             results = []
             for after, value in self.evaluate(left, state):
+                if right.kind == 'dynamic_call':
+                    results.extend(self.dynamic_call(right, after, (value,)))
+                    continue
                 call = right if right.kind == 'call' else Expr('call', right.token, args=(right,))
                 results.extend(self.call(call, after, (value,)))
             return self.outcomes(results)
@@ -1268,6 +1440,68 @@ class ElixirEngine:
         key = (expr.token.line, expr.token.col)
         self.effects[key] = join(self.effects.get(key, CLEAN), fact)
 
+    def has_callback(self, value):
+        self.budget.spend()
+        if value.kind == 'callback':
+            return True
+        if value.kind == 'map':
+            return any(self.has_callback(item) for _, item in value.items)
+        if value.kind in {'tuple', 'list', 'pair', 'map_pair', 'set'}:
+            return any(self.has_callback(item) for item in value.items)
+        return False
+
+    def enumerate_callback(self, expr, name, args, state):
+        if len(args) != 2 or args[0].kind != 'list':
+            raise ElixirSyntaxError(f'Unknown Elixir Enum.{name} collection at line {expr.token.line}; analysis is incomplete')
+        collection, callback = args
+        if callback.kind != 'callback' or callback.identity not in self.closures:
+            raise ElixirSyntaxError(f'Unknown Elixir Enum.{name} callback at line {expr.token.line}; analysis is incomplete')
+        pending = [(state, ())]
+        for item in collection.items:
+            self.budget.spend()
+            following = []
+            for before, values in pending:
+                for after, value in self.invoke_callback(expr, callback, (item,), before):
+                    following.append((after, (*values, value) if name == 'map' else ()))
+            if len(following) > 512:
+                raise AnalysisLimit('Elixir enumeration state limit exceeded; analysis is incomplete')
+            pending = following
+        return self.outcomes((after, self.derive(expr, values, 'list', items=values)
+                              if name == 'map' else Value('atom', 'ok')) for after, values in pending)
+
+    def pure_literal_value(self, node, call):
+        """Prove a tiny constant AST pure without executing its arithmetic."""
+        self.budget.spend()
+        if node.kind == 'block':
+            value = Value('nil')
+            for child in node.args:
+                value = self.pure_literal_value(child, call)
+            return value
+        if node.kind == 'number':
+            # Numeric magnitude is irrelevant to the absence of request/call
+            # effects. Never calculate attacker-supplied arithmetic here.
+            return Value('number')
+        if node.kind in {'string', 'atom'} and not node.args:
+            return Value(node.kind, node.value)
+        if node.kind == 'literal':
+            return Value('nil') if node.value == 'nil' else Value('bool', node.value == 'true')
+        if ((node.kind == 'unary' and node.value in {'+', '-'})
+                or (node.kind == 'binary' and node.value in {'+', '-', '*'})):
+            values = tuple(self.pure_literal_value(child, call) for child in node.args)
+            if all(value.kind == 'number' for value in values):
+                return Value('number')
+        raise ElixirSyntaxError(f'Code.eval_string payload is outside pure literal arithmetic at line '
+                                f'{call.token.line}; analysis is incomplete')
+
+    def literal_eval(self, expr, args, state):
+        if len(args) != 1 or args[0].fact or not isinstance(args[0].literal, str):
+            raise ElixirSyntaxError(f'Dynamic Code.eval_string payload at line {expr.token.line}; analysis is incomplete')
+        program = Parser(tokenize(args[0].literal, self.budget), self.budget).block()
+        value = self.pure_literal_value(program, expr)
+        # Code.eval_string/1 returns the evaluated value and its binding list.
+        result = Value('tuple', identity=self.identity(expr), items=(value, Value('list')))
+        return [(state, result)]
+
     def builtin(self, expr, module, name, args, state, qualified):
         canonical = f'{module}.{name}' if qualified else name
         options = [value for value in args if value.kind == 'pair']
@@ -1276,26 +1510,32 @@ class ElixirEngine:
                 options.extend(value.items)
         keywords = {value.literal: value.items[0] for value in options}
         positional = tuple(value for value in args if value.kind != 'pair')
+        if canonical in {'Enum.each', 'Enum.map'} and module not in self.attributes:
+            return self.enumerate_callback(expr, name, args, state)
+        if canonical == 'Code.eval_string' and module not in self.attributes:
+            return self.literal_eval(expr, args, state)
+        # The selected Ecto declarations and calls have the same identity for
+        # every shared policy. Only SQL turns the query operand into a sink.
+        arity = len(positional) + any(value.kind == 'pair' for value in args)
+        sql_module = module
+        if not qualified:
+            imports = dict(self.function_scope.sql_imports) if self.function_scope is not None else self.sql_imports.get(self.owner, {})
+            sql_module = imports.get((name, arity), '')
+        direct = sql_module == 'Ecto.Adapters.SQL' and sql_module not in self.attributes
+        repository = sql_module in self.sql_repositories
+        if (direct or repository) and name in SQL_CALLS | {'stream'}:
+            position = 1 if direct else 0
+            if not position + 1 <= arity <= position + 3 or len(positional) <= position:
+                raise ElixirSyntaxError(f'Unresolved Ecto SQL arity at line {expr.token.line}; analysis is incomplete')
+            query = positional[position]
+            if name == 'stream':
+                if query.fact:
+                    raise ElixirSyntaxError(f'Lazy Ecto SQL stream needs consumption analysis at line {expr.token.line}; analysis is incomplete')
+            elif self.policy == 'sql':
+                self.sink(expr, query, state, f'{sql_module}.{name}')
+            # SQL result rows are not the query operand or its parameters.
+            return [(state, Value(identity=self.identity(expr)))]
         if self.policy == 'sql':
-            arity = len(positional) + any(value.kind == 'pair' for value in args)
-            sql_module = module
-            if not qualified:
-                imports = dict(self.function_scope.sql_imports) if self.function_scope is not None else self.sql_imports.get(self.owner, {})
-                sql_module = imports.get((name, arity), '')
-            direct = sql_module == 'Ecto.Adapters.SQL' and sql_module not in self.attributes
-            repository = sql_module in self.sql_repositories
-            if (direct or repository) and name in SQL_CALLS | {'stream'}:
-                position = 1 if direct else 0
-                if not position + 1 <= arity <= position + 3 or len(positional) <= position:
-                    raise ElixirSyntaxError(f'Unresolved Ecto SQL arity at line {expr.token.line}; analysis is incomplete')
-                query = positional[position]
-                if name == 'stream':
-                    if query.fact:
-                        raise ElixirSyntaxError(f'Lazy Ecto SQL stream needs consumption analysis at line {expr.token.line}; analysis is incomplete')
-                else:
-                    self.sink(expr, query, state, f'{sql_module}.{name}')
-                # SQL result rows are not the query operand or its parameters.
-                return [(state, Value(identity=self.identity(expr)))]
             if canonical == 'String.to_integer' and module not in self.attributes and len(positional) in {1, 2}:
                 # A successful conversion yields an integer; a failed one raises.
                 # Preserve byte provenance for iodata; rendering the number as
@@ -1304,8 +1544,10 @@ class ElixirEngine:
         imported = dict(self.function_scope.imports) if self.function_scope is not None else self.imports.get(self.owner, {})
         if not qualified and (name in imported or '*' in imported):
             raise ElixirSyntaxError(f'Unresolved imported Elixir call {name} at line {expr.token.line}; analysis is incomplete')
-        if canonical in {'apply', 'Kernel.apply', 'Code.eval_string', 'Code.eval_quoted', 'Module.eval_quoted'}:
-            raise ElixirSyntaxError(f'Dynamic Elixir execution at line {expr.token.line}; analysis is incomplete')
+        if canonical in {'apply', 'Kernel.apply', ':erlang.apply', 'Code.eval_string', 'Code.eval_file',
+                         'Code.eval_quoted', 'Module.eval_quoted'}:
+            raise ElixirSyntaxError(f'Dynamic or external Elixir execution {canonical} at line '
+                                    f'{expr.token.line}; analysis is incomplete')
         if canonical in {'raise', 'throw', 'exit', 'Kernel.raise', 'Kernel.throw', 'Kernel.exit'}:
             return []
         if canonical in {'redirect', 'Phoenix.Controller.redirect'}:
@@ -1413,6 +1655,9 @@ class ElixirEngine:
             return [(state, positional[0] if positional else Value())]
         if canonical in {'String.trim', 'String.trim_leading', 'String.trim_trailing', 'String.replace', 'String.downcase', 'String.upcase', 'URI.decode', 'URI.decode_www_form', 'URI.encode', 'URI.encode_www_form', 'to_string', 'Kernel.to_string', 'Path.relative_to', 'Path.relative', 'Enum.join', 'List.to_string'}:
             return [(state, self.derive(expr, positional))]
+        if any(self.has_callback(value) for value in args):
+            raise ElixirSyntaxError(f'Deferred or unknown Elixir callback consumer {canonical} at line '
+                                    f'{expr.token.line}; analysis is incomplete')
         if any(value.fact for value in positional) or any(value.kind in {'conn', 'request_map'} for value in positional):
             raise ElixirSyntaxError(f'Unresolved Elixir call {canonical} at line {expr.token.line}; analysis is incomplete')
         return [(state, Value(identity=self.identity(expr)))]

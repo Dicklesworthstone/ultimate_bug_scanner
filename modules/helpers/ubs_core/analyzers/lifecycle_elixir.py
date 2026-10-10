@@ -1,8 +1,8 @@
 """Bounded Elixir resource obligations for actual bindings and exits.
 
 The request-flow frontend already owns Elixir tokens, immutable values,
-matching, lexical scopes and selected same-module calls. This analyzer reuses
-those semantics, adding callback and try/after syntax and a resource state
+matching, lexical scopes, local callbacks and selected same-module calls. This
+analyzer reuses those semantics, adding try/after syntax and a resource state
 carried alongside each path. A cleanup consumes only the object passed to it.
 Unknown ownership transfers and exhausted analysis remain explicit errors.
 """
@@ -33,48 +33,17 @@ _EXIT = ('lifecycle.exit',)
 
 
 class LifecycleParser(Parser):
-    """Add selected anonymous callbacks and try/after to the shared grammar."""
-
-    def callback(self, token):
-        clauses = []
-        self.newlines()
-        while self.current.text != 'end':
-            parameters = []
-            if self.current.text != '->':
-                parameters.append(self.expression())
-                while self.accept(','):
-                    parameters.append(self.expression())
-            self.require('->')
-            body = []
-            self.newlines()
-            while self.current.text != 'end' and self.current.kind != 'eof':
-                checkpoint = self.index
-                item = self.expression()
-                if self.current.text in {'->', ','}:
-                    self.index = checkpoint
-                    break
-                body.append(item)
-                if self.current.text == 'end':
-                    break
-                if self.current.kind != 'nl' and self.current.text != ';':
-                    raise ElixirSyntaxError(
-                        f'Unsupported Elixir callback at line {self.current.line}; analysis is incomplete')
-                self.newlines()
-            clauses.append((tuple(parameters), Expr('block', token, args=tuple(body))))
-        self.require('end')
-        return Expr('callback', token, args=tuple(clauses))
+    """Add selected try/after to the shared callback grammar."""
 
     def expression(self, minimum=0, bare=True):
         self.newlines()
-        if self.current.text not in {'fn', 'try'}:
+        if self.current.text != 'try':
             return super().expression(minimum, bare)
         self.depth += 1
         if self.depth > 120:
             raise AnalysisLimit('Elixir lifecycle syntax nesting limit exceeded; analysis is incomplete')
         token = self.take()
         try:
-            if token.text == 'fn':
-                return self.callback(token)
             self.require('do')
             body = self.block(frozenset({'after', 'rescue', 'catch', 'else', 'end'}))
             if self.current.text in {'rescue', 'catch', 'else'}:
@@ -105,10 +74,8 @@ class ElixirLifecycleEngine(ElixirEngine):
         self.families = families
         self.acquisitions: dict[tuple, Acquisition] = {}
         self.binding_names: dict[tuple, str] = {}
-        self.closures: dict[tuple, tuple] = {}
         self.leaks: dict[tuple, dict] = {}
         self.sequence_depth = 0
-        self.callback_depth = 0
         self.worker_depth = 0
 
     @staticmethod
@@ -231,49 +198,6 @@ class ElixirLifecycleEngine(ElixirEngine):
     def entry_arguments(self, function):
         return tuple(self.seed(pattern) for pattern in function.parameters)
 
-    @staticmethod
-    def call_name(callee):
-        if callee.kind == 'atom':
-            return ':' + callee.value
-        if callee.kind == 'member':
-            return ElixirLifecycleEngine.call_name(callee.args[0]) + '.' + callee.value
-        return Parser.name(callee)
-
-    def register_block(self, block, owner=''):
-        # Erlang module atoms are static names, not dynamic dispatch. Normalize
-        # their top-level call heads for the shared declaration collector.
-        statements = []
-        for expr in block.args:
-            if expr.kind == 'call':
-                name = self.call_name(expr.args[0])
-                if name.startswith(':'):
-                    callee = Expr('name', expr.args[0].token, name)
-                    expr = Expr('call', expr.token, args=(callee, *expr.args[1:]))
-            statements.append(expr)
-        return super().register_block(Expr('block', block.token, args=tuple(statements)), owner)
-
-    def call(self, expr, state, prepend=()):
-        name = self.call_name(expr.args[0])
-        if '.' in name:
-            module, function_name = name.rsplit('.', 1)
-            if module.split('.')[0] in state.bindings:
-                raise ElixirSyntaxError(f'Dynamic Elixir module dispatch at line '
-                                        f'{expr.token.line}; analysis is incomplete')
-            module = self.resolve_module(module)
-        else:
-            module, function_name = self.owner, name
-        results = []
-        for after, values in self.values(expr.args[1:], state):
-            args = (*prepend, *values)
-            first_keyword = next((index for index, value in enumerate(args) if value.kind == 'pair'), len(args))
-            selected = (*args[:first_keyword], Value('list', items=args[first_keyword:])) if first_keyword < len(args) else args
-            key = (module, function_name, len(selected))
-            if key in self.functions:
-                results.extend(self.invoke(key, selected, after, expr))
-            else:
-                results.extend(self.builtin(expr, module, function_name, args, after, '.' in name))
-        return self.outcomes(results)
-
     def analyze(self):
         pending, names = [self.tokens], set()
         while pending:
@@ -354,85 +278,9 @@ class ElixirLifecycleEngine(ElixirEngine):
                 return [state.copy()] if (first.identity == second.identity) == truth else []
         return super()._refine(predicate, state, truth)
 
-    @staticmethod
-    def pattern_names(pattern):
-        if pattern.kind == 'name':
-            return {pattern.value} if pattern.value != '_' and not pattern.value[:1].isupper() else set()
-        if pattern.kind == 'unary' and pattern.value == '^':
-            return set()
-        if pattern.kind == 'binary' and pattern.value == 'when':
-            return ElixirLifecycleEngine.pattern_names(pattern.args[0])
-        return set().union(*(ElixirLifecycleEngine.pattern_names(item)
-                             for item in pattern.args if isinstance(item, Expr)))
-
-    def capture_reads(self, expr, bound=frozenset()):
-        """Free reads respect assignment order and nested callback/clause scopes."""
-        self.budget.spend()
-        if expr.kind == 'name':
-            return ({expr.value} - set(bound), bound)
-        if expr.kind == 'block':
-            reads, local = set(), set(bound)
-            for item in expr.args:
-                used, local = self.capture_reads(item, local)
-                reads.update(used)
-            return reads, local
-        if expr.kind == 'binary' and expr.value in {'=', '<-'}:
-            reads, local = self.capture_reads(expr.args[1], bound)
-            names = self.pattern_names(expr.args[0])
-            pattern_reads, _ = self.capture_reads(expr.args[0], set(local) | names)
-            return reads | pattern_reads, set(local) | names
-        if expr.kind == 'callback':
-            reads = set()
-            for parameters, body in expr.args:
-                local = set(bound).union(*(self.pattern_names(pattern) for pattern in parameters))
-                for pattern in parameters:
-                    reads.update(self.capture_reads(pattern, local)[0])
-                reads.update(self.capture_reads(body, local)[0])
-            return reads, bound
-        if expr.kind in {'case', 'cond'}:
-            reads = set()
-            if expr.kind == 'case':
-                reads.update(self.capture_reads(expr.args[0], bound)[0])
-                clauses = expr.args[1]
-            else:
-                clauses = expr.args
-            for pattern, body in clauses:
-                local = set(bound) | self.pattern_names(pattern) if expr.kind == 'case' else bound
-                reads.update(self.capture_reads(pattern, local)[0])
-                reads.update(self.capture_reads(body, local)[0])
-            return reads, bound
-        if expr.kind == 'with':
-            generators, body, clauses = expr.args
-            reads, local = set(), bound
-            for generator in generators:
-                used, local = self.capture_reads(generator, local)
-                reads.update(used)
-            reads.update(self.capture_reads(body, local)[0])
-            for pattern, fallback in clauses:
-                selected = set(bound) | self.pattern_names(pattern)
-                reads.update(self.capture_reads(pattern, selected)[0])
-                reads.update(self.capture_reads(fallback, selected)[0])
-            return reads, bound
-        if expr.kind in {'if', 'try'}:
-            reads = set().union(*(self.capture_reads(item, bound)[0] for item in expr.args))
-            return reads, bound
-        reads, local = set(), bound
-        for item in expr.args:
-            if isinstance(item, Expr):
-                used, local = self.capture_reads(item, local)
-                reads.update(used)
-        return reads, local
-
     def evaluate(self, expr, state):
         if self.terminated(state):
             return [(state, Value('exception', self.exception(state)[0]))]
-        if expr.kind == 'callback':
-            identity = self.identity(expr)
-            used, _ = self.capture_reads(expr)
-            captured = tuple((name, value) for name, value in state.bindings.items() if name in used)
-            self.closures[identity] = (expr.args, captured,
-                                       self.owner, self.function_scope, self.context)
-            return [(state, Value('callback', identity=identity))]
         if expr.kind == 'try':
             outputs = []
             body, finalizer = expr.args
@@ -460,43 +308,15 @@ class ElixirLifecycleEngine(ElixirEngine):
             return self.outcomes(outputs)
         return super().evaluate(expr, state)
 
+    def callback_unmatched(self, state):
+        return [self.terminate(state)]
+
     def invoke_callback(self, expr, callback, args, state):
-        if self.callback_depth >= 24:
-            raise AnalysisLimit('Elixir lifecycle callback limit exceeded; analysis is incomplete')
-        clauses, captured, owner, scope, context = self.closures[callback.identity]
-        previous = self.owner, self.function_scope, self.context
-        self.owner, self.function_scope, self.context = owner, scope, (*context, 'callback', expr.token.offset)
         inherited = self.opened(state)
-        self.callback_depth += 1
-        pending, outputs = [state], []
-        try:
-            for parameters, body in clauses:
-                if len(parameters) != len(args):
-                    raise ElixirSyntaxError(f'Elixir callback arity mismatch at line '
-                                            f'{expr.token.line}; analysis is incomplete')
-                following = []
-                for candidate in pending:
-                    selections = [FlowState(dict(captured), dict(candidate.checks))]
-                    possible_failure, bound = False, {}
-                    for pattern, value in zip(parameters, args):
-                        matches = []
-                        for selection in selections:
-                            selected, failed = self.match(pattern, value, selection, bound)
-                            matches.extend(selected)
-                            possible_failure |= failed
-                        selections = matches
-                    if possible_failure or not selections:
-                        following.append(candidate)
-                    for selection in selections:
-                        for after, value in self.sequence(body, selection):
-                            self.observe(after, value, inherited)
-                            outputs.append((FlowState(dict(state.bindings), after.checks), value))
-                pending = following
-            outputs.extend(self.terminate(candidate) for candidate in pending)
-            return self.outcomes(outputs)
-        finally:
-            self.callback_depth -= 1
-            self.owner, self.function_scope, self.context = previous
+        results = super().invoke_callback(expr, callback, args, state)
+        for after, value in results:
+            self.observe(after, value, inherited)
+        return results
 
     def task_body(self, expr, module, args, state):
         """The worker's resources do not become caller cleanup effects."""
@@ -651,7 +471,7 @@ class ElixirLifecycleEngine(ElixirEngine):
         if canonical in {'Map.get', 'Map.fetch', 'Map.fetch!', 'Keyword.get', 'Keyword.fetch',
                          'Keyword.fetch!', 'List.first', 'hd', 'Kernel.hd', 'elem', 'Kernel.elem',
                          'get_in', 'is_binary', 'is_map', 'is_list', 'is_atom', 'is_integer',
-                         'is_nil', 'is_tuple'}:
+                         'is_nil', 'is_tuple', 'Enum.each', 'Enum.map'}:
             return super().builtin(expr, module, name, args, state, qualified)
         if any(self.references(arg) & self.opened(state) for arg in args):
             raise ElixirSyntaxError(f'Unresolved Elixir resource or callback call {canonical} at line '

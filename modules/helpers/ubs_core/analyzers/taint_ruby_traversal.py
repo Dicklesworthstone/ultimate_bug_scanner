@@ -3,8 +3,9 @@
 The two policies share Ruby syntax, local bindings, a finite CFG solver and
 argument-sensitive summaries. Unknown helper names propagate their arguments;
 only the operations and dominating checks in a visible body establish safety.
-Dynamic execution and request-derived state escaping a method are incomplete
-analysis, never evidence that a scan is clean.
+Request-derived execution is a terminal security sink. Static send targets
+reuse ordinary call summaries; unresolved dispatch with request arguments and
+request-derived state escaping a method remain explicit incomplete analysis.
 """
 from __future__ import annotations
 
@@ -46,7 +47,13 @@ SINK_RE = re.compile(
     r'|\brender\s+(?:file|template):',
 )
 PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path'})
-VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name'})
+VALUE_TAGS = PROOF_TAGS | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal'})
+PATH_RULE = 'ruby.taint.path_traversal'
+URL_RULE = 'ruby.taint.outbound_url'
+EVAL_RULE = 'ruby.security.eval-family'
+DISPATCH_RULE = 'ruby.security.dynamic-dispatch'
+COMMAND_RULE = 'ruby.security.backticks-interpolated'
+EXECUTION_RULES = frozenset({EVAL_RULE, DISPATCH_RULE, COMMAND_RULE})
 RUBY_EXCEPTION_BASES = {
     'Exception': None, 'StandardError': 'Exception', 'RuntimeError': 'StandardError',
     'ArgumentError': 'StandardError', 'TypeError': 'StandardError', 'IOError': 'StandardError',
@@ -740,7 +747,8 @@ def tainted(fact):
 
 
 def constant(value, kind='literal'):
-    return frozenset({Trace('constant', (kind, value))})
+    tags = frozenset({'exact-literal'}) if kind in {'literal', 'symbol'} else frozenset()
+    return frozenset({Trace('constant', (kind, value), tags=tags)})
 
 
 def shape(kind, offset):
@@ -768,6 +776,7 @@ class RubyEngine:
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
         self.contexts, self.summaries = {}, {}
+        self.dispatch_failures = {}
         self.pending_raises = CLEAN
         self.constants = {}
         # Only unconditional, literal constant definitions can be an allowlist
@@ -830,6 +839,9 @@ class RubyEngine:
         tokens = ungroup(tokens)
         if len(tokens) >= 2 and token_text(tokens[-2:]) == '.freeze':
             tokens = tokens[:-2]
+        if (len(tokens) == 2 and tokens[0].value == ':'
+                and tokens[1].kind in {'code', 'literal'}):
+            return constant(tokens[1].value, 'symbol')
         if len(tokens) == 1:
             token = tokens[0]
             if token.kind in {'literal', 'number'} or token.value in {'nil', 'true', 'false'}:
@@ -1001,7 +1013,39 @@ class RubyEngine:
                                          or re.fullmatch(r'(?:File|IO)\.(?:read|binread|write|binwrite|open|truncate)', operation))))
         if unsafe:
             label = 'file sink' if self.policy == 'path' else 'outbound URL sink'
-            self.effects[offset] = join(self.effects.get(offset, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
+            site = (PATH_RULE if self.policy == 'path' else URL_RULE, offset)
+            self.effects[site] = join(self.effects.get(site, CLEAN), advance(unsafe, self.step(offset, 'sink', label)))
+
+    def execution_sink(self, offset, value, rule, operation, state):
+        """Report the known hazard without interpreting attacker-controlled code.
+
+        The path pass owns execution findings so the URL pass cannot double
+        count them. Runtime code and method bodies are outside this terminal
+        boundary, but their result remains untrusted and existing validation
+        proofs cannot survive arbitrary execution in the current context.
+        """
+        if self.policy == 'path':
+            site = (rule, offset)
+            evidence = advance(tainted(value), self.step(offset, 'sink', operation))
+            self.effects[site] = join(self.effects.get(site, CLEAN), evidence)
+        for binding, fact in tuple(state.items()):
+            state[binding] = retag(fact, remove=VALUE_TAGS)
+        return self.fresh(retag(value, remove=VALUE_TAGS), 'unknown', offset)
+
+    def dispatch_target(self, value):
+        """Only a proved, unchanged string/symbol identifies a selected method."""
+        names = {trace.key[1] for trace in value
+                 if trace.kind == 'constant' and trace.key[0] in {'literal', 'symbol'}}
+        if len(names) != 1:
+            return None
+        for trace in value:
+            if (trace.kind == 'constant' and trace.key[0] in {'literal', 'symbol'}
+                    and 'exact-literal' in trace.tags):
+                continue
+            if trace.kind == 'object' and trace.key[0] == 'string':
+                continue
+            return None
+        return next(iter(names))
 
     def mutate(self, previous, value, state, name=None, overwrite=False):
         """Update object aliases; copied data does not imply shared identity.
@@ -1057,6 +1101,7 @@ class RubyEngine:
         return changed
 
     def call(self, name, receiver, arguments, token, state):
+        self.budget.spend()
         candidates = self.candidates(name, len(arguments))
         instances = {trace.key[0] for trace in receiver if trace.kind == 'instance'}
         if instances:
@@ -1120,8 +1165,25 @@ class RubyEngine:
         if method in {'[]', 'fetch', 'first', 'last', 'at'} and any(
                 trace.kind == 'object' and trace.key[0] == 'array' for trace in receiver):
             return self.elements(receiver)
-        if method in {'eval', 'instance_eval', 'class_eval', 'module_eval', 'send', 'public_send', '__send__', 'define_method'} and tainted(value):
-            raise ValueError(f'{self.path}:{self.step(token.start, "call", name).line}: Request-derived dynamic Ruby execution needs dispatch analysis; analysis is incomplete')
+        if method in {'send', 'public_send', '__send__'} and arguments:
+            selector, forwarded = arguments[0], arguments[1:]
+            if tainted(selector):
+                return self.execution_sink(token.start, selector, DISPATCH_RULE,
+                                           name + ' request-selected method', state)
+            target = self.dispatch_target(selector)
+            if target is not None:
+                dispatched = name.rsplit('.', 1)[0] + '.' + target if '.' in name else target
+                return self.call(dispatched, receiver, forwarded, token, state)
+            if tainted(join(receiver, *forwarded)):
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", name).line}: '
+                    'Ruby dispatch target is unresolved for request-derived arguments; analysis is incomplete')
+        if method in {'eval', 'instance_eval', 'class_eval', 'module_eval'} and arguments and tainted(arguments[0]):
+            return self.execution_sink(token.start, arguments[0], EVAL_RULE,
+                                       name + ' request-derived code', state)
+        if method == 'define_method' and arguments and tainted(arguments[0]):
+            return self.execution_sink(token.start, arguments[0], DISPATCH_RULE,
+                                       name + ' request-selected definition', state)
         if name == 'Rack::Request.new':
             return shape('request', token.start)
         if method in {'fetch', 'dig', '[]'} and (has_shape(receiver, 'request-params') or has_shape(receiver, 'request-headers') or has_shape(receiver, 'environment')):
@@ -1233,7 +1295,8 @@ class RubyEngine:
             if token.kind in {'template', 'dynamic'}:
                 atom = retag(join(*(self.expression(part, state, depth + 1) for part in token.parts)), remove=VALUE_TAGS)
                 if token.kind == 'dynamic' and tainted(atom):
-                    raise ValueError('Request-derived Ruby command interpolation needs execution analysis; analysis is incomplete')
+                    atom = self.execution_sink(token.start, atom, COMMAND_RULE,
+                                               'request-derived shell command', state)
                 atom = self.fresh(atom, 'string', token.start)
                 cursor += 1
                 name = ''
@@ -1252,7 +1315,10 @@ class RubyEngine:
                 while cursor + 1 < len(tokens) and tokens[cursor].value == '::':
                     name += '::' + tokens[cursor + 1].value
                     cursor += 2
-                atom = state.get(name, CLEAN)
+                constant_receiver = (name[0].isupper() and cursor < len(tokens)
+                                     and tokens[cursor].value in {'.', '&.'})
+                atom = state.get(name, CLEAN if constant_receiver
+                                 else shape('unresolved-value', token.start))
                 if cursor < len(tokens) and tokens[cursor].value == '(':
                     end = closing_token(tokens, cursor)
                     arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
@@ -1742,6 +1808,7 @@ class RubyEngine:
             for key, function in contexts:
                 self.budget.spend()
                 self.function, self.effects, self.returned, self.mutations, self.raised = function, {}, CLEAN, {}, CLEAN
+                self.unresolved_calls = set()
                 self.parameter_values = dict(enumerate(key[1]))
                 state = {'@reachable': constant('reachable'),
                          'params': shape('request-params', function.key), 'env': shape('environment', function.key),
@@ -1758,17 +1825,19 @@ class RubyEngine:
                     self.graphs[function.key] = self.graph(function)
                 entry, actions, edges = self.graphs[function.key]
                 solve(entry, state, edges, lambda node, incoming: self.transfer(actions[node], incoming), self.budget)
+                self.dispatch_failures[key] = self.unresolved_calls
                 updated = self.summaries[key].merged(RubySummary(self.returned, self.effects, self.mutations, self.raised))
                 if updated != self.summaries[key]:
                     self.summaries[key], changed = updated, True
             changed = changed or len(contexts) != len(self.contexts)
         effects = {}
         for summary in self.summaries.values():
-            for offset, fact in summary.effects.items():
+            for (rule, offset), fact in summary.effects.items():
                 concrete = frozenset(trace for trace in fact if trace.kind == 'source')
                 if concrete:
                     line = self.step(offset, 'sink', '').line
-                    effects[line] = join(effects.get(line, CLEAN), concrete)
+                    site = (rule, line)
+                    effects[site] = join(effects.get(site, CLEAN), concrete)
         return effects
 
 
@@ -1780,21 +1849,31 @@ def flow_findings(path, policy):
     engine = RubyEngine(path, text, policy)
     lines = text.splitlines()
     suppressions = build_index(text, lang='ruby')
-    rule = 'ruby.taint.path_traversal' if policy == 'path' else 'ruby.taint.outbound_url'
-    for line, fact in sorted(engine.analyze().items()):
+    for (rule, line), fact in sorted(engine.analyze().items()):
         if suppressions.is_suppressed(line, rule):
             continue
         evidence = min((trace.evidence for trace in fact), key=lambda steps: (len(steps), steps))
         route = ' -> '.join(step.label for step in evidence)
-        yield line, f'{source_line(lines, line)}  [{route}]', {
+        extras = {
             'taint_path': [step.record() for step in evidence],
             'source_count': len({trace.key for trace in fact}),
         }
+        if rule in EXECUTION_RULES:
+            extras['terminal_sink'] = True
+            extras['analysis_boundary'] = 'Request-derived execution is reported at this call; runtime code and dispatch bodies are not interpreted.'
+        yield rule, line, f'{source_line(lines, line)}  [{route}]', extras
+    # A helper may first have an empty summary before the fixed point proves a
+    # constant dispatch target. Check only the final contexts, after yielding
+    # independent findings so genuine incompleteness does not erase evidence.
+    failures = set().union(*engine.dispatch_failures.values())
+    if failures:
+        raise ValueError('; '.join(sorted(failures)))
 
 
 def analyze(path, issues):
-    for line, code, extras in flow_findings(path, 'path'):
-        issues.append((relpath(path), line, code))
+    for rule, line, code, extras in flow_findings(path, 'path'):
+        if rule == PATH_RULE:
+            issues.append((relpath(path), line, code))
 
 
 def _configure(root: Path) -> None:
@@ -1831,16 +1910,16 @@ def run(ctx: RunContext) -> Iterable[dict]:
     for path in ctx.files:
         if not path.is_file() or path.suffix.lower() not in EXTS:
             continue
-        for line_no, code, extras in flow_findings(path, 'path'):
+        for rule, line_no, code, extras in flow_findings(path, 'path'):
             yield {
-                "rule": "ruby.taint.path_traversal",
+                "rule": rule,
                 "path": relpath(path),
                 "line": line_no,
                 "col": 1,
                 "layer": "taint",
                 "lang": "ruby",
                 "severity": "critical",
-                "message": f"{MESSAGE}: {code}",
+                "message": f"{'Request-derived Ruby execution' if rule in EXECUTION_RULES else MESSAGE}: {code}",
                 "extras": extras,
             }
 

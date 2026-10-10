@@ -29,6 +29,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ### Fixed
 
+- Request-controlled Ruby eval-family calls, dynamic method selectors, and shell interpolation produce critical execution findings with source evidence. Static string and symbol selectors follow ordinary call analysis only while their literal identity remains unchanged; unresolved dispatch remains explicit partial analysis. Runtime execution invalidates validation proofs, and matching lexical alerts are qualified into one counted finding across cold scans, cache replay, JSON, and SARIF.
+
 - Bound JavaScript taint heap work per sink domain and selected import component, including copies, state joins, allocation translation, and materialization. Pathological expansion produces explicit incomplete analysis with retained findings instead of consuming unbounded time and memory; ordinary field-sensitive and sink-free analyses retain their behavior.
 
 - JavaScript analyzer exceptions preserve findings already emitted, continue the remaining registered analyzers, and produce explicit partial results with accurate file counts. Incomplete scans are never saved as successful cache entries; direct callers without an error collector still receive the exception.

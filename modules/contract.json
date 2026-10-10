@@ -126,7 +126,7 @@
     {
       "flag": "--only",
       "value": "CSV",
-      "modules": ["bash", "cpp", "csharp", "elixir", "java", "kotlin", "ruby", "rust", "swift"],
+      "modules": ["bash", "cpp", "csharp", "elixir", "java", "kotlin", "php", "ruby", "rust", "swift"],
       "documented": false,
       "doc": "run only these category numbers"
     },
@@ -141,13 +141,14 @@
         "java",
         "js",
         "kotlin",
+        "php",
         "python",
         "ruby",
         "rust",
         "swift"
       ],
       "documented": true,
-      "doc": "merge custom ast-grep rules into the built-in pack (all modules)"
+      "doc": "run custom ast-grep rules alongside the module's native checks (all modules)"
     },
     {
       "flag": "--list-rules",
@@ -160,13 +161,14 @@
         "java",
         "js",
         "kotlin",
+        "php",
         "python",
         "ruby",
         "rust",
         "swift"
       ],
       "documented": true,
-      "doc": "print generated ast-grep rule ids and exit (all modules)"
+      "doc": "print generated ast-grep rule ids (native security ids for PHP) and exit"
     },
     {
       "flag": "--dump-rules",
@@ -186,18 +188,18 @@
         "swift"
       ],
       "documented": true,
-      "doc": "write the generated ast-grep rules to DIR (same modules as --list-rules)"
+      "doc": "write generated ast-grep rules to DIR (bash, cpp, csharp, elixir, golang, java, js, kotlin, python, ruby, rust, swift)"
     },
     {
       "flag": "--list-categories",
-      "modules": ["bash", "cpp", "csharp", "kotlin", "python", "rust", "swift"],
+      "modules": ["bash", "cpp", "csharp", "kotlin", "php", "python", "rust", "swift"],
       "documented": true,
-      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin)"
+      "doc": "print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin, php)"
     },
     {
       "flag": "--summary-json",
       "value": "FILE",
-      "modules": ["bash", "csharp", "elixir", "kotlin", "python", "ruby", "rust", "swift"],
+      "modules": ["bash", "csharp", "elixir", "kotlin", "php", "python", "ruby", "rust", "swift"],
       "documented": false,
       "doc": "write summary JSON to FILE"
     },
@@ -537,6 +539,24 @@
         "--list-categories",
         "--list-rules",
         "--no-shellcheck",
+        "--only",
+        "--project",
+        "--rules",
+        "--sarif-out",
+        "--summary-json",
+        "--version"
+      ]
+    },
+    "php": {
+      "file": "ubs-php.sh",
+      "display": "PHP",
+      "extensions": ["php", "phtml"],
+      "manifest_files": ["composer.json", "composer.lock"],
+      "contract": 2,
+      "extra_flags": [
+        "--json-out",
+        "--list-categories",
+        "--list-rules",
         "--only",
         "--project",
         "--rules",

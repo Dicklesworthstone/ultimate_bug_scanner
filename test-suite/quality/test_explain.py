@@ -151,6 +151,39 @@ class ExplainRuleTests(unittest.TestCase):
 
         self._run_with_logging(case_id, _test)
 
+    def test_native_php_rules_keep_uncalibrated_confidence_and_fixtures(self) -> None:
+        categories = {
+            "sql-injection": "php.sql",
+            "command-injection": "php.execution",
+            "dynamic-code": "php.execution",
+            "dynamic-include": "php.includes",
+            "unsafe-deserialization": "php.deserialization",
+            "xss": "php.output",
+        }
+        for suffix, category in categories.items():
+            rule_id = f"php.security.{suffix}"
+            with self.subTest(rule=rule_id):
+                proc = run_ubs(["explain", rule_id, "--format=json"])
+                record_artifact(f"explain-{rule_id}", proc)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                document = json.loads(proc.stdout)
+                self.assertEqual(document["rule_id"], rule_id)
+                self.assertEqual(document["language"], "php")
+                self.assertEqual(document["category_id"], category)
+                self.assertEqual(document["severity"], "critical")
+                self.assertEqual(document["confidence"], "unknown")
+                self.assertTrue(document["message"])
+                self.assertTrue(document["remediation"])
+                for kind in ("buggy_fixture", "clean_fixture"):
+                    fixture = document[kind]
+                    self.assertTrue(fixture)
+                    self.assertTrue((REPO_ROOT / fixture["path"]).is_file())
+                    self.assertTrue(fixture["excerpt"])
+        proc = run_ubs(["explain", "php.security.sql-injection"])
+        record_artifact("explain-php-native-text", proc)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("unknown (uncalibrated)", proc.stdout)
+
     def test_unknown_rule_text_suggests_nearest_matches(self) -> None:
         case_id = "explain-unknown-rule-text"
 

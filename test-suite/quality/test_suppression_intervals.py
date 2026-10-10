@@ -75,6 +75,57 @@ def string_not_marker(event):
 '''
 
 
+class PhpSuppressionOwnershipTests(unittest.TestCase):
+    RULE = "php.security.command-injection"
+
+    def test_php_comment_forms_and_scoped_markers(self) -> None:
+        source = ("<?php\n"
+                  "system($_GET['x']); // ubs:ignore[" + self.RULE + "]\n"
+                  "system($_GET['x']); # ubs:ignore[" + self.RULE + "]\n"
+                  "/* ubs:ignore[" + self.RULE + "] */\n"
+                  "system($_GET['x']);\n")
+        self.assertEqual([marker.line for marker in parse_markers(source, "php")], [2, 3, 4])
+        index = build_index(source, "php")
+        for line in (2, 3, 5):
+            self.assertTrue(index.is_suppressed(line, self.RULE))
+            self.assertFalse(index.is_suppressed(line, "php.security.sql-injection"))
+
+    def test_strings_and_template_html_do_not_own_markers(self) -> None:
+        examples = (
+            "<?php\n$example = '// ubs:ignore';\nsystem($_GET['x']);\n",
+            "<?php\n$example = \"# ubs:ignore\";\nsystem($_GET['x']);\n",
+            "<!-- ubs:ignore -->\n<?php system($_GET['x']); ?>\n",
+            "<p>// ubs:ignore</p>\n<?php system($_GET['x']); ?>\n",
+            "<?php\n#[Example('ubs:ignore')]\nfunction example() {}\nsystem($_GET['x']);\n",
+        )
+        for source in examples:
+            with self.subTest(source=source):
+                self.assertEqual(parse_markers(source, "php"), [])
+                index = build_index(source, "php")
+                self.assertFalse(any(index.is_suppressed(line, self.RULE)
+                                     for line in range(1, len(source.splitlines()) + 1)))
+
+    def test_heredoc_and_nowdoc_are_opaque_to_marker_parser(self) -> None:
+        for opening in ("<<<EXAMPLE", "<<<'EXAMPLE'", '<<<"EXAMPLE"'):
+            source = ("<?php\n$example = " + opening + "\n"
+                      "# ubs:ignore\n// ubs:ignore\n/* ubs:ignore */\n"
+                      "EXAMPLE;\nsystem($_GET['x']);\n")
+            with self.subTest(opening=opening):
+                self.assertEqual(parse_markers(source, "php"), [])
+                self.assertFalse(build_index(source, "php").is_suppressed(7, self.RULE))
+
+    def test_php_masks_preserve_offsets_and_newlines(self) -> None:
+        source = "<p>Example</p>\n<?php\n# note\n$x = 'literal'; /* block\ncomment */\necho $x; ?>"
+        masked = strip_comments_and_strings(source, "php")
+        self.assertEqual(len(masked), len(source))
+        self.assertEqual([i for i, c in enumerate(masked) if c == "\n"],
+                         [i for i, c in enumerate(source) if c == "\n"])
+        self.assertNotIn("Example", masked)
+        self.assertNotIn("literal", masked)
+        self.assertNotIn("comment", masked)
+        self.assertIn("echo $x;", masked)
+
+
 class SuppressionLookupScalingTests(unittest.TestCase):
     @staticmethod
     def reference(index: SuppressionIndex, line: int, rule: str) -> bool:

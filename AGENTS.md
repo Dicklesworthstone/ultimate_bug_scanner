@@ -212,7 +212,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## ultimate_bug_scanner — This Project
 
-**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 12 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, and Bash.
+**This is the project you're working on.** The Ultimate Bug Scanner (`ubs`) is a multi-language static analysis meta-runner that dispatches language-specific scanning modules concurrently, merges their outputs, and reports findings in text, JSON, JSONL, SARIF, or TOON format. It covers 13 languages: JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, and PHP.
 
 ### What It Does
 

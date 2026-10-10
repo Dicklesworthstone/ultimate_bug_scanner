@@ -114,12 +114,13 @@ LANG_NAMES: dict[str, str] = {
     "csharp": "C# / .NET",
     "cs": "C# / .NET",
     "elixir": "Elixir",
+    "php": "PHP",
 }
 
 SRC_EXTS = {
     ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".go", ".rs", ".java", ".kt", ".kts", ".cpp", ".cc", ".cxx",
-    ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs",
+    ".c", ".h", ".hh", ".hpp", ".hxx", ".rb", ".swift", ".cs", ".ex", ".exs", ".php", ".phtml",
 }
 
 IGNORE_FILE_NAMES = {
@@ -200,6 +201,8 @@ def _find_primary_source_file(target_path: Path, lang: str | None = None) -> Pat
             if "cs" in lang_lower and ext == ".cs":
                 return c
             if "elixir" in lang_lower and ext in (".ex", ".exs"):
+                return c
+            if lang_lower == "php" and ext in (".php", ".phtml"):
                 return c
 
     return candidates[0]
@@ -379,6 +382,16 @@ def build_catalog(repo_root: Path) -> dict[str, dict[str, Any]]:
             for a in all_analyzers():
                 mod = inspect.getmodule(a.run)
                 if mod:
+                    metadata = getattr(mod, "RULE_METADATA", {})
+                    if isinstance(metadata, dict):
+                        for rule_id, details in metadata.items():
+                            if not isinstance(rule_id, str) or not isinstance(details, dict):
+                                continue
+                            rec = catalog.setdefault(rule_id, {})
+                            rec.update(details)
+                            rec["rule_id"] = rule_id
+                            rec.setdefault("language", a.lang)
+                            rec.setdefault("confidence", "unknown")
                     rid = getattr(mod, "RULE_ID", None)
                     if rid:
                         rec = catalog.setdefault(rid, {})
@@ -600,7 +613,8 @@ def explain_rule(
         f"{BOLD}Category:{RESET}    {rule_rec['category_id']}",
         f"{BOLD}Language:{RESET}    {lang_display}",
         f"{BOLD}Severity:{RESET}    {sev_color}{rule_rec['severity']}{RESET}",
-        f"{BOLD}Confidence:{RESET}  {GREEN}{rule_rec['confidence']}{RESET} (calibrated)",
+        f"{BOLD}Confidence:{RESET}  {GREEN}{rule_rec['confidence']}{RESET} "
+        + ("(uncalibrated)" if rule_rec["confidence"] == "unknown" else "(calibrated)"),
         f"{CYAN}================================================================================{RESET}",
         "",
         f"{BOLD}Message:{RESET}",

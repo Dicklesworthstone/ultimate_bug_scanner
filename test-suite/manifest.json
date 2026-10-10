@@ -10518,6 +10518,50 @@
         },
         "require_substrings": ["print() statements"]
       }
+    },
+    {
+      "id": "php-buggy",
+      "description": "Request data reaches all six PHP security sinks; PHTML exercises three additional output contexts.",
+      "path": "test-suite/php/buggy",
+      "language": "php",
+      "tags": ["php", "security", "taint", "buggy"],
+      "args": ["--only=php", "--format=json"],
+      "expect": {
+        "exit_code": "nonzero",
+        "totals": {
+          "files": {"min": 2, "max": 2},
+          "critical": {"min": 9, "max": 9},
+          "warning": {"max": 0},
+          "info": {"max": 0}
+        },
+        "rule_ids": {
+          "min": {
+            "php.security.sql-injection": 1,
+            "php.security.command-injection": 1,
+            "php.security.dynamic-code": 1,
+            "php.security.dynamic-include": 1,
+            "php.security.unsafe-deserialization": 1,
+            "php.security.xss": 4
+          }
+        }
+      }
+    },
+    {
+      "id": "php-clean",
+      "description": "Bound SQL values, fixed execution/include/deserialization inputs and context-safe PHP/PHTML output remain clean.",
+      "path": "test-suite/php/clean",
+      "language": "php",
+      "tags": ["php", "security", "taint", "clean"],
+      "args": ["--only=php", "--format=json"],
+      "expect": {
+        "exit_code": "zero",
+        "totals": {
+          "files": {"min": 2, "max": 2},
+          "critical": {"max": 0},
+          "warning": {"max": 0},
+          "info": {"max": 0}
+        }
+      }
     }
   ]
 }

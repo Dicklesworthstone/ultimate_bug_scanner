@@ -92,7 +92,8 @@ def main():
         "ruby": "ubs-ruby.sh",
         "swift": "ubs-swift.sh",
         "elixir": "ubs-elixir.sh",
-        "bash": "ubs-bash.sh"
+        "bash": "ubs-bash.sh",
+        "php": "ubs-php.sh",
     }
 
     new_checksums = {}

@@ -58,6 +58,7 @@ DEFAULT_SNIPPETS: dict[str, str] = {
     "ex": "defmodule Clean do\n  def clean, do: 42\nend\n",
     "kt": "fun main() {}\n",
     "kts": "println(42)\n",
+    "php": "<?php\nfunction clean(): int { return 42; }\n",
     "zig": "pub fn main() void {}\n",
 }
 
@@ -88,7 +89,8 @@ def run_cmd(
     if env:
         full_env.update(env)
     try:
-        return subprocess.run(
+        # These argv vectors are test-harness commands, never scanned source.
+        return subprocess.run(  # ubs:ignore[python.taint.command]
             cmd,
             cwd=cwd or REPO_ROOT,
             capture_output=True,

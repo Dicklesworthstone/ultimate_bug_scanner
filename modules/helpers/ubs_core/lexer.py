@@ -76,6 +76,21 @@ def strip_comments_and_strings(
     match the original text byte-for-byte.
     """
     lang_norm = lang.lower().strip()
+    if lang_norm in {"php", "phtml"}:
+        # PHP has three comment forms, heredoc/nowdoc strings and literal HTML
+        # between code islands. Use the same lexical ownership as the native
+        # analyzer so an example marker in a template cannot hide a finding.
+        from ubs_core.php_frontend import lexical_spans
+
+        characters = list(text)
+        for kind, start, end in lexical_spans(text):
+            mask = ((kind == "comment" and strip_comments and not preserve_comments)
+                    or (kind in {"string", "html"} and strip_strings))
+            if mask:
+                for position in range(start, end):
+                    if characters[position] != "\n":
+                        characters[position] = " "
+        return "".join(characters)
     is_rust = lang_norm in {"rust", "rs"}
     is_hash_comment = lang_norm in _HASH_COMMENT_LANGS
     supports_single_quote_strings = lang_norm not in _NO_SINGLE_QUOTE_STRING_LANGS

@@ -73,6 +73,7 @@ The user requested implementation of the reality-check plan and all remaining Be
 ### Useful new ecosystems and project configuration
 
 - [ ] `mj1j.31/.32`: bounded PHP request-to-sink module with PDO/mysqli binding and safe output contexts; coherent detection/contract/registry/ignore/profile/format/integrity integration.
+  - 2026-10-10: native PHP/PHTML scanning adds six critical rules for SQL, command/code execution, includes, deserialization and output. The bounded local-flow slice includes PDO/mysqli template identity, context-specific escaping, explicit incomplete results and ordinary runner/report/cache integration. Independent unsafe and clean labels precede implementation; broader framework resolution and corpus calibration remain open, so the umbrella stays open.
 - [ ] `mj1j.33/.34`: PostgreSQL SQL lexer/parser and explicit function/privilege hazards; comments/identifiers/dollar quotes, dialect/version and dynamic-unknown controls.
 - [ ] `mj1j.35/.36`: HCL provider/resource-specific rules and selected literal/local provenance; unresolved variables/modules are unknown; safe/contradictory configuration controls.
 - [ ] `mj1j.39/.40`: validated persistent scan configuration with defaults/project/environment/CLI precedence; excludes/languages/rules, explicit errors and shared cache/daemon policy identity.

@@ -1,6 +1,6 @@
 # UBS Language Modules
 
-Each `ubs-<lang>.sh` provides a consistent CLI (current modules: `js`, `python`, `cpp`, `rust`, `golang`, `java`, `kotlin`, `ruby`, `swift`, `csharp`, `elixir`, `bash`):
+Each `ubs-<lang>.sh` provides a consistent CLI (current modules: `js`, `python`, `cpp`, `rust`, `golang`, `java`, `kotlin`, `ruby`, `swift`, `csharp`, `elixir`, `bash`, `php`):
 
 ```
 ubs-<lang>.sh [PROJECT_DIR] [options] [OUTPUT_FILE]
@@ -18,10 +18,10 @@ Options:
 --skip=CSV         skip category numbers (numbers differ per module)
 --report-json=FILE write NDJSON findings sink to FILE
 --files-from=FILE  NUL-separated file list to scan (meta-runner contract v2 hand-off)
---rules=DIR        merge custom ast-grep rules into the built-in pack (all modules)
---list-rules       print generated ast-grep rule ids and exit (all modules)
---dump-rules=DIR   write the generated ast-grep rules to DIR (same modules as --list-rules)
---list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin)
+--rules=DIR        run custom ast-grep rules alongside the module's native checks (all modules)
+--list-rules       print generated ast-grep rule ids (native security ids for PHP) and exit
+--dump-rules=DIR   write generated ast-grep rules to DIR (bash, cpp, csharp, elixir, golang, java, js, kotlin, python, ruby, rust, swift)
+--list-categories  print the category table and exit (python, rust, cpp, swift, csharp, bash, kotlin, php)
 -h, --help         this help
 <!-- /contract:options -->
 ```

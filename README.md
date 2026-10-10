@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.4.36-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.4.37-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -122,7 +122,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 ## 🎯 **The Solution: Your 24/7 Bug Hunting Partner**
 
 ### 🧠 Language-Aware Meta-Runner
-- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Ruby, Swift, C#, and Elixir** in the same repo and fans out to per-language scanners.
+- `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Kotlin, Ruby, Swift, C#, Elixir, Bash, and PHP** in the same repo and fans out to per-language scanners.
 - Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
 - Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
@@ -165,6 +165,35 @@ repository declarations or model lazy SQL stream consumption. Unresolved tainted
 calls and exhausted analysis budgets produce an explicit incomplete result while
 preserving findings already established. The separate legacy fragment heuristic
 remains; it is not evidence of complete Ecto query-macro support.
+
+#### PHP request flow and template output
+
+PHP and PHTML files are scanned by a bounded native analyzer without requiring
+PHP or ast-grep to be installed. Six critical rules track request data into SQL,
+shell commands, dynamic code, includes, unsafe deserialization and HTML output.
+Use `ubs --only=php --format=json .` or inspect a rule with
+`ubs explain php.security.sql-injection`.
+
+The analysis follows local assignments, selected helpers and request APIs, and
+distinguishes actual PDO/mysqli query receivers from unrelated methods with the
+same names. Prepared statements retain the SQL template captured at preparation;
+passing request data as bound values is safe only when that template is trusted.
+Output escaping is evaluated for its supported HTML context, rather than being a
+universal sanitizer for SQL, shell commands, URLs or script expressions.
+
+PHP's five category IDs are `php.sql`, `php.execution`, `php.includes`,
+`php.deserialization` and `php.output`. Native rules appear in `--list-rules` and
+share ordinary file selection, exclusions, profiles, suppression, incremental
+cache and JSON/SARIF reporting. Custom ast-grep rules additionally require
+ast-grep. PHP native rules do not have an ast-grep `--dump-rules` representation.
+
+This is selected PHP 8.1+ syntax and local flow, not whole-program framework
+resolution. Unsupported syntax, unresolved effects and exhausted analysis limits
+produce a partial scan while retaining findings already established. Default
+limits per source are 100,000 tokens, 128 nesting levels and 500,000 analysis steps,
+configurable through `UBS_PHP_MAX_TOKENS`, `UBS_PHP_MAX_NESTING` and
+`UBS_PHP_MAX_STEPS`. PHP confidence remains `unknown` pending independent corpus
+calibration; fixture coverage is not a calibrated confidence score.
 
 #### Shareable output quickstart
 ```bash
@@ -516,7 +545,7 @@ Measured on 2026-09-02 (v5.3.13, single runs on a 16-core Linux box; ast-grep on
 ```
 Single file (JS or Python):                   4.6–5.8 seconds
 15-file repository (this one):                9 seconds
-29K-line fixture tree, 12 languages:          40 seconds
+29K-line fixture tree before PHP support:    40 seconds
 124K-line Python project (597 files):         143 seconds
 407K-line TypeScript monorepo (--only=js):    hit the 300 s module timeout
 ```
@@ -1526,7 +1555,7 @@ eval(safe_string)  # ubs:ignore
 
 ### **Cross-Language Async Error Detection**
 
-UBS detects unhandled async errors consistently across all 12 languages. The patterns adapt to each language's idioms while providing equivalent coverage:
+UBS detects selected unhandled async and failure-observation patterns in the languages below. Coverage follows each language's supported APIs and idioms; the PHP module currently focuses on request-flow security:
 
 | Language | Pattern | What UBS Detects |
 |----------|---------|------------------|
@@ -1601,7 +1630,7 @@ If a helper is modified or corrupted, the scanner fails safely with remediation 
 
 ### **Unified Severity Normalization**
 
-All 12 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
+All 13 language modules normalize their findings to a consistent severity scale, ensuring predictable output regardless of source language:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -1758,7 +1787,7 @@ Traditional linters were designed for **human developers** in **single-language 
 
 | Traditional Linting (Human-First) | UBS Approach (LLM-First) |
 |---|---|
-| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 12 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
+| **Goal:** Comprehensive coverage + auto-fix<br>**Speed:** 15-60 seconds acceptable<br>**Setup:** 30 min config per language<br>**Languages:** One tool per language<br>**False positives:** Must be <1% (frustrates humans)<br>**Output:** Human-readable prose | **Goal:** Critical bug detection + fast feedback<br>**Speed:** <5 seconds required<br>**Setup:** Zero config (instant start)<br>**Languages:** One scan for all 13 languages<br>**False positives:** 10-20% OK (LLMs filter instantly)<br>**Output:** Structured file:line for LLM parsing |
 
 ### **2. LLMs Don't Need Auto-Fix—They ARE the Auto-Fix Engine**
 
@@ -1828,7 +1857,7 @@ pip install pylint black mypy
 curl -fsSL https://raw.githubusercontent.com/.../install.sh | bash
 ubs .
 
-# Done. All 12 languages scanned, unified report.
+# Done. All supported languages detected, unified report.
 ```
 
 **This matters because:**
@@ -2033,7 +2062,7 @@ Layer 4: Metrics collection  → Time-series quality tracking
 **This combination of speed + semantic understanding + correlation is unique.**
 
 **Unified multi-language runner:**
-- Auto-detects 12 languages in one scan
+- Auto-detects 13 languages in one scan
 - Parallel execution (Go + Python + Rust simultaneously)
 - Unified JSON/SARIF output for tooling
 - Module system with lazy download/caching
@@ -2164,7 +2193,7 @@ You wouldn't use a truck for a Formula 1 race. You wouldn't use a sports car to 
 These are fundamentally incompatible goals. ESLint would never accept "10-20% false positives are fine" or "skip auto-fix entirely."
 
 **2. Multi-language meta-runner**
-- The unified runner that auto-detects 12 languages is the core innovation
+- The unified runner that auto-detects 13 languages is the core innovation
 - This doesn't fit into any single linter's architecture
 - Each linter project has different maintainers, philosophies, release cycles
 
@@ -2327,10 +2356,9 @@ Use both.
 
 **A:** Probably! The module system makes it easy to add languages.
 
-**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash (12 languages)
+**Current:** JavaScript/TypeScript, Python, Go, Rust, Java, Kotlin, C++, Ruby, Swift, C#, Elixir, Bash, PHP (13 languages)
 
 **Roadmap considerations:**
-- **PHP** - High demand, lots of legacy code
 - **Scala** - JVM ecosystem
 - **Lua** - Embedded scripts and game dev
 
@@ -2367,7 +2395,7 @@ But the core tool will always be free and open source.
 
 **This isn't trying to replace ESLint.** It's solving a different problem:
 
-> **"How do I give LLM coding agents the ability to self-audit across 12 languages with zero configuration overhead and sub-5-second feedback?"**
+> **"How do I give LLM coding agents the ability to self-audit across 13 languages with zero configuration overhead and sub-5-second feedback?"**
 
 No existing tool does this because:
 - Traditional linters are human-first (need auto-fix, low FP tolerance)

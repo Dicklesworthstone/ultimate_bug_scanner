@@ -1,6 +1,6 @@
 # Ultimate Bug Scanner - Test Suite
 
-This suite now spans **every language UBS supports**. JavaScript remains the template, but each directory (`python/`, `golang/`, `cpp/`, `rust/`, `java/`, `ruby/`, `swift/`, `csharp/`, `elixir/`) contains mirrored buggy/clean fixtures so we can regression-test the language modules with the same discipline.
+This suite now spans **every language UBS supports**. JavaScript remains the template, but the language directories contain mirrored buggy/clean fixtures so we can regression-test the modules with the same discipline. PHP fixtures cover all six native request-flow rules plus PHTML output contexts; the independent acceptance oracle lives in `quality/test_php_taint.py`.
 
 ## 📁 Directory Structure
 
@@ -63,6 +63,7 @@ test-suite/
 ├── swift/                      # Swift security + type narrowing fixtures and manifest cases
 ├── csharp/                     # C# fixtures + manifest cases
 ├── elixir/                     # Elixir security fixtures + manifest cases
+├── php/                        # PHP request-flow and PHTML output fixtures
 └── README.md                   # This file
 ```
 

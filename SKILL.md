@@ -1,11 +1,11 @@
 ---
 name: ubs
-description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 14-24 detection categories per language, 12 languages, regex + ast-grep + AST-helper analysis. The AI agent's quality gate."
+description: "Ultimate Bug Scanner - Pre-commit static analysis for AI coding workflows. 13 languages, including bounded PHP request-flow analysis, with language-specific detection categories and native or ast-grep analysis. The AI agent's quality gate."
 ---
 
 # UBS - Ultimate Bug Scanner
 
-Static analysis tool built for AI coding workflows. Catches bugs that AI agents commonly introduce: null safety, async/await issues, security holes, memory leaks. Scans JS/TS, Python, Go, Rust, Java, Kotlin, C/C++, Ruby, Swift, C#, Elixir, and Bash. Single-file scans take a few seconds; scope scans to changed files (see Speed Tips).
+Static analysis tool built for AI coding workflows. Catches bugs that AI agents commonly introduce: null safety, async/await issues, security holes, memory leaks. Scans JS/TS, Python, Go, Rust, Java, Kotlin, C/C++, Ruby, Swift, C#, Elixir, Bash, and PHP. PHP covers request-derived SQL, command/code execution, includes, deserialization, and unsafe output; it does not provide the async or lifecycle coverage of other modules. Single-file scans take a few seconds; scope scans to changed files (see Speed Tips).
 
 ## Why This Exists
 
@@ -65,7 +65,7 @@ Exit code: 1
 
 Parse: `file:line:col` → location | `💡` → how to fix | Exit 0/1 → pass/fail
 
-## Detection Categories (14 to 24 per language; numbers differ per module, so prefer `--skip-<lang>=N`)
+## Detection Categories (coverage and numbers differ per module; PHP has five categories, so prefer `--skip-<lang>=N`)
 
 ### Critical (Always Fix)
 

@@ -32,7 +32,8 @@ PATH = 'ruby.taint.path_traversal'
 EVAL = 'ruby.security.eval-family'
 DISPATCH = 'ruby.security.dynamic-dispatch'
 COMMAND = 'ruby.security.backticks-interpolated'
-TARGET_RULES = {URL, PATH, EVAL, DISPATCH, COMMAND}
+SQL = 'ruby.security.sql-injection'
+TARGET_RULES = {URL, PATH, EVAL, DISPATCH, COMMAND, SQL}
 URL_CHECK = "uri.scheme == 'https' && ['api.example.com'].include?(uri.host)"
 PATH_CHECK = 'target.start_with?(base + File::SEPARATOR) || target == base'
 
@@ -1005,7 +1006,352 @@ EXECUTION_CASES = (
         leaf = File.basename(params[:file].public_send(:to_s))
         File.read(File.join('/srv/files', leaf))''', ()),
 )
-CASES += EXECUTION_CASES
+SQL_CASES = (
+    Case('sql_request_query_execute', SQL, '''
+        query = 'SELECT * FROM accounts WHERE id = ' + params[:id]
+        ActiveRecord::Base.connection.execute(query)''', (2,)),
+    Case('sql_exec_query_binds_do_not_fix_query_text', SQL, '''
+        query = "SELECT * FROM accounts WHERE name = '#{params[:name]}' AND id = $1"
+        ActiveRecord::Base.connection.exec_query(query, 'Lookup', [params[:id]])''', (2,)),
+    Case('sql_genuine_query_binds', SQL, '''
+        id = params[:id]
+        bind = ActiveRecord::Relation::QueryAttribute.new('id', id, ActiveRecord::Type::Integer.new)
+        ActiveRecord::Base.connection.exec_query('SELECT * FROM accounts WHERE id = $1', 'Lookup', [bind])''', ()),
+    Case('sql_connection_alias', SQL, '''
+        database = ActiveRecord::Base.connection
+        alias_database = database
+        alias_database.exec_query(params[:sql])''', (3,)),
+    Case('sql_connection_helper_return', SQL, '''
+        def database
+          ActiveRecord::Base.connection
+        end
+        database.exec_query(params[:sql])''', (4,)),
+    Case('sql_connection_helper_argument', SQL, '''
+        def lookup(database, query)
+          database.exec_query(query)
+        end
+        lookup(ActiveRecord::Base.connection, params[:sql])''', (2,)),
+    Case('sql_safe_named_query_helper_is_not_a_validator', SQL, '''
+        def safe_sql(raw)
+          raw
+        end
+        ActiveRecord::Base.connection.exec_query(safe_sql(params[:sql]))''', (4,)),
+    Case('sql_query_helper_constant_return', SQL, '''
+        def query_text(raw)
+          'SELECT 1'
+        end
+        ActiveRecord::Base.connection.exec_query(query_text(params[:sql]))''', ()),
+    Case('sql_query_alias_mutation', SQL, '''
+        query = 'SELECT * FROM accounts WHERE id = '
+        alias_query = query
+        alias_query << params[:id]
+        ActiveRecord::Base.connection.execute(query)''', (4,)),
+    Case('sql_query_literal_rebinding', SQL, '''
+        query = params[:sql]
+        query = 'SELECT 1'
+        ActiveRecord::Base.connection.execute(query)''', ()),
+    Case('sql_query_branch_retains_unsafe_alternative', SQL, '''
+        query = 'SELECT 1'
+        if flag
+          query = params[:sql]
+        end
+        ActiveRecord::Base.connection.exec_query(query)''', (5,)),
+    Case('sql_unrelated_query_scope', SQL, '''
+        def remember
+          query = params[:sql]
+        end
+        def lookup
+          query = 'SELECT 1'
+          ActiveRecord::Base.connection.exec_query(query)
+        end''', ()),
+    Case('sql_log_label_is_not_query_text', SQL, '''
+        ActiveRecord::Base.connection.exec_query('SELECT 1', params[:label])''', ()),
+    Case('sql_connection_rebinding_to_application_object', SQL, '''
+        class LocalDatabase
+          def exec_query(value)
+            'application result'
+          end
+        end
+        database = ActiveRecord::Base.connection
+        database = LocalDatabase.new
+        database.exec_query(params[:sql])''', ()),
+    Case('sql_application_receiver_name_is_not_api_proof', SQL, '''
+        class Database
+          def self.exec_query(value)
+            'application result'
+          end
+        end
+        Database.exec_query(params[:sql])''', ()),
+    Case('sql_local_active_record_namespace_is_not_framework', SQL, '''
+        module ActiveRecord
+          class Base
+            def self.connection
+              'application object'
+            end
+          end
+        end
+        ActiveRecord::Base.connection.exec_query(params[:sql])''', ()),
+    Case('sql_scoped_active_record_constant_is_not_framework', SQL, '''
+        class Handler
+          ActiveRecord = LocalDatabase
+          def lookup
+            ActiveRecord::Base.connection.exec_query(params[:sql])
+          end
+        end''', ()),
+    Case('sql_explicit_model_connection', SQL, '''
+        class ApplicationRecord < ActiveRecord::Base
+        end
+        class Account < ApplicationRecord
+        end
+        Account.connection.exec_query(params[:sql])''', (5,)),
+    Case('sql_model_class_method_implicit_connection', SQL, '''
+        class Account < ActiveRecord::Base
+          def self.lookup
+            connection.exec_query(params[:sql])
+          end
+        end''', (3,)),
+    Case('sql_model_connection_override_is_local', SQL, '''
+        class Account < ActiveRecord::Base
+          def self.connection
+            'application object'
+          end
+        end
+        Account.connection.exec_query(params[:sql])''', ()),
+    Case('sql_model_spelling_without_inheritance_is_not_proof', SQL, '''
+        class Account
+        end
+        Account.connection.exec_query(params[:sql])''', ()),
+    Case('sql_unknown_query_parameter_is_not_request_proof', SQL, '''
+        def lookup(query)
+          ActiveRecord::Base.connection.exec_query(query)
+        end
+        ignored = params[:unused]''', ()),
+    Case('sql_static_dispatch_to_execution', SQL, '''
+        database = ActiveRecord::Base.connection
+        database.public_send(:exec_query, params[:sql])''', (2,)),
+    Case('sql_inert_examples_are_not_calls', SQL, '''
+        ignored = params[:unused]
+        example = 'ActiveRecord::Base.connection.exec_query(params[:sql])'
+        # ActiveRecord::Base.connection.execute(params[:sql])''', ()),
+    Case('sql_literal_array_splat_preserves_query_operand', SQL, '''
+        ActiveRecord::Base.connection.exec_query(*[params[:sql], 'Lookup', []])''', (1,)),
+    Case('sql_literal_array_splat_bound_values_are_not_query', SQL, '''
+        ActiveRecord::Base.connection.exec_query(*['SELECT $1', 'Lookup', [params[:id]]])''', ()),
+)
+# Each documented connection operation receives SQL first. The following
+# operands are names, bind values or metadata, never a repair of that SQL.
+SQL_CASES += tuple(
+    Case('sql_connection_operation_' + method, SQL,
+         f'ActiveRecord::Base.connection.{method}(params[:sql])', (1,))
+    for method in ('exec_insert', 'exec_update', 'exec_delete', 'select_all',
+                   'select_one', 'select_rows', 'select_value', 'select_values',
+                   'insert', 'update', 'delete')
+)
+SQL_BINDING_CASES = (
+    Case('sql_lease_connection', SQL,
+         'ActiveRecord::Base.lease_connection.exec_query(params[:sql])', (1,)),
+    Case('sql_with_connection_binds_callback_receiver', SQL, '''
+        ActiveRecord::Base.with_connection do |database|
+          database.exec_query(params[:sql])
+        end''', (2,)),
+    Case('sql_with_connection_static_query_binds', SQL, '''
+        ActiveRecord::Base.with_connection do |database|
+          database.exec_query('SELECT $1', 'Lookup', [params[:value]])
+        end''', ()),
+    Case('sql_with_connection_returns_callback_value', SQL, '''
+        query = ActiveRecord::Base.with_connection do |database|
+          params[:sql]
+        end
+        ActiveRecord::Base.connection.exec_query(query)''', (4,)),
+    Case('sql_pool_with_connection_numbered_parameter', SQL,
+         'ActiveRecord::Base.connection_pool.with_connection { _1.exec_query(params[:sql]) }', (1,)),
+    Case('sql_aliased_pool_with_connection', SQL, '''
+        pool = ActiveRecord::Base.connection_pool
+        pool.with_connection do |database|
+          database.exec_query(params[:sql])
+        end''', (3,)),
+    Case('sql_with_connection_parameter_rebinding', SQL, '''
+        ActiveRecord::Base.with_connection do |database|
+          database = 'application object'
+          database.exec_query(params[:sql])
+        end''', ()),
+    Case('sql_arel_real_positional_bindings', SQL, '''
+        query = Arel.sql('SELECT * FROM accounts WHERE name = ?', params[:name])
+        ActiveRecord::Base.connection.select_all(query)''', ()),
+    Case('sql_arel_real_named_bindings', SQL, '''
+        query = Arel.sql('SELECT * FROM accounts WHERE name = :name', name: params[:name])
+        ActiveRecord::Base.connection.select_all(query)''', ()),
+    Case('sql_arel_bindings_do_not_repair_query_text', SQL, '''
+        query = Arel.sql('SELECT * FROM accounts WHERE id = ' + params[:id] + ' AND name = ?', params[:name])
+        ActiveRecord::Base.connection.select_all(query)''', (2,)),
+    Case('sql_arel_without_bindings_does_not_validate', SQL, '''
+        query = Arel.sql(params[:sql])
+        ActiveRecord::Base.connection.select_all(query)''', (2,)),
+    Case('sql_arel_override_does_not_receive_framework_trust', SQL, '''
+        module Arel
+          def self.sql(query, value)
+            value
+          end
+        end
+        query = Arel.sql('SELECT ?', params[:sql])
+        ActiveRecord::Base.connection.select_all(query)''', (7,)),
+    Case('sql_bound_query_copy_retains_binding', SQL, '''
+        query = Arel.sql('SELECT ?', params[:value])
+        copy = query
+        ActiveRecord::Base.connection.select_all(copy)''', ()),
+    Case('sql_bound_query_append_adds_new_unsafe_text', SQL, '''
+        query = Arel.sql('SELECT ?', params[:value])
+        text = ActiveRecord::Base.connection.to_sql(query) + params[:sql]
+        ActiveRecord::Base.connection.exec_query(text)''', (3,)),
+    Case('sql_model_relation_hash_values_are_bound', SQL, '''
+        class Account < ActiveRecord::Base
+        end
+        query = Account.where(name: params[:name])
+        ActiveRecord::Base.connection.select_all(query)''', ()),
+    Case('sql_model_relation_positional_values_are_bound', SQL, '''
+        class Account < ActiveRecord::Base
+        end
+        query = Account.where('name = ?', params[:name])
+        ActiveRecord::Base.connection.select_all(query)''', ()),
+    Case('sql_model_relation_keeps_unsafe_condition_text', SQL, '''
+        class Account < ActiveRecord::Base
+        end
+        query = Account.where('id = ' + params[:id] + ' AND name = ?', params[:name])
+        ActiveRecord::Base.connection.select_all(query)''', (4,)),
+    Case('sql_model_alias_honors_connection_override', SQL, '''
+        class Account < ActiveRecord::Base
+          def self.connection
+            'application object'
+          end
+        end
+        model = Account
+        model.connection.exec_query(params[:sql])''', ()),
+    Case('sql_model_inherits_local_connection_override', SQL, '''
+        class ApplicationRecord < ActiveRecord::Base
+          def self.connection
+            'application object'
+          end
+        end
+        class Account < ApplicationRecord
+        end
+        Account.connection.exec_query(params[:sql])''', ()),
+    Case('sql_arel_bind_slot_raw_node_is_sql', SQL, '''
+        query = Arel.sql('SELECT * FROM accounts WHERE ?', Arel.sql(params[:condition]))
+        ActiveRecord::Base.connection.select_all(query)''', (2,)),
+    Case('sql_arel_array_bind_raw_node_is_sql', SQL, '''
+        query = Arel.sql('SELECT * FROM accounts WHERE id IN (?)', [Arel.sql(params[:id])])
+        ActiveRecord::Base.connection.select_all(query)''', (2,)),
+    Case('sql_mutated_arel_literal_is_still_sql', SQL, '''
+        condition = Arel.sql('1 = 1')
+        condition << params[:condition]
+        query = Arel.sql('SELECT * FROM accounts WHERE ?', condition)
+        ActiveRecord::Base.connection.select_all(query)''', (4,)),
+    Case('sql_arel_constructor_keeps_literal_identity', SQL, '''
+        condition = Arel.sql('1 = 1')
+        same = Arel.sql(condition)
+        condition << params[:condition]
+        query = Arel.sql('SELECT * FROM accounts WHERE ?', same)
+        ActiveRecord::Base.connection.select_all(query)''', (5,)),
+    Case('sql_arel_literal_replacement_keeps_literal_type', SQL, '''
+        condition = Arel.sql(params[:unused])
+        condition.clear
+        condition.replace(params[:condition])
+        query = Arel.sql('SELECT * FROM accounts WHERE ?', condition)
+        ActiveRecord::Base.connection.select_all(query)''', (5,)),
+    Case('sql_arel_stringified_node_is_bound_data', SQL, '''
+        query = Arel.sql('SELECT ?', Arel.sql(params[:value]).to_s)
+        ActiveRecord::Base.connection.select_all(query)''', ()),
+    Case('sql_connection_compilation_preserves_bound_values', SQL, '''
+        query = Arel.sql('SELECT ?', params[:value])
+        text = ActiveRecord::Base.connection.to_sql(query)
+        ActiveRecord::Base.connection.exec_query(text)''', ()),
+    Case('sql_relation_compilation_preserves_bound_values', SQL, '''
+        class Account < ActiveRecord::Base
+        end
+        query = Account.where(name: params[:name]).to_sql
+        ActiveRecord::Base.connection.exec_query(query)''', ()),
+    Case('sql_explicit_hash_conditions_bind_values', SQL, '''
+        class Account < ActiveRecord::Base
+        end
+        query = Account.where({name: params[:name]})
+        ActiveRecord::Base.connection.select_all(query)''', ()),
+    Case('sql_integer_conversion_is_numeric_data', SQL, '''
+        query = "SELECT * FROM accounts WHERE id = #{params[:id].to_i}"
+        ActiveRecord::Base.connection.exec_query(query)''', ()),
+    Case('sql_integer_conversion_does_not_cover_other_text', SQL, '''
+        query = "SELECT * FROM accounts WHERE id = #{params[:id].to_i} ORDER BY #{params[:order]}"
+        ActiveRecord::Base.connection.exec_query(query)''', (2,)),
+    Case('sql_numeric_named_helper_must_prove_conversion', SQL, '''
+        def to_integer(value)
+          value
+        end
+        query = 'SELECT * FROM accounts WHERE id = ' + to_integer(params[:id])
+        ActiveRecord::Base.connection.exec_query(query)''', (5,)),
+    Case('sql_root_qualified_superclass', SQL, '''
+        class Account < ::ActiveRecord::Base
+        end
+        Account.connection.execute(params[:sql])''', (3,)),
+    Case('sql_root_qualified_base_bypasses_local_shadow', SQL, '''
+        class Handler
+          ActiveRecord = Class.new
+          def lookup
+            ::ActiveRecord::Base.connection.execute(params[:sql])
+          end
+        end''', (4,)),
+    Case('sql_unqualified_base_keeps_local_shadow', SQL, '''
+        class Handler
+          ActiveRecord = Class.new
+          def lookup
+            ActiveRecord::Base.connection.execute(params[:sql])
+          end
+        end''', ()),
+    Case('sql_root_qualified_arel_bypasses_local_shadow', SQL, '''
+        class Handler
+          Arel = Class.new
+          def lookup
+            query = ::Arel.sql('SELECT ?', params[:id])
+            ActiveRecord::Base.connection.select_all(query)
+          end
+        end''', ()),
+)
+SQL_BINDING_CASES += tuple(Case('sql_model_receiver_' + name, SQL, '''\
+class LocalModel < ActiveRecord::Base
+  def self.connection
+    'local object'
+  end
+end
+class RealModel < ActiveRecord::Base
+end
+''' + binding + '\nmodel.connection.exec_query(params[:sql])', lines)
+    for name, binding, lines in (
+        ('joined_override_and_framework', 'if flag\n  model = LocalModel\nelse\n  model = RealModel\nend', (13,)),
+        ('local_override_control', 'model = LocalModel', ()),
+        ('framework_control', 'model = RealModel', (9,)),
+    ))
+SQL_CASES += SQL_BINDING_CASES
+SQL_BOUNDARIES = (
+    Case('sql_quoted_fragment_needs_context', SQL, '''
+        ActiveRecord::Base.connection.execute(params[:proven])
+        quoted = ActiveRecord::Base.connection.quote(params[:value])
+        query = 'SELECT * FROM accounts WHERE name = ' + quoted
+        ActiveRecord::Base.connection.execute(query)''', (1,)),
+    Case('sql_array_conditions_need_template_binding', SQL, '''
+        ActiveRecord::Base.connection.execute(params[:proven])
+        class Account < ActiveRecord::Base
+        end
+        query = Account.where(['name = ?', params[:name]])
+        ActiveRecord::Base.connection.select_all(query)''', (1,)),
+    Case('sql_compiled_query_transform_needs_context', SQL, '''
+        ActiveRecord::Base.connection.execute(params[:proven])
+        query = Arel.sql('SELECT ?', params[:value])
+        text = ActiveRecord::Base.connection.to_sql(query).upcase
+        ActiveRecord::Base.connection.execute(text)''', (1,)),
+    Case('sql_unknown_bind_value_needs_type_proof', SQL, '''
+        ActiveRecord::Base.connection.execute(params[:proven])
+        query = Arel.sql('SELECT ?', application_value(params[:value]))
+        ActiveRecord::Base.connection.select_all(query)''', (1,)),
+)
+CASES += EXECUTION_CASES + SQL_CASES
 BY_NAME = {case.name: case for case in CASES}
 UNRESOLVED_DISPATCH_CASES = (
     Case('dispatch_unknown', PATH, '''
@@ -1230,6 +1576,21 @@ class RubySemanticTests(LoggedCase):
                 self.assertEqual([(row['rule'], row['line']) for row in records],
                                  [(case.rule, line) for line in case.lines], records)
 
+    def test_sql_quoting_boundaries_preserve_independent_findings(self):
+        for case in SQL_BOUNDARIES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / case.name
+                directory.mkdir()
+                target = directory / 'input.rb'
+                target.write_text(case.source)
+                records = []
+                with self.assertRaisesRegex(ValueError, 'SQL quoting or array-template context.*incomplete'):
+                    records.extend(taint_ruby_traversal.run(RunContext(lang='ruby', files=[target])))
+                self.assertEqual([(row['rule'], row['line']) for row in records],
+                                 [(SQL, line) for line in case.lines], records)
+                self.assertEqual(records[0]['extras']['query_argument'], 0)
+                self.assertEqual(records[0]['extras']['taint_path'][-1]['kind'], 'sink')
+
     def test_helper_mutation_cannot_retain_a_callers_validation_proof(self):
         case = Case('url_helper_argument_mutation', URL, f'''
             def corrupt(uri, host)
@@ -1359,6 +1720,83 @@ class RubyPublicTests(LoggedCase):
                     result, payload = self.scan(directory / fmt, target, fmt)
                     self.assert_findings(result, payload, case, fmt, target)
                     print('RUBY_TAINT_PUBLIC', name, fmt, 'PASS', flush=True)
+
+    def test_sql_query_binding_reaches_module_and_meta_json_sarif(self):
+        names = ('sql_exec_query_binds_do_not_fix_query_text', 'sql_genuine_query_binds',
+                 'sql_connection_helper_argument', 'sql_with_connection_binds_callback_receiver',
+                 'sql_arel_real_named_bindings', 'sql_arel_bind_slot_raw_node_is_sql',
+                 'sql_model_connection_override_is_local', 'sql_relation_compilation_preserves_bound_values',
+                 'sql_root_qualified_arel_bypasses_local_shadow', 'sql_model_receiver_joined_override_and_framework')
+        for name in names:
+            case = BY_NAME[name]
+            directory = self.artifact / name
+            directory.mkdir(exist_ok=True)
+            target = directory / 'selected source.rb'
+            target.write_text(case.source)
+            (directory / 'unselected.rb').write_text('ActiveRecord::Base.connection.execute(params[:unselected])\n')
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', target, fmt, module=module)
+                        if module and fmt == 'json':
+                            self.assertEqual(result.returncode, int(bool(case.lines)), (result.stdout, result.stderr))
+                            self.assertEqual((payload['status'], payload['critical']), ('ok', len(case.lines)), payload)
+                            records = [row for row in payload['findings'] if row['rule'] in TARGET_RULES]
+                            self.assertEqual([(row['rule'], row['line']) for row in records],
+                                             [(SQL, line) for line in case.lines], payload)
+                            for record in records:
+                                self.assertEqual(Path(record['path']).name, target.name, record)
+                                self.assertEqual(record['extras']['query_argument'], 0, record)
+                                self.assertEqual(record['extras']['taint_path'][-1]['kind'], 'sink', record)
+                        else:
+                            self.assert_findings(result, payload, case, fmt, target)
+
+    def test_sql_cache_edit_suppression_and_security_category(self):
+        directory = self.artifact / 'sql-cache-policy'
+        directory.mkdir()
+        target = directory / 'handler.rb'
+        unsafe = BY_NAME['sql_connection_helper_argument']
+        safe = Case('sql_edited_binding', SQL, unsafe.source.replace('params[:sql]', "'SELECT 1'"), ())
+        for index, case in enumerate((unsafe, unsafe, safe, safe)):
+            if index in (0, 2):
+                target.write_text(case.source)
+            result, payload = self.scan(directory / str(index), target)
+            self.assert_findings(result, payload, case, 'json', target)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], int(index in (1, 3)), payload)
+        for label, suffix, options, count in (
+                ('suppressed', ' # ubs:ignore[ruby.security.sql-injection]', (), 0),
+                ('unrelated', ' # ubs:ignore[ruby.taint.path_traversal]', (), 1),
+                ('bare', ' # ubs:ignore all findings on this statement', (), 0),
+                ('skipped', '', ('--skip=6',), 0)):
+            target.write_text('ActiveRecord::Base.connection.execute(params[:sql])' + suffix + '\n')
+            result, payload = self.scan(directory / label, target, extra=options, module=True)
+            self.assertEqual(result.returncode, count, (result.stdout, result.stderr))
+            self.assertEqual((payload['status'], payload['critical']), ('ok', count), payload)
+            self.assertEqual([(row['rule'], row['line']) for row in payload['findings'] if row['rule'] in TARGET_RULES],
+                             [(SQL, 1)] if count else [], payload)
+
+    def test_sql_unresolved_context_remains_partial_with_proven_findings(self):
+        for case in SQL_BOUNDARIES:
+            directory = self.artifact / case.name
+            directory.mkdir()
+            target = directory / 'handler.rb'
+            target.write_text(case.source)
+            for attempt, fmt in enumerate(('json', 'json', 'sarif')):
+                result, payload = self.scan(directory / str(attempt), target, fmt)
+                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                if fmt == 'json':
+                    self.assertEqual(payload['status'], 'partial', payload)
+                    self.assertTrue(any(row.get('language') == 'ruby' and row.get('module_error') == 'ANALYZER_ERROR'
+                                        for row in payload['failed_modules']), payload)
+                    self.assertEqual([(row['rule_id'], row['line']) for row in payload['findings'] if row['rule_id'] in TARGET_RULES],
+                                     [(SQL, line) for line in case.lines], payload)
+                else:
+                    invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                    self.assertTrue(invocations, payload)
+                    self.assertTrue(all(not item['executionSuccessful'] and item['exitCode'] == 2 for item in invocations), payload)
+                    rows = [row for run in payload['runs'] for row in run.get('results', []) if row['ruleId'] in TARGET_RULES]
+                    self.assertEqual([(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine']) for row in rows],
+                                     [(SQL, line) for line in case.lines], payload)
 
     def test_warm_cache_and_same_file_helper_edit_invalidate_answers(self):
         directory = self.artifact / 'cache-edit'

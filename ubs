@@ -31,7 +31,7 @@ trap '' SIGPIPE 2>/dev/null || true
 UBS_VERSION="5.4.35"
 # The optional service is a release executable, not a command trusted via PATH.
 # scripts/update_checksums.py keeps this pin in sync with ubs-daemon.
-UBS_DAEMON_SHA256="5016469099336eb215179a04d432643e00fdde653a01481c55d4e2861c2e0ad7"
+UBS_DAEMON_SHA256="cf7f4bc306b71fb786083c2b1ece758ae4d7e89677564b101d3cd5e917a7730b"
 
 # Route service commands before scan setup, dependency probes or self-updates.
 # Execute the exact bytes checked below, not a path that can change after hashing.
@@ -106,18 +106,18 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='dfa2f630f789f7b494a7fe80d38169f4e413b20b7656201951d733de875a97fc'
-  [cpp]='e8f9f9d3d07ecea5ca3adb9ee493b5bad87d1a8858625e9efee6e6c6b20a4dca'
-  [csharp]='a5553d210a4ca8a13bdaa16d971343981f946f8e4d529c45d5520fb057a9f6e1'
-  [elixir]='4feb526548d3a35baaacff87b418fef8008814e5f2ba0b578d7deacb4ff6dd8c'
-  [golang]='470f8c67ebff175cd4088168425765ac55def8f1be37f76c7608ad80939cb34c'
-  [java]='1ad20086208e5d269f4f3767475312c81c9da08c05dc9095157d15ee126ed30d'
-  [js]='fd62e2acf1df92cab8c14fec5342a386ca3f9c860ac8a8be5bb89df6a6e0d50b'
-  [kotlin]='35b3f9c2183ace72aacc25c4ee61559dffba4c5aefd34b61342dcc13746b3601'
-  [python]='47cfdd34341c972d7c1e0c4e58a0ec3c281401804bf7cce9b495f20bd0c3d920'
-  [ruby]='44e71fb43419789eff1bc326266e8eed8da2ef57700e6601b931423213e787bb'
-  [rust]='8f239aa19f4e20444b34f8ba05b16b5bbf815121800b8f4e67e6a0d70bf28172'
-  [swift]='d3bd7e3d34667739faf68f01277f3c5b4b091186b51f9c15469238b88a103523'
+  [bash]='92c08c019ef029baeca50e4a007ab7924211efe09bab08bdf3b129bf9508adeb'
+  [cpp]='33318fb201469137d1ac51fb7e9f37557ea1090021d67e6dc628b138e02a317f'
+  [csharp]='9f3565aa97c0a4ebe3e32aa82853c10f5a3fc5e22fcd9fc661464014d4aa2e04'
+  [elixir]='83bbfa649e447322918cc6b15e1a7e217031bb0a928e570fde1c13eb6d4f6fb9'
+  [golang]='28a75d0b03c01ab9e318c82c3098722f460fb7af62a665079752cefe4b7380cc'
+  [java]='e8c4d8dffd75c8625cea4a081801b7e6db52e327aa6d61af09ee15d036bf64c3'
+  [js]='ca57416df3fe1628a2ad579a3313a94f7e7354842f24d6f015d9f8862e7e91bd'
+  [kotlin]='b63795be950aeb3449a801c3d8bd0fe6401454c6087d7611418258fa4702a13d'
+  [python]='53db03445f0aff53732f50c6d226ef52e848ae333f23e7dde112ed9c03dec103'
+  [ruby]='10efada15d4ed23f7da56e28100b3bcad8ae75e672d165f03b239aac1cac1cd2'
+  [rust]='70909e18625a942f243f7ca85ca0f784fb0132d94486685c91cb500e597291a0'
+  [swift]='6f21687f43061f70e68182097dc4d4d5be74ad63a12124c74d43de7a072ef5ad'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -230,7 +230,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_swift_traversal.py']='7ac2f088ebac063e17d72b2aecc9afe58716322dfc3adc86fff939c4190461e9'
   ['helpers/ubs_core/bash_rules.py']='17eda47be732993bb1f636cf0375823042c1701646cd656cf9735ae8dc298882'
   ['helpers/ubs_core/bash_scan.py']='db0a5a3bd3c77d0898e929b916d58f7dfe4f05f3eeaa53d7e2dc56313ef6095b'
-  ['helpers/ubs_core/cache.py']='10cbb2da51471d9ae91374704945e659ecc72fd3e6ab6c3ddd1976e2197fee81'
+  ['helpers/ubs_core/cache.py']='0b6bc20ba801467b84bd5235ec66e0b7031c47413fd6ee9598246232097e2e8c'
   ['helpers/ubs_core/cli.py']='5e9245b2f6752335de18cf850a22596e71f45bf83d70e53ae0938b4aab8b4b1a'
   ['helpers/ubs_core/cpp_detectors/__init__.py']='b74840d5af31f44ac13703f3c66f6968af4207c9ce08f3c0ae1010cd62c4fabd'
   ['helpers/ubs_core/cpp_detectors/archive_entry.py']='adb8693a5ac0370aa0bc9f7aabbb05eb63da64fac792e1451f15b352f870a114'
@@ -482,7 +482,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='b506f2f01c92fba09f5a684a24cdc124097b4760719f928e22f64fdf3bdcb246'
   ['helpers/ubs_core/taint_flow.py']='828316f978026b562f13a62e86abfefa83e5dfc802cc97151ecda6de107e16f2'
-  ['lib/ubs-common.sh']='be5945abefcc45863c227659479debab7f4a583b644fd2b134f5dc1145467c44'
+  ['lib/ubs-common.sh']='ce89d7e09a6e66635c361124fa248406988ab6b1623c58f399ba179ff0e60b52'
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,7 +606,15 @@ now_ms(){
   fi
 }
 UBS_START_MS="$(now_ms)"
+SCAN_ENV_PROFILE_SET="${UBS_PROFILE+x}"
 UBS_PROFILE="${UBS_PROFILE:-0}"
+PROFILE_TIMINGS=0
+case "$UBS_PROFILE" in
+  # Numeric values control instrumentation, not severity. Asking for timing
+  # must never disable a repository's strict warning gate.
+  1) PROFILE_TIMINGS=1; SCAN_ENV_PROFILE_SET="" ;;
+  0) SCAN_ENV_PROFILE_SET="" ;;
+esac
 PROFILE_LIST_MS=0
 PROFILE_FANOUT_MS=0
 PROFILE_MERGE_MS=0
@@ -1413,6 +1421,17 @@ ALL_LANGS=(js python cpp rust golang java kotlin ruby swift csharp elixir bash)
 # Per-language category skip lists, populated by --skip-LANG=N flags.
 # Bare --skip=N continues to apply globally via UBS_SKIP_CATEGORIES (issue #52).
 declare -A SKIP_BY_LANG=()
+# Configuration is declarative data. Record explicit options so applying a
+# project policy cannot replace command-line choices, including empty lists.
+declare -A CLI_SCAN_SETTINGS=()
+SCAN_CONFIG_PATH=""
+SCAN_CONFIG_EXPLICIT=0
+SCAN_CONFIG_DISABLED=0
+SCAN_CONFIG_DIGEST=""
+SCAN_FILES_OPTION=0
+SCAN_ENV_SKIP_SET="${UBS_SKIP_CATEGORIES+x}"
+SCAN_ENV_RULES_SET="${UBS_RULES+x}"
+unset UBS_SCAN_CONFIG_EXCLUDES UBS_SCAN_CONFIG_POLICY
 UPDATE_ONLY=0
 # FORCE_SELF_UPDATE=1 in the environment forces an update check (documented in
 # README); --update sets it too.
@@ -1495,6 +1514,263 @@ lang_for_source_file(){
   esac
 }
 
+# Shared by command-line parsing, configuration and language selection.
+normalize_lang(){
+  case "$1" in
+    c) echo "cpp" ;;
+    cs|csharp|csharp-dotnet|dotnet|c#) echo "csharp" ;;
+    ex|elixir|phoenix) echo "elixir" ;;
+    go) echo "golang" ;;
+    kt|kts|kotlin) echo "kotlin" ;;
+    py) echo "python" ;;
+    rb) echo "ruby" ;;
+    rs) echo "rust" ;;
+    ts) echo "js" ;;
+    sh|bash) echo "bash" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# The same stable category table serves config validation and CLI selection.
+# Index 18 in Ruby is intentionally empty; its existing table skips that id.
+category_slug_for(){
+  local lang="$1" cat="$2"
+  local -a slugs=()
+  case "$lang" in
+    js) slugs=(null-undefined equality proto-object type-coercion async error-handling security function-scope parsing control-flow debug perf vars code-quality regex dom typescript node resource-lifecycle);;
+    python) slugs=(none numeric collections comparison async error-handling security functions parsing control-flow debug perf variables code-quality regex io typing modules resource-lifecycle uv-tools deprecations packaging notebooks);;
+    rust) slugs=(ownership unsafe-memory async numeric collections allocation filesystem security code-quality modules tests lints build dependencies api-misuse domain ast-grep inventory resource-lifecycle async-locking panic casts parsing perf);;
+    golang) slugs=(concurrency channels context http resource-lifecycle error-handling json-encoding filesystem security reflection-unsafe imports build testing logging style panic-time lifecycle-correlation tooling dependencies defer-nil database shutdown);;
+    java) slugs=(null-optional equality concurrency security io logging regex collections control-flow streams-perf serialization java21 sql annotations ast-grep build inventory api-misuse resource-lifecycle filesystem secrets logging-practices);;
+    cpp) slugs=(memory-raii exceptions concurrency modernization pointer-lifetime numeric undefined-behavior headers stl string-io macros cmake code-quality perf debug resource-lifecycle);;
+    ruby) slugs=(nil numeric collections comparison exceptions security shell io parsing control-flow debug perf variables code-quality regex concurrency rails "" bundler);;
+    swift) slugs=(optionals concurrency closures networking error-handling security crypto filesystem threading perf debug regex swiftui memory code-quality resource-lifecycle info-plist deprecations build packaging ui-safety tests l10n);;
+    csharp) slugs=(exceptions-null resources concurrency numeric collections strings filesystem security code-quality api-misuse debug formatting build dependencies exceptions aspnet ast-grep inventory resource-lifecycle async-locks rethrow casts parsing perf);;
+    kotlin) slugs=(type-narrowing equality concurrency security io logging regex collections control-flow performance serialization features sql annotations ast-grep build inventory api-misuse resource-lifecycle filesystem secrets logging-practices);;
+    elixir) slugs=(pattern-matching error-handling process-otp security phoenix ecto concurrency io debug perf code-quality config testing mix binary-safety analyzers);;
+    bash) slugs=(syntax control-flow security robustness environment shellcheck);;
+  esac
+  if [[ "$cat" =~ ^[1-9][0-9]*$ ]] && (( cat <= ${#slugs[@]} )); then
+    printf '%s\n' "${slugs[cat-1]}"
+  else
+    printf '\n'
+  fi
+}
+
+category_slug_to_num(){
+  local lang="$1" slug="$2"
+  case "$slug" in
+    todo|quality) slug="code-quality";;
+    lifecycle) slug="resource-lifecycle";;
+  esac
+  local cat=1 s
+  while [[ $cat -le 35 ]]; do
+    s="$(category_slug_for "$lang" "$cat")"
+    if [[ "$s" == "$slug" ]]; then
+      echo "$cat"
+      return 0
+    fi
+    cat=$((cat + 1))
+  done
+  return 1
+}
+
+load_scan_config(){
+  if [[ "$SCAN_CONFIG_DISABLED" -eq 1 ]]; then
+    if [[ "$SCAN_CONFIG_EXPLICIT" -eq 1 ]]; then
+      refuse_scan "invalid-config" "--config and --no-config cannot be combined" ""
+    fi
+    return 0
+  fi
+  local anchor="$PROJECT_DIR" records key value token
+  # One explicit file chooses its own project. Multiple paths use the
+  # invocation project; discovering policy must never widen the scan target.
+  if [[ "$SCAN_FILES_OPTION" -eq 1 || ${#SCAN_FILES[@]} -gt 1 ]]; then
+    anchor="$(pwd -P)"
+  elif [[ ${#SCAN_FILES[@]} -eq 1 && ${#POSITIONAL_TARGETS[@]} -eq 1 ]]; then
+    anchor="${SCAN_FILES[0]}"
+  fi
+  if ! records="$(python3 - "$anchor" "$SCAN_CONFIG_EXPLICIT" "$SCAN_CONFIG_PATH" <<'PYCONFIG'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+LIMIT = 256 * 1024
+LANGUAGES = set("js python cpp rust golang java kotlin ruby swift csharp elixir bash".split())
+ALIASES = {
+    "c": "cpp", "cs": "csharp", "csharp-dotnet": "csharp", "dotnet": "csharp", "c#": "csharp",
+    "ex": "elixir", "phoenix": "elixir", "go": "golang", "kt": "kotlin", "kts": "kotlin",
+    "py": "python", "rb": "ruby", "rs": "rust", "ts": "js", "sh": "bash",
+}
+FIELDS = {"version", "only", "exclude_langs", "exclude", "profile", "skip", "skip_by_lang", "category", "fail_on_warning", "rules"}
+
+def string(value, field, csv=True):
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        raise ValueError(f"{field} must contain nonempty strings of at most 4096 characters")
+    if any(ord(c) < 32 or ord(c) == 127 for c in value) or (csv and "," in value):
+        raise ValueError(f"{field} contains a control character or an unsupported comma")
+    return value
+
+def language(value, field):
+    value = string(value, field)
+    value = ALIASES.get(value, value)
+    if value not in LANGUAGES:
+        raise ValueError(f"{field}: unknown language {value!r}")
+    return value
+
+def array(value, field):
+    if not isinstance(value, list) or len(value) > 256:
+        raise ValueError(f"{field} must be an array with at most 256 entries")
+    return value
+
+def skip_token(value, field, numeric_only=False):
+    if type(value) is int and 0 < value <= 999:
+        return str(value)
+    value = string(value, field)
+    if re.fullmatch(r"[1-9][0-9]{0,2}", value):
+        return value
+    if not numeric_only and re.fullmatch(r"[a-z0-9#+-]+\.[a-z0-9-]+", value):
+        lang, category = value.split(".", 1)
+        return language(lang, field) + "." + category
+    raise ValueError(f"{field} expects positive category numbers (1..999)" + ("" if numeric_only else " or language.category ids"))
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r}")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError(f"invalid JSON constant {value}")
+
+path = None
+try:
+    selected = Path(sys.argv[1]).resolve()
+    anchor = selected if selected.is_dir() else selected.parent
+    project = anchor
+    for candidate in (anchor, *anchor.parents):
+        if (candidate / ".git").exists():
+            project = candidate
+            break
+    explicit = sys.argv[2] == "1"
+    if explicit and not sys.argv[3]:
+        raise ValueError("--config requires a nonempty path")
+    path = Path(sys.argv[3]).resolve() if explicit else project / ".ubs.json"
+    if not explicit and not os.path.lexists(path):
+        raise SystemExit(0)
+    # Open nonblocking before checking the descriptor: a FIFO, directory or
+    # racing replacement must not hang or masquerade as a JSON policy file.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > LIMIT:
+            raise ValueError("configuration must be a regular file no larger than 256 KiB")
+        raw = stream.read(LIMIT + 1)
+    if len(raw) > LIMIT:
+        raise ValueError("configuration exceeds 256 KiB")
+    config = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    if not isinstance(config, dict):
+        raise ValueError("configuration must be a JSON object")
+    unknown = config.keys() - FIELDS
+    if unknown:
+        raise ValueError("unknown configuration field(s): " + ", ".join(sorted(unknown)))
+    if "version" in config and (type(config["version"]) is not int or config["version"] != 1):
+        raise ValueError("version must be the integer 1")
+    records = []
+    for field, value in config.items():
+        if field == "version":
+            continue
+        if field in ("only", "exclude_langs"):
+            records.append((field, ",".join(language(v, field) for v in array(value, field))))
+        elif field == "exclude":
+            patterns = [string(v, field).removeprefix("./").removesuffix("/") for v in array(value, field)]
+            if any(not pattern for pattern in patterns):
+                raise ValueError("exclude must not contain an empty or root-only pattern")
+            records.append((field, json.dumps({"root": str(project), "patterns": patterns}, ensure_ascii=True)))
+        elif field == "rules":
+            for item in array(value, field):
+                directory = (path.parent / string(item, field, csv=False)).resolve()
+                if not directory.is_dir() or not os.access(directory, os.R_OK | os.X_OK):
+                    raise ValueError(f"rules requires a readable directory: {directory}")
+                string(str(directory), field, csv=False)
+                records.append(("rule", str(directory)))
+        elif field == "skip":
+            records.append((field, ",".join(skip_token(v, field) for v in array(value, field))))
+        elif field == "skip_by_lang":
+            if not isinstance(value, dict) or len(value) > len(LANGUAGES) + len(ALIASES):
+                raise ValueError("skip_by_lang must be an object keyed by language")
+            seen = set()
+            for lang, tokens in value.items():
+                normalized = language(lang, field)
+                if normalized in seen:
+                    raise ValueError(f"skip_by_lang repeats the language {normalized!r} through an alias")
+                seen.add(normalized)
+                records.append(("skip-" + normalized, ",".join(skip_token(v, field, True) for v in array(tokens, field))))
+        elif field == "profile":
+            if value not in ("strict", "loose"):
+                raise ValueError("profile must be strict or loose")
+            records.append((field, value))
+        elif field == "category":
+            if value != "resource-lifecycle":
+                raise ValueError("category must be resource-lifecycle")
+            records.append((field, value))
+        elif field == "fail_on_warning":
+            if type(value) is not bool:
+                raise ValueError("fail_on_warning must be a boolean")
+            records.append((field, "1" if value else "0"))
+    # Nothing is emitted until the complete policy has passed validation.
+    records.append(("digest", hashlib.sha256(raw + b"\0" + os.fsencode(path) + b"\0" + os.fsencode(project)).hexdigest()))
+    for key, value in records:
+        print(key + "\t" + value)
+except (OSError, ValueError, UnicodeError, RuntimeError, RecursionError) as exc:
+    print(f"ubs: invalid configuration {str(path) if path else sys.argv[3]!r}: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+PYCONFIG
+)"; then
+    refuse_scan "invalid-config" "Cannot load scan configuration; see the diagnostic above" ""
+  fi
+  # Semantic validation also precedes output writers and policy application.
+  # Share the existing CLI table so a typo cannot silently disable a category.
+  while IFS=$'\t' read -r key value; do
+    if [[ "$key" == "skip" ]]; then
+      local -a tokens=()
+      IFS=',' read -r -a tokens <<<"$value"
+      for token in "${tokens[@]}"; do
+        if [[ "$token" == *.* ]] && ! category_slug_to_num "${token%%.*}" "${token#*.}" >/dev/null; then
+          refuse_scan "invalid-config" "Invalid skip category '$token' in ${SCAN_CONFIG_PATH:-.ubs.json}" ""
+        fi
+      done
+    fi
+  done <<<"$records"
+  while IFS=$'\t' read -r key value; do
+    case "$key" in
+      only) [[ -n "${CLI_SCAN_SETTINGS[only]:-}" ]] || ONLY_LANGS="$value" ;;
+      exclude_langs) [[ -n "${CLI_SCAN_SETTINGS[exclude_langs]:-}" ]] || EXCLUDE_LANGS="$value" ;;
+      exclude) [[ -n "${CLI_SCAN_SETTINGS[exclude]:-}" ]] || export UBS_SCAN_CONFIG_EXCLUDES="$value" ;;
+      profile)
+        if [[ -z "$SCAN_ENV_PROFILE_SET" && -z "${CLI_SCAN_SETTINGS[profile]:-}" ]]; then export UBS_PROFILE="$value"; fi ;;
+      skip)
+        if [[ -z "$SCAN_ENV_SKIP_SET" && -z "${CLI_SCAN_SETTINGS[skip]:-}" ]]; then export UBS_SKIP_CATEGORIES="$value"; fi ;;
+      skip-*)
+        if [[ -z "${CLI_SCAN_SETTINGS[$key]:-}" ]]; then SKIP_BY_LANG["${key#skip-}"]="$value"; fi ;;
+      category) [[ -n "${CLI_SCAN_SETTINGS[category]:-}" ]] || CATEGORY_FILTER="$value" ;;
+      fail_on_warning) [[ -n "${CLI_SCAN_SETTINGS[fail_on_warning]:-}" ]] || FAIL_ON_WARNING="$value" ;;
+      rule)
+        if [[ -z "$SCAN_ENV_RULES_SET" && -z "${CLI_SCAN_SETTINGS[rules]:-}" ]]; then
+          USER_RULES_SOURCES+=("$value"); USER_RULES_REQUESTED=1
+        fi ;;
+      digest) SCAN_CONFIG_DIGEST="$value" ;;
+    esac
+  done <<<"$records"
+  return 0
+}
+
 usage() {
   cat <<USAGE >&2
 Usage: ubs [options] [PROJECT_DIR]
@@ -1506,8 +1782,8 @@ Usage: ubs [options] [PROJECT_DIR]
        ubs explain <rule-id> [--format=text|json]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
-       ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]   (JSON for agents)
-       ubs --schema[=json|jsonl|sarif|toon|error|doctor|all]                (JSON Schema per format)
+       ubs robot-docs [guide|commands|examples|exit-codes|formats|env|config|all]   (JSON for agents)
+       ubs --schema[=json|jsonl|sarif|toon|error|doctor|config|all]                (JSON Schema)
 
 Options:
   --format=FMT            text|json|jsonl|sarif|toon (default: text)
@@ -1531,6 +1807,9 @@ Options:
   --only=CSV              Restrict to languages: js,python,c,cpp,rust,golang,java,kotlin,kt,ruby,swift,csharp,cs,elixir,ex,bash,sh
   --exclude=GLOB[,..]     Skip paths (globs/dirs, like .ubsignore lines); forwarded to modules
   --exclude-langs=CSV     Exclude languages (e.g. --exclude-langs=js,ruby)
+  --config=PATH          Load a JSON scan policy instead of the project's .ubs.json
+  --no-config            Disable automatic project configuration (conflicts with --config)
+                          Precedence: defaults < project < environment < explicit CLI
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
   --category=CSV          Focus on category packs (e.g., resource-lifecycle for AST lifecycle analyzers)
   --profile=NAME          Severity profile forwarded to the modules (strict|loose); strict also implies --fail-on-warning
@@ -1608,12 +1887,14 @@ Environment Variables:
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
   UBS_SKIP_TYPE_NARROWING=1   Skip the type-narrowing helpers (like --skip-type-narrowing)
   UBS_RULES=DIR[:DIR...]      Custom rule directories used when no --rules is given
+  UBS_SKIP_CATEGORIES=CSV    Category skips; overrides project skip, overridden by --skip
   UBS_NO_CACHE=1              Disable scan caching (like --no-cache)
   UBS_CACHE_DIR=PATH          Override root directory for scan cache (like --cache-dir)
   UBS_RELEASE_BASE=URL        Fetch update artifacts from another base (warns loudly)
   UBS_MODULE_TIMEOUT=SECS     Override automatic per-module timeout (minimum 300s; 0 disables)
   UBS_PROFILE=1               Add phase timings (copy, fan-out, per module, merge, total ms)
                               as a "profile" block in json/toon output and a Profile line in text
+                              strict|loose instead selects a severity profile; CLI --profile wins
   UBS_ALLOW_PARTIAL=1         Exit on findings even when a module timed out or crashed
                               (default: such partial runs exit 2; the JSON/JSONL/SARIF
                               envelope carries status and failed_modules either way)
@@ -1678,6 +1959,8 @@ cat <<'JSON'
       {"name": "--ci", "args": null, "example": "--ci", "description": "CI mode: stable UTC timestamps; also disables the auto-update check."},
       {"name": "--fail-on-warning", "args": null, "example": "--fail-on-warning", "description": "Exit 1 when warnings exist, not only criticals."},
       {"name": "--only", "args": "CSV", "example": "--only=js,python", "description": "Restrict to these languages (js, python, c/cpp, rust, golang, java, kotlin/kt, ruby, swift, csharp/cs, elixir/ex, bash/sh)."},
+      {"name": "--config", "args": "PATH", "example": "--config=./ci.ubs.json", "description": "Use an explicit JSON scan configuration; relative paths start at the invocation directory. See robot-docs config and --schema=config."},
+      {"name": "--no-config", "args": null, "example": "--no-config", "description": "Disable automatic .ubs.json loading. Cannot be combined with --config."},
       {"name": "--exclude-langs", "args": "CSV", "example": "--exclude-langs=ruby", "description": "Skip these languages."},
       {"name": "--exclude", "args": "GLOB[,..]", "example": "--exclude=legacy,generated", "description": "Skip paths (globs/dirs with .ubsignore semantics); forwarded to every module. A bare language name with no such path is rejected (use --exclude-langs)."},
       {"name": "--include-ext", "args": "CSV", "example": "--include-ext=js,vue", "description": "Extra file extensions forwarded to the language modules."},
@@ -1753,7 +2036,8 @@ cat <<'JSON'
     {"name": "UBS_OUTPUT_FORMAT", "value": "text|json|jsonl|sarif|toon", "description": "Default output format (CLI --format wins)."},
     {"name": "UBS_MODULE_TIMEOUT", "value": "SECS", "description": "Override automatic per-module timeout (3x estimated cost, minimum 300s); 0 disables."},
     {"name": "UBS_ALLOW_PARTIAL", "value": "1", "description": "Exit on findings even when a module timed out or crashed (envelope still says partial)."},
-    {"name": "UBS_PROFILE", "value": "1", "description": "Add a profile block (total_ms, list_ms, fanout_ms, merge_ms, modules{lang: ms}) to json/toon output and a Profile line to the text summary."},
+    {"name": "UBS_PROFILE", "value": "0|1|strict|loose", "description": "1 adds phase timings and 0 disables them; neither changes project severity. Strict or loose overrides project profile and is overridden by --profile. Strict implies --fail-on-warning."},
+    {"name": "UBS_SKIP_CATEGORIES", "value": "CSV", "description": "Global category skips. Overrides project skip and is overridden by --skip, including an empty value."},
     {"name": "UBS_ALLOW_NO_SCAN", "value": "1", "description": "Exit 0 instead of 3 when no supported language is detected."},
     {"name": "UBS_MAX_DIR_SIZE_MB", "value": "N", "description": "Refuse to scan directories larger than N MB after ignores (default 1000; 0 disables). Measured over the listed files: binary/media/archive/data files and files above UBS_MAX_FILE_MB are not counted or copied."},
     {"name": "UBS_MAX_FILE_MB", "value": "N", "description": "Leave files above N MB out of whole-project scans (default 8; 0 disables)."},
@@ -1769,7 +2053,20 @@ cat <<'JSON'
     {"name": "CI", "value": "true", "description": "Disables the auto-update check like --ci."},
     {"name": "NO_COLOR", "value": "1", "description": "Disable ANSI colors."},
     {"name": "TOON_TRU_BIN", "value": "PATH", "description": "toon_rust encoder binary for --format=toon."}
-  ]
+  ],
+  "config": {
+    "filename": ".ubs.json",
+    "schema": "ubs --schema=config",
+    "version": 1,
+    "precedence": ["built-in defaults", "project configuration", "documented environment variables", "explicit command-line options"],
+    "discovery": "For one directory or positional file, use its nearest Git worktree root; outside Git use that directory or file parent. For multiple targets or --files, use the invocation directory's Git root, or that directory outside Git. Read only that root's .ubs.json, without merging ancestors or nested configs. --config selects another file; --no-config disables discovery.",
+    "paths": "Exclude patterns keep the discovered project as their root even for a narrower selected directory. Explicitly named files continue to override ignores. Relative rules directories are anchored to the configuration file's parent. Configuration never broadens the selected scan targets.",
+    "merge": "Each field replaces the lower layer; skip_by_lang replaces one normalized language at a time. Empty arrays clear that field. Built-in ignores and .ubsignore remain independent. Existing repeated CLI flag behavior is preserved.",
+    "environment": {"profile": "UBS_PROFILE", "skip": "UBS_SKIP_CATEGORIES", "rules": "UBS_RULES"},
+    "validation": "JSON object, at most 256 KiB; version must be the integer 1 when present. Unknown or duplicate fields, unsupported categories, invalid types, control characters, unreadable files, and invalid rule directories fail with exit 2. Arrays contain at most 256 entries and strings at most 4096 characters. CSV-backed values cannot contain commas. Configuration is data, never executable shell.",
+    "cache": "The configuration identity and effective scan settings participate in native cache keys. Service snapshots observe configuration changes; selected-file watch automatically observes creation, edits, removal and discovery-location changes of the configuration selected by the ordinary CLI. If that policy lies outside the served directory, serve and watch its Git worktree root with --repo. Active custom rules disable whole-report service reuse, retaining native incremental caching. Watching stays inside the served root: add an explicit dependency for in-repository rule files and request a fresh scan after external rules change.",
+    "example": {"version": 1, "only": ["js", "python"], "exclude": ["/generated/**"], "profile": "strict", "skip": ["python.todo"], "skip_by_lang": {"js": [11]}, "fail_on_warning": true}
+  }
 }
 JSON
 }
@@ -1777,12 +2074,12 @@ JSON
 emit_robot_docs(){
   local topic="${1:-all}"
   case "$topic" in
-    guide|commands|examples|exit-codes|formats|env|all) ;;
+    guide|commands|examples|exit-codes|formats|env|config|all) ;;
     -h|--help)
-      say_err "Usage: ubs robot-docs [guide|commands|examples|exit-codes|formats|env|all]"
+      say_err "Usage: ubs robot-docs [guide|commands|examples|exit-codes|formats|env|config|all]"
       return 0 ;;
     *)
-      say_err "${RED}${X}${RESET} unknown robot-docs topic: $topic (guide|commands|examples|exit-codes|formats|env|all)"
+      say_err "${RED}${X}${RESET} unknown robot-docs topic: $topic (guide|commands|examples|exit-codes|formats|env|config|all)"
       return 2 ;;
   esac
   if ! need_cmd jq; then
@@ -1798,6 +2095,30 @@ emit_robot_docs(){
 schema_document(){
 cat <<'JSON'
 {
+  "config": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "UBS repository scan configuration (.ubs.json)",
+    "description": "Declarative scan settings. Runtime validation also checks category ids, normalized language uniqueness, readable rule directories and the 256 KiB document limit. Defaults < project < environment < explicit CLI.",
+    "type": "object",
+    "additionalProperties": false,
+    "$defs": {
+      "language": {"enum": ["js", "python", "cpp", "rust", "golang", "java", "kotlin", "ruby", "swift", "csharp", "elixir", "bash", "c", "cs", "csharp-dotnet", "dotnet", "c#", "ex", "phoenix", "go", "kt", "kts", "py", "rb", "rs", "ts", "sh"]},
+      "string": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000-\\u001f\\u007f]+$"},
+      "number": {"oneOf": [{"type": "integer", "minimum": 1, "maximum": 999}, {"type": "string", "pattern": "^[1-9][0-9]{0,2}$"}]}
+    },
+    "properties": {
+      "version": {"type": "integer", "const": 1},
+      "only": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/language"}},
+      "exclude_langs": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/language"}},
+      "exclude": {"type": "array", "maxItems": 256, "items": {"allOf": [{"$ref": "#/$defs/string"}, {"pattern": "^[^,]+$", "not": {"enum": ["/", "./"]}}]}},
+      "profile": {"enum": ["strict", "loose"]},
+      "skip": {"type": "array", "maxItems": 256, "items": {"oneOf": [{"$ref": "#/$defs/number"}, {"type": "string", "maxLength": 4096, "pattern": "^[a-z0-9#+-]+\\.[a-z0-9-]+$"}]}},
+      "skip_by_lang": {"type": "object", "propertyNames": {"$ref": "#/$defs/language"}, "additionalProperties": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/number"}}},
+      "category": {"const": "resource-lifecycle"},
+      "fail_on_warning": {"type": "boolean"},
+      "rules": {"type": "array", "maxItems": 256, "items": {"$ref": "#/$defs/string"}, "description": "Custom rule directories, relative to the configuration file's parent when not absolute."}
+    }
+  },
   "json": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "title": "ubs --format=json (and the document encoded by --format=toon)",
@@ -2080,7 +2401,7 @@ emit_schema(){
     return 2
   fi
   case "$fmt" in
-    json|jsonl|sarif|doctor) ;;
+    json|jsonl|sarif|doctor|config) ;;
     toon) fmt="json" ;;
     error)
       schema_document | jq --arg id "$UBS_SCHEMA_ID_BASE/error.schema.json" --arg sv "$UBS_SCHEMA_VERSION" '
@@ -2094,7 +2415,7 @@ emit_schema(){
         + {toon: {"$ref": ($base + "/json.schema.json"), description: "TOON is tru-encoded json; validate the decoded document against the json schema."}}'
       return 0 ;;
     *)
-      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|doctor|all)"
+      say_err "${RED}${X}${RESET} unknown --schema format: $fmt (json|jsonl|sarif|toon|error|doctor|config|all)"
       return 2 ;;
   esac
   schema_document | jq --arg key "$fmt" --arg base "$UBS_SCHEMA_ID_BASE" --arg sv "$UBS_SCHEMA_VERSION" '
@@ -2272,23 +2593,28 @@ else
         ALSO_REPORTS+=("$2"); shift 2;;
       --version|-V) SHOW_VERSION=1; shift;;
       --ci) CI_MODE=1; shift;;
-      --fail-on-warning) FAIL_ON_WARNING=1; shift;;
+      --fail-on-warning) FAIL_ON_WARNING=1; CLI_SCAN_SETTINGS[fail_on_warning]=1; shift;;
       -v|--verbose) VERBOSE=1; shift;;
       -q|--quiet) QUIET=1; shift;;
       --update) UPDATE_ONLY=1; FORCE_SELF_UPDATE=1; shift;;
       --no-cache) export UBS_NO_CACHE=1; shift;;
+      --config=*) SCAN_CONFIG_PATH="${1#*=}"; SCAN_CONFIG_EXPLICIT=1; shift;;
+      --config)
+        if [[ $# -lt 2 ]]; then say_err "ERROR: --config requires a path"; exit 2; fi
+        SCAN_CONFIG_PATH="$2"; SCAN_CONFIG_EXPLICIT=1; shift 2;;
+      --no-config) SCAN_CONFIG_DISABLED=1; shift;;
       --cache-dir=*) export UBS_CACHE_DIR="${1#*=}"; shift;;
       --cache-dir)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; export UBS_CACHE_DIR="$1"; shift;;
       --non-interactive) shift;;
-      --only=*) ONLY_LANGS="${1#*=}"; shift;;
-      --exclude=*) add_exclude_patterns "${1#*=}"; shift;;
-      --exclude-langs=*) EXCLUDE_LANGS="${1#*=}"; shift;;
-      --category=*) CATEGORY_FILTER="${1#*=}"; shift;;
+      --only=*) ONLY_LANGS="${1#*=}"; CLI_SCAN_SETTINGS[only]=1; shift;;
+      --exclude=*) add_exclude_patterns "${1#*=}"; CLI_SCAN_SETTINGS[exclude]=1; shift;;
+      --exclude-langs=*) EXCLUDE_LANGS="${1#*=}"; CLI_SCAN_SETTINGS[exclude_langs]=1; shift;;
+      --category=*) CATEGORY_FILTER="${1#*=}"; CLI_SCAN_SETTINGS[category]=1; shift;;
       --category)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
-        shift; CATEGORY_FILTER="$1"; shift;;
+        shift; CATEGORY_FILTER="$1"; CLI_SCAN_SETTINGS[category]=1; shift;;
       --save-baseline=*) SAVE_BASELINE_FILE="${1#*=}"; shift;;
       --save-baseline)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -2347,25 +2673,29 @@ else
       --no-auto-update) export UBS_NO_AUTO_UPDATE=1; shift;;
       --staged) GIT_MODE="staged"; shift;;
       --diff|--git-diff) GIT_MODE="diff"; shift;;
-      --files=*) IFS=',' read -r -a _f <<<"${1#*=}"; SCAN_FILES+=("${_f[@]}"); shift;;
+      --files=*) IFS=',' read -r -a _f <<<"${1#*=}"; SCAN_FILES+=("${_f[@]}"); SCAN_FILES_OPTION=1; shift;;
       --files)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
-        shift; IFS=',' read -r -a _f <<<"$1"; SCAN_FILES+=("${_f[@]}"); shift;;
+        shift; IFS=',' read -r -a _f <<<"$1"; SCAN_FILES+=("${_f[@]}"); SCAN_FILES_OPTION=1; shift;;
       --profile=*)
         export UBS_PROFILE="${1#*=}"
-        if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
+        [[ "$UBS_PROFILE" != "1" ]] || PROFILE_TIMINGS=1
+        CLI_SCAN_SETTINGS[profile]=1
         shift;;
       --skip=*)
         export UBS_SKIP_CATEGORIES="${1#*=}"
+        CLI_SCAN_SETTINGS[skip]=1
         shift;;
       --skip-*=*)
         # --skip-LANG=N[,M,...] applies only to the matching language module
         # (issue #52). LANG accepts the same aliases as --only / --exclude
-        # (e.g. --skip-c is normalized to --skip-cpp at run time, after the
-        # normalize_lang helper is defined). The earlier --skip-size-check /
+        # (e.g. --skip-c is normalized to --skip-cpp before config merging).
+        # The earlier --skip-size-check /
         # --skip-type-narrowing arms above shadow this glob for those flags.
         _sk_lang_key="${1#--skip-}"
         _sk_lang_key="${_sk_lang_key%%=*}"
+        _sk_lang_key="$(normalize_lang "$_sk_lang_key")"
+        CLI_SCAN_SETTINGS["skip-$_sk_lang_key"]=1
         _sk_lang_val="${1#*=}"
         if [[ -n "${SKIP_BY_LANG[$_sk_lang_key]:-}" ]]; then
           SKIP_BY_LANG["$_sk_lang_key"]="${SKIP_BY_LANG[$_sk_lang_key]},$_sk_lang_val"
@@ -2382,10 +2712,10 @@ else
       --include-ext)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; INCLUDE_EXT="$1"; shift;;
-      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_SOURCES+=("${1#*=}"); shift;;
+      --rules=*) USER_RULES_REQUESTED=1; USER_RULES_SOURCES+=("${1#*=}"); CLI_SCAN_SETTINGS[rules]=1; shift;;
       --rules)
         if [[ $# -lt 2 ]]; then say_err "ERROR: --rules requires a directory"; exit 2; fi
-        USER_RULES_REQUESTED=1; shift; USER_RULES_SOURCES+=("$1"); shift;;
+        USER_RULES_REQUESTED=1; shift; USER_RULES_SOURCES+=("$1"); CLI_SCAN_SETTINGS[rules]=1; shift;;
       --output=*) OUTPUT_FILE="${1#*=}"; shift;;
       --output|-o)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -2396,11 +2726,11 @@ else
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         _flag="$1"; shift
         case "$_flag" in
-          --only) ONLY_LANGS="$1";;
-          --exclude) add_exclude_patterns "$1";;
-          --exclude-langs) EXCLUDE_LANGS="$1";;
+          --only) ONLY_LANGS="$1"; CLI_SCAN_SETTINGS[only]=1;;
+          --exclude) add_exclude_patterns "$1"; CLI_SCAN_SETTINGS[exclude]=1;;
+          --exclude-langs) EXCLUDE_LANGS="$1"; CLI_SCAN_SETTINGS[exclude_langs]=1;;
           --jobs) JOBS="$1";;
-          --skip) export UBS_SKIP_CATEGORIES="$1";;
+          --skip) export UBS_SKIP_CATEGORIES="$1"; CLI_SCAN_SETTINGS[skip]=1;;
           --ignore-file) IGNORE_FILE="$1";;
         esac
         unset _flag
@@ -2467,6 +2797,10 @@ else
     PROJECT_DIR="${POSITIONAL_TARGETS[0]}"
   elif [[ ${#POSITIONAL_TARGETS[@]} -gt 0 ]]; then
     SCAN_FILES+=("${POSITIONAL_TARGETS[@]}")
+  fi
+  if [[ "$SHOW_VERSION" -eq 0 && "$UPDATE_ONLY" -eq 0 ]]; then
+    load_scan_config
+    if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
   fi
   if [[ ${#ALSO_PATHS[@]} -gt 0 ]]; then
     # Reject aliases before --output can truncate a file or any scan starts.
@@ -2790,7 +3124,7 @@ dir_size_mb_filtered(){
   local patterns_csv="${2:-}"
   local result=""
   local du_can_exclude=0
-  if need_cmd du; then
+  if [[ -z "${UBS_SCAN_CONFIG_EXCLUDES:-}" ]] && need_cmd du; then
     local -a du_args=()
     if [[ -n "$patterns_csv" ]] && du --help 2>/dev/null | grep -q -- '--exclude'; then
       # du --exclude matches patterns against each entry's basename, not the
@@ -2842,7 +3176,7 @@ patterns_csv = sys.argv[2] if len(sys.argv) > 2 else ""
 # The size guard has to measure what the scan will select: counting bytes the
 # ignore spec removes can refuse a project for a directory the user excluded.
 # Same matcher as the listing paths (issue #114).
-ignore_matcher = IgnoreMatcher(patterns_csv)
+ignore_matcher = IgnoreMatcher(patterns_csv, root)
 
 def excluded(rel_path):
     return ignore_matcher.excluded(str(rel_path).replace(os.sep, "/"))
@@ -2936,6 +3270,8 @@ so paths selected without rg agree exactly. Per pattern:
 Inside a glob, `*` and `?` never cross `/`; `**` does.
 """
 
+import json
+import os
 import re
 
 
@@ -3027,7 +3363,7 @@ def glob_to_regex(glob):
 class IgnoreMatcher:
     """A compiled ignore spec. `excluded()` takes a relative POSIX path."""
 
-    def __init__(self, spec):
+    def __init__(self, spec, root=None):
         paths, components = [], []
         for pattern in spec.split(","):
             if not pattern:
@@ -3049,6 +3385,17 @@ class IgnoreMatcher:
         # everything below it: `a/b` must drop `a/b/c.py`, not just `a/b`.
         self.path_re = self._compile(paths, r"(?:/.*)?")
         self.component_re = self._compile(components)
+        self.config_matcher = None
+        self.config_root = self.source_root = ""
+        policy = os.environ.get("UBS_SCAN_CONFIG_EXCLUDES", "")
+        if root is not None and policy:
+            # The runner already validated this object. Keep project patterns
+            # anchored to that project when selecting a narrower directory;
+            # they must not start matching unrelated external targets.
+            config = json.loads(policy)
+            self.config_root = config["root"]
+            self.source_root = os.path.abspath(os.fsdecode(root))
+            self.config_matcher = IgnoreMatcher(",".join(config["patterns"]))
 
     @staticmethod
     def _compile(sources, tail=""):
@@ -3059,6 +3406,8 @@ class IgnoreMatcher:
         return re.compile("(?:" + "|".join(sources) + ")" + tail + r"\Z", re.DOTALL)
 
     def excluded(self, rel):
+        if self.config_excluded(rel):
+            return True
         if self.path_re is not None and self.path_re.match(rel):
             return True
         if self.component_re is not None:
@@ -3066,6 +3415,18 @@ class IgnoreMatcher:
                 if self.component_re.match(part):
                     return True
         return False
+
+    def config_excluded(self, rel):
+        if self.config_matcher is None:
+            return False
+        candidate = os.path.abspath(os.path.join(self.source_root, rel))
+        try:
+            if os.path.commonpath((candidate, self.config_root)) != self.config_root:
+                return False
+        except ValueError:
+            return False
+        project_rel = os.path.relpath(candidate, self.config_root).replace(os.sep, "/")
+        return self.config_matcher.excluded(project_rel)
 PY
 }
 
@@ -3106,7 +3467,7 @@ from ubs_ignore import IgnoreMatcher
 root = os.fsencode(sys.argv[1])
 raw, out, max_mb = sys.argv[2], sys.argv[3], int(sys.argv[4])
 data_exts = {ext for ext in sys.argv[5].split(",") if ext}
-mode, ignore_matcher = sys.argv[6], IgnoreMatcher(sys.argv[7])
+mode, ignore_matcher = sys.argv[6], IgnoreMatcher(sys.argv[7], root)
 scoped = set(sys.argv[8].split(",")) if len(sys.argv) > 8 and sys.argv[8] else set()
 source_exts = set(sys.argv[9].split(",")) if len(sys.argv) > 9 else set()
 contract_path = sys.argv[10] if len(sys.argv) > 10 and sys.argv[10] else ""
@@ -3323,7 +3684,7 @@ kept, total, big, data = [], 0, 0, 0
 kept_sizes = {}
 scoped_skipped = 0
 for rel in entries:
-    if not rel:
+    if not rel or ignore_matcher.config_excluded(os.fsdecode(rel).replace(os.sep, "/")):
         continue
     name = rel.rsplit(b"/", 1)[-1]
     ext = ext_of(name)
@@ -3819,7 +4180,7 @@ sys.path.insert(0, os.environ['UBS_IGNORE_MATCHER_DIR'])
 from ubs_ignore import IgnoreMatcher
 
 repo, scope, raw_path, dest, excludes = sys.argv[1:]
-matcher = IgnoreMatcher(excludes)
+matcher = IgnoreMatcher(excludes, os.path.join(repo, scope))
 
 try:
     with open(raw_path, 'rb') as stream:
@@ -3965,12 +4326,12 @@ prepare_git_workspace(){
 import os, sys
 sys.path.insert(0, os.environ['UBS_IGNORE_MATCHER_DIR'])
 from ubs_ignore import IgnoreMatcher
-matcher = IgnoreMatcher(sys.argv[1])
+matcher = IgnoreMatcher(sys.argv[1], sys.argv[2])
 for raw in sys.stdin.buffer.read().split(b'\0'):
     f = os.fsdecode(raw)
     if f and not matcher.excluded(f):
         sys.stdout.buffer.write(raw + b'\0')
-" "$GLOBAL_EXCLUDE_PATTERNS" >"$filtered_list"; then
+" "$GLOBAL_EXCLUDE_PATTERNS" "$SOURCE_PROJECT_DIR" >"$filtered_list"; then
       refuse_scan "git-diff-failed" "Could not filter changed files" ""
     fi
     files=()
@@ -5314,23 +5675,6 @@ is_module_v2(){
   return 1
 }
 
-# Normalize language alias to module name (e.g. "c" -> "cpp").
-normalize_lang(){
-  case "$1" in
-    c) echo "cpp" ;;
-    cs|csharp|csharp-dotnet|dotnet|c#) echo "csharp" ;;
-    ex|elixir|phoenix) echo "elixir" ;;
-    go) echo "golang" ;;
-    kt|kts|kotlin) echo "kotlin" ;;
-    py) echo "python" ;;
-    rb) echo "ruby" ;;
-    rs) echo "rust" ;;
-    ts) echo "js" ;;
-    sh|bash) echo "bash" ;;
-    *) echo "$1" ;;
-  esac
-}
-
 # Build selected language set
 select_langs(){
   local detected=()
@@ -6234,7 +6578,7 @@ if [[ -n "$FILTERED_PROJECT_DIR" ]]; then
   # workspace already applies directory ignores and preserves explicitly
   # named files; filtering it again could drop a requested target. Keep these
   # relative lists rooted in the workspace used for scanning.
-  if ! GLOBAL_EXCLUDE_PATTERNS="" SCOPED_IGNORE_DIRS="" MAX_FILE_SIZE_MB=0 \
+  if ! GLOBAL_EXCLUDE_PATTERNS="" UBS_SCAN_CONFIG_EXCLUDES="" SCOPED_IGNORE_DIRS="" MAX_FILE_SIZE_MB=0 \
        SCAN_DATA_EXTENSIONS="" build_scan_file_list "$PROJECT_DIR"; then
     refuse_scan "file-list-failed" "Could not list the targeted scan workspace" ""
   fi
@@ -6563,317 +6907,6 @@ warn_ambiguous_skip(){
   say_err "${YELLOW}${WARN}${RESET} To silence in only one language, use --skip-LANG=${skip_csv} (e.g. --skip-js=${skip_csv} or --skip-rust=${skip_csv})."
   say_err ""
   unset _wac
-}
-
-# Category slug lookup for stable category ids (bead A5)
-category_slug_for(){
-  local lang="$1" cat="$2"
-  case "$lang" in
-    js)
-      case "$cat" in
-        1) echo "null-undefined";;
-        2) echo "equality";;
-        3) echo "proto-object";;
-        4) echo "type-coercion";;
-        5) echo "async";;
-        6) echo "error-handling";;
-        7) echo "security";;
-        8) echo "function-scope";;
-        9) echo "parsing";;
-        10) echo "control-flow";;
-        11) echo "debug";;
-        12) echo "perf";;
-        13) echo "vars";;
-        14) echo "code-quality";;
-        15) echo "regex";;
-        16) echo "dom";;
-        17) echo "typescript";;
-        18) echo "node";;
-        19) echo "resource-lifecycle";;
-        *) echo "";;
-      esac;;
-    python)
-      case "$cat" in
-        1) echo "none";;
-        2) echo "numeric";;
-        3) echo "collections";;
-        4) echo "comparison";;
-        5) echo "async";;
-        6) echo "error-handling";;
-        7) echo "security";;
-        8) echo "functions";;
-        9) echo "parsing";;
-        10) echo "control-flow";;
-        11) echo "debug";;
-        12) echo "perf";;
-        13) echo "variables";;
-        14) echo "code-quality";;
-        15) echo "regex";;
-        16) echo "io";;
-        17) echo "typing";;
-        18) echo "modules";;
-        19) echo "resource-lifecycle";;
-        20) echo "uv-tools";;
-        21) echo "deprecations";;
-        22) echo "packaging";;
-        23) echo "notebooks";;
-        *) echo "";;
-      esac;;
-    rust)
-      case "$cat" in
-        1) echo "ownership";;
-        2) echo "unsafe-memory";;
-        3) echo "async";;
-        4) echo "numeric";;
-        5) echo "collections";;
-        6) echo "allocation";;
-        7) echo "filesystem";;
-        8) echo "security";;
-        9) echo "code-quality";;
-        10) echo "modules";;
-        11) echo "tests";;
-        12) echo "lints";;
-        13) echo "build";;
-        14) echo "dependencies";;
-        15) echo "api-misuse";;
-        16) echo "domain";;
-        17) echo "ast-grep";;
-        18) echo "inventory";;
-        19) echo "resource-lifecycle";;
-        20) echo "async-locking";;
-        21) echo "panic";;
-        22) echo "casts";;
-        23) echo "parsing";;
-        24) echo "perf";;
-        *) echo "";;
-      esac;;
-    golang)
-      case "$cat" in
-        1) echo "concurrency";;
-        2) echo "channels";;
-        3) echo "context";;
-        4) echo "http";;
-        5) echo "resource-lifecycle";;
-        6) echo "error-handling";;
-        7) echo "json-encoding";;
-        8) echo "filesystem";;
-        9) echo "security";;
-        10) echo "reflection-unsafe";;
-        11) echo "imports";;
-        12) echo "build";;
-        13) echo "testing";;
-        14) echo "logging";;
-        15) echo "style";;
-        16) echo "panic-time";;
-        17) echo "lifecycle-correlation";;
-        18) echo "tooling";;
-        19) echo "dependencies";;
-        20) echo "defer-nil";;
-        21) echo "database";;
-        22) echo "shutdown";;
-        *) echo "";;
-      esac;;
-    java)
-      case "$cat" in
-        1) echo "null-optional";;
-        2) echo "equality";;
-        3) echo "concurrency";;
-        4) echo "security";;
-        5) echo "io";;
-        6) echo "logging";;
-        7) echo "regex";;
-        8) echo "collections";;
-        9) echo "control-flow";;
-        10) echo "streams-perf";;
-        11) echo "serialization";;
-        12) echo "java21";;
-        13) echo "sql";;
-        14) echo "annotations";;
-        15) echo "ast-grep";;
-        16) echo "build";;
-        17) echo "inventory";;
-        18) echo "api-misuse";;
-        19) echo "resource-lifecycle";;
-        20) echo "filesystem";;
-        21) echo "secrets";;
-        22) echo "logging-practices";;
-        *) echo "";;
-      esac;;
-    cpp)
-      case "$cat" in
-        1) echo "memory-raii";;
-        2) echo "exceptions";;
-        3) echo "concurrency";;
-        4) echo "modernization";;
-        5) echo "pointer-lifetime";;
-        6) echo "numeric";;
-        7) echo "undefined-behavior";;
-        8) echo "headers";;
-        9) echo "stl";;
-        10) echo "string-io";;
-        11) echo "macros";;
-        12) echo "cmake";;
-        13) echo "code-quality";;
-        14) echo "perf";;
-        15) echo "debug";;
-        16) echo "resource-lifecycle";;
-        *) echo "";;
-      esac;;
-    ruby)
-      case "$cat" in
-        1) echo "nil";;
-        2) echo "numeric";;
-        3) echo "collections";;
-        4) echo "comparison";;
-        5) echo "exceptions";;
-        6) echo "security";;
-        7) echo "shell";;
-        8) echo "io";;
-        9) echo "parsing";;
-        10) echo "control-flow";;
-        11) echo "debug";;
-        12) echo "perf";;
-        13) echo "variables";;
-        14) echo "code-quality";;
-        15) echo "regex";;
-        16) echo "concurrency";;
-        17) echo "rails";;
-        19) echo "bundler";;
-        *) echo "";;
-      esac;;
-    swift)
-      case "$cat" in
-        1) echo "optionals";;
-        2) echo "concurrency";;
-        3) echo "closures";;
-        4) echo "networking";;
-        5) echo "error-handling";;
-        6) echo "security";;
-        7) echo "crypto";;
-        8) echo "filesystem";;
-        9) echo "threading";;
-        10) echo "perf";;
-        11) echo "debug";;
-        12) echo "regex";;
-        13) echo "swiftui";;
-        14) echo "memory";;
-        15) echo "code-quality";;
-        16) echo "resource-lifecycle";;
-        17) echo "info-plist";;
-        18) echo "deprecations";;
-        19) echo "build";;
-        20) echo "packaging";;
-        21) echo "ui-safety";;
-        22) echo "tests";;
-        23) echo "l10n";;
-        *) echo "";;
-      esac;;
-    csharp)
-      case "$cat" in
-        1) echo "exceptions-null";;
-        2) echo "resources";;
-        3) echo "concurrency";;
-        4) echo "numeric";;
-        5) echo "collections";;
-        6) echo "strings";;
-        7) echo "filesystem";;
-        8) echo "security";;
-        9) echo "code-quality";;
-        10) echo "api-misuse";;
-        11) echo "debug";;
-        12) echo "formatting";;
-        13) echo "build";;
-        14) echo "dependencies";;
-        15) echo "exceptions";;
-        16) echo "aspnet";;
-        17) echo "ast-grep";;
-        18) echo "inventory";;
-        19) echo "resource-lifecycle";;
-        20) echo "async-locks";;
-        21) echo "rethrow";;
-        22) echo "casts";;
-        23) echo "parsing";;
-        24) echo "perf";;
-        *) echo "";;
-      esac;;
-    kotlin)
-      case "$cat" in
-        1) echo "type-narrowing";;
-        2) echo "equality";;
-        3) echo "concurrency";;
-        4) echo "security";;
-        5) echo "io";;
-        6) echo "logging";;
-        7) echo "regex";;
-        8) echo "collections";;
-        9) echo "control-flow";;
-        10) echo "performance";;
-        11) echo "serialization";;
-        12) echo "features";;
-        13) echo "sql";;
-        14) echo "annotations";;
-        15) echo "ast-grep";;
-        16) echo "build";;
-        17) echo "inventory";;
-        18) echo "api-misuse";;
-        19) echo "resource-lifecycle";;
-        20) echo "filesystem";;
-        21) echo "secrets";;
-        22) echo "logging-practices";;
-        *) echo "";;
-      esac;;
-    elixir)
-      case "$cat" in
-        1) echo "pattern-matching";;
-        2) echo "error-handling";;
-        3) echo "process-otp";;
-        4) echo "security";;
-        5) echo "phoenix";;
-        6) echo "ecto";;
-        7) echo "concurrency";;
-        8) echo "io";;
-        9) echo "debug";;
-        10) echo "perf";;
-        11) echo "code-quality";;
-        12) echo "config";;
-        13) echo "testing";;
-        14) echo "mix";;
-        15) echo "binary-safety";;
-        16) echo "analyzers";;
-        *) echo "";;
-      esac;;
-    bash)
-      case "$cat" in
-        1) echo "syntax";;
-        2) echo "control-flow";;
-        3) echo "security";;
-        4) echo "robustness";;
-        5) echo "environment";;
-        6) echo "shellcheck";;
-        *) echo "";;
-      esac;;
-    *) echo "";;
-  esac
-}
-
-# Resolve category slug to numeric category within a language
-category_slug_to_num(){
-  local lang="$1" slug="$2"
-  case "$slug" in
-    todo) slug="code-quality";;
-    quality) slug="code-quality";;
-    lifecycle) slug="resource-lifecycle";;
-  esac
-  local cat=1
-  while [[ $cat -le 35 ]]; do
-    local s; s="$(category_slug_for "$lang" "$cat")"
-    if [[ "$s" == "$slug" ]]; then
-      echo "$cat"
-      return 0
-    fi
-    cat=$((cat + 1))
-  done
-  return 1
 }
 
 # Normalize and validate --skip values (bead A5):
@@ -8043,14 +8076,14 @@ generate_combined_json(){
   return 0
 }
 
-# Print the combined JSON, with the profile block when UBS_PROFILE=1.
+# Print the combined JSON, retaining requested timings alongside severity.
 emit_combined_json(){
   local rendered="$TMPDIR_RUN/rendered-combined.json"
   local pending="$TMPDIR_RUN/rendered-combined.pending"
   if [[ ! -s "$rendered" ]]; then
     # Freeze timing metadata too: repeated renderings describe one snapshot.
     # A failed renderer must not leave a partial snapshot for later reports.
-    if [[ "$UBS_PROFILE" == "1" ]] && need_cmd jq; then
+    if [[ "$PROFILE_TIMINGS" -eq 1 ]] && need_cmd jq; then
       jq --argjson profile "$(profile_json)" '. + {profile: $profile, extras: ((.extras // {}) + {profile: $profile})}' "$COMBINED_JSON_FILE" >"$pending" || return 1
     else
       cat "$COMBINED_JSON_FILE" >"$pending" || return 1
@@ -8420,29 +8453,28 @@ if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
   list_categories_for_langs
 fi
 
-# Issue #52: normalize per-language skip keys (e.g. --skip-c → --skip-cpp)
-# now that normalize_lang is defined.
-if [[ "${#SKIP_BY_LANG[@]}" -gt 0 ]]; then
-  declare -A _SKIP_NORMALIZED=()
-  for _slk in "${!SKIP_BY_LANG[@]}"; do
-    _sln="$(normalize_lang "$_slk")"
-    if [[ -n "${_SKIP_NORMALIZED[$_sln]:-}" ]]; then
-      _SKIP_NORMALIZED["$_sln"]="${_SKIP_NORMALIZED[$_sln]},${SKIP_BY_LANG[$_slk]}"
-    else
-      _SKIP_NORMALIZED["$_sln"]="${SKIP_BY_LANG[$_slk]}"
-    fi
-  done
-  # Replace SKIP_BY_LANG with the normalized map.
-  unset SKIP_BY_LANG
-  declare -A SKIP_BY_LANG=()
-  for _slk in "${!_SKIP_NORMALIZED[@]}"; do
-    SKIP_BY_LANG["$_slk"]="${_SKIP_NORMALIZED[$_slk]}"
-  done
-  unset _SKIP_NORMALIZED _slk _sln
-fi
-
 # Bead A5: resolve language-prefixed category ids and per-language --skip mapping
 resolve_skip_categories
+
+# Include effective policy in native cache identity. Source bytes alone cannot
+# authorize reusing findings computed under a different scan configuration.
+_policy_args=("$SCAN_CONFIG_DIGEST" "$ONLY_LANGS" "$EXCLUDE_LANGS" "$GLOBAL_EXCLUDE_PATTERNS"
+  "${UBS_SCAN_CONFIG_EXCLUDES:-}" "$UBS_PROFILE" "${UBS_SKIP_CATEGORIES:-}"
+  "$CATEGORY_FILTER" "$FAIL_ON_WARNING" "${USER_RULES_SOURCES[@]}")
+for _policy_lang in "${ALL_LANGS[@]}"; do
+  _policy_args+=("$_policy_lang=${SKIP_BY_LANG[$_policy_lang]:-}")
+done
+if ! UBS_SCAN_CONFIG_POLICY="$(python3 - "${_policy_args[@]}" <<'PYPOLICY'
+import hashlib
+import json
+import sys
+print(hashlib.sha256(json.dumps(sys.argv[1:], ensure_ascii=True).encode()).hexdigest())
+PYPOLICY
+)"; then
+  refuse_scan "invalid-config" "Could not compute scan policy identity" ""
+fi
+export UBS_SCAN_CONFIG_POLICY
+unset _policy_args _policy_lang
 
 # Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
 if [[ " ${langs[*]} " == *" js "* ]]; then
@@ -8821,7 +8853,7 @@ case "$FORMAT" in
           if [[ "$RUN_STATUS" != "ok" ]]; then
             say "${RED}Status: ${RUN_STATUS}${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
-          if [[ "$UBS_PROFILE" == "1" ]]; then
+          if [[ "$PROFILE_TIMINGS" -eq 1 ]]; then
             say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end) + (if .slots != null and .slots > 0 then "; " + (.slots|tostring) + " slots" else "" end)')"
           fi
           crit="${tot_crit:-0}"
@@ -8832,7 +8864,7 @@ case "$FORMAT" in
           if [[ "$RUN_STATUS" != "ok" ]]; then
             say "${RED}Status: ${RUN_STATUS}${RESET} — $(printf '%s' "$FAILED_MODULES_JSON" | jq -r 'map(.language + ": " + .status) | join(", ")')"
           fi
-          if [[ "$UBS_PROFILE" == "1" ]]; then
+          if [[ "$PROFILE_TIMINGS" -eq 1 ]]; then
             say "$(profile_json | jq -r '"Profile: total " + (.total_ms|tostring) + " ms (list " + (.list_ms|tostring) + ", fan-out " + (.fanout_ms|tostring) + ", merge " + (.merge_ms|tostring) + "; " + (.modules | to_entries | map(.key + " " + (.value|tostring) + " ms") | join(", ")) + ")" + (if .files_considered != null and .files_considered > 0 then "; prefilter " + (.files_after_prefilter|tostring) + "/" + (.files_considered|tostring) + " files" else "" end) + (if .cache_hit_rate != null and ((.cache_hits // 0) + (.cache_misses // 0)) > 0 then "; cache " + ((.cache_hit_rate * 100 | round)|tostring) + "% hits (" + (.cache_hits|tostring) + "/" + (((.cache_hits // 0) + (.cache_misses // 0))|tostring) + ")" else "" end) + (if .slots != null and .slots > 0 then "; " + (.slots|tostring) + " slots" else "" end)')"
           fi
           if [[ -n "$COMPARISON_FILE" ]]; then

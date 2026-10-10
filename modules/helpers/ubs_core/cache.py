@@ -64,6 +64,10 @@ def compute_cache_key(
     h = hashlib.blake2b(digest_size=16)
     payload = f"v{CACHE_SCHEMA_VERSION}‖{lang}‖{engine_version}‖{module_checksum}‖{rulepack_hash}‖{extra}".encode("utf-8")
     h.update(payload)
+    policy = os.environ.get("UBS_SCAN_CONFIG_POLICY")
+    if policy:
+        h.update(b"\0scan-policy\0")
+        h.update(policy.encode("utf-8"))
     return h.hexdigest()
 
 

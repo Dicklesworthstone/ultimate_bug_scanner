@@ -1010,6 +1010,8 @@ Core Options:
   --fail-on-warning        Exit with code 1 on warnings (strict mode)
   --version                Print UBS meta-runner version and exit
   --profile=MODE           strict|loose (sets defaults for strictness)
+  --config=PATH            Load an explicit JSON scan policy instead of project .ubs.json
+  --no-config              Disable automatic project configuration
   --baseline=FILE          Compare findings against a baseline JSON (alias for --comparison)
   -h, --help               Show help and exit
 
@@ -1061,6 +1063,7 @@ Environment Variables:
   JOBS                     Same as --jobs=N
   UBS_SKIP_RUST_BUILD=1    Same as --no-cargo (Rust static-only mode)
   UBS_RULES=DIR[:DIR...]   Custom rule directories used when no --rules is given
+  UBS_SKIP_CATEGORIES=CSV Global category skips; project < environment < --skip
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
   UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
@@ -1068,6 +1071,7 @@ Environment Variables:
   UBS_PYTHON               Python >= 3.9 interpreter to use as python3 (Git Bash/Windows: `python` or `py -3` are tried automatically)
   UBS_ALLOW_PARTIAL=1      Accept partial runs (timed-out/crashed module): exit on findings, not 2
   UBS_PROFILE=1            Add phase timings (list, fan-out, per module, merge, total ms) to json/toon output and the text summary
+                           Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
 
@@ -1268,6 +1272,82 @@ them in a repository of their own and check it out (a git submodule, a pinned cl
 CI); UBS does not fetch rule packs at scan time, since that would make every scan depend
 on the network and on code you have not reviewed.
 
+### **Repository Scan Configuration**
+
+Commit a `.ubs.json` file to keep local, CI, and service scans on the same policy:
+
+```json
+{
+  "version": 1,
+  "only": ["js", "python"],
+  "exclude": ["/generated/**", "*.min.js"],
+  "profile": "strict",
+  "skip": ["python.todo"],
+  "skip_by_lang": {"js": [11]}
+}
+```
+
+The supported fields are `only`, `exclude_langs`, `exclude`, `profile`, `skip`,
+`skip_by_lang`, `category`, `fail_on_warning`, and `rules`. Language lists accept
+the same aliases as the CLI. `skip` accepts category numbers or stable
+`language.category` ids; `skip_by_lang` maps each language to category numbers.
+`category` currently accepts only `resource-lifecycle`. `rules` is an array of
+custom rule directories, and `fail_on_warning` is a JSON boolean. The optional
+`version` field must be the integer `1`.
+
+**Precedence is defaults, project configuration, documented environment
+variables, then explicit CLI options.** Each field replaces the corresponding
+lower layer; each normalized language in `skip_by_lang` is replaced separately.
+Empty arrays clear that field. Built-in ignores and `.ubsignore` remain
+independent, and repeatable CLI options keep their existing behavior.
+`UBS_SKIP_CATEGORIES`, `UBS_RULES`, and the `strict`/`loose` values of `UBS_PROFILE`
+override their project fields. Numeric `UBS_PROFILE=1` enables timing output
+alongside the effective severity profile; collecting timings cannot turn a
+strict warning gate into a passing scan.
+
+```bash
+ubs .                                  # use project .ubs.json when present
+ubs . --only=python --skip=             # replace two project fields for this run
+ubs --config=./ci.ubs.json .            # use a different JSON policy
+ubs --no-config .                      # use CLI/environment/defaults
+UBS_PROFILE=1 ubs . --profile=strict    # retain both strict gating and timings
+ubs --schema=config                   # machine-readable schema
+ubs robot-docs config                 # discovery, precedence and bounds
+```
+
+For a single directory or positional file, discovery uses its nearest Git
+worktree root; outside Git, it uses the selected directory or file's parent.
+For multiple paths or `--files`, discovery uses the invocation directory's Git
+root, or that directory outside Git. Only that root's `.ubs.json` is loaded:
+there is no merging with parent or nested configuration files. `--config`
+paths are relative to the invocation directory and conflict with `--no-config`.
+
+Exclusion globs remain anchored to the discovered project, including when a
+scan selects only a subdirectory. Relative `rules` directories are anchored to
+the configuration file's parent. Configuration never expands the selected
+scan targets; explicitly named files retain their existing override of ignores.
+Staged and diff scans retain their selected directory scope and source snapshot.
+
+Invalid configuration fails with exit `2` before a scan starts or report
+outputs are opened. Unknown or duplicate keys, unsupported category ids,
+incorrect types, unreadable files, and invalid rule directories are errors.
+Documents are limited to 256 KiB, arrays to 256 entries, and strings to 4096
+characters. Control characters are rejected, and fields translated to CSV
+cannot contain commas. Configuration is read as JSON data and is never sourced
+or evaluated as shell code.
+
+Configuration identity and effective settings participate in the native scan
+cache. The local service observes configuration changes. Selected-file watches
+automatically observe creation, edits, and removal of the `.ubs.json` selected
+by normal CLI discovery, including a change in its location after Git is
+initialized. If a selected path inherits policy from outside the served
+directory, start the service and watch with `--repo` set to its Git worktree
+root. Whole reports are not reused while custom rules are active, because rule
+directories can reference policy outside the service snapshot; the native
+incremental cache remains available. File watching stays within the served
+repository: use an explicit watch dependency for in-repository rule files, and
+request a fresh scan after changing external rules.
+
 ### **Excluding False Positives**
 
 If the scanner reports false positives for your specific use case:
@@ -1279,15 +1359,8 @@ ubs . --skip=js.debug,python.todo  # Skip debug code detection and TODO markers
 # Exclude specific files/directories (gitignore-style globs, one per line)
 printf 'legacy/\nthird-party/\ngenerated/\n' >> .ubsignore
 
-# For persistent config, create a wrapper script
-cat > ~/bin/ubs-custom <<'EOF'
-#!/bin/bash
-ubs "$@" \
-  --ignore-file=~/.config/ubs/ignore \
-  --skip=14 \
-  --rules=~/.config/ubs/rules
-EOF
-chmod +x ~/bin/ubs-custom
+# Put shared category/language/rule settings in .ubs.json (see above).
+# Use --no-config for a one-off scan without the repository policy.
 ```
 
 ---

@@ -76,7 +76,10 @@ scan timestamp. Symlinks, special files, unreadable input, more than 20,000 inpu
 entries, or over 128 MiB of snapshot input disable reuse rather than skip scans.
 Runtime-directory environment overrides, redirected/linked Git metadata,
 inherited parent repositories and Git external include/exclude configuration
-also disable reuse. Python text reports can include live dependency audits;
+also disable reuse. Active custom rule directories from `.ubs.json` or
+`UBS_RULES` disable whole-report reuse because their rule graphs can reference
+files outside the snapshot; each request still uses the scanner's native
+incremental cache. Python text reports can include live dependency audits;
 they are not reused unless the caller explicitly selects native-only analysis
 with `ENABLE_UV_TOOLS=0`. The frontend never silently disables those tools.
 
@@ -218,7 +221,8 @@ source files being edited:
 ```
 
 The watcher observes the bytes and file identity of each **explicitly named
-file**. The default polling interval is 0.25 seconds (`--watch-interval`, minimum
+file**, plus the automatically discovered `.ubs.json` policy described below.
+The default polling interval is 0.25 seconds (`--watch-interval`, minimum
 0.1); a 0.3-second quiet period combines rapid saves into one scan (`--debounce`).
 Atomic replacement and same-size edits with restored mtimes trigger another
 generation. Missing, unreadable, oversized, non-regular or escaping files
@@ -274,6 +278,16 @@ or build trees should use explicit files and narrower `--watch-input` paths.
 
 ### Dependency and policy invalidation
 
+The `.ubs.json` selected by ordinary CLI discovery is watched automatically,
+including its creation, edits, removal, and a change in its location after Git
+is initialized. A single resolved file uses its nearest Git worktree root, or
+its parent outside Git; multiple resolved files use the served directory's Git
+root, or the served directory outside Git. Duplicate names and internal aliases
+do not change this selection. This one automatic input does not consume the
+256 explicit dependency slots or add source files to the scan. If the policy
+lies outside the served directory, watch mode reports an error directing you
+to serve and watch the Git worktree root with `--repo`.
+
 Use repeatable `--watch-input=PATH` options to watch dependency files, entire
 dependency trees or policy files **without adding them to the scan targets**:
 
@@ -302,9 +316,10 @@ Every event includes `watch_inputs` separately from the unchanged scan `paths`.
 Dependency-only edits also cancel obsolete requests. A restored exact snapshot
 may reuse a valid report, but it is emitted under the new observation generation.
 
-This is not a warmed analysis engine. In explicit-file polling mode, unnamed
-dependencies, configuration, ignore files and tools do **not** trigger a new generation;
-restart the watcher after changing those inputs or name them explicitly.
+This is not a warmed analysis engine. Beyond the automatic `.ubs.json` input,
+unnamed dependencies, other configuration, ignore files and tools do **not**
+trigger a new generation in explicit-file polling mode. Name in-repository
+inputs explicitly, or request a fresh scan after changing external inputs.
 Keep generated reports, cache directories and service sockets outside watched
 trees to avoid self-triggered rescans or special-file errors. The underlying
 scanner still owns dependency analysis and cache validation on every request.
